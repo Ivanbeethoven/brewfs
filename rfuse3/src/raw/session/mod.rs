@@ -1403,7 +1403,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     .expect("won't happened");
 
                 if let Err(err) = fuse_connection
-                    .write_vectored(Bytes::from(init_out_header_data), None)
+                    .write_vectored(Bytes::from(init_out_header_data), None::<Bytes>)
                     .await
                     .1
                 {
@@ -1617,7 +1617,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     .expect("won't happened");
 
                 if let Err(err) = fuse_connection
-                    .write_vectored(Bytes::from(init_out_header_data), None)
+                    .write_vectored(Bytes::from(init_out_header_data), None::<Bytes>)
                     .await
                     .1
                 {
@@ -1661,7 +1661,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             time_gran: DEFAULT_TIME_GRAN,
             max_pages: DEFAULT_MAX_PAGES,
             map_alignment: DEFAULT_MAP_ALIGNMENT,
-            flags2: 0x1,  // FUSE_HAS_MAX_READ — tells kernel max_read is valid
+            flags2: 0x1, // FUSE_HAS_MAX_READ — tells kernel max_read is valid
             max_read: 4 * 1024 * 1024,
             unused: [0; 6],
         };
@@ -1684,7 +1684,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             .expect("won't happened");
 
         if let Err(err) = fuse_connection
-            .write_vectored(Bytes::from(data), None)
+            .write_vectored(Bytes::from(data), None::<Bytes>)
             .await
             .1
         {

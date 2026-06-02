@@ -12,13 +12,31 @@
 //! - `async-io-runtime`: use [async_io](https://docs.rs/async-io) and
 //!   [async-global-executor](https://docs.rs/async-global-executor) to drive async io and task.
 //! - `tokio-runtime`: use [tokio](https://docs.rs/tokio) runtime to drive async io and task.
+//! - `io-uring-runtime`: use an io_uring FUSE connection on Linux. This feature
+//!   also enables `tokio-runtime`.
 //! - `unprivileged`: allow mount filesystem without root permission by using `fusermount3`.
 //!
 //! # Notes:
 //!
-//! You must enable `async-io-runtime` or `tokio-runtime` feature.
+//! You must enable exactly one top-level runtime: either `async-io-runtime`,
+//! `tokio-runtime`, or `io-uring-runtime`. Because `io-uring-runtime` is backed
+//! by tokio tasks and channels, it implies `tokio-runtime`.
 
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
+#[cfg(not(any(
+    feature = "async-io-runtime",
+    feature = "tokio-runtime",
+    feature = "io-uring-runtime"
+)))]
+compile_error!(
+    "rfuse3 requires one runtime feature: async-io-runtime, tokio-runtime, or io-uring-runtime"
+);
+
+#[cfg(all(feature = "async-io-runtime", feature = "tokio-runtime"))]
+compile_error!(
+    "rfuse3 async-io-runtime cannot be enabled together with tokio-runtime or io-uring-runtime; use --no-default-features for async-io-runtime"
+);
 
 #[cfg(any(
     all(target_os = "linux", feature = "unprivileged"),
