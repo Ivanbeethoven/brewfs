@@ -10,6 +10,7 @@ data/
 # Large/generated test artifacts
 brewfs/docker/compose-xfstests/artifacts/
 brewfs/tests/scripts/xfstests-prebuilt/*.tar.gz
+!brewfs/tests/scripts/xfstests-prebuilt/xfstests-prebuilt.tar.gz
 perf.data
 
 # Editor and OS noise
