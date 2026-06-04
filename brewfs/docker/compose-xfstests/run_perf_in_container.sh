@@ -173,15 +173,36 @@ EOF
             fi
         fi
 
-        # Cache section (compression, writeback mode, etc.)
+        # Cache section (compression, writeback mode, memory/cache budgets, etc.)
         local comp="${BREWFS_COMPRESSION:-none}"
         local writeback_mode="${BREWFS_WRITEBACK_MODE:-}"
-        if [[ "$comp" != "none" || -n "$writeback_mode" ]]; then
+        if [[ -n "${BREWFS_CACHE_ROOT:-}" \
+            || -n "${BREWFS_READ_MEMORY_BYTES:-}" \
+            || -n "${BREWFS_READ_SSD_BYTES:-}" \
+            || -n "${BREWFS_WRITE_MEMORY_BYTES:-}" \
+            || -n "${BREWFS_WRITE_SSD_BYTES:-}" \
+            || -n "${BREWFS_DIRTY_SLICE_TARGET_SIZE:-}" \
+            || -n "${BREWFS_DIRTY_SLICE_MAX_AGE_MS:-}" \
+            || -n "${BREWFS_PREFETCH_ENABLED:-}" \
+            || -n "${BREWFS_PREFETCH_MAX_BYTES:-}" \
+            || -n "${BREWFS_PREFETCH_CONCURRENCY:-}" \
+            || -n "${BREWFS_MEMORY_BUDGET_BYTES:-}" \
+            || -n "${BREWFS_COMPRESSION:-}" \
+            || -n "$writeback_mode" ]]; then
             echo
             echo "cache:"
-            if [[ "$comp" != "none" ]]; then
-                echo "  compression: ${comp}"
-            fi
+            [[ -n "${BREWFS_CACHE_ROOT:-}" ]] && echo "  root: ${BREWFS_CACHE_ROOT}"
+            [[ -n "${BREWFS_READ_MEMORY_BYTES:-}" ]] && echo "  read_memory_bytes: ${BREWFS_READ_MEMORY_BYTES}"
+            [[ -n "${BREWFS_READ_SSD_BYTES:-}" ]] && echo "  read_ssd_bytes: ${BREWFS_READ_SSD_BYTES}"
+            [[ -n "${BREWFS_WRITE_MEMORY_BYTES:-}" ]] && echo "  write_memory_bytes: ${BREWFS_WRITE_MEMORY_BYTES}"
+            [[ -n "${BREWFS_WRITE_SSD_BYTES:-}" ]] && echo "  write_ssd_bytes: ${BREWFS_WRITE_SSD_BYTES}"
+            [[ -n "${BREWFS_DIRTY_SLICE_TARGET_SIZE:-}" ]] && echo "  dirty_slice_target_size: ${BREWFS_DIRTY_SLICE_TARGET_SIZE}"
+            [[ -n "${BREWFS_DIRTY_SLICE_MAX_AGE_MS:-}" ]] && echo "  dirty_slice_max_age_ms: ${BREWFS_DIRTY_SLICE_MAX_AGE_MS}"
+            [[ -n "${BREWFS_PREFETCH_ENABLED:-}" ]] && echo "  prefetch_enabled: ${BREWFS_PREFETCH_ENABLED}"
+            [[ -n "${BREWFS_PREFETCH_MAX_BYTES:-}" ]] && echo "  prefetch_max_bytes: ${BREWFS_PREFETCH_MAX_BYTES}"
+            [[ -n "${BREWFS_PREFETCH_CONCURRENCY:-}" ]] && echo "  prefetch_concurrency: ${BREWFS_PREFETCH_CONCURRENCY}"
+            [[ -n "${BREWFS_MEMORY_BUDGET_BYTES:-}" ]] && echo "  memory_budget_bytes: ${BREWFS_MEMORY_BUDGET_BYTES}"
+            [[ -n "${BREWFS_COMPRESSION:-}" ]] && echo "  compression: ${comp}"
             if [[ -n "$writeback_mode" ]]; then
                 echo "  writeback_mode: ${writeback_mode}"
             fi
