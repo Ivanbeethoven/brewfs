@@ -36,6 +36,7 @@ fn default_mount_options() -> MountOptions {
     mo.allow_other(true);
     // Default to 4 MiB for higher throughput while keeping memory usage reasonable.
     mo.max_write(NonZeroU32::new(BREWFS_FUSE_MAX_WRITE).unwrap());
+    mo.custom_options(format!("max_read={BREWFS_FUSE_MAX_WRITE}"));
     // Set kernel readahead to 16 MiB (4 blocks). Larger values cause excessive
     // concurrent FUSE reads that create scheduling contention. 16 MiB lets the
     // kernel pipeline 4 read requests while our userspace prefetcher handles
@@ -160,4 +161,20 @@ where
         std::io::ErrorKind::Unsupported,
         "FUSE mount is only supported on Linux in this build",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_mount_options_request_large_read_requests() {
+        let options = default_mount_options();
+        let debug = format!("{options:?}");
+
+        assert!(
+            debug.contains("max_read=4194304"),
+            "Linux mount options should request 4 MiB FUSE read requests: {debug}"
+        );
+    }
 }

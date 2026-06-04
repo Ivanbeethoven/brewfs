@@ -25,7 +25,7 @@ use bytes::Bytes;
 use rfuse3::Errno;
 use rfuse3::Result as FuseResult;
 use rfuse3::raw::Request;
-use rfuse3::raw::flags::{FOPEN_KEEP_CACHE, FUSE_WRITE_CACHE};
+use rfuse3::raw::flags::{FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE, FUSE_WRITE_CACHE};
 use rfuse3::raw::reply::{
     DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyCopyFileRange, ReplyCreated, ReplyData,
     ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyIoctl, ReplyLSeek, ReplyLock,
@@ -57,6 +57,25 @@ fn fuse_cache_ttl() -> Duration {
             None => Duration::from_secs(1),
         }
     })
+}
+
+fn fuse_read_direct_io_enabled() -> bool {
+    std::env::var("BREWFS_FUSE_READ_DIRECT_IO")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn fuse_open_reply_flags(read: bool, write: bool) -> u32 {
+    let mut flags = FOPEN_KEEP_CACHE;
+    if read && !write && fuse_read_direct_io_enabled() {
+        flags |= FOPEN_DIRECT_IO;
+    }
+    flags
 }
 
 /// Virtual inode for the `.stats` file exposed at the mount root.
@@ -464,7 +483,7 @@ where
         // and exposing a window where overlay_dirty may miss in-flight data.
         Ok(ReplyOpen {
             fh,
-            flags: FOPEN_KEEP_CACHE,
+            flags: fuse_open_reply_flags(read, write),
         })
     }
 
@@ -2123,6 +2142,13 @@ mod fuse_init_tests {
     use crate::chunk::store::InMemoryBlockStore;
     use crate::meta::factory::create_meta_store_from_url;
     use rfuse3::raw::Filesystem;
+    use rfuse3::raw::flags::FOPEN_DIRECT_IO;
+    use std::sync::{Mutex as StdMutex, OnceLock};
+
+    fn env_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
 
     #[tokio::test]
     async fn init_reply_advertises_large_write_requests() {
@@ -2134,5 +2160,33 @@ mod fuse_init_tests {
         let reply = Filesystem::init(&fs, Request::default()).await.unwrap();
 
         assert_eq!(reply.max_write.get(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn open_reply_flags_keep_cache_by_default() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::remove_var("BREWFS_FUSE_READ_DIRECT_IO");
+        }
+
+        assert_eq!(fuse_open_reply_flags(true, false), FOPEN_KEEP_CACHE);
+    }
+
+    #[test]
+    fn open_reply_flags_enable_direct_io_for_read_only_handles() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("BREWFS_FUSE_READ_DIRECT_IO", "1");
+        }
+
+        assert_eq!(
+            fuse_open_reply_flags(true, false),
+            FOPEN_KEEP_CACHE | FOPEN_DIRECT_IO
+        );
+        assert_eq!(fuse_open_reply_flags(true, true), FOPEN_KEEP_CACHE);
+
+        unsafe {
+            std::env::remove_var("BREWFS_FUSE_READ_DIRECT_IO");
+        }
     }
 }
