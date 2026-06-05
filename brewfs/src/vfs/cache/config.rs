@@ -4,22 +4,17 @@ use crate::chunk::bandwidth::BandwidthConfig;
 use crate::chunk::compress::Compression;
 
 /// Write-back mode controls when data becomes globally visible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WriteBackMode {
     /// Default safe mode: upload to S3 first, then metadata commit.
     /// fsync/close success guarantees data is in object store + metadata committed.
+    #[default]
     UploadBeforeCommit,
     /// High-performance mode: metadata commit first, async upload.
     /// Risk: local SSD loss before upload = data loss. Other clients may
     /// see metadata-visible slices whose objects don't exist yet.
     /// Must be explicitly opted in.
     CommitBeforeUpload,
-}
-
-impl Default for WriteBackMode {
-    fn default() -> Self {
-        Self::UploadBeforeCommit
-    }
 }
 
 /// Configuration for the BrewFS local cache system.

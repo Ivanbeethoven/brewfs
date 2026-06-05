@@ -1564,7 +1564,7 @@ impl RedisMetaStore {
         let mut conn = self.conn.clone();
         let values: Vec<Option<Vec<u8>>> = conn.get(&keys).await.map_err(redis_err)?;
 
-        for (ino, value) in missing_inodes.into_iter().zip(values.into_iter()) {
+        for (ino, value) in missing_inodes.into_iter().zip(values) {
             let node = match value {
                 Some(bytes) => Some(
                     serde_json::from_slice(&bytes)
@@ -1864,7 +1864,7 @@ impl RedisMetaStore {
                 .arg(
                     slices
                         .iter()
-                        .map(|s| crate::meta::serialization::serialize_meta(s))
+                        .map(crate::meta::serialization::serialize_meta)
                         .collect::<Result<Vec<_>, _>>()?,
                 )
                 .invoke_async(&mut conn)

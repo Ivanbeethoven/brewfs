@@ -317,6 +317,37 @@ impl Filesystem for MinimalFileSystem {
         debug!("Listing extended attributes: inode={}", inode);
         Ok(ReplyXAttr::Data(Vec::new().into()))
     }
+
+    #[cfg(feature = "file-lock")]
+    async fn getlk(
+        &self,
+        _req: Request,
+        _inode: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _type: u32,
+        _pid: u32,
+    ) -> Result<ReplyLock> {
+        Err(libc::ENOSYS.into())
+    }
+
+    #[cfg(feature = "file-lock")]
+    async fn setlk(
+        &self,
+        _req: Request,
+        _inode: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _type: u32,
+        _pid: u32,
+        _block: bool,
+    ) -> Result<()> {
+        Err(libc::ENOSYS.into())
+    }
 }
 
 #[derive(Parser, Debug)]

@@ -421,6 +421,7 @@ impl FsStats {
             .store(recent_uploaded_bytes, ORD);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn sync_object_store_metrics(
         &self,
         get_ops: u64,

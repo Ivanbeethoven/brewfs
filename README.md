@@ -73,6 +73,12 @@ Build the CLI:
 cargo build -p brewfs --release
 ```
 
+BrewFS defaults to the `io_uring` FUSE runtime. Build the Tokio FUSE runtime with:
+
+```bash
+cargo build -p brewfs --release --no-default-features --features fuse-tokio-runtime
+```
+
 Mount with local object storage and SQLite metadata:
 
 ```bash

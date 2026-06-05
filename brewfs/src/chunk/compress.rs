@@ -11,20 +11,15 @@ use tracing::{debug, trace};
 const MAGIC: [u8; 2] = [0x53, 0x46];
 
 /// Compression algorithm selection
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Compression {
     /// No compression — data stored/transferred as-is
+    #[default]
     None,
     /// LZ4 compression (fast, moderate ratio ~2-3x)
     Lz4,
     /// Zstd compression with configurable level (slower, better ratio ~3-5x)
     Zstd(i32),
-}
-
-impl Default for Compression {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl Compression {

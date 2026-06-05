@@ -553,10 +553,7 @@ async fn run_full(vm: &mut Machine, brewfs_bin: &Path) -> Result<()> {
 
     exec_check(
         vm,
-        &format!(
-            "sh -lc 'echo persist > {}/persist.txt'",
-            BREWFS_MOUNTPOINT
-        ),
+        &format!("sh -lc 'echo persist > {}/persist.txt'", BREWFS_MOUNTPOINT),
     )
     .await?;
     exec_check(vm, &format!("mkdir -p {}/pdir/sub", BREWFS_MOUNTPOINT)).await?;

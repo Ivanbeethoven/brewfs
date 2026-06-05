@@ -659,8 +659,7 @@ mod tests {
             .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
         let bucket =
             std::env::var("BREWFS_S3_BUCKET").unwrap_or_else(|_| "brewfs-data".to_string());
-        let region =
-            std::env::var("BREWFS_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let region = std::env::var("BREWFS_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
         let s3_config = Config::builder()
             .endpoint_url(endpoint)
@@ -716,7 +715,7 @@ mod tests {
             Some(payload.as_slice())
         );
 
-        let streaming_put = timeout(
+        timeout(
             Duration::from_secs(10),
             backend.put_object_vectored_simple(&streaming_key, chunks),
         )
@@ -724,7 +723,7 @@ mod tests {
         .expect("streaming body put_object timed out; contiguous put_object already succeeded")
         .expect("streaming body put_object returned an error");
 
-        assert_eq!(streaming_put, ());
+        assert_eq!((), ());
         assert_eq!(
             backend.get_object(&streaming_key).await.unwrap().as_deref(),
             Some(payload.as_slice())

@@ -601,10 +601,10 @@ where
 
         // Close-to-open: if there is a local inode with a more recent size
         // (e.g. from an uncommitted write), prefer it over the metadata value.
-        if let Some(size) = self.vfs.inode_size_cached(ino) {
-            if size > attr.size {
-                attr.size = size;
-            }
+        if let Some(size) = self.vfs.inode_size_cached(ino)
+            && size > attr.size
+        {
+            attr.size = size;
         }
 
         let name = path.rsplit('/').next().unwrap_or("");

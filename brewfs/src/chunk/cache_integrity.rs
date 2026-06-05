@@ -17,8 +17,9 @@ const HEADER_LEN: usize = 8;
 /// Encode data with CRC32C checksums for disk storage.
 /// Format: [MAGIC(4)][data_len_u32(4)][data][checksums]
 /// Each checksum covers CS_BLOCK bytes (last block may be smaller).
+#[allow(dead_code)]
 pub fn encode(data: &[u8]) -> Vec<u8> {
-    let num_blocks = (data.len() + CS_BLOCK - 1) / CS_BLOCK;
+    let num_blocks = data.len().div_ceil(CS_BLOCK);
     let checksum_bytes = num_blocks * 4;
     let total = HEADER_LEN + data.len() + checksum_bytes;
     let mut out = Vec::with_capacity(total);
@@ -44,7 +45,7 @@ pub fn encode(data: &[u8]) -> Vec<u8> {
 /// Compute the header and checksums without copying data.
 /// Returns (header_bytes, checksum_bytes) for use with vectored I/O.
 pub fn compute_framing(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let num_blocks = (data.len() + CS_BLOCK - 1) / CS_BLOCK;
+    let num_blocks = data.len().div_ceil(CS_BLOCK);
 
     let mut header = Vec::with_capacity(HEADER_LEN);
     header.extend_from_slice(&MAGIC);
@@ -72,7 +73,7 @@ pub fn decode(raw: &[u8]) -> Option<Vec<u8>> {
     }
 
     let data_len = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
-    let num_blocks = (data_len + CS_BLOCK - 1) / CS_BLOCK;
+    let num_blocks = data_len.div_ceil(CS_BLOCK);
     let checksum_bytes = num_blocks * 4;
     let expected_total = HEADER_LEN + data_len + checksum_bytes;
 

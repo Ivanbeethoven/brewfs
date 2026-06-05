@@ -754,8 +754,7 @@ where
             .read_count
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1)
-            % 64
-            == 0;
+            .is_multiple_of(64);
         if should_clean {
             self.clean_evictable_slices(offset, actual_len)
                 .instrument(tracing::trace_span!(
@@ -1311,7 +1310,7 @@ mod tests {
         assert!(
             ranges
                 .iter()
-                .any(|&(start, end)| start <= 0 && end >= demand_end),
+                .any(|&(start, end)| start == 0 && end >= demand_end),
             "demand range should be in slices, ranges={ranges:?}"
         );
     }

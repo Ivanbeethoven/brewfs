@@ -17,7 +17,7 @@ impl CleanBlockKey {
         }
     }
 
-    pub fn to_cache_path(&self) -> String {
+    pub fn to_cache_path(self) -> String {
         format!("chunks/{}/{}", self.slice_id, self.block_index)
     }
 }

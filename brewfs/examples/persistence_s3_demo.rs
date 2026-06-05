@@ -1,9 +1,9 @@
-use clap::Parser;
 use brewfs::fuse::mount::mount_vfs_unprivileged;
 use brewfs::{
     ChunkLayout, DatabaseMetaStore, DatabaseType, EtcdMetaStore, MetaStore, MetaStoreFactory,
-    ObjectBlockStore, ObjectClient, RedisMetaStore, S3Backend, S3Config, VFS,
+    ObjectBlockStore, ObjectClient, RedisMetaStore, S3Backend, S3Config, TiKvMetaStore, VFS,
 };
+use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
@@ -223,6 +223,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             DatabaseType::Etcd { .. } => {
                 MetaStoreFactory::<EtcdMetaStore>::create_from_config(config.clone())
+                    .await
+                    .map_err(|e| format!("Failed to initialize metadata storage: {}", e))?
+                    .store()
+            }
+            DatabaseType::TiKv { .. } => {
+                MetaStoreFactory::<TiKvMetaStore>::create_from_config(config.clone())
                     .await
                     .map_err(|e| format!("Failed to initialize metadata storage: {}", e))?
                     .store()

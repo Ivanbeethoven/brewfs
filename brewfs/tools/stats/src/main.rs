@@ -8,7 +8,7 @@
 //!   brewfs-stats /mnt/brewfs -i 2     # 2s interval
 
 use clap::Parser;
-use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor, ResetColor};
+use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -16,7 +16,10 @@ use std::time::Duration;
 
 /// Real-time BrewFS performance stats viewer.
 #[derive(Parser, Debug)]
-#[command(name = "brewfs-stats", about = "Monitor BrewFS performance in real-time")]
+#[command(
+    name = "brewfs-stats",
+    about = "Monitor BrewFS performance in real-time"
+)]
 struct Args {
     /// Mount point of BrewFS
     mountpoint: PathBuf,
@@ -101,7 +104,9 @@ fn format_latency_us(total_us: u64, ops: u64) -> String {
 }
 
 fn delta(prev: &Metrics, curr: &Metrics, key: &str) -> u64 {
-    curr.get(key).unwrap_or(&0).saturating_sub(*prev.get(key).unwrap_or(&0))
+    curr.get(key)
+        .unwrap_or(&0)
+        .saturating_sub(*prev.get(key).unwrap_or(&0))
 }
 
 fn build_sections() -> Vec<Section> {
@@ -109,11 +114,31 @@ fn build_sections() -> Vec<Section> {
         Section {
             name: "fuse",
             columns: vec![
-                Column { label: "ops", width: 7, color: Color::Cyan },
-                Column { label: "read", width: 8, color: Color::Green },
-                Column { label: "write", width: 8, color: Color::Yellow },
-                Column { label: "r_lat", width: 7, color: Color::Green },
-                Column { label: "w_lat", width: 7, color: Color::Yellow },
+                Column {
+                    label: "ops",
+                    width: 7,
+                    color: Color::Cyan,
+                },
+                Column {
+                    label: "read",
+                    width: 8,
+                    color: Color::Green,
+                },
+                Column {
+                    label: "write",
+                    width: 8,
+                    color: Color::Yellow,
+                },
+                Column {
+                    label: "r_lat",
+                    width: 7,
+                    color: Color::Green,
+                },
+                Column {
+                    label: "w_lat",
+                    width: 7,
+                    color: Color::Yellow,
+                },
             ],
             compute: |prev, curr, dt| {
                 let read_ops = delta(prev, curr, "brewfs_fuse_read_ops_total");
@@ -141,9 +166,21 @@ fn build_sections() -> Vec<Section> {
         Section {
             name: "meta",
             columns: vec![
-                Column { label: "ops", width: 7, color: Color::Magenta },
-                Column { label: "txn", width: 6, color: Color::Magenta },
-                Column { label: "lat", width: 7, color: Color::Magenta },
+                Column {
+                    label: "ops",
+                    width: 7,
+                    color: Color::Magenta,
+                },
+                Column {
+                    label: "txn",
+                    width: 6,
+                    color: Color::Magenta,
+                },
+                Column {
+                    label: "lat",
+                    width: 7,
+                    color: Color::Magenta,
+                },
             ],
             compute: |prev, curr, dt| {
                 let ops = delta(prev, curr, "brewfs_meta_ops_total");
@@ -159,11 +196,31 @@ fn build_sections() -> Vec<Section> {
         Section {
             name: "object",
             columns: vec![
-                Column { label: "get", width: 6, color: Color::Blue },
-                Column { label: "get/s", width: 8, color: Color::Blue },
-                Column { label: "put", width: 6, color: Color::Red },
-                Column { label: "put/s", width: 8, color: Color::Red },
-                Column { label: "del", width: 5, color: Color::DarkRed },
+                Column {
+                    label: "get",
+                    width: 6,
+                    color: Color::Blue,
+                },
+                Column {
+                    label: "get/s",
+                    width: 8,
+                    color: Color::Blue,
+                },
+                Column {
+                    label: "put",
+                    width: 6,
+                    color: Color::Red,
+                },
+                Column {
+                    label: "put/s",
+                    width: 8,
+                    color: Color::Red,
+                },
+                Column {
+                    label: "del",
+                    width: 5,
+                    color: Color::DarkRed,
+                },
             ],
             compute: |prev, curr, dt| {
                 let get_ops = delta(prev, curr, "brewfs_s3_get_ops_total");
@@ -183,9 +240,21 @@ fn build_sections() -> Vec<Section> {
         Section {
             name: "cache",
             columns: vec![
-                Column { label: "hit", width: 6, color: Color::Green },
-                Column { label: "miss", width: 6, color: Color::Red },
-                Column { label: "dirty", width: 8, color: Color::Yellow },
+                Column {
+                    label: "hit",
+                    width: 6,
+                    color: Color::Green,
+                },
+                Column {
+                    label: "miss",
+                    width: 6,
+                    color: Color::Red,
+                },
+                Column {
+                    label: "dirty",
+                    width: 8,
+                    color: Color::Yellow,
+                },
             ],
             compute: |prev, curr, dt| {
                 let hits = delta(prev, curr, "brewfs_cache_hits_total");
@@ -206,7 +275,13 @@ fn print_header(sections: &[Section], stdout: &mut io::Stdout) {
     write!(stdout, "{}", SetAttribute(Attribute::Bold)).unwrap();
     for section in sections {
         let total_width: usize = section.columns.iter().map(|c| c.width + 1).sum::<usize>();
-        write!(stdout, " {:^width$}", section.name.to_uppercase(), width = total_width).unwrap();
+        write!(
+            stdout,
+            " {:^width$}",
+            section.name.to_uppercase(),
+            width = total_width
+        )
+        .unwrap();
         write!(stdout, "│").unwrap();
     }
     writeln!(stdout, "{}", SetAttribute(Attribute::Reset)).unwrap();
@@ -236,7 +311,13 @@ fn print_header(sections: &[Section], stdout: &mut io::Stdout) {
     writeln!(stdout).unwrap();
 }
 
-fn print_row(sections: &[Section], prev: &Metrics, curr: &Metrics, dt: f64, stdout: &mut io::Stdout) {
+fn print_row(
+    sections: &[Section],
+    prev: &Metrics,
+    curr: &Metrics,
+    dt: f64,
+    stdout: &mut io::Stdout,
+) {
     for section in sections {
         let values = (section.compute)(prev, curr, dt);
         for (i, col) in section.columns.iter().enumerate() {

@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 /// tracking is an *estimate*, not a precise POSIX `st_blocks` value, because
 /// the true allocated size depends on the metadata store's view of visible
 /// extents after compaction, overwrites, and truncates.
-
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AllocatedState {

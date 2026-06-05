@@ -213,6 +213,7 @@ where
         skip(self, buf),
         fields(chunk_id = self.id, offset = offset.0, len = buf.len())
     )]
+    #[allow(dead_code)]
     pub(crate) async fn read_at_into(&mut self, offset: ChunkOffset, buf: &mut [u8]) -> Result<()> {
         let offset = offset.get();
         let len = buf.len();

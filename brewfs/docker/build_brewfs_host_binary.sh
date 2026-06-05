@@ -26,7 +26,12 @@ pick_strip_tool() {
 cd "$PROJECT_DIR"
 
 info "在宿主机构建 brewfs release 二进制"
-cargo build --release -p brewfs --bin brewfs
+build_args=(--release -p brewfs --bin brewfs)
+if [[ -n "${BREWFS_CARGO_BUILD_ARGS:-}" ]]; then
+    read -r -a extra_args <<<"$BREWFS_CARGO_BUILD_ARGS"
+    build_args+=("${extra_args[@]}")
+fi
+cargo build "${build_args[@]}"
 
 if [[ ! -f "$BIN_PATH" ]]; then
     err "构建完成后未找到二进制: $BIN_PATH"

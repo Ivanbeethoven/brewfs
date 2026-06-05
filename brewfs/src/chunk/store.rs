@@ -733,10 +733,11 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             }
 
             tracing::Span::current().record("read_len", total_read);
-            if range_missed && total_read > 0 {
-                if !self.try_promote_page_cache_to_block_cache(key).await {
-                    self.prefetch_full_block_background(key, key_str);
-                }
+            if range_missed
+                && total_read > 0
+                && !self.try_promote_page_cache_to_block_cache(key).await
+            {
+                self.prefetch_full_block_background(key, key_str);
             }
             return Ok(());
         }

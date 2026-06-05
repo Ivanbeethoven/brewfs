@@ -310,9 +310,7 @@ impl InodeCache {
         let mut entries = Vec::new();
 
         for (name, child_ino) in children_map.iter() {
-            let Some(child) = self.ttl_manager.get(child_ino).await else {
-                return None;
-            };
+            let child = self.ttl_manager.get(child_ino).await?;
             let kind = child.attr.read().await.kind;
 
             entries.push(DirEntry {

@@ -63,10 +63,7 @@ fn init_tracing(chrome_trace: Option<&Path>) {
 }
 
 #[derive(Parser, Debug, Clone)]
-#[command(
-    name = "brewfs-bench",
-    about = "BrewFS benchmark config (env-driven)"
-)]
+#[command(name = "brewfs-bench", about = "BrewFS benchmark config (env-driven)")]
 struct BenchArgs {
     #[arg(long, env = "BREWFS_BENCH_BLOCK_MB", default_value_t = 1)]
     block_mb: usize,
@@ -82,11 +79,7 @@ struct BenchArgs {
     sample_size: usize,
     #[arg(long, env = "BREWFS_BENCH_META_BACKEND", value_enum, default_value_t = MetaBackendKind::Sqlx)]
     meta_backend: MetaBackendKind,
-    #[arg(
-        long,
-        env = "BREWFS_BENCH_META_URL",
-        default_value = "sqlite::memory:"
-    )]
+    #[arg(long, env = "BREWFS_BENCH_META_URL", default_value = "sqlite::memory:")]
     meta_url: String,
     #[arg(long, env = "BREWFS_BENCH_META_ETCD_URLS")]
     meta_etcd_urls: Option<String>,

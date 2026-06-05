@@ -1,10 +1,10 @@
-use serial_test::serial;
 use brewfs::chunk::SliceDesc;
 use brewfs::meta::store::{MetaError, RetryReason};
 use brewfs::{
     CacheConfig, ClientOptions, CompactConfig, Config, DatabaseConfig, DatabaseType, MetaStore,
     RedisMetaStore,
 };
+use serial_test::serial;
 
 fn test_config() -> Config {
     Config {

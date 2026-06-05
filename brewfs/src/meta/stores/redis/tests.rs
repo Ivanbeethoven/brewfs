@@ -2995,7 +2995,7 @@ async fn test_truncate_consistency() {
     assert!(
         slices0
             .iter()
-            .all(|s| s.offset + s.length as u64 <= chunk_size / 2 || s.offset <= chunk_size / 2)
+            .all(|s| s.offset + s.length <= chunk_size / 2 || s.offset <= chunk_size / 2)
     );
 }
 
@@ -3017,10 +3017,7 @@ async fn test_delayed_slice_workflow_consistency() {
         offset: 0,
         length: 1024,
     };
-    store
-        .append_slice(chunk_id, old_slice.clone())
-        .await
-        .unwrap();
+    store.append_slice(chunk_id, old_slice).await.unwrap();
 
     let new_slice = crate::chunk::SliceDesc {
         slice_id: 402,
@@ -3028,7 +3025,7 @@ async fn test_delayed_slice_workflow_consistency() {
         offset: 0,
         length: 1024,
     };
-    let delayed_data = crate::chunk::SliceDesc::encode_delayed_data(&[old_slice.clone()], &[401]);
+    let delayed_data = crate::chunk::SliceDesc::encode_delayed_data(&[old_slice], &[401]);
     store
         .replace_slices_for_compact(chunk_id, &[new_slice], &delayed_data)
         .await

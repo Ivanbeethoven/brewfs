@@ -794,16 +794,8 @@ where
                     let reads_delta = reads.saturating_sub(prev_reads);
                     let bytes_delta = bytes.saturating_sub(prev_bytes);
                     let lat_delta = lat_us.saturating_sub(prev_lat_us);
-                    let avg_sz = if reads_delta > 0 {
-                        bytes_delta / reads_delta
-                    } else {
-                        0
-                    };
-                    let avg_lat_us = if reads_delta > 0 {
-                        lat_delta / reads_delta
-                    } else {
-                        0
-                    };
+                    let avg_sz = bytes_delta.checked_div(reads_delta).unwrap_or(0);
+                    let avg_lat_us = lat_delta.checked_div(reads_delta).unwrap_or(0);
                     prev_reads = reads;
                     prev_bytes = bytes;
                     prev_lat_us = lat_us;
@@ -2631,13 +2623,13 @@ where
                 .flush_for_close(handle.ino as u64)
                 .await
                 .map_err(VfsError::from)?;
-            if had_write || flushed_pending {
-                if let Err(err) = self.update_mtime_ctime(handle.ino).await {
-                    if had_write {
-                        handle.mark_write_dirty();
-                    }
-                    return Err(err);
+            if (had_write || flushed_pending)
+                && let Err(err) = self.update_mtime_ctime(handle.ino).await
+            {
+                if had_write {
+                    handle.mark_write_dirty();
                 }
+                return Err(err);
             }
         }
 
@@ -2695,13 +2687,13 @@ where
             .map_err(VfsError::from)?;
         tracing::trace!(fh, ino = handle.ino, "vfs.flush_handle_done");
 
-        if had_write || flushed_pending {
-            if let Err(err) = self.update_mtime_ctime(handle.ino).await {
-                if had_write {
-                    handle.mark_write_dirty();
-                }
-                return Err(err);
+        if (had_write || flushed_pending)
+            && let Err(err) = self.update_mtime_ctime(handle.ino).await
+        {
+            if had_write {
+                handle.mark_write_dirty();
             }
+            return Err(err);
         }
         Ok(handle.ino)
     }
@@ -2832,8 +2824,7 @@ where
                 .state
                 .recently_unlinked_cleanup_tick
                 .fetch_add(1, Ordering::Relaxed)
-                % RECENTLY_UNLINKED_ATTR_CLEANUP_INTERVAL
-                == 0
+                .is_multiple_of(RECENTLY_UNLINKED_ATTR_CLEANUP_INTERVAL)
         {
             self.cleanup_recently_unlinked_attrs();
         }

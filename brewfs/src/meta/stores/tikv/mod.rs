@@ -842,6 +842,7 @@ impl TiKvMetaStore {
         self.txn_put_node(txn, &node, operation).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn txn_move_node_binding(
         &self,
         txn: &mut Transaction,

@@ -43,6 +43,7 @@ impl<B: ObjectBackend> ObjectClient<B> {
         Self { backend }
     }
 
+    #[allow(dead_code)]
     pub async fn put_object(&self, key: &str, data: &[u8]) -> Result<()> {
         self.backend.put_object(key, data).await
     }

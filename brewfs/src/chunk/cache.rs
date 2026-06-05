@@ -274,10 +274,10 @@ impl DiskStorage {
             Err(_) => return 0,
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Ok(meta) = entry.metadata().await {
-                if meta.is_file() {
-                    total += meta.len();
-                }
+            if let Ok(meta) = entry.metadata().await
+                && meta.is_file()
+            {
+                total += meta.len();
             }
         }
         total
@@ -446,16 +446,16 @@ impl DiskStorage {
             Err(_) => return,
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Ok(meta) = entry.metadata().await {
-                if meta.is_file() {
-                    let atime = meta
-                        .accessed()
-                        .unwrap_or(SystemTime::UNIX_EPOCH)
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    files.push((entry.path(), meta.len(), atime));
-                }
+            if let Ok(meta) = entry.metadata().await
+                && meta.is_file()
+            {
+                let atime = meta
+                    .accessed()
+                    .unwrap_or(SystemTime::UNIX_EPOCH)
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                files.push((entry.path(), meta.len(), atime));
             }
         }
 
@@ -1682,11 +1682,11 @@ impl ChunksCache {
         let hot_bytes = self.hot_cache.weighted_size();
         let max_bytes = self.config.max_hot_bytes;
         // Convert byte utilization to entry-like scale for the policy
-        let utilization_scaled = if max_bytes > 0 {
-            (hot_bytes * 10000 / max_bytes).min(10000)
-        } else {
-            0
-        };
+        let utilization_scaled = hot_bytes
+            .checked_mul(10000)
+            .and_then(|bytes| bytes.checked_div(max_bytes))
+            .unwrap_or(0)
+            .min(10000);
         trace!(
             "Updating cache utilization: {:.1} MiB / {:.1} MiB hot, disk: {:.1} MiB / {:.1} MiB",
             hot_bytes as f64 / 1048576.0,

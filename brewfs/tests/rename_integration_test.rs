@@ -1,7 +1,7 @@
 //! Comprehensive integration tests for rename functionality
 
-use serial_test::serial;
 use brewfs::{ChunkLayout, InMemoryBlockStore, RenameFlags, VFS, create_meta_store_from_url};
+use serial_test::serial;
 
 #[tokio::test]
 #[serial(rename_integration)]

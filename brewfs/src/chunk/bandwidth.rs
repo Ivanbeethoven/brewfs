@@ -13,21 +13,12 @@ use tracing::{debug, trace};
 type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
 /// Configuration for bandwidth rate limiting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BandwidthConfig {
     /// Maximum upload bandwidth in MiB/s. None = unlimited.
     pub upload_limit_mibps: Option<u64>,
     /// Maximum download bandwidth in MiB/s. None = unlimited.
     pub download_limit_mibps: Option<u64>,
-}
-
-impl Default for BandwidthConfig {
-    fn default() -> Self {
-        Self {
-            upload_limit_mibps: None,
-            download_limit_mibps: None,
-        }
-    }
 }
 
 /// Rate limiter for upload and download bandwidth.
@@ -91,7 +82,7 @@ impl BandwidthLimiter {
     pub async fn acquire_upload(&self, bytes: usize) {
         if let Some(limiter) = &self.upload {
             // Each token represents 64KB
-            let tokens = ((bytes + 65535) / 65536).max(1) as u32;
+            let tokens = bytes.div_ceil(65536).max(1) as u32;
             self.acquire_tokens(limiter, tokens, "upload").await;
         }
     }
@@ -100,7 +91,7 @@ impl BandwidthLimiter {
     /// Blocks until enough tokens are available.
     pub async fn acquire_download(&self, bytes: usize) {
         if let Some(limiter) = &self.download {
-            let tokens = ((bytes + 65535) / 65536).max(1) as u32;
+            let tokens = bytes.div_ceil(65536).max(1) as u32;
             self.acquire_tokens(limiter, tokens, "download").await;
         }
     }
@@ -129,11 +120,13 @@ impl BandwidthLimiter {
     }
 
     /// Check if upload limiting is active
+    #[allow(dead_code)]
     pub fn has_upload_limit(&self) -> bool {
         self.upload.is_some()
     }
 
     /// Check if download limiting is active
+    #[allow(dead_code)]
     pub fn has_download_limit(&self) -> bool {
         self.download.is_some()
     }

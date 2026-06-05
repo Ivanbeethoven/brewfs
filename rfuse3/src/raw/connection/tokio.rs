@@ -9,14 +9,17 @@ use std::fs::File;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::fs::OpenOptions;
 use std::io;
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
-use std::io::{IoSlice, IoSliceMut};
+#[cfg(target_os = "macos")]
+use std::io::IoSlice;
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", feature = "unprivileged")
+))]
+use std::io::IoSliceMut;
 use std::ops::{Deref, DerefMut};
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::os::fd::OwnedFd;
-use std::os::fd::{AsFd, BorrowedFd};
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 #[cfg(any(
     target_os = "macos",
     all(target_os = "linux", feature = "unprivileged")
@@ -42,17 +45,8 @@ use futures_util::{select, FutureExt};
     target_os = "macos"
 ))]
 use nix::sys::socket::{self, AddressFamily, SockFlag, SockType};
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use nix::sys::uio;
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
-use nix::{
-    fcntl::{FcntlArg, OFlag},
-    sys::socket::{ControlMessageOwned, MsgFlags},
-};
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use tokio::io::unix::AsyncFd;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use tokio::io::Interest;
+use nix::sys::socket::{ControlMessageOwned, MsgFlags};
 #[cfg(any(
     all(target_os = "linux", feature = "unprivileged"),
     target_os = "macos"
@@ -153,21 +147,21 @@ impl FuseConnection {
     pub fn new(unmount_notify: Arc<Notify>) -> io::Result<Self> {
         #[cfg(target_os = "freebsd")]
         {
-            let connection = NonBlockFuseConnection::new()?;
+            let connection = BlockingFuseConnection::new()?;
 
             Ok(Self {
                 unmount_notify,
-                mode: ConnectionMode::NonBlock(connection),
+                mode: ConnectionMode::Blocking(connection),
             })
         }
 
         #[cfg(target_os = "linux")]
         {
-            let connection = NonBlockFuseConnection::new()?;
+            let connection = BlockingFuseConnection::new()?;
 
             Ok(Self {
                 unmount_notify,
-                mode: ConnectionMode::NonBlock(connection),
+                mode: ConnectionMode::Blocking(connection),
             })
         }
     }
@@ -179,11 +173,11 @@ impl FuseConnection {
         unmount_notify: Arc<Notify>,
     ) -> io::Result<Self> {
         let connection =
-            NonBlockFuseConnection::new_with_unprivileged(mount_options, mount_path).await?;
+            BlockingFuseConnection::new_with_unprivileged(mount_options, mount_path).await?;
 
         Ok(Self {
             unmount_notify,
-            mode: ConnectionMode::NonBlock(connection),
+            mode: ConnectionMode::Blocking(connection),
         })
     }
 
@@ -209,8 +203,8 @@ impl FuseConnection {
                 #[cfg(target_os = "macos")]
                 ConnectionMode::Block(connection) => ConnectionMode::Block(connection.try_clone()?),
                 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                ConnectionMode::NonBlock(connection) => {
-                    ConnectionMode::NonBlock(connection.try_clone()?)
+                ConnectionMode::Blocking(connection) => {
+                    ConnectionMode::Blocking(connection.try_clone()?)
                 }
             },
         })
@@ -241,7 +235,7 @@ impl FuseConnection {
                 connection.read_vectored(header_buf, data_buf).await
             }
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            ConnectionMode::NonBlock(connection) => {
+            ConnectionMode::Blocking(connection) => {
                 connection.read_vectored(header_buf, data_buf).await
             }
         }
@@ -261,7 +255,7 @@ impl FuseConnection {
                 connection.write_vectored(data, body_extend_data).await
             }
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            ConnectionMode::NonBlock(connection) => {
+            ConnectionMode::Blocking(connection) => {
                 connection.write_vectored(data, body_extend_data).await
             }
         }
@@ -273,7 +267,7 @@ enum ConnectionMode {
     #[cfg(target_os = "macos")]
     Block(BlockFuseConnection),
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    NonBlock(NonBlockFuseConnection),
+    Blocking(BlockingFuseConnection),
 }
 
 #[cfg(target_os = "macos")]
@@ -526,14 +520,14 @@ impl BlockFuseConnection {
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[derive(Debug)]
-struct NonBlockFuseConnection {
-    fd: AsyncFd<OwnedFd>,
+struct BlockingFuseConnection {
+    fd: Arc<OwnedFd>,
     read: Mutex<()>,
     write: Mutex<()>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-impl NonBlockFuseConnection {
+impl BlockingFuseConnection {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn new() -> io::Result<Self> {
         use std::io::ErrorKind;
@@ -541,12 +535,7 @@ impl NonBlockFuseConnection {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         const DEV_FUSE: &str = "/dev/fuse";
 
-        match OpenOptions::new()
-            .write(true)
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(DEV_FUSE)
-        {
+        match OpenOptions::new().write(true).read(true).open(DEV_FUSE) {
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
                     warn!("Cannot open {}.  Is the module loaded?", DEV_FUSE);
@@ -555,7 +544,7 @@ impl NonBlockFuseConnection {
                 Err(e)
             }
             Ok(file) => Ok(Self {
-                fd: AsyncFd::new(file.into())?,
+                fd: Arc::new(file.into()),
                 read: Mutex::new(()),
                 write: Mutex::new(()),
             }),
@@ -635,76 +624,52 @@ impl NonBlockFuseConnection {
         .await
         .unwrap()?;
 
-        Self::set_fd_non_blocking(fd)?;
-
         // Safety: fd is valid
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
         Ok(Self {
-            fd: AsyncFd::new(fd)?,
+            fd: Arc::new(fd),
             read: Mutex::new(()),
             write: Mutex::new(()),
         })
-    }
-
-    #[cfg(all(target_os = "linux", feature = "unprivileged"))]
-    fn set_fd_non_blocking(fd: RawFd) -> io::Result<()> {
-        let flags = nix::fcntl::fcntl(fd, FcntlArg::F_GETFL).map_err(io::Error::from)?;
-        debug!(
-            "set fd {:?} to non-blocking",
-            OFlag::from_bits_truncate(flags)
-        );
-        let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
-
-        debug!("set fd {:?} to non-blocking", flags);
-        nix::fcntl::fcntl(fd, FcntlArg::F_SETFL(flags)).map_err(io::Error::from)?;
-
-        Ok(())
     }
 
     fn try_clone(&self) -> io::Result<Self> {
-        use std::os::fd::{AsRawFd, FromRawFd};
-        let fd = self.fd.as_raw_fd();
-        let new_fd = unsafe { libc::dup(fd) };
-        if new_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let owned_fd = unsafe { OwnedFd::from_raw_fd(new_fd) };
         Ok(Self {
-            fd: AsyncFd::new(owned_fd)?,
+            fd: self.fd.clone(),
             read: Mutex::new(()),
             write: Mutex::new(()),
         })
     }
 
-    async fn read_vectored<T: DerefMut<Target = [u8]> + Send>(
+    async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
         &self,
         mut header_buf: Vec<u8>,
         mut data_buf: T,
     ) -> CompleteIoResult<(Vec<u8>, T), usize> {
         let _guard = self.read.lock().await;
+        let fd = self.fd.clone();
 
-        loop {
-            let mut read_guard = match self.fd.ready(Interest::READABLE | Interest::ERROR).await {
-                Err(err) => return ((header_buf, data_buf), Err(err)),
-                Ok(read_guard) => read_guard,
-            };
-
-            if let Ok(result) = read_guard.try_io(|fd| {
-                uio::readv(
-                    fd,
-                    &mut [
-                        IoSliceMut::new(&mut header_buf),
-                        IoSliceMut::new(&mut data_buf),
-                    ],
-                )
-                .map_err(io::Error::from)
-            }) {
-                return ((header_buf, data_buf), result);
+        tokio::task::spawn_blocking(move || {
+            let mut iov = [
+                libc::iovec {
+                    iov_base: header_buf.as_mut_ptr().cast(),
+                    iov_len: header_buf.len(),
+                },
+                libc::iovec {
+                    iov_base: data_buf.deref_mut().as_mut_ptr().cast(),
+                    iov_len: data_buf.deref().len(),
+                },
+            ];
+            let n = unsafe { libc::readv(fd.as_raw_fd(), iov.as_mut_ptr(), iov.len() as i32) };
+            if n < 0 {
+                ((header_buf, data_buf), Err(io::Error::last_os_error()))
             } else {
-                continue;
+                ((header_buf, data_buf), Ok(n as usize))
             }
-        }
+        })
+        .await
+        .unwrap()
     }
 
     async fn write_vectored<
@@ -716,24 +681,40 @@ impl NonBlockFuseConnection {
         body_extend_data: Option<U>,
     ) -> CompleteIoResult<(T, Option<U>), usize> {
         let _guard = self.write.lock().await;
+        let fd = self.fd.clone();
 
-        let res = {
-            let body_extend_data = body_extend_data.as_deref();
-
-            match body_extend_data {
-                None => uio::writev(&self.fd, &[IoSlice::new(data.deref())]),
-
-                Some(body_extend_data) => uio::writev(
-                    &self.fd,
-                    &[IoSlice::new(data.deref()), IoSlice::new(body_extend_data)],
-                ),
+        tokio::task::spawn_blocking(move || {
+            let body = body_extend_data.as_deref();
+            let n = match body {
+                None => {
+                    let iov = [libc::iovec {
+                        iov_base: data.deref().as_ptr() as *mut libc::c_void,
+                        iov_len: data.deref().len(),
+                    }];
+                    unsafe { libc::writev(fd.as_raw_fd(), iov.as_ptr(), iov.len() as i32) }
+                }
+                Some(body_data) => {
+                    let iov = [
+                        libc::iovec {
+                            iov_base: data.deref().as_ptr() as *mut libc::c_void,
+                            iov_len: data.deref().len(),
+                        },
+                        libc::iovec {
+                            iov_base: body_data.as_ptr() as *mut libc::c_void,
+                            iov_len: body_data.len(),
+                        },
+                    ];
+                    unsafe { libc::writev(fd.as_raw_fd(), iov.as_ptr(), iov.len() as i32) }
+                }
+            };
+            if n < 0 {
+                ((data, body_extend_data), Err(io::Error::last_os_error()))
+            } else {
+                ((data, body_extend_data), Ok(n as usize))
             }
-        };
-
-        match res {
-            Err(err) => ((data, body_extend_data), Err(err.into())),
-            Ok(n) => ((data, body_extend_data), Ok(n)),
-        }
+        })
+        .await
+        .unwrap()
     }
 }
 
@@ -744,7 +725,7 @@ impl AsFd for FuseConnection {
             ConnectionMode::Block(connection) => connection.file.as_fd(),
 
             #[cfg(any(target_os = "linux", target_os = "freebsd",))]
-            ConnectionMode::NonBlock(connection) => connection.fd.as_fd(),
+            ConnectionMode::Blocking(connection) => connection.fd.as_ref().as_fd(),
         }
     }
 }
