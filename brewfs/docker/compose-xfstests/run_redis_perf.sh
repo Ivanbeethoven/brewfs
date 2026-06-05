@@ -29,6 +29,8 @@ usage() {
   --minio                    使用 MinIO 作为对象存储
   --local-fs                 改为使用本地目录作为对象存储
   --s3-writeback             启用 S3 commit-before-upload 写回语义（等价于 BREWFS_WRITEBACK_MODE=commit_before_upload）
+  --writeback-throughput-profile
+                             启用已验证的 S3 writeback 吞吐 profile（12GiB write buffer, 24GiB memory budget, writeback upload concurrency=4）
   --tools "<tool...>"        指定压力工具列表，默认: "fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
   --brewfs-bench           额外运行一次宿主机 cargo bench --bench brewfs_bench
   --bench-args "<args...>"   透传给 cargo bench 之后的 Criterion 参数
@@ -66,6 +68,7 @@ require_value() {
 KEEP=false
 STORAGE_BACKEND="rustfs"  # rustfs | minio | local-fs
 RUN_BREWFS_BENCH=false
+WRITEBACK_THROUGHPUT_PROFILE=false
 PERF_TOOLS_VALUE="fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
 BENCH_ARGS_VALUE=""
 BREWFS_WRITEBACK_MODE_VALUE="${BREWFS_WRITEBACK_MODE:-}"
@@ -85,6 +88,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --s3-writeback)
+            BREWFS_WRITEBACK_MODE_VALUE="commit_before_upload"
+            shift
+            ;;
+        --writeback-throughput-profile)
+            WRITEBACK_THROUGHPUT_PROFILE=true
             BREWFS_WRITEBACK_MODE_VALUE="commit_before_upload"
             shift
             ;;
@@ -121,6 +129,13 @@ if [[ -n "$BREWFS_WRITEBACK_MODE_VALUE" && "$STORAGE_BACKEND" == "local-fs" ]]; 
     exit 1
 fi
 export BREWFS_WRITEBACK_MODE="$BREWFS_WRITEBACK_MODE_VALUE"
+
+if [[ "$WRITEBACK_THROUGHPUT_PROFILE" == true ]]; then
+    export BREWFS_READ_MEMORY_BYTES="${BREWFS_READ_MEMORY_BYTES:-10737418240}"
+    export BREWFS_WRITE_MEMORY_BYTES="${BREWFS_WRITE_MEMORY_BYTES:-12884901888}"
+    export BREWFS_MEMORY_BUDGET_BYTES="${BREWFS_MEMORY_BUDGET_BYTES:-25769803776}"
+    export BREWFS_WRITEBACK_UPLOAD_CONCURRENCY="${BREWFS_WRITEBACK_UPLOAD_CONCURRENCY:-4}"
+fi
 
 mkdir -p "$ARTIFACTS_DIR"
 
