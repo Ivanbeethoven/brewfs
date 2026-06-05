@@ -188,6 +188,7 @@ EOF
             || -n "${BREWFS_PREFETCH_CONCURRENCY:-}" \
             || -n "${BREWFS_MEMORY_BUDGET_BYTES:-}" \
             || -n "${BREWFS_COMPRESSION:-}" \
+            || -n "${BREWFS_WRITEBACK_PERSIST_SYNC:-}" \
             || -n "${BREWFS_UPLOAD_LIMIT_MIBPS:-}" \
             || -n "${BREWFS_DOWNLOAD_LIMIT_MIBPS:-}" \
             || -n "$writeback_mode" ]]; then
@@ -205,6 +206,7 @@ EOF
             [[ -n "${BREWFS_PREFETCH_CONCURRENCY:-}" ]] && echo "  prefetch_concurrency: ${BREWFS_PREFETCH_CONCURRENCY}"
             [[ -n "${BREWFS_MEMORY_BUDGET_BYTES:-}" ]] && echo "  memory_budget_bytes: ${BREWFS_MEMORY_BUDGET_BYTES}"
             [[ -n "${BREWFS_COMPRESSION:-}" ]] && echo "  compression: ${comp}"
+            [[ -n "${BREWFS_WRITEBACK_PERSIST_SYNC:-}" ]] && echo "  writeback_persist_sync: ${BREWFS_WRITEBACK_PERSIST_SYNC}"
             if [[ -n "$writeback_mode" ]]; then
                 echo "  writeback_mode: ${writeback_mode}"
             fi

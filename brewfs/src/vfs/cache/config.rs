@@ -52,6 +52,7 @@ pub struct CacheConfig {
 
     // Disk safety
     pub min_free_disk_bytes: u64,
+    pub writeback_persist_sync: bool,
 
     // Compression
     pub compression: Compression,
@@ -83,6 +84,7 @@ impl Default for CacheConfig {
             strict_posix: true,
             writeback_mode: WriteBackMode::UploadBeforeCommit,
             min_free_disk_bytes: 1024 * 1024 * 1024,
+            writeback_persist_sync: true,
             compression: Compression::Lz4,
             bandwidth: BandwidthConfig::default(),
             // Default: read/write soft buffers plus headroom for transient overlap.
@@ -111,5 +113,6 @@ mod tests {
         assert_eq!(config.write_memory_bytes, 300 * 1024 * 1024);
         assert_eq!(config.dirty_slice_target_size, 32 * 1024 * 1024);
         assert_eq!(config.prefetch_max_bytes, 64 * 1024 * 1024);
+        assert!(config.writeback_persist_sync);
     }
 }

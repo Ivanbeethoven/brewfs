@@ -50,6 +50,9 @@ Recent accepted writeback profile evidence:
 | `perf-run-1780677697-6276` | lower-backlog full-matrix candidate profile | `fio-seqwrite = 107.75 MiB/s`, `fio-randread = 1775.16 MiB/s`, follow-on prefill completed |
 | `perf-run-1780678311-20354` | new default profile, write/read/randrw/metaperf gate | `fio-seqwrite = 108.26 MiB/s`, `fio-randread = 2104.11 MiB/s`, `fio-randrw = 129.04/59.47 MiB/s`, `metaperf pass` |
 | `perf-run-1780678962-2388` | new default profile, remaining fio and non-fio gates | `fio-bigwrite = 415.25 MiB/s`, `fio-bigread = 4196.72 MiB/s`, `fio-seqread = 1572.72 MiB/s`, `fio-randwrite = 123.79 MiB/s`, `dirstress/dirperf/looptest pass` |
+| `perf-run-1780680852-8870` | pure metadata metaperf, `PERF_METAPERF_FILE_SIZE=0` | `create = 5347.64 ops/s`; proves BrewFS pure create metadata is not the bottleneck |
+| `perf-run-1780682166-14826` | metaperf default `-s 4096` with writeback persist sync disabled in throughput profile | `create = 766.04 ops/s`, up from `249.13 ops/s` in the comparable small-file baseline and above JuiceFS `704.41 ops/s`; open/stat/readdir/rename stayed stable |
+| `perf-run-1780682653-28693` | hot `fio-randread fio-randrw` smoke with the same throughput profile | `fio-randrw = 179.56/80.43 MiB/s`, p99 `109.58/24.25 ms`, cache hit `99.1%`; no mixed-workload regression versus `129.04/59.47 MiB/s` baseline |
 
 Latest partial BrewFS all-fio sample:
 
@@ -73,6 +76,7 @@ Conclusion from evidence:
 - The old high-backlog writeback profile can make isolated `fio-seqwrite` strong, but it is not acceptable as a full-suite default because committed-but-not-uploaded bytes can accumulate past 17GiB and stall later read-prefill workloads.
 - The current default writeback throughput profile is intentionally lower-backlog: 4GiB read/write buffers, 12GiB memory budget, S3/upload concurrency 16, and pending soft/hard 4GiB/6GiB.
 - `fio-randrw` must be treated as a first-class gate because earlier rejected writeback experiments caused hangs or severe mixed-workload instability.
+- `metaperf` default `-s 4096` is not pure metadata. It measures create plus a 4KiB write and close, so low `create` throughput can be a writeback staging problem. Use `PERF_METAPERF_FILE_SIZE=0` to isolate pure metadata create.
 - The next optimization should focus on metadata cache and read-cache scheduling, then re-check all writes and mixed workloads.
 
 ## Workload Matrix
@@ -108,6 +112,8 @@ Non-fio gates:
 ## Cache-Aware Read/Write Validation
 
 The default fio profiles are useful, but they do not fully describe cold object-store performance. They run through FUSE buffered I/O by default, prefill the same dataset before read tests, and use data sizes that can be smaller than the host/container page-cache budget. These numbers should be interpreted as application-visible hot-path throughput, not as pure S3/object-path throughput.
+
+For mixed workloads, compare only runs with the same warmup sequence. `fio-randrw` is especially sensitive to whether `fio-randread` ran first and warmed BrewFS/Linux caches. In `perf-run-1780682400-14830`, a short `fio-seqwrite fio-randrw` smoke reached only `58.81/27.72 MiB/s` with cache hit `53.4%`; the comparable hot-path smoke `fio-randread fio-randrw` in `perf-run-1780682653-28693` reached `179.56/80.43 MiB/s` with cache hit `99.1%`.
 
 Every accepted performance change must therefore be checked in three layers:
 

@@ -60,13 +60,19 @@ pub trait WriteBackCache: Send + Sync {
 pub struct FsWriteBackCache {
     root: PathBuf,
     seq: AtomicU64,
+    sync_on_persist: bool,
 }
 
 impl FsWriteBackCache {
     pub fn new(root: PathBuf) -> Self {
+        Self::new_with_sync(root, true)
+    }
+
+    pub fn new_with_sync(root: PathBuf, sync_on_persist: bool) -> Self {
         Self {
             root,
             seq: AtomicU64::new(0),
+            sync_on_persist,
         }
     }
 
@@ -113,14 +119,18 @@ impl WriteBackCache for FsWriteBackCache {
             total_len += chunk.len() as u64;
         }
         file.flush().await?;
-        file.sync_all().await?;
+        if self.sync_on_persist {
+            file.sync_all().await?;
+        }
         drop(file);
 
         fs::rename(&tmp_path, &slice_path).await?;
 
-        // fsync parent directory to ensure the rename is durable.
-        let dir_fd = fs::File::open(&dir).await?;
-        dir_fd.sync_all().await?;
+        if self.sync_on_persist {
+            // fsync parent directory to ensure the rename is durable.
+            let dir_fd = fs::File::open(&dir).await?;
+            dir_fd.sync_all().await?;
+        }
 
         let record = DirtySliceRecord {
             key,
@@ -271,5 +281,33 @@ impl FsWriteBackCache {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unsynced_persist_still_writes_slice_and_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), false);
+        let key = DirtySliceKey {
+            ino: 7,
+            chunk_id: 11,
+            local_seq: 13,
+            epoch: 0,
+        };
+
+        let path = cache
+            .persist_slice(key, vec![Bytes::from_static(b"small")], 0)
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"small");
+        let records = cache.recover().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key, key);
+        assert_eq!(records[0].state, DirtySliceState::Sealed);
     }
 }

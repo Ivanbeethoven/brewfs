@@ -252,6 +252,7 @@ pub struct CacheFileConfig {
     pub compression: Option<String>,
     pub zstd_level: Option<i32>,
     pub writeback_mode: Option<String>,
+    pub writeback_persist_sync: Option<bool>,
     pub bandwidth: Option<BandwidthFileConfig>,
 }
 
@@ -439,6 +440,9 @@ impl CacheFileConfig {
         }
         if let Some(writeback_mode) = self.writeback_mode {
             cache.writeback_mode = parse_writeback_mode(&writeback_mode)?;
+        }
+        if let Some(writeback_persist_sync) = self.writeback_persist_sync {
+            cache.writeback_persist_sync = writeback_persist_sync;
         }
         if let Some(bandwidth) = self.bandwidth {
             cache.bandwidth = BandwidthConfig {
@@ -663,6 +667,7 @@ cache:
   compression: zstd
   zstd_level: 5
   writeback_mode: upload_before_commit
+  writeback_persist_sync: false
   bandwidth:
     upload_limit_mibps: 10
     download_limit_mibps: 20
@@ -689,6 +694,7 @@ cache:
             config.cache.writeback_mode,
             WriteBackMode::UploadBeforeCommit
         );
+        assert!(!config.cache.writeback_persist_sync);
         assert_eq!(config.cache.bandwidth.upload_limit_mibps, Some(10));
         assert_eq!(config.cache.bandwidth.download_limit_mibps, Some(20));
     }

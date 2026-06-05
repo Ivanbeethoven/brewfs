@@ -337,9 +337,12 @@ where
         let write_back = {
             let cache_root = config.cache.cache_root.join("writeback");
             let _ = std::fs::create_dir_all(&cache_root);
-            let wb = Arc::new(crate::vfs::cache::write_back::FsWriteBackCache::new(
-                cache_root,
-            ));
+            let wb = Arc::new(
+                crate::vfs::cache::write_back::FsWriteBackCache::new_with_sync(
+                    cache_root,
+                    config.cache.writeback_persist_sync,
+                ),
+            );
 
             // Crash recovery: scan for dirty slices from a previous session.
             // Skip in test builds to avoid cross-test contamination from
