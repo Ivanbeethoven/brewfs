@@ -75,6 +75,34 @@ const WRITE_MAX_WAIT: Duration = Duration::from_secs(30);
 /// NOTE: This is the fallback; prefer config.freeze_min_bytes when available.
 const SHOULD_FREEZE_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
+enum WritebackBackpressureDecision {
+    Allow,
+    SoftYield,
+    Wait,
+}
+
+fn decide_writeback_backpressure(
+    pending: u64,
+    incoming: u64,
+    soft_limit: u64,
+    hard_limit: u64,
+) -> WritebackBackpressureDecision {
+    if soft_limit == 0 {
+        return WritebackBackpressureDecision::Allow;
+    }
+
+    let projected = pending.saturating_add(incoming);
+    if projected <= soft_limit {
+        return WritebackBackpressureDecision::Allow;
+    }
+
+    if hard_limit > soft_limit && projected <= hard_limit {
+        return WritebackBackpressureDecision::SoftYield;
+    }
+
+    WritebackBackpressureDecision::Wait
+}
+
 fn truncate_flush_deadline() -> Duration {
     std::env::var("BREWFS_TRUNCATE_FLUSH_TIMEOUT_SECS")
         .ok()
@@ -1229,8 +1257,7 @@ where
 
         let soft = self.shared.config.writeback_recent_pending_soft_limit;
         let hard = self.shared.config.writeback_recent_pending_hard_limit;
-        let limit = if hard > 0 { hard } else { soft };
-        if limit == 0 {
+        if soft == 0 {
             return Ok(());
         }
 
@@ -1242,10 +1269,16 @@ where
                 .recent_pending_upload
                 .bytes
                 .load(Ordering::Acquire);
-            if pending.saturating_add(incoming) <= limit {
-                return Ok(());
+            match decide_writeback_backpressure(pending, incoming, soft, hard) {
+                WritebackBackpressureDecision::Allow => return Ok(()),
+                WritebackBackpressureDecision::SoftYield => {
+                    tokio::task::yield_now().await;
+                    return Ok(());
+                }
+                WritebackBackpressureDecision::Wait => {
+                    self.shared.recent_pending_upload.notify.notified().await;
+                }
             }
-            self.shared.recent_pending_upload.notify.notified().await;
         }
     }
 
@@ -3030,6 +3063,25 @@ mod tests {
 
     fn test_config(layout: ChunkLayout) -> Arc<WriteConfig> {
         test_config_with_writeback(layout, WriteBackMode::UploadBeforeCommit)
+    }
+
+    #[test]
+    fn test_writeback_backpressure_decision_uses_soft_yield_before_hard_wait() {
+        let soft = 12 * 1024;
+        let hard = 16 * 1024;
+
+        assert!(matches!(
+            decide_writeback_backpressure(soft - 512, 256, soft, hard),
+            WritebackBackpressureDecision::Allow
+        ));
+        assert!(matches!(
+            decide_writeback_backpressure(soft, 512, soft, hard),
+            WritebackBackpressureDecision::SoftYield
+        ));
+        assert!(matches!(
+            decide_writeback_backpressure(hard, 512, soft, hard),
+            WritebackBackpressureDecision::Wait
+        ));
     }
 
     fn blocks_len(data: &[(usize, Vec<Bytes>)]) -> usize {
