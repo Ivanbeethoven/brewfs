@@ -448,6 +448,119 @@ stats_snapshot_after_tool() {
     } >"$artifact_dir/diagnostics/stats-${tool}-after.txt" 2>&1 || true
 }
 
+brewfs_stat_value() {
+    local metric="$1"
+    local stats_path="$mount_dir/.stats"
+    [[ -e "$stats_path" ]] || return 1
+
+    tr -d '\000' <"$stats_path" | awk -v metric="$metric" '
+        $1 == metric {
+            print $2
+            found = 1
+            exit
+        }
+        END {
+            if (!found) {
+                exit 1
+            }
+        }
+    '
+}
+
+numeric_stat_or_zero() {
+    local metric="$1"
+    local value
+    value="$(brewfs_stat_value "$metric" 2>/dev/null || true)"
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$value"
+    else
+        printf '0'
+    fi
+}
+
+max_u64() {
+    local lhs="$1"
+    local rhs="$2"
+    if (( lhs >= rhs )); then
+        printf '%s' "$lhs"
+    else
+        printf '%s' "$rhs"
+    fi
+}
+
+wait_for_fio_prefill_drain() {
+    local tool="$1"
+    local timeout="${PERF_FIO_PREFILL_DRAIN_TIMEOUT_SECS:-600}"
+    local interval="${PERF_FIO_PREFILL_DRAIN_INTERVAL_SECS:-2}"
+    local threshold="${PERF_FIO_PREFILL_DRAIN_PENDING_BYTES:-0}"
+    local start now elapsed pending dirty buffer_dirty drain_bytes put_bytes uploaded
+
+    info "等待 fio 预填充写回完成: $tool (threshold=${threshold} bytes, timeout=${timeout}s)"
+    start="$(date +%s)"
+
+    while true; do
+        pending="$(numeric_stat_or_zero brewfs_writeback_recent_pending_upload_bytes)"
+        dirty="$(numeric_stat_or_zero brewfs_writeback_dirty_bytes)"
+        buffer_dirty="$(numeric_stat_or_zero brewfs_buffer_dirty_bytes)"
+        put_bytes="$(numeric_stat_or_zero brewfs_s3_put_bytes_total)"
+        uploaded="$(numeric_stat_or_zero brewfs_writeback_recent_uploaded_bytes)"
+        drain_bytes="$(max_u64 "$pending" "$dirty")"
+        drain_bytes="$(max_u64 "$drain_bytes" "$buffer_dirty")"
+
+        now="$(date +%s)"
+        elapsed="$((now - start))"
+
+        if (( drain_bytes <= threshold )); then
+            ok "fio 预填充写回已完成: $tool (pending=$pending dirty=$dirty buffer_dirty=$buffer_dirty put_bytes=$put_bytes uploaded=$uploaded elapsed=${elapsed}s)"
+            stats_snapshot_after_tool "${tool}-prefill-drained"
+            return 0
+        fi
+
+        if (( elapsed >= timeout )); then
+            err "fio 预填充写回等待超时: $tool (pending=$pending dirty=$dirty buffer_dirty=$buffer_dirty put_bytes=$put_bytes uploaded=$uploaded elapsed=${elapsed}s)"
+            stats_snapshot_after_tool "${tool}-prefill-drain-timeout"
+            return 1
+        fi
+
+        if (( elapsed % 10 == 0 )); then
+            info "  写回等待中: pending=$pending dirty=$dirty buffer_dirty=$buffer_dirty put_bytes=$put_bytes uploaded=$uploaded elapsed=${elapsed}s"
+        fi
+        sleep "$interval"
+    done
+}
+
+drop_kernel_page_cache_if_requested() {
+    if truthy_env "${PERF_FIO_DROP_CACHES:-false}" || truthy_env "${PERF_FIO_COLD_READ_DROP_CACHES:-false}"; then
+        info "请求 drop_caches 以降低页缓存影响"
+        sync || true
+        if ! sh -c 'echo 3 > /proc/sys/vm/drop_caches' >/dev/null 2>&1; then
+            err "drop_caches 失败；继续测试，但结果可能仍受页缓存影响"
+        fi
+    fi
+}
+
+clear_brewfs_cache_root_if_requested() {
+    if truthy_env "${PERF_FIO_COLD_READ:-false}" || truthy_env "${PERF_FIO_COLD_READ_CLEAR_CACHE:-false}"; then
+        local root="${BREWFS_CACHE_ROOT:-${XDG_CACHE_HOME:-/root/.cache}/brewfs}"
+        if [[ -n "$root" && "$root" == /* && "$root" != "/" ]]; then
+            info "清理 BrewFS 本地 cache root: $root"
+            rm -rf -- "$root"
+        else
+            err "跳过 BrewFS cache root 清理，路径不安全: ${root:-<empty>}"
+        fi
+    fi
+}
+
+remount_brewfs_for_fio_profile() {
+    local tool="$1"
+
+    info "为 fio cold-read 重挂载 BrewFS: $tool"
+    cleanup
+    clear_brewfs_cache_root_if_requested
+    drop_kernel_page_cache_if_requested
+    mount_brewfs
+}
+
 mount_brewfs() {
     mkdir -p "$mount_dir"
     if findmnt -rn --target "$mount_dir" --output FSTYPE 2>/dev/null | grep -Eq '^fuse(\.|$)'; then
@@ -925,6 +1038,13 @@ run_fio_profile() {
 
     if [[ "$needs_prefill" == true ]]; then
         prepare_fio_dataset "$tool" "$work_dir" "$name" "$size" "$direct" "$numjobs" "$bs" "$ioengine" "$iodepth" || return $?
+        stats_snapshot_after_tool "${tool}-prefill"
+        if truthy_env "${PERF_FIO_COLD_READ:-false}" || truthy_env "${PERF_FIO_PREFILL_DRAIN:-false}"; then
+            wait_for_fio_prefill_drain "$tool" || return $?
+        fi
+        if truthy_env "${PERF_FIO_COLD_READ:-false}" || truthy_env "${PERF_FIO_PREFILL_REMOUNT:-false}"; then
+            remount_brewfs_for_fio_profile "$tool" || return $?
+        fi
     fi
 
     # Collect per-second latency logs for time-series analysis
