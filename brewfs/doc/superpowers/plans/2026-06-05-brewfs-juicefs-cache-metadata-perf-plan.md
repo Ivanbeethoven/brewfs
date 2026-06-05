@@ -46,6 +46,10 @@ Recent accepted writeback profile evidence:
 | `perf-run-1780666039-10304` | explicit writeback throughput profile | `fio-seqwrite = 1531.14 MiB/s`, write p99 `9.50 ms` |
 | `perf-run-1780666168-636` | committed default writeback throughput profile | `fio-seqwrite = 1496.05 MiB/s`, write p99 `10.03 ms` |
 | `perf-run-1780665906-14234` | same batch without the new admission gate | `fio-seqwrite = 1346.13 MiB/s`, write p99 `10.81 ms` |
+| `perf-run-1780676297-22029` | old high-backlog profile in full matrix | `fio-seqwrite = 138.67 MiB/s`, then `fio-randread` prefill stalled with ~19GiB pending upload |
+| `perf-run-1780677697-6276` | lower-backlog full-matrix candidate profile | `fio-seqwrite = 107.75 MiB/s`, `fio-randread = 1775.16 MiB/s`, follow-on prefill completed |
+| `perf-run-1780678311-20354` | new default profile, write/read/randrw/metaperf gate | `fio-seqwrite = 108.26 MiB/s`, `fio-randread = 2104.11 MiB/s`, `fio-randrw = 129.04/59.47 MiB/s`, `metaperf pass` |
+| `perf-run-1780678962-2388` | new default profile, remaining fio and non-fio gates | `fio-bigwrite = 415.25 MiB/s`, `fio-bigread = 4196.72 MiB/s`, `fio-seqread = 1572.72 MiB/s`, `fio-randwrite = 123.79 MiB/s`, `dirstress/dirperf/looptest pass` |
 
 Latest partial BrewFS all-fio sample:
 
@@ -66,7 +70,8 @@ Partial sample fio numbers:
 
 Conclusion from evidence:
 
-- The writeback throughput profile can make `fio-seqwrite` strong, but default full-suite behavior still needs a fresh, complete profile run.
+- The old high-backlog writeback profile can make isolated `fio-seqwrite` strong, but it is not acceptable as a full-suite default because committed-but-not-uploaded bytes can accumulate past 17GiB and stall later read-prefill workloads.
+- The current default writeback throughput profile is intentionally lower-backlog: 4GiB read/write buffers, 12GiB memory budget, S3/upload concurrency 16, and pending soft/hard 4GiB/6GiB.
 - `fio-randrw` must be treated as a first-class gate because earlier rejected writeback experiments caused hangs or severe mixed-workload instability.
 - The next optimization should focus on metadata cache and read-cache scheduling, then re-check all writes and mixed workloads.
 

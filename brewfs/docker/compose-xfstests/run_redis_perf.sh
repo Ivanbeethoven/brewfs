@@ -30,7 +30,7 @@ usage() {
   --local-fs                 改为使用本地目录作为对象存储
   --s3-writeback             启用 S3 commit-before-upload 写回语义（等价于 BREWFS_WRITEBACK_MODE=commit_before_upload）
   --writeback-throughput-profile
-                             启用已验证的 S3 writeback 吞吐 profile（12GiB write buffer, 24GiB memory budget, S3 max concurrency=16, writeback upload concurrency=12, pending soft/hard=14GiB/16GiB）
+                             启用已验证的 S3 writeback 全场景吞吐 profile（4GiB read/write buffer, 12GiB memory budget, S3 max concurrency=16, writeback upload concurrency=16, pending soft/hard=4GiB/6GiB）
   --tools "<tool...>"        指定压力工具列表，默认: "fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
   --brewfs-bench           额外运行一次宿主机 cargo bench --bench brewfs_bench
   --bench-args "<args...>"   透传给 cargo bench 之后的 Criterion 参数
@@ -136,13 +136,13 @@ fi
 export BREWFS_WRITEBACK_MODE="$BREWFS_WRITEBACK_MODE_VALUE"
 
 if [[ "$WRITEBACK_THROUGHPUT_PROFILE" == true ]]; then
-    export BREWFS_READ_MEMORY_BYTES="${BREWFS_READ_MEMORY_BYTES:-10737418240}"
-    export BREWFS_WRITE_MEMORY_BYTES="${BREWFS_WRITE_MEMORY_BYTES:-12884901888}"
-    export BREWFS_MEMORY_BUDGET_BYTES="${BREWFS_MEMORY_BUDGET_BYTES:-25769803776}"
+    export BREWFS_READ_MEMORY_BYTES="${BREWFS_READ_MEMORY_BYTES:-4294967296}"
+    export BREWFS_WRITE_MEMORY_BYTES="${BREWFS_WRITE_MEMORY_BYTES:-4294967296}"
+    export BREWFS_MEMORY_BUDGET_BYTES="${BREWFS_MEMORY_BUDGET_BYTES:-12884901888}"
     export BREWFS_S3_MAX_CONCURRENCY="${BREWFS_S3_MAX_CONCURRENCY:-16}"
-    export BREWFS_WRITEBACK_UPLOAD_CONCURRENCY="${BREWFS_WRITEBACK_UPLOAD_CONCURRENCY:-12}"
-    export BREWFS_WRITEBACK_RECENT_PENDING_SOFT_BYTES="${BREWFS_WRITEBACK_RECENT_PENDING_SOFT_BYTES:-15032385536}"
-    export BREWFS_WRITEBACK_RECENT_PENDING_HARD_BYTES="${BREWFS_WRITEBACK_RECENT_PENDING_HARD_BYTES:-17179869184}"
+    export BREWFS_WRITEBACK_UPLOAD_CONCURRENCY="${BREWFS_WRITEBACK_UPLOAD_CONCURRENCY:-16}"
+    export BREWFS_WRITEBACK_RECENT_PENDING_SOFT_BYTES="${BREWFS_WRITEBACK_RECENT_PENDING_SOFT_BYTES:-4294967296}"
+    export BREWFS_WRITEBACK_RECENT_PENDING_HARD_BYTES="${BREWFS_WRITEBACK_RECENT_PENDING_HARD_BYTES:-6442450944}"
 fi
 
 mkdir -p "$ARTIFACTS_DIR"
