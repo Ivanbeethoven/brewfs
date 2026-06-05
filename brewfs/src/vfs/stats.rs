@@ -69,6 +69,8 @@ pub struct FsStatsSnapshot {
     pub s3_put_ops: u64,
     pub s3_put_bytes: u64,
     pub s3_put_lat_us: u64,
+    pub s3_put_prepare_lat_us: u64,
+    pub s3_put_cache_lat_us: u64,
     pub s3_del_ops: u64,
     pub buf_dirty_bytes: u64,
     pub buf_read_bytes: u64,
@@ -103,6 +105,14 @@ impl FsStatsSnapshot {
 
     pub fn avg_s3_put_lat_us(&self) -> f64 {
         ratio(self.s3_put_lat_us, self.s3_put_ops)
+    }
+
+    pub fn avg_s3_put_prepare_lat_us(&self) -> f64 {
+        ratio(self.s3_put_prepare_lat_us, self.s3_put_ops)
+    }
+
+    pub fn avg_s3_put_cache_lat_us(&self) -> f64 {
+        ratio(self.s3_put_cache_lat_us, self.s3_put_ops)
     }
 }
 
@@ -226,6 +236,10 @@ pub struct FsStats {
     pub s3_put_bytes: AtomicU64,
     /// Total S3 PUT latency in microseconds
     pub s3_put_lat_us: AtomicU64,
+    /// Total block preparation latency before S3 PUT in microseconds
+    pub s3_put_prepare_lat_us: AtomicU64,
+    /// Total write-cache population latency after S3 PUT in microseconds
+    pub s3_put_cache_lat_us: AtomicU64,
     /// Total S3 DELETE requests
     pub s3_del_ops: AtomicU64,
 
@@ -294,6 +308,8 @@ impl FsStats {
             s3_put_ops: AtomicU64::new(0),
             s3_put_bytes: AtomicU64::new(0),
             s3_put_lat_us: AtomicU64::new(0),
+            s3_put_prepare_lat_us: AtomicU64::new(0),
+            s3_put_cache_lat_us: AtomicU64::new(0),
             s3_del_ops: AtomicU64::new(0),
             buf_dirty_bytes: AtomicU64::new(0),
             buf_read_bytes: AtomicU64::new(0),
@@ -355,6 +371,8 @@ impl FsStats {
             s3_put_ops: self.s3_put_ops.load(ORD),
             s3_put_bytes: self.s3_put_bytes.load(ORD),
             s3_put_lat_us: self.s3_put_lat_us.load(ORD),
+            s3_put_prepare_lat_us: self.s3_put_prepare_lat_us.load(ORD),
+            s3_put_cache_lat_us: self.s3_put_cache_lat_us.load(ORD),
             s3_del_ops: self.s3_del_ops.load(ORD),
             buf_dirty_bytes: self.buf_dirty_bytes.load(ORD),
             buf_read_bytes: self.buf_read_bytes.load(ORD),
@@ -381,6 +399,8 @@ impl FsStats {
         put_ops: u64,
         put_bytes: u64,
         put_lat_us: u64,
+        put_prepare_lat_us: u64,
+        put_cache_lat_us: u64,
         del_ops: u64,
     ) {
         self.s3_get_ops.store(get_ops, ORD);
@@ -389,6 +409,8 @@ impl FsStats {
         self.s3_put_ops.store(put_ops, ORD);
         self.s3_put_bytes.store(put_bytes, ORD);
         self.s3_put_lat_us.store(put_lat_us, ORD);
+        self.s3_put_prepare_lat_us.store(put_prepare_lat_us, ORD);
+        self.s3_put_cache_lat_us.store(put_cache_lat_us, ORD);
         self.s3_del_ops.store(del_ops, ORD);
     }
 
@@ -624,6 +646,14 @@ impl FsStats {
             self.s3_put_lat_us.load(ORD)
         ));
         out.push_str(&format!(
+            "brewfs_s3_put_prepare_lat_us_total {}\n",
+            self.s3_put_prepare_lat_us.load(ORD)
+        ));
+        out.push_str(&format!(
+            "brewfs_s3_put_cache_lat_us_total {}\n",
+            self.s3_put_cache_lat_us.load(ORD)
+        ));
+        out.push_str(&format!(
             "brewfs_s3_del_ops_total {}\n",
             self.s3_del_ops.load(ORD)
         ));
@@ -634,6 +664,14 @@ impl FsStats {
         out.push_str(&format!(
             "brewfs_s3_put_avg_lat_us {:.6}\n",
             snapshot.avg_s3_put_lat_us()
+        ));
+        out.push_str(&format!(
+            "brewfs_s3_put_prepare_avg_lat_us {:.6}\n",
+            snapshot.avg_s3_put_prepare_lat_us()
+        ));
+        out.push_str(&format!(
+            "brewfs_s3_put_cache_avg_lat_us {:.6}\n",
+            snapshot.avg_s3_put_cache_lat_us()
         ));
 
         // Buffer/cache
@@ -773,6 +811,8 @@ mod tests {
         stats.fuse_read_lat_us.store(840, ORD);
         stats.s3_put_ops.store(10, ORD);
         stats.s3_put_lat_us.store(250, ORD);
+        stats.s3_put_prepare_lat_us.store(500, ORD);
+        stats.s3_put_cache_lat_us.store(100, ORD);
         stats.sync_cache_counters(8, 2);
         stats.sync_buffer_bytes(4096, 8192);
 
@@ -782,6 +822,8 @@ mod tests {
         assert!(output.contains("brewfs_fuse_read_avg_lat_us 20.000000"));
         assert!(output.contains("brewfs_s3_put_ops_total 10"));
         assert!(output.contains("brewfs_s3_put_avg_lat_us 25.000000"));
+        assert!(output.contains("brewfs_s3_put_prepare_avg_lat_us 50.000000"));
+        assert!(output.contains("brewfs_s3_put_cache_avg_lat_us 10.000000"));
         assert!(output.contains("brewfs_uptime_seconds"));
         assert!(output.contains("brewfs_cache_hits_total 8"));
         assert!(output.contains("brewfs_cache_misses_total 2"));
@@ -809,7 +851,7 @@ mod tests {
         stats.fuse_write_ops.store(4, ORD);
         stats.fuse_write_lat_us.store(1000, ORD);
         stats.sync_cache_counters(3, 1);
-        stats.sync_object_store_metrics(2, 8192, 50, 1, 4096, 25, 3);
+        stats.sync_object_store_metrics(2, 8192, 50, 1, 4096, 25, 75, 125, 3);
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.cache_requests(), 4);
@@ -821,6 +863,8 @@ mod tests {
         assert_eq!(snapshot.s3_put_ops, 1);
         assert_eq!(snapshot.s3_put_bytes, 4096);
         assert_eq!(snapshot.avg_s3_put_lat_us(), 25.0);
+        assert_eq!(snapshot.avg_s3_put_prepare_lat_us(), 75.0);
+        assert_eq!(snapshot.avg_s3_put_cache_lat_us(), 125.0);
         assert_eq!(snapshot.s3_del_ops, 3);
     }
 

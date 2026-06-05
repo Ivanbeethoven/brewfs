@@ -99,6 +99,8 @@ pub struct ObjectStoreStatsSnapshot {
     pub put_ops: u64,
     pub put_bytes: u64,
     pub put_lat_us: u64,
+    pub put_prepare_lat_us: u64,
+    pub put_cache_lat_us: u64,
     pub del_ops: u64,
 }
 
@@ -110,6 +112,8 @@ pub struct ObjectStoreMetrics {
     put_ops: AtomicU64,
     put_bytes: AtomicU64,
     put_lat_us: AtomicU64,
+    put_prepare_lat_us: AtomicU64,
+    put_cache_lat_us: AtomicU64,
     del_ops: AtomicU64,
 }
 
@@ -122,6 +126,8 @@ impl ObjectStoreMetrics {
             put_ops: self.put_ops.load(Ordering::Relaxed),
             put_bytes: self.put_bytes.load(Ordering::Relaxed),
             put_lat_us: self.put_lat_us.load(Ordering::Relaxed),
+            put_prepare_lat_us: self.put_prepare_lat_us.load(Ordering::Relaxed),
+            put_cache_lat_us: self.put_cache_lat_us.load(Ordering::Relaxed),
             del_ops: self.del_ops.load(Ordering::Relaxed),
         }
     }
@@ -137,6 +143,16 @@ impl ObjectStoreMetrics {
         self.put_ops.fetch_add(1, Ordering::Relaxed);
         self.put_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.put_lat_us
+            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    fn record_put_prepare(&self, duration: Duration) {
+        self.put_prepare_lat_us
+            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    fn record_put_cache(&self, duration: Duration) {
+        self.put_cache_lat_us
             .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
     }
 
@@ -505,15 +521,14 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
     }
 }
 
-#[async_trait]
-impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B> {
-    #[tracing::instrument(name = "ObjectBlockStore.write_fresh_vectored", level = "trace", skip(self, chunks), fields(key = ?key, offset, chunk_count = chunks.len()))]
-    async fn write_fresh_vectored(
+impl<B: ObjectBackend + Send + Sync + 'static> ObjectBlockStore<B> {
+    async fn write_fresh_vectored_inner(
         &self,
         key: BlockKey,
         offset: u64,
         chunks: Vec<Bytes>,
     ) -> anyhow::Result<u64> {
+        let prepare_started = Instant::now();
         let key_str = Self::key_for(key);
         let total_len = chunks.iter().map(|c| c.len()).sum::<usize>();
         if total_len == 0 {
@@ -544,6 +559,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         // Rate limit upload bandwidth
         self.bandwidth.acquire_upload(upload_bytes.len()).await;
         let upload_len = upload_bytes.len() as u64;
+        self.object_metrics
+            .record_put_prepare(prepare_started.elapsed());
         let started = Instant::now();
         self.client
             .put_object_vectored(&key_str, vec![upload_bytes])
@@ -552,10 +569,26 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         self.object_metrics
             .record_put(upload_len, started.elapsed());
 
+        let cache_started = Instant::now();
         self.populate_write_cache_after_upload(key_str, full_block)
             .await;
+        self.object_metrics
+            .record_put_cache(cache_started.elapsed());
 
         Ok(total_len as u64)
+    }
+}
+
+#[async_trait]
+impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B> {
+    #[tracing::instrument(name = "ObjectBlockStore.write_fresh_vectored", level = "trace", skip(self, chunks), fields(key = ?key, offset, chunk_count = chunks.len()))]
+    async fn write_fresh_vectored(
+        &self,
+        key: BlockKey,
+        offset: u64,
+        chunks: Vec<Bytes>,
+    ) -> anyhow::Result<u64> {
+        self.write_fresh_vectored_inner(key, offset, chunks).await
     }
 
     async fn write_fresh_range(
@@ -564,47 +597,10 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         offset: u64,
         data: &[u8],
     ) -> anyhow::Result<u64> {
-        let key_str = Self::key_for(key);
-        if data.is_empty() {
-            return Ok(0);
-        }
-
-        let offset_usize = offset.as_usize();
-        let mut parts = Vec::new();
-        if offset_usize > 0 {
-            parts.extend(make_zero_bytes(offset_usize));
-        }
-        parts.push(Bytes::copy_from_slice(data));
-
-        // Assemble full block (uncompressed) for cache.
-        let full_block = Bytes::from(
-            parts
-                .iter()
-                .flat_map(|b| b.iter().copied())
-                .collect::<Vec<_>>(),
-        );
-
-        // Compress for S3 upload (Cow avoids copy when incompressible)
-        let compressed = compress(&full_block, self.config.compression);
-        let upload_bytes = match compressed {
-            std::borrow::Cow::Borrowed(_) => full_block.clone(),
-            std::borrow::Cow::Owned(v) => Bytes::from(v),
-        };
-        // Rate limit upload bandwidth
-        self.bandwidth.acquire_upload(upload_bytes.len()).await;
-        let upload_len = upload_bytes.len() as u64;
-        let started = Instant::now();
-        self.client
-            .put_object_vectored(&key_str, vec![upload_bytes])
+        let chunks = vec![Bytes::copy_from_slice(data)];
+        self.write_fresh_vectored_inner(key, offset, chunks)
             .await
-            .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
-        self.object_metrics
-            .record_put(upload_len, started.elapsed());
-
-        self.populate_write_cache_after_upload(key_str, full_block)
-            .await;
-
-        Ok(data.len() as u64)
+            .map(|_| data.len() as u64)
     }
 
     #[tracing::instrument(

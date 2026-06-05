@@ -774,6 +774,8 @@ where
                             object.put_ops,
                             object.put_bytes,
                             object.put_lat_us,
+                            object.put_prepare_lat_us,
+                            object.put_cache_lat_us,
                             object.del_ops,
                         );
                     }
