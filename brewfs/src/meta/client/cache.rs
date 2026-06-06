@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::chunk::SliceDesc;
 use crate::meta::entities::etcd::EtcdEntryInfo;
@@ -410,6 +410,104 @@ impl InodeCache {
                 .children_generation
                 .fetch_add(1, Ordering::AcqRel);
         }
+    }
+}
+
+struct OpenFileEntry {
+    attr: Arc<RwLock<FileAttr>>,
+    refs: AtomicU64,
+    last_check: Arc<RwLock<Instant>>,
+}
+
+impl OpenFileEntry {
+    fn new(attr: FileAttr) -> Self {
+        Self {
+            attr: Arc::new(RwLock::new(attr)),
+            refs: AtomicU64::new(0),
+            last_check: Arc::new(RwLock::new(Instant::now())),
+        }
+    }
+
+    async fn attr(&self) -> FileAttr {
+        self.attr.read().await.clone()
+    }
+
+    async fn open(&self, attr: FileAttr) {
+        *self.attr.write().await = attr;
+        *self.last_check.write().await = Instant::now();
+        self.refs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    async fn close(&self) {
+        self.refs
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |refs| {
+                Some(refs.saturating_sub(1))
+            })
+            .ok();
+        *self.last_check.write().await = Instant::now();
+    }
+}
+
+/// JuiceFS-style metadata cache scoped to files that were recently opened.
+///
+/// This cache is created only when explicitly enabled by configuration. It is
+/// intentionally narrower than `InodeCache`: it is used for close-to-open
+/// refresh avoidance on repeated non-append opens and is invalidated on local
+/// metadata mutations.
+pub(crate) struct OpenFileCache {
+    entries: Arc<DashMap<i64, Arc<OpenFileEntry>>>,
+    ttl_manager: Cache<i64, Arc<OpenFileEntry>>,
+}
+
+impl OpenFileCache {
+    pub(crate) fn new(capacity: u64, ttl: Duration) -> Self {
+        let entries = Arc::new(DashMap::new());
+        let entries_clone = entries.clone();
+        let ttl_manager = Cache::builder()
+            .max_capacity(capacity.max(1))
+            .time_to_live(ttl)
+            .eviction_listener(
+                move |key: Arc<i64>, _value: Arc<OpenFileEntry>, cause: RemovalCause| {
+                    debug!("OpenFileCache: Evicting inode {} (cause: {:?})", key, cause);
+                    entries_clone.remove(&*key);
+                },
+            )
+            .build();
+
+        Self {
+            entries,
+            ttl_manager,
+        }
+    }
+
+    pub(crate) async fn attr(&self, ino: i64) -> Option<FileAttr> {
+        let entry = self.ttl_manager.get(&ino).await?;
+        Some(entry.attr().await)
+    }
+
+    pub(crate) async fn open(&self, ino: i64, attr: FileAttr) {
+        match self.ttl_manager.get(&ino).await {
+            Some(entry) => {
+                entry.open(attr).await;
+            }
+            None => {
+                let entry = Arc::new(OpenFileEntry::new(attr.clone()));
+                entry.open(attr).await;
+                self.entries.insert(ino, entry.clone());
+                self.ttl_manager.insert(ino, entry).await;
+            }
+        }
+    }
+
+    pub(crate) async fn close(&self, ino: i64) {
+        if let Some(entry) = self.ttl_manager.get(&ino).await {
+            entry.close().await;
+        }
+    }
+
+    pub(crate) async fn invalidate_inode(&self, ino: i64) {
+        self.ttl_manager.invalidate(&ino).await;
+        self.entries.remove(&ino);
     }
 }
 

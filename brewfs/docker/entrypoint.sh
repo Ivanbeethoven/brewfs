@@ -94,6 +94,12 @@ EOF
       exit 1
       ;;
   esac
+  if [[ -n "${BREWFS_METADATA_OPEN_CACHE_TTL_MS:-}" ]]; then
+    echo "  open_file_cache_ttl_ms: ${BREWFS_METADATA_OPEN_CACHE_TTL_MS}"
+  fi
+  if [[ -n "${BREWFS_METADATA_OPEN_CACHE_CAPACITY:-}" ]]; then
+    echo "  open_file_cache_capacity: ${BREWFS_METADATA_OPEN_CACHE_CAPACITY}"
+  fi
 }
 
 write_config() {

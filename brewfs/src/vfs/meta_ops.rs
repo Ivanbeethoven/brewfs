@@ -44,6 +44,40 @@ where
             .map_err(meta_err_to_vfs)
     }
 
+    pub(super) async fn meta_stat_for_open(
+        &self,
+        ino: i64,
+        read: bool,
+        write: bool,
+        append: bool,
+    ) -> Result<Option<FileAttr>, VfsError> {
+        self.meta_layer()
+            .stat_for_open(ino, read, write, append)
+            .await
+            .map_err(meta_err_to_vfs)
+    }
+
+    pub(super) async fn meta_record_open(
+        &self,
+        ino: i64,
+        attr: FileAttr,
+        read: bool,
+        write: bool,
+        append: bool,
+    ) -> Result<(), VfsError> {
+        self.meta_layer()
+            .record_open(ino, attr, read, write, append)
+            .await
+            .map_err(meta_err_to_vfs)
+    }
+
+    pub(super) async fn meta_record_close(&self, ino: i64) -> Result<(), VfsError> {
+        self.meta_layer()
+            .record_close(ino)
+            .await
+            .map_err(meta_err_to_vfs)
+    }
+
     // ------------------------------------------------------------------
     // Directory / name lookups
     // ------------------------------------------------------------------

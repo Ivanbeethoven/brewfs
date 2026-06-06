@@ -25,6 +25,7 @@ use std::io::BufWriter;
 use std::sync::Arc;
 #[cfg(feature = "profiling")]
 use std::sync::{LazyLock, Mutex as StdMutex};
+use std::time::Duration;
 
 pub mod config;
 use config::*;
@@ -436,6 +437,12 @@ where
     let store = Arc::new(store);
     let mut meta_config = MetaClientConfig::default();
     meta_config.options.mount_point = Some(mount_point.display().to_string());
+    if let Some(ttl_ms) = args.meta_open_file_cache_ttl_ms {
+        meta_config.options.open_file_cache.ttl = Duration::from_millis(ttl_ms);
+    }
+    if let Some(capacity) = args.meta_open_file_cache_capacity {
+        meta_config.options.open_file_cache.capacity = capacity;
+    }
 
     tracing::info!("mount startup meta client create begin");
     let meta_client = MetaClient::with_options(

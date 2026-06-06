@@ -204,6 +204,8 @@ pub struct MetaFileConfig {
     pub redis: Option<UrlBackedMetaFileConfig>,
     pub etcd: Option<EtcdMetaFileConfig>,
     pub tikv: Option<TiKvMetaFileConfig>,
+    pub open_file_cache_ttl_ms: Option<u64>,
+    pub open_file_cache_capacity: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -279,6 +281,8 @@ pub struct MountConfig {
     pub meta_etcd_urls: Vec<String>,
     pub meta_tikv_pd_endpoints: Vec<String>,
     pub meta_tikv_namespace: String,
+    pub meta_open_file_cache_ttl_ms: Option<u64>,
+    pub meta_open_file_cache_capacity: Option<u64>,
     pub chunk_size: u64,
     pub block_size: u32,
     pub fuse_workers: usize,
@@ -376,6 +380,8 @@ impl MountConfig {
                 .meta_tikv_namespace
                 .or(tikv_cfg.namespace)
                 .unwrap_or_else(crate::meta::config::default_tikv_namespace),
+            meta_open_file_cache_ttl_ms: meta_cfg.open_file_cache_ttl_ms,
+            meta_open_file_cache_capacity: meta_cfg.open_file_cache_capacity,
             chunk_size: args
                 .chunk_size
                 .or(layout_cfg.chunk_size)

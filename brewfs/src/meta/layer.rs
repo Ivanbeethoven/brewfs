@@ -48,6 +48,35 @@ pub trait MetaLayer: Send + Sync {
     /// Do `stat` but bypass the inode cache.
     async fn stat_fresh(&self, ino: i64) -> Result<Option<FileAttr>, MetaError>;
 
+    /// Fetch the attribute used by an open operation. Implementations may
+    /// reuse an explicitly enabled open-file scoped cache for read-only opens.
+    async fn stat_for_open(
+        &self,
+        ino: i64,
+        _read: bool,
+        _write: bool,
+        _append: bool,
+    ) -> Result<Option<FileAttr>, MetaError> {
+        self.stat_fresh(ino).await
+    }
+
+    /// Record that VFS successfully opened a file handle.
+    async fn record_open(
+        &self,
+        _ino: i64,
+        _attr: FileAttr,
+        _read: bool,
+        _write: bool,
+        _append: bool,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    /// Record that VFS released a file handle.
+    async fn record_close(&self, _ino: i64) -> Result<(), MetaError> {
+        Ok(())
+    }
+
     async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError>;
 
     async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError>;

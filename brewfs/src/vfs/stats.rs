@@ -95,6 +95,8 @@ pub struct FsStatsSnapshot {
     pub meta_get_slices_cache_hit: u64,
     pub meta_get_slices_cache_miss: u64,
     pub meta_open_fresh_stat: u64,
+    pub meta_open_file_cache_hit: u64,
+    pub meta_open_file_cache_miss: u64,
 }
 
 impl FsStatsSnapshot {
@@ -309,6 +311,10 @@ pub struct FsStats {
     pub meta_get_slices_cache_miss: AtomicU64,
     /// Fresh stat calls issued for close-to-open/open refresh
     pub meta_open_fresh_stat: AtomicU64,
+    /// Open-file scoped metadata cache hits
+    pub meta_open_file_cache_hit: AtomicU64,
+    /// Open-file scoped metadata cache misses
+    pub meta_open_file_cache_miss: AtomicU64,
 }
 
 impl FsStats {
@@ -391,6 +397,8 @@ impl FsStats {
             meta_get_slices_cache_hit: AtomicU64::new(0),
             meta_get_slices_cache_miss: AtomicU64::new(0),
             meta_open_fresh_stat: AtomicU64::new(0),
+            meta_open_file_cache_hit: AtomicU64::new(0),
+            meta_open_file_cache_miss: AtomicU64::new(0),
         }
     }
 
@@ -475,6 +483,8 @@ impl FsStats {
             meta_get_slices_cache_hit: self.meta_get_slices_cache_hit.load(ORD),
             meta_get_slices_cache_miss: self.meta_get_slices_cache_miss.load(ORD),
             meta_open_fresh_stat: self.meta_open_fresh_stat.load(ORD),
+            meta_open_file_cache_hit: self.meta_open_file_cache_hit.load(ORD),
+            meta_open_file_cache_miss: self.meta_open_file_cache_miss.load(ORD),
         }
     }
 
@@ -560,6 +570,8 @@ impl FsStats {
         get_slices_cache_hit: u64,
         get_slices_cache_miss: u64,
         open_fresh_stat: u64,
+        open_file_cache_hit: u64,
+        open_file_cache_miss: u64,
     ) {
         self.meta_stat_cache_hit.store(stat_cache_hit, ORD);
         self.meta_stat_cache_miss.store(stat_cache_miss, ORD);
@@ -572,6 +584,10 @@ impl FsStats {
         self.meta_get_slices_cache_miss
             .store(get_slices_cache_miss, ORD);
         self.meta_open_fresh_stat.store(open_fresh_stat, ORD);
+        self.meta_open_file_cache_hit
+            .store(open_file_cache_hit, ORD);
+        self.meta_open_file_cache_miss
+            .store(open_file_cache_miss, ORD);
     }
 
     /// Render all counters in Prometheus text format (one metric per line).
@@ -943,6 +959,14 @@ impl FsStats {
             "brewfs_meta_open_fresh_stat_total {}\n",
             snapshot.meta_open_fresh_stat
         ));
+        out.push_str(&format!(
+            "brewfs_meta_open_file_cache_hit_total {}\n",
+            snapshot.meta_open_file_cache_hit
+        ));
+        out.push_str(&format!(
+            "brewfs_meta_open_file_cache_miss_total {}\n",
+            snapshot.meta_open_file_cache_miss
+        ));
 
         out
     }
@@ -1082,6 +1106,8 @@ mod tests {
         assert!(output.contains("brewfs_meta_get_slices_cache_hit_total 0"));
         assert!(output.contains("brewfs_meta_get_slices_cache_miss_total 0"));
         assert!(output.contains("brewfs_meta_open_fresh_stat_total 0"));
+        assert!(output.contains("brewfs_meta_open_file_cache_hit_total 0"));
+        assert!(output.contains("brewfs_meta_open_file_cache_miss_total 0"));
         assert!(output.contains("brewfs_writeback_dirty_bytes 4096"));
         assert!(output.contains("brewfs_writeback_live_dirty_bytes 1024"));
         assert!(output.contains("brewfs_writeback_recent_pending_upload_bytes 2048"));

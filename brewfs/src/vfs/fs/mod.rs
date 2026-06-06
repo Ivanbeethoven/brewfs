@@ -812,6 +812,8 @@ where
                             meta.get_slices_cache_hit,
                             meta.get_slices_cache_miss,
                             meta.open_fresh_stat,
+                            meta.open_file_cache_hit,
+                            meta.open_file_cache_miss,
                         );
                     }
 
@@ -2551,7 +2553,7 @@ where
         write: bool,
         append: bool,
     ) -> Result<u64, VfsError> {
-        let attr = match self.meta_stat_fresh(ino).await {
+        let attr = match self.meta_stat_for_open(ino, read, write, append).await {
             Ok(Some(attr)) => attr,
             Ok(None) => {
                 return Err(VfsError::NotFound {
@@ -2570,8 +2572,12 @@ where
             });
         }
 
-        self.open_with_attr_refresh(ino, attr, read, write, append, false)
-            .await
+        let fh = self
+            .open_with_attr_refresh(ino, attr.clone(), read, write, append, false)
+            .await?;
+        self.meta_record_open(ino, attr, read, write, append)
+            .await?;
+        Ok(fh)
     }
 
     async fn open_with_attr_refresh(
@@ -2584,12 +2590,14 @@ where
         refresh_attr: bool,
     ) -> Result<u64, VfsError> {
         let mut latest_attr = attr;
+        let mut record_open = false;
 
         // Retrieve the latest attr for close-to-open semantics.
         if refresh_attr {
-            match self.meta_stat_fresh(ino).await {
+            match self.meta_stat_for_open(ino, read, write, append).await {
                 Ok(Some(fresh)) => {
                     latest_attr = fresh;
+                    record_open = true;
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -2609,6 +2617,7 @@ where
         }
 
         let inode = guard.clone();
+        let record_attr = record_open.then(|| latest_attr.clone());
         let handle =
             self.state
                 .handles
@@ -2616,6 +2625,10 @@ where
         if write {
             let writer = self.state.writer.ensure_file(inode.clone());
             handle.writer(writer);
+        }
+        if let Some(attr) = record_attr {
+            self.meta_record_open(ino, attr, read, write, append)
+                .await?;
         }
         Ok(handle.fh)
     }
@@ -2693,6 +2706,8 @@ where
         if release_writer {
             self.state.writer.release(handle.ino as u64).await;
         }
+
+        self.meta_record_close(handle.ino).await?;
 
         tracing::trace!(fh, ino = handle.ino, "vfs.close_done");
         Ok(())

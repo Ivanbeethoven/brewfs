@@ -33,13 +33,37 @@ use tracing::{Instrument, debug, info, trace, warn};
 use uuid::Uuid;
 
 use crate::vfs::extract_ino_and_chunk_index;
-use cache::InodeCache;
+use cache::{InodeCache, OpenFileCache};
 use chrono::Utc;
 use hostname::get as get_hostname;
 use path_trie::PathTrie;
 use session::{SessionInfo, SessionManager};
 
 const ROOT_INODE: i64 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenFileCacheConfig {
+    /// Attribute reuse window for repeated non-append opens. `Duration::ZERO`
+    /// disables this cache and preserves strict close-to-open refresh.
+    pub ttl: Duration,
+    /// Maximum number of recently opened inodes retained by the cache.
+    pub capacity: u64,
+}
+
+impl OpenFileCacheConfig {
+    fn enabled(&self) -> bool {
+        !self.ttl.is_zero() && self.capacity > 0
+    }
+}
+
+impl Default for OpenFileCacheConfig {
+    fn default() -> Self {
+        Self {
+            ttl: Duration::ZERO,
+            capacity: 8192,
+        }
+    }
+}
 
 /// Configuration options for `MetaClient` that correspond to the core metadata
 /// behaviours implemented by the Go `baseMeta`. Only a minimal subset of
@@ -64,6 +88,8 @@ pub struct MetaClientOptions {
     pub max_symlinks: usize,
     /// Batch attribute prefetch configuration
     pub batch_prefetch: BatchPrefetchConfig,
+    /// Opt-in JuiceFS-style cache scoped to recently opened files.
+    pub open_file_cache: OpenFileCacheConfig,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -76,6 +102,8 @@ pub struct MetaClientMetricsSnapshot {
     pub get_slices_cache_hit: u64,
     pub get_slices_cache_miss: u64,
     pub open_fresh_stat: u64,
+    pub open_file_cache_hit: u64,
+    pub open_file_cache_miss: u64,
 }
 
 #[derive(Debug, Default)]
@@ -88,6 +116,8 @@ pub struct MetaClientMetrics {
     get_slices_cache_hit: AtomicU64,
     get_slices_cache_miss: AtomicU64,
     open_fresh_stat: AtomicU64,
+    open_file_cache_hit: AtomicU64,
+    open_file_cache_miss: AtomicU64,
 }
 
 impl MetaClientMetrics {
@@ -101,6 +131,8 @@ impl MetaClientMetrics {
             get_slices_cache_hit: self.get_slices_cache_hit.load(Ordering::Relaxed),
             get_slices_cache_miss: self.get_slices_cache_miss.load(Ordering::Relaxed),
             open_fresh_stat: self.open_fresh_stat.load(Ordering::Relaxed),
+            open_file_cache_hit: self.open_file_cache_hit.load(Ordering::Relaxed),
+            open_file_cache_miss: self.open_file_cache_miss.load(Ordering::Relaxed),
         }
     }
 
@@ -134,6 +166,14 @@ impl MetaClientMetrics {
 
     fn record_open_fresh_stat(&self) {
         self.open_fresh_stat.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_open_file_cache_hit(&self) {
+        self.open_file_cache_hit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_open_file_cache_miss(&self) {
+        self.open_file_cache_miss.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -208,6 +248,7 @@ impl Default for MetaClientOptions {
             case_insensitive: false,
             max_symlinks: 40,
             batch_prefetch: BatchPrefetchConfig::default(),
+            open_file_cache: OpenFileCacheConfig::default(),
         }
     }
 }
@@ -225,6 +266,7 @@ pub struct MetaClient<T: MetaStore + ?Sized> {
     root: AtomicI64,
     umounting: AtomicBool,
     inode_cache: Arc<InodeCache>,
+    open_file_cache: Option<Arc<OpenFileCache>>,
     /// it's absolute path.
     /// Used for quick lookups and invalidation
     path_cache: Cache<String, i64>,
@@ -324,6 +366,13 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         let root_ino = store.root_ino();
         debug!(root_ino, "MetaClient::with_options root ready");
 
+        let open_file_cache = options.open_file_cache.enabled().then(|| {
+            Arc::new(OpenFileCache::new(
+                options.open_file_cache.capacity,
+                options.open_file_cache.ttl,
+            ))
+        });
+
         // Create MetaClient
         debug!("MetaClient::with_options cache structures begin");
         let client = Arc::new(Self {
@@ -332,6 +381,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
             root: AtomicI64::new(root_ino),
             umounting: AtomicBool::new(false),
             inode_cache: Arc::new(InodeCache::new(capacity.inode as u64, ttl.inode_ttl)),
+            open_file_cache,
             path_cache: Cache::builder()
                 .max_capacity(capacity.path as u64)
                 .time_to_live(ttl.path_ttl)
@@ -392,6 +442,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
     pub(crate) async fn invalidate_chunk_slices(&self, chunk_id: u64) {
         let (inode, chunk_index) = extract_ino_and_chunk_index(chunk_id);
         self.inode_cache.invalidate_slices(inode, chunk_index).await;
+        self.invalidate_open_file_cache_inode(inode).await;
     }
 
     /// Update the logical root inode. All subsequent metadata lookups treat
@@ -463,6 +514,22 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
     fn is_umounting(&self) -> bool {
         self.umounting.load(Ordering::SeqCst)
     }
+
+    fn open_file_cache_eligible(read: bool, write: bool, append: bool) -> bool {
+        (read || write) && !append
+    }
+
+    async fn invalidate_open_file_cache_inode(&self, inode: i64) {
+        if let Some(cache) = &self.open_file_cache {
+            cache.invalidate_inode(inode).await;
+        }
+    }
+
+    async fn invalidate_open_file_cache_checked(&self, ino: i64) {
+        let inode = self.check_root(ino);
+        self.invalidate_open_file_cache_inode(inode).await;
+    }
+
     /// Starts a background heartbeat session with the underlying store.
     ///
     /// Callers provide a `SessionInfo` struct containing session parameters understood by the backend;
@@ -1299,6 +1366,60 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         Ok(attr)
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino, read, write, append))]
+    async fn stat_for_open(
+        &self,
+        ino: i64,
+        read: bool,
+        write: bool,
+        append: bool,
+    ) -> Result<Option<FileAttr>, MetaError> {
+        let inode = self.check_root(ino);
+        let eligible = Self::open_file_cache_eligible(read, write, append);
+
+        if eligible && let Some(cache) = &self.open_file_cache {
+            if let Some(attr) = cache.attr(inode).await {
+                self.metrics.record_open_file_cache_hit();
+                return Ok(Some(attr));
+            }
+            self.metrics.record_open_file_cache_miss();
+        }
+
+        self.stat_fresh(inode).await
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, attr), fields(ino, read, write, append))]
+    async fn record_open(
+        &self,
+        ino: i64,
+        attr: FileAttr,
+        read: bool,
+        write: bool,
+        append: bool,
+    ) -> Result<(), MetaError> {
+        let inode = self.check_root(ino);
+        let Some(cache) = &self.open_file_cache else {
+            return Ok(());
+        };
+
+        if Self::open_file_cache_eligible(read, write, append) {
+            cache.open(inode, attr).await;
+        } else {
+            cache.invalidate_inode(inode).await;
+        }
+
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
+    async fn record_close(&self, ino: i64) -> Result<(), MetaError> {
+        let inode = self.check_root(ino);
+        if let Some(cache) = &self.open_file_cache {
+            cache.close(inode).await;
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
         self.cached_lookup(parent, name).await
@@ -1578,11 +1699,15 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         let parent = self.check_root(parent);
         info!("MetaClient: unlink operation for ({}, '{}')", parent, name);
 
+        let target_ino = self.cached_lookup(parent, name).await?;
         self.store.unlink(parent, name).await?;
 
         debug!("MetaClient: unlink completed, updating cache");
 
         self.inode_cache.remove_child(parent, name).await;
+        if let Some(ino) = target_ino {
+            self.invalidate_open_file_cache_inode(ino).await;
+        }
         self.invalidate_parent_path(parent).await;
 
         Ok(())
@@ -1637,6 +1762,10 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         self.store
             .rename(old_parent, old_name, new_parent, new_name.clone())
             .await?;
+        self.invalidate_open_file_cache_inode(src_ino).await;
+        if let Some(dest_ino) = dest_ino {
+            self.invalidate_open_file_cache_inode(dest_ino).await;
+        }
 
         debug!("MetaClient: rename completed, updating cache");
 
@@ -1755,6 +1884,8 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         self.store
             .rename_exchange(old_parent, old_name, new_parent, new_name)
             .await?;
+        self.invalidate_open_file_cache_inode(old_ino).await;
+        self.invalidate_open_file_cache_inode(new_ino).await;
 
         debug!("MetaClient: rename_exchange completed, updating cache");
 
@@ -1905,6 +2036,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
             let mut attr = node.attr.write().await;
             attr.size = size;
         }
+        self.invalidate_open_file_cache_inode(inode).await;
 
         Ok(())
     }
@@ -1921,6 +2053,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
                 attr.size = size;
             }
         }
+        self.invalidate_open_file_cache_inode(inode).await;
 
         Ok(())
     }
@@ -1931,6 +2064,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         let inode = self.check_root(ino);
         self.store.truncate(inode, size, chunk_size).await?;
         self.inode_cache.invalidate_inode(inode).await;
+        self.invalidate_open_file_cache_inode(inode).await;
         Ok(())
     }
 
@@ -1998,6 +2132,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         self.inode_cache
             .insert_node(inode, attr.clone(), None)
             .await;
+        self.invalidate_open_file_cache_inode(inode).await;
         Ok(attr)
     }
 
@@ -2040,6 +2175,8 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         self.inode_cache
             .append_slice(inode_from_chunk, chunk_index, slice)
             .await;
+        self.invalidate_open_file_cache_inode(inode_from_chunk)
+            .await;
 
         if let Some(node) = self.inode_cache.get_node(inode).await {
             let mut attr = node.attr.write().await;
@@ -2059,6 +2196,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn remove_file_metadata(&self, ino: i64) -> Result<(), MetaError> {
         self.ensure_writable()?;
+        self.invalidate_open_file_cache_checked(ino).await;
         self.store.remove_file_metadata(ino).await
     }
 
@@ -2102,6 +2240,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
 
     async fn invalidate_chunk_slices(&self, ino: i64, chunk_index: u64) -> Result<(), MetaError> {
         self.inode_cache.invalidate_slices(ino, chunk_index).await;
+        self.invalidate_open_file_cache_checked(ino).await;
         Ok(())
     }
 
@@ -2118,6 +2257,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         self.inode_cache
             .append_slice(inode, chunk_index, slice)
             .await;
+        self.invalidate_open_file_cache_inode(inode).await;
         Ok(())
     }
 
@@ -2426,6 +2566,115 @@ mod tests {
         assert!(metrics.lookup_cache_miss >= 1);
         assert!(metrics.lookup_cache_hit >= 1);
         assert!(metrics.stat_cache_hit >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_open_file_cache_disabled_preserves_fresh_open_stat() {
+        let client = create_test_client().await;
+        let ino = client
+            .create_file(1, "open-cache-disabled.txt".to_string())
+            .await
+            .unwrap();
+
+        let first = client
+            .stat_for_open(ino, true, false, false)
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .record_open(ino, first, true, false, false)
+            .await
+            .unwrap();
+        client.record_close(ino).await.unwrap();
+
+        let second = client
+            .stat_for_open(ino, true, false, false)
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .record_open(ino, second, true, false, false)
+            .await
+            .unwrap();
+        client.record_close(ino).await.unwrap();
+
+        let metrics = client.metrics().snapshot();
+        assert_eq!(metrics.open_fresh_stat, 2);
+        assert_eq!(metrics.open_file_cache_hit, 0);
+        assert_eq!(metrics.open_file_cache_miss, 0);
+    }
+
+    #[tokio::test]
+    async fn test_open_file_cache_hits_readonly_open_and_invalidates_on_mutation() {
+        let options = MetaClientOptions {
+            open_file_cache: OpenFileCacheConfig {
+                ttl: Duration::from_secs(60),
+                capacity: 128,
+            },
+            ..Default::default()
+        };
+        let client = create_test_client_with_options(options).await;
+        let ino = client
+            .create_file(1, "open-cache-enabled.txt".to_string())
+            .await
+            .unwrap();
+
+        let first = client
+            .stat_for_open(ino, true, false, false)
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .record_open(ino, first.clone(), true, false, false)
+            .await
+            .unwrap();
+        client.record_close(ino).await.unwrap();
+
+        let cached = client
+            .stat_for_open(ino, true, false, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.size, first.size);
+
+        let metrics = client.metrics().snapshot();
+        assert_eq!(metrics.open_fresh_stat, 1);
+        assert_eq!(metrics.open_file_cache_miss, 1);
+        assert_eq!(metrics.open_file_cache_hit, 1);
+
+        let rdwr_cached = client
+            .stat_for_open(ino, true, true, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rdwr_cached.size, first.size);
+        let metrics = client.metrics().snapshot();
+        assert_eq!(metrics.open_fresh_stat, 1);
+        assert_eq!(metrics.open_file_cache_hit, 2);
+
+        client
+            .set_attr(
+                ino,
+                &SetAttrRequest {
+                    size: Some(first.size + 4096),
+                    ..Default::default()
+                },
+                SetAttrFlags::empty(),
+            )
+            .await
+            .unwrap();
+
+        let refreshed = client
+            .stat_for_open(ino, true, false, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.size, first.size + 4096);
+
+        let metrics = client.metrics().snapshot();
+        assert_eq!(metrics.open_fresh_stat, 2);
+        assert_eq!(metrics.open_file_cache_hit, 2);
+        assert_eq!(metrics.open_file_cache_miss, 2);
     }
 
     #[tokio::test]
