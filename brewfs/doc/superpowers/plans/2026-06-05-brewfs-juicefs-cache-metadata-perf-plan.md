@@ -53,6 +53,8 @@ Recent accepted writeback profile evidence:
 | `perf-run-1780680852-8870` | pure metadata metaperf, `PERF_METAPERF_FILE_SIZE=0` | `create = 5347.64 ops/s`; proves BrewFS pure create metadata is not the bottleneck |
 | `perf-run-1780682166-14826` | metaperf default `-s 4096` with writeback persist sync disabled in throughput profile | `create = 766.04 ops/s`, up from `249.13 ops/s` in the comparable small-file baseline and above JuiceFS `704.41 ops/s`; open/stat/readdir/rename stayed stable |
 | `perf-run-1780682653-28693` | hot `fio-randread fio-randrw` smoke with the same throughput profile | `fio-randrw = 179.56/80.43 MiB/s`, p99 `109.58/24.25 ms`, cache hit `99.1%`; no mixed-workload regression versus `129.04/59.47 MiB/s` baseline |
+| `perf-run-1780730151-20133` | Task 1 hot observability gate, `fio-seqread fio-randread metaperf` | New `.stats` read strategy and metadata cache counters appeared in diagnostics; `fio-seqread = 1.65 GiB/s`, `fio-randread = 821.04 MiB/s`, `metaperf create = 751.7 ops/s` |
+| `perf-run-1780730522-11955` | Task 1 cold/direct read smoke with drain, cache clear, and remount | New counters distinguished cold full GETs: seqread `S3 GET=287/read_full_gets=287`, randread `S3 GET=1037/read_full_gets=1037` |
 
 Latest partial BrewFS all-fio sample:
 
@@ -399,7 +401,7 @@ Expected:
 - Modify: `/mnt/slayerfs/brewfs/brewfs/src/meta/client/mod.rs`
 - Test: existing unit tests under `brewfs/src/chunk/store.rs`, `brewfs/src/vfs/stats.rs`, and `brewfs/src/meta/client/mod.rs`
 
-- [ ] **Step 1: Add read strategy counters**
+- [x] **Step 1: Add read strategy counters**
 
 Add counters to `ObjectStoreMetrics` for:
 
@@ -419,7 +421,7 @@ Expected:
 - `ObjectBlockStore::read_range` increments exactly one primary strategy counter per read request.
 - Background prefetch increments the background counters separately.
 
-- [ ] **Step 2: Export counters in `.stats`**
+- [x] **Step 2: Export counters in `.stats`**
 
 Expose the counters as:
 
@@ -439,7 +441,7 @@ Expected:
 - `stats.rs` unit tests assert the new lines exist.
 - Existing `.stats` cache metrics still pass.
 
-- [ ] **Step 3: Add metadata hit/miss counters**
+- [x] **Step 3: Add metadata hit/miss counters**
 
 Add counters for:
 
@@ -459,7 +461,7 @@ Expected:
 - `cached_stat`, `cached_lookup`, `get_slices`, and `open_with_attr_refresh` update counters.
 - `.stats` exposes counters under `brewfs_meta_*`.
 
-- [ ] **Step 4: Verify observability**
+- [x] **Step 4: Verify observability**
 
 Run:
 
@@ -479,7 +481,7 @@ Expected:
 - Perf run exits `0`.
 - `diagnostics/stats-*-after.txt` includes both read strategy and metadata counters.
 
-- [ ] **Step 5: Commit if accepted**
+- [x] **Step 5: Commit if accepted**
 
 Run:
 

@@ -102,6 +102,14 @@ pub struct ObjectStoreStatsSnapshot {
     pub put_prepare_lat_us: u64,
     pub put_cache_lat_us: u64,
     pub del_ops: u64,
+    pub read_block_cache_hits: u64,
+    pub read_page_cache_hits: u64,
+    pub read_page_cache_misses: u64,
+    pub read_range_gets: u64,
+    pub read_full_gets: u64,
+    pub read_piggyback_full: u64,
+    pub read_background_prefetches: u64,
+    pub read_background_prefetch_dropped: u64,
 }
 
 #[derive(Debug, Default)]
@@ -115,6 +123,14 @@ pub struct ObjectStoreMetrics {
     put_prepare_lat_us: AtomicU64,
     put_cache_lat_us: AtomicU64,
     del_ops: AtomicU64,
+    read_block_cache_hits: AtomicU64,
+    read_page_cache_hits: AtomicU64,
+    read_page_cache_misses: AtomicU64,
+    read_range_gets: AtomicU64,
+    read_full_gets: AtomicU64,
+    read_piggyback_full: AtomicU64,
+    read_background_prefetches: AtomicU64,
+    read_background_prefetch_dropped: AtomicU64,
 }
 
 impl ObjectStoreMetrics {
@@ -129,6 +145,16 @@ impl ObjectStoreMetrics {
             put_prepare_lat_us: self.put_prepare_lat_us.load(Ordering::Relaxed),
             put_cache_lat_us: self.put_cache_lat_us.load(Ordering::Relaxed),
             del_ops: self.del_ops.load(Ordering::Relaxed),
+            read_block_cache_hits: self.read_block_cache_hits.load(Ordering::Relaxed),
+            read_page_cache_hits: self.read_page_cache_hits.load(Ordering::Relaxed),
+            read_page_cache_misses: self.read_page_cache_misses.load(Ordering::Relaxed),
+            read_range_gets: self.read_range_gets.load(Ordering::Relaxed),
+            read_full_gets: self.read_full_gets.load(Ordering::Relaxed),
+            read_piggyback_full: self.read_piggyback_full.load(Ordering::Relaxed),
+            read_background_prefetches: self.read_background_prefetches.load(Ordering::Relaxed),
+            read_background_prefetch_dropped: self
+                .read_background_prefetch_dropped
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -158,6 +184,40 @@ impl ObjectStoreMetrics {
 
     fn record_delete(&self) {
         self.del_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_read_block_cache_hit(&self) {
+        self.read_block_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_read_page_cache_hit(&self) {
+        self.read_page_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_read_page_cache_miss(&self) {
+        self.read_page_cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_read_range_get(&self) {
+        self.read_range_gets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_read_full_get(&self) {
+        self.read_full_gets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_read_piggyback_full(&self) {
+        self.read_piggyback_full.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_read_background_prefetch(&self) {
+        self.read_background_prefetches
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_read_background_prefetch_dropped(&self) {
+        self.read_background_prefetch_dropped
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -459,6 +519,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
     }
 
     fn prefetch_full_block_background(&self, key: BlockKey, key_str: String) {
+        self.object_metrics.record_read_background_prefetch();
         let cache = self.block_cache.clone();
         let client = self.client.clone();
         let read_flight = self.read_flight.clone();
@@ -474,6 +535,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             }
 
             let Ok(_permit) = prefetch_limit.acquire_owned().await else {
+                object_metrics.record_read_background_prefetch_dropped();
                 return;
             };
             if cache.get(&key_str).await.is_some() {
@@ -619,6 +681,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         if let Some(cached) = self.block_cache.get(&key_str).await {
             tracing::trace!(key = %key_str, len = cached.len(), "block_cache HIT");
             tracing::Span::current().record("strategy", "cache_hit");
+            self.object_metrics.record_read_block_cache_hit();
             let offset_usize = offset as usize;
             let end = (offset_usize + len).min(cached.len());
             if offset_usize < cached.len() {
@@ -637,6 +700,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         {
             if let Some(block_data) = self.read_flight.try_piggyback(&key).await {
                 tracing::Span::current().record("strategy", "piggyback_full");
+                self.object_metrics.record_read_piggyback_full();
                 let block_data = block_data
                     .map_err(|e| anyhow::anyhow!("SingleFlight piggyback read failed: {e}"))?;
 
@@ -733,6 +797,12 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             }
 
             tracing::Span::current().record("read_len", total_read);
+            if range_missed {
+                self.object_metrics.record_read_range_get();
+                self.object_metrics.record_read_page_cache_miss();
+            } else {
+                self.object_metrics.record_read_page_cache_hit();
+            }
             if range_missed
                 && total_read > 0
                 && !self.try_promote_page_cache_to_block_cache(key).await
@@ -759,6 +829,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                     let raw = client.get_object(&key_str).await.map_err(|e| {
                         anyhow::anyhow!("object store get failed: {key_str}, {e:?}")
                     })?;
+                    object_metrics.record_read_full_get();
                     let raw_bytes = match raw {
                         Some(data) => {
                             object_metrics.record_get(data.len() as u64, started.elapsed());
@@ -1071,6 +1142,22 @@ mod tests {
         store.read_range((42, 4), 64 * 1024, &mut range_buf).await?;
 
         let stats = backend.get_stats();
+        let snapshot = store
+            .object_store_metrics()
+            .expect("ObjectBlockStore exposes object metrics")
+            .snapshot();
+        assert_eq!(
+            snapshot.read_range_gets, 1,
+            "Non-zero small read should record one range-read strategy event"
+        );
+        assert_eq!(
+            snapshot.read_page_cache_misses, 1,
+            "Non-zero small read should record one page-cache miss event per request"
+        );
+        assert_eq!(
+            snapshot.read_background_prefetches, 1,
+            "Range miss should schedule one background full-block prefetch"
+        );
         assert_eq!(
             stats.get_object_range_calls, 8,
             "Non-zero 512KB read should fetch 8 pages (8 x 64KB range reads)"
@@ -1423,6 +1510,15 @@ mod tests {
         assert_eq!(snapshot.get_bytes, full_block.len() as u64);
         assert_eq!(snapshot.put_ops, 1);
         assert_eq!(snapshot.del_ops, 1);
+        assert_eq!(snapshot.read_full_gets, 1);
+        assert_eq!(snapshot.read_block_cache_hits, 0);
+        assert_eq!(snapshot.read_range_gets, 0);
+
+        let mut cached_out = vec![0u8; 4096];
+        store.read_range((11, 0), 0, &mut cached_out).await?;
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.read_block_cache_hits, 1);
+        assert_eq!(snapshot.get_ops, 1);
 
         Ok(())
     }

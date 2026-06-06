@@ -79,6 +79,22 @@ pub struct FsStatsSnapshot {
     pub writeback_recent_uploaded_bytes: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    pub read_block_cache_hits: u64,
+    pub read_page_cache_hits: u64,
+    pub read_page_cache_misses: u64,
+    pub read_range_gets: u64,
+    pub read_full_gets: u64,
+    pub read_piggyback_full: u64,
+    pub read_background_prefetches: u64,
+    pub read_background_prefetch_dropped: u64,
+    pub meta_stat_cache_hit: u64,
+    pub meta_stat_cache_miss: u64,
+    pub meta_stat_fresh_store_hit: u64,
+    pub meta_lookup_cache_hit: u64,
+    pub meta_lookup_cache_miss: u64,
+    pub meta_get_slices_cache_hit: u64,
+    pub meta_get_slices_cache_miss: u64,
+    pub meta_open_fresh_stat: u64,
 }
 
 impl FsStatsSnapshot {
@@ -261,6 +277,38 @@ pub struct FsStats {
     pub cache_hits: AtomicU64,
     /// Block cache miss count
     pub cache_misses: AtomicU64,
+    /// Full-block cache read hits
+    pub read_block_cache_hits: AtomicU64,
+    /// Page-cache read hits
+    pub read_page_cache_hits: AtomicU64,
+    /// Page-cache read misses
+    pub read_page_cache_misses: AtomicU64,
+    /// Foreground range GET requests
+    pub read_range_gets: AtomicU64,
+    /// Foreground full-block GET requests
+    pub read_full_gets: AtomicU64,
+    /// Reads piggybacked onto an in-flight full-block GET
+    pub read_piggyback_full: AtomicU64,
+    /// Background full-block prefetches scheduled by range reads
+    pub read_background_prefetches: AtomicU64,
+    /// Background full-block prefetches dropped before execution
+    pub read_background_prefetch_dropped: AtomicU64,
+    /// Metadata stat cache hits
+    pub meta_stat_cache_hit: AtomicU64,
+    /// Metadata stat cache misses
+    pub meta_stat_cache_miss: AtomicU64,
+    /// Fresh stat store hits
+    pub meta_stat_fresh_store_hit: AtomicU64,
+    /// Metadata lookup cache hits, including cached negative answers
+    pub meta_lookup_cache_hit: AtomicU64,
+    /// Metadata lookup cache misses
+    pub meta_lookup_cache_miss: AtomicU64,
+    /// Metadata slice cache hits
+    pub meta_get_slices_cache_hit: AtomicU64,
+    /// Metadata slice cache misses
+    pub meta_get_slices_cache_miss: AtomicU64,
+    /// Fresh stat calls issued for close-to-open/open refresh
+    pub meta_open_fresh_stat: AtomicU64,
 }
 
 impl FsStats {
@@ -327,6 +375,22 @@ impl FsStats {
             writeback_recent_uploaded_bytes: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            read_block_cache_hits: AtomicU64::new(0),
+            read_page_cache_hits: AtomicU64::new(0),
+            read_page_cache_misses: AtomicU64::new(0),
+            read_range_gets: AtomicU64::new(0),
+            read_full_gets: AtomicU64::new(0),
+            read_piggyback_full: AtomicU64::new(0),
+            read_background_prefetches: AtomicU64::new(0),
+            read_background_prefetch_dropped: AtomicU64::new(0),
+            meta_stat_cache_hit: AtomicU64::new(0),
+            meta_stat_cache_miss: AtomicU64::new(0),
+            meta_stat_fresh_store_hit: AtomicU64::new(0),
+            meta_lookup_cache_hit: AtomicU64::new(0),
+            meta_lookup_cache_miss: AtomicU64::new(0),
+            meta_get_slices_cache_hit: AtomicU64::new(0),
+            meta_get_slices_cache_miss: AtomicU64::new(0),
+            meta_open_fresh_stat: AtomicU64::new(0),
         }
     }
 
@@ -395,6 +459,22 @@ impl FsStats {
             writeback_recent_uploaded_bytes: self.writeback_recent_uploaded_bytes.load(ORD),
             cache_hits: self.cache_hits.load(ORD),
             cache_misses: self.cache_misses.load(ORD),
+            read_block_cache_hits: self.read_block_cache_hits.load(ORD),
+            read_page_cache_hits: self.read_page_cache_hits.load(ORD),
+            read_page_cache_misses: self.read_page_cache_misses.load(ORD),
+            read_range_gets: self.read_range_gets.load(ORD),
+            read_full_gets: self.read_full_gets.load(ORD),
+            read_piggyback_full: self.read_piggyback_full.load(ORD),
+            read_background_prefetches: self.read_background_prefetches.load(ORD),
+            read_background_prefetch_dropped: self.read_background_prefetch_dropped.load(ORD),
+            meta_stat_cache_hit: self.meta_stat_cache_hit.load(ORD),
+            meta_stat_cache_miss: self.meta_stat_cache_miss.load(ORD),
+            meta_stat_fresh_store_hit: self.meta_stat_fresh_store_hit.load(ORD),
+            meta_lookup_cache_hit: self.meta_lookup_cache_hit.load(ORD),
+            meta_lookup_cache_miss: self.meta_lookup_cache_miss.load(ORD),
+            meta_get_slices_cache_hit: self.meta_get_slices_cache_hit.load(ORD),
+            meta_get_slices_cache_miss: self.meta_get_slices_cache_miss.load(ORD),
+            meta_open_fresh_stat: self.meta_open_fresh_stat.load(ORD),
         }
     }
 
@@ -443,6 +523,55 @@ impl FsStats {
         self.s3_put_prepare_lat_us.store(put_prepare_lat_us, ORD);
         self.s3_put_cache_lat_us.store(put_cache_lat_us, ORD);
         self.s3_del_ops.store(del_ops, ORD);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_read_strategy_metrics(
+        &self,
+        block_cache_hits: u64,
+        page_cache_hits: u64,
+        page_cache_misses: u64,
+        range_gets: u64,
+        full_gets: u64,
+        piggyback_full: u64,
+        background_prefetches: u64,
+        background_prefetch_dropped: u64,
+    ) {
+        self.read_block_cache_hits.store(block_cache_hits, ORD);
+        self.read_page_cache_hits.store(page_cache_hits, ORD);
+        self.read_page_cache_misses.store(page_cache_misses, ORD);
+        self.read_range_gets.store(range_gets, ORD);
+        self.read_full_gets.store(full_gets, ORD);
+        self.read_piggyback_full.store(piggyback_full, ORD);
+        self.read_background_prefetches
+            .store(background_prefetches, ORD);
+        self.read_background_prefetch_dropped
+            .store(background_prefetch_dropped, ORD);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_meta_client_metrics(
+        &self,
+        stat_cache_hit: u64,
+        stat_cache_miss: u64,
+        stat_fresh_store_hit: u64,
+        lookup_cache_hit: u64,
+        lookup_cache_miss: u64,
+        get_slices_cache_hit: u64,
+        get_slices_cache_miss: u64,
+        open_fresh_stat: u64,
+    ) {
+        self.meta_stat_cache_hit.store(stat_cache_hit, ORD);
+        self.meta_stat_cache_miss.store(stat_cache_miss, ORD);
+        self.meta_stat_fresh_store_hit
+            .store(stat_fresh_store_hit, ORD);
+        self.meta_lookup_cache_hit.store(lookup_cache_hit, ORD);
+        self.meta_lookup_cache_miss.store(lookup_cache_miss, ORD);
+        self.meta_get_slices_cache_hit
+            .store(get_slices_cache_hit, ORD);
+        self.meta_get_slices_cache_miss
+            .store(get_slices_cache_miss, ORD);
+        self.meta_open_fresh_stat.store(open_fresh_stat, ORD);
     }
 
     /// Render all counters in Prometheus text format (one metric per line).
@@ -750,6 +879,70 @@ impl FsStats {
             "brewfs_cache_hit_ratio {:.6}\n",
             snapshot.cache_hit_ratio()
         ));
+        out.push_str(&format!(
+            "brewfs_read_block_cache_hits_total {}\n",
+            snapshot.read_block_cache_hits
+        ));
+        out.push_str(&format!(
+            "brewfs_read_page_cache_hits_total {}\n",
+            snapshot.read_page_cache_hits
+        ));
+        out.push_str(&format!(
+            "brewfs_read_page_cache_misses_total {}\n",
+            snapshot.read_page_cache_misses
+        ));
+        out.push_str(&format!(
+            "brewfs_read_range_gets_total {}\n",
+            snapshot.read_range_gets
+        ));
+        out.push_str(&format!(
+            "brewfs_read_full_gets_total {}\n",
+            snapshot.read_full_gets
+        ));
+        out.push_str(&format!(
+            "brewfs_read_piggyback_full_total {}\n",
+            snapshot.read_piggyback_full
+        ));
+        out.push_str(&format!(
+            "brewfs_read_background_prefetch_total {}\n",
+            snapshot.read_background_prefetches
+        ));
+        out.push_str(&format!(
+            "brewfs_read_background_prefetch_dropped_total {}\n",
+            snapshot.read_background_prefetch_dropped
+        ));
+        out.push_str(&format!(
+            "brewfs_meta_stat_cache_hit_total {}\n",
+            snapshot.meta_stat_cache_hit
+        ));
+        out.push_str(&format!(
+            "brewfs_meta_stat_cache_miss_total {}\n",
+            snapshot.meta_stat_cache_miss
+        ));
+        out.push_str(&format!(
+            "brewfs_meta_stat_fresh_store_hit_total {}\n",
+            snapshot.meta_stat_fresh_store_hit
+        ));
+        out.push_str(&format!(
+            "brewfs_meta_lookup_cache_hit_total {}\n",
+            snapshot.meta_lookup_cache_hit
+        ));
+        out.push_str(&format!(
+            "brewfs_meta_lookup_cache_miss_total {}\n",
+            snapshot.meta_lookup_cache_miss
+        ));
+        out.push_str(&format!(
+            "brewfs_meta_get_slices_cache_hit_total {}\n",
+            snapshot.meta_get_slices_cache_hit
+        ));
+        out.push_str(&format!(
+            "brewfs_meta_get_slices_cache_miss_total {}\n",
+            snapshot.meta_get_slices_cache_miss
+        ));
+        out.push_str(&format!(
+            "brewfs_meta_open_fresh_stat_total {}\n",
+            snapshot.meta_open_fresh_stat
+        ));
 
         out
     }
@@ -873,6 +1066,22 @@ mod tests {
         assert!(output.contains("brewfs_cache_misses_total 2"));
         assert!(output.contains("brewfs_cache_requests_total 10"));
         assert!(output.contains("brewfs_cache_hit_ratio 0.800000"));
+        assert!(output.contains("brewfs_read_block_cache_hits_total 0"));
+        assert!(output.contains("brewfs_read_page_cache_hits_total 0"));
+        assert!(output.contains("brewfs_read_page_cache_misses_total 0"));
+        assert!(output.contains("brewfs_read_range_gets_total 0"));
+        assert!(output.contains("brewfs_read_full_gets_total 0"));
+        assert!(output.contains("brewfs_read_piggyback_full_total 0"));
+        assert!(output.contains("brewfs_read_background_prefetch_total 0"));
+        assert!(output.contains("brewfs_read_background_prefetch_dropped_total 0"));
+        assert!(output.contains("brewfs_meta_stat_cache_hit_total 0"));
+        assert!(output.contains("brewfs_meta_stat_cache_miss_total 0"));
+        assert!(output.contains("brewfs_meta_stat_fresh_store_hit_total 0"));
+        assert!(output.contains("brewfs_meta_lookup_cache_hit_total 0"));
+        assert!(output.contains("brewfs_meta_lookup_cache_miss_total 0"));
+        assert!(output.contains("brewfs_meta_get_slices_cache_hit_total 0"));
+        assert!(output.contains("brewfs_meta_get_slices_cache_miss_total 0"));
+        assert!(output.contains("brewfs_meta_open_fresh_stat_total 0"));
         assert!(output.contains("brewfs_writeback_dirty_bytes 4096"));
         assert!(output.contains("brewfs_writeback_live_dirty_bytes 1024"));
         assert!(output.contains("brewfs_writeback_recent_pending_upload_bytes 2048"));

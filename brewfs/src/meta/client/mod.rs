@@ -25,7 +25,7 @@ use if_addrs::get_if_addrs;
 use moka::future::Cache;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 use std::{collections::HashSet, process};
 use tokio::sync::{Mutex, mpsc};
@@ -64,6 +64,77 @@ pub struct MetaClientOptions {
     pub max_symlinks: usize,
     /// Batch attribute prefetch configuration
     pub batch_prefetch: BatchPrefetchConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetaClientMetricsSnapshot {
+    pub stat_cache_hit: u64,
+    pub stat_cache_miss: u64,
+    pub stat_fresh_store_hit: u64,
+    pub lookup_cache_hit: u64,
+    pub lookup_cache_miss: u64,
+    pub get_slices_cache_hit: u64,
+    pub get_slices_cache_miss: u64,
+    pub open_fresh_stat: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct MetaClientMetrics {
+    stat_cache_hit: AtomicU64,
+    stat_cache_miss: AtomicU64,
+    stat_fresh_store_hit: AtomicU64,
+    lookup_cache_hit: AtomicU64,
+    lookup_cache_miss: AtomicU64,
+    get_slices_cache_hit: AtomicU64,
+    get_slices_cache_miss: AtomicU64,
+    open_fresh_stat: AtomicU64,
+}
+
+impl MetaClientMetrics {
+    pub fn snapshot(&self) -> MetaClientMetricsSnapshot {
+        MetaClientMetricsSnapshot {
+            stat_cache_hit: self.stat_cache_hit.load(Ordering::Relaxed),
+            stat_cache_miss: self.stat_cache_miss.load(Ordering::Relaxed),
+            stat_fresh_store_hit: self.stat_fresh_store_hit.load(Ordering::Relaxed),
+            lookup_cache_hit: self.lookup_cache_hit.load(Ordering::Relaxed),
+            lookup_cache_miss: self.lookup_cache_miss.load(Ordering::Relaxed),
+            get_slices_cache_hit: self.get_slices_cache_hit.load(Ordering::Relaxed),
+            get_slices_cache_miss: self.get_slices_cache_miss.load(Ordering::Relaxed),
+            open_fresh_stat: self.open_fresh_stat.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_stat_cache_hit(&self) {
+        self.stat_cache_hit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_stat_cache_miss(&self) {
+        self.stat_cache_miss.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_stat_fresh_store_hit(&self) {
+        self.stat_fresh_store_hit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_lookup_cache_hit(&self) {
+        self.lookup_cache_hit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_lookup_cache_miss(&self) {
+        self.lookup_cache_miss.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_get_slices_cache_hit(&self) {
+        self.get_slices_cache_hit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_get_slices_cache_miss(&self) {
+        self.get_slices_cache_miss.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_open_fresh_stat(&self) {
+        self.open_fresh_stat.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Configuration for batch attribute prefetching during opendir
@@ -164,6 +235,7 @@ pub struct MetaClient<T: MetaStore + ?Sized> {
     /// Kept separate from trie for O(1) inode-to-paths lookup
     /// it's absolute path.
     inode_to_paths: Arc<DashMap<i64, Vec<String>>>,
+    metrics: Arc<MetaClientMetrics>,
 
     /// Manages background session heartbeats when enabled by callers.
     session_manager: Arc<SessionManager<T>>,
@@ -266,6 +338,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
                 .build(),
             path_trie: Arc::new(PathTrie::new()),
             inode_to_paths: Arc::new(DashMap::new()),
+            metrics: Arc::new(MetaClientMetrics::default()),
             session_manager: Arc::new(SessionManager::new(store.clone())),
             job_manager: Arc::new(JobManager::default()),
             control_plane: Mutex::new(None),
@@ -310,6 +383,10 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
     #[allow(dead_code)]
     pub fn store(&self) -> Arc<T> {
         self.store.clone()
+    }
+
+    pub fn metrics(&self) -> Arc<MetaClientMetrics> {
+        self.metrics.clone()
     }
 
     pub(crate) async fn invalidate_chunk_slices(&self, chunk_id: u64) {
@@ -893,10 +970,12 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
 
         if let Some(attr) = self.inode_cache.get_attr(inode).await {
             trace!("MetaClient: Inode cache HIT for inode {}", inode);
+            self.metrics.record_stat_cache_hit();
             return Ok(Some(attr));
         }
 
         trace!("MetaClient: Inode cache MISS for inode {}", inode);
+        self.metrics.record_stat_cache_miss();
 
         let attr = self.store.stat(inode).await?;
 
@@ -932,10 +1011,12 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
                         "MetaClient: lookup HIT ({}, '{}') -> inode {}",
                         parent, name, ino
                     );
+                    self.metrics.record_lookup_cache_hit();
                     return Ok(Some(ino));
                 }
                 None if !self.options.case_insensitive => {
                     trace!("MetaClient: complete lookup MISS ({}, '{}')", parent, name);
+                    self.metrics.record_lookup_cache_hit();
                     return Ok(None);
                 }
                 None => {
@@ -948,6 +1029,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         }
 
         trace!("MetaClient: lookup MISS ({}, '{}')", parent, name);
+        self.metrics.record_lookup_cache_miss();
 
         let result = self.store.lookup(parent, name).await?;
 
@@ -1166,6 +1248,10 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         self.store.name()
     }
 
+    fn metrics(&self) -> Option<Arc<MetaClientMetrics>> {
+        Some(self.metrics())
+    }
+
     fn root_ino(&self) -> i64 {
         self.root()
     }
@@ -1193,9 +1279,11 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
     async fn stat_fresh(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
         let inode = self.check_root(ino);
 
+        self.metrics.record_open_fresh_stat();
         let attr = self.store.stat(inode).await?;
         match &attr {
             Some(a) => {
+                self.metrics.record_stat_fresh_store_hit();
                 if !self
                     .inode_cache
                     .refresh_cached_node_for_fresh_stat(inode, a.clone())
@@ -1993,9 +2081,11 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         {
             tracing::Span::current().record("cache_hit", true);
             tracing::Span::current().record("slice_count", slices.len());
+            self.metrics.record_get_slices_cache_hit();
             return Ok(slices);
         }
         tracing::Span::current().record("cache_hit", false);
+        self.metrics.record_get_slices_cache_miss();
         let slices = self
             .store
             .get_slices(chunk_id)
@@ -2308,6 +2398,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(test_slices, from_cached);
+
+        let metrics = client.metrics().snapshot();
+        assert_eq!(metrics.get_slices_cache_miss, 1);
+        assert_eq!(metrics.get_slices_cache_hit, 0);
+
+        let second = client.get_slices(chunk_id).await.unwrap();
+        assert_eq!(test_slices, second);
+        let metrics = client.metrics().snapshot();
+        assert_eq!(metrics.get_slices_cache_hit, 1);
+    }
+
+    #[tokio::test]
+    async fn test_meta_client_cache_metrics_track_stat_and_lookup() {
+        let client = create_test_client().await;
+        let ino = client
+            .create_file(1, "metrics.txt".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(client.lookup(1, "metrics.txt").await.unwrap(), Some(ino));
+        assert!(client.stat(ino).await.unwrap().is_some());
+        client.readdir(1).await.unwrap();
+        assert_eq!(client.lookup(1, "metrics.txt").await.unwrap(), Some(ino));
+
+        let metrics = client.metrics().snapshot();
+        assert!(metrics.lookup_cache_miss >= 1);
+        assert!(metrics.lookup_cache_hit >= 1);
+        assert!(metrics.stat_cache_hit >= 1);
     }
 
     #[tokio::test]

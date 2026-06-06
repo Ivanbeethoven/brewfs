@@ -734,6 +734,7 @@ where
     ) -> Result<Self, VfsError> {
         let layout = config.write.layout;
         let root_ino = meta_layer.root_ino();
+        let meta_metrics = meta_layer.metrics();
         let backend = Arc::new(Backend::new(store.clone(), meta_layer.clone()));
         let core = Arc::new(VfsCore::new(layout, backend.clone(), meta_layer, root_ino));
         let config = Arc::new(config);
@@ -748,6 +749,7 @@ where
         if cache_hits.is_some()
             || cache_misses.is_some()
             || object_metrics.is_some()
+            || meta_metrics.is_some()
             || memory_budget.is_some()
         {
             tokio::spawn(async move {
@@ -787,6 +789,29 @@ where
                             object.put_prepare_lat_us,
                             object.put_cache_lat_us,
                             object.del_ops,
+                        );
+                        fuse_stats.sync_read_strategy_metrics(
+                            object.read_block_cache_hits,
+                            object.read_page_cache_hits,
+                            object.read_page_cache_misses,
+                            object.read_range_gets,
+                            object.read_full_gets,
+                            object.read_piggyback_full,
+                            object.read_background_prefetches,
+                            object.read_background_prefetch_dropped,
+                        );
+                    }
+                    if let Some(meta_metrics) = &meta_metrics {
+                        let meta = meta_metrics.snapshot();
+                        fuse_stats.sync_meta_client_metrics(
+                            meta.stat_cache_hit,
+                            meta.stat_cache_miss,
+                            meta.stat_fresh_store_hit,
+                            meta.lookup_cache_hit,
+                            meta.lookup_cache_miss,
+                            meta.get_slices_cache_hit,
+                            meta.get_slices_cache_miss,
+                            meta.open_fresh_stat,
                         );
                     }
 

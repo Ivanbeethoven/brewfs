@@ -1,6 +1,8 @@
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use crate::chunk::SliceDesc;
+use crate::meta::client::MetaClientMetrics;
 use crate::meta::client::session::SessionInfo;
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
 use crate::meta::store::{
@@ -23,6 +25,11 @@ pub trait MetaLayer: Send + Sync {
     /// Optional human readable backend name.
     fn name(&self) -> &'static str {
         "meta-layer"
+    }
+
+    /// Optional metadata cache counters exposed by caching layers.
+    fn metrics(&self) -> Option<Arc<MetaClientMetrics>> {
+        None
     }
 
     /// Returns / mutates the logical root inode alias used by chroot.
