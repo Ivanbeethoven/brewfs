@@ -70,6 +70,8 @@ pub struct WriteConfig {
     pub freeze_min_bytes: u64,
     /// Maximum age of a Writable slice before auto_flush freezes it.
     pub auto_flush_max_age: Duration,
+    /// Maximum in-flight block uploads per writer.
+    pub upload_concurrency: usize,
     /// Controls ordering of upload vs metadata commit.
     pub writeback_mode: crate::vfs::cache::config::WriteBackMode,
     /// Soft limit for committed-but-not-uploaded dirty bytes. 0 disables this gate.
@@ -120,6 +122,7 @@ impl Default for WriteConfig {
             auto_flush_max_age: Duration::from_millis(500),
             #[cfg(test)]
             auto_flush_max_age: Duration::from_millis(5),
+            upload_concurrency: 32,
             writeback_mode,
             writeback_recent_pending_soft_limit,
             writeback_recent_pending_hard_limit,
@@ -164,6 +167,13 @@ impl WriteConfig {
     pub fn auto_flush_max_age(self, auto_flush_max_age: Duration) -> Self {
         Self {
             auto_flush_max_age,
+            ..self
+        }
+    }
+
+    pub fn upload_concurrency(self, upload_concurrency: usize) -> Self {
+        Self {
+            upload_concurrency: upload_concurrency.max(1),
             ..self
         }
     }
@@ -236,6 +246,7 @@ impl VFSConfig {
                 .buffer_size(cache.write_memory_bytes)
                 .freeze_min_bytes(cache.dirty_slice_target_size)
                 .auto_flush_max_age(Duration::from_millis(cache.dirty_slice_max_age_ms))
+                .upload_concurrency(cache.upload_concurrency)
                 .writeback_mode(cache.writeback_mode),
         );
 
@@ -260,6 +271,7 @@ mod tests {
             dirty_slice_target_size: 2 * 1024 * 1024,
             dirty_slice_max_age_ms: 123,
             prefetch_max_bytes: 3 * 1024 * 1024,
+            upload_concurrency: 7,
             writeback_mode: WriteBackMode::CommitBeforeUpload,
             ..CacheConfig::default()
         };
@@ -270,6 +282,7 @@ mod tests {
         assert_eq!(config.read.max_ahead, cache.prefetch_max_bytes);
         assert_eq!(config.write.buffer_size, cache.write_memory_bytes);
         assert_eq!(config.write.freeze_min_bytes, cache.dirty_slice_target_size);
+        assert_eq!(config.write.upload_concurrency, cache.upload_concurrency);
         assert_eq!(
             config.write.auto_flush_max_age,
             Duration::from_millis(cache.dirty_slice_max_age_ms)

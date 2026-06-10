@@ -189,11 +189,14 @@ EOF
             || -n "${BREWFS_WRITE_SSD_BYTES:-}" \
             || -n "${BREWFS_DIRTY_SLICE_TARGET_SIZE:-}" \
             || -n "${BREWFS_DIRTY_SLICE_MAX_AGE_MS:-}" \
+            || -n "${BREWFS_UPLOAD_CONCURRENCY:-}" \
             || -n "${BREWFS_PREFETCH_ENABLED:-}" \
             || -n "${BREWFS_PREFETCH_MAX_BYTES:-}" \
             || -n "${BREWFS_PREFETCH_CONCURRENCY:-}" \
+            || -n "${BREWFS_RANGE_BACKGROUND_PREFETCH:-}" \
             || -n "${BREWFS_MEMORY_BUDGET_BYTES:-}" \
             || -n "${BREWFS_COMPRESSION:-}" \
+            || -n "${BREWFS_VERIFY_CACHE_CHECKSUM:-}" \
             || -n "${BREWFS_WRITEBACK_PERSIST_SYNC:-}" \
             || -n "${BREWFS_UPLOAD_LIMIT_MIBPS:-}" \
             || -n "${BREWFS_DOWNLOAD_LIMIT_MIBPS:-}" \
@@ -207,11 +210,14 @@ EOF
             [[ -n "${BREWFS_WRITE_SSD_BYTES:-}" ]] && echo "  write_ssd_bytes: ${BREWFS_WRITE_SSD_BYTES}"
             [[ -n "${BREWFS_DIRTY_SLICE_TARGET_SIZE:-}" ]] && echo "  dirty_slice_target_size: ${BREWFS_DIRTY_SLICE_TARGET_SIZE}"
             [[ -n "${BREWFS_DIRTY_SLICE_MAX_AGE_MS:-}" ]] && echo "  dirty_slice_max_age_ms: ${BREWFS_DIRTY_SLICE_MAX_AGE_MS}"
+            [[ -n "${BREWFS_UPLOAD_CONCURRENCY:-}" ]] && echo "  upload_concurrency: ${BREWFS_UPLOAD_CONCURRENCY}"
             [[ -n "${BREWFS_PREFETCH_ENABLED:-}" ]] && echo "  prefetch_enabled: ${BREWFS_PREFETCH_ENABLED}"
             [[ -n "${BREWFS_PREFETCH_MAX_BYTES:-}" ]] && echo "  prefetch_max_bytes: ${BREWFS_PREFETCH_MAX_BYTES}"
             [[ -n "${BREWFS_PREFETCH_CONCURRENCY:-}" ]] && echo "  prefetch_concurrency: ${BREWFS_PREFETCH_CONCURRENCY}"
+            [[ -n "${BREWFS_RANGE_BACKGROUND_PREFETCH:-}" ]] && echo "  range_background_prefetch: ${BREWFS_RANGE_BACKGROUND_PREFETCH}"
             [[ -n "${BREWFS_MEMORY_BUDGET_BYTES:-}" ]] && echo "  memory_budget_bytes: ${BREWFS_MEMORY_BUDGET_BYTES}"
             [[ -n "${BREWFS_COMPRESSION:-}" ]] && echo "  compression: ${comp}"
+            [[ -n "${BREWFS_VERIFY_CACHE_CHECKSUM:-}" ]] && echo "  verify_cache_checksum: ${BREWFS_VERIFY_CACHE_CHECKSUM}"
             [[ -n "${BREWFS_WRITEBACK_PERSIST_SYNC:-}" ]] && echo "  writeback_persist_sync: ${BREWFS_WRITEBACK_PERSIST_SYNC}"
             if [[ -n "$writeback_mode" ]]; then
                 echo "  writeback_mode: ${writeback_mode}"
@@ -867,6 +873,8 @@ run_fio_custom() {
 run_fio_profile() {
     local tool="$1"
     local mode="$2"
+    local direct_override="${3:-}"
+    local profile_key_override="${4:-}"
     local work_dir="$mount_dir/.perf-${tool}"
     local json_path="$artifact_dir/results/${tool}.json"
     local profile_suffix="${tool#fio-}"
@@ -886,7 +894,11 @@ run_fio_profile() {
     local needs_prefill=false
     local -a args=()
 
-    profile_key="$(printf '%s' "$profile_suffix" | tr '[:lower:]-' '[:upper:]_')"
+    if [[ -n "$profile_key_override" ]]; then
+        profile_key="$profile_key_override"
+    else
+        profile_key="$(printf '%s' "$profile_suffix" | tr '[:lower:]-' '[:upper:]_')"
+    fi
     profile_args_var="PERF_FIO_${profile_key}_ARGS"
     name_var="PERF_FIO_${profile_key}_NAME"
     rw_var="PERF_FIO_${profile_key}_RW"
@@ -898,6 +910,23 @@ run_fio_profile() {
     iodepth_var="PERF_FIO_${profile_key}_IODEPTH"
     direct_var="PERF_FIO_${profile_key}_DIRECT"
     runtime_var="PERF_FIO_${profile_key}_RUNTIME"
+
+    local direct_matrix_var="PERF_FIO_${profile_key}_DIRECT_MATRIX"
+    local direct_matrix="${!direct_matrix_var:-${PERF_FIO_DIRECT_MATRIX:-}}"
+    if [[ -z "$direct_override" && -z "${!profile_args_var:-}" && -n "$direct_matrix" ]]; then
+        local direct_value matrix_status=0
+        for direct_value in $direct_matrix; do
+            case "$direct_value" in
+                0|1) ;;
+                *)
+                    err "无效的 fio direct matrix 值: $direct_value (只支持 0 或 1)"
+                    return 1
+                    ;;
+            esac
+            run_fio_profile "${tool}-direct${direct_value}" "$mode" "$direct_value" "$profile_key" || matrix_status=1
+        done
+        return "$matrix_status"
+    fi
 
     rm -rf "$work_dir"
     mkdir -p "$work_dir"
@@ -914,7 +943,7 @@ run_fio_profile() {
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 1)"
                 ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE io_uring)"
                 iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
-                direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
+                direct="${direct_override:-$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)}"
                 runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
                 use_time_based=true
                 use_end_fsync=false
@@ -929,7 +958,7 @@ run_fio_profile() {
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 1)"
                 ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE io_uring)"
                 iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
-                direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
+                direct="${direct_override:-$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)}"
                 runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
                 use_time_based=true
                 use_end_fsync=false
@@ -943,7 +972,7 @@ run_fio_profile() {
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 4)"
                 ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE io_uring)"
                 iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
-                direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
+                direct="${direct_override:-$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)}"
                 runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
                 use_time_based=true
                 use_end_fsync=false
@@ -958,7 +987,7 @@ run_fio_profile() {
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 4)"
                 ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE io_uring)"
                 iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
-                direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
+                direct="${direct_override:-$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)}"
                 runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
                 use_time_based=true
                 use_end_fsync=false
@@ -973,7 +1002,7 @@ run_fio_profile() {
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 4)"
                 ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE io_uring)"
                 iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
-                direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
+                direct="${direct_override:-$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)}"
                 runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
                 use_time_based=true
                 use_end_fsync=false
@@ -988,7 +1017,7 @@ run_fio_profile() {
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 8)"
                 ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE io_uring)"
                 iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
-                direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
+                direct="${direct_override:-$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)}"
                 runtime="0"
                 use_time_based=false
                 use_end_fsync=true
@@ -1003,7 +1032,7 @@ run_fio_profile() {
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 8)"
                 ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE io_uring)"
                 iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
-                direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
+                direct="${direct_override:-$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)}"
                 runtime="0"
                 use_time_based=false
                 use_refill_buffers=true
@@ -1081,6 +1110,7 @@ rows = []
 if summary_path.exists():
     with summary_path.open(newline="") as f:
         rows = list(csv.DictReader(f, delimiter="\t"))
+summary_by_tool = {row.get("tool", ""): row for row in rows}
 
 lines = [
     "# BrewFS Perf Report",
@@ -1126,6 +1156,23 @@ if fio_json_paths:
         def fmt_ms_from_ns(value):
             return f"{num(value) / 1_000_000:.3f} ms"
 
+        def fmt_seconds_from_ms(value):
+            value = num(value)
+            if value <= 0:
+                return "-"
+            return f"{value / 1000.0:.3f} s"
+
+        def fmt_delta_ms(value):
+            value = num(value)
+            sign = "+" if value >= 0 else "-"
+            return f"{sign}{abs(value) / 1000.0:.3f} s"
+
+        def fmt_ratio(value):
+            value = num(value)
+            if value <= 0:
+                return "-"
+            return f"{value:.2f}x"
+
         def latency_percentile(op, pct):
             percentiles = op.get("clat_ns", {}).get("percentile", {})
             return percentiles.get(f"{pct:.6f}") or percentiles.get(str(pct))
@@ -1165,14 +1212,41 @@ if fio_json_paths:
                     return options
             return {}
 
+        def fio_runtime_accounting(data, tool_name, read, write):
+            jobs = data.get("jobs", [])
+            raw_job_runtime_ms = max((num(job.get("job_runtime")) for job in jobs), default=0)
+            active_runtime_ms = max(read["runtime_ms"], write["runtime_ms"])
+            wall_seconds = num(summary_by_tool.get(tool_name, {}).get("seconds"))
+            wall_ms = wall_seconds * 1000.0 if wall_seconds > 0 else 0
+            wall_vs_job_ms = wall_ms - raw_job_runtime_ms if raw_job_runtime_ms > 0 and wall_ms > 0 else 0
+            wall_vs_active_ms = wall_ms - active_runtime_ms if active_runtime_ms > 0 and wall_ms > 0 else 0
+            wall_job_ratio = wall_ms / raw_job_runtime_ms if raw_job_runtime_ms > 0 and wall_ms > 0 else 0
+            wall_active_ratio = wall_ms / active_runtime_ms if active_runtime_ms > 0 and wall_ms > 0 else 0
+            tail = "-"
+            if wall_vs_active_ms > 5000 or wall_active_ratio > 1.15:
+                tail = "close/flush tail"
+            elif raw_job_runtime_ms > wall_ms > 0:
+                tail = "fio job_runtime aggregates jobs"
+            return {
+                "raw_job_runtime_ms": raw_job_runtime_ms,
+                "active_runtime_ms": active_runtime_ms,
+                "wall_seconds": wall_seconds,
+                "wall_vs_job_ms": wall_vs_job_ms,
+                "wall_vs_active_ms": wall_vs_active_ms,
+                "wall_job_ratio": wall_job_ratio,
+                "wall_active_ratio": wall_active_ratio,
+                "tail": tail,
+            }
+
         lines.extend([
             "",
             "## Fio",
             "",
-            "| Tool | Workload | BS | Jobs | Read BW | Read IOPS | Write BW | Write IOPS | Read P99 | Write P99 | Raw |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |---: | ---: | ---: |",
+            "| Tool | Workload | Direct | BS | Jobs | Read BW | Read IOPS | Write BW | Write IOPS | Read P99 | Write P99 | Raw |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |---: | ---: | ---: |",
         ])
 
+        runtime_rows = []
         for fio_json_path in fio_json_paths:
             data = json.loads(fio_json_path.read_text())
             jobs = data.get("jobs", [])
@@ -1182,13 +1256,34 @@ if fio_json_paths:
             read = op_totals("read")
             write = op_totals("write")
             tool_name = fio_json_path.stem
+            runtime_rows.append((tool_name, options, fio_runtime_accounting(data, tool_name, read, write)))
             lines.append(
-                f"| {tool_name} | {options.get('rw', 'unknown')} | {options.get('bs', 'unknown')} | "
+                f"| {tool_name} | {options.get('rw', 'unknown')} | {options.get('direct', 'unknown')} | "
+                f"{options.get('bs', 'unknown')} | "
                 f"{options.get('numjobs', 'unknown')} | {fmt_rate(read['bw_bytes'])} | "
                 f"{fmt_iops(read['iops'])} | {fmt_rate(write['bw_bytes'])} | "
                 f"{fmt_iops(write['iops'])} | {fmt_ms_from_ns(read['p99_ns'])} | "
                 f"{fmt_ms_from_ns(write['p99_ns'])} | results/{fio_json_path.name} |"
             )
+
+        if runtime_rows:
+            lines.extend([
+                "",
+                "## Fio Runtime Accounting",
+                "",
+                "Use `active_io_runtime` for close/flush tail detection; fio `job_runtime_ms` can aggregate multiple jobs under group reporting.",
+                "",
+                "| Tool | Direct | Script wall | fio job_runtime | wall-job_runtime | wall/job_runtime | active_io_runtime | wall-active_io | wall/active_io | Tail marker |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+            ])
+            for tool_name, options, runtime in runtime_rows:
+                lines.append(
+                    f"| {tool_name} | {options.get('direct', 'unknown')} | "
+                    f"{runtime['wall_seconds']:.0f} s | {fmt_seconds_from_ms(runtime['raw_job_runtime_ms'])} | "
+                    f"{fmt_delta_ms(runtime['wall_vs_job_ms'])} | {fmt_ratio(runtime['wall_job_ratio'])} | "
+                    f"{fmt_seconds_from_ms(runtime['active_runtime_ms'])} | {fmt_delta_ms(runtime['wall_vs_active_ms'])} | "
+                    f"{fmt_ratio(runtime['wall_active_ratio'])} | {runtime['tail']} |"
+                )
     except Exception as exc:
         lines.extend(["", "## Fio", "", f"Failed to parse fio JSON: {exc}"])
 
@@ -1316,8 +1411,8 @@ if brewfs_stats_paths:
         "",
         "## BrewFS Stats",
         "",
-        "| Tool | Cache hit | FUSE read | FUSE write | Dirty | Read buffer | S3 ops | Details |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| Tool | Cache hit | FUSE read | FUSE write | Dirty | Live dirty | Recent pending | Recent uploaded | Read buffer | S3 ops | S3 avg latency | Details |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ])
 
     def parse_brewfs_stats(path):
@@ -1354,17 +1449,28 @@ if brewfs_stats_paths:
             "brewfs_writeback_dirty_bytes",
             metrics.get("brewfs_buffer_dirty_bytes", 0.0),
         )
+        live_dirty = metrics.get("brewfs_writeback_live_dirty_bytes", 0.0)
+        recent_pending = metrics.get("brewfs_writeback_recent_pending_upload_bytes", 0.0)
+        recent_uploaded = metrics.get("brewfs_writeback_recent_uploaded_bytes", 0.0)
         read_buffer = metrics.get(
             "brewfs_reader_buffer_bytes",
             metrics.get("brewfs_buffer_read_bytes", 0.0),
         )
         s3_get = metrics.get("brewfs_s3_get_ops_total", 0.0)
         s3_put = metrics.get("brewfs_s3_put_ops_total", 0.0)
+        s3_get_avg_ms = metrics.get("brewfs_s3_get_avg_lat_us", 0.0) / 1000.0
+        s3_put_avg_ms = metrics.get("brewfs_s3_put_avg_lat_us", 0.0) / 1000.0
+        range_gets = metrics.get("brewfs_read_range_gets_total", 0.0)
+        full_gets = metrics.get("brewfs_read_full_gets_total", 0.0)
+        bg_prefetch = metrics.get("brewfs_read_background_prefetch_total", 0.0)
         rel = path.relative_to(artifact_dir)
         lines.append(
             f"| {tool} | {hit_ratio * 100.0:.1f}% ({int(hits)}/{int(requests)}) | "
             f"{fmt_mib(fuse_read)} | {fmt_mib(fuse_write)} | {fmt_mib(dirty)} | "
-            f"{fmt_mib(read_buffer)} | GET={int(s3_get)}, PUT={int(s3_put)} | {rel} |"
+            f"{fmt_mib(live_dirty)} | {fmt_mib(recent_pending)} | {fmt_mib(recent_uploaded)} | "
+            f"{fmt_mib(read_buffer)} | GET={int(s3_get)}, PUT={int(s3_put)} | "
+            f"GET={s3_get_avg_ms:.2f} ms, PUT={s3_put_avg_ms:.2f} ms | "
+            f"{rel}; range={int(range_gets)}, full={int(full_gets)}, bg_prefetch={int(bg_prefetch)} |"
         )
 
 fuse_log = artifact_dir / "brewfs_fuse_ops.log"

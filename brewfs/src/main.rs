@@ -371,10 +371,12 @@ where
         cache.read_memory_bytes,
         cache.read_ssd_bytes,
         cache.cache_root.join("chunks"),
-    );
+    )
+    .with_integrity_mode(cache.verify_cache_checksum);
     let block_store_config = BlockStoreConfig {
         block_size: layout.block_size as usize,
         compression: cache.compression,
+        range_background_prefetch: cache.range_background_prefetch,
         ..BlockStoreConfig::default()
     };
     let bandwidth = BandwidthLimiter::new(&cache.bandwidth);

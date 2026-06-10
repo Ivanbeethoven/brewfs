@@ -10,6 +10,7 @@ use std::{
 };
 
 use crate::chunk::cache_health::DiskHealth;
+use crate::chunk::cache_integrity::CacheIntegrityMode;
 use anyhow::anyhow;
 use dashmap::DashSet;
 use dirs::cache_dir;
@@ -149,6 +150,13 @@ pub struct ChunksCacheConfig {
     /// Files are stored using SHA256 hash of the key for unique naming
     pub disk_storage_dir: Option<PathBuf>,
 
+    /// Integrity mode for on-disk clean block cache entries.
+    ///
+    /// Full uses CRC32C framing on every disk cache store/load. None stores raw
+    /// bytes for trusted local SSD profiles where avoiding checksum CPU is more
+    /// important than detecting local cache corruption.
+    pub disk_integrity_mode: CacheIntegrityMode,
+
     /// Weight for short window access frequency in promotion decisions
     ///
     /// **Range**: 0.0 - 1.0
@@ -198,6 +206,7 @@ impl Default for ChunksCacheConfig {
             medium_window_size: Duration::from_secs(60),
             max_access_entries: 100,
             disk_storage_dir: None,
+            disk_integrity_mode: CacheIntegrityMode::Full,
             short_window_weight: 0.75,
             medium_window_weight: 0.25,
             enable_adaptive_threshold: true,
@@ -217,6 +226,11 @@ impl ChunksCacheConfig {
             ..Default::default()
         }
     }
+
+    pub fn with_integrity_mode(mut self, mode: CacheIntegrityMode) -> Self {
+        self.disk_integrity_mode = mode;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -231,14 +245,23 @@ struct DiskStorage {
     read_sem: Arc<Semaphore>,
     /// Semaphore for write/store operations
     write_sem: Arc<Semaphore>,
+    integrity_mode: CacheIntegrityMode,
 }
 
 impl DiskStorage {
     pub async fn new<P: AsRef<Path>>(base_dir: P, max_bytes: u64) -> anyhow::Result<Self> {
+        Self::new_with_integrity(base_dir, max_bytes, CacheIntegrityMode::Full).await
+    }
+
+    pub async fn new_with_integrity<P: AsRef<Path>>(
+        base_dir: P,
+        max_bytes: u64,
+        integrity_mode: CacheIntegrityMode,
+    ) -> anyhow::Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
         debug!(
-            "Initializing disk storage at: {:?}, max_bytes: {}",
-            base_dir, max_bytes
+            "Initializing disk storage at: {:?}, max_bytes: {}, integrity_mode: {:?}",
+            base_dir, max_bytes, integrity_mode
         );
 
         if !base_dir.exists() {
@@ -263,6 +286,7 @@ impl DiskStorage {
             max_bytes,
             read_sem: Arc::new(Semaphore::new(DISK_CACHE_READ_CONCURRENCY)),
             write_sem: Arc::new(Semaphore::new(DISK_CACHE_WRITE_CONCURRENCY)),
+            integrity_mode,
         })
     }
 
@@ -356,8 +380,11 @@ impl DiskStorage {
         let filename = Self::key_to_filename(key);
         let filepath = self.base_dir.join(&filename);
 
-        // Compute CRC32C framing without copying the data block
-        let (header, checksums) = super::cache_integrity::compute_framing(&data);
+        // Compute CRC32C framing without copying the data block when enabled.
+        let (header, checksums) = match self.integrity_mode {
+            CacheIntegrityMode::Full => super::cache_integrity::compute_framing(&data),
+            CacheIntegrityMode::None => (Vec::new(), Vec::new()),
+        };
         let total_len = (header.len() + data.len() + checksums.len()) as u64;
 
         // Atomically reserve space and trigger eviction if over budget.
@@ -1575,7 +1602,12 @@ impl ChunksCache {
             .take()
             .unwrap_or_else(|| cache_dir().unwrap());
         debug!("Using cache directory: {:?}", cache_dir);
-        let disk_storage = DiskStorage::new(cache_dir, config.max_disk_bytes).await?;
+        let disk_storage = DiskStorage::new_with_integrity(
+            cache_dir,
+            config.max_disk_bytes,
+            config.disk_integrity_mode,
+        )
+        .await?;
 
         let hot_bytes = Arc::new(AtomicU64::new(0));
         let hot_bytes_evict = hot_bytes.clone();
@@ -2403,6 +2435,30 @@ mod tests {
         assert_eq!(config.base_promotion_threshold, 5.0);
         assert_eq!(config.short_window_weight, 0.75);
         assert_eq!(config.medium_window_weight, 0.25);
+    }
+
+    #[tokio::test]
+    async fn disk_storage_can_bypass_integrity_framing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = DiskStorage::new_with_integrity(
+            temp_dir.path(),
+            0,
+            crate::chunk::cache_integrity::CacheIntegrityMode::None,
+        )
+        .await
+        .unwrap();
+
+        storage.store("raw-cache-entry", b"abcdef").await.unwrap();
+
+        let filename = DiskStorage::key_to_filename("raw-cache-entry");
+        let raw = tokio::fs::read(temp_dir.path().join(filename))
+            .await
+            .unwrap();
+        assert_eq!(raw, b"abcdef");
+        assert_eq!(
+            storage.load("raw-cache-entry").await.unwrap(),
+            b"abcdef".to_vec()
+        );
     }
 
     #[test]

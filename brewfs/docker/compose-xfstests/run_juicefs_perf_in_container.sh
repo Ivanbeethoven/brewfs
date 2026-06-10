@@ -18,6 +18,17 @@ xfstests_dir="${XFSTESTS_DIR:-/opt/xfstests-dev}"
 artifact_root="${BREWFS_ARTIFACT_ROOT:-/artifacts}"
 artifact_dir="${BREWFS_ARTIFACT_DIR:-}"
 perf_tools="${PERF_TOOLS:-fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest}"
+jfs_compress="${JFS_COMPRESS:-none}"
+jfs_writeback="${JFS_WRITEBACK:-false}"
+jfs_buffer_size_mib="${JFS_BUFFER_SIZE_MIB:-}"
+jfs_cache_size_mib="${JFS_CACHE_SIZE_MIB:-}"
+jfs_max_uploads="${JFS_MAX_UPLOADS:-}"
+jfs_max_downloads="${JFS_MAX_DOWNLOADS:-}"
+jfs_open_cache="${JFS_OPEN_CACHE:-}"
+jfs_open_cache_limit="${JFS_OPEN_CACHE_LIMIT:-}"
+jfs_backup_meta="${JFS_BACKUP_META:-}"
+jfs_no_usage_report="${JFS_NO_USAGE_REPORT:-false}"
+jfs_cache_dir="${JFS_CACHE_DIR:-}"
 
 env_or_default() {
     local specific_var="$1"
@@ -34,6 +45,30 @@ env_or_default() {
 prepare_artifacts() {
     mkdir -p "$artifact_dir/results" "$artifact_dir/tools"
     printf 'tool\tstatus\tseconds\tlog\n' >"$artifact_dir/perf-summary.tsv"
+    write_juicefs_profile
+}
+
+truthy() {
+    case "${1:-}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+write_juicefs_profile() {
+    cat >"$artifact_dir/juicefs-profile.env" <<EOF
+JFS_COMPRESS=${jfs_compress}
+JFS_WRITEBACK=${jfs_writeback}
+JFS_BUFFER_SIZE_MIB=${jfs_buffer_size_mib}
+JFS_CACHE_SIZE_MIB=${jfs_cache_size_mib}
+JFS_MAX_UPLOADS=${jfs_max_uploads}
+JFS_MAX_DOWNLOADS=${jfs_max_downloads}
+JFS_OPEN_CACHE=${jfs_open_cache}
+JFS_OPEN_CACHE_LIMIT=${jfs_open_cache_limit}
+JFS_BACKUP_META=${jfs_backup_meta}
+JFS_NO_USAGE_REPORT=${jfs_no_usage_report}
+JFS_CACHE_DIR=${jfs_cache_dir}
+EOF
 }
 
 require_tool_bin() {
@@ -102,6 +137,7 @@ format_juicefs() {
         --bucket "$bucket_url" \
         --access-key "$access_key" \
         --secret-key "$secret_key" \
+        --compress "$jfs_compress" \
         "$meta_url" \
         myjfs
 
@@ -115,10 +151,26 @@ mount_juicefs() {
         umount "$mount_dir" 2>/dev/null || fusermount3 -u "$mount_dir" 2>/dev/null || true
     fi
 
-    info "挂载 JuiceFS: $mount_dir"
-    /usr/local/bin/juicefs mount "$meta_url" "$mount_dir" \
-        --enable-xattr \
-        -o allow_other &
+    local -a mount_args=("$meta_url" "$mount_dir" --enable-xattr)
+
+    if truthy "$jfs_writeback"; then
+        mount_args+=(--writeback)
+    fi
+    [[ -n "$jfs_buffer_size_mib" ]] && mount_args+=(--buffer-size="$jfs_buffer_size_mib")
+    [[ -n "$jfs_cache_size_mib" ]] && mount_args+=(--cache-size="$jfs_cache_size_mib")
+    [[ -n "$jfs_max_uploads" ]] && mount_args+=(--max-uploads="$jfs_max_uploads")
+    [[ -n "$jfs_max_downloads" ]] && mount_args+=(--max-downloads="$jfs_max_downloads")
+    [[ -n "$jfs_open_cache" ]] && mount_args+=(--open-cache="$jfs_open_cache")
+    [[ -n "$jfs_open_cache_limit" ]] && mount_args+=(--open-cache-limit="$jfs_open_cache_limit")
+    [[ -n "$jfs_backup_meta" ]] && mount_args+=(--backup-meta="$jfs_backup_meta")
+    [[ -n "$jfs_cache_dir" ]] && mount_args+=(--cache-dir="$jfs_cache_dir")
+    if truthy "$jfs_no_usage_report"; then
+        mount_args+=(--no-usage-report)
+    fi
+    mount_args+=(-o allow_other)
+
+    info "挂载 JuiceFS: /usr/local/bin/juicefs mount ${mount_args[*]}"
+    /usr/local/bin/juicefs mount "${mount_args[@]}" &
 
     local i=0
     for ((i = 0; i < 30; i++)); do
@@ -134,6 +186,39 @@ mount_juicefs() {
 }
 
 # ---- perf tool runners (same logic as brewfs) ----
+
+drop_kernel_page_cache_if_requested() {
+    if truthy "${PERF_FIO_DROP_CACHES:-false}" || truthy "${PERF_FIO_COLD_READ_DROP_CACHES:-false}"; then
+        info "请求 drop_caches 以降低页缓存影响"
+        sync || true
+        if ! sh -c 'echo 3 > /proc/sys/vm/drop_caches' >/dev/null 2>&1; then
+            err "drop_caches 失败；继续测试，但结果可能仍受页缓存影响"
+        fi
+    fi
+}
+
+clear_juicefs_cache_if_requested() {
+    if truthy "${PERF_FIO_COLD_READ:-false}" || truthy "${PERF_FIO_COLD_READ_CLEAR_CACHE:-false}"; then
+        local root="${jfs_cache_dir:-}"
+        if [[ -n "$root" && "$root" == /* && "$root" != "/" ]]; then
+            info "清理 JuiceFS 本地 cache dir: $root"
+            rm -rf -- "$root"
+        else
+            err "跳过 JuiceFS cache dir 清理，路径不安全: ${root:-<empty>}"
+        fi
+    fi
+}
+
+remount_juicefs_for_fio_profile() {
+    local tool="$1"
+
+    info "为 fio cold-read 重挂载 JuiceFS: $tool"
+    sync || true
+    cleanup
+    clear_juicefs_cache_if_requested
+    drop_kernel_page_cache_if_requested
+    mount_juicefs
+}
 
 run_dirstress() {
     local bin="$xfstests_dir/src/dirstress"
@@ -453,6 +538,13 @@ run_fio_profile() {
 
     if [[ "$needs_prefill" == true ]]; then
         prepare_fio_dataset "$tool" "$work_dir" "$name" "$size" "$direct" "$numjobs" "$bs" "$ioengine" "$iodepth" || return $?
+        if truthy "${PERF_FIO_COLD_READ:-false}" || truthy "${PERF_FIO_PREFILL_DRAIN:-false}"; then
+            info "同步 fio 预填充数据集: $tool"
+            sync
+        fi
+        if truthy "${PERF_FIO_COLD_READ:-false}" || truthy "${PERF_FIO_PREFILL_REMOUNT:-false}"; then
+            remount_juicefs_for_fio_profile "$tool"
+        fi
     fi
 
     local lat_log_prefix="$artifact_dir/results/${tool}_lat"

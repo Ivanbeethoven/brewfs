@@ -74,6 +74,112 @@ cleanly.
 - **Read request merging**: Merge adjacent small reads into single S3 range
   requests
 
+## Negative Result: Writeback-Pending-Gated Range Prefetch
+
+2026-06-10 tested a prototype that skipped range-read-triggered full-block
+background prefetch when commit-before-upload pending bytes exceeded a limit.
+The intent was to keep read tail benefits from normal background prefetch while
+reducing object-store/cache contention during heavy randrw writeback.
+
+Test command shape:
+
+```bash
+PERF_FIO_RANDRW_RUNTIME=20 \
+PERF_FIO_RANDRW_SIZE=512m \
+PERF_FIO_PREFILL_DRAIN_TIMEOUT_SECS=600 \
+BREWFS_COMPRESSION=none \
+BREWFS_PREFETCH_ENABLED=true \
+bash docker/compose-xfstests/run_redis_perf.sh \
+  --writeback-throughput-profile --tools "fio-randrw"
+```
+
+Results:
+
+| Variant | Read BW | Write BW | Read P99 | Write P99 | Script Wall | Notes |
+|---------|---------|----------|----------|-----------|-------------|-------|
+| No pending gate | 719.57 MiB/s | 328.80 MiB/s | 54.264 ms | 120.062 ms | 113s | Baseline for this code state |
+| Pending gate 1GiB | 117.78 MiB/s | 53.24 MiB/s | 54.788 ms | 53.215 ms | 141s | Severe throughput regression; active IO stretched to 136.9s |
+| Pending gate 512MiB | 751.47 MiB/s | 342.56 MiB/s | 53.740 ms | 40.108 ms | 128s | Throughput ok, but close/flush tail worsened; gate did not trigger in final stats |
+
+Conclusion: pending-byte-gated range background prefetch is not a valid default
+optimization. It was rolled back. The next write-path attempt should target the
+actual tail driver shown by the reports: high PUT/object count and recent pending
+upload drain time. Prefer small-write coalescing, upload object-count accounting,
+and tighter writeback drain instrumentation over read-prefetch gating.
+
+## Result: Nonblocking Range Background Prefetch Admission
+
+2026-06-10 implemented a low-risk object/read-cache change: range-triggered
+full-block background prefetch now uses a nonblocking permit acquisition. When
+all range prefetch permits are busy, the prefetch is dropped and counted instead
+of queueing behind existing background GETs. This keeps the existing prefetch
+benefit when capacity is available, while preventing background work from
+building an unbounded tail under pressure.
+
+Targeted TDD:
+
+- RED: `cargo test -p brewfs test_background_range_prefetch_drops_when_limit_saturated --lib`
+  failed because `read_background_prefetch_dropped` stayed at 0 while all 8
+  permits were held.
+- GREEN: the same test passes after switching the permit acquisition to
+  `try_acquire_owned()`.
+- Regression checks:
+  - `cargo test -p brewfs test_background_range_prefetch_is_serialized --lib`
+  - `cargo test -p brewfs test_small_range_read_prefetches_full_block_in_background --lib`
+  - `cargo test -p brewfs test_intelligent_read_strategy --lib`
+  - `cargo fmt --all --check`
+  - `bash -n` for the compose and tools/perf scripts
+
+Compose validation command shape:
+
+```bash
+PERF_FIO_RANDRW_RUNTIME=20 \
+PERF_FIO_RANDRW_SIZE=512m \
+PERF_FIO_PREFILL_DRAIN_TIMEOUT_SECS=600 \
+BREWFS_COMPRESSION=none \
+BREWFS_PREFETCH_ENABLED=true \
+BREWFS_UPLOAD_CONCURRENCY=32 \
+bash docker/compose-xfstests/run_redis_perf.sh \
+  --writeback-throughput-profile --tools "fio-randrw"
+```
+
+Compose artifact: `docker/compose-xfstests/artifacts/perf-run-1781112437-22526`.
+
+| Variant | Read BW | Write BW | Read P99 | Write P99 | Script Wall | Notes |
+|---------|---------|----------|----------|-----------|-------------|-------|
+| Prior default-32 baseline | 127.11 MiB/s | 57.76 MiB/s | 52.691 ms | 26.083 ms | 122s | `perf-run-1781110789-10279` |
+| Nonblocking prefetch permits | 127.11 MiB/s | 57.88 MiB/s | 58.982 ms | 22.413 ms | 125s | No obvious throughput/write-tail regression; dropped=0 in this run |
+
+The compose run did not saturate range prefetch permits
+(`brewfs_read_background_prefetch_dropped_total=0`), so it mainly proves the
+change is neutral for this randrw profile. It does not prove a large win for the
+default workload.
+
+Tools/perf quick validation:
+
+```bash
+PERF_FIO_WORKLOADS="randrw" \
+PERF_FIO_DIRECT=0 \
+PERF_RECORD_FREQ=19 \
+BREWFS_COMPRESSION=none \
+BREWFS_PREFETCH_ENABLED=true \
+BREWFS_UPLOAD_CONCURRENCY=32 \
+bash tools/perf/run_perf.sh --no-build --quick --skip-oncpu --skip-offcpu
+```
+
+Tools/perf artifact: `tools/perf/results/20260610-173023`.
+
+| Variant | Read BW | Write BW | Read P99 | Read P99.9 | Write P99 | Write P99.9 |
+|---------|---------|----------|----------|------------|-----------|-------------|
+| Prior quick baseline | 637.5 MiB/s | 289.7 MiB/s | 29.75 ms | 2.20 s | 893.39 ms | 2.40 s |
+| Nonblocking prefetch permits | 768.0 MiB/s | 343.9 MiB/s | 28.70 ms | 320.86 ms | 943.72 ms | 2.09 s |
+
+Conclusion: keep this change. It fixes a real admission-control bug and shows
+no meaningful compose regression. The next high-impact bottleneck remains write
+buffer/backpressure and committed-but-not-uploaded slice drain: tools/perf still
+flags write P99 around 944ms and identifies `src/vfs/io/writer.rs` as the next
+target.
+
 ## Measurement
 
 Run benchmarks before/after each optimization:

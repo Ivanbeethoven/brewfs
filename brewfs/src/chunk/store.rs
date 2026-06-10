@@ -322,6 +322,8 @@ pub struct BlockStoreConfig {
     pub page_size: usize,
     /// Maximum number of pages in the read cache (default: 4096 → 256MB with 64KB pages).
     pub page_cache_capacity: usize,
+    /// Whether a page-cache range miss should schedule a best-effort full-block prefetch.
+    pub range_background_prefetch: bool,
     /// Block compression algorithm for storage and transfer.
     /// Blocks are compressed before S3 upload and decompressed on read.
     pub compression: Compression,
@@ -334,6 +336,7 @@ impl Default for BlockStoreConfig {
             range_read_threshold: 0.25,  // 25% = 1MB for 4MB blocks
             page_size: 64 * 1024,        // 64KB
             page_cache_capacity: 4096,   // 4096 pages × 64KB = 256MB
+            range_background_prefetch: true,
             compression: Compression::Lz4,
         }
     }
@@ -534,7 +537,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                 return;
             }
 
-            let Ok(_permit) = prefetch_limit.acquire_owned().await else {
+            let Ok(_permit) = prefetch_limit.try_acquire_owned() else {
                 object_metrics.record_read_background_prefetch_dropped();
                 return;
             };
@@ -805,6 +808,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             }
             if range_missed
                 && total_read > 0
+                && self.config.range_background_prefetch
                 && !self.try_promote_page_cache_to_block_cache(key).await
             {
                 self.prefetch_full_block_background(key, key_str);
@@ -1172,6 +1176,51 @@ mod tests {
             backend.get_stats().get_object_calls,
             1,
             "Non-zero small read should trigger one background full-block prefetch"
+        );
+
+        let disabled_backend = MockBackend::new();
+        let disabled_client = ObjectClient::new(disabled_backend.clone());
+        let disabled_config = BlockStoreConfig {
+            block_size: 4 * 1024 * 1024,
+            range_read_threshold: 0.25,
+            compression: Compression::None,
+            range_background_prefetch: false,
+            ..Default::default()
+        };
+        let disabled_cache_dir = tempfile::tempdir()?;
+        let disabled_store = ObjectBlockStore::new_with_configs_async(
+            disabled_client,
+            ChunksCacheConfig::with_budgets(
+                16 * 1024 * 1024,
+                16 * 1024 * 1024,
+                disabled_cache_dir.path().to_path_buf(),
+            ),
+            disabled_config,
+        )
+        .await?;
+
+        let mut disabled_range_buf = vec![0u8; 512 * 1024];
+        disabled_store
+            .read_range((42, 4), 64 * 1024, &mut disabled_range_buf)
+            .await?;
+        sleep(Duration::from_millis(50)).await;
+
+        let disabled_stats = disabled_backend.get_stats();
+        let disabled_snapshot = disabled_store
+            .object_store_metrics()
+            .expect("ObjectBlockStore exposes object metrics")
+            .snapshot();
+        assert_eq!(
+            disabled_stats.get_object_range_calls, 8,
+            "Disabled background prefetch should still serve the request via page ranges"
+        );
+        assert_eq!(
+            disabled_stats.get_object_calls, 0,
+            "Disabled background prefetch should not issue a full-object GET"
+        );
+        assert_eq!(
+            disabled_snapshot.read_background_prefetches, 0,
+            "Disabled background prefetch should not schedule prefetch work"
         );
 
         backend.reset_stats();
@@ -2173,6 +2222,135 @@ mod tests {
         );
         assert_eq!(backend.get_object_calls.load(Ordering::SeqCst), 2);
         assert_eq!(backend.current_full_gets.load(Ordering::SeqCst), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_background_range_prefetch_drops_when_limit_saturated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::cadapter::client::{ObjectBackend, ObjectClient};
+        use async_trait::async_trait;
+        use std::{
+            collections::HashMap,
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+        use tokio::time::Duration;
+
+        #[derive(Clone, Default)]
+        struct MockBackend {
+            data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            get_object_calls: Arc<AtomicUsize>,
+            get_object_range_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl ObjectBackend for MockBackend {
+            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), data.to_vec());
+                Ok(())
+            }
+
+            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                self.get_object_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.data.lock().unwrap().get(key).cloned())
+            }
+
+            async fn get_object_range(
+                &self,
+                key: &str,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                self.get_object_range_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(data) = self.data.lock().unwrap().get(key) {
+                    let offset = offset as usize;
+                    let end = (offset + buf.len()).min(data.len());
+                    if offset < data.len() {
+                        let copy_len = end - offset;
+                        buf[..copy_len].copy_from_slice(&data[offset..end]);
+                        return Ok(copy_len);
+                    }
+                }
+                Ok(0)
+            }
+
+            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
+                Ok("test_etag".to_string())
+            }
+
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                self.data.lock().unwrap().remove(key);
+                Ok(())
+            }
+        }
+
+        let backend = MockBackend::default();
+        let block: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        backend
+            .data
+            .lock()
+            .unwrap()
+            .insert("chunks/92/0".to_string(), block);
+
+        let cache_dir = tempfile::tempdir()?;
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(backend.clone()),
+            ChunksCacheConfig::with_budgets(
+                16 * 1024 * 1024,
+                16 * 1024 * 1024,
+                cache_dir.path().to_path_buf(),
+            ),
+            BlockStoreConfig {
+                block_size: 4 * 1024 * 1024,
+                range_read_threshold: 0.25,
+                compression: Compression::None,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let _permits = store
+            .range_prefetch_limit
+            .clone()
+            .acquire_many_owned(8)
+            .await?;
+
+        let mut buf = vec![0u8; 4096];
+        store.read_range((92, 0), 1024, &mut buf).await?;
+        assert_eq!(backend.get_object_range_calls.load(Ordering::SeqCst), 1);
+
+        for _ in 0..20 {
+            let snapshot = store
+                .object_store_metrics()
+                .expect("ObjectBlockStore exposes object metrics")
+                .snapshot();
+            if snapshot.read_background_prefetch_dropped >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let snapshot = store
+            .object_store_metrics()
+            .expect("ObjectBlockStore exposes object metrics")
+            .snapshot();
+        assert_eq!(snapshot.read_background_prefetches, 1);
+        assert_eq!(
+            snapshot.read_background_prefetch_dropped, 1,
+            "background prefetch should be dropped immediately when all permits are busy"
+        );
+        assert_eq!(
+            backend.get_object_calls.load(Ordering::SeqCst),
+            0,
+            "dropped background prefetch should not issue a full-object GET"
+        );
 
         Ok(())
     }

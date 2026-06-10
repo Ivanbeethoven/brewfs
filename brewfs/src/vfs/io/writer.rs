@@ -37,7 +37,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{interval, timeout};
 use tracing::{Instrument, warn};
@@ -1037,6 +1037,8 @@ struct Shared<B, M> {
     recent_pending_upload: Arc<RecentPendingUploadState>,
     /// First durable writeback error observed by background upload/commit.
     writeback_error: ParkingMutex<Option<String>>,
+    /// Per-writer limit for concurrently dispatched block uploads.
+    upload_limit: Arc<Semaphore>,
     /// The last user handle was released, but writeback overlay may still be
     /// needed until committed slices finish uploading and age out.
     released: AtomicBool,
@@ -1072,6 +1074,7 @@ where
         memory_budget: Option<MemoryBudget>,
         recent_pending_upload: Arc<RecentPendingUploadState>,
     ) -> Self {
+        let upload_concurrency = config.upload_concurrency.max(1);
         Self {
             inode,
             config,
@@ -1091,6 +1094,7 @@ where
             last_flushed_gen: AtomicU64::new(0),
             recent_pending_upload,
             writeback_error: ParkingMutex::new(None),
+            upload_limit: Arc::new(Semaphore::new(upload_concurrency)),
             released: AtomicBool::new(false),
         }
     }
@@ -1906,11 +1910,12 @@ where
                         let upload = async {
                             backoff(UPLOAD_MAX_RETRIES, || async {
                                 match uploader
-                                    .write_at_vectored_with_priority(
+                                    .write_at_vectored_with_priority_and_limit(
                                         slice_id,
                                         batch_offset.into(),
                                         &all_chunks,
                                         upload_priority,
+                                        Some(shared2.upload_limit.clone()),
                                     )
                                     .await
                                 {

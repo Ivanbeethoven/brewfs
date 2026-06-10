@@ -22,6 +22,8 @@ usage() {
   - 测试产物输出到: $ARTIFACTS_DIR/perf-run-*
 
 选项:
+  --writeback-throughput-profile
+                             启用 JuiceFS 对齐吞吐 profile（writeback, buffer=8192MiB, cache=4096MiB, upload/download concurrency=4/16, open-cache=1s/65536, compression=none, backup-meta=0, fio prefill sync+remount）
   --tools "<tool...>"        指定压力工具列表，默认: "fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
   --keep                     结束后不执行 compose down（便于调试）
   -h, --help                 显示帮助
@@ -33,6 +35,9 @@ usage() {
   PERF_DIRSTRESS_ARGS PERF_DIRPERF_ARGS PERF_METAPERF_ARGS PERF_LOOPTEST_ARGS
   PERF_FIO_ARGS PERF_FIO_RUNTIME PERF_FIO_SIZE PERF_FIO_BS PERF_FIO_NUMJOBS
   PERF_FIO_{SEQREAD,SEQWRITE,RANDREAD,RANDWRITE,RANDRW,BIGREAD,BIGWRITE}_{ARGS,BS,SIZE,NUMJOBS,IOENGINE,IODEPTH,DIRECT,RUNTIME}
+  PERF_FIO_COLD_READ PERF_FIO_PREFILL_DRAIN PERF_FIO_PREFILL_REMOUNT PERF_FIO_DROP_CACHES PERF_FIO_COLD_READ_DROP_CACHES PERF_FIO_COLD_READ_CLEAR_CACHE
+  JFS_COMPRESS JFS_WRITEBACK JFS_BUFFER_SIZE_MIB JFS_CACHE_SIZE_MIB JFS_MAX_UPLOADS JFS_MAX_DOWNLOADS
+  JFS_OPEN_CACHE JFS_OPEN_CACHE_LIMIT JFS_BACKUP_META JFS_NO_USAGE_REPORT JFS_CACHE_DIR
   PERF_LOG_TO_CONSOLE=true 可恢复压测工具日志输出到终端（默认关闭）
 EOF
     exit 0
@@ -48,10 +53,15 @@ require_value() {
 }
 
 KEEP=false
+WRITEBACK_THROUGHPUT_PROFILE=false
 PERF_TOOLS_VALUE="fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
 
 while [[ $# -gt 0 ]]; do
     case "${1:-}" in
+        --writeback-throughput-profile)
+            WRITEBACK_THROUGHPUT_PROFILE=true
+            shift
+            ;;
         --tools)
             require_value "$1" "${2:-}"
             PERF_TOOLS_VALUE="${2:-}"
@@ -70,6 +80,23 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "$WRITEBACK_THROUGHPUT_PROFILE" == true ]]; then
+    export JFS_COMPRESS="${JFS_COMPRESS:-none}"
+    export JFS_WRITEBACK="${JFS_WRITEBACK:-true}"
+    export JFS_BUFFER_SIZE_MIB="${JFS_BUFFER_SIZE_MIB:-8192}"
+    export JFS_CACHE_SIZE_MIB="${JFS_CACHE_SIZE_MIB:-4096}"
+    export JFS_MAX_UPLOADS="${JFS_MAX_UPLOADS:-4}"
+    export JFS_MAX_DOWNLOADS="${JFS_MAX_DOWNLOADS:-16}"
+    export JFS_OPEN_CACHE="${JFS_OPEN_CACHE:-1s}"
+    export JFS_OPEN_CACHE_LIMIT="${JFS_OPEN_CACHE_LIMIT:-65536}"
+    export JFS_BACKUP_META="${JFS_BACKUP_META:-0}"
+    export JFS_NO_USAGE_REPORT="${JFS_NO_USAGE_REPORT:-true}"
+    export JFS_CACHE_DIR="${JFS_CACHE_DIR:-/var/lib/juicefs/cache}"
+    export PERF_FIO_PREFILL_DRAIN="${PERF_FIO_PREFILL_DRAIN:-true}"
+    export PERF_FIO_PREFILL_REMOUNT="${PERF_FIO_PREFILL_REMOUNT:-true}"
+    export PERF_FIO_COLD_READ_CLEAR_CACHE="${PERF_FIO_COLD_READ_CLEAR_CACHE:-true}"
+fi
 
 mkdir -p "$ARTIFACTS_DIR"
 
@@ -206,6 +233,23 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e PERF_FIO_IODEPTH \
     -e PERF_FIO_DIRECT \
     -e PERF_FIO_RUNTIME \
+    -e PERF_FIO_COLD_READ \
+    -e PERF_FIO_PREFILL_DRAIN \
+    -e PERF_FIO_PREFILL_REMOUNT \
+    -e PERF_FIO_DROP_CACHES \
+    -e PERF_FIO_COLD_READ_DROP_CACHES \
+    -e PERF_FIO_COLD_READ_CLEAR_CACHE \
+    -e JFS_COMPRESS \
+    -e JFS_WRITEBACK \
+    -e JFS_BUFFER_SIZE_MIB \
+    -e JFS_CACHE_SIZE_MIB \
+    -e JFS_MAX_UPLOADS \
+    -e JFS_MAX_DOWNLOADS \
+    -e JFS_OPEN_CACHE \
+    -e JFS_OPEN_CACHE_LIMIT \
+    -e JFS_BACKUP_META \
+    -e JFS_NO_USAGE_REPORT \
+    -e JFS_CACHE_DIR \
     -e PERF_LOG_TO_CONSOLE \
     perf
 container_status=$?

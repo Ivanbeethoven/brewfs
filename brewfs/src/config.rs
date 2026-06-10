@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 use crate::chunk::bandwidth::BandwidthConfig;
+use crate::chunk::cache_integrity::CacheIntegrityMode;
 use crate::chunk::compress::Compression;
 use crate::chunk::layout::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
 use crate::vfs::cache::config::{CacheConfig as VfsCacheConfig, WriteBackMode};
@@ -17,8 +18,29 @@ fn default_fuse_workers() -> usize {
     1
 }
 
+fn long_version() -> &'static str {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        "\ncommit: ",
+        env!("BREWFS_GIT_COMMIT"),
+        "\ncommit_short: ",
+        env!("BREWFS_GIT_COMMIT_SHORT"),
+        "\nbranch: ",
+        env!("BREWFS_GIT_BRANCH"),
+        "\ndirty: ",
+        env!("BREWFS_GIT_DIRTY"),
+        "\nbuilt: ",
+        env!("BREWFS_BUILD_TIMESTAMP")
+    )
+}
+
 #[derive(Parser)]
-#[command(name = "brewfs", version, about = "BrewFS FUSE CLI")]
+#[command(
+    name = "brewfs",
+    version,
+    long_version = long_version(),
+    about = "BrewFS FUSE CLI"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub cmd: Command,
@@ -247,12 +269,15 @@ pub struct CacheFileConfig {
     pub write_ssd_bytes: Option<u64>,
     pub dirty_slice_target_size: Option<u64>,
     pub dirty_slice_max_age_ms: Option<u64>,
+    pub upload_concurrency: Option<usize>,
     pub prefetch_enabled: Option<bool>,
     pub prefetch_max_bytes: Option<u64>,
     pub prefetch_concurrency: Option<usize>,
+    pub range_background_prefetch: Option<bool>,
     pub memory_budget_bytes: Option<u64>,
     pub compression: Option<String>,
     pub zstd_level: Option<i32>,
+    pub verify_cache_checksum: Option<String>,
     pub writeback_mode: Option<String>,
     pub writeback_persist_sync: Option<bool>,
     pub bandwidth: Option<BandwidthFileConfig>,
@@ -429,6 +454,9 @@ impl CacheFileConfig {
         if let Some(dirty_slice_max_age_ms) = self.dirty_slice_max_age_ms {
             cache.dirty_slice_max_age_ms = dirty_slice_max_age_ms;
         }
+        if let Some(upload_concurrency) = self.upload_concurrency {
+            cache.upload_concurrency = upload_concurrency.max(1);
+        }
         if let Some(prefetch_enabled) = self.prefetch_enabled {
             cache.prefetch_enabled = prefetch_enabled;
         }
@@ -438,11 +466,17 @@ impl CacheFileConfig {
         if let Some(prefetch_concurrency) = self.prefetch_concurrency {
             cache.prefetch_concurrency = prefetch_concurrency;
         }
+        if let Some(range_background_prefetch) = self.range_background_prefetch {
+            cache.range_background_prefetch = range_background_prefetch;
+        }
         if let Some(memory_budget_bytes) = self.memory_budget_bytes {
             cache.memory_budget_bytes = memory_budget_bytes;
         }
         if let Some(compression) = self.compression {
             cache.compression = parse_compression(&compression, self.zstd_level)?;
+        }
+        if let Some(verify_cache_checksum) = self.verify_cache_checksum {
+            cache.verify_cache_checksum = parse_cache_integrity_mode(&verify_cache_checksum)?;
         }
         if let Some(writeback_mode) = self.writeback_mode {
             cache.writeback_mode = parse_writeback_mode(&writeback_mode)?;
@@ -458,6 +492,20 @@ impl CacheFileConfig {
         }
 
         Ok(cache)
+    }
+}
+
+fn parse_cache_integrity_mode(value: &str) -> anyhow::Result<CacheIntegrityMode> {
+    match value.to_ascii_lowercase().replace('-', "_").as_str() {
+        "none" | "off" | "false" | "disable" | "disabled" => Ok(CacheIntegrityMode::None),
+        "full" | "on" | "true" | "enable" | "enabled" | "crc32c" | "extend" | "shrink" => {
+            Ok(CacheIntegrityMode::Full)
+        }
+        other => {
+            anyhow::bail!(
+                "unsupported cache.verify_cache_checksum '{other}' (expected none or full)"
+            )
+        }
     }
 }
 
@@ -490,7 +538,9 @@ fn parse_writeback_mode(value: &str) -> anyhow::Result<WriteBackMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use clap::Parser;
+    use clap::error::ErrorKind;
 
     fn empty_mount_args(config: Option<PathBuf>, mount_point: Option<PathBuf>) -> MountArgs {
         MountArgs {
@@ -550,6 +600,30 @@ mod tests {
             }
             other => panic!("expected mount command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn version_output_includes_build_commit() {
+        let mut cmd = Cli::command();
+        let err = cmd
+            .try_get_matches_from_mut(["brewfs", "--version"])
+            .expect_err("--version should exit through clap DisplayVersion");
+        assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+
+        let version = err.to_string();
+        assert!(
+            version.starts_with(&format!("brewfs {}\n", env!("CARGO_PKG_VERSION"))),
+            "version output should start with package version, got: {version}"
+        );
+
+        assert!(
+            version.contains("commit:"),
+            "version output should include git commit metadata, got: {version}"
+        );
+        assert!(
+            version.contains(env!("BREWFS_GIT_COMMIT")),
+            "version output should include concrete git commit, got: {version}"
+        );
     }
 
     #[test]
@@ -666,12 +740,15 @@ cache:
   write_ssd_bytes: 4194304
   dirty_slice_target_size: 524288
   dirty_slice_max_age_ms: 250
+  upload_concurrency: 7
   prefetch_enabled: false
   prefetch_max_bytes: 8388608
   prefetch_concurrency: 7
+  range_background_prefetch: false
   memory_budget_bytes: 9437184
   compression: zstd
   zstd_level: 5
+  verify_cache_checksum: none
   writeback_mode: upload_before_commit
   writeback_persist_sync: false
   bandwidth:
@@ -691,11 +768,14 @@ cache:
         assert_eq!(config.cache.write_ssd_bytes, 4194304);
         assert_eq!(config.cache.dirty_slice_target_size, 524288);
         assert_eq!(config.cache.dirty_slice_max_age_ms, 250);
+        assert_eq!(config.cache.upload_concurrency, 7);
         assert!(!config.cache.prefetch_enabled);
         assert_eq!(config.cache.prefetch_max_bytes, 8388608);
         assert_eq!(config.cache.prefetch_concurrency, 7);
+        assert!(!config.cache.range_background_prefetch);
         assert_eq!(config.cache.memory_budget_bytes, 9437184);
         assert_eq!(config.cache.compression, Compression::Zstd(5));
+        assert_eq!(config.cache.verify_cache_checksum, CacheIntegrityMode::None);
         assert_eq!(
             config.cache.writeback_mode,
             WriteBackMode::UploadBeforeCommit

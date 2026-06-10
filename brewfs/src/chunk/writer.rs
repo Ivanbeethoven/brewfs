@@ -8,6 +8,7 @@ use crate::utils::NumCastExt;
 use crate::vfs::backend::Backend;
 use anyhow::Result;
 use bytes::Bytes;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use tokio::sync::Semaphore;
 
@@ -145,6 +146,18 @@ where
         chunks: &[Bytes],
         priority: UploadPriority,
     ) -> Result<()> {
+        self.write_at_vectored_with_priority_and_limit(slice_id, offset, chunks, priority, None)
+            .await
+    }
+
+    pub(crate) async fn write_at_vectored_with_priority_and_limit(
+        &self,
+        slice_id: u64,
+        offset: SliceOffset,
+        chunks: &[Bytes],
+        priority: UploadPriority,
+        local_upload_limit: Option<Arc<Semaphore>>,
+    ) -> Result<()> {
         let total_len = chunks.iter().map(|c| c.len()).sum::<usize>();
 
         let mut cursor = ChunkCursor::new(chunks);
@@ -167,9 +180,21 @@ where
         // foreground reads keep capacity. Compaction uses upload_permit() directly.
         let futures: Vec<_> = futures
             .into_iter()
-            .map(|f| async move {
-                let _p = upload_permit_for(priority).await;
-                f.await
+            .map(|f| {
+                let local_upload_limit = local_upload_limit.clone();
+                async move {
+                    let _local_permit = match local_upload_limit {
+                        Some(limit) => Some(
+                            limit
+                                .acquire_owned()
+                                .await
+                                .expect("local upload semaphore closed"),
+                        ),
+                        None => None,
+                    };
+                    let _p = upload_permit_for(priority).await;
+                    f.await
+                }
             })
             .collect();
         for res in futures_util::future::join_all(futures).await {
@@ -185,15 +210,17 @@ mod tests {
     use crate::chunk::SliceDesc;
     use crate::chunk::layout::ChunkLayout;
     use crate::chunk::reader::DataFetcher;
-    use crate::chunk::store::InMemoryBlockStore;
+    use crate::chunk::store::{BlockKey, InMemoryBlockStore};
     use crate::meta::SLICE_ID_KEY;
     use crate::meta::factory::create_meta_store_from_url;
     use crate::vfs::backend::Backend;
+    use async_trait::async_trait;
     use bytes::Bytes;
     use std::sync::Arc;
     use std::sync::LazyLock as StdLazyLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{Duration, sleep, timeout};
 
     static UPLOAD_PERMIT_TEST_LOCK: StdLazyLock<Mutex<()>> = StdLazyLock::new(|| Mutex::new(()));
 
@@ -210,6 +237,62 @@ mod tests {
             *b = seed.wrapping_add(i as u8);
         }
         buf
+    }
+
+    #[derive(Default)]
+    struct SlowStore {
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+    }
+
+    impl SlowStore {
+        fn max_in_flight(&self) -> usize {
+            self.max_in_flight.load(Ordering::SeqCst)
+        }
+
+        fn record_start(&self) {
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut observed = self.max_in_flight.load(Ordering::SeqCst);
+            while current > observed {
+                match self.max_in_flight.compare_exchange(
+                    observed,
+                    current,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => observed = next,
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl BlockStore for SlowStore {
+        async fn write_fresh_range(
+            &self,
+            _key: BlockKey,
+            _offset: u64,
+            data: &[u8],
+        ) -> anyhow::Result<u64> {
+            self.record_start();
+            sleep(Duration::from_millis(20)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(data.len() as u64)
+        }
+
+        async fn read_range(
+            &self,
+            _key: BlockKey,
+            _offset: u64,
+            _buf: &mut [u8],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn delete_range(&self, _key: BlockKey, _block_count: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -296,6 +379,37 @@ mod tests {
         fetcher.prepare_slices().await.unwrap();
         let out = fetcher.read_at(offset.into(), data.len()).await.unwrap();
         assert_eq!(out, data);
+    }
+
+    #[tokio::test]
+    async fn test_data_uploader_honors_local_upload_limit() {
+        let layout = small_layout();
+        let store = Arc::new(SlowStore::default());
+        let meta = create_meta_store_from_url("sqlite::memory:")
+            .await
+            .unwrap()
+            .layer();
+        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
+        let uploader = DataUploader::new(layout, backend.as_ref());
+        let payload = Bytes::from(vec![1u8; layout.block_size as usize * 4]);
+        let local_limit = Arc::new(Semaphore::new(1));
+
+        uploader
+            .write_at_vectored_with_priority_and_limit(
+                202,
+                0u64.into(),
+                &[payload],
+                UploadPriority::Foreground,
+                Some(local_limit),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.max_in_flight(),
+            1,
+            "local upload limit should bound concurrent block PUTs"
+        );
     }
 
     #[tokio::test]

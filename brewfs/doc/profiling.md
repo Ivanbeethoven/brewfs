@@ -186,13 +186,25 @@ cd project/brewfs
 ./tools/perf/run_perf.sh --quick      # 短时间压测（15s）
 ./tools/perf/run_perf.sh --no-build   # 跳过编译
 ./tools/perf/run_perf.sh --skip-offcpu # 跳过 off-CPU 分析
+PERF_FIO_WORKLOADS="randrw" PERF_FIO_DIRECT=1 ./tools/perf/run_perf.sh --quick
 ```
 
 输出产物：
-- `/tmp/brewfs-perf/flame/oncpu-flame.svg` — On-CPU 火焰图
-- `/tmp/brewfs-perf/flame/offcpu-flame.svg` — Off-CPU 火焰图
-- `/tmp/brewfs-perf/results/fio-*.json` — fio 原始数据
-- `/tmp/brewfs-perf/llm-report.txt` — LLM 可读的分析报告
+- `tools/perf/results/<timestamp>/flame/oncpu-flame.svg` — On-CPU 火焰图
+- `tools/perf/results/<timestamp>/flame/offcpu-flame.svg` — Off-CPU 火焰图
+- `tools/perf/results/<timestamp>/fio/fio-*.json` — fio 原始数据
+- `tools/perf/results/<timestamp>/llm-report.txt` — LLM 可读的分析报告
+- `tools/perf/results/<timestamp>/report.md` — Markdown 报告
+
+常用环境变量：
+- `PERF_FIO_WORKLOADS="seqwrite seqread randwrite randread randrw"` 控制 fio workload 集合。
+- `PERF_FIO_DIRECT=0|1` 显式选择 buffered 或 direct I/O；默认仍为 `0`，便于观察 Linux page cache/FUSE writeback 的影响。
+- `PERF_RECORD_FREQ=19` 可降低 perf 采样频率，减少 `perf.data` 体积；默认 `49`。
+- `KEEP_PERF_DATA=1` 保留原始 `perf.data`；默认生成火焰图和报告后删除，避免结果目录膨胀。
+- `BREWFS_UPLOAD_CONCURRENCY=32` 控制单个 writer 内并发 block PUT 上限；它会与 `BREWFS_WRITEBACK_UPLOAD_CONCURRENCY` 的全局 writeback 上传池共同生效，较低者更容易成为瓶颈。
+- `BREWFS_RANGE_BACKGROUND_PREFETCH=false` 只关闭 range miss 后的 full-block 后台预取，保留 VFS 层顺序预取；适合诊断 randrw 下后台 GET/PUT 竞争。
+
+Compose perf runner 的 `report.md` 会把脚本 wall seconds、fio `job_runtime_ms`、active IO runtime、writeback dirty/recent pending/uploaded 和 S3 GET/PUT 平均延迟放在同一份报告里。对 `direct=0` 结果尤其要看这些字段，因为 page cache/FUSE writeback 可能让 fio 运行期吞吐看起来很好，但 close/flush 或后台上传拖尾仍然很重。
 
 > **注意**：脚本使用 `--call-graph fp`（frame pointers）而非 `dwarf`，因为 brewfs
 > release binary 含有 735MB+ 的调试信息，`addr2line` 无法处理如此大的 DWARF section，

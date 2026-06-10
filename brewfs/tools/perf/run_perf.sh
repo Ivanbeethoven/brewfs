@@ -11,6 +11,11 @@
 #   ./run_perf.sh --compress lz4  # Enable LZ4 compression
 #   ./run_perf.sh --compress zstd # Enable Zstd compression
 #
+# Useful environment knobs:
+#   PERF_FIO_WORKLOADS="randrw" PERF_FIO_DIRECT=1 ./run_perf.sh --quick --skip-oncpu --skip-offcpu
+#   PERF_RECORD_FREQ=19          # Lower perf sample frequency to keep perf.data smaller.
+#   KEEP_PERF_DATA=1             # Preserve perf.data; default removes it after flame/report generation.
+#
 # For detailed libc frames, install matching system debuginfo first:
 #   Ubuntu/Debian: apt-get install libc6-dbg
 # Without it, libc frames may show up as [libc.so.6] or raw addresses.
@@ -37,6 +42,7 @@ WORK_DIR="/tmp/brewfs-perf-$$"
 CONFIG_PATH="$WORK_DIR/config.yaml"
 MNT_DIR="$WORK_DIR/mnt"
 DATA_DIR="$WORK_DIR/data"
+CACHE_DIR="$WORK_DIR/cache"
 
 REDIS_PORT="${REDIS_PORT:-16379}"
 RUSTFS_S3_PORT="${RUSTFS_S3_PORT:-19000}"
@@ -50,6 +56,18 @@ CLEANUP=1
 SKIP_ONCPU=0
 SKIP_OFFCPU=0
 COMPRESSION="${BREWFS_COMPRESSION:-none}"
+VERIFY_CACHE_CHECKSUM="${BREWFS_VERIFY_CACHE_CHECKSUM:-full}"
+WRITEBACK_MODE="${BREWFS_WRITEBACK_MODE:-commit_before_upload}"
+WRITEBACK_PERSIST_SYNC="${BREWFS_WRITEBACK_PERSIST_SYNC:-false}"
+READ_MEMORY_BYTES="${BREWFS_READ_MEMORY_BYTES:-4294967296}"
+WRITE_MEMORY_BYTES="${BREWFS_WRITE_MEMORY_BYTES:-4294967296}"
+MEMORY_BUDGET_BYTES="${BREWFS_MEMORY_BUDGET_BYTES:-12884901888}"
+FUSE_WORKERS="${BREWFS_FUSE_WORKERS:-6}"
+RANGE_BACKGROUND_PREFETCH="${BREWFS_RANGE_BACKGROUND_PREFETCH:-true}"
+UPLOAD_CONCURRENCY="${BREWFS_UPLOAD_CONCURRENCY:-32}"
+PERF_RECORD_FREQ="${PERF_RECORD_FREQ:-49}"
+PERF_FIO_WORKLOADS="${PERF_FIO_WORKLOADS:-seqwrite seqread randwrite randread randrw}"
+PERF_FIO_DIRECT="${PERF_FIO_DIRECT:-0}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -132,7 +150,7 @@ fi
 # ---- Setup ----
 info "setting up environment..."
 rm -rf "$WORK_DIR"
-mkdir -p "$WORK_DIR" "$MNT_DIR" "$DATA_DIR"
+mkdir -p "$WORK_DIR" "$MNT_DIR" "$DATA_DIR" "$CACHE_DIR"
 mkdir -p "$RUN_DIR/flame" "$RUN_DIR/fio"
 
 FLAME_DIR="$RUN_DIR/flame"
@@ -147,10 +165,24 @@ REDIS_PORT="$REDIS_PORT" \
     RUSTFS_ACCESS_KEY="$RUSTFS_ACCESS_KEY" \
     RUSTFS_SECRET_KEY="$RUSTFS_SECRET_KEY" \
     S3_BUCKET="$S3_BUCKET" \
-    docker compose up -d --wait 2>&1 | tail -5
+    docker compose up -d --wait redis rustfs 2>&1 | tail -5
+
+REDIS_PORT="$REDIS_PORT" \
+    RUSTFS_S3_PORT="$RUSTFS_S3_PORT" \
+    RUSTFS_ACCESS_KEY="$RUSTFS_ACCESS_KEY" \
+    RUSTFS_SECRET_KEY="$RUSTFS_SECRET_KEY" \
+    S3_BUCKET="$S3_BUCKET" \
+    docker compose run --rm rustfs-init >/dev/null
 
 docker compose ps --format 'table {{.Service}}\t{{.Status}}' 2>/dev/null || true
-redis-cli -p "$REDIS_PORT" ping >/dev/null 2>&1 || { err "redis not reachable"; exit 1; }
+if command -v redis-cli >/dev/null 2>&1; then
+    redis-cli -p "$REDIS_PORT" ping >/dev/null 2>&1 || { err "redis not reachable"; exit 1; }
+else
+    docker compose exec -T redis redis-cli ping >/dev/null 2>&1 || {
+        err "redis not reachable"
+        exit 1
+    }
+fi
 info "redis: OK, rustfs: OK"
 
 # ---- Generate config ----
@@ -170,25 +202,30 @@ meta:
   backend: redis
   redis:
     url: "redis://127.0.0.1:$REDIS_PORT/0"
+  open_file_cache_ttl_ms: 1000
+  open_file_cache_capacity: 65536
 layout:
-  chunk_size: 268435456
+  chunk_size: 67108864
   block_size: 4194304
 fuse:
-  workers: 8
+  workers: $FUSE_WORKERS
   max_background: 512
-YEOF
-
-# Append cache section if compression is set
-if [[ "$COMPRESSION" != "none" ]]; then
-    cat >> "$CONFIG_PATH" << YEOF
 cache:
+  root: $CACHE_DIR
+  read_memory_bytes: $READ_MEMORY_BYTES
+  write_memory_bytes: $WRITE_MEMORY_BYTES
+  memory_budget_bytes: $MEMORY_BUDGET_BYTES
+  upload_concurrency: $UPLOAD_CONCURRENCY
+  range_background_prefetch: $RANGE_BACKGROUND_PREFETCH
   compression: $COMPRESSION
+  verify_cache_checksum: $VERIFY_CACHE_CHECKSUM
+  writeback_persist_sync: $WRITEBACK_PERSIST_SYNC
+  writeback_mode: $WRITEBACK_MODE
 YEOF
-fi
 
 # Save a copy of the config to results
 cp "$CONFIG_PATH" "$RUN_DIR/config.yaml"
-info "config: compression=$COMPRESSION"
+info "config: compression=$COMPRESSION verify_cache_checksum=$VERIFY_CACHE_CHECKSUM writeback_mode=$WRITEBACK_MODE upload_concurrency=$UPLOAD_CONCURRENCY range_background_prefetch=$RANGE_BACKGROUND_PREFETCH"
 
 # ---- Mount ----
 info "mounting brewfs..."
@@ -237,6 +274,33 @@ for j in d.get('jobs',[]):
             print(f'    {op}: {bw/1024/1024:.0f} MiB/s, iops={iops:.1f}, lat_avg={lat:.2f}ms')
 " 2>/dev/null || true
     mv "$tmp_json" "$FIO_DIR/fio-${label}.json" 2>/dev/null || true
+}
+
+run_fio_suite() {
+    local workload
+    for workload in $PERF_FIO_WORKLOADS; do
+        case "$workload" in
+            seqwrite)
+                run_fio "seqwrite" --name=seqwrite --rw=write --bs=4m --size="$SEQ_SIZE" --numjobs=1 --ioengine=sync --direct="$PERF_FIO_DIRECT"
+                ;;
+            seqread)
+                run_fio "seqread" --name=seqread --rw=read --bs=4m --size="$SEQ_SIZE" --numjobs=1 --ioengine=sync --direct="$PERF_FIO_DIRECT"
+                ;;
+            randwrite)
+                run_fio "randwrite" --name=randwrite --rw=randwrite --bs=4m --size="$RAND_SIZE" --numjobs=4 --ioengine=sync --direct="$PERF_FIO_DIRECT"
+                ;;
+            randread)
+                run_fio "randread" --name=randread --rw=randread --bs=4m --size="$RAND_SIZE" --numjobs=4 --ioengine=sync --direct="$PERF_FIO_DIRECT"
+                ;;
+            randrw)
+                run_fio "randrw" --name=randrw --rw=randrw --rwmixread=70 --bs=4m --size="$RAND_SIZE" --numjobs=4 --ioengine=sync --direct="$PERF_FIO_DIRECT"
+                ;;
+            *)
+                err "unknown PERF_FIO_WORKLOADS entry: $workload"
+                exit 1
+                ;;
+        esac
+    done
 }
 
 # ---- Helper: run perf script safely ----
@@ -321,19 +385,15 @@ generate_libc_report() {
 # ON-CPU FLAME GRAPH
 # =========================================================================
 if [ "$SKIP_ONCPU" -eq 0 ]; then
-    info "=== ON-CPU profiling (perf record -F 99 --call-graph fp) ==="
+    info "=== ON-CPU profiling (perf record -F $PERF_RECORD_FREQ --call-graph fp) ==="
 
     # Use frame-pointer based call graphs (fp) — faster and more reliable
     # than dwarf for large binaries. Requires -C force-frame-pointers=yes at build.
-    perf record -F 99 --call-graph fp -a -o "$FLAME_DIR/oncpu-perf.data" &
+    perf record -F "$PERF_RECORD_FREQ" --call-graph fp -p "$BREWFS_PID" -o "$FLAME_DIR/oncpu-perf.data" &
     PERF_ONCPU_PID=$!
     sleep 1
 
-    run_fio "seqwrite"  --name=seqwrite  --rw=write    --bs=4m --size="$SEQ_SIZE" --numjobs=1 --ioengine=sync --direct=0
-    run_fio "seqread"   --name=seqread   --rw=read     --bs=4m --size="$SEQ_SIZE" --numjobs=1 --ioengine=sync --direct=0
-    run_fio "randwrite" --name=randwrite --rw=randwrite --bs=4m --size="$RAND_SIZE" --numjobs=4 --ioengine=sync --direct=0
-    run_fio "randread"  --name=randread  --rw=randread  --bs=4m --size="$RAND_SIZE" --numjobs=4 --ioengine=sync --direct=0
-    run_fio "randrw"    --name=randrw    --rw=randrw --rwmixread=70 --bs=4m --size="$RAND_SIZE" --numjobs=4 --ioengine=sync --direct=0
+    run_fio_suite
 
     kill -INT "$PERF_ONCPU_PID" 2>/dev/null || true
     wait "$PERF_ONCPU_PID" 2>/dev/null || true
@@ -363,10 +423,16 @@ if [ "$SKIP_ONCPU" -eq 0 ]; then
         info "  generating libc symbol report..."
         generate_libc_report "$FLAME_DIR/oncpu-perf.data" "$FLAME_DIR/libc-report.txt"
         info "  libc report: $FLAME_DIR/libc-report.txt"
+        if [[ "${KEEP_PERF_DATA:-0}" != "1" ]]; then
+            rm -f "$FLAME_DIR/oncpu-perf.data"
+        fi
 
         # Clean up intermediate file
         rm -f "$FLAME_DIR/oncpu-raw.txt"
     fi
+elif [ "$SKIP_OFFCPU" -eq 1 ]; then
+    info "=== fio benchmark (perf disabled) ==="
+    run_fio_suite
 fi
 
 # =========================================================================
@@ -385,13 +451,13 @@ if [ "$SKIP_OFFCPU" -eq 0 ]; then
 
     info "  fio seqwrite (off-CPU)..."
     fio --name=offcpu-seqwrite --directory="$MNT_DIR" --rw=write --bs=4m \
-        --size="$SEQ_SIZE" --numjobs=1 --ioengine=sync --direct=0 \
+        --size="$SEQ_SIZE" --numjobs=1 --ioengine=sync --direct="$PERF_FIO_DIRECT" \
         --runtime="$RUNTIME" --time_based --group_reporting --eta=never \
         --output-format=terse 2>/dev/null || true
 
     info "  fio seqread (off-CPU)..."
     fio --name=offcpu-seqread --directory="$MNT_DIR" --rw=read --bs=4m \
-        --size="$SEQ_SIZE" --numjobs=1 --ioengine=sync --direct=0 \
+        --size="$SEQ_SIZE" --numjobs=1 --ioengine=sync --direct="$PERF_FIO_DIRECT" \
         --runtime="$RUNTIME" --time_based --group_reporting --eta=never \
         --output-format=terse 2>/dev/null || true
 
@@ -410,6 +476,9 @@ if [ "$SKIP_OFFCPU" -eq 0 ]; then
             info "  off-CPU flame graph: $FLAME_DIR/offcpu-flame.svg"
         else
             warn "  no off-CPU brewfs samples captured"
+        fi
+        if [[ "${KEEP_PERF_DATA:-0}" != "1" ]]; then
+            rm -f "$FLAME_DIR/offcpu-perf.data"
         fi
     fi
 fi

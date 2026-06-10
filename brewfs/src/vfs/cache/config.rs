@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::chunk::bandwidth::BandwidthConfig;
+use crate::chunk::cache_integrity::CacheIntegrityMode;
 use crate::chunk::compress::Compression;
 
 /// Write-back mode controls when data becomes globally visible.
@@ -45,6 +46,7 @@ pub struct CacheConfig {
     pub prefetch_initial_bytes: u64,
     pub prefetch_max_bytes: u64,
     pub prefetch_concurrency: usize,
+    pub range_background_prefetch: bool,
 
     // Semantics
     pub strict_posix: bool,
@@ -56,6 +58,7 @@ pub struct CacheConfig {
 
     // Compression
     pub compression: Compression,
+    pub verify_cache_checksum: CacheIntegrityMode,
 
     // Bandwidth limiting
     pub bandwidth: BandwidthConfig,
@@ -81,11 +84,13 @@ impl Default for CacheConfig {
             prefetch_initial_bytes: 4 * 1024 * 1024,
             prefetch_max_bytes: 64 * 1024 * 1024,
             prefetch_concurrency: 64,
+            range_background_prefetch: true,
             strict_posix: true,
             writeback_mode: WriteBackMode::UploadBeforeCommit,
             min_free_disk_bytes: 1024 * 1024 * 1024,
             writeback_persist_sync: true,
             compression: Compression::Lz4,
+            verify_cache_checksum: CacheIntegrityMode::Full,
             bandwidth: BandwidthConfig::default(),
             // Default: read/write soft buffers plus headroom for transient overlap.
             memory_budget_bytes: 1024 * 1024 * 1024,
@@ -113,6 +118,7 @@ mod tests {
         assert_eq!(config.write_memory_bytes, 300 * 1024 * 1024);
         assert_eq!(config.dirty_slice_target_size, 32 * 1024 * 1024);
         assert_eq!(config.prefetch_max_bytes, 64 * 1024 * 1024);
+        assert!(config.range_background_prefetch);
         assert!(config.writeback_persist_sync);
     }
 }

@@ -5,6 +5,19 @@
 //! on x86_64 via SSE4.2). The trailing 8-byte `data_len` allows the decoder
 //! to split data from checksums without knowing the original size upfront.
 
+/// Disk cache integrity mode.
+///
+/// `Full` preserves the current behavior: every cached block is wrapped with
+/// CRC32C framing and verified on load. `None` stores raw cache bytes and
+/// relies on atomic rename plus cache miss recovery if local cache data is
+/// corrupted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheIntegrityMode {
+    #[default]
+    Full,
+    None,
+}
+
 /// Block size for checksum calculation (32KB, matching JuiceFS)
 const CS_BLOCK: usize = 32 * 1024;
 
