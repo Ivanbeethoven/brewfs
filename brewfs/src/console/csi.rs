@@ -39,18 +39,18 @@ pub trait CsiAdapter: fmt::Debug + Send + Sync {
     async fn pods(&self, query: &CsiResourceQuery) -> Result<CsiResourceList, CsiAdapterError>;
 }
 
-pub fn default_csi_adapter(csi_dashboard: bool) -> Arc<dyn CsiAdapter> {
-    Arc::new(UnsupportedCsiAdapter { csi_dashboard })
+pub fn default_csi_adapter(config: super::ConsoleCsiConfig) -> Arc<dyn CsiAdapter> {
+    Arc::new(UnsupportedCsiAdapter { config })
 }
 
 #[derive(Debug)]
 struct UnsupportedCsiAdapter {
-    csi_dashboard: bool,
+    config: super::ConsoleCsiConfig,
 }
 
 impl UnsupportedCsiAdapter {
     fn unavailable_or_unsupported<T>(&self, message: &'static str) -> Result<T, CsiAdapterError> {
-        if self.csi_dashboard {
+        if self.config.enabled {
             Err(CsiAdapterError::Unsupported(message))
         } else {
             Err(CsiAdapterError::Disabled)

@@ -16,8 +16,8 @@ pub fn build_router(config: ConsoleConfig) -> Router {
         static_dir: config.static_dir.clone(),
         registry: super::registry::VolumeRegistry::new(config.state_dir.clone()),
         runtime_registry: crate::control::runtime::RuntimeRegistry::new(config.runtime_dir.clone()),
-        csi_dashboard: config.csi_dashboard,
-        csi_adapter: super::csi::default_csi_adapter(config.csi_dashboard),
+        csi_dashboard: config.csi.enabled,
+        csi_adapter: super::csi::default_csi_adapter(config.csi.clone()),
     };
     let api = Router::new()
         .route("/health", get(api::health))
@@ -182,7 +182,7 @@ fn json_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::console::{AuthConfig, ConsoleConfig};
+    use crate::console::{AuthConfig, ConsoleConfig, ConsoleCsiConfig};
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
     use std::net::SocketAddr;
@@ -196,7 +196,10 @@ mod tests {
             runtime_dir: static_dir.join("runtime"),
             static_dir: static_dir.to_path_buf(),
             auth,
-            csi_dashboard: false,
+            csi: ConsoleCsiConfig {
+                enabled: false,
+                kubeconfig: None,
+            },
         }
     }
 
@@ -850,7 +853,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "<div id=\"root\"></div>").unwrap();
         let mut config = test_config(dir.path(), AuthConfig::Disabled);
-        config.csi_dashboard = true;
+        config.csi.enabled = true;
         let app = build_router(config);
 
         let requests = [Request::builder()
@@ -923,7 +926,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "<div id=\"root\"></div>").unwrap();
         let mut config = test_config(dir.path(), AuthConfig::Disabled);
-        config.csi_dashboard = true;
+        config.csi.enabled = true;
         let app = build_router(config);
 
         for uri in [

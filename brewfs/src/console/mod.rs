@@ -59,7 +59,13 @@ pub struct ConsoleConfig {
     pub runtime_dir: PathBuf,
     pub static_dir: PathBuf,
     pub auth: AuthConfig,
-    pub csi_dashboard: bool,
+    pub csi: ConsoleCsiConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleCsiConfig {
+    pub enabled: bool,
+    pub kubeconfig: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +97,10 @@ impl ConsoleConfig {
                 .static_dir
                 .unwrap_or_else(|| PathBuf::from("brewfs/web/console/dist")),
             auth,
-            csi_dashboard: args.enable_csi_dashboard,
+            csi: ConsoleCsiConfig {
+                enabled: args.enable_csi_dashboard,
+                kubeconfig: args.kubeconfig,
+            },
         })
     }
 }
@@ -187,5 +196,21 @@ mod tests {
         let err = ConsoleConfig::from_args(args).unwrap_err();
 
         assert!(err.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn preserves_csi_kubeconfig_for_adapter_setup() {
+        let mut args = console_args();
+        args.dev_no_auth = true;
+        args.enable_csi_dashboard = true;
+        args.kubeconfig = Some(PathBuf::from("/tmp/kubeconfig"));
+
+        let config = ConsoleConfig::from_args(args).unwrap();
+
+        assert!(config.csi.enabled);
+        assert_eq!(
+            config.csi.kubeconfig,
+            Some(PathBuf::from("/tmp/kubeconfig"))
+        );
     }
 }
