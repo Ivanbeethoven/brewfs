@@ -750,7 +750,7 @@ export function App() {
       <main className="workspace">
         <header className="topbar">
           <div>
-            <p className="eyebrow">Phase 1A scaffold</p>
+            <p className="eyebrow">Control plane</p>
             <h1>{pageTitle(page)}</h1>
           </div>
           <div className={`status-pill ${status.tone}`}>{status.label}</div>
