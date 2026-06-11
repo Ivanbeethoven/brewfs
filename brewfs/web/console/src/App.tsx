@@ -47,6 +47,7 @@ import { buildMountCommand } from './mountCommand';
 import { loadTrashView, type TrashViewResult } from './trashView';
 import { buildSettingsSummary } from './settingsSummary';
 import { labelsFromText, labelsToText } from './volumeEdit';
+import { formatVolumeRuntime } from './volumeRuntime';
 
 type PageKey =
   | 'overview'
@@ -1637,6 +1638,7 @@ function FilesystemsPage({
                   <th>Data</th>
                   <th>Meta</th>
                   <th>Mount</th>
+                  <th>Runtime</th>
                   <th>Meta URL</th>
                   <th>Command</th>
                   <th>Actions</th>
@@ -1652,6 +1654,7 @@ function FilesystemsPage({
                       <td>{volume.mount_config.data_backend}</td>
                       <td>{volume.mount_config.meta_backend}</td>
                       <td>{volume.mount_config.mount_point ?? '-'}</td>
+                      <td>{formatVolumeRuntime(volume.runtime)}</td>
                       <td>{volume.mount_config.meta_url_redacted ?? '-'}</td>
                       <td>
                         <div className="mount-command">

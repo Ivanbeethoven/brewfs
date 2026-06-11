@@ -19,6 +19,12 @@ const volumes: VolumeResponse[] = [
       chunk_size: null,
       block_size: null,
     },
+    runtime: {
+      mounted: false,
+      pid: null,
+      mount_point: null,
+      started_at: null,
+    },
   },
 ];
 

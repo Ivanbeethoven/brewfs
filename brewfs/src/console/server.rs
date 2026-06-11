@@ -437,6 +437,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn volumes_api_marks_registered_filesystems_with_live_runtime_state() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\"></div>").unwrap();
+        let config = test_config(dir.path(), AuthConfig::Disabled);
+        let registry = crate::control::runtime::RuntimeRegistry::new(config.runtime_dir.clone());
+        let pid = std::process::id();
+        let socket_path = registry.socket_path(pid);
+        let record = crate::control::runtime::InstanceRecord::new(
+            pid,
+            "/mnt/brewfs".to_string(),
+            socket_path,
+            chrono::Utc::now(),
+        );
+        registry.write_record(&record).await.unwrap();
+        let app = build_router(config);
+
+        for (name, mount_point) in [("mounted", "/mnt/brewfs"), ("offline", "/mnt/offline")] {
+            let create_body = serde_json::json!({
+                "name": name,
+                "mount_config": {
+                    "mount_point": mount_point,
+                    "data_backend": "local-fs",
+                    "meta_backend": "sqlx"
+                }
+            });
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/volumes")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(create_body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/volumes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mounted = listed["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == "mounted")
+            .unwrap();
+        let offline = listed["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == "offline")
+            .unwrap();
+
+        assert_eq!(mounted["runtime"]["mounted"], true);
+        assert_eq!(mounted["runtime"]["pid"], pid);
+        assert_eq!(offline["runtime"]["mounted"], false);
+        assert_eq!(offline["runtime"]["pid"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
     async fn volumes_api_gets_updates_and_deletes_registry_entries() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "<div id=\"root\"></div>").unwrap();

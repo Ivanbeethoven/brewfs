@@ -20,6 +20,12 @@ function volume(overrides: Partial<VolumeResponse['mount_config']> = {}): Volume
       block_size: 4096,
       ...overrides,
     },
+    runtime: {
+      mounted: false,
+      pid: null,
+      mount_point: null,
+      started_at: null,
+    },
   };
 }
 

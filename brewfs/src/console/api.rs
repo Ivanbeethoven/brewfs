@@ -1,6 +1,9 @@
 use super::{
     AuthMode, ConsoleState,
-    registry::{CreateVolumeRequest, RegistryError, UpdateVolumeRequest, VolumeResponse},
+    registry::{
+        CreateVolumeRequest, RegistryError, UpdateVolumeRequest,
+        VolumeResponse as RegistryVolumeResponse,
+    },
 };
 use crate::{
     control::{
@@ -39,7 +42,22 @@ pub struct HealthIntegrations {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ListVolumesResponse {
-    pub volumes: Vec<VolumeResponse>,
+    pub volumes: Vec<ConsoleVolumeResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ConsoleVolumeResponse {
+    #[serde(flatten)]
+    pub volume: RegistryVolumeResponse,
+    pub runtime: VolumeRuntimeResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VolumeRuntimeResponse {
+    pub mounted: bool,
+    pub pid: Option<u32>,
+    pub mount_point: Option<String>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -169,30 +187,39 @@ pub async fn list_volumes(
         .list()
         .await
         .map_err(ApiErrorResponse::from)?;
+    let runtime_records = list_runtime_records(&state).await?;
+    let volumes = volumes
+        .into_iter()
+        .map(|volume| enrich_volume_response(volume, &runtime_records))
+        .collect();
     Ok(Json(ListVolumesResponse { volumes }))
 }
 
 pub async fn create_volume(
     State(state): State<ConsoleState>,
     Json(request): Json<CreateVolumeRequest>,
-) -> Result<(StatusCode, Json<VolumeResponse>), ApiErrorResponse> {
+) -> Result<(StatusCode, Json<ConsoleVolumeResponse>), ApiErrorResponse> {
     let volume = state
         .registry
         .create(request)
         .await
         .map_err(ApiErrorResponse::from)?;
+    let runtime_records = list_runtime_records(&state).await?;
+    let volume = enrich_volume_response(volume, &runtime_records);
     Ok((StatusCode::CREATED, Json(volume)))
 }
 
 pub async fn get_volume(
     State(state): State<ConsoleState>,
     Path(volume_id): Path<String>,
-) -> Result<Json<VolumeResponse>, ApiErrorResponse> {
+) -> Result<Json<ConsoleVolumeResponse>, ApiErrorResponse> {
     let volume = state
         .registry
         .get(&volume_id)
         .await
         .map_err(ApiErrorResponse::from)?;
+    let runtime_records = list_runtime_records(&state).await?;
+    let volume = enrich_volume_response(volume, &runtime_records);
     Ok(Json(volume))
 }
 
@@ -200,12 +227,14 @@ pub async fn update_volume(
     State(state): State<ConsoleState>,
     Path(volume_id): Path<String>,
     Json(request): Json<UpdateVolumeRequest>,
-) -> Result<Json<VolumeResponse>, ApiErrorResponse> {
+) -> Result<Json<ConsoleVolumeResponse>, ApiErrorResponse> {
     let volume = state
         .registry
         .update(&volume_id, request)
         .await
         .map_err(ApiErrorResponse::from)?;
+    let runtime_records = list_runtime_records(&state).await?;
+    let volume = enrich_volume_response(volume, &runtime_records);
     Ok(Json(volume))
 }
 
@@ -219,6 +248,51 @@ pub async fn delete_volume(
         .await
         .map_err(ApiErrorResponse::from)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_runtime_records(
+    state: &ConsoleState,
+) -> Result<Vec<InstanceRecord>, ApiErrorResponse> {
+    state
+        .runtime_registry
+        .list_instances()
+        .await
+        .map_err(|err| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime_registry_error",
+                format!("failed to read runtime registry: {err}"),
+            )
+        })
+}
+
+fn enrich_volume_response(
+    volume: RegistryVolumeResponse,
+    runtime_records: &[InstanceRecord],
+) -> ConsoleVolumeResponse {
+    let runtime = volume
+        .mount_config
+        .mount_point
+        .as_deref()
+        .and_then(|mount_point| {
+            runtime_records
+                .iter()
+                .find(|record| record.mount_point == mount_point)
+        })
+        .map(|record| VolumeRuntimeResponse {
+            mounted: true,
+            pid: Some(record.pid),
+            mount_point: Some(record.mount_point.clone()),
+            started_at: Some(record.started_at),
+        })
+        .unwrap_or(VolumeRuntimeResponse {
+            mounted: false,
+            pid: None,
+            mount_point: None,
+            started_at: None,
+        });
+
+    ConsoleVolumeResponse { volume, runtime }
 }
 
 pub async fn list_instances(

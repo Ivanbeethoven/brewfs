@@ -19,6 +19,7 @@ export interface VolumeResponse {
   created_at: string;
   updated_at: string;
   mount_config: VolumeMountConfigResponse;
+  runtime: VolumeRuntimeResponse;
 }
 
 export interface VolumeMountConfigResponse {
@@ -29,6 +30,13 @@ export interface VolumeMountConfigResponse {
   meta_url_redacted: string | null;
   chunk_size: number | null;
   block_size: number | null;
+}
+
+export interface VolumeRuntimeResponse {
+  mounted: boolean;
+  pid: number | null;
+  mount_point: string | null;
+  started_at: string | null;
 }
 
 export interface ListVolumesResponse {
