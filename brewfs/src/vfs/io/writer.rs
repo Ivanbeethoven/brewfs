@@ -3068,14 +3068,19 @@ where
                             shared: &shared,
                         };
 
-                        let (age, idle_time, data_len, writeable) = handle.with_ref(|s| {
-                            (
-                                now.duration_since(s.started),
-                                now.duration_since(s.last_mod),
-                                s.data.len(),
-                                matches!(s.state, SliceStatus::Writable),
-                            )
-                        });
+                        let (age, idle_time, data_len, writeable, cached_sub_block) = handle
+                            .with_ref(|s| {
+                                let data_len = s.data.len();
+                                let cached_sub_block =
+                                    s.creation_unique != 0 && data_len < s.data.block_size() as u64;
+                                (
+                                    now.duration_since(s.started),
+                                    now.duration_since(s.last_mod),
+                                    data_len,
+                                    matches!(s.state, SliceStatus::Writable),
+                                    cached_sub_block,
+                                )
+                            });
 
                         if !writeable || data_len == 0 {
                             continue;
@@ -3089,7 +3094,7 @@ where
                         // already frozen the slice and kicked off the upload,
                         // so flush only waits for in-flight work to land.
                         let auto_flush_max = shared.config.auto_flush_max_age;
-                        let mut trigger = if age > auto_flush_max {
+                        let mut trigger = if age > auto_flush_max && !cached_sub_block {
                             Some(AutoFreezeTrigger::Age)
                         } else if idle_time > idle && age > idle {
                             Some(AutoFreezeTrigger::Idle)
@@ -4654,6 +4659,52 @@ mod tests {
         })
         .await
         .expect("auto age partial-tail upload should be attributed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_auto_flush_defers_cached_sub_block_age_freeze_until_explicit_flush() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store, meta.clone()));
+        let ino = meta
+            .create_file(1, "cached_auto_age_deferral.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = Arc::new(DataWriter::new(test_config(layout), backend, reader, None));
+        let file_writer = writer.ensure_file(inode);
+
+        file_writer
+            .write_at_cached(0, &[4u8; 1024], 10)
+            .await
+            .unwrap();
+
+        sleep(Duration::from_millis(50)).await;
+
+        let before_flush = writer.dirty_breakdown().await;
+        assert_eq!(
+            before_flush.freeze_auto_ops, 0,
+            "cached sub-block slices should not be auto-age frozen before explicit flush"
+        );
+        assert_eq!(before_flush.upload_partial_tail_auto_age_ops, 0);
+        assert_eq!(before_flush.upload_partial_tail_ops, 0);
+
+        file_writer.flush().await.unwrap();
+
+        let after_flush = writer.dirty_breakdown().await;
+        assert_eq!(after_flush.freeze_explicit_flush_ops, 1);
+        assert_eq!(after_flush.upload_partial_tail_ops, 1);
+        assert_eq!(after_flush.upload_partial_tail_explicit_flush_ops, 1);
+        assert_eq!(after_flush.upload_partial_tail_auto_age_ops, 0);
     }
 
     #[tokio::test]

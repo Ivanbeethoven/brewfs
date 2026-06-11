@@ -454,3 +454,79 @@ Expected movement:
 - direct0 `put_ops_per_gib_written` decreases.
 - direct0 `writeback_avg_upload_batch_mib` increases.
 - direct1 `writeback_partial_tail_ratio` remains about 0.03 and `avg_upload_batch_mib` remains about 4MiB.
+
+## Candidate D Result
+
+Implementation:
+
+- Added `test_auto_flush_defers_cached_sub_block_age_freeze_until_explicit_flush`.
+- Changed only the periodic auto-flush age path:
+  if a writable slice was created by cached writeback (`creation_unique != 0`) and is still smaller than one block, `auto_age` does not freeze it.
+- Kept explicit flush, fsync, close, truncate, pressure, too-many-slices, buffer-high, and non-cached direct write behavior unchanged.
+
+Verification:
+
+```text
+cargo test -p brewfs --lib \
+  vfs::io::writer::tests::test_auto_flush_defers_cached_sub_block_age_freeze_until_explicit_flush
+  # red before implementation, green after implementation
+
+cargo test -p brewfs --lib 'vfs::io::writer::tests::'  # 31 passed
+cargo clippy -p brewfs --lib -- -D warnings
+```
+
+Direct0 artifact:
+
+```text
+brewfs/docker/compose-xfstests/artifacts/perf-run-1781205242-516
+```
+
+Direct0 result versus Candidate C (`perf-run-1781203850-6552`):
+
+```text
+write_bw_mib_s=99.3 vs 91.4 (+8.7%)
+tool_wall_s=83 vs 78 (+6.4%)
+post_write_drain_s=6 vs 2
+post-drained put_ops_per_gib_written=1928.8 vs 2021.3 (-4.6%)
+s3_put_ops=11226 vs 12120 (-7.4%)
+avg_upload_batch_mib=0.525 vs 0.505 (+3.9%)
+writeback_hard_wait_ms=16.2M vs 24.7M (-34.4%)
+partial_tail_total=10712 vs 11577 (-7.5%)
+partial_tail_auto_age=46 vs 10640 (-99.6%)
+partial_tail_auto_idle=8313 vs 0
+partial_tail_auto_too_many=553 vs 193
+partial_tail_explicit_flush=1718 vs 669
+```
+
+Direct1 guard artifact:
+
+```text
+brewfs/docker/compose-xfstests/artifacts/perf-run-1781205600-16115
+```
+
+Direct1 guard versus Candidate C (`perf-run-1781204206-4747`):
+
+```text
+read_bw_mib_s=232.7 vs 247.2 (-5.9%)
+write_bw_mib_s=106.2 vs 110.5 (-3.9%)
+post_write_drain_s=22 vs 30
+post-drained put_ops_per_gib_written=259.0 vs 259.9 (-0.3%)
+avg_upload_batch_mib=4.046 vs 4.024 (+0.5%)
+partial_tail_ratio=0.030 vs 0.032
+partial_tail_total=47 vs 53
+```
+
+Decision:
+
+- Accept Candidate D.
+- It reduces direct0 object amplification and hard-wait pressure without a direct1 object-shape regression.
+- It is not sufficient as the final optimization because most remaining direct0 auto tails moved from `age` to `idle`. The next candidate should decide whether to defer cached sub-block `idle` too, or use a full-block-first/pressure-aware scan to avoid accumulating too many pending tiny slices.
+
+Next bottleneck:
+
+```text
+direct0 remaining partial-tail attribution:
+  auto_idle=8313
+  explicit_flush=1718
+  auto_too_many=553
+```
