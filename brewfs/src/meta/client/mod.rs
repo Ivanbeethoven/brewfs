@@ -6,7 +6,7 @@ use crate::chunk::SliceDesc;
 use crate::control::job::{GcJobResult, JobManager};
 use crate::control::protocol::{
     ControlAclEntry, ControlDirectoryEntry, ControlFileKind, ControlPathMetadata, ControlRequest,
-    ControlResponse,
+    ControlResponse, ControlTrashEntry,
 };
 use crate::control::runtime::{InstanceRecord, RuntimeRegistry};
 use crate::control::server::{ControlHandler, ControlServer};
@@ -41,6 +41,13 @@ use chrono::Utc;
 use hostname::get as get_hostname;
 
 const CONTROL_ACL_XATTR_NAME: &str = "system.brewfs.acl";
+const CONTROL_TRASH_XATTR_NAME: &str = "system.brewfs.trash";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ControlTrashMetadata {
+    original_path: String,
+    deleted_at: String,
+}
 use path_trie::PathTrie;
 use session::{SessionInfo, SessionManager};
 
@@ -619,6 +626,87 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         match self.store.remove_xattr(ino, CONTROL_ACL_XATTR_NAME).await {
             Ok(()) | Err(MetaError::NotFound(_)) => ControlResponse::AclDeleted { path },
             Err(err) => control_meta_error(err),
+        }
+    }
+
+    async fn list_trash_for_control(&self) -> ControlResponse {
+        let deleted_files = match self.store.get_deleted_files().await {
+            Ok(inodes) => inodes,
+            Err(err) => return control_meta_error(err),
+        };
+
+        let mut entries = Vec::with_capacity(deleted_files.len());
+        for ino in deleted_files {
+            let attr = match self.store.stat(ino).await {
+                Ok(Some(attr)) => attr,
+                Ok(None) => continue,
+                Err(err) => return control_meta_error(err),
+            };
+            let metadata = match self.store.get_xattr(ino, CONTROL_TRASH_XATTR_NAME).await {
+                Ok(Some(raw)) => match serde_json::from_slice::<ControlTrashMetadata>(&raw) {
+                    Ok(metadata) => Some(metadata),
+                    Err(err) => {
+                        warn!(inode = ino, error = %err, "invalid trash metadata");
+                        None
+                    }
+                },
+                Ok(None) | Err(MetaError::NotImplemented) => None,
+                Err(err) => return control_meta_error(err),
+            };
+
+            entries.push(ControlTrashEntry {
+                id: ino.to_string(),
+                original_path: metadata
+                    .as_ref()
+                    .map(|metadata| metadata.original_path.clone())
+                    .unwrap_or_else(|| format!("inode:{ino}")),
+                size: Some(attr.size),
+                deleted_at: metadata.map(|metadata| metadata.deleted_at),
+            });
+        }
+        entries.sort_by(|left, right| left.id.cmp(&right.id));
+
+        ControlResponse::Trash { entries }
+    }
+
+    fn unsupported_trash_response(action: &str) -> ControlResponse {
+        ControlResponse::Error {
+            code: "unsupported".to_string(),
+            message: format!("trash {action} control-plane request is not implemented yet"),
+        }
+    }
+
+    async fn child_original_path_for_trash(&self, parent: i64, name: &str) -> String {
+        let parent_path = MetaLayer::get_paths(self, parent)
+            .await
+            .ok()
+            .and_then(|paths| paths.into_iter().next())
+            .unwrap_or_else(|| "/".to_string());
+        if parent_path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", parent_path.trim_end_matches('/'))
+        }
+    }
+
+    async fn remember_trash_entry(&self, ino: i64, original_path: String) {
+        let metadata = ControlTrashMetadata {
+            original_path,
+            deleted_at: Utc::now().to_rfc3339(),
+        };
+        let raw = match serde_json::to_vec(&metadata) {
+            Ok(raw) => raw,
+            Err(err) => {
+                warn!(inode = ino, error = %err, "failed to encode trash metadata");
+                return;
+            }
+        };
+        if let Err(err) = self
+            .store
+            .set_xattr(ino, CONTROL_TRASH_XATTR_NAME, &raw, 0)
+            .await
+        {
+            warn!(inode = ino, error = ?err, "failed to persist trash metadata");
         }
     }
 
@@ -1592,12 +1680,13 @@ impl<T: MetaStore + ?Sized + 'static> ControlHandler for Arc<MetaClient<T>> {
                 self.put_acl_for_control(&path, entries).await
             }
             ControlRequest::DeleteAcl { path } => self.delete_acl_for_control(&path).await,
-            ControlRequest::ListTrash
-            | ControlRequest::RestoreTrashEntry { .. }
-            | ControlRequest::DeleteTrashEntry { .. } => ControlResponse::Error {
-                code: "unsupported".to_string(),
-                message: "trash control-plane requests are not implemented yet".to_string(),
-            },
+            ControlRequest::ListTrash => self.list_trash_for_control().await,
+            ControlRequest::RestoreTrashEntry { .. } => {
+                MetaClient::<T>::unsupported_trash_response("restore")
+            }
+            ControlRequest::DeleteTrashEntry { .. } => {
+                MetaClient::<T>::unsupported_trash_response("delete")
+            }
         }
     }
 }
@@ -2016,7 +2105,11 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         info!("MetaClient: unlink operation for ({}, '{}')", parent, name);
 
         let target_ino = self.cached_lookup(parent, name).await?;
+        let original_path = self.child_original_path_for_trash(parent, name).await;
         self.store.unlink(parent, name).await?;
+        if let Some(ino) = target_ino {
+            self.remember_trash_entry(ino, original_path).await;
+        }
 
         debug!("MetaClient: unlink completed, updating cache");
 
@@ -3428,6 +3521,69 @@ mod tests {
         let stored = client.get_acl(1, 1, 1000).await.unwrap().unwrap();
         assert_eq!(stored, replacement);
         assert!(client.get_acl(1, 1, 2000).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_control_plane_list_trash_returns_unlinked_files() {
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let options = MetaClientOptions {
+            mount_point: Some("/mnt/trash".to_string()),
+            control_runtime_dir: Some(runtime_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let client = create_test_client_with_options(options).await;
+        let docs_ino = client.mkdir(1, "docs".to_string()).await.unwrap();
+        let report_ino = client
+            .create_file(docs_ino, "report.txt".to_string())
+            .await
+            .unwrap();
+        client.unlink(docs_ino, "report.txt").await.unwrap();
+        client.start_control_plane().await.unwrap();
+
+        let registry =
+            crate::control::runtime::RuntimeRegistry::new(runtime_dir.path().to_path_buf());
+        let record = registry.select_instance(Some("/mnt/trash")).await.unwrap();
+
+        let response = crate::control::client::send_request(
+            &record.socket_path,
+            &crate::control::protocol::ControlRequest::ListTrash,
+        )
+        .await
+        .unwrap();
+
+        match response {
+            crate::control::protocol::ControlResponse::Trash { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].id, report_ino.to_string());
+                assert_eq!(entries[0].original_path, "/docs/report.txt");
+                assert_eq!(entries[0].size, Some(0));
+                assert!(entries[0].deleted_at.is_some());
+            }
+            other => panic!("unexpected trash response: {other:?}"),
+        }
+
+        let restore = crate::control::client::send_request(
+            &record.socket_path,
+            &crate::control::protocol::ControlRequest::RestoreTrashEntry {
+                entry_id: report_ino.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_control_error_code(restore, "unsupported");
+
+        let delete = crate::control::client::send_request(
+            &record.socket_path,
+            &crate::control::protocol::ControlRequest::DeleteTrashEntry {
+                entry_id: report_ino.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_control_error_code(delete, "unsupported");
+
+        client.shutdown_runtime().await;
     }
 
     fn assert_control_error_code(
