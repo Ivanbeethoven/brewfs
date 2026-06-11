@@ -109,6 +109,11 @@ pub struct FsStatsSnapshot {
     pub writeback_upload_batch_bytes: u64,
     pub writeback_upload_batch_blocks: u64,
     pub writeback_upload_partial_tail_ops: u64,
+    pub writeback_upload_partial_tail_size_ops: u64,
+    pub writeback_upload_partial_tail_max_unflushed_ops: u64,
+    pub writeback_upload_partial_tail_explicit_flush_ops: u64,
+    pub writeback_upload_partial_tail_auto_ops: u64,
+    pub writeback_upload_partial_tail_commit_age_ops: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub read_block_cache_hits: u64,
@@ -374,6 +379,16 @@ pub struct FsStats {
     pub writeback_upload_batch_blocks: AtomicU64,
     /// Upload batches that included a frozen partial tail block.
     pub writeback_upload_partial_tail_ops: AtomicU64,
+    /// Partial-tail upload batches from size/chunk-end freezes.
+    pub writeback_upload_partial_tail_size_ops: AtomicU64,
+    /// Partial-tail upload batches from max-unflushed freezes.
+    pub writeback_upload_partial_tail_max_unflushed_ops: AtomicU64,
+    /// Partial-tail upload batches from explicit flush/fsync/close freezes.
+    pub writeback_upload_partial_tail_explicit_flush_ops: AtomicU64,
+    /// Partial-tail upload batches from auto flush freezes.
+    pub writeback_upload_partial_tail_auto_ops: AtomicU64,
+    /// Partial-tail upload batches from commit-age safety freezes.
+    pub writeback_upload_partial_tail_commit_age_ops: AtomicU64,
     /// Block cache hit count
     pub cache_hits: AtomicU64,
     /// Block cache miss count
@@ -516,6 +531,11 @@ impl FsStats {
             writeback_upload_batch_bytes: AtomicU64::new(0),
             writeback_upload_batch_blocks: AtomicU64::new(0),
             writeback_upload_partial_tail_ops: AtomicU64::new(0),
+            writeback_upload_partial_tail_size_ops: AtomicU64::new(0),
+            writeback_upload_partial_tail_max_unflushed_ops: AtomicU64::new(0),
+            writeback_upload_partial_tail_explicit_flush_ops: AtomicU64::new(0),
+            writeback_upload_partial_tail_auto_ops: AtomicU64::new(0),
+            writeback_upload_partial_tail_commit_age_ops: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             read_block_cache_hits: AtomicU64::new(0),
@@ -655,6 +675,21 @@ impl FsStats {
             writeback_upload_batch_bytes: self.writeback_upload_batch_bytes.load(ORD),
             writeback_upload_batch_blocks: self.writeback_upload_batch_blocks.load(ORD),
             writeback_upload_partial_tail_ops: self.writeback_upload_partial_tail_ops.load(ORD),
+            writeback_upload_partial_tail_size_ops: self
+                .writeback_upload_partial_tail_size_ops
+                .load(ORD),
+            writeback_upload_partial_tail_max_unflushed_ops: self
+                .writeback_upload_partial_tail_max_unflushed_ops
+                .load(ORD),
+            writeback_upload_partial_tail_explicit_flush_ops: self
+                .writeback_upload_partial_tail_explicit_flush_ops
+                .load(ORD),
+            writeback_upload_partial_tail_auto_ops: self
+                .writeback_upload_partial_tail_auto_ops
+                .load(ORD),
+            writeback_upload_partial_tail_commit_age_ops: self
+                .writeback_upload_partial_tail_commit_age_ops
+                .load(ORD),
             cache_hits: self.cache_hits.load(ORD),
             cache_misses: self.cache_misses.load(ORD),
             read_block_cache_hits: self.read_block_cache_hits.load(ORD),
@@ -811,18 +846,34 @@ impl FsStats {
             .store(commit_age_bytes, ORD);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn sync_writeback_upload_batch_metrics(
         &self,
         ops: u64,
         bytes: u64,
         blocks: u64,
         partial_tail_ops: u64,
+        partial_tail_size_ops: u64,
+        partial_tail_max_unflushed_ops: u64,
+        partial_tail_explicit_flush_ops: u64,
+        partial_tail_auto_ops: u64,
+        partial_tail_commit_age_ops: u64,
     ) {
         self.writeback_upload_batch_ops.store(ops, ORD);
         self.writeback_upload_batch_bytes.store(bytes, ORD);
         self.writeback_upload_batch_blocks.store(blocks, ORD);
         self.writeback_upload_partial_tail_ops
             .store(partial_tail_ops, ORD);
+        self.writeback_upload_partial_tail_size_ops
+            .store(partial_tail_size_ops, ORD);
+        self.writeback_upload_partial_tail_max_unflushed_ops
+            .store(partial_tail_max_unflushed_ops, ORD);
+        self.writeback_upload_partial_tail_explicit_flush_ops
+            .store(partial_tail_explicit_flush_ops, ORD);
+        self.writeback_upload_partial_tail_auto_ops
+            .store(partial_tail_auto_ops, ORD);
+        self.writeback_upload_partial_tail_commit_age_ops
+            .store(partial_tail_commit_age_ops, ORD);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1327,6 +1378,26 @@ impl FsStats {
             snapshot.writeback_upload_partial_tail_ops
         ));
         out.push_str(&format!(
+            "brewfs_writeback_upload_partial_tail_size_ops_total {}\n",
+            snapshot.writeback_upload_partial_tail_size_ops
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_upload_partial_tail_max_unflushed_ops_total {}\n",
+            snapshot.writeback_upload_partial_tail_max_unflushed_ops
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_upload_partial_tail_explicit_flush_ops_total {}\n",
+            snapshot.writeback_upload_partial_tail_explicit_flush_ops
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_upload_partial_tail_auto_ops_total {}\n",
+            snapshot.writeback_upload_partial_tail_auto_ops
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_upload_partial_tail_commit_age_ops_total {}\n",
+            snapshot.writeback_upload_partial_tail_commit_age_ops
+        ));
+        out.push_str(&format!(
             "brewfs_reader_buffer_bytes {}\n",
             snapshot.buf_read_bytes
         ));
@@ -1544,7 +1615,7 @@ mod tests {
         stats.sync_writeback_phase_metrics(1, 2, 3, 4, 5, 6, 7);
         stats.sync_writeback_slice_selection_metrics(8, 9, 10, 11);
         stats.sync_writeback_freeze_metrics(12, 1024, 13, 2048, 14, 4096, 15, 8192, 16, 16384);
-        stats.sync_writeback_upload_batch_metrics(17, 32768, 18, 19);
+        stats.sync_writeback_upload_batch_metrics(17, 32768, 18, 19, 20, 21, 22, 23, 24);
 
         let output = stats.render();
         assert!(output.contains("brewfs_fuse_read_ops_total 42"));
@@ -1616,6 +1687,13 @@ mod tests {
         assert!(output.contains("brewfs_writeback_upload_batch_bytes_total 32768"));
         assert!(output.contains("brewfs_writeback_upload_batch_blocks_total 18"));
         assert!(output.contains("brewfs_writeback_upload_partial_tail_ops_total 19"));
+        assert!(output.contains("brewfs_writeback_upload_partial_tail_size_ops_total 20"));
+        assert!(output.contains("brewfs_writeback_upload_partial_tail_max_unflushed_ops_total 21"));
+        assert!(
+            output.contains("brewfs_writeback_upload_partial_tail_explicit_flush_ops_total 22")
+        );
+        assert!(output.contains("brewfs_writeback_upload_partial_tail_auto_ops_total 23"));
+        assert!(output.contains("brewfs_writeback_upload_partial_tail_commit_age_ops_total 24"));
         assert!(output.contains("brewfs_reader_buffer_bytes 8192"));
         assert!(output.contains("brewfs_vfs_create_total_ops_total 0"));
         assert!(output.contains("brewfs_vfs_unlink_lookup_lat_us_total 0"));
@@ -1644,7 +1722,7 @@ mod tests {
         stats.sync_writeback_phase_metrics(111, 222, 333, 444, 555, 666, 777);
         stats.sync_writeback_slice_selection_metrics(888, 999, 1000, 1001);
         stats.sync_writeback_freeze_metrics(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
-        stats.sync_writeback_upload_batch_metrics(11, 12, 13, 14);
+        stats.sync_writeback_upload_batch_metrics(11, 12, 13, 14, 15, 16, 17, 18, 19);
         stats.sync_object_store_metrics(2, 8192, 50, 1, 4096, 25, 75, 125, 3);
 
         let snapshot = stats.snapshot();
@@ -1695,6 +1773,14 @@ mod tests {
         assert_eq!(snapshot.writeback_upload_batch_bytes, 12);
         assert_eq!(snapshot.writeback_upload_batch_blocks, 13);
         assert_eq!(snapshot.writeback_upload_partial_tail_ops, 14);
+        assert_eq!(snapshot.writeback_upload_partial_tail_size_ops, 15);
+        assert_eq!(snapshot.writeback_upload_partial_tail_max_unflushed_ops, 16);
+        assert_eq!(
+            snapshot.writeback_upload_partial_tail_explicit_flush_ops,
+            17
+        );
+        assert_eq!(snapshot.writeback_upload_partial_tail_auto_ops, 18);
+        assert_eq!(snapshot.writeback_upload_partial_tail_commit_age_ops, 19);
     }
 
     #[test]

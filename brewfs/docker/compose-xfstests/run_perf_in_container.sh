@@ -1562,6 +1562,20 @@ if brewfs_stats_paths:
         batch_bytes = metrics.get("brewfs_writeback_upload_batch_bytes_total", 0.0)
         batch_blocks = metrics.get("brewfs_writeback_upload_batch_blocks_total", 0.0)
         partial_tail = metrics.get("brewfs_writeback_upload_partial_tail_ops_total", 0.0)
+        partial_tail_size = metrics.get("brewfs_writeback_upload_partial_tail_size_ops_total", 0.0)
+        partial_tail_max = metrics.get(
+            "brewfs_writeback_upload_partial_tail_max_unflushed_ops_total",
+            0.0,
+        )
+        partial_tail_flush = metrics.get(
+            "brewfs_writeback_upload_partial_tail_explicit_flush_ops_total",
+            0.0,
+        )
+        partial_tail_auto = metrics.get("brewfs_writeback_upload_partial_tail_auto_ops_total", 0.0)
+        partial_tail_age = metrics.get(
+            "brewfs_writeback_upload_partial_tail_commit_age_ops_total",
+            0.0,
+        )
         freeze_size = metrics.get("brewfs_writeback_freeze_size_ops_total", 0.0)
         freeze_flush = metrics.get("brewfs_writeback_freeze_explicit_flush_ops_total", 0.0)
         freeze_auto = metrics.get("brewfs_writeback_freeze_auto_ops_total", 0.0)
@@ -1584,7 +1598,10 @@ if brewfs_stats_paths:
             f"reject_unique {int(reject_older)}/reject_prefix {int(reject_prefix)}, "
             f"live_slices={int(live_slices)} avg={fmt_avg_mib(live_dirty, live_slices)}, "
             f"upload_batch={int(batch_ops)} avg={fmt_avg_mib(batch_bytes, batch_ops)} "
-            f"blocks={avg_batch_blocks:.2f}/batch partial_tail={partial_tail_ratio:.2f}, "
+            f"blocks={avg_batch_blocks:.2f}/batch partial_tail={partial_tail_ratio:.2f} "
+            f"(size {int(partial_tail_size)}/max {int(partial_tail_max)}/"
+            f"flush {int(partial_tail_flush)}/auto {int(partial_tail_auto)}/"
+            f"age {int(partial_tail_age)}), "
             f"freeze=size {int(freeze_size)}/flush {int(freeze_flush)}/auto {int(freeze_auto)}/"
             f"max {int(freeze_max)}/age {int(freeze_age)} |"
         )

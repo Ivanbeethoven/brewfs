@@ -818,6 +818,11 @@ where
                         dirty.upload_batch_bytes,
                         dirty.upload_batch_blocks,
                         dirty.upload_partial_tail_ops,
+                        dirty.upload_partial_tail_size_ops,
+                        dirty.upload_partial_tail_max_unflushed_ops,
+                        dirty.upload_partial_tail_explicit_flush_ops,
+                        dirty.upload_partial_tail_auto_ops,
+                        dirty.upload_partial_tail_commit_age_ops,
                     );
                     if let Some(object_metrics) = &object_metrics {
                         let object = object_metrics.snapshot();

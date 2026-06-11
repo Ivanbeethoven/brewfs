@@ -254,6 +254,8 @@ pub(crate) struct SliceState {
     /// Set to `true` when a meta.write() has been initiated (or completed)
     /// to prevent both try_commit and commit_chunk from writing the same slice.
     meta_write_started: bool,
+    /// Reason this slice was sealed. Used to attribute partial-tail uploads.
+    freeze_reason: Option<SliceFreezeReason>,
     /// FUSE request unique id that created this slice, used to order overlapping
     /// slices for correct commit sequencing (lower unique = older data = commit first).
     creation_unique: u64,
@@ -295,6 +297,7 @@ impl SliceState {
             last_mod: now,
             frozen_epoch: 0,
             meta_write_started: false,
+            freeze_reason: None,
             creation_unique,
             max_write_unique: creation_unique,
         }
@@ -506,6 +509,7 @@ where
             frozen_bytes = s.data.len();
             s.state = SliceStatus::Readonly;
             s.frozen_epoch = self.shared.inode.data_epoch();
+            s.freeze_reason = Some(reason);
             s.data.freeze();
 
             if s.in_flight == 0 && !s.has_idle_block() {
@@ -691,6 +695,7 @@ where
                 data_len,
                 (end - start) as u64,
                 partial_tail,
+                s.freeze_reason,
             );
 
             Ok(Some(UploadPlan {
@@ -1168,6 +1173,11 @@ struct RecentPendingUploadState {
     upload_batch_bytes: AtomicU64,
     upload_batch_blocks: AtomicU64,
     upload_partial_tail_ops: AtomicU64,
+    upload_partial_tail_size_ops: AtomicU64,
+    upload_partial_tail_max_unflushed_ops: AtomicU64,
+    upload_partial_tail_explicit_flush_ops: AtomicU64,
+    upload_partial_tail_auto_ops: AtomicU64,
+    upload_partial_tail_commit_age_ops: AtomicU64,
     notify: Notify,
 }
 
@@ -1215,6 +1225,11 @@ impl RecentPendingUploadState {
             upload_batch_bytes: AtomicU64::new(0),
             upload_batch_blocks: AtomicU64::new(0),
             upload_partial_tail_ops: AtomicU64::new(0),
+            upload_partial_tail_size_ops: AtomicU64::new(0),
+            upload_partial_tail_max_unflushed_ops: AtomicU64::new(0),
+            upload_partial_tail_explicit_flush_ops: AtomicU64::new(0),
+            upload_partial_tail_auto_ops: AtomicU64::new(0),
+            upload_partial_tail_commit_age_ops: AtomicU64::new(0),
             notify: Notify::new(),
         }
     }
@@ -1304,13 +1319,31 @@ impl RecentPendingUploadState {
         total_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    fn record_upload_batch(&self, bytes: u64, blocks: u64, partial_tail: bool) {
+    fn record_upload_batch(
+        &self,
+        bytes: u64,
+        blocks: u64,
+        partial_tail: bool,
+        partial_tail_reason: Option<SliceFreezeReason>,
+    ) {
         self.upload_batch_ops.fetch_add(1, Ordering::Relaxed);
         self.upload_batch_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.upload_batch_blocks
             .fetch_add(blocks, Ordering::Relaxed);
         if partial_tail {
             self.upload_partial_tail_ops.fetch_add(1, Ordering::Relaxed);
+            if let Some(reason) = partial_tail_reason {
+                let counter = match reason {
+                    SliceFreezeReason::SizeOrChunkEnd => &self.upload_partial_tail_size_ops,
+                    SliceFreezeReason::MaxUnflushed => &self.upload_partial_tail_max_unflushed_ops,
+                    SliceFreezeReason::ExplicitFlush => {
+                        &self.upload_partial_tail_explicit_flush_ops
+                    }
+                    SliceFreezeReason::Auto => &self.upload_partial_tail_auto_ops,
+                    SliceFreezeReason::CommitAgeSafety => &self.upload_partial_tail_commit_age_ops,
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -3120,6 +3153,11 @@ pub(crate) struct WritebackDirtyBreakdown {
     pub upload_batch_bytes: u64,
     pub upload_batch_blocks: u64,
     pub upload_partial_tail_ops: u64,
+    pub upload_partial_tail_size_ops: u64,
+    pub upload_partial_tail_max_unflushed_ops: u64,
+    pub upload_partial_tail_explicit_flush_ops: u64,
+    pub upload_partial_tail_auto_ops: u64,
+    pub upload_partial_tail_commit_age_ops: u64,
 }
 
 impl<B, M> DataWriter<B, M>
@@ -3291,6 +3329,26 @@ where
             upload_partial_tail_ops: self
                 .recent_pending_upload
                 .upload_partial_tail_ops
+                .load(Ordering::Relaxed),
+            upload_partial_tail_size_ops: self
+                .recent_pending_upload
+                .upload_partial_tail_size_ops
+                .load(Ordering::Relaxed),
+            upload_partial_tail_max_unflushed_ops: self
+                .recent_pending_upload
+                .upload_partial_tail_max_unflushed_ops
+                .load(Ordering::Relaxed),
+            upload_partial_tail_explicit_flush_ops: self
+                .recent_pending_upload
+                .upload_partial_tail_explicit_flush_ops
+                .load(Ordering::Relaxed),
+            upload_partial_tail_auto_ops: self
+                .recent_pending_upload
+                .upload_partial_tail_auto_ops
+                .load(Ordering::Relaxed),
+            upload_partial_tail_commit_age_ops: self
+                .recent_pending_upload
+                .upload_partial_tail_commit_age_ops
                 .load(Ordering::Relaxed),
             ..WritebackDirtyBreakdown::default()
         };
@@ -4434,6 +4492,9 @@ mod tests {
         assert_eq!(after_flush.freeze_explicit_flush_ops, 1);
         assert_eq!(after_flush.upload_batch_ops, 1);
         assert_eq!(after_flush.upload_partial_tail_ops, 1);
+        assert_eq!(after_flush.upload_partial_tail_explicit_flush_ops, 1);
+        assert_eq!(after_flush.upload_partial_tail_auto_ops, 0);
+        assert_eq!(after_flush.upload_partial_tail_max_unflushed_ops, 0);
     }
 
     #[tokio::test]
