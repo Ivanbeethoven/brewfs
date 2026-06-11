@@ -3,6 +3,7 @@ pub mod registry;
 pub mod server;
 
 use crate::config::ConsoleArgs;
+use crate::control::runtime::RuntimeRegistry;
 use registry::VolumeRegistry;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
@@ -54,6 +55,7 @@ impl fmt::Debug for AuthConfig {
 pub struct ConsoleConfig {
     pub listen: SocketAddr,
     pub state_dir: PathBuf,
+    pub runtime_dir: PathBuf,
     pub static_dir: PathBuf,
     pub auth: AuthConfig,
     pub csi_dashboard: bool,
@@ -64,6 +66,7 @@ pub struct ConsoleState {
     pub auth: AuthConfig,
     pub static_dir: PathBuf,
     pub registry: VolumeRegistry,
+    pub runtime_registry: RuntimeRegistry,
     pub csi_dashboard: bool,
 }
 
@@ -79,6 +82,9 @@ impl ConsoleConfig {
         Ok(Self {
             listen: args.listen,
             state_dir: args.state_dir.unwrap_or_else(default_state_dir),
+            runtime_dir: args
+                .runtime_dir
+                .unwrap_or_else(RuntimeRegistry::default_root),
             static_dir: args
                 .static_dir
                 .unwrap_or_else(|| PathBuf::from("brewfs/web/console/dist")),

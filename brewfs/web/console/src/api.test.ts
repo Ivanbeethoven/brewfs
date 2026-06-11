@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, createVolume, fetchHealth, fetchVolumes } from './api';
+import { ApiError, createVolume, fetchHealth, fetchInstances, fetchVolumes } from './api';
 
 const healthResponse = {
   service: 'brewfs-console',
@@ -157,5 +157,42 @@ describe('volume registry API', () => {
       }),
     });
     expect(JSON.stringify(result)).not.toContain('secret');
+  });
+});
+
+describe('runtime instances API', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('fetches runtime instances with a bearer token', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          instances: [
+            {
+              pid: 42,
+              mount_point: '/mnt/brewfs',
+              socket_path: '/run/user/1000/brewfs/42.sock',
+              started_at: '2026-06-11T00:00:00Z',
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        },
+      ),
+    );
+
+    const result = await fetchInstances('secret-token');
+
+    expect(fetch).toHaveBeenCalledWith('/api/instances', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer secret-token',
+      },
+    });
+    expect(result.instances[0].mount_point).toBe('/mnt/brewfs');
   });
 });

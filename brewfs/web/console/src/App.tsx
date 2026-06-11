@@ -16,8 +16,10 @@ import {
   ApiError,
   createVolume,
   fetchHealth,
+  fetchInstances,
   fetchVolumes,
   type HealthResponse,
+  type InstanceResponse,
   type VolumeResponse,
 } from './api';
 
@@ -91,6 +93,8 @@ export function App() {
   const [tokenInput, setTokenInput] = useState('');
   const [authRequired, setAuthRequired] = useState(false);
   const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [instances, setInstances] = useState<InstanceResponse[]>([]);
+  const [instanceError, setInstanceError] = useState<string | null>(null);
   const [volumes, setVolumes] = useState<VolumeResponse[]>([]);
   const [volumeError, setVolumeError] = useState<string | null>(null);
   const [volumeForm, setVolumeForm] = useState<VolumeFormState>(emptyVolumeForm);
@@ -108,6 +112,22 @@ export function App() {
         setHealth(result);
         setError(null);
         setAuthRequired(false);
+
+        try {
+          const instanceResult = await fetchInstances(token);
+          if (!cancelled) {
+            setInstances(instanceResult.instances);
+            setInstanceError(null);
+          }
+        } catch (err: unknown) {
+          if (cancelled) return;
+          if (err instanceof ApiError && err.status === 401) {
+            setHealth(null);
+            setAuthRequired(true);
+          } else {
+            setInstanceError(err instanceof Error ? err.message : 'instances request failed');
+          }
+        }
 
         try {
           const volumeResult = await fetchVolumes(token);
@@ -253,6 +273,8 @@ export function App() {
             renderPage(page, {
               health,
               error,
+              instances,
+              instanceError,
               volumes,
               volumeError,
               volumeForm,
@@ -304,6 +326,8 @@ function AuthPanel({
 type RenderContext = {
   health: HealthResponse | null;
   error: string | null;
+  instances: InstanceResponse[];
+  instanceError: string | null;
   volumes: VolumeResponse[];
   volumeError: string | null;
   volumeForm: VolumeFormState;
@@ -317,6 +341,8 @@ function renderPage(page: PageKey, context: RenderContext) {
   const {
     health,
     error,
+    instances,
+    instanceError,
     volumes,
     volumeError,
     volumeForm,
@@ -333,12 +359,23 @@ function renderPage(page: PageKey, context: RenderContext) {
           <Metric label="Service" value={health?.service ?? 'waiting'} />
           <Metric label="Commit" value={health?.commit_short ?? 'unknown'} />
           <Metric label="Auth" value={health?.auth_mode ?? 'unknown'} />
+          <Metric label="Live mounts" value={String(instances.length)} />
         </Panel>
-        <Panel title="Scaffold status">
-          <p className="muted">
-            The console shell is connected to the health API. Volume registry, jobs, file browsing,
-            trash, ACL, and CSI data are intentionally empty in this phase.
-          </p>
+        <Panel title="Live instances">
+          {instanceError ? <p className="error-text">{instanceError}</p> : null}
+          {instances.length === 0 ? (
+            <p className="muted">No live BrewFS mount records found.</p>
+          ) : (
+            <div className="instance-list">
+              {instances.map((instance) => (
+                <div className="instance-row" key={instance.pid}>
+                  <strong>{instance.mount_point}</strong>
+                  <span>pid {instance.pid}</span>
+                  <code>{instance.socket_path}</code>
+                </div>
+              ))}
+            </div>
+          )}
           {error ? <p className="error-text">{error}</p> : null}
         </Panel>
       </>
@@ -363,7 +400,7 @@ function renderPage(page: PageKey, context: RenderContext) {
     return (
       <EmptyPanel
         title="No jobs"
-        detail="Runtime job discovery arrives with control-plane integration."
+        detail="Live instance discovery is available; job control-plane actions arrive next."
       />
     );
   }

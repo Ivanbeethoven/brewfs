@@ -2,6 +2,7 @@ use super::{
     AuthMode, ConsoleState,
     registry::{CreateVolumeRequest, RegistryError, VolumeResponse},
 };
+use crate::control::runtime::InstanceRecord;
 use axum::{Json, extract::State};
 use axum::{
     http::StatusCode,
@@ -27,6 +28,30 @@ pub struct HealthIntegrations {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ListVolumesResponse {
     pub volumes: Vec<VolumeResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ListInstancesResponse {
+    pub instances: Vec<InstanceResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct InstanceResponse {
+    pub pid: u32,
+    pub mount_point: String,
+    pub socket_path: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<InstanceRecord> for InstanceResponse {
+    fn from(record: InstanceRecord) -> Self {
+        Self {
+            pid: record.pid,
+            mount_point: record.mount_point,
+            socket_path: record.socket_path.to_string_lossy().into_owned(),
+            started_at: record.started_at,
+        }
+    }
 }
 
 impl HealthResponse {
@@ -70,6 +95,26 @@ pub async fn create_volume(
         .await
         .map_err(ApiErrorResponse::from)?;
     Ok((StatusCode::CREATED, Json(volume)))
+}
+
+pub async fn list_instances(
+    State(state): State<ConsoleState>,
+) -> Result<Json<ListInstancesResponse>, ApiErrorResponse> {
+    let instances = state
+        .runtime_registry
+        .list_instances()
+        .await
+        .map_err(|err| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime_registry_error",
+                format!("failed to read runtime registry: {err}"),
+            )
+        })?
+        .into_iter()
+        .map(InstanceResponse::from)
+        .collect();
+    Ok(Json(ListInstancesResponse { instances }))
 }
 
 pub fn json_error(
@@ -134,7 +179,10 @@ struct ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::console::{AuthConfig, AuthMode, ConsoleState, registry::VolumeRegistry};
+    use crate::{
+        console::{AuthConfig, AuthMode, ConsoleState, registry::VolumeRegistry},
+        control::runtime::RuntimeRegistry,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -144,6 +192,7 @@ mod tests {
             auth: AuthConfig::Disabled,
             static_dir: static_dir.clone(),
             registry: VolumeRegistry::new(static_dir.join("state")),
+            runtime_registry: RuntimeRegistry::new(static_dir.join("runtime")),
             csi_dashboard: true,
         };
 

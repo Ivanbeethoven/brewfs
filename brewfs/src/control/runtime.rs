@@ -75,6 +75,25 @@ impl RuntimeRegistry {
     }
 
     pub async fn select_instance(&self, mount_point: Option<&str>) -> Result<InstanceRecord> {
+        let mut records = self.list_instances().await?;
+
+        if let Some(mount_point) = mount_point {
+            return records
+                .into_iter()
+                .find(|record| record.mount_point == mount_point)
+                .ok_or_else(|| anyhow!("no brewfs instance for mount point: {mount_point}"));
+        }
+
+        match records.len() {
+            0 => Err(anyhow!("no brewfs instances found")),
+            1 => Ok(records.pop().expect("single record")),
+            _ => Err(anyhow!(
+                "multiple brewfs instances found, please specify mount point"
+            )),
+        }
+    }
+
+    pub async fn list_instances(&self) -> Result<Vec<InstanceRecord>> {
         tokio::fs::create_dir_all(&self.root).await?;
 
         let mut records = Vec::new();
@@ -93,20 +112,8 @@ impl RuntimeRegistry {
             }
         }
 
-        if let Some(mount_point) = mount_point {
-            return records
-                .into_iter()
-                .find(|record| record.mount_point == mount_point)
-                .ok_or_else(|| anyhow!("no brewfs instance for mount point: {mount_point}"));
-        }
-
-        match records.len() {
-            0 => Err(anyhow!("no brewfs instances found")),
-            1 => Ok(records.pop().expect("single record")),
-            _ => Err(anyhow!(
-                "multiple brewfs instances found, please specify mount point"
-            )),
-        }
+        records.sort_by_key(|record| record.pid);
+        Ok(records)
     }
 
     fn load_record(&self, path: &Path) -> Result<Option<InstanceRecord>> {

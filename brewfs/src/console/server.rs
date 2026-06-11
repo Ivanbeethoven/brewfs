@@ -15,11 +15,13 @@ pub fn build_router(config: ConsoleConfig) -> Router {
         auth: config.auth.clone(),
         static_dir: config.static_dir.clone(),
         registry: super::registry::VolumeRegistry::new(config.state_dir.clone()),
+        runtime_registry: crate::control::runtime::RuntimeRegistry::new(config.runtime_dir.clone()),
         csi_dashboard: config.csi_dashboard,
     };
     let api = Router::new()
         .route("/health", get(api::health))
         .route("/volumes", get(api::list_volumes).post(api::create_volume))
+        .route("/instances", get(api::list_instances))
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -157,6 +159,7 @@ mod tests {
         ConsoleConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             state_dir: static_dir.join("state"),
+            runtime_dir: static_dir.join("runtime"),
             static_dir: static_dir.to_path_buf(),
             auth,
             csi_dashboard: false,
@@ -398,5 +401,37 @@ mod tests {
         let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(listed["volumes"][0]["id"], created["id"]);
         assert!(!String::from_utf8_lossy(&body).contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn instances_api_lists_live_runtime_records() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\"></div>").unwrap();
+        let config = test_config(dir.path(), AuthConfig::Disabled);
+        let registry = crate::control::runtime::RuntimeRegistry::new(config.runtime_dir.clone());
+        let record = crate::control::runtime::InstanceRecord::new(
+            std::process::id(),
+            "/mnt/brewfs".to_string(),
+            registry.socket_path(std::process::id()),
+            chrono::Utc::now(),
+        );
+        registry.write_record(&record).await.unwrap();
+        let app = build_router(config);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/instances")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["instances"][0]["pid"], std::process::id());
+        assert_eq!(value["instances"][0]["mount_point"], "/mnt/brewfs");
     }
 }

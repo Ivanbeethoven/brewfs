@@ -207,6 +207,32 @@ h2 {
   overflow-wrap: anywhere;
 }
 
+.instance-list {
+  display: grid;
+  gap: 10px;
+}
+
+.instance-row {
+  display: grid;
+  gap: 4px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.instance-row:last-child {
+  border-bottom: 0;
+}
+
+.instance-row span,
+.instance-row code {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.instance-row code {
+  overflow-wrap: anywhere;
+}
+
 .error-text {
   color: var(--bad);
 }

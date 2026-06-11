@@ -35,6 +35,17 @@ export interface ListVolumesResponse {
   volumes: VolumeResponse[];
 }
 
+export interface InstanceResponse {
+  pid: number;
+  mount_point: string;
+  socket_path: string;
+  started_at: string;
+}
+
+export interface ListInstancesResponse {
+  instances: InstanceResponse[];
+}
+
 export interface CreateVolumeRequest {
   name: string;
   description?: string;
@@ -78,6 +89,16 @@ export async function fetchVolumes(token?: string | null): Promise<ListVolumesRe
   assertOk(response, 'volumes request failed');
 
   return (await response.json()) as ListVolumesResponse;
+}
+
+export async function fetchInstances(token?: string | null): Promise<ListInstancesResponse> {
+  const response = await fetch('/api/instances', {
+    headers: apiHeaders(token),
+  });
+
+  assertOk(response, 'instances request failed');
+
+  return (await response.json()) as ListInstancesResponse;
 }
 
 export async function createVolume(
