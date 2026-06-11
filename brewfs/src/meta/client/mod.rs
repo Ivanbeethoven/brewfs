@@ -4,7 +4,9 @@ pub mod session;
 
 use crate::chunk::SliceDesc;
 use crate::control::job::{GcJobResult, JobManager};
-use crate::control::protocol::{ControlRequest, ControlResponse};
+use crate::control::protocol::{
+    ControlDirectoryEntry, ControlFileKind, ControlRequest, ControlResponse,
+};
 use crate::control::runtime::{InstanceRecord, RuntimeRegistry};
 use crate::control::server::{ControlHandler, ControlServer};
 use crate::meta::config::{CacheCapacity, CacheTtl};
@@ -458,6 +460,69 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
 
     pub fn metrics(&self) -> Arc<MetaClientMetrics> {
         self.metrics.clone()
+    }
+
+    async fn list_directory_for_control(&self, path: &str) -> ControlResponse {
+        let path = match Self::normalize_control_path(path) {
+            Ok(path) => path,
+            Err(err) => return control_meta_error(err),
+        };
+        let (ino, attr) = match self.lookup_path_with_attr(&path).await {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                return control_meta_error(MetaError::NotFound(self.root()));
+            }
+            Err(err) => return control_meta_error(err),
+        };
+
+        if attr.kind != FileType::Dir {
+            return control_meta_error(MetaError::NotDirectory(ino));
+        }
+
+        let entries = match self.readdir(ino).await {
+            Ok(entries) => entries,
+            Err(err) => return control_meta_error(err),
+        };
+        let mut response_entries = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let attr = match self.cached_stat(entry.ino).await {
+                Ok(Some(attr)) => attr,
+                Ok(None) => return control_meta_error(MetaError::NotFound(entry.ino)),
+                Err(err) => return control_meta_error(err),
+            };
+            response_entries.push(ControlDirectoryEntry {
+                name: entry.name,
+                inode: entry.ino,
+                kind: ControlFileKind::from(attr.kind),
+                size: attr.size,
+                mode: attr.mode,
+                uid: attr.uid,
+                gid: attr.gid,
+                mtime_ns: attr.mtime,
+            });
+        }
+
+        ControlResponse::DirectoryListing {
+            path,
+            entries: response_entries,
+        }
+    }
+
+    fn normalize_control_path(path: &str) -> Result<String, MetaError> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Ok("/".to_string());
+        }
+        if !path.starts_with('/') {
+            return Err(MetaError::InvalidPath(path.to_string()));
+        }
+
+        let normalized = Self::normalize_path(path);
+        if normalized.is_empty() {
+            Ok("/".to_string())
+        } else {
+            Ok(normalized)
+        }
     }
 
     pub(crate) async fn invalidate_chunk_slices(&self, chunk_id: u64) {
@@ -1405,7 +1470,22 @@ impl<T: MetaStore + ?Sized + 'static> ControlHandler for Arc<MetaClient<T>> {
                     message: format!("job not found: {job_id}"),
                 },
             },
+            ControlRequest::ListDirectory { path } => self.list_directory_for_control(&path).await,
         }
+    }
+}
+
+fn control_meta_error(err: MetaError) -> ControlResponse {
+    let code = match &err {
+        MetaError::NotFound(_) => "not_found",
+        MetaError::NotDirectory(_) => "not_directory",
+        MetaError::InvalidPath(_) | MetaError::InvalidFilename => "invalid_path",
+        MetaError::NotSupported(_) | MetaError::NotImplemented => "unsupported",
+        _ => "meta_error",
+    };
+    ControlResponse::Error {
+        code: code.to_string(),
+        message: err.to_string(),
     }
 }
 
@@ -2947,6 +3027,53 @@ mod tests {
         match status {
             crate::control::protocol::ControlResponse::JobStatus { .. } => {}
             other => panic!("unexpected status response: {other:?}"),
+        }
+
+        client.shutdown_runtime().await;
+    }
+
+    #[tokio::test]
+    async fn test_control_plane_lists_directory_metadata() {
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let options = MetaClientOptions {
+            mount_point: Some("/mnt/list".to_string()),
+            control_runtime_dir: Some(runtime_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let client = create_test_client_with_options(options).await;
+        let docs_ino = client.mkdir(1, "docs".to_string()).await.unwrap();
+        let readme_ino = client
+            .create_file(docs_ino, "readme.md".to_string())
+            .await
+            .unwrap();
+        client.start_control_plane().await.unwrap();
+
+        let registry =
+            crate::control::runtime::RuntimeRegistry::new(runtime_dir.path().to_path_buf());
+        let record = registry.select_instance(Some("/mnt/list")).await.unwrap();
+
+        let response = crate::control::client::send_request(
+            &record.socket_path,
+            &crate::control::protocol::ControlRequest::ListDirectory {
+                path: "/docs".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        match response {
+            crate::control::protocol::ControlResponse::DirectoryListing { path, entries } => {
+                assert_eq!(path, "/docs");
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].name, "readme.md");
+                assert_eq!(entries[0].inode, readme_ino);
+                assert_eq!(
+                    entries[0].kind,
+                    crate::control::protocol::ControlFileKind::File
+                );
+            }
+            other => panic!("unexpected directory listing response: {other:?}"),
         }
 
         client.shutdown_runtime().await;

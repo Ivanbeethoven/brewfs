@@ -1,4 +1,5 @@
 use crate::control::job::{JobInfo, JobOutcome, JobState};
+use crate::meta::store::FileType;
 use crate::meta::store::MetaStoreCapabilities;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -7,6 +8,7 @@ pub enum ControlRequest {
     GetInfo,
     RunGc { dry_run: bool },
     GetJob { job_id: String },
+    ListDirectory { path: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -29,10 +31,44 @@ pub enum ControlResponse {
         detail: Option<String>,
         outcome: Option<JobOutcome>,
     },
+    DirectoryListing {
+        path: String,
+        entries: Vec<ControlDirectoryEntry>,
+    },
     Error {
         code: String,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ControlDirectoryEntry {
+    pub name: String,
+    pub inode: i64,
+    pub kind: ControlFileKind,
+    pub size: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime_ns: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ControlFileKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+impl From<FileType> for ControlFileKind {
+    fn from(kind: FileType) -> Self {
+        match kind {
+            FileType::File => Self::File,
+            FileType::Dir => Self::Directory,
+            FileType::Symlink => Self::Symlink,
+        }
+    }
 }
 
 impl From<JobInfo> for ControlResponse {

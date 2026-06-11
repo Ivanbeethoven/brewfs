@@ -6,7 +6,7 @@ use crate::{
     control::{
         client::send_request,
         job::{JobOutcome, JobState},
-        protocol::{ControlRequest, ControlResponse},
+        protocol::{ControlDirectoryEntry, ControlFileKind, ControlRequest, ControlResponse},
         runtime::InstanceRecord,
     },
     meta::store::MetaStoreCapabilities,
@@ -86,6 +86,24 @@ pub struct JobStatusResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct PathQuery {
     pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FileListResponse {
+    pub path: String,
+    pub entries: Vec<FileEntryResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FileEntryResponse {
+    pub name: String,
+    pub inode: i64,
+    pub kind: &'static str,
+    pub size: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime: String,
 }
 
 impl From<InstanceRecord> for InstanceResponse {
@@ -325,13 +343,42 @@ pub async fn get_job_status(
 }
 
 pub async fn list_files(
-    Path(_volume_id): Path<String>,
+    State(state): State<ConsoleState>,
+    Path(volume_id): Path<String>,
     Query(query): Query<PathQuery>,
-) -> Result<Json<serde_json::Value>, ApiErrorResponse> {
-    let _path = query.path.unwrap_or_else(|| "/".to_string());
-    Err(unsupported(
-        "file browser APIs are not implemented for BrewFS volumes yet",
-    ))
+) -> Result<Json<FileListResponse>, ApiErrorResponse> {
+    let path = normalize_absolute_path(query.path.as_deref().unwrap_or("/"))?;
+    let record = find_runtime_record_for_volume(&state, &volume_id).await?;
+    let response = send_control_request(
+        &record.socket_path,
+        &ControlRequest::ListDirectory { path: path.clone() },
+    )
+    .await?;
+
+    match response {
+        ControlResponse::DirectoryListing {
+            path: response_path,
+            entries,
+        } => {
+            if response_path != path {
+                return Err(json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "control_plane_error",
+                    format!("control-plane path mismatch: requested {path}, got {response_path}"),
+                ));
+            }
+            Ok(Json(FileListResponse {
+                path: response_path,
+                entries: entries.into_iter().map(FileEntryResponse::from).collect(),
+            }))
+        }
+        ControlResponse::Error { code, message } => Err(control_error_response(&code, &message)),
+        other => Err(json_error(
+            StatusCode::BAD_GATEWAY,
+            "control_plane_error",
+            format!("unexpected control-plane response: {other:?}"),
+        )),
+    }
 }
 
 pub async fn list_trash(
@@ -433,6 +480,39 @@ async fn find_runtime_record(
         })
 }
 
+async fn find_runtime_record_for_volume(
+    state: &ConsoleState,
+    volume_id: &str,
+) -> Result<InstanceRecord, ApiErrorResponse> {
+    let volume = state
+        .registry
+        .get(volume_id)
+        .await
+        .map_err(ApiErrorResponse::from)?;
+    let mount_point = volume.mount_config.mount_point.ok_or_else(|| {
+        unavailable("registered volume has no mount point; mount it before browsing files")
+    })?;
+
+    state
+        .runtime_registry
+        .list_instances()
+        .await
+        .map_err(|err| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime_registry_error",
+                format!("failed to read runtime registry: {err}"),
+            )
+        })?
+        .into_iter()
+        .find(|record| record.mount_point == mount_point)
+        .ok_or_else(|| {
+            unavailable(format!(
+                "registered volume is not mounted at {mount_point}; mount it before browsing files"
+            ))
+        })
+}
+
 async fn send_control_request(
     socket_path: &FsPath,
     request: &ControlRequest,
@@ -457,6 +537,87 @@ async fn send_control_request(
 
 fn unsupported(message: impl Into<String>) -> ApiErrorResponse {
     json_error(StatusCode::NOT_IMPLEMENTED, "unsupported", message)
+}
+
+fn unavailable(message: impl Into<String>) -> ApiErrorResponse {
+    json_error(StatusCode::CONFLICT, "unavailable", message)
+}
+
+fn control_error_response(code: &str, message: &str) -> ApiErrorResponse {
+    match code {
+        "not_found" => json_error(StatusCode::NOT_FOUND, "not_found", message),
+        "not_directory" | "invalid_path" => {
+            json_error(StatusCode::BAD_REQUEST, "invalid_path", message)
+        }
+        "unsupported" => unsupported(message),
+        _ => json_error(
+            StatusCode::BAD_GATEWAY,
+            "control_plane_error",
+            format!("{code}: {message}"),
+        ),
+    }
+}
+
+fn normalize_absolute_path(path: &str) -> Result<String, ApiErrorResponse> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Ok("/".to_string());
+    }
+    if !path.starts_with('/') {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_path",
+            "path must be absolute",
+        ));
+    }
+
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+
+    if parts.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(format!("/{}", parts.join("/")))
+    }
+}
+
+impl From<ControlDirectoryEntry> for FileEntryResponse {
+    fn from(entry: ControlDirectoryEntry) -> Self {
+        Self {
+            name: entry.name,
+            inode: entry.inode,
+            kind: control_kind_name(entry.kind),
+            size: entry.size,
+            mode: entry.mode,
+            uid: entry.uid,
+            gid: entry.gid,
+            mtime: format_timestamp_ns(entry.mtime_ns),
+        }
+    }
+}
+
+fn control_kind_name(kind: ControlFileKind) -> &'static str {
+    match kind {
+        ControlFileKind::File => "file",
+        ControlFileKind::Directory => "directory",
+        ControlFileKind::Symlink => "symlink",
+    }
+}
+
+fn format_timestamp_ns(value: i64) -> String {
+    let seconds = value.div_euclid(1_000_000_000);
+    let nanos = value.rem_euclid(1_000_000_000) as u32;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, nanos)
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_else(|| value.to_string())
 }
 
 pub fn json_error(

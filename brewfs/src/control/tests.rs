@@ -14,6 +14,35 @@ fn protocol_roundtrip_preserves_gc_request() {
     assert_eq!(decoded, req);
 }
 
+#[test]
+fn protocol_roundtrip_preserves_directory_listing_request() {
+    let req = ControlRequest::ListDirectory {
+        path: "/projects".to_string(),
+    };
+    let raw = serde_json::to_vec(&req).expect("serialize request");
+    let decoded: ControlRequest = serde_json::from_slice(&raw).expect("deserialize request");
+
+    assert_eq!(decoded, req);
+
+    let response = ControlResponse::DirectoryListing {
+        path: "/projects".to_string(),
+        entries: vec![super::protocol::ControlDirectoryEntry {
+            name: "readme.md".to_string(),
+            inode: 42,
+            kind: super::protocol::ControlFileKind::File,
+            size: 128,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            mtime_ns: 1_786_000_000_000_000_000,
+        }],
+    };
+    let raw = serde_json::to_vec(&response).expect("serialize response");
+    let decoded: ControlResponse = serde_json::from_slice(&raw).expect("deserialize response");
+
+    assert_eq!(decoded, response);
+}
+
 #[tokio::test]
 async fn runtime_registry_auto_selects_single_live_instance() {
     let dir = tempdir().expect("tempdir");

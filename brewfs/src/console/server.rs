@@ -770,10 +770,6 @@ mod tests {
 
         let requests = [
             Request::builder()
-                .uri("/api/volumes/vol-1/files?path=/")
-                .body(Body::empty())
-                .unwrap(),
-            Request::builder()
                 .uri("/api/volumes/vol-1/trash")
                 .body(Body::empty())
                 .unwrap(),
@@ -818,6 +814,208 @@ mod tests {
             let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(value["error"]["code"], "unsupported");
         }
+    }
+
+    #[tokio::test]
+    async fn files_api_returns_unavailable_when_registered_volume_is_not_mounted() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\"></div>").unwrap();
+        let app = build_router(test_config(dir.path(), AuthConfig::Disabled));
+
+        let create_body = serde_json::json!({
+            "name": "dev-local",
+            "mount_config": {
+                "mount_point": "/mnt/brewfs",
+                "data_backend": "local-fs",
+                "meta_backend": "sqlx"
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/volumes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let volume_id = created["id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/volumes/{volume_id}/files?path=/"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "unavailable");
+    }
+
+    #[tokio::test]
+    async fn files_api_rejects_relative_paths() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\"></div>").unwrap();
+        let app = build_router(test_config(dir.path(), AuthConfig::Disabled));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/volumes/vol-1/files?path=relative")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_path");
+    }
+
+    #[tokio::test]
+    async fn files_api_lists_entries_from_live_control_plane() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\"></div>").unwrap();
+        let config = test_config(dir.path(), AuthConfig::Disabled);
+        let registry = crate::control::runtime::RuntimeRegistry::new(config.runtime_dir.clone());
+        let pid = std::process::id();
+        let socket_path = registry.socket_path(pid);
+        let _server =
+            crate::control::server::ControlServer::bind(socket_path.clone(), FileListHandler)
+                .await
+                .unwrap();
+        let record = crate::control::runtime::InstanceRecord::new(
+            pid,
+            "/mnt/brewfs".to_string(),
+            socket_path,
+            chrono::Utc::now(),
+        );
+        registry.write_record(&record).await.unwrap();
+        let app = build_router(config);
+
+        let create_body = serde_json::json!({
+            "name": "dev-local",
+            "mount_config": {
+                "mount_point": "/mnt/brewfs",
+                "data_backend": "local-fs",
+                "meta_backend": "sqlx"
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/volumes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let volume_id = created["id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/volumes/{volume_id}/files?path=/projects/../projects"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["path"], "/projects");
+        assert_eq!(value["entries"][0]["name"], "notes.txt");
+        assert_eq!(value["entries"][0]["kind"], "file");
+        assert_eq!(value["entries"][0]["inode"], 42);
+        assert_eq!(value["entries"][0]["size"], 128);
+        assert_eq!(value["entries"][0]["mode"], 0o644);
+    }
+
+    #[tokio::test]
+    async fn files_api_rejects_control_plane_path_mismatch() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\"></div>").unwrap();
+        let config = test_config(dir.path(), AuthConfig::Disabled);
+        let registry = crate::control::runtime::RuntimeRegistry::new(config.runtime_dir.clone());
+        let pid = std::process::id();
+        let socket_path = registry.socket_path(pid);
+        let _server = crate::control::server::ControlServer::bind(
+            socket_path.clone(),
+            MismatchedDirectoryHandler,
+        )
+        .await
+        .unwrap();
+        let record = crate::control::runtime::InstanceRecord::new(
+            pid,
+            "/mnt/brewfs".to_string(),
+            socket_path,
+            chrono::Utc::now(),
+        );
+        registry.write_record(&record).await.unwrap();
+        let app = build_router(config);
+
+        let create_body = serde_json::json!({
+            "name": "dev-local",
+            "mount_config": {
+                "mount_point": "/mnt/brewfs",
+                "data_backend": "local-fs",
+                "meta_backend": "sqlx"
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/volumes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let volume_id = created["id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/volumes/{volume_id}/files?path=/projects"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "control_plane_error");
     }
 
     struct GetInfoHandler;
@@ -937,6 +1135,63 @@ mod tests {
                         state: crate::control::job::JobState::Succeeded,
                         detail: None,
                         outcome: None,
+                    }
+                }
+                other => crate::control::protocol::ControlResponse::Error {
+                    code: "unexpected".to_string(),
+                    message: format!("unexpected request: {other:?}"),
+                },
+            }
+        }
+    }
+
+    struct FileListHandler;
+
+    #[async_trait::async_trait]
+    impl crate::control::server::ControlHandler for FileListHandler {
+        async fn handle(
+            &self,
+            request: crate::control::protocol::ControlRequest,
+        ) -> crate::control::protocol::ControlResponse {
+            match request {
+                crate::control::protocol::ControlRequest::ListDirectory { path }
+                    if path == "/projects" =>
+                {
+                    crate::control::protocol::ControlResponse::DirectoryListing {
+                        path,
+                        entries: vec![crate::control::protocol::ControlDirectoryEntry {
+                            name: "notes.txt".to_string(),
+                            inode: 42,
+                            kind: crate::control::protocol::ControlFileKind::File,
+                            size: 128,
+                            mode: 0o644,
+                            uid: 1000,
+                            gid: 1000,
+                            mtime_ns: 1_786_000_000_000_000_000,
+                        }],
+                    }
+                }
+                other => crate::control::protocol::ControlResponse::Error {
+                    code: "unexpected".to_string(),
+                    message: format!("unexpected request: {other:?}"),
+                },
+            }
+        }
+    }
+
+    struct MismatchedDirectoryHandler;
+
+    #[async_trait::async_trait]
+    impl crate::control::server::ControlHandler for MismatchedDirectoryHandler {
+        async fn handle(
+            &self,
+            request: crate::control::protocol::ControlRequest,
+        ) -> crate::control::protocol::ControlResponse {
+            match request {
+                crate::control::protocol::ControlRequest::ListDirectory { .. } => {
+                    crate::control::protocol::ControlResponse::DirectoryListing {
+                        path: "/other".to_string(),
+                        entries: Vec::new(),
                     }
                 }
                 other => crate::control::protocol::ControlResponse::Error {
