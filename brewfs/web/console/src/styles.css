@@ -164,7 +164,7 @@ h2 {
 .data-table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 1240px;
+  min-width: 1520px;
   font-size: 14px;
 }
 
@@ -348,6 +348,23 @@ h2 {
   padding: 8px;
   background: #f6f8fb;
   color: #17202a;
+}
+
+.capability-summary {
+  display: grid;
+  gap: 5px;
+  min-width: 260px;
+  max-width: 520px;
+}
+
+.capability-summary strong,
+.capability-summary span {
+  overflow-wrap: anywhere;
+}
+
+.capability-summary span {
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .browser-toolbar {

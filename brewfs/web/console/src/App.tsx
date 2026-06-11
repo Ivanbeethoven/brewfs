@@ -46,6 +46,7 @@ import { loadInstanceDetails } from './instanceDetails';
 import { buildMountCommand } from './mountCommand';
 import { loadTrashView, type TrashViewResult } from './trashView';
 import { buildSettingsSummary } from './settingsSummary';
+import { enabledCapabilityLabels, summarizeVolumeCapabilities } from './volumeCapabilities';
 import { labelsFromText, labelsToText } from './volumeEdit';
 import { formatVolumeRuntime } from './volumeRuntime';
 
@@ -1029,7 +1030,7 @@ function renderPage(page: PageKey, context: RenderContext) {
                   {instanceDetails[instance.pid] ? (
                     <span>
                       capabilities:{' '}
-                      {enabledCapabilities(instanceDetails[instance.pid].capabilities).join(', ') ||
+                      {enabledCapabilityLabels(instanceDetails[instance.pid].capabilities).join(', ') ||
                         'none'}
                     </span>
                   ) : null}
@@ -1048,6 +1049,7 @@ function renderPage(page: PageKey, context: RenderContext) {
       <FilesystemsPage
         volumes={volumes}
         volumeError={volumeError}
+        instanceDetails={instanceDetails}
         form={volumeForm}
         creating={creatingVolume}
         createError={createVolumeError}
@@ -1678,6 +1680,7 @@ function JobsPage({
 function FilesystemsPage({
   volumes,
   volumeError,
+  instanceDetails,
   form,
   creating,
   createError,
@@ -1698,6 +1701,7 @@ function FilesystemsPage({
 }: {
   volumes: VolumeResponse[];
   volumeError: string | null;
+  instanceDetails: Record<number, InstanceInfoResponse>;
   form: VolumeFormState;
   creating: boolean;
   createError: string | null;
@@ -1735,6 +1739,7 @@ function FilesystemsPage({
                   <th>Meta</th>
                   <th>Mount</th>
                   <th>Runtime</th>
+                  <th>Capabilities</th>
                   <th>Meta URL</th>
                   <th>Command</th>
                   <th>Actions</th>
@@ -1743,6 +1748,7 @@ function FilesystemsPage({
               <tbody>
                 {volumes.map((volume) => {
                   const mountCommand = buildMountCommand(volume);
+                  const capabilitySummary = summarizeVolumeCapabilities(volume, instanceDetails);
                   const copied = copiedMountCommandVolumeId === volume.id;
                   return (
                     <tr key={volume.id}>
@@ -1751,6 +1757,23 @@ function FilesystemsPage({
                       <td>{volume.mount_config.meta_backend}</td>
                       <td>{volume.mount_config.mount_point ?? '-'}</td>
                       <td>{formatVolumeRuntime(volume.runtime)}</td>
+                      <td>
+                        <div className="capability-summary">
+                          <strong>{capabilitySummary.label}</strong>
+                          {capabilitySummary.state === 'ready' ? (
+                            <>
+                              <span>on: {capabilitySummary.enabled.join(', ') || 'none'}</span>
+                              <span>off: {capabilitySummary.disabled.join(', ') || 'none'}</span>
+                            </>
+                          ) : (
+                            <span>
+                              {capabilitySummary.state === 'offline'
+                                ? 'mount filesystem to inspect capabilities'
+                                : 'runtime details unavailable'}
+                            </span>
+                          )}
+                        </div>
+                      </td>
                       <td>{volume.mount_config.meta_url_redacted ?? '-'}</td>
                       <td>
                         <div className="mount-command">
@@ -1950,10 +1973,4 @@ function browserErrorMessage(err: unknown): string {
 function optionalField(value: string): string | undefined {
   const trimmed = value.trim();
   return trimmed ? trimmed : undefined;
-}
-
-function enabledCapabilities(capabilities: Record<string, boolean>): string[] {
-  return Object.entries(capabilities)
-    .filter(([, enabled]) => enabled)
-    .map(([name]) => name);
 }
