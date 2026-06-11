@@ -357,8 +357,17 @@ h2 {
   align-items: end;
 }
 
+.page-toolbar {
+  display: grid;
+  grid-template-columns: minmax(180px, 280px) auto;
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 12px;
+}
+
 .browser-toolbar label,
-.browser-path-form label {
+.browser-path-form label,
+.page-toolbar label {
   display: grid;
   gap: 5px;
 }

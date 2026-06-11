@@ -44,6 +44,7 @@ import { loadCsiDashboard, type CsiDashboardResult } from './csiDashboard';
 import { loadFeatureStatus, type FeatureKey, type FeatureStatus } from './featureStatus';
 import { loadInstanceDetails } from './instanceDetails';
 import { buildMountCommand } from './mountCommand';
+import { loadTrashView, type TrashViewResult } from './trashView';
 import { buildSettingsSummary } from './settingsSummary';
 import { labelsFromText, labelsToText } from './volumeEdit';
 
@@ -128,7 +129,7 @@ function pageFromPathname(pathname: string): PageKey {
 }
 
 function featureForPage(page: PageKey): FeatureKey | null {
-  if (page === 'trash' || page === 'acl') {
+  if (page === 'acl') {
     return page;
   }
   return null;
@@ -170,6 +171,10 @@ export function App() {
   const [browserLinkTarget, setBrowserLinkTarget] = useState<string | null>(null);
   const [browserMetadataLoading, setBrowserMetadataLoading] = useState(false);
   const [browserMetadataError, setBrowserMetadataError] = useState<string | null>(null);
+  const [selectedTrashVolumeId, setSelectedTrashVolumeId] = useState<string | null>(null);
+  const [trashResult, setTrashResult] = useState<TrashViewResult | null>(null);
+  const [trashLoading, setTrashLoading] = useState(false);
+  const [trashError, setTrashError] = useState<string | null>(null);
   const [featureResult, setFeatureResult] = useState<FeatureResult | null>(null);
   const [featureLoading, setFeatureLoading] = useState(false);
   const [featureError, setFeatureError] = useState<string | null>(null);
@@ -270,6 +275,14 @@ export function App() {
   }, [volumes]);
 
   useEffect(() => {
+    setSelectedTrashVolumeId((current) =>
+      current !== null && volumes.some((volume) => volume.id === current)
+        ? current
+        : (volumes[0]?.id ?? null),
+    );
+  }, [volumes]);
+
+  useEffect(() => {
     setBrowserResult(null);
     setBrowserError(null);
     setBrowserMetadata(null);
@@ -355,6 +368,38 @@ export function App() {
   }, [page, token, volumes]);
 
   useEffect(() => {
+    if (page !== 'trash') return;
+    let cancelled = false;
+    const volume = volumes.find((entry) => entry.id === selectedTrashVolumeId) ?? null;
+
+    setTrashLoading(true);
+    setTrashError(null);
+    void loadTrashView(volume, token)
+      .then((result) => {
+        if (!cancelled) {
+          setTrashResult(result);
+        }
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        if (err instanceof ApiError && err.status === 401) {
+          setAuthRequired(true);
+        } else {
+          setTrashError(err instanceof Error ? err.message : 'trash request failed');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setTrashLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [page, selectedTrashVolumeId, token, volumes]);
+
+  useEffect(() => {
     if (page !== 'csi') return;
     let cancelled = false;
 
@@ -399,6 +444,11 @@ export function App() {
     [selectedBrowserVolumeId, volumes],
   );
 
+  const selectedTrashVolume = useMemo(
+    () => volumes.find((volume) => volume.id === selectedTrashVolumeId) ?? null,
+    [selectedTrashVolumeId, volumes],
+  );
+
   const submitBrowserPath = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const normalized = normalizeBrowserPath(browserPathInput);
@@ -417,6 +467,11 @@ export function App() {
     setBrowserPath('/');
     setBrowserPathInput('/');
     setBrowserResult(null);
+  };
+
+  const changeTrashVolume = (volumeId: string) => {
+    setSelectedTrashVolumeId(volumeId);
+    setTrashResult(null);
   };
 
   const refreshBrowser = () => {
@@ -716,6 +771,10 @@ export function App() {
               browserLinkTarget,
               browserMetadataLoading,
               browserMetadataError,
+              selectedTrashVolume,
+              trashResult,
+              trashLoading,
+              trashError,
               featureResult,
               featureLoading,
               featureError,
@@ -740,6 +799,7 @@ export function App() {
               onBrowserRefresh: refreshBrowser,
               onBrowserNavigate: navigateBrowserPath,
               onBrowserInspect: inspectBrowserPath,
+              onTrashVolumeChange: changeTrashVolume,
             })
           )}
         </section>
@@ -812,6 +872,10 @@ type RenderContext = {
   browserLinkTarget: string | null;
   browserMetadataLoading: boolean;
   browserMetadataError: string | null;
+  selectedTrashVolume: VolumeResponse | null;
+  trashResult: TrashViewResult | null;
+  trashLoading: boolean;
+  trashError: string | null;
   featureResult: FeatureResult | null;
   featureLoading: boolean;
   featureError: string | null;
@@ -836,6 +900,7 @@ type RenderContext = {
   onBrowserRefresh: () => void;
   onBrowserNavigate: (path: string) => void;
   onBrowserInspect: (path: string) => void;
+  onTrashVolumeChange: (volumeId: string) => void;
 };
 
 function renderPage(page: PageKey, context: RenderContext) {
@@ -870,6 +935,10 @@ function renderPage(page: PageKey, context: RenderContext) {
     browserLinkTarget,
     browserMetadataLoading,
     browserMetadataError,
+    selectedTrashVolume,
+    trashResult,
+    trashLoading,
+    trashError,
     featureResult,
     featureLoading,
     featureError,
@@ -894,6 +963,7 @@ function renderPage(page: PageKey, context: RenderContext) {
     onBrowserRefresh,
     onBrowserNavigate,
     onBrowserInspect,
+    onTrashVolumeChange,
   } = context;
 
   if (page === 'overview') {
@@ -1006,12 +1076,13 @@ function renderPage(page: PageKey, context: RenderContext) {
 
   if (page === 'trash') {
     return (
-      <FeatureStatusPanel
-        feature="trash"
-        fallbackTitle="Trash"
-        result={featureResult}
-        loading={featureLoading}
-        error={featureError}
+      <TrashPage
+        volumes={volumes}
+        selectedVolume={selectedTrashVolume}
+        result={trashResult}
+        loading={trashLoading}
+        error={trashError}
+        onVolumeChange={onTrashVolumeChange}
       />
     );
   }
@@ -1033,6 +1104,78 @@ function renderPage(page: PageKey, context: RenderContext) {
   }
 
   return <SettingsPage health={health} volumes={volumes} instances={instances} />;
+}
+
+function TrashPage({
+  volumes,
+  selectedVolume,
+  result,
+  loading,
+  error,
+  onVolumeChange,
+}: {
+  volumes: VolumeResponse[];
+  selectedVolume: VolumeResponse | null;
+  result: TrashViewResult | null;
+  loading: boolean;
+  error: string | null;
+  onVolumeChange: (volumeId: string) => void;
+}) {
+  return (
+    <article className="panel table-panel">
+      <h2>{result?.title ?? 'Trash'}</h2>
+      {volumes.length > 0 ? (
+        <div className="page-toolbar">
+          <label>
+            Filesystem
+            <select
+              value={selectedVolume?.id ?? ''}
+              onChange={(event) => onVolumeChange(event.target.value)}
+            >
+              {volumes.map((volume) => (
+                <option key={volume.id} value={volume.id}>
+                  {volume.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      ) : null}
+      {loading && !result ? <p className="muted">Loading trash.</p> : null}
+      {error ? <p className="error-text">{error}</p> : null}
+      {result ? (
+        <>
+          <Metric label="State" value={result.state} />
+          {result.volumeName ? <Metric label="Filesystem" value={result.volumeName} /> : null}
+          <p className="muted feature-message">{result.message}</p>
+          {result.entries.length > 0 ? (
+            <div className="table-wrap">
+              <table className="data-table compact-data-table">
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Original path</th>
+                    <th>Size</th>
+                    <th>Deleted</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.entries.map((entry) => (
+                    <tr key={entry.id}>
+                      <td>{entry.id}</td>
+                      <td>{entry.path}</td>
+                      <td>{entry.size}</td>
+                      <td>{entry.deletedAt}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+        </>
+      ) : null}
+    </article>
+  );
 }
 
 function FeatureStatusPanel({
