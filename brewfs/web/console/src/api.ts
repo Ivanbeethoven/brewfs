@@ -140,6 +140,15 @@ export interface CsiSummaryResponse {
   unhealthy_mounts: number;
 }
 
+export interface CsiResourceListResponse {
+  items: unknown[];
+}
+
+export interface CsiPodsQuery {
+  namespace?: string;
+  volume?: string;
+}
+
 export interface ListInstancesResponse {
   instances: InstanceResponse[];
 }
@@ -445,6 +454,41 @@ export async function fetchCsiSummary(token?: string | null): Promise<CsiSummary
   return (await response.json()) as CsiSummaryResponse;
 }
 
+export async function fetchCsiStorageClasses(
+  token?: string | null,
+): Promise<CsiResourceListResponse> {
+  return fetchCsiResourceList('/api/csi/storageclasses', token);
+}
+
+export async function fetchCsiPersistentVolumes(
+  token?: string | null,
+): Promise<CsiResourceListResponse> {
+  return fetchCsiResourceList('/api/csi/persistentvolumes', token);
+}
+
+export async function fetchCsiPersistentVolumeClaims(
+  namespace?: string,
+  token?: string | null,
+): Promise<CsiResourceListResponse> {
+  return fetchCsiResourceList(
+    `/api/csi/persistentvolumeclaims${optionalSearch([['namespace', namespace]])}`,
+    token,
+  );
+}
+
+export async function fetchCsiPods(
+  query: CsiPodsQuery = {},
+  token?: string | null,
+): Promise<CsiResourceListResponse> {
+  return fetchCsiResourceList(
+    `/api/csi/pods${optionalSearch([
+      ['namespace', query.namespace],
+      ['volume', query.volume],
+    ])}`,
+    token,
+  );
+}
+
 export async function createVolume(
   request: CreateVolumeRequest,
   token?: string | null,
@@ -474,6 +518,28 @@ function apiHeaders(token?: string | null, json = false): Record<string, string>
 
 function pathSearch(path: string): string {
   return new URLSearchParams({ path }).toString();
+}
+
+function optionalSearch(params: Array<[string, string | undefined]>): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of params) {
+    if (value) search.set(key, value);
+  }
+  const encoded = search.toString();
+  return encoded ? `?${encoded}` : '';
+}
+
+async function fetchCsiResourceList(
+  url: string,
+  token?: string | null,
+): Promise<CsiResourceListResponse> {
+  const response = await fetch(url, {
+    headers: apiHeaders(token),
+  });
+
+  assertOk(response, 'CSI resource request failed');
+
+  return (await response.json()) as CsiResourceListResponse;
 }
 
 function assertOk(response: Response, message: string) {

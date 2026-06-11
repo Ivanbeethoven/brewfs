@@ -6,6 +6,10 @@ import {
   deleteVolume,
   deleteTrashEntry,
   fetchAcl,
+  fetchCsiPersistentVolumeClaims,
+  fetchCsiPersistentVolumes,
+  fetchCsiPods,
+  fetchCsiStorageClasses,
   fetchCsiSummary,
   fetchFileList,
   fetchFileStat,
@@ -573,6 +577,47 @@ describe('unsupported feature API contracts', () => {
       status: 501,
     } satisfies Partial<ApiError>);
     expect(fetch).toHaveBeenCalledWith('/api/csi/summary', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer secret-token',
+      },
+    });
+  });
+
+  it('sends CSI resource table requests through stable endpoints', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({ items: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    await fetchCsiStorageClasses('secret-token');
+    expect(fetch).toHaveBeenLastCalledWith('/api/csi/storageclasses', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer secret-token',
+      },
+    });
+
+    await fetchCsiPersistentVolumes('secret-token');
+    expect(fetch).toHaveBeenLastCalledWith('/api/csi/persistentvolumes', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer secret-token',
+      },
+    });
+
+    await fetchCsiPersistentVolumeClaims('default', 'secret-token');
+    expect(fetch).toHaveBeenLastCalledWith('/api/csi/persistentvolumeclaims?namespace=default', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer secret-token',
+      },
+    });
+
+    await fetchCsiPods({ namespace: 'default', volume: 'data' }, 'secret-token');
+    expect(fetch).toHaveBeenLastCalledWith('/api/csi/pods?namespace=default&volume=data', {
       headers: {
         Accept: 'application/json',
         Authorization: 'Bearer secret-token',

@@ -48,6 +48,13 @@ pub fn build_router(config: ConsoleConfig) -> Router {
         .route("/instances/{pid}/jobs/gc", post(api::start_gc_job))
         .route("/instances/{pid}/jobs/{job_id}", get(api::get_job_status))
         .route("/csi/summary", get(api::csi_summary))
+        .route("/csi/storageclasses", get(api::csi_storageclasses))
+        .route("/csi/persistentvolumes", get(api::csi_persistentvolumes))
+        .route(
+            "/csi/persistentvolumeclaims",
+            get(api::csi_persistentvolumeclaims),
+        )
+        .route("/csi/pods", get(api::csi_pods))
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -810,6 +817,58 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["error"]["code"], "unavailable");
+    }
+
+    #[tokio::test]
+    async fn csi_resource_routes_are_unavailable_when_dashboard_is_disabled() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\"></div>").unwrap();
+        let app = build_router(test_config(dir.path(), AuthConfig::Disabled));
+
+        for uri in [
+            "/api/csi/storageclasses",
+            "/api/csi/persistentvolumes",
+            "/api/csi/persistentvolumeclaims?namespace=default",
+            "/api/csi/pods?namespace=default&volume=data",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["error"]["code"], "unavailable");
+        }
+    }
+
+    #[tokio::test]
+    async fn csi_resource_routes_are_unsupported_when_dashboard_is_enabled() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\"></div>").unwrap();
+        let mut config = test_config(dir.path(), AuthConfig::Disabled);
+        config.csi_dashboard = true;
+        let app = build_router(config);
+
+        for uri in [
+            "/api/csi/storageclasses",
+            "/api/csi/persistentvolumes",
+            "/api/csi/persistentvolumeclaims?namespace=default",
+            "/api/csi/pods?namespace=default&volume=data",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["error"]["code"], "unsupported");
+        }
     }
 
     #[tokio::test]

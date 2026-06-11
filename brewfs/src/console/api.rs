@@ -88,6 +88,12 @@ pub struct PathQuery {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CsiResourceQuery {
+    pub namespace: Option<String>,
+    pub volume: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FileListResponse {
     pub path: String,
@@ -540,11 +546,39 @@ pub async fn delete_acl(
 pub async fn csi_summary(
     State(state): State<ConsoleState>,
 ) -> Result<Json<serde_json::Value>, ApiErrorResponse> {
-    if state.csi_dashboard {
-        Err(unsupported("CSI dashboard adapter is not implemented yet"))
-    } else {
-        Err(unavailable("CSI dashboard is disabled"))
-    }
+    csi_adapter_unavailable(&state, "CSI dashboard adapter is not implemented yet")
+}
+
+pub async fn csi_storageclasses(
+    State(state): State<ConsoleState>,
+) -> Result<Json<serde_json::Value>, ApiErrorResponse> {
+    csi_adapter_unavailable(&state, "CSI StorageClass adapter is not implemented yet")
+}
+
+pub async fn csi_persistentvolumes(
+    State(state): State<ConsoleState>,
+) -> Result<Json<serde_json::Value>, ApiErrorResponse> {
+    csi_adapter_unavailable(
+        &state,
+        "CSI PersistentVolume adapter is not implemented yet",
+    )
+}
+
+pub async fn csi_persistentvolumeclaims(
+    State(state): State<ConsoleState>,
+    Query(_query): Query<CsiResourceQuery>,
+) -> Result<Json<serde_json::Value>, ApiErrorResponse> {
+    csi_adapter_unavailable(
+        &state,
+        "CSI PersistentVolumeClaim adapter is not implemented yet",
+    )
+}
+
+pub async fn csi_pods(
+    State(state): State<ConsoleState>,
+    Query(_query): Query<CsiResourceQuery>,
+) -> Result<Json<serde_json::Value>, ApiErrorResponse> {
+    csi_adapter_unavailable(&state, "CSI Pod adapter is not implemented yet")
 }
 
 async fn send_instance_control_request(
@@ -712,6 +746,17 @@ fn unsupported(message: impl Into<String>) -> ApiErrorResponse {
 
 fn unavailable(message: impl Into<String>) -> ApiErrorResponse {
     json_error(StatusCode::CONFLICT, "unavailable", message)
+}
+
+fn csi_adapter_unavailable(
+    state: &ConsoleState,
+    message: &'static str,
+) -> Result<Json<serde_json::Value>, ApiErrorResponse> {
+    if state.csi_dashboard {
+        Err(unsupported(message))
+    } else {
+        Err(unavailable("CSI dashboard is disabled"))
+    }
 }
 
 fn control_error_response(code: &str, message: &str) -> ApiErrorResponse {
