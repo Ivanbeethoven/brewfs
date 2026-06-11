@@ -803,3 +803,96 @@ Candidate H: cached-origin full-block-first idle cleanup.
   Accept only if direct0 PUT/GiB improves and direct1 read/write stays within
   the 5% guard band versus Candidate D.
 ```
+
+## Rejected Candidate H: Cached-Only Sub-Block Idle Deferral
+
+Goal:
+
+- Use Candidate G's explicit write-origin signal instead of the older
+  `creation_unique != 0` proxy.
+- Defer `AutoFreezeTrigger::Idle` only for `cached_only` sub-block slices.
+- Keep normal-origin direct1 age/idle behavior unchanged.
+- Keep explicit flush, pressure, too-many-slices, buffer-high, and
+  flush-duration paths active.
+
+Implementation tested:
+
+- Added a unit test proving cached-only sub-block slices are not frozen by idle
+  auto-flush before explicit flush.
+- Changed the periodic auto-flush path to skip both age and idle for
+  `WriteOriginKind::CachedOnly` sub-block slices.
+
+Verification before perf:
+
+```text
+cargo test -p brewfs --lib \
+  vfs::io::writer::tests::test_auto_flush_defers_cached_only_sub_block_idle_freeze_until_explicit_flush
+  # red before implementation, green after implementation
+
+cargo fmt --all
+cargo test -p brewfs --lib 'vfs::io::writer::tests::'  # 34 passed
+cargo clippy -p brewfs --lib -- -D warnings
+git diff --check
+```
+
+Direct0 clean artifact:
+
+```text
+brewfs/docker/compose-xfstests/artifacts/perf-run-1781213381-2023
+```
+
+Direct0 result versus Candidate D (`perf-run-1781205242-516`):
+
+```text
+read_bw_mib_s=229.9 vs 219.0 (+5.0%)
+write_bw_mib_s=105.0 vs 99.3 (+5.7%)
+post_write_drain_s=8 vs 6
+post-drained put_ops_per_gib_written=1388.3 vs 1928.8 (-28.0%)
+s3_put_ops=8541 vs 11226 (-23.9%)
+avg_upload_batch_mib=0.708 vs 0.525 (+34.8%)
+partial_tail_total=7855 vs 10712 (-26.7%)
+partial_tail_auto_idle=0 vs 8313 (-100%)
+partial_tail_auto_too_many=2286 vs 553
+partial_tail_auto_flush_duration=2411 vs 0
+writeback_hard_wait_ms=20.42M vs 16.19M (+26.2%)
+```
+
+Direct1 guard artifact:
+
+```text
+brewfs/docker/compose-xfstests/artifacts/perf-run-1781213764-29688
+```
+
+Direct1 result versus Candidate D (`perf-run-1781205600-16115`):
+
+```text
+read_bw_mib_s=186.5 vs 232.7 (-19.9%)
+write_bw_mib_s=84.9 vs 106.2 (-20.1%)
+active_io_runtime_s=63.5 vs 60.1
+post_write_drain_s=18 vs 22
+post-drained put_ops_per_gib_written=259.0 vs 259.0
+avg_upload_batch_mib=4.079 vs 4.046 (+0.8%)
+partial_tail_ratio=0.029 vs 0.030
+writeback_hard_wait_ms=217.6k vs 193.2k (+12.6%)
+```
+
+Decision:
+
+- Reject and roll back Candidate H.
+- The direct0 object-amplification improvement is strong, but the direct1 guard
+  does not meet the 5% read/write regression limit.
+- H does not appear to add a new direct1 object-shape regression versus
+  Candidate G, but the current committed branch needs a clean rebaseline before
+  another behavior change.
+
+Next target:
+
+```text
+Candidate I: current-branch direct1 rebaseline and backpressure attribution.
+  First rerun direct1 on the reverted/current committed behavior to separate
+  Candidate G observation overhead from Candidate H behavior.
+  If direct1 remains near -20% versus Candidate D, inspect origin metric update
+  cost, writeback hard-wait timing, and S3 put latency before changing policy.
+  If direct1 returns near Candidate D, resume cached-origin idle cleanup with a
+  bounded full-block-first scanner that avoids increasing hard_wait.
+```
