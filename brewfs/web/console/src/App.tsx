@@ -22,6 +22,7 @@ import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from 're
 import {
   ApiError,
   createVolume,
+  deleteAcl,
   deleteTrashEntry,
   deleteVolume as deleteVolumeRequest,
   fetchFileList,
@@ -31,6 +32,7 @@ import {
   fetchInstances,
   fetchVolumes,
   fetchReadLink,
+  putAcl,
   restoreTrashEntry,
   runGcJob,
   type FileListResponse,
@@ -42,6 +44,7 @@ import {
   type VolumeResponse,
   updateVolume,
 } from './api';
+import { formatAclDraft, parseAclDraft } from './aclDraft';
 import { loadAclView, type AclViewResult } from './aclView';
 import { formatMode, joinBrowserPath, normalizeBrowserPath, parentBrowserPath } from './browserPath';
 import { loadCsiDashboard, type CsiDashboardResult } from './csiDashboard';
@@ -176,6 +179,10 @@ export function App() {
   const [aclResult, setAclResult] = useState<AclViewResult | null>(null);
   const [aclLoading, setAclLoading] = useState(false);
   const [aclError, setAclError] = useState<string | null>(null);
+  const [aclReloadKey, setAclReloadKey] = useState(0);
+  const [aclDraft, setAclDraft] = useState('');
+  const [aclDraftError, setAclDraftError] = useState<string | null>(null);
+  const [aclActionInFlight, setAclActionInFlight] = useState<string | null>(null);
   const [csiDashboard, setCsiDashboard] = useState<CsiDashboardResult | null>(null);
   const [csiLoading, setCsiLoading] = useState(false);
   const [csiError, setCsiError] = useState<string | null>(null);
@@ -403,7 +410,16 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [aclPath, page, selectedAclVolumeId, token, volumes]);
+  }, [aclPath, aclReloadKey, page, selectedAclVolumeId, token, volumes]);
+
+  useEffect(() => {
+    if (aclResult?.state === 'ready') {
+      setAclDraft(formatAclDraft(aclResult.entries));
+    } else {
+      setAclDraft('');
+    }
+    setAclDraftError(null);
+  }, [aclResult]);
 
   useEffect(() => {
     if (page !== 'csi') return;
@@ -532,6 +548,8 @@ export function App() {
     setAclPathInput(normalized);
     setAclPath(normalized);
     setAclResult(null);
+    setAclActionInFlight(null);
+    setAclDraftError(null);
   };
 
   const changeAclVolume = (volumeId: string) => {
@@ -539,6 +557,59 @@ export function App() {
     setAclPath('/');
     setAclPathInput('/');
     setAclResult(null);
+    setAclActionInFlight(null);
+    setAclDraftError(null);
+  };
+
+  const replaceAclFromPage = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedAclVolume) return;
+
+    let request;
+    try {
+      request = parseAclDraft(aclDraft);
+      setAclDraftError(null);
+    } catch (err: unknown) {
+      setAclDraftError(err instanceof Error ? err.message : 'ACL draft is invalid.');
+      return;
+    }
+
+    setAclActionInFlight('replace');
+    setAclError(null);
+    try {
+      await putAcl(selectedAclVolume.id, aclResult?.path ?? aclPath, request, token);
+      setAclReloadKey((current) => current + 1);
+    } catch (err: unknown) {
+      if (err instanceof ApiError && err.status === 401) {
+        setAuthRequired(true);
+      } else {
+        setAclError(err instanceof Error ? err.message : 'ACL update request failed');
+      }
+    } finally {
+      setAclActionInFlight(null);
+    }
+  };
+
+  const clearAclFromPage = async () => {
+    if (!selectedAclVolume) return;
+    const path = aclResult?.path ?? aclPath;
+    if (!window.confirm(`Clear extended ACL for ${path}?`)) return;
+
+    setAclActionInFlight('clear');
+    setAclError(null);
+    setAclDraftError(null);
+    try {
+      await deleteAcl(selectedAclVolume.id, path, token);
+      setAclReloadKey((current) => current + 1);
+    } catch (err: unknown) {
+      if (err instanceof ApiError && err.status === 401) {
+        setAuthRequired(true);
+      } else {
+        setAclError(err instanceof Error ? err.message : 'ACL delete request failed');
+      }
+    } finally {
+      setAclActionInFlight(null);
+    }
   };
 
   const refreshBrowser = () => {
@@ -848,6 +919,9 @@ export function App() {
               aclResult,
               aclLoading,
               aclError,
+              aclDraft,
+              aclDraftError,
+              aclActionInFlight,
               csiDashboard,
               csiLoading,
               csiError,
@@ -875,6 +949,9 @@ export function App() {
               onAclVolumeChange: changeAclVolume,
               onAclPathInputChange: setAclPathInput,
               onAclPathSubmit: submitAclPath,
+              onAclDraftChange: setAclDraft,
+              onAclReplace: replaceAclFromPage,
+              onAclClear: clearAclFromPage,
             })
           )}
         </section>
@@ -957,6 +1034,9 @@ type RenderContext = {
   aclResult: AclViewResult | null;
   aclLoading: boolean;
   aclError: string | null;
+  aclDraft: string;
+  aclDraftError: string | null;
+  aclActionInFlight: string | null;
   csiDashboard: CsiDashboardResult | null;
   csiLoading: boolean;
   csiError: string | null;
@@ -984,6 +1064,9 @@ type RenderContext = {
   onAclVolumeChange: (volumeId: string) => void;
   onAclPathInputChange: (path: string) => void;
   onAclPathSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onAclDraftChange: (value: string) => void;
+  onAclReplace: (event: FormEvent<HTMLFormElement>) => void;
+  onAclClear: () => void;
 };
 
 function renderPage(page: PageKey, context: RenderContext) {
@@ -1028,6 +1111,9 @@ function renderPage(page: PageKey, context: RenderContext) {
     aclResult,
     aclLoading,
     aclError,
+    aclDraft,
+    aclDraftError,
+    aclActionInFlight,
     csiDashboard,
     csiLoading,
     csiError,
@@ -1055,6 +1141,9 @@ function renderPage(page: PageKey, context: RenderContext) {
     onAclVolumeChange,
     onAclPathInputChange,
     onAclPathSubmit,
+    onAclDraftChange,
+    onAclReplace,
+    onAclClear,
   } = context;
 
   if (page === 'overview') {
@@ -1191,9 +1280,15 @@ function renderPage(page: PageKey, context: RenderContext) {
         result={aclResult}
         loading={aclLoading}
         error={aclError}
+        draft={aclDraft}
+        draftError={aclDraftError}
+        actionInFlight={aclActionInFlight}
         onVolumeChange={onAclVolumeChange}
         onPathInputChange={onAclPathInputChange}
         onPathSubmit={onAclPathSubmit}
+        onDraftChange={onAclDraftChange}
+        onReplace={onAclReplace}
+        onClear={onAclClear}
       />
     );
   }
@@ -1317,9 +1412,15 @@ function AclPage({
   result,
   loading,
   error,
+  draft,
+  draftError,
+  actionInFlight,
   onVolumeChange,
   onPathInputChange,
   onPathSubmit,
+  onDraftChange,
+  onReplace,
+  onClear,
 }: {
   volumes: VolumeResponse[];
   selectedVolume: VolumeResponse | null;
@@ -1327,9 +1428,15 @@ function AclPage({
   result: AclViewResult | null;
   loading: boolean;
   error: string | null;
+  draft: string;
+  draftError: string | null;
+  actionInFlight: string | null;
   onVolumeChange: (volumeId: string) => void;
   onPathInputChange: (path: string) => void;
   onPathSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onDraftChange: (value: string) => void;
+  onReplace: (event: FormEvent<HTMLFormElement>) => void;
+  onClear: () => void;
 }) {
   return (
     <article className="panel table-panel">
@@ -1392,6 +1499,38 @@ function AclPage({
                 </tbody>
               </table>
             </div>
+          ) : null}
+          {result.state === 'ready' ? (
+            <form className="acl-editor" onSubmit={onReplace}>
+              <label>
+                <span>Entries JSON</span>
+                <textarea
+                  value={draft}
+                  onChange={(event) => onDraftChange(event.target.value)}
+                  spellCheck={false}
+                />
+              </label>
+              {draftError ? <p className="error-text">{draftError}</p> : null}
+              <div className="form-actions">
+                <button
+                  className="primary-button"
+                  type="submit"
+                  disabled={Boolean(actionInFlight)}
+                >
+                  <ShieldCheck size={16} aria-hidden="true" />
+                  <span>{actionInFlight === 'replace' ? 'Saving' : 'Replace ACL'}</span>
+                </button>
+                <button
+                  className="danger-button"
+                  type="button"
+                  disabled={Boolean(actionInFlight)}
+                  onClick={onClear}
+                >
+                  <Trash2 size={16} aria-hidden="true" />
+                  <span>{actionInFlight === 'clear' ? 'Clearing' : 'Clear ACL'}</span>
+                </button>
+              </div>
+            </form>
           ) : null}
         </>
       ) : null}
