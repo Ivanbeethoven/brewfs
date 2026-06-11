@@ -715,6 +715,7 @@ git commit -m "feat: scaffold console web package"
 - Create: `brewfs/web/console/src/App.tsx`
 - Create: `brewfs/web/console/src/api.ts`
 - Create: `brewfs/web/console/src/styles.css`
+- Create: `brewfs/web/console/src/vite-env.d.ts`
 
 - [ ] **Step 1: Create typed API client**
 
@@ -752,13 +753,13 @@ export async function fetchHealth(): Promise<HealthResponse> {
 Create `brewfs/web/console/src/App.tsx`:
 
 ```tsx
-import { Activity, Database, FileTree, Gauge, HardDrive, Settings } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { Activity, Database, FolderTree, Gauge, HardDrive, Settings, type LucideIcon } from 'lucide-react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { fetchHealth, type HealthResponse } from './api';
 
 type PageKey = 'overview' | 'filesystems' | 'jobs' | 'csi' | 'settings';
 
-const navItems: Array<{ key: PageKey; label: string; icon: typeof Activity }> = [
+const navItems: Array<{ key: PageKey; label: string; icon: LucideIcon }> = [
   { key: 'overview', label: 'Overview', icon: Gauge },
   { key: 'filesystems', label: 'Filesystems', icon: HardDrive },
   { key: 'jobs', label: 'Jobs', icon: Activity },
@@ -803,7 +804,7 @@ export function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <FileTree size={24} aria-hidden="true" />
+          <FolderTree size={24} aria-hidden="true" />
           <div>
             <strong>BrewFS</strong>
             <span>Console</span>
@@ -877,7 +878,7 @@ function renderPage(page: PageKey, health: HealthResponse | null, error: string 
   return <EmptyPanel title="Settings unavailable" detail="Token auth and registry settings arrive in Phase 1B." />;
 }
 
-function Panel({ title, children }: { title: string; children: React.ReactNode }) {
+function Panel({ title, children }: { title: string; children: ReactNode }) {
   return (
     <article className="panel">
       <h2>{title}</h2>
@@ -922,7 +923,15 @@ createRoot(document.getElementById('root') as HTMLElement).render(
 );
 ```
 
-- [ ] **Step 4: Create CSS**
+- [ ] **Step 4: Create Vite type references**
+
+Create `brewfs/web/console/src/vite-env.d.ts`:
+
+```typescript
+/// <reference types="vite/client" />
+```
+
+- [ ] **Step 5: Create CSS**
 
 Create `brewfs/web/console/src/styles.css`:
 
@@ -1131,7 +1140,7 @@ h2 {
 }
 ```
 
-- [ ] **Step 5: Build the frontend**
+- [ ] **Step 6: Build the frontend**
 
 Run:
 
@@ -1142,10 +1151,10 @@ npm run build
 
 Expected: PASS and `dist/index.html` is created.
 
-- [ ] **Step 6: Commit React shell**
+- [ ] **Step 7: Commit React shell**
 
 ```bash
-git add brewfs/web/console/src/main.tsx brewfs/web/console/src/App.tsx brewfs/web/console/src/api.ts brewfs/web/console/src/styles.css
+git add brewfs/web/console/src/main.tsx brewfs/web/console/src/App.tsx brewfs/web/console/src/api.ts brewfs/web/console/src/styles.css brewfs/web/console/src/vite-env.d.ts
 git commit -m "feat: add console web shell"
 ```
 
