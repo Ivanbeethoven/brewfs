@@ -180,6 +180,54 @@ buffer/backpressure and committed-but-not-uploaded slice drain: tools/perf still
 flags write P99 around 944ms and identifies `src/vfs/io/writer.rs` as the next
 target.
 
+## Negative Result: LZ4 Raw-Fallback Read Zero-Copy
+
+2026-06-11 tested an object/read-cache candidate from the parallel review:
+avoid copying raw fallback payloads on the LZ4 read path. The prototype added a
+`decompress_to_bytes(Vec<u8>) -> Bytes` helper and switched full-object read and
+range-triggered background prefetch to keep the original S3 payload buffer when
+an object has no compression header.
+
+Targeted TDD:
+
+- RED: `cargo test -p brewfs test_raw_data_to_bytes_reuses_vec_without_copy --lib`
+  failed because the helper did not exist.
+- GREEN: the helper returned `Bytes` with the same pointer for raw data.
+- Regression checks passed before perf comparison:
+  - `cargo test -p brewfs chunk::compress::tests --lib`
+  - `cargo test -p brewfs test_compressed_small_read_uses_full_object --lib`
+  - `cargo test -p brewfs test_intelligent_read_strategy --lib`
+  - `cargo test -p brewfs test_small_read_piggybacks_in_flight_full_block_read --lib`
+  - `cargo fmt --all --check`
+
+The first perf attempt exposed an environment issue: `/mnt/slayerfs/root/.cache/brewfs`
+had grown to about 12GiB, leaving too little headroom for tools/perf result
+files. That generated `No space left on device` while writing fio JSON. The
+cache was removed because it is regenerated BrewFS local cache data.
+
+Valid `tools/perf` quick comparison with `compression=lz4`:
+
+```bash
+PERF_FIO_WORKLOADS="randrw" \
+PERF_FIO_DIRECT=0 \
+PERF_RECORD_FREQ=19 \
+BREWFS_COMPRESSION=lz4 \
+BREWFS_PREFETCH_ENABLED=true \
+BREWFS_UPLOAD_CONCURRENCY=32 \
+bash brewfs/tools/perf/run_perf.sh --quick --skip-oncpu --skip-offcpu
+```
+
+| Variant | Artifact | Read BW | Write BW | Read P99 | Write P99 | Write P99.9 |
+|---------|----------|---------|----------|----------|-----------|-------------|
+| Raw-fallback zero-copy prototype | `tools/perf/results/20260611-051752` | 503.6 MiB/s | 230.6 MiB/s | 29.75 ms | 1.52 s | 5.34 s |
+| Baseline mainline | `tools/perf/results/20260611-052102` | 759.0 MiB/s | 343.6 MiB/s | 37.49 ms | 111.67 ms | 2.84 s |
+
+Conclusion: do not merge this prototype. The idea is locally sensible, but this
+implementation did not translate into a workload win and coincided with a large
+write-tail regression in the A/B sample. Keep focus on the bottleneck reported
+by tools/perf: write buffer backpressure, auto-flush, and committed-but-not-
+uploaded drain behavior.
+
 ## Measurement
 
 Run benchmarks before/after each optimization:
