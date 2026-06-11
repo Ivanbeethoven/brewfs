@@ -2042,6 +2042,7 @@ where
                             shared: &shared,
                         };
                         handle.advance_upload_range(start_idx, end_idx, data_len);
+                        Self::remove_writeback_record_if_uploaded_committed(&shared, &slice).await;
                         handle.try_commit().await;
                     }
                     Some(Ok(Err(err))) => {
@@ -2114,6 +2115,31 @@ where
                 .recent_pending_upload
                 .bytes
                 .fetch_add(bytes, Ordering::AcqRel);
+        }
+    }
+
+    async fn remove_writeback_record_if_uploaded_committed(
+        shared: &Arc<Shared<B, M>>,
+        slice: &Arc<ParkingMutex<SliceState>>,
+    ) {
+        let key = {
+            let state = slice.lock();
+            if !matches!(state.state, SliceStatus::Committed) || !state.upload_complete() {
+                return;
+            }
+            let Some(slice_id) = state.slice_id else {
+                return;
+            };
+            crate::vfs::cache::keys::DirtySliceKey {
+                ino: shared.inode.ino(),
+                chunk_id: state.chunk_id,
+                local_seq: slice_id,
+                epoch: 0,
+            }
+        };
+
+        if let Some(wb) = &shared.write_back {
+            let _ = wb.remove(&key).await;
         }
     }
 
@@ -3789,6 +3815,75 @@ mod tests {
         })
         .await
         .expect("pending-upload bytes should drop after object upload completes");
+    }
+
+    #[tokio::test]
+    async fn test_commit_before_upload_removes_writeback_record_after_upload() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(BlockingStore::new(true));
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
+        let ino = meta
+            .create_file(1, "pending_upload_record_cleanup.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let write_back = Arc::new(
+            crate::vfs::cache::write_back::FsWriteBackCache::new_with_sync(
+                temp.path().to_path_buf(),
+                false,
+            ),
+        );
+        let writer = Arc::new(DataWriter::new(
+            test_config_with_writeback(layout, WriteBackMode::CommitBeforeUpload),
+            backend,
+            reader,
+            Some(write_back.clone()),
+        ));
+        let file_writer = writer.ensure_file(inode);
+
+        file_writer
+            .write_at(0, &vec![5u8; layout.block_size as usize])
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), file_writer.flush())
+            .await
+            .expect("commit-before-upload flush should return while object upload is blocked")
+            .unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if write_back.recover().await.unwrap().len() == 1 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("blocked upload should leave one recoverable dirty record");
+
+        store.unblock();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if writer.recent_pending_upload_bytes() == 0
+                    && write_back.recover().await.unwrap().is_empty()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dirty record should be removed after object upload completes");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
