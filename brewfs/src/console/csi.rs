@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use std::{fmt, sync::Arc};
 
+#[cfg(test)]
 pub const DEFAULT_DRIVER_NAME: &str = "csi.brewfs.io";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -86,6 +87,7 @@ impl CsiAdapter for UnsupportedCsiAdapter {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub struct CsiResourceSnapshot {
     pub storageclasses: Vec<serde_json::Value>,
@@ -94,12 +96,14 @@ pub struct CsiResourceSnapshot {
     pub pods: Vec<serde_json::Value>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct SnapshotCsiAdapter {
     driver_name: String,
     snapshot: CsiResourceSnapshot,
 }
 
+#[cfg(test)]
 impl SnapshotCsiAdapter {
     pub fn new(driver_name: impl Into<String>, snapshot: CsiResourceSnapshot) -> Self {
         Self {
@@ -213,6 +217,7 @@ impl SnapshotCsiAdapter {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl CsiAdapter for SnapshotCsiAdapter {
     async fn summary(&self) -> Result<CsiSummary, CsiAdapterError> {
@@ -279,11 +284,13 @@ impl CsiAdapter for SnapshotCsiAdapter {
     }
 }
 
+#[cfg(test)]
 fn resource_name(item: &serde_json::Value) -> Option<&str> {
     item.pointer("/metadata/name")
         .and_then(|value| value.as_str())
 }
 
+#[cfg(test)]
 fn namespace_matches(item: &serde_json::Value, namespace: Option<&str>) -> bool {
     namespace.is_none_or(|expected| {
         item.pointer("/metadata/namespace")
@@ -292,6 +299,7 @@ fn namespace_matches(item: &serde_json::Value, namespace: Option<&str>) -> bool 
     })
 }
 
+#[cfg(test)]
 fn metadata_value<'a>(item: &'a serde_json::Value, section: &str, key: &str) -> Option<&'a str> {
     item.pointer("/metadata")
         .and_then(|metadata| metadata.get(section))
@@ -299,6 +307,7 @@ fn metadata_value<'a>(item: &'a serde_json::Value, section: &str, key: &str) -> 
         .and_then(|value| value.as_str())
 }
 
+#[cfg(test)]
 fn pod_ready(pod: &serde_json::Value) -> bool {
     let phase = pod
         .pointer("/status/phase")

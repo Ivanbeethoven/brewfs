@@ -66,7 +66,7 @@ function normalizeTrashEntries(entries: unknown[]): TrashEntryRow[] {
 }
 
 function trashErrorOrThrow(volume: VolumeResponse, err: unknown): TrashViewResult {
-  if (err instanceof ApiError && err.status === 409) {
+  if (err instanceof ApiError && (err.status === 409 || err.status === 502)) {
     return {
       state: 'unavailable',
       title: 'Trash unavailable',

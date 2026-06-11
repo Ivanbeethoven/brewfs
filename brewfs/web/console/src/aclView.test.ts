@@ -76,4 +76,19 @@ describe('loadAclView', () => {
     expect(result.state).toBe('unsupported');
     expect(result.volumeName).toBe('dev-local');
   });
+
+  it('maps control-plane ACL errors to a visible unavailable state', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ error: { code: 'control_plane_error' } }), {
+        status: 502,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const result = await loadAclView(volume, '/', 'secret-token');
+
+    expect(result.state).toBe('unavailable');
+    expect(result.title).toBe('ACL unavailable');
+    expect(result.volumeName).toBe('dev-local');
+  });
 });
