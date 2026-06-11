@@ -11,6 +11,7 @@ import {
   HardDrive,
   Pencil,
   RefreshCw,
+  RotateCcw,
   Settings,
   ShieldCheck,
   Trash2,
@@ -21,6 +22,7 @@ import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from 're
 import {
   ApiError,
   createVolume,
+  deleteTrashEntry,
   deleteVolume as deleteVolumeRequest,
   fetchFileList,
   fetchFileStat,
@@ -29,6 +31,7 @@ import {
   fetchInstances,
   fetchVolumes,
   fetchReadLink,
+  restoreTrashEntry,
   runGcJob,
   type FileListResponse,
   type FileStatResponse,
@@ -165,6 +168,8 @@ export function App() {
   const [trashResult, setTrashResult] = useState<TrashViewResult | null>(null);
   const [trashLoading, setTrashLoading] = useState(false);
   const [trashError, setTrashError] = useState<string | null>(null);
+  const [trashReloadKey, setTrashReloadKey] = useState(0);
+  const [trashActionInFlight, setTrashActionInFlight] = useState<string | null>(null);
   const [selectedAclVolumeId, setSelectedAclVolumeId] = useState<string | null>(null);
   const [aclPath, setAclPath] = useState('/');
   const [aclPathInput, setAclPathInput] = useState('/');
@@ -366,7 +371,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [page, selectedTrashVolumeId, token, volumes]);
+  }, [page, selectedTrashVolumeId, token, trashReloadKey, volumes]);
 
   useEffect(() => {
     if (page !== 'acl') return;
@@ -478,6 +483,47 @@ export function App() {
   const changeTrashVolume = (volumeId: string) => {
     setSelectedTrashVolumeId(volumeId);
     setTrashResult(null);
+    setTrashActionInFlight(null);
+    setTrashError(null);
+  };
+
+  const restoreTrashEntryFromPage = async (entryId: string) => {
+    if (!selectedTrashVolume) return;
+
+    setTrashActionInFlight(`restore:${entryId}`);
+    setTrashError(null);
+    try {
+      await restoreTrashEntry(selectedTrashVolume.id, entryId, token);
+      setTrashReloadKey((current) => current + 1);
+    } catch (err: unknown) {
+      if (err instanceof ApiError && err.status === 401) {
+        setAuthRequired(true);
+      } else {
+        setTrashError(err instanceof Error ? err.message : 'trash restore request failed');
+      }
+    } finally {
+      setTrashActionInFlight(null);
+    }
+  };
+
+  const deleteTrashEntryFromPage = async (entryId: string) => {
+    if (!selectedTrashVolume) return;
+    if (!window.confirm(`Delete trash entry ${entryId}?`)) return;
+
+    setTrashActionInFlight(`delete:${entryId}`);
+    setTrashError(null);
+    try {
+      await deleteTrashEntry(selectedTrashVolume.id, entryId, token);
+      setTrashReloadKey((current) => current + 1);
+    } catch (err: unknown) {
+      if (err instanceof ApiError && err.status === 401) {
+        setAuthRequired(true);
+      } else {
+        setTrashError(err instanceof Error ? err.message : 'trash delete request failed');
+      }
+    } finally {
+      setTrashActionInFlight(null);
+    }
   };
 
   const submitAclPath = (event: FormEvent<HTMLFormElement>) => {
@@ -796,6 +842,7 @@ export function App() {
               trashResult,
               trashLoading,
               trashError,
+              trashActionInFlight,
               selectedAclVolume,
               aclPathInput,
               aclResult,
@@ -823,6 +870,8 @@ export function App() {
               onBrowserNavigate: navigateBrowserPath,
               onBrowserInspect: inspectBrowserPath,
               onTrashVolumeChange: changeTrashVolume,
+              onTrashRestore: restoreTrashEntryFromPage,
+              onTrashDelete: deleteTrashEntryFromPage,
               onAclVolumeChange: changeAclVolume,
               onAclPathInputChange: setAclPathInput,
               onAclPathSubmit: submitAclPath,
@@ -902,6 +951,7 @@ type RenderContext = {
   trashResult: TrashViewResult | null;
   trashLoading: boolean;
   trashError: string | null;
+  trashActionInFlight: string | null;
   selectedAclVolume: VolumeResponse | null;
   aclPathInput: string;
   aclResult: AclViewResult | null;
@@ -929,6 +979,8 @@ type RenderContext = {
   onBrowserNavigate: (path: string) => void;
   onBrowserInspect: (path: string) => void;
   onTrashVolumeChange: (volumeId: string) => void;
+  onTrashRestore: (entryId: string) => void;
+  onTrashDelete: (entryId: string) => void;
   onAclVolumeChange: (volumeId: string) => void;
   onAclPathInputChange: (path: string) => void;
   onAclPathSubmit: (event: FormEvent<HTMLFormElement>) => void;
@@ -970,6 +1022,7 @@ function renderPage(page: PageKey, context: RenderContext) {
     trashResult,
     trashLoading,
     trashError,
+    trashActionInFlight,
     selectedAclVolume,
     aclPathInput,
     aclResult,
@@ -997,6 +1050,8 @@ function renderPage(page: PageKey, context: RenderContext) {
     onBrowserNavigate,
     onBrowserInspect,
     onTrashVolumeChange,
+    onTrashRestore,
+    onTrashDelete,
     onAclVolumeChange,
     onAclPathInputChange,
     onAclPathSubmit,
@@ -1119,7 +1174,10 @@ function renderPage(page: PageKey, context: RenderContext) {
         result={trashResult}
         loading={trashLoading}
         error={trashError}
+        actionInFlight={trashActionInFlight}
         onVolumeChange={onTrashVolumeChange}
+        onRestore={onTrashRestore}
+        onDelete={onTrashDelete}
       />
     );
   }
@@ -1153,14 +1211,20 @@ function TrashPage({
   result,
   loading,
   error,
+  actionInFlight,
   onVolumeChange,
+  onRestore,
+  onDelete,
 }: {
   volumes: VolumeResponse[];
   selectedVolume: VolumeResponse | null;
   result: TrashViewResult | null;
   loading: boolean;
   error: string | null;
+  actionInFlight: string | null;
   onVolumeChange: (volumeId: string) => void;
+  onRestore: (entryId: string) => void;
+  onDelete: (entryId: string) => void;
 }) {
   return (
     <article className="panel table-panel">
@@ -1198,6 +1262,7 @@ function TrashPage({
                     <th>Original path</th>
                     <th>Size</th>
                     <th>Deleted</th>
+                    <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1207,6 +1272,32 @@ function TrashPage({
                       <td>{entry.path}</td>
                       <td>{entry.size}</td>
                       <td>{entry.deletedAt}</td>
+                      <td>
+                        <div className="table-actions">
+                          <button
+                            className="secondary-button compact-button"
+                            type="button"
+                            disabled={Boolean(actionInFlight)}
+                            onClick={() => onRestore(entry.id)}
+                          >
+                            <RotateCcw size={14} aria-hidden="true" />
+                            <span>
+                              {actionInFlight === `restore:${entry.id}` ? 'Restoring' : 'Restore'}
+                            </span>
+                          </button>
+                          <button
+                            className="danger-button compact-button"
+                            type="button"
+                            disabled={Boolean(actionInFlight)}
+                            onClick={() => onDelete(entry.id)}
+                          >
+                            <Trash2 size={14} aria-hidden="true" />
+                            <span>
+                              {actionInFlight === `delete:${entry.id}` ? 'Deleting' : 'Delete'}
+                            </span>
+                          </button>
+                        </div>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
