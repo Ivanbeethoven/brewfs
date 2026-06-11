@@ -43,6 +43,7 @@ import { formatMode, joinBrowserPath, normalizeBrowserPath, parentBrowserPath } 
 import { loadFeatureStatus, type FeatureKey, type FeatureStatus } from './featureStatus';
 import { loadInstanceDetails } from './instanceDetails';
 import { buildMountCommand } from './mountCommand';
+import { buildSettingsSummary } from './settingsSummary';
 import { labelsFromText, labelsToText } from './volumeEdit';
 
 type PageKey =
@@ -994,12 +995,7 @@ function renderPage(page: PageKey, context: RenderContext) {
     );
   }
 
-  return (
-    <EmptyPanel
-      title="Settings unavailable"
-      detail="Token auth and registry settings arrive in Phase 1B."
-    />
-  );
+  return <SettingsPage health={health} volumes={volumes} instances={instances} />;
 }
 
 function FeatureStatusPanel({
@@ -1029,6 +1025,29 @@ function FeatureStatusPanel({
           <p className="muted feature-message">{status.message}</p>
         </>
       ) : null}
+    </article>
+  );
+}
+
+function SettingsPage({
+  health,
+  volumes,
+  instances,
+}: {
+  health: HealthResponse | null;
+  volumes: VolumeResponse[];
+  instances: InstanceResponse[];
+}) {
+  const summary = buildSettingsSummary(health, volumes, instances);
+
+  return (
+    <article className="panel">
+      <h2>Settings</h2>
+      <div className="metadata-grid">
+        {summary.metrics.map((metric) => (
+          <Metric key={metric.label} label={metric.label} value={metric.value} />
+        ))}
+      </div>
     </article>
   );
 }
