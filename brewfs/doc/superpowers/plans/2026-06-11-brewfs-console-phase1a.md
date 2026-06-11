@@ -87,6 +87,7 @@ git commit -m "chore: add console scaffold dependencies"
 
 **Files:**
 - Modify: `brewfs/src/config.rs`
+- Modify: `brewfs/src/main.rs`
 
 - [ ] **Step 1: Write the failing CLI parser test**
 
@@ -174,6 +175,14 @@ pub struct ConsoleArgs {
 ```
 
 - [ ] **Step 4: Run the parser test and verify it passes**
+
+If the test compile fails because `main.rs` does not cover `Command::Console`, add this temporary arm to the `match cli.cmd` block:
+
+```rust
+        Command::Console(_) => anyhow::bail!("console command is not implemented"),
+```
+
+Task 4 replaces this temporary arm with the real console server call.
 
 Run:
 

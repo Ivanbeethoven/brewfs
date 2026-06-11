@@ -59,6 +59,9 @@ pub enum Command {
 
     /// Talk to a mounted BrewFS instance and print mount information.
     Info(InfoArgs),
+
+    /// Run the BrewFS web console.
+    Console(ConsoleArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -166,6 +169,41 @@ pub struct InfoArgs {
     /// Optional mount point used to locate the target instance.
     #[arg(value_name = "MOUNT_POINT")]
     pub mount_point: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ConsoleArgs {
+    /// HTTP listen address for the console server.
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    pub listen: std::net::SocketAddr,
+
+    /// Console registry and runtime state directory.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+
+    /// BrewFS runtime registry directory.
+    #[arg(long, value_name = "DIR")]
+    pub runtime_dir: Option<PathBuf>,
+
+    /// Pre-built frontend static asset directory.
+    #[arg(long, value_name = "DIR")]
+    pub static_dir: Option<PathBuf>,
+
+    /// Bearer-token file used for console API authentication.
+    #[arg(long, value_name = "FILE")]
+    pub auth_token_file: Option<PathBuf>,
+
+    /// Kubernetes config path for CSI dashboard discovery.
+    #[arg(long, value_name = "FILE")]
+    pub kubeconfig: Option<PathBuf>,
+
+    /// Disable auth for local development. Only allowed with loopback listeners.
+    #[arg(long, default_value_t = false)]
+    pub dev_no_auth: bool,
+
+    /// Enable read-only Kubernetes CSI dashboard endpoints.
+    #[arg(long, default_value_t = false)]
+    pub enable_csi_dashboard: bool,
 }
 
 #[derive(ValueEnum, Deserialize, Clone, Copy, Debug)]
@@ -578,6 +616,27 @@ mod tests {
             }
             other => panic!("expected info command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_console_command_defaults() {
+        let cli = Cli::parse_from(["brewfs", "console", "--dev-no-auth"]);
+
+        let Command::Console(args) = cli.cmd else {
+            panic!("expected console command");
+        };
+
+        assert_eq!(
+            args.listen,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 8080))
+        );
+        assert!(args.dev_no_auth);
+        assert!(!args.enable_csi_dashboard);
+        assert!(args.state_dir.is_none());
+        assert!(args.runtime_dir.is_none());
+        assert!(args.static_dir.is_none());
+        assert!(args.kubeconfig.is_none());
+        assert!(args.auth_token_file.is_none());
     }
 
     #[test]
