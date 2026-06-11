@@ -430,9 +430,72 @@ Decision: rejected; code reverted.
 
 Reason: allowing many more unflushed writable slices worsened the exact object-amplification symptom it was meant to address. It improved `randrw-direct1` foreground throughput, but caused buffered `randrw-direct0` wall time, PUT/GET ops per GiB, and write tail to regress hard, and it also regressed `seqwrite-direct0` throughput and `seqwrite-direct1` drain. This falsifies the simple "raise max unflushed slices" theory. The next write-path attempt should instrument freeze reasons and live slice counts first, or move to a bounded stage/upload queue with clear recovery semantics.
 
+### Attempt 7: Stage-Before-Commit Barrier
+
+Candidate: require local writeback `persist_slice` to complete before `CommitBeforeUpload` publishes metadata for a still-uploading slice. The prototype added a per-slice `writeback_persisted` flag, woke `commit_chunk` when staging finished, and reported persist failure through the existing writeback error path.
+Branch: `codex/perf-tune-integration`
+Commit: none; code reverted after perf.
+Touched files: `brewfs/src/vfs/io/writer.rs`
+Perf artifact baseline: `brewfs/docker/compose-xfstests/artifacts/perf-run-1781179262-25151`
+Perf artifact candidate: `brewfs/docker/compose-xfstests/artifacts/perf-run-1781188559-17056`
+
+Validation before perf:
+
+```bash
+CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/mnt/slayerfs/brewfs/target cargo test -p brewfs test_commit_before_upload_requires_persist_before_metadata_commit --lib
+CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/mnt/slayerfs/brewfs/target cargo test -p brewfs vfs::io::writer --lib
+cargo fmt --check
+CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/mnt/slayerfs/brewfs/target cargo clippy -p brewfs --lib -- -D warnings
+```
+
+Perf command:
+
+```bash
+PERF_FIO_DIRECT_MATRIX="0 1" \
+PERF_FIO_RANDRW_RUNTIME=20 \
+PERF_FIO_RANDWRITE_RUNTIME=20 \
+PERF_FIO_RANDREAD_RUNTIME=20 \
+PERF_FIO_SEQWRITE_RUNTIME=20 \
+PERF_FIO_SEQREAD_RUNTIME=20 \
+PERF_FIO_POST_WRITE_DRAIN=true \
+PERF_FIO_PREFILL_DRAIN_TIMEOUT_SECS=600 \
+BREWFS_COMPRESSION=none \
+BREWFS_PREFETCH_ENABLED=true \
+BREWFS_UPLOAD_CONCURRENCY=32 \
+bash brewfs/docker/compose-xfstests/run_redis_perf.sh \
+  --writeback-throughput-profile \
+  --tools "fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw"
+```
+
+Key result:
+
+| Tool | Metric | Baseline | Candidate | Delta |
+| --- | --- | ---: | ---: | ---: |
+| `fio-randrw-direct0` | tool wall seconds | 71 | 50 | -29.6% |
+| `fio-randrw-direct0` | read/write BW MiB/s | 743.14 / 336.90 | 810.56 / 365.69 | +9.1% / +8.5% |
+| `fio-randrw-direct0` | write p99 ms | 6.32 | 9.11 | +44.0% |
+| `fio-randrw-direct0` | write p99.9 ms | 11.86 | 123.21 | +938.7% |
+| `fio-randrw-direct0` | post-write drain seconds | 10 | 20 | +100.0% |
+| `fio-randrw-direct0` | PUT ops/GiB written | 2266.85 | 389.44 | -82.8% |
+| `fio-randrw-direct0` | S3 PUT avg object MiB | 0.466 | 2.266 | +386.0% |
+| `fio-randrw-direct1` | tool wall seconds | 44 | 128 | +190.9% |
+| `fio-randrw-direct1` | read/write BW MiB/s | 156.17 / 72.02 | 206.65 / 92.40 | +32.3% / +28.3% |
+| `fio-randrw-direct1` | write p99 ms | 27.39 | 88.61 | +223.4% |
+| `fio-randrw-direct1` | post-write drain seconds | 44 | 53 | +20.5% |
+| `fio-seqwrite-direct0` | write BW MiB/s | 186.37 | 1884.71 | +911.3% |
+| `fio-seqwrite-direct1` | write BW MiB/s | 145.26 | 225.05 | +54.9% |
+| `fio-seqread-direct0` | read BW MiB/s | 1506.57 | 1185.54 | -21.3% |
+| `fio-seqread-direct1` | read BW MiB/s | 3125.39 | 3475.83 | +11.2% |
+
+Decision: rejected; code reverted. The perf script produced the artifact and all benchmark rows passed, but the wrapper exited with `container=1, bench=0` during container teardown.
+
+Reason: the barrier improved object size and reduced `direct0` PUT amplification, which confirms that staging/aggregation is the right area. However, the implementation is not acceptable: it doubled `randrw-direct0` drain, regressed `randrw-direct0` write p99/p99.9 beyond the tail gate, and caused `randrw-direct1` wall time, write p99, and drain to regress far beyond the direct-mode gate. A safe design cannot make foreground direct writes wait on local staging or cause the upload task to complete only after both staging and remote upload. The next attempt should decouple the three phases explicitly: seal/stage quickly, commit metadata only after stage, and let a bounded uploader drain staged records without delaying direct foreground progress.
+
 ## Next Target: Staged Upload And Object Count
 
 - Treat `fio-randrw-direct0` object amplification as the primary write-path bottleneck: baseline already shows thousands of PUT ops/GiB written and sub-1MiB average PUT object size.
 - Keep commit-before-upload semantics, but separate foreground commit progress from S3 PUT completion through a bounded staged uploader design, similar to JuiceFS `stage -> metadata commit -> delayed upload`.
+- Do not accept a plain "stage-before-commit barrier" inside the current upload task. Attempt 7 showed that this can improve object aggregation while badly regressing `direct=1` wall time and write tails.
+- Add explicit phase accounting before the next code candidate: time spent staging, time waiting for stage before metadata commit, staged bytes queued for upload, uploader active bytes, and object upload completion lag.
 - Preserve the current safe path as the default; any staged uploader behavior must be feature-gated and must pass recovery, remount, and post-write-drain checks before becoming part of the throughput profile.
 - Use `compare_artifacts.py` amplification metrics as the acceptance gate. A candidate must reduce PUT ops or tail/backpressure without regressing `direct=1` throughput, p99.9, or post-write drain beyond the existing gates.
