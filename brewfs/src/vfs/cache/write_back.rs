@@ -110,39 +110,54 @@ impl WriteBackCache for FsWriteBackCache {
         fs::create_dir_all(&dir).await?;
 
         let slice_path = key.slice_path(&self.root);
-        let tmp_path = dir.join(format!("{}.tmp", key.local_seq));
 
-        let mut file = fs::File::create(&tmp_path).await?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&slice_path)
+            .await?;
+        file.seek(std::io::SeekFrom::Start(chunk_offset)).await?;
         let mut total_len = 0u64;
         for chunk in &data {
             file.write_all(chunk).await?;
             total_len += chunk.len() as u64;
         }
+        let written_end = chunk_offset.saturating_add(total_len);
         file.flush().await?;
         if self.sync_on_persist {
             file.sync_all().await?;
         }
+        let file_len = file.metadata().await?.len().max(written_end);
         drop(file);
 
-        fs::rename(&tmp_path, &slice_path).await?;
-
         if self.sync_on_persist {
-            // fsync parent directory to ensure the rename is durable.
+            // fsync parent directory to ensure a newly-created slice path is durable.
             let dir_fd = fs::File::open(&dir).await?;
             dir_fd.sync_all().await?;
         }
 
-        let record = DirtySliceRecord {
-            key,
-            ino: key.ino,
-            chunk_id: key.chunk_id,
-            chunk_offset,
-            length: total_len,
-            remote_slice_id: None,
-            state: DirtySliceState::Sealed,
-            path: slice_path.clone(),
-            retry_count: 0,
-            last_error: None,
+        let meta_path = key.meta_path(&self.root);
+        let record = match self.read_meta(&meta_path).await {
+            Ok(mut record) => {
+                record.length = record.length.max(file_len);
+                record.chunk_offset = record.chunk_offset.min(chunk_offset);
+                record.state = DirtySliceState::Sealed;
+                record.path = slice_path.clone();
+                record
+            }
+            Err(_) => DirtySliceRecord {
+                key,
+                ino: key.ino,
+                chunk_id: key.chunk_id,
+                chunk_offset,
+                length: file_len,
+                remote_slice_id: None,
+                state: DirtySliceState::Sealed,
+                path: slice_path.clone(),
+                retry_count: 0,
+                last_error: None,
+            },
         };
         self.write_meta(&key, &record).await?;
 
@@ -309,5 +324,31 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].key, key);
         assert_eq!(records[0].state, DirtySliceState::Sealed);
+    }
+
+    #[tokio::test]
+    async fn persist_slice_merges_batches_by_chunk_offset() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), false);
+        let key = DirtySliceKey {
+            ino: 8,
+            chunk_id: 12,
+            local_seq: 14,
+            epoch: 0,
+        };
+
+        cache
+            .persist_slice(key, vec![Bytes::from_static(b"first")], 0)
+            .await
+            .unwrap();
+        let path = cache
+            .persist_slice(key, vec![Bytes::from_static(b"second")], 5)
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"firstsecond");
+        let records = cache.recover().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].length, 11);
     }
 }

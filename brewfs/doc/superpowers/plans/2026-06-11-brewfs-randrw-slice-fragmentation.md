@@ -1073,3 +1073,96 @@ freezes to TooMany and ExplicitFlush. Inspect slice ordering and cached-origin
 batch selection so delayed cached tails are drained in larger, older-first
 groups without increasing hard_wait.
 ```
+
+## 2026-06-11 Follow-up: Commit-Before-Upload Staging Barrier Attempts
+
+Goal:
+
+- Make local writeback staging a real precondition for commit-before-upload
+  metadata publication.
+- Preserve the accepted Candidate J direct0/direct1 randrw guardrails.
+
+Rejected strict-gate candidates:
+
+```text
+Strict metadata gate only:
+  artifact: perf-run-1781218633-26450
+  direct0 read/write +42.6%/+39.6%, commit_before_stage_ops=0,
+  but post_write_drain_s 2 -> 79 and post-drained PUT/GiB +20.5%.
+
+Strict gate + full stage-inflight backpressure:
+  artifact: perf-run-1781219307-2683
+  post_write_drain_s 2 -> 0, but read/write -27.7%/-27.9% and
+  post-drained PUT/GiB +93.2%.
+
+Strict gate + 1/4 weighted stage-inflight backpressure:
+  artifact: perf-run-1781219770-1834
+  read/write -3.7%/-5.3%, but post_write_drain_s 2 -> 59 and live
+  cached-only dirty backlog remained around 8 GiB.
+
+Strict gate + weighted stage backpressure + cached TooMany grace:
+  artifact: perf-run-1781220339-23425
+  read/write +34.8%/+32.2%, post_write_drain_s 2 -> 0, but tool_wall_s
+  80 -> 159 and post-drained PUT ops +85.6%.
+
+Strict gate + weighted stage backpressure + TooMany grace + writeback batch merge:
+  artifact: perf-run-1781220905-5533
+  read/write +6.7%/+4.7%, post_write_drain_s 2 -> 0, but tool_wall_s
+  80 -> 162 and post-drained PUT ops +95.8%.
+```
+
+Finding:
+
+- A naive staging-before-metadata gate is functionally correct but changes the
+  direct0 timing model enough to create many more cached-only partial-tail
+  uploads.
+- Backpressure can move the drain cost into the fio run, but it either
+  over-throttles or still leaves large live dirty tails.
+- `FsWriteBackCache::persist_slice` had an independent correctness bug: multiple
+  staging batches for the same dirty slice reused the same key but overwrote the
+  local `.slice` file instead of merging at `chunk_offset`.
+
+Accepted precondition fix:
+
+```text
+writeback batch merge direct0 baseline: perf-run-1781217272-13985
+writeback batch merge direct0 candidate: perf-run-1781221364-30168
+writeback batch merge direct1 baseline: perf-run-1781217577-3420
+writeback batch merge direct1 candidate: perf-run-1781221708-4757
+```
+
+Direct0:
+
+```text
+read_bw_mib_s=276.6 vs 242.1 (+14.3%)
+write_bw_mib_s=124.4 vs 110.2 (+12.9%)
+post_write_drain_s=4 vs 2 (+2s)
+post-drained put_ops_per_gib_written=2037.4 vs 1629.0 (+25.1%)
+```
+
+Direct1:
+
+```text
+read_bw_mib_s=182.4 vs 189.3 (-3.6%)
+write_bw_mib_s=82.4 vs 85.7 (-3.8%)
+post_write_drain_s=21 vs 20 (+5.0%)
+post-drained s3_put_ops=1280 vs 1290 (-0.8%)
+```
+
+Decision:
+
+- Accept the writeback batch merge as a reliability precondition, not as the
+  final staging-barrier implementation.
+- Do not accept the strict metadata gate variants yet; they still violate the
+  direct0 object-amplification guardrail.
+
+Next target:
+
+```text
+Candidate L: redesign the staging barrier around slice-level durable staging
+completion, not per-upload-batch timing. The next attempt should keep direct0
+post-drained PUT/GiB within 5% of Candidate J while driving
+commit_before_stage_ops toward zero. Focus on coalescing cached-only dirty
+sub-blocks before upload dispatch and avoid turning metadata ordering into a
+source of extra partial-tail slices.
+```
