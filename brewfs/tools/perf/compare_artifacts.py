@@ -112,6 +112,7 @@ def op_totals(jobs: list[dict], op_name: str) -> dict[str, float]:
         "mean_ns": mean_ns,
         "p95_ns": max((percentile(op, 95) for op in ops), default=0.0),
         "p99_ns": max((percentile(op, 99) for op in ops), default=0.0),
+        "p999_ns": max((percentile(op, 99.9) for op in ops), default=0.0),
         "runtime_ms": max(runtimes) if runtimes else 0.0,
     }
 
@@ -162,6 +163,7 @@ def load_fio_metrics(artifact_dir: pathlib.Path) -> list[Metric]:
                     Metric("fio", item, f"{prefix}_mean_ms", op["mean_ns"] / 1_000_000.0, "ms"),
                     Metric("fio", item, f"{prefix}_p95_ms", op["p95_ns"] / 1_000_000.0, "ms"),
                     Metric("fio", item, f"{prefix}_p99_ms", op["p99_ns"] / 1_000_000.0, "ms"),
+                    Metric("fio", item, f"{prefix}_p999_ms", op["p999_ns"] / 1_000_000.0, "ms"),
                 ]
             )
 
@@ -245,6 +247,10 @@ STAT_METRICS = {
     "brewfs_s3_get_ops_total": ("s3_get_ops", "ops", 1.0),
     "brewfs_s3_put_avg_lat_us": ("s3_put_avg_ms", "ms", 1000.0),
     "brewfs_s3_get_avg_lat_us": ("s3_get_avg_ms", "ms", 1000.0),
+    "brewfs_writeback_backpressure_soft_sleep_ops": ("writeback_soft_sleep_ops", "ops", 1.0),
+    "brewfs_writeback_backpressure_soft_sleep_us": ("writeback_soft_sleep_ms", "ms", 1000.0),
+    "brewfs_writeback_backpressure_hard_wait_ops": ("writeback_hard_wait_ops", "ops", 1.0),
+    "brewfs_writeback_backpressure_hard_wait_us": ("writeback_hard_wait_ms", "ms", 1000.0),
 }
 
 

@@ -49,6 +49,10 @@ brewfs_fuse_write_bytes_total 536870912
 brewfs_fuse_read_bytes_total 268435456
 brewfs_s3_put_ops_total 32
 brewfs_s3_put_avg_lat_us 25000
+brewfs_writeback_backpressure_soft_sleep_ops 12
+brewfs_writeback_backpressure_soft_sleep_us 36000
+brewfs_writeback_backpressure_hard_wait_ops 3
+brewfs_writeback_backpressure_hard_wait_us 9000
 EOF
 }
 
@@ -81,7 +85,8 @@ write_fio() {
           "N": 100,
           "percentile": {
             "95.000000": 80000000,
-            "99.000000": $read_p99
+            "99.000000": $read_p99,
+            "99.900000": $((read_p99 * 2))
           }
         }
       },
@@ -96,7 +101,8 @@ write_fio() {
           "N": 200,
           "percentile": {
             "95.000000": 120000000,
-            "99.000000": $write_p99
+            "99.000000": $write_p99,
+            "99.900000": $((write_p99 * 2))
           }
         }
       }
@@ -122,8 +128,11 @@ python3 "$SCRIPT" --format tsv "$baseline" "$candidate" >"$tmp_dir/out.tsv"
 grep -F $'kind	item	metric	baseline	candidate	delta_pct	unit' "$tmp_dir/out.tsv" >/dev/null
 grep -F $'fio	fio-seqwrite-direct1	write_bw_mib_s	100.000	125.000	+25.0	MiB/s' "$tmp_dir/out.tsv" >/dev/null
 grep -F $'fio	fio-randrw-direct1	read_p99_ms	100.000	90.000	-10.0	ms' "$tmp_dir/out.tsv" >/dev/null
+grep -F $'fio	fio-randrw-direct1	write_p999_ms	300.000	360.000	+20.0	ms' "$tmp_dir/out.tsv" >/dev/null
 grep -F $'drain	fio-seqwrite-direct1	post_write_drain_s	4.000	8.000	+100.0	s' "$tmp_dir/out.tsv" >/dev/null
 grep -F $'stats	fio-randrw-direct1	backpressure_pending_mib	1.000	0.500	-50.0	MiB' "$tmp_dir/out.tsv" >/dev/null
+grep -F $'stats	fio-randrw-direct1	writeback_soft_sleep_ops	12.000	12.000	+0.0	ops' "$tmp_dir/out.tsv" >/dev/null
+grep -F $'stats	fio-randrw-direct1	writeback_hard_wait_ms	9.000	9.000	+0.0	ms' "$tmp_dir/out.tsv" >/dev/null
 
 python3 "$SCRIPT" --format markdown --baseline-label base --candidate-label cand "$baseline" "$candidate" >"$tmp_dir/out.md"
 grep -F "Baseline: \`base\`" "$tmp_dir/out.md" >/dev/null
