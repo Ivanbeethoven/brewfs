@@ -248,6 +248,46 @@ STAT_METRICS = {
     "brewfs_writeback_dirty_bytes": ("writeback_dirty_mib", "MiB", BYTES_PER_MIB),
     "brewfs_writeback_live_dirty_bytes": ("writeback_live_dirty_mib", "MiB", BYTES_PER_MIB),
     "brewfs_writeback_live_slices": ("writeback_live_slices", "slices", 1.0),
+    "brewfs_writeback_live_normal_only_bytes": (
+        "writeback_live_normal_only_mib",
+        "MiB",
+        BYTES_PER_MIB,
+    ),
+    "brewfs_writeback_live_normal_only_slices": (
+        "writeback_live_normal_only_slices",
+        "slices",
+        1.0,
+    ),
+    "brewfs_writeback_live_cached_only_bytes": (
+        "writeback_live_cached_only_mib",
+        "MiB",
+        BYTES_PER_MIB,
+    ),
+    "brewfs_writeback_live_cached_only_slices": (
+        "writeback_live_cached_only_slices",
+        "slices",
+        1.0,
+    ),
+    "brewfs_writeback_live_mixed_origin_bytes": (
+        "writeback_live_mixed_origin_mib",
+        "MiB",
+        BYTES_PER_MIB,
+    ),
+    "brewfs_writeback_live_mixed_origin_slices": (
+        "writeback_live_mixed_origin_slices",
+        "slices",
+        1.0,
+    ),
+    "brewfs_writeback_live_unknown_origin_bytes": (
+        "writeback_live_unknown_origin_mib",
+        "MiB",
+        BYTES_PER_MIB,
+    ),
+    "brewfs_writeback_live_unknown_origin_slices": (
+        "writeback_live_unknown_origin_slices",
+        "slices",
+        1.0,
+    ),
     "brewfs_buffer_dirty_bytes": ("buffer_dirty_mib", "MiB", BYTES_PER_MIB),
     "brewfs_writeback_recent_uploaded_bytes": ("writeback_recent_uploaded_mib", "MiB", BYTES_PER_MIB),
     "brewfs_writeback_recent_pending_upload_slices": ("writeback_recent_pending_slices", "slices", 1.0),
@@ -361,6 +401,26 @@ STAT_METRICS = {
         "ops",
         1.0,
     ),
+    "brewfs_writeback_upload_partial_tail_normal_only_ops_total": (
+        "writeback_upload_partial_tail_normal_only_ops",
+        "ops",
+        1.0,
+    ),
+    "brewfs_writeback_upload_partial_tail_cached_only_ops_total": (
+        "writeback_upload_partial_tail_cached_only_ops",
+        "ops",
+        1.0,
+    ),
+    "brewfs_writeback_upload_partial_tail_mixed_origin_ops_total": (
+        "writeback_upload_partial_tail_mixed_origin_ops",
+        "ops",
+        1.0,
+    ),
+    "brewfs_writeback_upload_partial_tail_unknown_origin_ops_total": (
+        "writeback_upload_partial_tail_unknown_origin_ops",
+        "ops",
+        1.0,
+    ),
     "brewfs_writeback_upload_partial_tail_auto_age_ops_total": (
         "writeback_upload_partial_tail_auto_age_ops",
         "ops",
@@ -393,6 +453,26 @@ STAT_METRICS = {
     ),
     "brewfs_writeback_upload_partial_tail_auto_unknown_ops_total": (
         "writeback_upload_partial_tail_auto_unknown_ops",
+        "ops",
+        1.0,
+    ),
+    "brewfs_writeback_upload_partial_tail_auto_normal_only_ops_total": (
+        "writeback_upload_partial_tail_auto_normal_only_ops",
+        "ops",
+        1.0,
+    ),
+    "brewfs_writeback_upload_partial_tail_auto_cached_only_ops_total": (
+        "writeback_upload_partial_tail_auto_cached_only_ops",
+        "ops",
+        1.0,
+    ),
+    "brewfs_writeback_upload_partial_tail_auto_mixed_origin_ops_total": (
+        "writeback_upload_partial_tail_auto_mixed_origin_ops",
+        "ops",
+        1.0,
+    ),
+    "brewfs_writeback_upload_partial_tail_auto_unknown_origin_ops_total": (
+        "writeback_upload_partial_tail_auto_unknown_origin_ops",
         "ops",
         1.0,
     ),

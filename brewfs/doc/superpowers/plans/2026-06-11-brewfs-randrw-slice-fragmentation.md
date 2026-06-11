@@ -698,3 +698,108 @@ Candidate G: add explicit writer-origin instrumentation before changing policy.
   use the signal to design an active-writeback-only idle deferral;
   preserve Candidate D as the performance baseline until the new signal proves useful.
 ```
+
+## Candidate G Result: Write-Origin Attribution
+
+Goal:
+
+- Add behavior-neutral write-origin attribution before another idle/age policy
+  change.
+- Distinguish slices that were written only by the normal write path, only by
+  the cached writeback path, by both paths, or by an unknown path.
+- Export both live writeback origin gauges and cumulative partial-tail upload
+  origin counters.
+
+Implementation:
+
+- Added `WriteOrigin` tracking to successful slice writes.
+- Kept the writeback freeze/upload policy unchanged.
+- Exported live origin gauges:
+  `normal_only`, `cached_only`, `mixed_origin`, and `unknown_origin`.
+- Exported partial-tail upload counters by origin, including auto-only origin
+  counters.
+- Extended the perf report and `compare_artifacts.py` so artifacts show
+  `partial_origin=...` and `auto_origin=...`.
+
+Verification:
+
+```text
+cargo fmt --all
+cargo test -p brewfs --lib 'vfs::io::writer::tests::'  # 33 passed
+cargo test -p brewfs --lib vfs::stats::tests::         # 3 passed
+bash brewfs/tools/perf/test_compare_artifacts.sh        # passed
+cargo clippy -p brewfs --lib -- -D warnings
+git diff --check
+```
+
+Direct0 artifact:
+
+```text
+brewfs/docker/compose-xfstests/artifacts/perf-run-1781211889-1001
+```
+
+Direct0 versus Candidate D (`perf-run-1781205242-516`):
+
+```text
+read_bw_mib_s=190.5 vs 219.0 (-13.0%)
+write_bw_mib_s=86.7 vs 99.3 (-12.7%)
+post_write_drain_s=2 vs 6
+post-drained put_ops_per_gib_written=1540.9 vs 1928.8 (-20.1%)
+avg_upload_batch_mib=0.659 vs 0.525 (+25.5%)
+partial_tail_ratio=0.933 vs 0.955
+partial_origin=normal 0/cached 7830/mixed 0/unknown 0
+auto_origin=normal 0/cached 6711/mixed 0/unknown 0
+auto_detail=age 33/idle 5928/too_many 750/pressure 0/buffer_high 0/flush_duration 0
+```
+
+Note:
+
+- A separate Codex task repeatedly launched cargo tests during this period, so
+  treat direct0 throughput as potentially noisy.
+- The object-shape signal is still useful: buffered randrw direct0 partial-tail
+  uploads are overwhelmingly cached-origin tails, and the remaining auto
+  triggers are mostly `idle` plus `too_many`.
+
+Direct1 artifact:
+
+```text
+brewfs/docker/compose-xfstests/artifacts/perf-run-1781212221-16078
+```
+
+Direct1 versus Candidate D (`perf-run-1781205600-16115`):
+
+```text
+read_bw_mib_s=185.7 vs 232.7 (-20.2%)
+write_bw_mib_s=84.4 vs 106.2 (-20.6%)
+post_write_drain_s=18 vs 22
+post-drained put_ops_per_gib_written=259.2 vs 259.0 (+0.1%)
+avg_upload_batch_mib=4.066 vs 4.046 (+0.5%)
+partial_tail_ratio=0.034 vs 0.030
+partial_origin=normal 45/cached 0/mixed 0/unknown 0
+auto_origin=normal 36/cached 0/mixed 0/unknown 0
+auto_detail=age 36/idle 0/too_many 0/pressure 0/buffer_high 0/flush_duration 0
+```
+
+Decision:
+
+- Keep Candidate G as observability, not as a claimed throughput improvement.
+- The origin signal is decisive enough for the next behavior candidate:
+  direct0 remaining partial-tail amplification is cached-origin and mostly
+  `auto_idle`; direct1 partial tails are normal-origin and still dominated by
+  `auto_age`.
+- Because direct1 throughput was lower in this run, the next behavior candidate
+  must run a direct1 guard and reject any stable direct1 read/write regression
+  above 5%.
+
+Next target:
+
+```text
+Candidate H: cached-origin full-block-first idle cleanup.
+  Do not use a fixed time grace.
+  Do not change normal-origin direct1 idle/age behavior.
+  When cached-origin sub-block slices are idle, prefer freezing/uploading full
+  blocks and older/larger cached tails first.
+  Only freeze tiny cached idle tails when slice-count/backpressure requires it.
+  Accept only if direct0 PUT/GiB improves and direct1 read/write stays within
+  the 5% guard band versus Candidate D.
+```

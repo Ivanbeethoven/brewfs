@@ -780,6 +780,16 @@ where
                         dirty.recently_committed_uploaded_bytes,
                         dirty.recently_committed_uploaded_slices,
                     );
+                    fuse_stats.sync_writeback_live_origin_metrics(
+                        dirty.live_normal_only_bytes,
+                        dirty.live_normal_only_slices,
+                        dirty.live_cached_only_bytes,
+                        dirty.live_cached_only_slices,
+                        dirty.live_mixed_origin_bytes,
+                        dirty.live_mixed_origin_slices,
+                        dirty.live_unknown_origin_bytes,
+                        dirty.live_unknown_origin_slices,
+                    );
                     fuse_stats.sync_writeback_backpressure_metrics(
                         dirty.backpressure_soft_sleep_ops,
                         dirty.backpressure_soft_sleep_us,
@@ -830,6 +840,16 @@ where
                         dirty.upload_partial_tail_auto_flush_duration_ops,
                         dirty.upload_partial_tail_auto_unknown_ops,
                         dirty.upload_partial_tail_commit_age_ops,
+                    );
+                    fuse_stats.sync_writeback_upload_origin_metrics(
+                        dirty.upload_partial_tail_normal_only_ops,
+                        dirty.upload_partial_tail_cached_only_ops,
+                        dirty.upload_partial_tail_mixed_origin_ops,
+                        dirty.upload_partial_tail_unknown_origin_ops,
+                        dirty.upload_partial_tail_auto_normal_only_ops,
+                        dirty.upload_partial_tail_auto_cached_only_ops,
+                        dirty.upload_partial_tail_auto_mixed_origin_ops,
+                        dirty.upload_partial_tail_auto_unknown_origin_ops,
                     );
                     if let Some(object_metrics) = &object_metrics {
                         let object = object_metrics.snapshot();

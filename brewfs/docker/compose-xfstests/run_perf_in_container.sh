@@ -1551,6 +1551,10 @@ if brewfs_stats_paths:
         )
         remote_inflight = metrics.get("brewfs_writeback_remote_upload_inflight_bytes", 0.0)
         live_slices = metrics.get("brewfs_writeback_live_slices", 0.0)
+        live_normal_only_slices = metrics.get("brewfs_writeback_live_normal_only_slices", 0.0)
+        live_cached_only_slices = metrics.get("brewfs_writeback_live_cached_only_slices", 0.0)
+        live_mixed_origin_slices = metrics.get("brewfs_writeback_live_mixed_origin_slices", 0.0)
+        live_unknown_origin_slices = metrics.get("brewfs_writeback_live_unknown_origin_slices", 0.0)
         slice_create = metrics.get("brewfs_writeback_slice_create_ops_total", 0.0)
         slice_reuse = metrics.get("brewfs_writeback_slice_reuse_ops_total", 0.0)
         reject_older = metrics.get("brewfs_writeback_slice_reject_older_unique_ops_total", 0.0)
@@ -1572,6 +1576,22 @@ if brewfs_stats_paths:
             0.0,
         )
         partial_tail_auto = metrics.get("brewfs_writeback_upload_partial_tail_auto_ops_total", 0.0)
+        partial_tail_normal = metrics.get(
+            "brewfs_writeback_upload_partial_tail_normal_only_ops_total",
+            0.0,
+        )
+        partial_tail_cached = metrics.get(
+            "brewfs_writeback_upload_partial_tail_cached_only_ops_total",
+            0.0,
+        )
+        partial_tail_mixed = metrics.get(
+            "brewfs_writeback_upload_partial_tail_mixed_origin_ops_total",
+            0.0,
+        )
+        partial_tail_unknown_origin = metrics.get(
+            "brewfs_writeback_upload_partial_tail_unknown_origin_ops_total",
+            0.0,
+        )
         partial_tail_auto_age = metrics.get(
             "brewfs_writeback_upload_partial_tail_auto_age_ops_total",
             0.0,
@@ -1600,6 +1620,22 @@ if brewfs_stats_paths:
             "brewfs_writeback_upload_partial_tail_auto_unknown_ops_total",
             0.0,
         )
+        partial_tail_auto_normal = metrics.get(
+            "brewfs_writeback_upload_partial_tail_auto_normal_only_ops_total",
+            0.0,
+        )
+        partial_tail_auto_cached = metrics.get(
+            "brewfs_writeback_upload_partial_tail_auto_cached_only_ops_total",
+            0.0,
+        )
+        partial_tail_auto_mixed = metrics.get(
+            "brewfs_writeback_upload_partial_tail_auto_mixed_origin_ops_total",
+            0.0,
+        )
+        partial_tail_auto_unknown_origin = metrics.get(
+            "brewfs_writeback_upload_partial_tail_auto_unknown_origin_ops_total",
+            0.0,
+        )
         partial_tail_age = metrics.get(
             "brewfs_writeback_upload_partial_tail_commit_age_ops_total",
             0.0,
@@ -1625,16 +1661,23 @@ if brewfs_stats_paths:
             f"slices=create {int(slice_create)}/reuse {int(slice_reuse)}/"
             f"reject_unique {int(reject_older)}/reject_prefix {int(reject_prefix)}, "
             f"live_slices={int(live_slices)} avg={fmt_avg_mib(live_dirty, live_slices)}, "
+            f"origin=normal {int(live_normal_only_slices)}/cached {int(live_cached_only_slices)}/"
+            f"mixed {int(live_mixed_origin_slices)}/unknown {int(live_unknown_origin_slices)}, "
             f"upload_batch={int(batch_ops)} avg={fmt_avg_mib(batch_bytes, batch_ops)} "
             f"blocks={avg_batch_blocks:.2f}/batch partial_tail={partial_tail_ratio:.2f} "
             f"(size {int(partial_tail_size)}/max {int(partial_tail_max)}/"
             f"flush {int(partial_tail_flush)}/auto {int(partial_tail_auto)}/"
             f"age {int(partial_tail_age)}), "
+            f"partial_origin=normal {int(partial_tail_normal)}/cached {int(partial_tail_cached)}/"
+            f"mixed {int(partial_tail_mixed)}/unknown {int(partial_tail_unknown_origin)}, "
             f"auto_detail=age {int(partial_tail_auto_age)}/idle {int(partial_tail_auto_idle)}/"
             f"pressure {int(partial_tail_auto_pressure)}/too_many {int(partial_tail_auto_too_many)}/"
             f"buffer_high {int(partial_tail_auto_buffer_high)}/"
             f"flush_duration {int(partial_tail_auto_flush_duration)}/"
             f"unknown {int(partial_tail_auto_unknown)}, "
+            f"auto_origin=normal {int(partial_tail_auto_normal)}/"
+            f"cached {int(partial_tail_auto_cached)}/mixed {int(partial_tail_auto_mixed)}/"
+            f"unknown {int(partial_tail_auto_unknown_origin)}, "
             f"freeze=size {int(freeze_size)}/flush {int(freeze_flush)}/auto {int(freeze_auto)}/"
             f"max {int(freeze_max)}/age {int(freeze_age)} |"
         )

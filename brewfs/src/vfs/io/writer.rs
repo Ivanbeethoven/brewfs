@@ -222,6 +222,29 @@ enum AutoFreezeTrigger {
     FlushDuration,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WriteOrigin {
+    Normal,
+    Cached,
+}
+
+impl WriteOrigin {
+    fn mask(self) -> u8 {
+        match self {
+            Self::Normal => 0b01,
+            Self::Cached => 0b10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteOriginKind {
+    Unknown,
+    NormalOnly,
+    CachedOnly,
+    Mixed,
+}
+
 pub(crate) struct SliceState {
     state: SliceStatus,
     /// ID of the chunk it belongs to.
@@ -275,6 +298,8 @@ pub(crate) struct SliceState {
     /// unique < max_write_unique is rejected (must go to its own slice) to
     /// prevent an older concurrent write from overwriting newer data.
     max_write_unique: u64,
+    /// Bitmask of write paths that have successfully appended to this slice.
+    write_origin_mask: u8,
 }
 
 impl SliceState {
@@ -313,6 +338,7 @@ impl SliceState {
             auto_freeze_trigger: None,
             creation_unique,
             max_write_unique: creation_unique,
+            write_origin_mask: 0,
         }
     }
 
@@ -357,10 +383,24 @@ impl SliceState {
         offset: u64,
         buf: &[u8],
         action: PageWriteAction,
+        origin: WriteOrigin,
     ) -> anyhow::Result<()> {
         self.data.write(offset - self.offset, buf, action)?;
+        self.write_origin_mask |= origin.mask();
         self.last_mod = Instant::now();
         Ok(())
+    }
+
+    fn write_origin_kind(&self) -> WriteOriginKind {
+        match (
+            self.write_origin_mask & WriteOrigin::Normal.mask() != 0,
+            self.write_origin_mask & WriteOrigin::Cached.mask() != 0,
+        ) {
+            (false, false) => WriteOriginKind::Unknown,
+            (true, false) => WriteOriginKind::NormalOnly,
+            (false, true) => WriteOriginKind::CachedOnly,
+            (true, true) => WriteOriginKind::Mixed,
+        }
     }
 
     fn can_overlay_read(&self) -> bool {
@@ -490,10 +530,10 @@ where
         self.with_ref(|s| s.data.len() >= s.data.block_size() as u64)
     }
 
-    fn try_write(&self, offset: u64, buf: &[u8]) -> anyhow::Result<bool> {
+    fn try_write(&self, offset: u64, buf: &[u8], origin: WriteOrigin) -> anyhow::Result<bool> {
         let wrote = self.with_mut(|s| match s.can_write(offset, buf.len()) {
             Some(action) => {
-                s.write(offset, buf, action)?;
+                s.write(offset, buf, action, origin)?;
                 s.update_usage(s.data.alloc_bytes());
                 Ok::<bool, anyhow::Error>(true)
             }
@@ -723,12 +763,14 @@ where
                 && end as u64 * block_size >= s.data.len();
             let partial_tail_reason = s.freeze_reason;
             let partial_tail_auto_trigger = s.auto_freeze_trigger;
+            let partial_tail_origin = s.write_origin_kind();
             self.shared.recent_pending_upload.record_upload_batch(
                 data_len,
                 (end - start) as u64,
                 partial_tail,
                 partial_tail_reason,
                 partial_tail_auto_trigger,
+                partial_tail_origin,
             );
 
             Ok(Some(UploadPlan {
@@ -1090,6 +1132,7 @@ where
         offset: u64,
         buf: &[u8],
         creation_unique: u64,
+        origin: WriteOrigin,
     ) -> anyhow::Result<WriteAction> {
         let mut start_commit = false;
         let mut flush = Vec::new();
@@ -1111,7 +1154,7 @@ where
                 shared: self.shared,
             };
 
-            if handle.try_write(offset, buf)? {
+            if handle.try_write(offset, buf, origin)? {
                 if handle.can_continue_upload()
                     || handle.should_freeze()
                         && handle.freeze_with_reason(SliceFreezeReason::SizeOrChunkEnd)
@@ -1210,6 +1253,10 @@ struct RecentPendingUploadState {
     upload_partial_tail_max_unflushed_ops: AtomicU64,
     upload_partial_tail_explicit_flush_ops: AtomicU64,
     upload_partial_tail_auto_ops: AtomicU64,
+    upload_partial_tail_normal_only_ops: AtomicU64,
+    upload_partial_tail_cached_only_ops: AtomicU64,
+    upload_partial_tail_mixed_origin_ops: AtomicU64,
+    upload_partial_tail_unknown_origin_ops: AtomicU64,
     upload_partial_tail_auto_age_ops: AtomicU64,
     upload_partial_tail_auto_idle_ops: AtomicU64,
     upload_partial_tail_auto_pressure_ops: AtomicU64,
@@ -1217,6 +1264,10 @@ struct RecentPendingUploadState {
     upload_partial_tail_auto_buffer_high_ops: AtomicU64,
     upload_partial_tail_auto_flush_duration_ops: AtomicU64,
     upload_partial_tail_auto_unknown_ops: AtomicU64,
+    upload_partial_tail_auto_normal_only_ops: AtomicU64,
+    upload_partial_tail_auto_cached_only_ops: AtomicU64,
+    upload_partial_tail_auto_mixed_origin_ops: AtomicU64,
+    upload_partial_tail_auto_unknown_origin_ops: AtomicU64,
     upload_partial_tail_commit_age_ops: AtomicU64,
     notify: Notify,
 }
@@ -1269,6 +1320,10 @@ impl RecentPendingUploadState {
             upload_partial_tail_max_unflushed_ops: AtomicU64::new(0),
             upload_partial_tail_explicit_flush_ops: AtomicU64::new(0),
             upload_partial_tail_auto_ops: AtomicU64::new(0),
+            upload_partial_tail_normal_only_ops: AtomicU64::new(0),
+            upload_partial_tail_cached_only_ops: AtomicU64::new(0),
+            upload_partial_tail_mixed_origin_ops: AtomicU64::new(0),
+            upload_partial_tail_unknown_origin_ops: AtomicU64::new(0),
             upload_partial_tail_auto_age_ops: AtomicU64::new(0),
             upload_partial_tail_auto_idle_ops: AtomicU64::new(0),
             upload_partial_tail_auto_pressure_ops: AtomicU64::new(0),
@@ -1276,6 +1331,10 @@ impl RecentPendingUploadState {
             upload_partial_tail_auto_buffer_high_ops: AtomicU64::new(0),
             upload_partial_tail_auto_flush_duration_ops: AtomicU64::new(0),
             upload_partial_tail_auto_unknown_ops: AtomicU64::new(0),
+            upload_partial_tail_auto_normal_only_ops: AtomicU64::new(0),
+            upload_partial_tail_auto_cached_only_ops: AtomicU64::new(0),
+            upload_partial_tail_auto_mixed_origin_ops: AtomicU64::new(0),
+            upload_partial_tail_auto_unknown_origin_ops: AtomicU64::new(0),
             upload_partial_tail_commit_age_ops: AtomicU64::new(0),
             notify: Notify::new(),
         }
@@ -1373,6 +1432,7 @@ impl RecentPendingUploadState {
         partial_tail: bool,
         partial_tail_reason: Option<SliceFreezeReason>,
         partial_tail_auto_trigger: Option<AutoFreezeTrigger>,
+        partial_tail_origin: WriteOriginKind,
     ) {
         self.upload_batch_ops.fetch_add(1, Ordering::Relaxed);
         self.upload_batch_bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -1380,6 +1440,13 @@ impl RecentPendingUploadState {
             .fetch_add(blocks, Ordering::Relaxed);
         if partial_tail {
             self.upload_partial_tail_ops.fetch_add(1, Ordering::Relaxed);
+            let origin_counter = match partial_tail_origin {
+                WriteOriginKind::NormalOnly => &self.upload_partial_tail_normal_only_ops,
+                WriteOriginKind::CachedOnly => &self.upload_partial_tail_cached_only_ops,
+                WriteOriginKind::Mixed => &self.upload_partial_tail_mixed_origin_ops,
+                WriteOriginKind::Unknown => &self.upload_partial_tail_unknown_origin_ops,
+            };
+            origin_counter.fetch_add(1, Ordering::Relaxed);
             if let Some(reason) = partial_tail_reason {
                 let counter = match reason {
                     SliceFreezeReason::SizeOrChunkEnd => &self.upload_partial_tail_size_ops,
@@ -1410,6 +1477,19 @@ impl RecentPendingUploadState {
                         None => &self.upload_partial_tail_auto_unknown_ops,
                     };
                     auto_counter.fetch_add(1, Ordering::Relaxed);
+                    let auto_origin_counter = match partial_tail_origin {
+                        WriteOriginKind::NormalOnly => {
+                            &self.upload_partial_tail_auto_normal_only_ops
+                        }
+                        WriteOriginKind::CachedOnly => {
+                            &self.upload_partial_tail_auto_cached_only_ops
+                        }
+                        WriteOriginKind::Mixed => &self.upload_partial_tail_auto_mixed_origin_ops,
+                        WriteOriginKind::Unknown => {
+                            &self.upload_partial_tail_auto_unknown_origin_ops
+                        }
+                    };
+                    auto_origin_counter.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -1718,7 +1798,8 @@ where
         fields(offset, len = buf.len(), bypass_flush_gate = false)
     )]
     pub(crate) async fn write_at(&self, offset: u64, buf: &[u8]) -> anyhow::Result<usize> {
-        self.write_at_inner(offset, buf, false, 0).await
+        self.write_at_inner(offset, buf, false, 0, WriteOrigin::Normal)
+            .await
     }
 
     #[tracing::instrument(
@@ -1732,7 +1813,7 @@ where
         buf: &[u8],
         creation_unique: u64,
     ) -> anyhow::Result<usize> {
-        self.write_at_inner(offset, buf, true, creation_unique)
+        self.write_at_inner(offset, buf, true, creation_unique, WriteOrigin::Cached)
             .await
     }
 
@@ -1742,6 +1823,7 @@ where
         buf: &[u8],
         bypass_flush_gate: bool,
         creation_unique: u64,
+        origin: WriteOrigin,
     ) -> anyhow::Result<usize> {
         self.shared.writeback_result()?;
         self.back_pressure().await?;
@@ -1772,7 +1854,7 @@ where
             let cid = chunk_id_for(self.shared.inode.ino(), chunk_index)?;
             let ckey = guard.get_or_create_chunk(cid);
             let mut handle = guard.chunk_handle(&self.shared, ckey);
-            let action = handle.write_at(within_offset, buf, creation_unique)?;
+            let action = handle.write_at(within_offset, buf, creation_unique, origin)?;
             drop(guard);
 
             for slice in action.flush {
@@ -1795,6 +1877,7 @@ where
                     span.offset,
                     &buf[position..position + span_len],
                     creation_unique,
+                    origin,
                 )?;
                 drop(guard);
 
@@ -3204,6 +3287,14 @@ pub(crate) struct DataWriter<B, M> {
 pub(crate) struct WritebackDirtyBreakdown {
     pub live_bytes: u64,
     pub live_slices: u64,
+    pub live_normal_only_bytes: u64,
+    pub live_normal_only_slices: u64,
+    pub live_cached_only_bytes: u64,
+    pub live_cached_only_slices: u64,
+    pub live_mixed_origin_bytes: u64,
+    pub live_mixed_origin_slices: u64,
+    pub live_unknown_origin_bytes: u64,
+    pub live_unknown_origin_slices: u64,
     pub recently_committed_pending_upload_bytes: u64,
     pub recently_committed_pending_upload_slices: u64,
     pub recently_committed_uploaded_bytes: u64,
@@ -3241,6 +3332,10 @@ pub(crate) struct WritebackDirtyBreakdown {
     pub upload_partial_tail_max_unflushed_ops: u64,
     pub upload_partial_tail_explicit_flush_ops: u64,
     pub upload_partial_tail_auto_ops: u64,
+    pub upload_partial_tail_normal_only_ops: u64,
+    pub upload_partial_tail_cached_only_ops: u64,
+    pub upload_partial_tail_mixed_origin_ops: u64,
+    pub upload_partial_tail_unknown_origin_ops: u64,
     pub upload_partial_tail_auto_age_ops: u64,
     pub upload_partial_tail_auto_idle_ops: u64,
     pub upload_partial_tail_auto_pressure_ops: u64,
@@ -3248,6 +3343,10 @@ pub(crate) struct WritebackDirtyBreakdown {
     pub upload_partial_tail_auto_buffer_high_ops: u64,
     pub upload_partial_tail_auto_flush_duration_ops: u64,
     pub upload_partial_tail_auto_unknown_ops: u64,
+    pub upload_partial_tail_auto_normal_only_ops: u64,
+    pub upload_partial_tail_auto_cached_only_ops: u64,
+    pub upload_partial_tail_auto_mixed_origin_ops: u64,
+    pub upload_partial_tail_auto_unknown_origin_ops: u64,
     pub upload_partial_tail_commit_age_ops: u64,
 }
 
@@ -3437,6 +3536,22 @@ where
                 .recent_pending_upload
                 .upload_partial_tail_auto_ops
                 .load(Ordering::Relaxed),
+            upload_partial_tail_normal_only_ops: self
+                .recent_pending_upload
+                .upload_partial_tail_normal_only_ops
+                .load(Ordering::Relaxed),
+            upload_partial_tail_cached_only_ops: self
+                .recent_pending_upload
+                .upload_partial_tail_cached_only_ops
+                .load(Ordering::Relaxed),
+            upload_partial_tail_mixed_origin_ops: self
+                .recent_pending_upload
+                .upload_partial_tail_mixed_origin_ops
+                .load(Ordering::Relaxed),
+            upload_partial_tail_unknown_origin_ops: self
+                .recent_pending_upload
+                .upload_partial_tail_unknown_origin_ops
+                .load(Ordering::Relaxed),
             upload_partial_tail_auto_age_ops: self
                 .recent_pending_upload
                 .upload_partial_tail_auto_age_ops
@@ -3465,6 +3580,22 @@ where
                 .recent_pending_upload
                 .upload_partial_tail_auto_unknown_ops
                 .load(Ordering::Relaxed),
+            upload_partial_tail_auto_normal_only_ops: self
+                .recent_pending_upload
+                .upload_partial_tail_auto_normal_only_ops
+                .load(Ordering::Relaxed),
+            upload_partial_tail_auto_cached_only_ops: self
+                .recent_pending_upload
+                .upload_partial_tail_auto_cached_only_ops
+                .load(Ordering::Relaxed),
+            upload_partial_tail_auto_mixed_origin_ops: self
+                .recent_pending_upload
+                .upload_partial_tail_auto_mixed_origin_ops
+                .load(Ordering::Relaxed),
+            upload_partial_tail_auto_unknown_origin_ops: self
+                .recent_pending_upload
+                .upload_partial_tail_auto_unknown_origin_ops
+                .load(Ordering::Relaxed),
             upload_partial_tail_commit_age_ops: self
                 .recent_pending_upload
                 .upload_partial_tail_commit_age_ops
@@ -3476,10 +3607,36 @@ where
             let guard = writer.shared.inner.lock().await;
             for chunk in guard.chunks.values() {
                 for slice in &chunk.slices {
+                    let state = slice.lock();
+                    let bytes = state.data.alloc_bytes();
                     breakdown.live_slices = breakdown.live_slices.saturating_add(1);
-                    breakdown.live_bytes = breakdown
-                        .live_bytes
-                        .saturating_add(slice.lock().data.alloc_bytes());
+                    breakdown.live_bytes = breakdown.live_bytes.saturating_add(bytes);
+                    match state.write_origin_kind() {
+                        WriteOriginKind::NormalOnly => {
+                            breakdown.live_normal_only_slices =
+                                breakdown.live_normal_only_slices.saturating_add(1);
+                            breakdown.live_normal_only_bytes =
+                                breakdown.live_normal_only_bytes.saturating_add(bytes);
+                        }
+                        WriteOriginKind::CachedOnly => {
+                            breakdown.live_cached_only_slices =
+                                breakdown.live_cached_only_slices.saturating_add(1);
+                            breakdown.live_cached_only_bytes =
+                                breakdown.live_cached_only_bytes.saturating_add(bytes);
+                        }
+                        WriteOriginKind::Mixed => {
+                            breakdown.live_mixed_origin_slices =
+                                breakdown.live_mixed_origin_slices.saturating_add(1);
+                            breakdown.live_mixed_origin_bytes =
+                                breakdown.live_mixed_origin_bytes.saturating_add(bytes);
+                        }
+                        WriteOriginKind::Unknown => {
+                            breakdown.live_unknown_origin_slices =
+                                breakdown.live_unknown_origin_slices.saturating_add(1);
+                            breakdown.live_unknown_origin_bytes =
+                                breakdown.live_unknown_origin_bytes.saturating_add(bytes);
+                        }
+                    }
                 }
                 for slice in &chunk.recently_committed {
                     let state = slice.lock();
@@ -4616,6 +4773,116 @@ mod tests {
         assert_eq!(after_flush.upload_partial_tail_max_unflushed_ops, 0);
     }
 
+    #[tokio::test]
+    async fn test_dirty_breakdown_reports_live_write_origin_mix() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store, meta.clone()));
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = Arc::new(DataWriter::new(test_config(layout), backend, reader, None));
+
+        let normal_ino = meta
+            .create_file(1, "origin_normal.txt".to_string())
+            .await
+            .unwrap();
+        writer
+            .ensure_file(Inode::new(normal_ino, 0))
+            .write_at(0, &[1u8; 1024])
+            .await
+            .unwrap();
+
+        let cached_ino = meta
+            .create_file(1, "origin_cached.txt".to_string())
+            .await
+            .unwrap();
+        writer
+            .ensure_file(Inode::new(cached_ino, 0))
+            .write_at_cached(0, &[2u8; 1024], 10)
+            .await
+            .unwrap();
+
+        let mixed_ino = meta
+            .create_file(1, "origin_mixed.txt".to_string())
+            .await
+            .unwrap();
+        let mixed_writer = writer.ensure_file(Inode::new(mixed_ino, 0));
+        mixed_writer
+            .write_at_cached(0, &[3u8; 1024], 20)
+            .await
+            .unwrap();
+        mixed_writer.write_at(1024, &[4u8; 1024]).await.unwrap();
+
+        let breakdown = writer.dirty_breakdown().await;
+        assert_eq!(breakdown.live_slices, 3);
+        assert_eq!(breakdown.live_normal_only_slices, 1);
+        assert_eq!(breakdown.live_cached_only_slices, 1);
+        assert_eq!(breakdown.live_mixed_origin_slices, 1);
+        assert_eq!(breakdown.live_unknown_origin_slices, 0);
+    }
+
+    #[tokio::test]
+    async fn test_upload_partial_tail_metrics_are_attributed_by_write_origin() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store, meta.clone()));
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = Arc::new(DataWriter::new(test_config(layout), backend, reader, None));
+
+        let normal_ino = meta
+            .create_file(1, "tail_origin_normal.txt".to_string())
+            .await
+            .unwrap();
+        let normal_writer = writer.ensure_file(Inode::new(normal_ino, 0));
+        normal_writer.write_at(0, &[1u8; 1024]).await.unwrap();
+        normal_writer.flush().await.unwrap();
+
+        let cached_ino = meta
+            .create_file(1, "tail_origin_cached.txt".to_string())
+            .await
+            .unwrap();
+        let cached_writer = writer.ensure_file(Inode::new(cached_ino, 0));
+        cached_writer
+            .write_at_cached(0, &[2u8; 1024], 10)
+            .await
+            .unwrap();
+        cached_writer.flush().await.unwrap();
+
+        let mixed_ino = meta
+            .create_file(1, "tail_origin_mixed.txt".to_string())
+            .await
+            .unwrap();
+        let mixed_writer = writer.ensure_file(Inode::new(mixed_ino, 0));
+        mixed_writer
+            .write_at_cached(0, &[3u8; 1024], 20)
+            .await
+            .unwrap();
+        mixed_writer.write_at(1024, &[4u8; 1024]).await.unwrap();
+        mixed_writer.flush().await.unwrap();
+
+        let breakdown = writer.dirty_breakdown().await;
+        assert_eq!(breakdown.upload_partial_tail_ops, 3);
+        assert_eq!(breakdown.upload_partial_tail_normal_only_ops, 1);
+        assert_eq!(breakdown.upload_partial_tail_cached_only_ops, 1);
+        assert_eq!(breakdown.upload_partial_tail_mixed_origin_ops, 1);
+        assert_eq!(breakdown.upload_partial_tail_unknown_origin_ops, 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_auto_flush_age_partial_tail_is_attributed() {
         let layout = ChunkLayout {
@@ -4652,6 +4919,14 @@ mod tests {
                     assert_eq!(breakdown.upload_partial_tail_auto_buffer_high_ops, 0);
                     assert_eq!(breakdown.upload_partial_tail_auto_flush_duration_ops, 0);
                     assert_eq!(breakdown.upload_partial_tail_auto_unknown_ops, 0);
+                    assert_eq!(breakdown.upload_partial_tail_normal_only_ops, 1);
+                    assert_eq!(breakdown.upload_partial_tail_cached_only_ops, 0);
+                    assert_eq!(breakdown.upload_partial_tail_mixed_origin_ops, 0);
+                    assert_eq!(breakdown.upload_partial_tail_unknown_origin_ops, 0);
+                    assert_eq!(breakdown.upload_partial_tail_auto_normal_only_ops, 1);
+                    assert_eq!(breakdown.upload_partial_tail_auto_cached_only_ops, 0);
+                    assert_eq!(breakdown.upload_partial_tail_auto_mixed_origin_ops, 0);
+                    assert_eq!(breakdown.upload_partial_tail_auto_unknown_origin_ops, 0);
                     break;
                 }
                 sleep(Duration::from_millis(10)).await;

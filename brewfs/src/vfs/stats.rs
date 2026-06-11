@@ -76,6 +76,14 @@ pub struct FsStatsSnapshot {
     pub buf_read_bytes: u64,
     pub writeback_live_dirty_bytes: u64,
     pub writeback_live_slices: u64,
+    pub writeback_live_normal_only_bytes: u64,
+    pub writeback_live_normal_only_slices: u64,
+    pub writeback_live_cached_only_bytes: u64,
+    pub writeback_live_cached_only_slices: u64,
+    pub writeback_live_mixed_origin_bytes: u64,
+    pub writeback_live_mixed_origin_slices: u64,
+    pub writeback_live_unknown_origin_bytes: u64,
+    pub writeback_live_unknown_origin_slices: u64,
     pub writeback_recent_pending_upload_bytes: u64,
     pub writeback_recent_pending_upload_slices: u64,
     pub writeback_recent_uploaded_bytes: u64,
@@ -113,6 +121,10 @@ pub struct FsStatsSnapshot {
     pub writeback_upload_partial_tail_max_unflushed_ops: u64,
     pub writeback_upload_partial_tail_explicit_flush_ops: u64,
     pub writeback_upload_partial_tail_auto_ops: u64,
+    pub writeback_upload_partial_tail_normal_only_ops: u64,
+    pub writeback_upload_partial_tail_cached_only_ops: u64,
+    pub writeback_upload_partial_tail_mixed_origin_ops: u64,
+    pub writeback_upload_partial_tail_unknown_origin_ops: u64,
     pub writeback_upload_partial_tail_auto_age_ops: u64,
     pub writeback_upload_partial_tail_auto_idle_ops: u64,
     pub writeback_upload_partial_tail_auto_pressure_ops: u64,
@@ -120,6 +132,10 @@ pub struct FsStatsSnapshot {
     pub writeback_upload_partial_tail_auto_buffer_high_ops: u64,
     pub writeback_upload_partial_tail_auto_flush_duration_ops: u64,
     pub writeback_upload_partial_tail_auto_unknown_ops: u64,
+    pub writeback_upload_partial_tail_auto_normal_only_ops: u64,
+    pub writeback_upload_partial_tail_auto_cached_only_ops: u64,
+    pub writeback_upload_partial_tail_auto_mixed_origin_ops: u64,
+    pub writeback_upload_partial_tail_auto_unknown_origin_ops: u64,
     pub writeback_upload_partial_tail_commit_age_ops: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
@@ -320,6 +336,22 @@ pub struct FsStats {
     pub writeback_live_dirty_bytes: AtomicU64,
     /// Active writeback slices currently visible to overlay/commit.
     pub writeback_live_slices: AtomicU64,
+    /// Active writeback bytes in slices written only through the ordinary write path.
+    pub writeback_live_normal_only_bytes: AtomicU64,
+    /// Active writeback slices written only through the ordinary write path.
+    pub writeback_live_normal_only_slices: AtomicU64,
+    /// Active writeback bytes in slices written only through the cached writeback path.
+    pub writeback_live_cached_only_bytes: AtomicU64,
+    /// Active writeback slices written only through the cached writeback path.
+    pub writeback_live_cached_only_slices: AtomicU64,
+    /// Active writeback bytes in slices that received both ordinary and cached writes.
+    pub writeback_live_mixed_origin_bytes: AtomicU64,
+    /// Active writeback slices that received both ordinary and cached writes.
+    pub writeback_live_mixed_origin_slices: AtomicU64,
+    /// Active writeback bytes in slices whose write origin is unknown.
+    pub writeback_live_unknown_origin_bytes: AtomicU64,
+    /// Active writeback slices whose write origin is unknown.
+    pub writeback_live_unknown_origin_slices: AtomicU64,
     /// Recently committed bytes still waiting for S3 upload completion.
     pub writeback_recent_pending_upload_bytes: AtomicU64,
     /// Recently committed slices still waiting for S3 upload completion.
@@ -394,6 +426,14 @@ pub struct FsStats {
     pub writeback_upload_partial_tail_explicit_flush_ops: AtomicU64,
     /// Partial-tail upload batches from auto flush freezes.
     pub writeback_upload_partial_tail_auto_ops: AtomicU64,
+    /// Partial-tail upload batches from ordinary-write-only slices.
+    pub writeback_upload_partial_tail_normal_only_ops: AtomicU64,
+    /// Partial-tail upload batches from cached-writeback-only slices.
+    pub writeback_upload_partial_tail_cached_only_ops: AtomicU64,
+    /// Partial-tail upload batches from slices that mixed ordinary and cached writes.
+    pub writeback_upload_partial_tail_mixed_origin_ops: AtomicU64,
+    /// Partial-tail upload batches from slices whose write origin is unknown.
+    pub writeback_upload_partial_tail_unknown_origin_ops: AtomicU64,
     /// Partial-tail auto upload batches caused by max-age auto flush.
     pub writeback_upload_partial_tail_auto_age_ops: AtomicU64,
     /// Partial-tail auto upload batches caused by idle auto flush.
@@ -408,6 +448,14 @@ pub struct FsStats {
     pub writeback_upload_partial_tail_auto_flush_duration_ops: AtomicU64,
     /// Partial-tail auto upload batches without trigger attribution.
     pub writeback_upload_partial_tail_auto_unknown_ops: AtomicU64,
+    /// Auto partial-tail upload batches from ordinary-write-only slices.
+    pub writeback_upload_partial_tail_auto_normal_only_ops: AtomicU64,
+    /// Auto partial-tail upload batches from cached-writeback-only slices.
+    pub writeback_upload_partial_tail_auto_cached_only_ops: AtomicU64,
+    /// Auto partial-tail upload batches from slices that mixed ordinary and cached writes.
+    pub writeback_upload_partial_tail_auto_mixed_origin_ops: AtomicU64,
+    /// Auto partial-tail upload batches from slices whose write origin is unknown.
+    pub writeback_upload_partial_tail_auto_unknown_origin_ops: AtomicU64,
     /// Partial-tail upload batches from commit-age safety freezes.
     pub writeback_upload_partial_tail_commit_age_ops: AtomicU64,
     /// Block cache hit count
@@ -519,6 +567,14 @@ impl FsStats {
             buf_read_bytes: AtomicU64::new(0),
             writeback_live_dirty_bytes: AtomicU64::new(0),
             writeback_live_slices: AtomicU64::new(0),
+            writeback_live_normal_only_bytes: AtomicU64::new(0),
+            writeback_live_normal_only_slices: AtomicU64::new(0),
+            writeback_live_cached_only_bytes: AtomicU64::new(0),
+            writeback_live_cached_only_slices: AtomicU64::new(0),
+            writeback_live_mixed_origin_bytes: AtomicU64::new(0),
+            writeback_live_mixed_origin_slices: AtomicU64::new(0),
+            writeback_live_unknown_origin_bytes: AtomicU64::new(0),
+            writeback_live_unknown_origin_slices: AtomicU64::new(0),
             writeback_recent_pending_upload_bytes: AtomicU64::new(0),
             writeback_recent_pending_upload_slices: AtomicU64::new(0),
             writeback_recent_uploaded_bytes: AtomicU64::new(0),
@@ -556,6 +612,10 @@ impl FsStats {
             writeback_upload_partial_tail_max_unflushed_ops: AtomicU64::new(0),
             writeback_upload_partial_tail_explicit_flush_ops: AtomicU64::new(0),
             writeback_upload_partial_tail_auto_ops: AtomicU64::new(0),
+            writeback_upload_partial_tail_normal_only_ops: AtomicU64::new(0),
+            writeback_upload_partial_tail_cached_only_ops: AtomicU64::new(0),
+            writeback_upload_partial_tail_mixed_origin_ops: AtomicU64::new(0),
+            writeback_upload_partial_tail_unknown_origin_ops: AtomicU64::new(0),
             writeback_upload_partial_tail_auto_age_ops: AtomicU64::new(0),
             writeback_upload_partial_tail_auto_idle_ops: AtomicU64::new(0),
             writeback_upload_partial_tail_auto_pressure_ops: AtomicU64::new(0),
@@ -563,6 +623,10 @@ impl FsStats {
             writeback_upload_partial_tail_auto_buffer_high_ops: AtomicU64::new(0),
             writeback_upload_partial_tail_auto_flush_duration_ops: AtomicU64::new(0),
             writeback_upload_partial_tail_auto_unknown_ops: AtomicU64::new(0),
+            writeback_upload_partial_tail_auto_normal_only_ops: AtomicU64::new(0),
+            writeback_upload_partial_tail_auto_cached_only_ops: AtomicU64::new(0),
+            writeback_upload_partial_tail_auto_mixed_origin_ops: AtomicU64::new(0),
+            writeback_upload_partial_tail_auto_unknown_origin_ops: AtomicU64::new(0),
             writeback_upload_partial_tail_commit_age_ops: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
@@ -650,6 +714,16 @@ impl FsStats {
             buf_read_bytes: self.buf_read_bytes.load(ORD),
             writeback_live_dirty_bytes: self.writeback_live_dirty_bytes.load(ORD),
             writeback_live_slices: self.writeback_live_slices.load(ORD),
+            writeback_live_normal_only_bytes: self.writeback_live_normal_only_bytes.load(ORD),
+            writeback_live_normal_only_slices: self.writeback_live_normal_only_slices.load(ORD),
+            writeback_live_cached_only_bytes: self.writeback_live_cached_only_bytes.load(ORD),
+            writeback_live_cached_only_slices: self.writeback_live_cached_only_slices.load(ORD),
+            writeback_live_mixed_origin_bytes: self.writeback_live_mixed_origin_bytes.load(ORD),
+            writeback_live_mixed_origin_slices: self.writeback_live_mixed_origin_slices.load(ORD),
+            writeback_live_unknown_origin_bytes: self.writeback_live_unknown_origin_bytes.load(ORD),
+            writeback_live_unknown_origin_slices: self
+                .writeback_live_unknown_origin_slices
+                .load(ORD),
             writeback_recent_pending_upload_bytes: self
                 .writeback_recent_pending_upload_bytes
                 .load(ORD),
@@ -715,6 +789,18 @@ impl FsStats {
             writeback_upload_partial_tail_auto_ops: self
                 .writeback_upload_partial_tail_auto_ops
                 .load(ORD),
+            writeback_upload_partial_tail_normal_only_ops: self
+                .writeback_upload_partial_tail_normal_only_ops
+                .load(ORD),
+            writeback_upload_partial_tail_cached_only_ops: self
+                .writeback_upload_partial_tail_cached_only_ops
+                .load(ORD),
+            writeback_upload_partial_tail_mixed_origin_ops: self
+                .writeback_upload_partial_tail_mixed_origin_ops
+                .load(ORD),
+            writeback_upload_partial_tail_unknown_origin_ops: self
+                .writeback_upload_partial_tail_unknown_origin_ops
+                .load(ORD),
             writeback_upload_partial_tail_auto_age_ops: self
                 .writeback_upload_partial_tail_auto_age_ops
                 .load(ORD),
@@ -735,6 +821,18 @@ impl FsStats {
                 .load(ORD),
             writeback_upload_partial_tail_auto_unknown_ops: self
                 .writeback_upload_partial_tail_auto_unknown_ops
+                .load(ORD),
+            writeback_upload_partial_tail_auto_normal_only_ops: self
+                .writeback_upload_partial_tail_auto_normal_only_ops
+                .load(ORD),
+            writeback_upload_partial_tail_auto_cached_only_ops: self
+                .writeback_upload_partial_tail_auto_cached_only_ops
+                .load(ORD),
+            writeback_upload_partial_tail_auto_mixed_origin_ops: self
+                .writeback_upload_partial_tail_auto_mixed_origin_ops
+                .load(ORD),
+            writeback_upload_partial_tail_auto_unknown_origin_ops: self
+                .writeback_upload_partial_tail_auto_unknown_origin_ops
                 .load(ORD),
             writeback_upload_partial_tail_commit_age_ops: self
                 .writeback_upload_partial_tail_commit_age_ops
@@ -794,6 +892,36 @@ impl FsStats {
             .store(recent_uploaded_bytes, ORD);
         self.writeback_recent_uploaded_slices
             .store(recent_uploaded_slices, ORD);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_writeback_live_origin_metrics(
+        &self,
+        normal_only_bytes: u64,
+        normal_only_slices: u64,
+        cached_only_bytes: u64,
+        cached_only_slices: u64,
+        mixed_origin_bytes: u64,
+        mixed_origin_slices: u64,
+        unknown_origin_bytes: u64,
+        unknown_origin_slices: u64,
+    ) {
+        self.writeback_live_normal_only_bytes
+            .store(normal_only_bytes, ORD);
+        self.writeback_live_normal_only_slices
+            .store(normal_only_slices, ORD);
+        self.writeback_live_cached_only_bytes
+            .store(cached_only_bytes, ORD);
+        self.writeback_live_cached_only_slices
+            .store(cached_only_slices, ORD);
+        self.writeback_live_mixed_origin_bytes
+            .store(mixed_origin_bytes, ORD);
+        self.writeback_live_mixed_origin_slices
+            .store(mixed_origin_slices, ORD);
+        self.writeback_live_unknown_origin_bytes
+            .store(unknown_origin_bytes, ORD);
+        self.writeback_live_unknown_origin_slices
+            .store(unknown_origin_slices, ORD);
     }
 
     pub fn add_writeback_backpressure_soft_sleep(&self, duration: Duration) {
@@ -944,6 +1072,36 @@ impl FsStats {
             .store(partial_tail_auto_unknown_ops, ORD);
         self.writeback_upload_partial_tail_commit_age_ops
             .store(partial_tail_commit_age_ops, ORD);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_writeback_upload_origin_metrics(
+        &self,
+        partial_tail_normal_only_ops: u64,
+        partial_tail_cached_only_ops: u64,
+        partial_tail_mixed_origin_ops: u64,
+        partial_tail_unknown_origin_ops: u64,
+        partial_tail_auto_normal_only_ops: u64,
+        partial_tail_auto_cached_only_ops: u64,
+        partial_tail_auto_mixed_origin_ops: u64,
+        partial_tail_auto_unknown_origin_ops: u64,
+    ) {
+        self.writeback_upload_partial_tail_normal_only_ops
+            .store(partial_tail_normal_only_ops, ORD);
+        self.writeback_upload_partial_tail_cached_only_ops
+            .store(partial_tail_cached_only_ops, ORD);
+        self.writeback_upload_partial_tail_mixed_origin_ops
+            .store(partial_tail_mixed_origin_ops, ORD);
+        self.writeback_upload_partial_tail_unknown_origin_ops
+            .store(partial_tail_unknown_origin_ops, ORD);
+        self.writeback_upload_partial_tail_auto_normal_only_ops
+            .store(partial_tail_auto_normal_only_ops, ORD);
+        self.writeback_upload_partial_tail_auto_cached_only_ops
+            .store(partial_tail_auto_cached_only_ops, ORD);
+        self.writeback_upload_partial_tail_auto_mixed_origin_ops
+            .store(partial_tail_auto_mixed_origin_ops, ORD);
+        self.writeback_upload_partial_tail_auto_unknown_origin_ops
+            .store(partial_tail_auto_unknown_origin_ops, ORD);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1316,6 +1474,38 @@ impl FsStats {
             snapshot.writeback_live_slices
         ));
         out.push_str(&format!(
+            "brewfs_writeback_live_normal_only_bytes {}\n",
+            snapshot.writeback_live_normal_only_bytes
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_live_normal_only_slices {}\n",
+            snapshot.writeback_live_normal_only_slices
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_live_cached_only_bytes {}\n",
+            snapshot.writeback_live_cached_only_bytes
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_live_cached_only_slices {}\n",
+            snapshot.writeback_live_cached_only_slices
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_live_mixed_origin_bytes {}\n",
+            snapshot.writeback_live_mixed_origin_bytes
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_live_mixed_origin_slices {}\n",
+            snapshot.writeback_live_mixed_origin_slices
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_live_unknown_origin_bytes {}\n",
+            snapshot.writeback_live_unknown_origin_bytes
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_live_unknown_origin_slices {}\n",
+            snapshot.writeback_live_unknown_origin_slices
+        ));
+        out.push_str(&format!(
             "brewfs_writeback_recent_pending_upload_bytes {}\n",
             snapshot.writeback_recent_pending_upload_bytes
         ));
@@ -1464,6 +1654,22 @@ impl FsStats {
             snapshot.writeback_upload_partial_tail_auto_ops
         ));
         out.push_str(&format!(
+            "brewfs_writeback_upload_partial_tail_normal_only_ops_total {}\n",
+            snapshot.writeback_upload_partial_tail_normal_only_ops
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_upload_partial_tail_cached_only_ops_total {}\n",
+            snapshot.writeback_upload_partial_tail_cached_only_ops
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_upload_partial_tail_mixed_origin_ops_total {}\n",
+            snapshot.writeback_upload_partial_tail_mixed_origin_ops
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_upload_partial_tail_unknown_origin_ops_total {}\n",
+            snapshot.writeback_upload_partial_tail_unknown_origin_ops
+        ));
+        out.push_str(&format!(
             "brewfs_writeback_upload_partial_tail_auto_age_ops_total {}\n",
             snapshot.writeback_upload_partial_tail_auto_age_ops
         ));
@@ -1490,6 +1696,22 @@ impl FsStats {
         out.push_str(&format!(
             "brewfs_writeback_upload_partial_tail_auto_unknown_ops_total {}\n",
             snapshot.writeback_upload_partial_tail_auto_unknown_ops
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_upload_partial_tail_auto_normal_only_ops_total {}\n",
+            snapshot.writeback_upload_partial_tail_auto_normal_only_ops
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_upload_partial_tail_auto_cached_only_ops_total {}\n",
+            snapshot.writeback_upload_partial_tail_auto_cached_only_ops
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_upload_partial_tail_auto_mixed_origin_ops_total {}\n",
+            snapshot.writeback_upload_partial_tail_auto_mixed_origin_ops
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_upload_partial_tail_auto_unknown_origin_ops_total {}\n",
+            snapshot.writeback_upload_partial_tail_auto_unknown_origin_ops
         ));
         out.push_str(&format!(
             "brewfs_writeback_upload_partial_tail_commit_age_ops_total {}\n",
@@ -1708,6 +1930,7 @@ mod tests {
         stats.sync_cache_counters(8, 2);
         stats.sync_buffer_bytes(4096, 8192);
         stats.sync_writeback_dirty_breakdown(1024, 2, 2048, 3, 512, 4);
+        stats.sync_writeback_live_origin_metrics(128, 1, 256, 2, 512, 3, 1024, 4);
         stats.add_writeback_backpressure_soft_sleep(Duration::from_micros(12));
         stats.add_writeback_backpressure_hard_wait(Duration::from_micros(34));
         stats.sync_writeback_phase_metrics(1, 2, 3, 4, 5, 6, 7);
@@ -1716,6 +1939,7 @@ mod tests {
         stats.sync_writeback_upload_batch_metrics(
             17, 32768, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
         );
+        stats.sync_writeback_upload_origin_metrics(32, 33, 34, 35, 36, 37, 38, 39);
 
         let output = stats.render();
         assert!(output.contains("brewfs_fuse_read_ops_total 42"));
@@ -1754,6 +1978,14 @@ mod tests {
         assert!(output.contains("brewfs_writeback_dirty_bytes 4096"));
         assert!(output.contains("brewfs_writeback_live_dirty_bytes 1024"));
         assert!(output.contains("brewfs_writeback_live_slices 2"));
+        assert!(output.contains("brewfs_writeback_live_normal_only_bytes 128"));
+        assert!(output.contains("brewfs_writeback_live_normal_only_slices 1"));
+        assert!(output.contains("brewfs_writeback_live_cached_only_bytes 256"));
+        assert!(output.contains("brewfs_writeback_live_cached_only_slices 2"));
+        assert!(output.contains("brewfs_writeback_live_mixed_origin_bytes 512"));
+        assert!(output.contains("brewfs_writeback_live_mixed_origin_slices 3"));
+        assert!(output.contains("brewfs_writeback_live_unknown_origin_bytes 1024"));
+        assert!(output.contains("brewfs_writeback_live_unknown_origin_slices 4"));
         assert!(output.contains("brewfs_writeback_recent_pending_upload_bytes 2048"));
         assert!(output.contains("brewfs_writeback_recent_pending_upload_slices 3"));
         assert!(output.contains("brewfs_writeback_recent_uploaded_bytes 512"));
@@ -1793,6 +2025,12 @@ mod tests {
             output.contains("brewfs_writeback_upload_partial_tail_explicit_flush_ops_total 22")
         );
         assert!(output.contains("brewfs_writeback_upload_partial_tail_auto_ops_total 23"));
+        assert!(output.contains("brewfs_writeback_upload_partial_tail_normal_only_ops_total 32"));
+        assert!(output.contains("brewfs_writeback_upload_partial_tail_cached_only_ops_total 33"));
+        assert!(output.contains("brewfs_writeback_upload_partial_tail_mixed_origin_ops_total 34"));
+        assert!(
+            output.contains("brewfs_writeback_upload_partial_tail_unknown_origin_ops_total 35")
+        );
         assert!(output.contains("brewfs_writeback_upload_partial_tail_auto_age_ops_total 24"));
         assert!(output.contains("brewfs_writeback_upload_partial_tail_auto_idle_ops_total 25"));
         assert!(output.contains("brewfs_writeback_upload_partial_tail_auto_pressure_ops_total 26"));
@@ -1805,6 +2043,19 @@ mod tests {
                 .contains("brewfs_writeback_upload_partial_tail_auto_flush_duration_ops_total 29")
         );
         assert!(output.contains("brewfs_writeback_upload_partial_tail_auto_unknown_ops_total 30"));
+        assert!(
+            output.contains("brewfs_writeback_upload_partial_tail_auto_normal_only_ops_total 36")
+        );
+        assert!(
+            output.contains("brewfs_writeback_upload_partial_tail_auto_cached_only_ops_total 37")
+        );
+        assert!(
+            output.contains("brewfs_writeback_upload_partial_tail_auto_mixed_origin_ops_total 38")
+        );
+        assert!(
+            output
+                .contains("brewfs_writeback_upload_partial_tail_auto_unknown_origin_ops_total 39")
+        );
         assert!(output.contains("brewfs_writeback_upload_partial_tail_commit_age_ops_total 31"));
         assert!(output.contains("brewfs_reader_buffer_bytes 8192"));
         assert!(output.contains("brewfs_vfs_create_total_ops_total 0"));
@@ -1828,6 +2079,7 @@ mod tests {
         stats.fuse_write_lat_us.store(1000, ORD);
         stats.sync_cache_counters(3, 1);
         stats.sync_writeback_dirty_breakdown(11, 2, 22, 3, 33, 4);
+        stats.sync_writeback_live_origin_metrics(55, 6, 66, 7, 77, 8, 88, 9);
         stats.add_writeback_backpressure_soft_sleep(Duration::from_micros(44));
         stats.add_writeback_backpressure_hard_wait(Duration::from_micros(55));
         stats.sync_writeback_backpressure_metrics(66, 77, 88, 99);
@@ -1837,6 +2089,7 @@ mod tests {
         stats.sync_writeback_upload_batch_metrics(
             11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
         );
+        stats.sync_writeback_upload_origin_metrics(27, 28, 29, 30, 31, 32, 33, 34);
         stats.sync_object_store_metrics(2, 8192, 50, 1, 4096, 25, 75, 125, 3);
 
         let snapshot = stats.snapshot();
@@ -1854,6 +2107,14 @@ mod tests {
         assert_eq!(snapshot.s3_del_ops, 3);
         assert_eq!(snapshot.writeback_live_dirty_bytes, 11);
         assert_eq!(snapshot.writeback_live_slices, 2);
+        assert_eq!(snapshot.writeback_live_normal_only_bytes, 55);
+        assert_eq!(snapshot.writeback_live_normal_only_slices, 6);
+        assert_eq!(snapshot.writeback_live_cached_only_bytes, 66);
+        assert_eq!(snapshot.writeback_live_cached_only_slices, 7);
+        assert_eq!(snapshot.writeback_live_mixed_origin_bytes, 77);
+        assert_eq!(snapshot.writeback_live_mixed_origin_slices, 8);
+        assert_eq!(snapshot.writeback_live_unknown_origin_bytes, 88);
+        assert_eq!(snapshot.writeback_live_unknown_origin_slices, 9);
         assert_eq!(snapshot.writeback_recent_pending_upload_bytes, 22);
         assert_eq!(snapshot.writeback_recent_pending_upload_slices, 3);
         assert_eq!(snapshot.writeback_recent_uploaded_bytes, 33);
@@ -1894,6 +2155,13 @@ mod tests {
             17
         );
         assert_eq!(snapshot.writeback_upload_partial_tail_auto_ops, 18);
+        assert_eq!(snapshot.writeback_upload_partial_tail_normal_only_ops, 27);
+        assert_eq!(snapshot.writeback_upload_partial_tail_cached_only_ops, 28);
+        assert_eq!(snapshot.writeback_upload_partial_tail_mixed_origin_ops, 29);
+        assert_eq!(
+            snapshot.writeback_upload_partial_tail_unknown_origin_ops,
+            30
+        );
         assert_eq!(snapshot.writeback_upload_partial_tail_auto_age_ops, 19);
         assert_eq!(snapshot.writeback_upload_partial_tail_auto_idle_ops, 20);
         assert_eq!(snapshot.writeback_upload_partial_tail_auto_pressure_ops, 21);
@@ -1907,6 +2175,22 @@ mod tests {
             24
         );
         assert_eq!(snapshot.writeback_upload_partial_tail_auto_unknown_ops, 25);
+        assert_eq!(
+            snapshot.writeback_upload_partial_tail_auto_normal_only_ops,
+            31
+        );
+        assert_eq!(
+            snapshot.writeback_upload_partial_tail_auto_cached_only_ops,
+            32
+        );
+        assert_eq!(
+            snapshot.writeback_upload_partial_tail_auto_mixed_origin_ops,
+            33
+        );
+        assert_eq!(
+            snapshot.writeback_upload_partial_tail_auto_unknown_origin_ops,
+            34
+        );
         assert_eq!(snapshot.writeback_upload_partial_tail_commit_age_ops, 26);
     }
 
