@@ -48,7 +48,12 @@ import {
 import { formatAclDraft, parseAclDraft } from './aclDraft';
 import { loadAclView, type AclViewResult } from './aclView';
 import { formatMode, joinBrowserPath, normalizeBrowserPath, parentBrowserPath } from './browserPath';
-import { loadCsiDashboard, type CsiDashboardFilters, type CsiDashboardResult } from './csiDashboard';
+import {
+  formatCsiItemCount,
+  loadCsiDashboard,
+  type CsiDashboardFilters,
+  type CsiDashboardResult,
+} from './csiDashboard';
 import { loadInstanceDetails } from './instanceDetails';
 import { buildMountCommand } from './mountCommand';
 import { loadTrashView, type TrashViewResult } from './trashView';
@@ -1650,7 +1655,7 @@ function CsiDashboardPage({
                   <div className="resource-heading">
                     <h3>{resource.title}</h3>
                     <span>
-                      {resource.state} · {formatItemCount(resource.count)}
+                      {resource.state} · {formatCsiItemCount(resource.count)}
                     </span>
                   </div>
                   <p className="muted feature-message">{resource.message}</p>
@@ -1686,11 +1691,6 @@ function CsiDashboardPage({
       ) : null}
     </article>
   );
-}
-
-function formatItemCount(count: number | null): string {
-  if (count === null) return '- items';
-  return count === 1 ? '1 item' : `${count} items`;
 }
 
 function SettingsPage({

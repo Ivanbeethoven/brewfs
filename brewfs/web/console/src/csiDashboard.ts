@@ -50,6 +50,11 @@ export interface CsiDashboardResult {
   resources: CsiResourceStatus[];
 }
 
+export function formatCsiItemCount(count: number | null): string {
+  if (count === null) return 'items unavailable';
+  return count === 1 ? '1 item' : `${count} items`;
+}
+
 type CsiResourceDescriptor = {
   key: CsiResourceKey;
   title: string;

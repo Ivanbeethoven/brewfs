@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { loadCsiDashboard } from './csiDashboard';
+import { formatCsiItemCount, loadCsiDashboard } from './csiDashboard';
 
 describe('loadCsiDashboard', () => {
   afterEach(() => {
@@ -193,5 +193,13 @@ describe('loadCsiDashboard', () => {
     expect(result.state).toBe('ready');
     expect(result.resources).toHaveLength(4);
     expect(result.resources.every((resource) => resource.state === 'unsupported')).toBe(true);
+  });
+});
+
+describe('formatCsiItemCount', () => {
+  it('labels unavailable counts without implying a numeric item total', () => {
+    expect(formatCsiItemCount(null)).toBe('items unavailable');
+    expect(formatCsiItemCount(1)).toBe('1 item');
+    expect(formatCsiItemCount(2)).toBe('2 items');
   });
 });
