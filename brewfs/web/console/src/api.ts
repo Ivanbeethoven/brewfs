@@ -97,6 +97,22 @@ export interface FileListResponse {
   entries: FileEntryResponse[];
 }
 
+export interface FileStatResponse {
+  path: string;
+  inode: number;
+  kind: string;
+  size: number;
+  mode: number;
+  uid: number;
+  gid: number;
+  mtime: string;
+}
+
+export interface ReadLinkResponse {
+  path: string;
+  target: string;
+}
+
 export interface TrashResponse {
   entries: unknown[];
 }
@@ -285,6 +301,40 @@ export async function fetchFileList(
   assertOk(response, 'file list request failed');
 
   return (await response.json()) as FileListResponse;
+}
+
+export async function fetchFileStat(
+  volumeId: string,
+  path: string,
+  token?: string | null,
+): Promise<FileStatResponse> {
+  const response = await fetch(
+    `/api/volumes/${encodeURIComponent(volumeId)}/files/stat?${pathSearch(path)}`,
+    {
+      headers: apiHeaders(token),
+    },
+  );
+
+  assertOk(response, 'file stat request failed');
+
+  return (await response.json()) as FileStatResponse;
+}
+
+export async function fetchReadLink(
+  volumeId: string,
+  path: string,
+  token?: string | null,
+): Promise<ReadLinkResponse> {
+  const response = await fetch(
+    `/api/volumes/${encodeURIComponent(volumeId)}/files/readlink?${pathSearch(path)}`,
+    {
+      headers: apiHeaders(token),
+    },
+  );
+
+  assertOk(response, 'readlink request failed');
+
+  return (await response.json()) as ReadLinkResponse;
 }
 
 export async function fetchTrash(

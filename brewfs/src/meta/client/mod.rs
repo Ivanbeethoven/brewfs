@@ -5,7 +5,7 @@ pub mod session;
 use crate::chunk::SliceDesc;
 use crate::control::job::{GcJobResult, JobManager};
 use crate::control::protocol::{
-    ControlDirectoryEntry, ControlFileKind, ControlRequest, ControlResponse,
+    ControlDirectoryEntry, ControlFileKind, ControlPathMetadata, ControlRequest, ControlResponse,
 };
 use crate::control::runtime::{InstanceRecord, RuntimeRegistry};
 use crate::control::server::{ControlHandler, ControlServer};
@@ -505,6 +505,42 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         ControlResponse::DirectoryListing {
             path,
             entries: response_entries,
+        }
+    }
+
+    async fn stat_path_for_control(&self, path: &str) -> ControlResponse {
+        let path = match Self::normalize_control_path(path) {
+            Ok(path) => path,
+            Err(err) => return control_meta_error(err),
+        };
+        let metadata = match self.lookup_path_with_attr(&path).await {
+            Ok(Some((_, attr))) => ControlPathMetadata::from(attr),
+            Ok(None) => return control_meta_error(MetaError::NotFound(self.root())),
+            Err(err) => return control_meta_error(err),
+        };
+
+        ControlResponse::PathMetadata { path, metadata }
+    }
+
+    async fn readlink_for_control(&self, path: &str) -> ControlResponse {
+        let path = match Self::normalize_control_path(path) {
+            Ok(path) => path,
+            Err(err) => return control_meta_error(err),
+        };
+        let (ino, attr) = match self.lookup_path_with_attr(&path).await {
+            Ok(Some(result)) => result,
+            Ok(None) => return control_meta_error(MetaError::NotFound(self.root())),
+            Err(err) => return control_meta_error(err),
+        };
+        if attr.kind != FileType::Symlink {
+            return control_meta_error(MetaError::InvalidPath(format!(
+                "path is not a symlink: {path}"
+            )));
+        }
+
+        match self.read_symlink(ino).await {
+            Ok(target) => ControlResponse::SymlinkTarget { path, target },
+            Err(err) => control_meta_error(err),
         }
     }
 
@@ -1471,6 +1507,8 @@ impl<T: MetaStore + ?Sized + 'static> ControlHandler for Arc<MetaClient<T>> {
                 },
             },
             ControlRequest::ListDirectory { path } => self.list_directory_for_control(&path).await,
+            ControlRequest::StatPath { path } => self.stat_path_for_control(&path).await,
+            ControlRequest::ReadLink { path } => self.readlink_for_control(&path).await,
         }
     }
 }
@@ -3074,6 +3112,72 @@ mod tests {
                 );
             }
             other => panic!("unexpected directory listing response: {other:?}"),
+        }
+
+        client.shutdown_runtime().await;
+    }
+
+    #[tokio::test]
+    async fn test_control_plane_stats_paths_and_reads_symlinks() {
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let options = MetaClientOptions {
+            mount_point: Some("/mnt/stat".to_string()),
+            control_runtime_dir: Some(runtime_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let client = create_test_client_with_options(options).await;
+        let docs_ino = client.mkdir(1, "docs".to_string()).await.unwrap();
+        let readme_ino = client
+            .create_file(docs_ino, "readme.md".to_string())
+            .await
+            .unwrap();
+        client
+            .symlink(1, "latest", "/docs/readme.md")
+            .await
+            .unwrap();
+        client.start_control_plane().await.unwrap();
+
+        let registry =
+            crate::control::runtime::RuntimeRegistry::new(runtime_dir.path().to_path_buf());
+        let record = registry.select_instance(Some("/mnt/stat")).await.unwrap();
+
+        let metadata = crate::control::client::send_request(
+            &record.socket_path,
+            &crate::control::protocol::ControlRequest::StatPath {
+                path: "/docs/readme.md".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        match metadata {
+            crate::control::protocol::ControlResponse::PathMetadata { path, metadata } => {
+                assert_eq!(path, "/docs/readme.md");
+                assert_eq!(metadata.inode, readme_ino);
+                assert_eq!(
+                    metadata.kind,
+                    crate::control::protocol::ControlFileKind::File
+                );
+            }
+            other => panic!("unexpected path metadata response: {other:?}"),
+        }
+
+        let target = crate::control::client::send_request(
+            &record.socket_path,
+            &crate::control::protocol::ControlRequest::ReadLink {
+                path: "/latest".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        match target {
+            crate::control::protocol::ControlResponse::SymlinkTarget { path, target } => {
+                assert_eq!(path, "/latest");
+                assert_eq!(target, "/docs/readme.md");
+            }
+            other => panic!("unexpected symlink target response: {other:?}"),
         }
 
         client.shutdown_runtime().await;

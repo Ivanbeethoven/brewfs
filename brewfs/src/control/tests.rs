@@ -43,6 +43,50 @@ fn protocol_roundtrip_preserves_directory_listing_request() {
     assert_eq!(decoded, response);
 }
 
+#[test]
+fn protocol_roundtrip_preserves_path_metadata_and_readlink_requests() {
+    let stat_req = ControlRequest::StatPath {
+        path: "/projects/readme.md".to_string(),
+    };
+    let raw = serde_json::to_vec(&stat_req).expect("serialize stat request");
+    let decoded: ControlRequest = serde_json::from_slice(&raw).expect("deserialize stat request");
+    assert_eq!(decoded, stat_req);
+
+    let readlink_req = ControlRequest::ReadLink {
+        path: "/latest".to_string(),
+    };
+    let raw = serde_json::to_vec(&readlink_req).expect("serialize readlink request");
+    let decoded: ControlRequest =
+        serde_json::from_slice(&raw).expect("deserialize readlink request");
+    assert_eq!(decoded, readlink_req);
+
+    let metadata = ControlResponse::PathMetadata {
+        path: "/projects/readme.md".to_string(),
+        metadata: super::protocol::ControlPathMetadata {
+            inode: 42,
+            kind: super::protocol::ControlFileKind::File,
+            size: 128,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            mtime_ns: 1_786_000_000_000_000_000,
+        },
+    };
+    let raw = serde_json::to_vec(&metadata).expect("serialize metadata response");
+    let decoded: ControlResponse =
+        serde_json::from_slice(&raw).expect("deserialize metadata response");
+    assert_eq!(decoded, metadata);
+
+    let target = ControlResponse::SymlinkTarget {
+        path: "/latest".to_string(),
+        target: "/projects/readme.md".to_string(),
+    };
+    let raw = serde_json::to_vec(&target).expect("serialize symlink response");
+    let decoded: ControlResponse =
+        serde_json::from_slice(&raw).expect("deserialize symlink response");
+    assert_eq!(decoded, target);
+}
+
 #[tokio::test]
 async fn runtime_registry_auto_selects_single_live_instance() {
     let dir = tempdir().expect("tempdir");

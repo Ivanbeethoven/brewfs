@@ -106,6 +106,24 @@ pub struct FileEntryResponse {
     pub mtime: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FileStatResponse {
+    pub path: String,
+    pub inode: i64,
+    pub kind: &'static str,
+    pub size: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReadLinkResponse {
+    pub path: String,
+    pub target: String,
+}
+
 impl From<InstanceRecord> for InstanceResponse {
     fn from(record: InstanceRecord) -> Self {
         Self {
@@ -361,15 +379,87 @@ pub async fn list_files(
             entries,
         } => {
             if response_path != path {
-                return Err(json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "control_plane_error",
-                    format!("control-plane path mismatch: requested {path}, got {response_path}"),
-                ));
+                return Err(path_mismatch_error(&path, &response_path));
             }
             Ok(Json(FileListResponse {
                 path: response_path,
                 entries: entries.into_iter().map(FileEntryResponse::from).collect(),
+            }))
+        }
+        ControlResponse::Error { code, message } => Err(control_error_response(&code, &message)),
+        other => Err(json_error(
+            StatusCode::BAD_GATEWAY,
+            "control_plane_error",
+            format!("unexpected control-plane response: {other:?}"),
+        )),
+    }
+}
+
+pub async fn stat_file(
+    State(state): State<ConsoleState>,
+    Path(volume_id): Path<String>,
+    Query(query): Query<PathQuery>,
+) -> Result<Json<FileStatResponse>, ApiErrorResponse> {
+    let path = normalize_absolute_path(query.path.as_deref().unwrap_or("/"))?;
+    let record = find_runtime_record_for_volume(&state, &volume_id).await?;
+    let response = send_control_request(
+        &record.socket_path,
+        &ControlRequest::StatPath { path: path.clone() },
+    )
+    .await?;
+
+    match response {
+        ControlResponse::PathMetadata {
+            path: response_path,
+            metadata,
+        } => {
+            if response_path != path {
+                return Err(path_mismatch_error(&path, &response_path));
+            }
+            Ok(Json(FileStatResponse {
+                path: response_path,
+                inode: metadata.inode,
+                kind: control_kind_name(metadata.kind),
+                size: metadata.size,
+                mode: metadata.mode,
+                uid: metadata.uid,
+                gid: metadata.gid,
+                mtime: format_timestamp_ns(metadata.mtime_ns),
+            }))
+        }
+        ControlResponse::Error { code, message } => Err(control_error_response(&code, &message)),
+        other => Err(json_error(
+            StatusCode::BAD_GATEWAY,
+            "control_plane_error",
+            format!("unexpected control-plane response: {other:?}"),
+        )),
+    }
+}
+
+pub async fn read_link(
+    State(state): State<ConsoleState>,
+    Path(volume_id): Path<String>,
+    Query(query): Query<PathQuery>,
+) -> Result<Json<ReadLinkResponse>, ApiErrorResponse> {
+    let path = normalize_absolute_path(query.path.as_deref().unwrap_or("/"))?;
+    let record = find_runtime_record_for_volume(&state, &volume_id).await?;
+    let response = send_control_request(
+        &record.socket_path,
+        &ControlRequest::ReadLink { path: path.clone() },
+    )
+    .await?;
+
+    match response {
+        ControlResponse::SymlinkTarget {
+            path: response_path,
+            target,
+        } => {
+            if response_path != path {
+                return Err(path_mismatch_error(&path, &response_path));
+            }
+            Ok(Json(ReadLinkResponse {
+                path: response_path,
+                target,
             }))
         }
         ControlResponse::Error { code, message } => Err(control_error_response(&code, &message)),
@@ -556,6 +646,14 @@ fn control_error_response(code: &str, message: &str) -> ApiErrorResponse {
             format!("{code}: {message}"),
         ),
     }
+}
+
+fn path_mismatch_error(requested_path: &str, response_path: &str) -> ApiErrorResponse {
+    json_error(
+        StatusCode::BAD_GATEWAY,
+        "control_plane_error",
+        format!("control-plane path mismatch: requested {requested_path}, got {response_path}"),
+    )
 }
 
 fn normalize_absolute_path(path: &str) -> Result<String, ApiErrorResponse> {

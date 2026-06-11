@@ -28,6 +28,8 @@ pub fn build_router(config: ConsoleConfig) -> Router {
                 .delete(api::delete_volume),
         )
         .route("/volumes/{volume_id}/files", get(api::list_files))
+        .route("/volumes/{volume_id}/files/stat", get(api::stat_file))
+        .route("/volumes/{volume_id}/files/readlink", get(api::read_link))
         .route("/volumes/{volume_id}/trash", get(api::list_trash))
         .route(
             "/volumes/{volume_id}/trash/{entry_id}/restore",
@@ -1018,6 +1020,120 @@ mod tests {
         assert_eq!(value["error"]["code"], "control_plane_error");
     }
 
+    #[tokio::test]
+    async fn file_stat_api_returns_metadata_from_live_control_plane() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\"></div>").unwrap();
+        let config = test_config(dir.path(), AuthConfig::Disabled);
+        let registry = crate::control::runtime::RuntimeRegistry::new(config.runtime_dir.clone());
+        let pid = std::process::id();
+        let socket_path = registry.socket_path(pid);
+        let _server =
+            crate::control::server::ControlServer::bind(socket_path.clone(), FileMetadataHandler)
+                .await
+                .unwrap();
+        let record = crate::control::runtime::InstanceRecord::new(
+            pid,
+            "/mnt/brewfs".to_string(),
+            socket_path,
+            chrono::Utc::now(),
+        );
+        registry.write_record(&record).await.unwrap();
+        let app = build_router(config);
+
+        let volume_id = create_live_browser_volume(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/volumes/{volume_id}/files/stat?path=/projects/readme.md"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["path"], "/projects/readme.md");
+        assert_eq!(value["kind"], "file");
+        assert_eq!(value["inode"], 42);
+        assert_eq!(value["size"], 128);
+        assert_eq!(value["mode"], 0o644);
+    }
+
+    #[tokio::test]
+    async fn file_readlink_api_returns_target_from_live_control_plane() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\"></div>").unwrap();
+        let config = test_config(dir.path(), AuthConfig::Disabled);
+        let registry = crate::control::runtime::RuntimeRegistry::new(config.runtime_dir.clone());
+        let pid = std::process::id();
+        let socket_path = registry.socket_path(pid);
+        let _server =
+            crate::control::server::ControlServer::bind(socket_path.clone(), FileMetadataHandler)
+                .await
+                .unwrap();
+        let record = crate::control::runtime::InstanceRecord::new(
+            pid,
+            "/mnt/brewfs".to_string(),
+            socket_path,
+            chrono::Utc::now(),
+        );
+        registry.write_record(&record).await.unwrap();
+        let app = build_router(config);
+
+        let volume_id = create_live_browser_volume(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/volumes/{volume_id}/files/readlink?path=/latest"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["path"], "/latest");
+        assert_eq!(value["target"], "/projects/readme.md");
+    }
+
+    async fn create_live_browser_volume(app: &Router) -> String {
+        let create_body = serde_json::json!({
+            "name": "dev-local",
+            "mount_config": {
+                "mount_point": "/mnt/brewfs",
+                "data_backend": "local-fs",
+                "meta_backend": "sqlx"
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/volumes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        created["id"].as_str().unwrap().to_string()
+    }
+
     struct GetInfoHandler;
 
     #[async_trait::async_trait]
@@ -1192,6 +1308,47 @@ mod tests {
                     crate::control::protocol::ControlResponse::DirectoryListing {
                         path: "/other".to_string(),
                         entries: Vec::new(),
+                    }
+                }
+                other => crate::control::protocol::ControlResponse::Error {
+                    code: "unexpected".to_string(),
+                    message: format!("unexpected request: {other:?}"),
+                },
+            }
+        }
+    }
+
+    struct FileMetadataHandler;
+
+    #[async_trait::async_trait]
+    impl crate::control::server::ControlHandler for FileMetadataHandler {
+        async fn handle(
+            &self,
+            request: crate::control::protocol::ControlRequest,
+        ) -> crate::control::protocol::ControlResponse {
+            match request {
+                crate::control::protocol::ControlRequest::StatPath { path }
+                    if path == "/projects/readme.md" =>
+                {
+                    crate::control::protocol::ControlResponse::PathMetadata {
+                        path,
+                        metadata: crate::control::protocol::ControlPathMetadata {
+                            inode: 42,
+                            kind: crate::control::protocol::ControlFileKind::File,
+                            size: 128,
+                            mode: 0o644,
+                            uid: 1000,
+                            gid: 1000,
+                            mtime_ns: 1_786_000_000_000_000_000,
+                        },
+                    }
+                }
+                crate::control::protocol::ControlRequest::ReadLink { path }
+                    if path == "/latest" =>
+                {
+                    crate::control::protocol::ControlResponse::SymlinkTarget {
+                        path,
+                        target: "/projects/readme.md".to_string(),
                     }
                 }
                 other => crate::control::protocol::ControlResponse::Error {

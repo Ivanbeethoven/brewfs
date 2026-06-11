@@ -8,10 +8,12 @@ import {
   fetchAcl,
   fetchCsiSummary,
   fetchFileList,
+  fetchFileStat,
   fetchHealth,
   fetchInstanceInfo,
   fetchInstances,
   fetchJobStatus,
+  fetchReadLink,
   fetchTrash,
   fetchVolume,
   fetchVolumes,
@@ -417,6 +419,59 @@ describe('unsupported feature API contracts', () => {
         Authorization: 'Bearer secret-token',
       },
     });
+  });
+
+  it('fetches file stat and readlink metadata', async () => {
+    const fetch = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            path: '/projects/readme.md',
+            inode: 42,
+            kind: 'file',
+            size: 128,
+            mode: 420,
+            uid: 1000,
+            gid: 1000,
+            mtime: '2026-06-11T00:00:00Z',
+          }),
+          {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            path: '/latest',
+            target: '/projects/readme.md',
+          }),
+          {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          },
+        ),
+      );
+
+    const stat = await fetchFileStat('vol-1', '/projects/readme.md', 'secret-token');
+    const link = await fetchReadLink('vol-1', '/latest', 'secret-token');
+
+    expect(fetch).toHaveBeenNthCalledWith(1, '/api/volumes/vol-1/files/stat?path=%2Fprojects%2Freadme.md', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer secret-token',
+      },
+    });
+    expect(fetch).toHaveBeenNthCalledWith(2, '/api/volumes/vol-1/files/readlink?path=%2Flatest', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer secret-token',
+      },
+    });
+    expect(stat.inode).toBe(42);
+    expect(link.target).toBe('/projects/readme.md');
   });
 
   it('throws ApiError for unsupported trash responses', async () => {

@@ -1,6 +1,5 @@
 use crate::control::job::{JobInfo, JobOutcome, JobState};
-use crate::meta::store::FileType;
-use crate::meta::store::MetaStoreCapabilities;
+use crate::meta::store::{FileAttr, FileType, MetaStoreCapabilities};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ControlRequest {
@@ -9,6 +8,8 @@ pub enum ControlRequest {
     RunGc { dry_run: bool },
     GetJob { job_id: String },
     ListDirectory { path: String },
+    StatPath { path: String },
+    ReadLink { path: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -35,6 +36,14 @@ pub enum ControlResponse {
         path: String,
         entries: Vec<ControlDirectoryEntry>,
     },
+    PathMetadata {
+        path: String,
+        metadata: ControlPathMetadata,
+    },
+    SymlinkTarget {
+        path: String,
+        target: String,
+    },
     Error {
         code: String,
         message: String,
@@ -44,6 +53,17 @@ pub enum ControlResponse {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ControlDirectoryEntry {
     pub name: String,
+    pub inode: i64,
+    pub kind: ControlFileKind,
+    pub size: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime_ns: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ControlPathMetadata {
     pub inode: i64,
     pub kind: ControlFileKind,
     pub size: u64,
@@ -67,6 +87,20 @@ impl From<FileType> for ControlFileKind {
             FileType::File => Self::File,
             FileType::Dir => Self::Directory,
             FileType::Symlink => Self::Symlink,
+        }
+    }
+}
+
+impl From<FileAttr> for ControlPathMetadata {
+    fn from(attr: FileAttr) -> Self {
+        Self {
+            inode: attr.ino,
+            kind: ControlFileKind::from(attr.kind),
+            size: attr.size,
+            mode: attr.mode,
+            uid: attr.uid,
+            gid: attr.gid,
+            mtime_ns: attr.mtime,
         }
     }
 }
