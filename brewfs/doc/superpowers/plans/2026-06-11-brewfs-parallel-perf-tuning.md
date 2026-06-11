@@ -318,6 +318,118 @@ Decision: rejected; do not merge as a performance change.
 
 Reason: the candidate shifts cost out of some foreground paths but increases buffered `randrw` wall time, object count, and soft backpressure. It also exceeds the drain regression gate for `seqwrite-direct0` and `randrw-direct1`, and regresses `seqwrite-direct1` throughput and p99.9. This confirms that delaying dispatch of still-writable full blocks is not the right default direction. The next candidate should target JuiceFS-style staged upload queueing or object-count reduction, not later dispatch of already full blocks.
 
+### Attempt 5: FileReader Direct Output Buffer
+
+Candidate: change `FileReader::read_at` to fill the final output buffer directly through `DataFetcher::read_at_into`, avoiding per-span `Bytes` allocation and final concatenation.
+Branch: `codex/perf-tune-integration`
+Commit: none; reverted after smoke.
+Perf artifact baseline: `brewfs/docker/compose-xfstests/artifacts/perf-run-1781179262-25151`
+Perf artifact candidate: `brewfs/docker/compose-xfstests/artifacts/perf-run-1781181822-17005`
+
+Validation before perf:
+
+```bash
+CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/mnt/slayerfs/brewfs/target cargo test -p brewfs vfs::io::reader --lib
+CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/mnt/slayerfs/brewfs/target cargo test -p brewfs chunk::reader --lib
+cargo fmt -p brewfs --check
+git diff --check
+```
+
+Perf smoke command:
+
+```bash
+PERF_FIO_DIRECT_MATRIX="0 1" \
+PERF_FIO_SEQREAD_RUNTIME=15 \
+PERF_FIO_RANDRW_RUNTIME=15 \
+PERF_FIO_POST_WRITE_DRAIN=true \
+PERF_FIO_POST_WRITE_DRAIN_TIMEOUT_SECS=600 \
+PERF_FIO_PREFILL_DRAIN_TIMEOUT_SECS=600 \
+BREWFS_COMPRESSION=none \
+BREWFS_PREFETCH_ENABLED=true \
+BREWFS_UPLOAD_CONCURRENCY=32 \
+CARGO_PROFILE_RELEASE_DEBUG=0 \
+bash brewfs/docker/compose-xfstests/run_redis_perf.sh \
+  --writeback-throughput-profile \
+  --tools "fio-seqread fio-randrw"
+```
+
+Key result:
+
+| Tool | Metric | Baseline | Candidate | Delta |
+| --- | --- | ---: | ---: | ---: |
+| `fio-seqread-direct0` | read BW MiB/s | 1506.57 | 1749.75 | +16.1% |
+| `fio-seqread-direct1` | read BW MiB/s | 3125.39 | 3887.47 | +24.4% |
+| `fio-randrw-direct0` | tool wall seconds | 71 | 49 | -31.0% |
+| `fio-randrw-direct0` | read BW MiB/s | 743.14 | 631.57 | -15.0% |
+| `fio-randrw-direct0` | write BW MiB/s | 336.90 | 290.06 | -13.9% |
+| `fio-randrw-direct0` | write p99 ms | 6.32 | 96.99 | +1433.7% |
+| `fio-randrw-direct0` | write p99.9 ms | 11.86 | 1770.00 | +14821.5% |
+| `fio-randrw-direct0` | GET ops/GiB read | 307.90 | 153.77 | -50.1% |
+| `fio-randrw-direct1` | read/write BW MiB/s | 156.17 / 72.02 | 173.96 / 80.68 | +11.4% / +12.0% |
+| `fio-randrw-direct1` | post-write drain seconds | 44 | 48 | +9.1% |
+
+Decision: rejected; code reverted.
+
+Reason: the refactor substantially improves sequential read and reduces GET amplification, but it violates the mixed workload hard gate: `fio-randrw-direct0` active read/write throughput regressed by more than 5%, and write p99/p99.9 regressed catastrophically. The lower wall time and lower GET count are not enough to accept a change that makes buffered mixed writes unpredictable. A future read-path optimization needs repeated samples and a design that does not worsen write tail under FUSE writeback-cache.
+
+### Attempt 6: Max Unflushed Slices 16
+
+Candidate: expose `MAX_UNFLUSHED_SLICES` as `BREWFS_MAX_UNFLUSHED_SLICES`, keep the default at `3`, and run the writeback smoke with `BREWFS_MAX_UNFLUSHED_SLICES=16`.
+Branch: `codex/perf-tune-integration`
+Commit: none; code reverted after smoke.
+Perf artifact baseline: `brewfs/docker/compose-xfstests/artifacts/perf-run-1781179262-25151`
+Perf artifact candidate: `brewfs/docker/compose-xfstests/artifacts/perf-run-1781182550-30708`
+
+Validation before perf:
+
+```bash
+CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/mnt/slayerfs/brewfs/target cargo test -p brewfs write_config_defaults_and_sets_max_unflushed_slices --lib
+CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/mnt/slayerfs/brewfs/target cargo test -p brewfs vfs::io::writer --lib
+bash -n brewfs/docker/compose-xfstests/run_redis_perf.sh
+bash -n brewfs/docker/compose-xfstests/run_perf_in_container.sh
+cargo fmt -p brewfs --check
+git diff --check
+```
+
+Perf smoke command:
+
+```bash
+PERF_FIO_DIRECT_MATRIX="0 1" \
+PERF_FIO_SEQWRITE_RUNTIME=15 \
+PERF_FIO_RANDRW_RUNTIME=15 \
+PERF_FIO_POST_WRITE_DRAIN=true \
+PERF_FIO_POST_WRITE_DRAIN_TIMEOUT_SECS=600 \
+PERF_FIO_PREFILL_DRAIN_TIMEOUT_SECS=600 \
+BREWFS_COMPRESSION=none \
+BREWFS_PREFETCH_ENABLED=true \
+BREWFS_UPLOAD_CONCURRENCY=32 \
+BREWFS_MAX_UNFLUSHED_SLICES=16 \
+CARGO_PROFILE_RELEASE_DEBUG=0 \
+bash brewfs/docker/compose-xfstests/run_redis_perf.sh \
+  --writeback-throughput-profile \
+  --tools "fio-seqwrite fio-randrw"
+```
+
+Key result:
+
+| Tool | Metric | Baseline | Candidate | Delta |
+| --- | --- | ---: | ---: | ---: |
+| `fio-randrw-direct0` | tool wall seconds | 71 | 99 | +39.4% |
+| `fio-randrw-direct0` | write p99 ms | 6.32 | 10.42 | +64.8% |
+| `fio-randrw-direct0` | write p99.9 ms | 11.86 | 1019.22 | +8492.3% |
+| `fio-randrw-direct0` | PUT ops/GiB written | 2266.85 | 3200.40 | +41.2% |
+| `fio-randrw-direct0` | GET ops/GiB read | 307.90 | 441.57 | +43.4% |
+| `fio-randrw-direct0` | S3 PUT avg object MiB | 0.466 | 0.339 | -27.4% |
+| `fio-randrw-direct1` | read/write BW MiB/s | 156.17 / 72.02 | 175.20 / 81.07 | +12.2% / +12.6% |
+| `fio-randrw-direct1` | post-write drain seconds | 44 | 43 | -2.3% |
+| `fio-seqwrite-direct0` | write BW MiB/s | 186.37 | 171.93 | -7.8% |
+| `fio-seqwrite-direct0` | write p99.9 ms | 13.17 | 233.83 | +1675.1% |
+| `fio-seqwrite-direct1` | post-write drain seconds | 40 | 46 | +15.0% |
+
+Decision: rejected; code reverted.
+
+Reason: allowing many more unflushed writable slices worsened the exact object-amplification symptom it was meant to address. It improved `randrw-direct1` foreground throughput, but caused buffered `randrw-direct0` wall time, PUT/GET ops per GiB, and write tail to regress hard, and it also regressed `seqwrite-direct0` throughput and `seqwrite-direct1` drain. This falsifies the simple "raise max unflushed slices" theory. The next write-path attempt should instrument freeze reasons and live slice counts first, or move to a bounded stage/upload queue with clear recovery semantics.
+
 ## Next Target: Staged Upload And Object Count
 
 - Treat `fio-randrw-direct0` object amplification as the primary write-path bottleneck: baseline already shows thousands of PUT ops/GiB written and sub-1MiB average PUT object size.
