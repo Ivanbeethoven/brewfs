@@ -1,5 +1,6 @@
 import {
   Activity,
+  ArrowUp,
   Database,
   FileSearch,
   FolderTree,
@@ -19,11 +20,13 @@ import {
   ApiError,
   createVolume,
   deleteVolume as deleteVolumeRequest,
+  fetchFileList,
   fetchJobStatus,
   fetchHealth,
   fetchInstances,
   fetchVolumes,
   runGcJob,
+  type FileListResponse,
   type HealthResponse,
   type InstanceInfoResponse,
   type InstanceResponse,
@@ -31,6 +34,7 @@ import {
   type VolumeResponse,
   updateVolume,
 } from './api';
+import { formatMode, joinBrowserPath, normalizeBrowserPath, parentBrowserPath } from './browserPath';
 import { loadFeatureStatus, type FeatureKey, type FeatureStatus } from './featureStatus';
 import { loadInstanceDetails } from './instanceDetails';
 import { labelsFromText, labelsToText } from './volumeEdit';
@@ -116,7 +120,7 @@ function pageFromPathname(pathname: string): PageKey {
 }
 
 function featureForPage(page: PageKey): FeatureKey | null {
-  if (page === 'browser' || page === 'trash' || page === 'acl' || page === 'csi') {
+  if (page === 'trash' || page === 'acl' || page === 'csi') {
     return page;
   }
   return null;
@@ -145,6 +149,13 @@ export function App() {
   const [jobRequestInFlight, setJobRequestInFlight] = useState(false);
   const [jobError, setJobError] = useState<string | null>(null);
   const [currentJob, setCurrentJob] = useState<CurrentJob | null>(null);
+  const [selectedBrowserVolumeId, setSelectedBrowserVolumeId] = useState<string | null>(null);
+  const [browserPath, setBrowserPath] = useState('/');
+  const [browserPathInput, setBrowserPathInput] = useState('/');
+  const [browserReloadKey, setBrowserReloadKey] = useState(0);
+  const [browserResult, setBrowserResult] = useState<FileListResponse | null>(null);
+  const [browserLoading, setBrowserLoading] = useState(false);
+  const [browserError, setBrowserError] = useState<string | null>(null);
   const [featureResult, setFeatureResult] = useState<FeatureResult | null>(null);
   const [featureLoading, setFeatureLoading] = useState(false);
   const [featureError, setFeatureError] = useState<string | null>(null);
@@ -234,6 +245,58 @@ export function App() {
   }, [instances]);
 
   useEffect(() => {
+    setSelectedBrowserVolumeId((current) =>
+      current !== null && volumes.some((volume) => volume.id === current)
+        ? current
+        : (volumes[0]?.id ?? null),
+    );
+  }, [volumes]);
+
+  useEffect(() => {
+    setBrowserResult(null);
+    setBrowserError(null);
+  }, [selectedBrowserVolumeId]);
+
+  useEffect(() => {
+    if (page !== 'browser') return;
+    if (!selectedBrowserVolumeId) {
+      setBrowserResult(null);
+      setBrowserError(null);
+      setBrowserLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setBrowserLoading(true);
+    setBrowserError(null);
+
+    void fetchFileList(selectedBrowserVolumeId, browserPath, token)
+      .then((result) => {
+        if (!cancelled) {
+          setBrowserResult(result);
+        }
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        if (err instanceof ApiError && err.status === 401) {
+          setAuthRequired(true);
+        } else {
+          setBrowserResult(null);
+          setBrowserError(browserErrorMessage(err));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setBrowserLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [browserPath, browserReloadKey, page, selectedBrowserVolumeId, token]);
+
+  useEffect(() => {
     const handlePopState = () => setPage(pageFromPathname(window.location.pathname));
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
@@ -277,6 +340,35 @@ export function App() {
     if (window.location.pathname !== nextPath) {
       window.history.pushState(null, '', nextPath);
     }
+  };
+
+  const selectedBrowserVolume = useMemo(
+    () => volumes.find((volume) => volume.id === selectedBrowserVolumeId) ?? null,
+    [selectedBrowserVolumeId, volumes],
+  );
+
+  const submitBrowserPath = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const normalized = normalizeBrowserPath(browserPathInput);
+    setBrowserPathInput(normalized);
+    setBrowserPath(normalized);
+  };
+
+  const navigateBrowserPath = (path: string) => {
+    const normalized = normalizeBrowserPath(path);
+    setBrowserPathInput(normalized);
+    setBrowserPath(normalized);
+  };
+
+  const changeBrowserVolume = (volumeId: string) => {
+    setSelectedBrowserVolumeId(volumeId);
+    setBrowserPath('/');
+    setBrowserPathInput('/');
+    setBrowserResult(null);
+  };
+
+  const refreshBrowser = () => {
+    setBrowserReloadKey((current) => current + 1);
   };
 
   const submitToken = (event: FormEvent<HTMLFormElement>) => {
@@ -509,6 +601,11 @@ export function App() {
               jobRequestInFlight,
               jobError,
               currentJob,
+              selectedBrowserVolume,
+              browserPathInput,
+              browserResult,
+              browserLoading,
+              browserError,
               featureResult,
               featureLoading,
               featureError,
@@ -523,6 +620,11 @@ export function App() {
               onGcDryRunChange: setGcDryRun,
               onGcJobSubmit: submitGcJob,
               onRefreshCurrentJob: refreshCurrentJob,
+              onBrowserVolumeChange: changeBrowserVolume,
+              onBrowserPathInputChange: setBrowserPathInput,
+              onBrowserPathSubmit: submitBrowserPath,
+              onBrowserRefresh: refreshBrowser,
+              onBrowserNavigate: navigateBrowserPath,
             })
           )}
         </section>
@@ -584,6 +686,11 @@ type RenderContext = {
   jobRequestInFlight: boolean;
   jobError: string | null;
   currentJob: CurrentJob | null;
+  selectedBrowserVolume: VolumeResponse | null;
+  browserPathInput: string;
+  browserResult: FileListResponse | null;
+  browserLoading: boolean;
+  browserError: string | null;
   featureResult: FeatureResult | null;
   featureLoading: boolean;
   featureError: string | null;
@@ -598,6 +705,11 @@ type RenderContext = {
   onGcDryRunChange: (enabled: boolean) => void;
   onGcJobSubmit: (event: FormEvent<HTMLFormElement>) => void;
   onRefreshCurrentJob: () => void;
+  onBrowserVolumeChange: (volumeId: string) => void;
+  onBrowserPathInputChange: (path: string) => void;
+  onBrowserPathSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onBrowserRefresh: () => void;
+  onBrowserNavigate: (path: string) => void;
 };
 
 function renderPage(page: PageKey, context: RenderContext) {
@@ -621,6 +733,11 @@ function renderPage(page: PageKey, context: RenderContext) {
     jobRequestInFlight,
     jobError,
     currentJob,
+    selectedBrowserVolume,
+    browserPathInput,
+    browserResult,
+    browserLoading,
+    browserError,
     featureResult,
     featureLoading,
     featureError,
@@ -635,6 +752,11 @@ function renderPage(page: PageKey, context: RenderContext) {
     onGcDryRunChange,
     onGcJobSubmit,
     onRefreshCurrentJob,
+    onBrowserVolumeChange,
+    onBrowserPathInputChange,
+    onBrowserPathSubmit,
+    onBrowserRefresh,
+    onBrowserNavigate,
   } = context;
 
   if (page === 'overview') {
@@ -721,12 +843,18 @@ function renderPage(page: PageKey, context: RenderContext) {
 
   if (page === 'browser') {
     return (
-      <FeatureStatusPanel
-        feature="browser"
-        fallbackTitle="File browser"
-        result={featureResult}
-        loading={featureLoading}
-        error={featureError}
+      <BrowserPage
+        volumes={volumes}
+        selectedVolume={selectedBrowserVolume}
+        pathInput={browserPathInput}
+        result={browserResult}
+        loading={browserLoading}
+        error={browserError}
+        onVolumeChange={onBrowserVolumeChange}
+        onPathInputChange={onBrowserPathInputChange}
+        onPathSubmit={onBrowserPathSubmit}
+        onRefresh={onBrowserRefresh}
+        onNavigate={onBrowserNavigate}
       />
     );
   }
@@ -803,6 +931,155 @@ function FeatureStatusPanel({
         </>
       ) : null}
     </article>
+  );
+}
+
+function BrowserPage({
+  volumes,
+  selectedVolume,
+  pathInput,
+  result,
+  loading,
+  error,
+  onVolumeChange,
+  onPathInputChange,
+  onPathSubmit,
+  onRefresh,
+  onNavigate,
+}: {
+  volumes: VolumeResponse[];
+  selectedVolume: VolumeResponse | null;
+  pathInput: string;
+  result: FileListResponse | null;
+  loading: boolean;
+  error: string | null;
+  onVolumeChange: (volumeId: string) => void;
+  onPathInputChange: (path: string) => void;
+  onPathSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onRefresh: () => void;
+  onNavigate: (path: string) => void;
+}) {
+  if (volumes.length === 0) {
+    return <EmptyPanel title="No registered filesystems" detail="Register a filesystem first." />;
+  }
+
+  const currentPath = result?.path ?? normalizeBrowserPath(pathInput);
+
+  return (
+    <>
+      <article className="panel table-panel">
+        <div className="browser-toolbar">
+          <label>
+            <span>Filesystem</span>
+            <select
+              value={selectedVolume?.id ?? ''}
+              onChange={(event) => onVolumeChange(event.target.value)}
+            >
+              {volumes.map((volume) => (
+                <option key={volume.id} value={volume.id}>
+                  {volume.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <form className="browser-path-form" onSubmit={onPathSubmit}>
+            <label>
+              <span>Path</span>
+              <input
+                value={pathInput}
+                onChange={(event) => onPathInputChange(event.target.value)}
+                placeholder="/"
+              />
+            </label>
+            <button className="primary-button" type="submit" disabled={loading}>
+              <FileSearch size={16} aria-hidden="true" />
+              <span>Open</span>
+            </button>
+          </form>
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={onRefresh}
+            disabled={loading || !selectedVolume}
+          >
+            <RefreshCw size={16} aria-hidden="true" />
+            <span>Refresh</span>
+          </button>
+        </div>
+        {selectedVolume?.mount_config.mount_point ? (
+          <p className="muted browser-context">
+            {selectedVolume.mount_config.mount_point} · {currentPath}
+          </p>
+        ) : null}
+        {error ? <p className="error-text">{error}</p> : null}
+      </article>
+
+      <article className="panel table-panel">
+        <div className="table-actions browser-actions">
+          <button
+            className="secondary-button compact-button"
+            type="button"
+            onClick={() => onNavigate(parentBrowserPath(currentPath))}
+            disabled={loading || currentPath === '/'}
+          >
+            <ArrowUp size={14} aria-hidden="true" />
+            <span>Parent</span>
+          </button>
+        </div>
+        {loading && !result ? <p className="muted">Loading directory.</p> : null}
+        {result && result.entries.length === 0 ? (
+          <p className="muted">Directory is empty.</p>
+        ) : null}
+        {result && result.entries.length > 0 ? (
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>Inode</th>
+                  <th>Size</th>
+                  <th>Mode</th>
+                  <th>Owner</th>
+                  <th>Modified</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {result.entries.map((entry) => (
+                  <tr key={`${entry.inode}-${entry.name}`}>
+                    <td>{entry.name}</td>
+                    <td>{entry.kind}</td>
+                    <td>{entry.inode}</td>
+                    <td>{entry.size}</td>
+                    <td>{formatMode(entry.mode)}</td>
+                    <td>
+                      {entry.uid}:{entry.gid}
+                    </td>
+                    <td>{entry.mtime}</td>
+                    <td>
+                      {entry.kind === 'directory' ? (
+                        <button
+                          className="secondary-button compact-button"
+                          type="button"
+                          onClick={() => onNavigate(joinBrowserPath(result.path, entry.name))}
+                          disabled={loading}
+                        >
+                          <FolderTree size={14} aria-hidden="true" />
+                          <span>Open</span>
+                        </button>
+                      ) : (
+                        <span className="muted">-</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+      </article>
+    </>
   );
 }
 
@@ -1129,6 +1406,15 @@ function Metric({ label, value }: { label: string; value: string }) {
       <strong>{value}</strong>
     </div>
   );
+}
+
+function browserErrorMessage(err: unknown): string {
+  if (err instanceof ApiError) {
+    if (err.status === 400) return 'Path must be absolute.';
+    if (err.status === 404) return 'Directory was not found.';
+    if (err.status === 409) return 'Filesystem is registered but not mounted.';
+  }
+  return err instanceof Error ? err.message : 'file list request failed';
 }
 
 function optionalField(value: string): string | undefined {

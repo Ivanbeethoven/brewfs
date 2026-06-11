@@ -329,6 +329,51 @@ h2 {
   gap: 8px;
 }
 
+.browser-toolbar {
+  display: grid;
+  grid-template-columns: minmax(180px, 260px) minmax(280px, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.browser-toolbar label,
+.browser-path-form label {
+  display: grid;
+  gap: 5px;
+}
+
+.browser-toolbar span,
+.browser-path-form span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.browser-toolbar select,
+.browser-path-form input {
+  width: 100%;
+  min-width: 0;
+  height: 38px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0 10px;
+  font: inherit;
+}
+
+.browser-path-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.browser-context {
+  margin: 12px 0 0;
+}
+
+.browser-actions {
+  margin-bottom: 10px;
+}
+
 .volume-form,
 .job-form {
   display: grid;
@@ -416,6 +461,11 @@ h2 {
 
   .input-row {
     flex-direction: column;
+  }
+
+  .browser-toolbar,
+  .browser-path-form {
+    grid-template-columns: 1fr;
   }
 
   .primary-button,
