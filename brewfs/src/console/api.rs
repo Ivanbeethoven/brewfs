@@ -883,6 +883,9 @@ fn trash_adapter_error(err: TrashAdapterError) -> ApiErrorResponse {
 fn acl_adapter_error(err: AclAdapterError) -> ApiErrorResponse {
     match err {
         AclAdapterError::Unsupported(message) => unsupported(message),
+        AclAdapterError::ControlPlane(message) => {
+            json_error(StatusCode::BAD_GATEWAY, "control_plane_error", message)
+        }
     }
 }
 

@@ -1,5 +1,5 @@
 use super::job::{GcJobResult, JobManager, JobOutcome, JobState};
-use super::protocol::{ControlRequest, ControlResponse};
+use super::protocol::{ControlAclEntry, ControlRequest, ControlResponse};
 use super::runtime::{InstanceRecord, RuntimeRegistry};
 use super::server::{ControlHandler, ControlServer};
 use async_trait::async_trait;
@@ -85,6 +85,56 @@ fn protocol_roundtrip_preserves_path_metadata_and_readlink_requests() {
     let decoded: ControlResponse =
         serde_json::from_slice(&raw).expect("deserialize symlink response");
     assert_eq!(decoded, target);
+}
+
+#[test]
+fn protocol_roundtrip_preserves_acl_requests_and_responses() {
+    let entry = ControlAclEntry {
+        scope: "access".to_string(),
+        tag: "user_obj".to_string(),
+        id: None,
+        perm: "rwx".to_string(),
+    };
+    let get_req = ControlRequest::GetAcl {
+        path: "/docs".to_string(),
+    };
+    let raw = serde_json::to_vec(&get_req).expect("serialize get acl request");
+    let decoded: ControlRequest =
+        serde_json::from_slice(&raw).expect("deserialize get acl request");
+    assert_eq!(decoded, get_req);
+
+    let put_req = ControlRequest::PutAcl {
+        path: "/docs".to_string(),
+        entries: vec![entry.clone()],
+    };
+    let raw = serde_json::to_vec(&put_req).expect("serialize put acl request");
+    let decoded: ControlRequest =
+        serde_json::from_slice(&raw).expect("deserialize put acl request");
+    assert_eq!(decoded, put_req);
+
+    let delete_req = ControlRequest::DeleteAcl {
+        path: "/docs".to_string(),
+    };
+    let raw = serde_json::to_vec(&delete_req).expect("serialize delete acl request");
+    let decoded: ControlRequest =
+        serde_json::from_slice(&raw).expect("deserialize delete acl request");
+    assert_eq!(decoded, delete_req);
+
+    let response = ControlResponse::Acl {
+        path: "/docs".to_string(),
+        entries: vec![entry],
+    };
+    let raw = serde_json::to_vec(&response).expect("serialize acl response");
+    let decoded: ControlResponse = serde_json::from_slice(&raw).expect("deserialize acl response");
+    assert_eq!(decoded, response);
+
+    let deleted = ControlResponse::AclDeleted {
+        path: "/docs".to_string(),
+    };
+    let raw = serde_json::to_vec(&deleted).expect("serialize acl delete response");
+    let decoded: ControlResponse =
+        serde_json::from_slice(&raw).expect("deserialize acl delete response");
+    assert_eq!(decoded, deleted);
 }
 
 #[tokio::test]

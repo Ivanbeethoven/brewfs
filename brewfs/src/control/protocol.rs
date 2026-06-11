@@ -5,11 +5,31 @@ use crate::meta::store::{FileAttr, FileType, MetaStoreCapabilities};
 pub enum ControlRequest {
     Ping,
     GetInfo,
-    RunGc { dry_run: bool },
-    GetJob { job_id: String },
-    ListDirectory { path: String },
-    StatPath { path: String },
-    ReadLink { path: String },
+    RunGc {
+        dry_run: bool,
+    },
+    GetJob {
+        job_id: String,
+    },
+    ListDirectory {
+        path: String,
+    },
+    StatPath {
+        path: String,
+    },
+    ReadLink {
+        path: String,
+    },
+    GetAcl {
+        path: String,
+    },
+    PutAcl {
+        path: String,
+        entries: Vec<ControlAclEntry>,
+    },
+    DeleteAcl {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -44,6 +64,13 @@ pub enum ControlResponse {
         path: String,
         target: String,
     },
+    Acl {
+        path: String,
+        entries: Vec<ControlAclEntry>,
+    },
+    AclDeleted {
+        path: String,
+    },
     Error {
         code: String,
         message: String,
@@ -71,6 +98,14 @@ pub struct ControlPathMetadata {
     pub uid: u32,
     pub gid: u32,
     pub mtime_ns: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ControlAclEntry {
+    pub scope: String,
+    pub tag: String,
+    pub id: Option<u32>,
+    pub perm: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

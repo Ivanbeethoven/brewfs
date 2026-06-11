@@ -1509,6 +1509,12 @@ impl<T: MetaStore + ?Sized + 'static> ControlHandler for Arc<MetaClient<T>> {
             ControlRequest::ListDirectory { path } => self.list_directory_for_control(&path).await,
             ControlRequest::StatPath { path } => self.stat_path_for_control(&path).await,
             ControlRequest::ReadLink { path } => self.readlink_for_control(&path).await,
+            ControlRequest::GetAcl { .. }
+            | ControlRequest::PutAcl { .. }
+            | ControlRequest::DeleteAcl { .. } => ControlResponse::Error {
+                code: "unsupported".to_string(),
+                message: "ACL control-plane requests are not implemented yet".to_string(),
+            },
         }
     }
 }
