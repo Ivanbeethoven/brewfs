@@ -48,7 +48,7 @@ import {
 import { formatAclDraft, parseAclDraft } from './aclDraft';
 import { loadAclView, type AclViewResult } from './aclView';
 import { formatMode, joinBrowserPath, normalizeBrowserPath, parentBrowserPath } from './browserPath';
-import { loadCsiDashboard, type CsiDashboardResult } from './csiDashboard';
+import { loadCsiDashboard, type CsiDashboardFilters, type CsiDashboardResult } from './csiDashboard';
 import { loadInstanceDetails } from './instanceDetails';
 import { buildMountCommand } from './mountCommand';
 import { loadTrashView, type TrashViewResult } from './trashView';
@@ -187,6 +187,10 @@ export function App() {
   const [csiDashboard, setCsiDashboard] = useState<CsiDashboardResult | null>(null);
   const [csiLoading, setCsiLoading] = useState(false);
   const [csiError, setCsiError] = useState<string | null>(null);
+  const [csiNamespaceInput, setCsiNamespaceInput] = useState('');
+  const [csiVolumeInput, setCsiVolumeInput] = useState('');
+  const [csiFilters, setCsiFilters] = useState<CsiDashboardFilters>({});
+  const [csiReloadKey, setCsiReloadKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -429,7 +433,7 @@ export function App() {
     setCsiLoading(true);
     setCsiError(null);
     setCsiDashboard(null);
-    void loadCsiDashboard(token)
+    void loadCsiDashboard(token, csiFilters)
       .then((result) => {
         if (!cancelled) {
           setCsiDashboard(result);
@@ -452,7 +456,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [page, token]);
+  }, [csiFilters, csiReloadKey, page, token]);
 
   const navigate = (nextPage: PageKey) => {
     setPage(nextPage);
@@ -831,6 +835,18 @@ export function App() {
     }
   };
 
+  const submitCsiFilters = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setCsiFilters({
+      namespace: optionalField(csiNamespaceInput),
+      volume: optionalField(csiVolumeInput),
+    });
+  };
+
+  const refreshCsiDashboard = () => {
+    setCsiReloadKey((current) => current + 1);
+  };
+
   const status = useMemo(() => {
     if (authRequired) return { label: 'Auth required', tone: 'warn' };
     if (error) return { label: 'API unavailable', tone: 'bad' };
@@ -926,6 +942,8 @@ export function App() {
               csiDashboard,
               csiLoading,
               csiError,
+              csiNamespaceInput,
+              csiVolumeInput,
               onVolumeFormChange: updateVolumeForm,
               onVolumeSubmit: submitVolume,
               onVolumeEditStart: startVolumeEdit,
@@ -953,6 +971,10 @@ export function App() {
               onAclDraftChange: setAclDraft,
               onAclReplace: replaceAclFromPage,
               onAclClear: clearAclFromPage,
+              onCsiNamespaceChange: setCsiNamespaceInput,
+              onCsiVolumeChange: setCsiVolumeInput,
+              onCsiFilterSubmit: submitCsiFilters,
+              onCsiRefresh: refreshCsiDashboard,
             })
           )}
         </section>
@@ -1041,6 +1063,8 @@ type RenderContext = {
   csiDashboard: CsiDashboardResult | null;
   csiLoading: boolean;
   csiError: string | null;
+  csiNamespaceInput: string;
+  csiVolumeInput: string;
   onVolumeFormChange: (field: keyof VolumeFormState, value: string) => void;
   onVolumeSubmit: (event: FormEvent<HTMLFormElement>) => void;
   onVolumeEditStart: (volume: VolumeResponse) => void;
@@ -1068,6 +1092,10 @@ type RenderContext = {
   onAclDraftChange: (value: string) => void;
   onAclReplace: (event: FormEvent<HTMLFormElement>) => void;
   onAclClear: () => void;
+  onCsiNamespaceChange: (value: string) => void;
+  onCsiVolumeChange: (value: string) => void;
+  onCsiFilterSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onCsiRefresh: () => void;
 };
 
 function renderPage(page: PageKey, context: RenderContext) {
@@ -1118,6 +1146,8 @@ function renderPage(page: PageKey, context: RenderContext) {
     csiDashboard,
     csiLoading,
     csiError,
+    csiNamespaceInput,
+    csiVolumeInput,
     onVolumeFormChange,
     onVolumeSubmit,
     onVolumeEditStart,
@@ -1145,6 +1175,10 @@ function renderPage(page: PageKey, context: RenderContext) {
     onAclDraftChange,
     onAclReplace,
     onAclClear,
+    onCsiNamespaceChange,
+    onCsiVolumeChange,
+    onCsiFilterSubmit,
+    onCsiRefresh,
   } = context;
 
   if (page === 'overview') {
@@ -1295,7 +1329,19 @@ function renderPage(page: PageKey, context: RenderContext) {
   }
 
   if (page === 'csi') {
-    return <CsiDashboardPage result={csiDashboard} loading={csiLoading} error={csiError} />;
+    return (
+      <CsiDashboardPage
+        result={csiDashboard}
+        loading={csiLoading}
+        error={csiError}
+        namespaceInput={csiNamespaceInput}
+        volumeInput={csiVolumeInput}
+        onNamespaceChange={onCsiNamespaceChange}
+        onVolumeChange={onCsiVolumeChange}
+        onFilterSubmit={onCsiFilterSubmit}
+        onRefresh={onCsiRefresh}
+      />
+    );
   }
 
   return <SettingsPage health={health} volumes={volumes} instances={instances} />;
@@ -1543,14 +1589,47 @@ function CsiDashboardPage({
   result,
   loading,
   error,
+  namespaceInput,
+  volumeInput,
+  onNamespaceChange,
+  onVolumeChange,
+  onFilterSubmit,
+  onRefresh,
 }: {
   result: CsiDashboardResult | null;
   loading: boolean;
   error: string | null;
+  namespaceInput: string;
+  volumeInput: string;
+  onNamespaceChange: (value: string) => void;
+  onVolumeChange: (value: string) => void;
+  onFilterSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onRefresh: () => void;
 }) {
   return (
     <article className="panel table-panel">
       <h2>{result?.title ?? 'CSI dashboard'}</h2>
+      <form className="csi-filter-form" onSubmit={onFilterSubmit}>
+        <label>
+          <span>Namespace</span>
+          <input
+            value={namespaceInput}
+            onChange={(event) => onNamespaceChange(event.target.value)}
+          />
+        </label>
+        <label>
+          <span>Volume</span>
+          <input value={volumeInput} onChange={(event) => onVolumeChange(event.target.value)} />
+        </label>
+        <button className="primary-button" type="submit" disabled={loading}>
+          <Database size={16} aria-hidden="true" />
+          <span>Apply</span>
+        </button>
+        <button className="secondary-button" type="button" onClick={onRefresh} disabled={loading}>
+          <RefreshCw size={16} aria-hidden="true" />
+          <span>Refresh</span>
+        </button>
+      </form>
       {loading && !result ? <p className="muted">Loading CSI resources.</p> : null}
       {error ? <p className="error-text">{error}</p> : null}
       {result ? (

@@ -20,6 +20,11 @@ export interface CsiDashboardMetric {
   value: string;
 }
 
+export interface CsiDashboardFilters {
+  namespace?: string;
+  volume?: string;
+}
+
 export interface CsiResourceStatus {
   key: CsiResourceKey;
   title: string;
@@ -40,37 +45,43 @@ export interface CsiDashboardResult {
 type CsiResourceDescriptor = {
   key: CsiResourceKey;
   title: string;
-  load: (token?: string | null) => Promise<CsiResourceListResponse>;
+  load: (
+    filters: CsiDashboardFilters,
+    token?: string | null,
+  ) => Promise<CsiResourceListResponse>;
 };
 
 const resourceDescriptors: CsiResourceDescriptor[] = [
   {
     key: 'storageclasses',
     title: 'StorageClasses',
-    load: fetchCsiStorageClasses,
+    load: (_filters, token) => fetchCsiStorageClasses(token),
   },
   {
     key: 'persistentvolumes',
     title: 'PersistentVolumes',
-    load: fetchCsiPersistentVolumes,
+    load: (_filters, token) => fetchCsiPersistentVolumes(token),
   },
   {
     key: 'persistentvolumeclaims',
     title: 'PersistentVolumeClaims',
-    load: (token) => fetchCsiPersistentVolumeClaims(undefined, token),
+    load: (filters, token) => fetchCsiPersistentVolumeClaims(filters.namespace, token),
   },
   {
     key: 'pods',
     title: 'Pods',
-    load: (token) => fetchCsiPods({}, token),
+    load: (filters, token) => fetchCsiPods(filters, token),
   },
 ];
 
-export async function loadCsiDashboard(token?: string | null): Promise<CsiDashboardResult> {
+export async function loadCsiDashboard(
+  token?: string | null,
+  filters: CsiDashboardFilters = {},
+): Promise<CsiDashboardResult> {
   try {
     const summary = await fetchCsiSummary(token);
     const resources = await Promise.all(
-      resourceDescriptors.map((descriptor) => loadResourceStatus(descriptor, token)),
+      resourceDescriptors.map((descriptor) => loadResourceStatus(descriptor, filters, token)),
     );
 
     return {
@@ -93,10 +104,11 @@ export async function loadCsiDashboard(token?: string | null): Promise<CsiDashbo
 
 async function loadResourceStatus(
   descriptor: CsiResourceDescriptor,
+  filters: CsiDashboardFilters,
   token?: string | null,
 ): Promise<CsiResourceStatus> {
   try {
-    const response = await descriptor.load(token);
+    const response = await descriptor.load(filters, token);
     return {
       key: descriptor.key,
       title: descriptor.title,

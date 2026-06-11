@@ -34,9 +34,24 @@ describe('loadCsiDashboard', () => {
         new Response(JSON.stringify({ items: [{ name: 'pod-a' }] }), { status: 200 }),
       );
 
-    const result = await loadCsiDashboard('secret-token');
+    const result = await loadCsiDashboard('secret-token', {
+      namespace: 'prod',
+      volume: 'data',
+    });
 
     expect(result.state).toBe('ready');
+    expect(fetch).toHaveBeenNthCalledWith(4, '/api/csi/persistentvolumeclaims?namespace=prod', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer secret-token',
+      },
+    });
+    expect(fetch).toHaveBeenNthCalledWith(5, '/api/csi/pods?namespace=prod&volume=data', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer secret-token',
+      },
+    });
     expect(result.summaryMetrics).toContainEqual({ label: 'Pods', value: '4' });
     expect(result.resources.map((resource) => [resource.key, resource.state, resource.count])).toEqual([
       ['storageclasses', 'ready', 1],
