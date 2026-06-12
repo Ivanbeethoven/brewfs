@@ -56,6 +56,10 @@ export function formatCsiItemCount(count: number | null): string {
   return count === 1 ? '1 item' : `${count} items`;
 }
 
+export function shouldLoadCsiDashboardForPage(page: string, csiDashboardEnabled: boolean): boolean {
+  return page === 'csi' || (page === 'overview' && csiDashboardEnabled);
+}
+
 type CsiResourceDescriptor = {
   key: CsiResourceKey;
   title: string;

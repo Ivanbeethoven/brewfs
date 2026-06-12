@@ -61,11 +61,18 @@ import {
 import {
   formatCsiItemCount,
   loadCsiDashboard,
+  shouldLoadCsiDashboardForPage,
   type CsiDashboardFilters,
   type CsiDashboardResult,
 } from './csiDashboard';
 import { loadInstanceDetails } from './instanceDetails';
 import { buildMountCommand } from './mountCommand';
+import {
+  overviewCapabilityWarnings,
+  overviewCsiSummary,
+  overviewMetrics as buildOverviewMetrics,
+  overviewRecentJob,
+} from './overviewSummary';
 import { loadTrashView, type TrashViewResult } from './trashView';
 import { buildSettingsSummary } from './settingsSummary';
 import {
@@ -446,7 +453,7 @@ export function App() {
   }, [aclResult]);
 
   useEffect(() => {
-    if (page !== 'csi') return;
+    if (!shouldLoadCsiDashboardForPage(page, health?.integrations.csi_dashboard === true)) return;
     let cancelled = false;
 
     setCsiLoading(true);
@@ -475,7 +482,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [csiFilters, csiReloadKey, page, token]);
+  }, [csiFilters, csiReloadKey, health?.integrations.csi_dashboard, page, token]);
 
   const navigate = (nextPage: PageKey) => {
     setPage(nextPage);
@@ -1201,13 +1208,50 @@ function renderPage(page: PageKey, context: RenderContext) {
   } = context;
 
   if (page === 'overview') {
+    const metrics = buildOverviewMetrics({ health, volumes, instances });
+    const recentJob = overviewRecentJob(currentJob);
+    const capabilityWarnings = overviewCapabilityWarnings({ volumes, instanceDetails });
+    const csiSummary = overviewCsiSummary({
+      health,
+      dashboard: csiDashboard,
+      loading: csiLoading,
+      error: csiError,
+    });
+
     return (
       <>
         <Panel title="Runtime">
-          <Metric label="Service" value={health?.service ?? 'waiting'} />
-          <Metric label="Commit" value={health?.commit_short ?? 'unknown'} />
-          <Metric label="Auth" value={health?.auth_mode ?? 'unknown'} />
-          <Metric label="Live mounts" value={String(instances.length)} />
+          {metrics.map((metric) => (
+            <Metric key={metric.label} label={metric.label} value={metric.value} />
+          ))}
+        </Panel>
+        <Panel title="Recent job">
+          <h3 className="panel-subtitle">{recentJob.title}</h3>
+          <p className="muted job-detail">{recentJob.detail}</p>
+          {recentJob.metrics.length > 0 ? (
+            <div className="job-metrics">
+              {recentJob.metrics.map((metric) => (
+                <Metric key={metric.label} label={metric.label} value={metric.value} />
+              ))}
+            </div>
+          ) : null}
+        </Panel>
+        <Panel title="Backend capabilities">
+          {capabilityWarnings.length === 0 ? (
+            <p className="muted">No capability warnings.</p>
+          ) : (
+            <div className="warning-list">
+              {capabilityWarnings.map((warning) => (
+                <p className="warning-text" key={warning}>
+                  {warning}
+                </p>
+              ))}
+            </div>
+          )}
+        </Panel>
+        <Panel title="CSI health">
+          <Metric label={csiSummary.label} value={csiSummary.value} />
+          <p className="muted job-detail">{csiSummary.detail}</p>
         </Panel>
         <Panel title="Live instances">
           {instanceError ? <p className="error-text">{instanceError}</p> : null}

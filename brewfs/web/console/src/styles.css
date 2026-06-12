@@ -628,6 +628,11 @@ h2 {
   margin: 12px 0;
 }
 
+.panel-subtitle {
+  margin: 4px 0 0;
+  font-size: 14px;
+}
+
 .job-metrics {
   margin: 8px 0 14px;
 }

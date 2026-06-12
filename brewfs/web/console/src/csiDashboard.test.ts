@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { formatCsiItemCount, loadCsiDashboard } from './csiDashboard';
+import { formatCsiItemCount, loadCsiDashboard, shouldLoadCsiDashboardForPage } from './csiDashboard';
 
 describe('loadCsiDashboard', () => {
   afterEach(() => {
@@ -249,6 +249,15 @@ describe('loadCsiDashboard', () => {
       'PersistentVolume pv-stale is Released; inspect claim and reclaim state.',
       'Pod prod/pod-stuck is Pending · NotReady; inspect node mount and PVC attachment.',
     ]);
+  });
+});
+
+describe('shouldLoadCsiDashboardForPage', () => {
+  it('loads on the CSI page and on overview only when enabled', () => {
+    expect(shouldLoadCsiDashboardForPage('csi', false)).toBe(true);
+    expect(shouldLoadCsiDashboardForPage('overview', true)).toBe(true);
+    expect(shouldLoadCsiDashboardForPage('overview', false)).toBe(false);
+    expect(shouldLoadCsiDashboardForPage('filesystems', true)).toBe(false);
   });
 });
 
