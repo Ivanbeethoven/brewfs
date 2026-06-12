@@ -1,6 +1,8 @@
 import type { AclEntry, AclUpdateRequest } from './api';
 import type { AclEntryRow } from './aclView';
 
+const SUPPORTED_ACL_TAGS = new Set(['user_obj', 'user', 'group_obj', 'group', 'mask', 'other']);
+
 export function formatAclDraft(rows: AclEntryRow[]): string {
   return JSON.stringify(
     rows.map((row) => {
@@ -52,13 +54,41 @@ function parseEntry(value: unknown, index: number): AclEntry {
   const id = value.id;
 
   if (id === undefined || id === null) {
+    validateAclEntry({ scope, tag, perm }, index);
     return { scope, tag, perm };
   }
   if (typeof id !== 'number' || !Number.isInteger(id)) {
     throw new Error(`ACL entry ${index + 1} id must be a number.`);
   }
+  if (id < 0) {
+    throw new Error(`ACL entry ${index + 1} id must be a non-negative number.`);
+  }
 
+  validateAclEntry({ scope, tag, id, perm }, index);
   return { scope, tag, id, perm };
+}
+
+function validateAclEntry(entry: AclEntry, index: number): void {
+  const entryNumber = index + 1;
+  if (entry.scope !== 'access' && entry.scope !== 'default') {
+    throw new Error(`ACL entry ${entryNumber} scope must be access or default.`);
+  }
+
+  if (!SUPPORTED_ACL_TAGS.has(entry.tag)) {
+    throw new Error(`ACL entry ${entryNumber} tag is not supported.`);
+  }
+
+  if (!/^[r-][w-][x-]$/.test(entry.perm)) {
+    throw new Error(`ACL entry ${entryNumber} perm must use rwx characters like rw- or r-x.`);
+  }
+
+  if ((entry.tag === 'user' || entry.tag === 'group') && entry.id === undefined) {
+    throw new Error(`ACL entry ${entryNumber} tag ${entry.tag} requires id.`);
+  }
+
+  if (entry.tag !== 'user' && entry.tag !== 'group' && entry.id !== undefined) {
+    throw new Error(`ACL entry ${entryNumber} tag ${entry.tag} must not include id.`);
+  }
 }
 
 function requiredString(record: Record<string, unknown>, key: keyof AclEntry, index: number): string {

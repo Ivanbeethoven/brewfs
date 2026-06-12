@@ -35,5 +35,26 @@ describe('aclDraft', () => {
     expect(() => parseAclDraft('[{"scope":"access","tag":"user","id":"1001","perm":"rwx"}]')).toThrow(
       'ACL entry 1 id must be a number.',
     );
+    expect(() => parseAclDraft('[{"scope":"access","tag":"group","id":-1,"perm":"rwx"}]')).toThrow(
+      'ACL entry 1 id must be a non-negative number.',
+    );
+  });
+
+  it('rejects ACL entries that fail POSIX-oriented preflight validation', () => {
+    expect(() => parseAclDraft('[{"scope":"mask","tag":"user_obj","perm":"rwx"}]')).toThrow(
+      'ACL entry 1 scope must be access or default.',
+    );
+    expect(() => parseAclDraft('[{"scope":"access","tag":"owner","perm":"rwx"}]')).toThrow(
+      'ACL entry 1 tag is not supported.',
+    );
+    expect(() => parseAclDraft('[{"scope":"access","tag":"user","perm":"rw-"}]')).toThrow(
+      'ACL entry 1 tag user requires id.',
+    );
+    expect(() => parseAclDraft('[{"scope":"access","tag":"other","id":1000,"perm":"r--"}]')).toThrow(
+      'ACL entry 1 tag other must not include id.',
+    );
+    expect(() => parseAclDraft('[{"scope":"access","tag":"group_obj","perm":"read"}]')).toThrow(
+      'ACL entry 1 perm must use rwx characters like rw- or r-x.',
+    );
   });
 });
