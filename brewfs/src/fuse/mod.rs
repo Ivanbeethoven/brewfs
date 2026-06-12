@@ -1081,14 +1081,20 @@ where
 
         let ino = match file_type {
             // Linux accepts mknod(path, 0, 0) as a regular file with mode 000.
-            0 | libc::S_IFREG => self
-                .create_file_at(parent as i64, &name, true)
-                .await
-                .map_err(Errno::from)?,
-            libc::S_IFDIR => self
-                .mkdir_at_new(parent as i64, &name)
-                .await
-                .map_err(Errno::from)?,
+            0 | libc::S_IFREG => {
+                self.ensure_directory_parent_namespace_mutation_allowed(parent, req.uid, req.gid)
+                    .await?;
+                self.create_file_at(parent as i64, &name, true)
+                    .await
+                    .map_err(Errno::from)?
+            }
+            libc::S_IFDIR => {
+                self.ensure_directory_parent_namespace_mutation_allowed(parent, req.uid, req.gid)
+                    .await?;
+                self.mkdir_at_new(parent as i64, &name)
+                    .await
+                    .map_err(Errno::from)?
+            }
             libc::S_IFIFO | libc::S_IFSOCK | libc::S_IFCHR | libc::S_IFBLK => {
                 return Err(libc::ENOSYS.into());
             }
@@ -1131,6 +1137,8 @@ where
             "fuse.mkdir"
         );
         let name = name.to_string_lossy();
+        self.ensure_directory_parent_namespace_mutation_allowed(parent, req.uid, req.gid)
+            .await?;
         let _ino = self
             .mkdir_at_new(parent as i64, &name)
             .await
@@ -1170,6 +1178,8 @@ where
         );
         let name = name.to_string_lossy();
         let create_new = (flags & libc::O_EXCL as u32) != 0;
+        self.ensure_directory_parent_namespace_mutation_allowed(parent, req.uid, req.gid)
+            .await?;
         let ino = match self.create_file_at(parent as i64, &name, create_new).await {
             Ok(ino) => {
                 debug!(
@@ -1251,6 +1261,8 @@ where
         if new_name_str.is_empty() || new_name_str.contains('/') || new_name_str.contains('\0') {
             return Err(libc::EINVAL.into());
         }
+        self.ensure_directory_parent_namespace_mutation_allowed(new_parent, req.uid, req.gid)
+            .await?;
 
         // Use the inode directly from the FUSE request; avoid roundtripping through path_of
         // which can return None if path reconstruction races with concurrent operations.
@@ -1303,12 +1315,8 @@ where
             return Err(libc::EINVAL.into());
         }
 
-        let Some(pattr) = self.stat_ino(parent as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if !matches!(pattr.kind, VfsFileType::Dir) {
-            return Err(libc::ENOTDIR.into());
-        }
+        self.ensure_directory_parent_namespace_mutation_allowed(parent, req.uid, req.gid)
+            .await?;
 
         if self.child_of(parent as i64, name.as_ref()).await.is_some() {
             return Err(libc::EEXIST.into());
@@ -1337,20 +1345,8 @@ where
     async fn unlink(&self, req: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
         debug!(parent, name = %name.to_string_lossy(), "fuse.unlink");
         let name = name.to_string_lossy();
-        // Ensure parent directory exists and has the right type
-        let Some(pattr) = self.stat_ino(parent as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if !matches!(pattr.kind, VfsFileType::Dir) {
-            return Err(libc::ENOTDIR.into());
-        }
-        self.ensure_access_allowed(
-            parent as i64,
-            req.uid,
-            req.gid,
-            namespace_mutation_access_mask(),
-        )
-        .await?;
+        self.ensure_directory_parent_namespace_mutation_allowed(parent, req.uid, req.gid)
+            .await?;
         // Target must exist and be a file
         let Some(child) = self.child_of(parent as i64, name.as_ref()).await else {
             return Err(libc::ENOENT.into());
@@ -1370,19 +1366,8 @@ where
     async fn rmdir(&self, req: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
         debug!(parent, name = %name.to_string_lossy(), "fuse.rmdir");
         let name = name.to_string_lossy();
-        let Some(pattr) = self.stat_ino(parent as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if !matches!(pattr.kind, VfsFileType::Dir) {
-            return Err(libc::ENOTDIR.into());
-        }
-        self.ensure_access_allowed(
-            parent as i64,
-            req.uid,
-            req.gid,
-            namespace_mutation_access_mask(),
-        )
-        .await?;
+        self.ensure_directory_parent_namespace_mutation_allowed(parent, req.uid, req.gid)
+            .await?;
         // Target must be a directory
         let Some(child) = self.child_of(parent as i64, name.as_ref()).await else {
             return Err(libc::ENOENT.into());
@@ -1951,6 +1936,27 @@ where
         Ok(())
     }
 
+    async fn ensure_directory_parent_namespace_mutation_allowed(
+        &self,
+        parent: u64,
+        uid: u32,
+        gid: u32,
+    ) -> FuseResult<()> {
+        let Some(attr) = self.stat_ino(parent as i64).await else {
+            return Err(libc::ENOENT.into());
+        };
+        if !matches!(attr.kind, VfsFileType::Dir) {
+            return Err(libc::ENOTDIR.into());
+        }
+        self.ensure_access_allowed(
+            parent as i64,
+            uid,
+            gid,
+            parent_namespace_mutation_access_mask(),
+        )
+        .await
+    }
+
     async fn acl_access_mode_for_inode(
         &self,
         ino: i64,
@@ -1994,6 +2000,10 @@ fn opendir_access_mask() -> u32 {
 
 fn namespace_mutation_access_mask() -> u32 {
     (libc::W_OK | libc::X_OK) as u32
+}
+
+fn parent_namespace_mutation_access_mask() -> u32 {
+    namespace_mutation_access_mask()
 }
 
 fn access_mode_from_bits(attr: &VfsFileAttr, uid: u32, gid: u32) -> u32 {
@@ -2237,7 +2247,7 @@ mod mode_sanitization_tests {
     use super::{
         access_mode_from_bits, acl_entries_access_mode, apply_creation_umask,
         namespace_mutation_access_mask, open_flags_access_mask, opendir_access_mask,
-        sanitize_special_mode_bits,
+        parent_namespace_mutation_access_mask, sanitize_special_mode_bits,
     };
     use crate::control::protocol::ControlAclEntry;
     use crate::vfs::fs::{FileAttr as VfsFileAttr, FileType as VfsFileType};
@@ -2365,6 +2375,14 @@ mod mode_sanitization_tests {
         assert_eq!(
             namespace_mutation_access_mask(),
             (libc::W_OK | libc::X_OK) as u32
+        );
+    }
+
+    #[test]
+    fn parent_namespace_mutations_use_namespace_mutation_mask() {
+        assert_eq!(
+            parent_namespace_mutation_access_mask(),
+            namespace_mutation_access_mask()
         );
     }
 
