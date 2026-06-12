@@ -1961,11 +1961,15 @@ where
 }
 
 fn open_flags_access_mask(flags: u32) -> u32 {
-    match flags & (libc::O_ACCMODE as u32) {
+    let mut mask = match flags & (libc::O_ACCMODE as u32) {
         value if value == libc::O_WRONLY as u32 => libc::W_OK as u32,
         value if value == libc::O_RDWR as u32 => (libc::R_OK | libc::W_OK) as u32,
         _ => libc::R_OK as u32,
+    };
+    if (flags & libc::O_TRUNC as u32) != 0 {
+        mask |= libc::W_OK as u32;
     }
+    mask
 }
 
 fn access_mode_from_bits(attr: &VfsFileAttr, uid: u32, gid: u32) -> u32 {
@@ -2318,6 +2322,10 @@ mod mode_sanitization_tests {
         );
         assert_eq!(
             open_flags_access_mask(libc::O_RDWR as u32),
+            (libc::R_OK | libc::W_OK) as u32
+        );
+        assert_eq!(
+            open_flags_access_mask((libc::O_RDONLY | libc::O_TRUNC) as u32),
             (libc::R_OK | libc::W_OK) as u32
         );
     }
