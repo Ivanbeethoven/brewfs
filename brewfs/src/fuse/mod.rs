@@ -488,7 +488,7 @@ where
     }
 
     // Open directory: create handle for caching
-    async fn opendir(&self, _req: Request, ino: u64, _flags: u32) -> FuseResult<ReplyOpen> {
+    async fn opendir(&self, req: Request, ino: u64, _flags: u32) -> FuseResult<ReplyOpen> {
         debug!(ino, "fuse.opendir");
         let Some(attr) = self.stat_ino(ino as i64).await else {
             return Err(libc::ENOENT.into());
@@ -496,6 +496,8 @@ where
         if !matches!(attr.kind, VfsFileType::Dir) {
             return Err(libc::ENOTDIR.into());
         }
+        self.ensure_access_allowed(ino as i64, req.uid, req.gid, opendir_access_mask())
+            .await?;
 
         // Create directory handle for efficient readdir operations
         let fh = self
@@ -1972,6 +1974,10 @@ fn open_flags_access_mask(flags: u32) -> u32 {
     mask
 }
 
+fn opendir_access_mask() -> u32 {
+    libc::R_OK as u32
+}
+
 fn access_mode_from_bits(attr: &VfsFileAttr, uid: u32, gid: u32) -> u32 {
     if uid == attr.uid {
         (attr.mode >> 6) & 0o7
@@ -2212,7 +2218,7 @@ fn attr_request_is_empty(req: &SetAttrRequest) -> bool {
 mod mode_sanitization_tests {
     use super::{
         access_mode_from_bits, acl_entries_access_mode, apply_creation_umask,
-        open_flags_access_mask, sanitize_special_mode_bits,
+        open_flags_access_mask, opendir_access_mask, sanitize_special_mode_bits,
     };
     use crate::control::protocol::ControlAclEntry;
     use crate::vfs::fs::{FileAttr as VfsFileAttr, FileType as VfsFileType};
@@ -2328,6 +2334,11 @@ mod mode_sanitization_tests {
             open_flags_access_mask((libc::O_RDONLY | libc::O_TRUNC) as u32),
             (libc::R_OK | libc::W_OK) as u32
         );
+    }
+
+    #[test]
+    fn opendir_requires_read_access() {
+        assert_eq!(opendir_access_mask(), libc::R_OK as u32);
     }
 
     fn acl_entry(scope: &str, tag: &str, id: Option<u32>, perm: &str) -> ControlAclEntry {
