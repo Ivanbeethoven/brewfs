@@ -24,6 +24,29 @@ export function parentBrowserPath(path: string): string {
   return normalizeBrowserPath(normalized.split('/').slice(0, -1).join('/') || '/');
 }
 
+export type BrowserBreadcrumb = {
+  label: string;
+  path: string;
+  current: boolean;
+};
+
+export function browserBreadcrumbs(path: string): BrowserBreadcrumb[] {
+  const normalized = normalizeBrowserPath(path);
+  if (normalized === '/') return [{ label: '/', path: '/', current: true }];
+
+  const parts = normalized.split('/').filter(Boolean);
+  const breadcrumbs: BrowserBreadcrumb[] = [{ label: '/', path: '/', current: false }];
+  parts.forEach((part, index) => {
+    const crumbPath = `/${parts.slice(0, index + 1).join('/')}`;
+    breadcrumbs.push({
+      label: part,
+      path: crumbPath,
+      current: index === parts.length - 1,
+    });
+  });
+  return breadcrumbs;
+}
+
 export function formatMode(mode: number): string {
   return `0${mode.toString(8)}`;
 }

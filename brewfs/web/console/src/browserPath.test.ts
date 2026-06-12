@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  browserBreadcrumbs,
   browserMvpDataActions,
   formatBrowserEntryFlags,
   formatMode,
@@ -22,6 +23,20 @@ describe('browser path helpers', () => {
     expect(joinBrowserPath('/docs', 'readme')).toBe('/docs/readme');
     expect(parentBrowserPath('/docs/readme')).toBe('/docs');
     expect(parentBrowserPath('/')).toBe('/');
+  });
+
+  it('builds breadcrumb items from normalized browser paths', () => {
+    expect(browserBreadcrumbs('/')).toEqual([{ label: '/', path: '/', current: true }]);
+    expect(browserBreadcrumbs('/projects/logs')).toEqual([
+      { label: '/', path: '/', current: false },
+      { label: 'projects', path: '/projects', current: false },
+      { label: 'logs', path: '/projects/logs', current: true },
+    ]);
+    expect(browserBreadcrumbs('projects/../logs/today')).toEqual([
+      { label: '/', path: '/', current: false },
+      { label: 'logs', path: '/logs', current: false },
+      { label: 'today', path: '/logs/today', current: true },
+    ]);
   });
 
   it('formats numeric modes as octal text', () => {

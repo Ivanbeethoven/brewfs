@@ -492,6 +492,54 @@ h2 {
   margin: 12px 0 0;
 }
 
+.browser-breadcrumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 10px;
+}
+
+.browser-breadcrumb-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.browser-breadcrumb-separator {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.browser-breadcrumb-button {
+  min-width: 0;
+  border: 0;
+  border-radius: 4px;
+  padding: 3px 6px;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+}
+
+.browser-breadcrumb-button span {
+  display: block;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-breadcrumb-button:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.browser-breadcrumb-button:not(:disabled):hover {
+  background: #edf4ff;
+}
+
 .browser-actions {
   margin-bottom: 10px;
 }

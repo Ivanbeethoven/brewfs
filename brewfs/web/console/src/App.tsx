@@ -49,6 +49,7 @@ import {
 import { formatAclDraft, parseAclDraft } from './aclDraft';
 import { loadAclView, type AclViewResult } from './aclView';
 import {
+  browserBreadcrumbs,
   browserMvpDataActions,
   formatBrowserEntryFlags,
   formatMode,
@@ -1783,6 +1784,7 @@ function BrowserPage({
   }
 
   const currentPath = result?.path ?? normalizeBrowserPath(pathInput);
+  const breadcrumbs = browserBreadcrumbs(currentPath);
   const dataActions = browserMvpDataActions();
 
   return (
@@ -1831,6 +1833,26 @@ function BrowserPage({
             {selectedVolume.mount_config.mount_point} · {currentPath}
           </p>
         ) : null}
+        <nav className="browser-breadcrumbs" aria-label="Browser path">
+          {breadcrumbs.map((crumb, index) => (
+            <span className="browser-breadcrumb-item" key={crumb.path}>
+              {index > 0 ? (
+                <span className="browser-breadcrumb-separator" aria-hidden="true">
+                  /
+                </span>
+              ) : null}
+              <button
+                className="browser-breadcrumb-button"
+                type="button"
+                onClick={() => onNavigate(crumb.path)}
+                disabled={loading || crumb.current}
+                aria-current={crumb.current ? 'page' : undefined}
+              >
+                <span>{crumb.path === '/' ? 'Root' : crumb.label}</span>
+              </button>
+            </span>
+          ))}
+        </nav>
         {error ? <p className="error-text">{error}</p> : null}
       </article>
 
