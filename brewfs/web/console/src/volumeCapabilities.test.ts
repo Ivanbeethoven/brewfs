@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { InstanceInfoResponse, VolumeResponse } from './api';
-import { enabledCapabilityLabels, summarizeVolumeCapabilities } from './volumeCapabilities';
+import {
+  aclCapabilityWarning,
+  enabledCapabilityLabels,
+  summarizeVolumeCapabilities,
+} from './volumeCapabilities';
 
 const mountedVolume: VolumeResponse = {
   id: 'vol-1',
@@ -92,5 +96,37 @@ describe('summarizeVolumeCapabilities', () => {
         custom_future_flag: true,
       }),
     ).toEqual(['Namespace', 'custom_future_flag']);
+  });
+
+  it('builds ACL capability warnings for the ACL page', () => {
+    expect(aclCapabilityWarning(null, {})).toBe('Register a filesystem before editing ACLs.');
+    expect(
+      aclCapabilityWarning(
+        {
+          ...mountedVolume,
+          runtime: {
+            mounted: false,
+            pid: null,
+            mount_point: null,
+            started_at: null,
+          },
+        },
+        {},
+      ),
+    ).toBe('Mount this filesystem to inspect ACL capability.');
+    expect(aclCapabilityWarning(mountedVolume, {})).toBe(
+      'ACL capability is unknown until instance details finish loading.',
+    );
+    expect(aclCapabilityWarning(mountedVolume, { 42: instanceInfo })).toBe(
+      'Mounted metadata backend reports ACL unsupported; saving changes will be rejected.',
+    );
+    expect(
+      aclCapabilityWarning(mountedVolume, {
+        42: {
+          ...instanceInfo,
+          capabilities: { acl: true },
+        },
+      }),
+    ).toBeNull();
   });
 });

@@ -64,7 +64,11 @@ import { loadInstanceDetails } from './instanceDetails';
 import { buildMountCommand } from './mountCommand';
 import { loadTrashView, type TrashViewResult } from './trashView';
 import { buildSettingsSummary } from './settingsSummary';
-import { enabledCapabilityLabels, summarizeVolumeCapabilities } from './volumeCapabilities';
+import {
+  aclCapabilityWarning,
+  enabledCapabilityLabels,
+  summarizeVolumeCapabilities,
+} from './volumeCapabilities';
 import { labelsFromText, labelsToText } from './volumeEdit';
 import { formatVolumeRuntime } from './volumeRuntime';
 
@@ -1322,6 +1326,7 @@ function renderPage(page: PageKey, context: RenderContext) {
       <AclPage
         volumes={volumes}
         selectedVolume={selectedAclVolume}
+        capabilityWarning={aclCapabilityWarning(selectedAclVolume, instanceDetails)}
         pathInput={aclPathInput}
         result={aclResult}
         loading={aclLoading}
@@ -1467,6 +1472,7 @@ function TrashPage({
 function AclPage({
   volumes,
   selectedVolume,
+  capabilityWarning,
   pathInput,
   result,
   loading,
@@ -1483,6 +1489,7 @@ function AclPage({
 }: {
   volumes: VolumeResponse[];
   selectedVolume: VolumeResponse | null;
+  capabilityWarning: string | null;
   pathInput: string;
   result: AclViewResult | null;
   loading: boolean;
@@ -1527,6 +1534,7 @@ function AclPage({
           </button>
         </form>
       </div>
+      {capabilityWarning ? <p className="warning-text">{capabilityWarning}</p> : null}
       {loading && !result ? <p className="muted">Loading ACL.</p> : null}
       {error ? <p className="error-text">{error}</p> : null}
       {result ? (

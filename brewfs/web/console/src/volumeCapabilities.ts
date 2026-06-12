@@ -65,6 +65,34 @@ export function enabledCapabilityLabels(capabilities: Record<string, boolean>): 
     .map((entry) => entry.label);
 }
 
+export function aclCapabilityWarning(
+  volume: VolumeResponse | null,
+  instanceDetails: Record<number, InstanceInfoResponse>,
+): string | null {
+  if (!volume) {
+    return 'Register a filesystem before editing ACLs.';
+  }
+
+  if (!volume.runtime.mounted) {
+    return 'Mount this filesystem to inspect ACL capability.';
+  }
+
+  if (volume.runtime.pid === null || !instanceDetails[volume.runtime.pid]) {
+    return 'ACL capability is unknown until instance details finish loading.';
+  }
+
+  const details = instanceDetails[volume.runtime.pid];
+  if (details.capabilities.acl === false) {
+    return 'Mounted metadata backend reports ACL unsupported; saving changes will be rejected.';
+  }
+
+  if (details.capabilities.acl !== true) {
+    return 'ACL capability is unknown until the metadata backend reports it.';
+  }
+
+  return null;
+}
+
 function emptySummary(state: Exclude<VolumeCapabilityState, 'ready'>): VolumeCapabilitySummary {
   return {
     state,

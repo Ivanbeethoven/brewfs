@@ -241,6 +241,10 @@ h2 {
   color: var(--bad);
 }
 
+.warning-text {
+  color: var(--warn);
+}
+
 .auth-form {
   display: grid;
   gap: 10px;
