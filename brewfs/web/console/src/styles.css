@@ -245,6 +245,15 @@ h2 {
   color: var(--warn);
 }
 
+.warning-list {
+  display: grid;
+  gap: 6px;
+}
+
+.warning-list p {
+  margin: 0;
+}
+
 .auth-form {
   display: grid;
   gap: 10px;

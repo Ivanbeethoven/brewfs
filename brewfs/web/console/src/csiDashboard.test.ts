@@ -194,6 +194,62 @@ describe('loadCsiDashboard', () => {
     expect(result.resources).toHaveLength(4);
     expect(result.resources.every((resource) => resource.state === 'unsupported')).toBe(true);
   });
+
+  it('surfaces warnings for stale PVs and unhealthy pod mounts', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch');
+    fetch
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            storageclasses: 1,
+            persistentvolumes: 1,
+            persistentvolumeclaims: 1,
+            pods: 1,
+            unhealthy_mounts: 2,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] }), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [
+              {
+                metadata: { name: 'pv-stale' },
+                status: { phase: 'Released' },
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] }), { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [
+              {
+                metadata: { namespace: 'prod', name: 'pod-stuck' },
+                spec: { volumes: [{ name: 'data', persistentVolumeClaim: { claimName: 'data' } }] },
+                status: {
+                  phase: 'Pending',
+                  conditions: [{ type: 'Ready', status: 'False' }],
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+
+    const result = await loadCsiDashboard('secret-token');
+
+    expect(result.warnings).toEqual([
+      'PersistentVolume pv-stale is Released; inspect claim and reclaim state.',
+      'Pod prod/pod-stuck is Pending · NotReady; inspect node mount and PVC attachment.',
+    ]);
+  });
 });
 
 describe('formatCsiItemCount', () => {

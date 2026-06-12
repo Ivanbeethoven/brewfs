@@ -46,6 +46,7 @@ export interface CsiDashboardResult {
   state: CsiDashboardState;
   title: string;
   message: string;
+  warnings: string[];
   summaryMetrics: CsiDashboardMetric[];
   resources: CsiResourceStatus[];
 }
@@ -101,6 +102,7 @@ export async function loadCsiDashboard(
       state: 'ready',
       title: 'CSI dashboard',
       message: `${summary.pods} pods reference BrewFS volumes; ${summary.unhealthy_mounts} mounts need attention.`,
+      warnings: csiWarnings(resources),
       summaryMetrics: [
         { label: 'StorageClasses', value: String(summary.storageclasses) },
         { label: 'PersistentVolumes', value: String(summary.persistentvolumes) },
@@ -142,6 +144,7 @@ function dashboardErrorOrThrow(err: unknown): CsiDashboardResult {
       state: 'unavailable',
       title: 'CSI dashboard unavailable',
       message: 'Enable the CSI dashboard integration before loading Kubernetes resources.',
+      warnings: [],
       summaryMetrics: [],
       resources: [],
     };
@@ -151,6 +154,7 @@ function dashboardErrorOrThrow(err: unknown): CsiDashboardResult {
       state: 'unavailable',
       title: 'Kubernetes CSI unavailable',
       message: err.detail ?? 'Kubernetes resource discovery failed.',
+      warnings: [],
       summaryMetrics: [],
       resources: [],
     };
@@ -160,6 +164,7 @@ function dashboardErrorOrThrow(err: unknown): CsiDashboardResult {
       state: 'unsupported',
       title: 'CSI dashboard unsupported',
       message: 'The server exposes CSI endpoints but no Kubernetes adapter is connected yet.',
+      warnings: [],
       summaryMetrics: [],
       resources: [],
     };
@@ -206,6 +211,27 @@ function resourceErrorOrThrow(descriptor: CsiResourceDescriptor, err: unknown): 
 
 function isKubernetesError(err: unknown): err is ApiError {
   return err instanceof ApiError && err.status === 502 && err.code === 'kubernetes_error';
+}
+
+function csiWarnings(resources: CsiResourceStatus[]): string[] {
+  return resources.flatMap((resource) => {
+    if (resource.key === 'persistentvolumes') {
+      return resource.rows
+        .filter((row) => row.status !== '-' && row.status !== 'Bound')
+        .map((row) => `PersistentVolume ${row.name} is ${row.status}; inspect claim and reclaim state.`);
+    }
+
+    if (resource.key === 'pods') {
+      return resource.rows
+        .filter((row) => row.status !== 'Running · Ready')
+        .map(
+          (row) =>
+            `Pod ${row.namespace}/${row.name} is ${row.status}; inspect node mount and PVC attachment.`,
+        );
+    }
+
+    return [];
+  });
 }
 
 function resourceRow(key: CsiResourceKey, item: unknown): CsiResourceRow {

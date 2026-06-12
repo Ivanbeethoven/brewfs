@@ -1656,6 +1656,15 @@ function CsiDashboardPage({
         <>
           <Metric label="State" value={result.state} />
           <p className="muted feature-message">{result.message}</p>
+          {result.warnings.length > 0 ? (
+            <div className="warning-list">
+              {result.warnings.map((warning) => (
+                <p className="warning-text" key={warning}>
+                  {warning}
+                </p>
+              ))}
+            </div>
+          ) : null}
           {result.summaryMetrics.length > 0 ? (
             <div className="metadata-grid">
               {result.summaryMetrics.map((metric) => (
