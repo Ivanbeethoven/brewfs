@@ -69,6 +69,7 @@ const MAX_UNFLUSHED_SLICES: usize = 3;
 const MAX_SLICES_THRESHOLD: usize = 800;
 const WRITE_MAX_WAIT: Duration = Duration::from_secs(30);
 const CACHED_SUB_BLOCK_IDLE_GRACE: Duration = Duration::from_secs(3);
+const CACHED_SUB_BLOCK_TOO_MANY_MIN_AGE: Duration = Duration::from_secs(1);
 const WRITEBACK_SOFT_BACKPRESSURE_MIN_SLEEP: Duration = Duration::from_millis(1);
 const WRITEBACK_SOFT_BACKPRESSURE_MAX_SLEEP: Duration = Duration::from_millis(6);
 /// Minimum number of bytes a Writable slice must hold before `should_freeze`
@@ -3338,7 +3339,9 @@ where
                         {
                             trigger = Some(AutoFreezeTrigger::Pressure);
                         }
-                        if trigger.is_none() && too_many {
+                        let cached_too_many_too_young =
+                            cached_sub_block && age <= CACHED_SUB_BLOCK_TOO_MANY_MIN_AGE;
+                        if trigger.is_none() && too_many && !cached_too_many_too_young {
                             // idx <= half represents older slices.
                             if chunk_idx % 2 == pick_bit && idx <= half {
                                 trigger = Some(AutoFreezeTrigger::TooMany);
@@ -5341,6 +5344,52 @@ mod tests {
         })
         .await
         .expect("cached sub-block idle grace should still be bounded");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_auto_flush_too_many_defers_cached_sub_block_slices_during_grace() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store, meta.clone()));
+        let ino = meta
+            .create_file(1, "cached_too_many_deferral.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = Arc::new(DataWriter::new(test_config(layout), backend, reader, None));
+        let file_writer = writer.ensure_file(inode);
+
+        for idx in 0..(MAX_SLICES_THRESHOLD + 16) as u64 {
+            file_writer
+                .write_at_cached(
+                    idx * layout.block_size as u64 * 2,
+                    &[idx as u8; 1024],
+                    idx + 1,
+                )
+                .await
+                .unwrap();
+        }
+
+        sleep(Duration::from_millis(500)).await;
+
+        let breakdown = writer.dirty_breakdown().await;
+        assert!(
+            breakdown.live_slices > MAX_SLICES_THRESHOLD as u64,
+            "test setup should keep enough live slices to trigger tooMany"
+        );
+        assert_eq!(
+            breakdown.upload_partial_tail_auto_too_many_ops, 0,
+            "tooMany should not force cached sub-block tails during the coalescing grace"
+        );
     }
 
     #[tokio::test]
