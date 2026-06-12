@@ -15,6 +15,7 @@
 pub(crate) mod adapter;
 pub mod mount;
 use crate::chunk::store::BlockStore;
+use crate::control::protocol::{CONTROL_ACL_XATTR_NAME, ControlAclEntry};
 use crate::meta::MetaLayer;
 use crate::meta::file_lock::{FileLockQuery, FileLockRange, FileLockType};
 use crate::meta::store::{MetaError, SetAttrFlags, SetAttrRequest};
@@ -444,7 +445,7 @@ where
     }
 
     // Open file: allocate a handle for read/write operations.
-    async fn open(&self, _req: Request, ino: u64, flags: u32) -> FuseResult<ReplyOpen> {
+    async fn open(&self, req: Request, ino: u64, flags: u32) -> FuseResult<ReplyOpen> {
         // Virtual .stats file: allow read-only open, no real file handle needed.
         if ino == STATS_INODE {
             let accmode = flags & (libc::O_ACCMODE as u32);
@@ -467,6 +468,8 @@ where
             has_creat = (flags & libc::O_CREAT as u32) != 0,
             "fuse.open"
         );
+        self.ensure_access_allowed(ino as i64, req.uid, req.gid, open_flags_access_mask(flags))
+            .await?;
         let fh = self
             .open_fresh_ino(ino as i64, read, write, append)
             .await
@@ -1874,18 +1877,31 @@ where
             gid = req.gid,
             "fuse.access"
         );
-        let Some(attr) = self.stat_ino(ino as i64).await else {
+        self.ensure_access_allowed(ino as i64, req.uid, req.gid, mask)
+            .await
+    }
+}
+
+// =============== helpers ===============
+impl<S, M> VFS<S, M>
+where
+    S: BlockStore + Send + Sync + 'static,
+    M: MetaLayer + Send + Sync + 'static,
+{
+    async fn ensure_access_allowed(
+        &self,
+        ino: i64,
+        uid: u32,
+        gid: u32,
+        mask: u32,
+    ) -> FuseResult<()> {
+        let Some(attr) = self.stat_ino(ino).await else {
             return Err(libc::ENOENT.into());
         };
 
-        // F_OK (0) just checks for existence
         if mask == 0 {
             return Ok(());
         }
-
-        // Check if the requesting user has the required access
-        let uid = req.uid;
-        let gid = req.gid;
 
         // Root can access everything (except execute on non-executable files)
         if uid == 0 {
@@ -1896,16 +1912,12 @@ where
             return Ok(());
         }
 
-        // Determine which permission bits to check
-        let mode = if uid == attr.uid {
-            // Owner permissions
-            (attr.mode >> 6) & 0o7
-        } else if gid == attr.gid {
-            // Group permissions
-            (attr.mode >> 3) & 0o7
-        } else {
-            // Other permissions
-            attr.mode & 0o7
+        let mode = match self
+            .acl_access_mode_for_inode(ino as i64, &attr, uid, gid)
+            .await
+        {
+            Some(mode) => mode,
+            None => access_mode_from_bits(&attr, uid, gid),
         };
 
         // Check if the requested access is allowed
@@ -1922,9 +1934,116 @@ where
 
         Ok(())
     }
+
+    async fn acl_access_mode_for_inode(
+        &self,
+        ino: i64,
+        attr: &VfsFileAttr,
+        uid: u32,
+        gid: u32,
+    ) -> Option<u32> {
+        let raw = match self.get_xattr_ino(ino, CONTROL_ACL_XATTR_NAME).await {
+            Ok(Some(raw)) => raw,
+            Ok(None) => return None,
+            Err(err) => {
+                warn!(ino, error = %err, "failed to load ACL xattr for access check");
+                return None;
+            }
+        };
+        match serde_json::from_slice::<Vec<ControlAclEntry>>(&raw) {
+            Ok(entries) => acl_entries_access_mode(&entries, attr, uid, gid),
+            Err(err) => {
+                warn!(ino, error = %err, "invalid ACL xattr for access check");
+                None
+            }
+        }
+    }
 }
 
-// =============== helpers ===============
+fn open_flags_access_mask(flags: u32) -> u32 {
+    match flags & (libc::O_ACCMODE as u32) {
+        value if value == libc::O_WRONLY as u32 => libc::W_OK as u32,
+        value if value == libc::O_RDWR as u32 => (libc::R_OK | libc::W_OK) as u32,
+        _ => libc::R_OK as u32,
+    }
+}
+
+fn access_mode_from_bits(attr: &VfsFileAttr, uid: u32, gid: u32) -> u32 {
+    if uid == attr.uid {
+        (attr.mode >> 6) & 0o7
+    } else if gid == attr.gid {
+        (attr.mode >> 3) & 0o7
+    } else {
+        attr.mode & 0o7
+    }
+}
+
+fn acl_entries_access_mode(
+    entries: &[ControlAclEntry],
+    attr: &VfsFileAttr,
+    uid: u32,
+    gid: u32,
+) -> Option<u32> {
+    if uid == attr.uid {
+        return find_acl_perm(entries, "access", "user_obj", None);
+    }
+
+    if let Some(mode) = find_acl_perm(entries, "access", "user", Some(uid)) {
+        return Some(apply_acl_mask(entries, mode));
+    }
+
+    let mut group_mode = None;
+    if gid == attr.gid
+        && let Some(mode) = find_acl_perm(entries, "access", "group_obj", None)
+    {
+        group_mode = Some(mode);
+    }
+    if let Some(mode) = find_acl_perm(entries, "access", "group", Some(gid)) {
+        group_mode = Some(group_mode.unwrap_or(0) | mode);
+    }
+    if let Some(mode) = group_mode {
+        return Some(apply_acl_mask(entries, mode));
+    }
+
+    find_acl_perm(entries, "access", "other", None)
+}
+
+fn apply_acl_mask(entries: &[ControlAclEntry], mode: u32) -> u32 {
+    match find_acl_perm(entries, "access", "mask", None) {
+        Some(mask) => mode & mask,
+        None => mode,
+    }
+}
+
+fn find_acl_perm(
+    entries: &[ControlAclEntry],
+    scope: &str,
+    tag: &str,
+    id: Option<u32>,
+) -> Option<u32> {
+    entries
+        .iter()
+        .find(|entry| entry.scope == scope && entry.tag == tag && entry.id == id)
+        .and_then(|entry| acl_perm_bits(&entry.perm))
+}
+
+fn acl_perm_bits(perm: &str) -> Option<u32> {
+    if perm.len() != 3 {
+        return None;
+    }
+    let mut bits = 0;
+    for (index, ch) in perm.chars().enumerate() {
+        match (index, ch) {
+            (0, 'r') => bits |= 0o4,
+            (1, 'w') => bits |= 0o2,
+            (2, 'x') => bits |= 0o1,
+            (_, '-') => {}
+            _ => return None,
+        }
+    }
+    Some(bits)
+}
+
 impl From<MetaError> for Errno {
     fn from(val: MetaError) -> Self {
         let code = match val {
@@ -2087,7 +2206,12 @@ fn attr_request_is_empty(req: &SetAttrRequest) -> bool {
 
 #[cfg(test)]
 mod mode_sanitization_tests {
-    use super::{apply_creation_umask, sanitize_special_mode_bits};
+    use super::{
+        access_mode_from_bits, acl_entries_access_mode, apply_creation_umask,
+        open_flags_access_mask, sanitize_special_mode_bits,
+    };
+    use crate::control::protocol::ControlAclEntry;
+    use crate::vfs::fs::{FileAttr as VfsFileAttr, FileType as VfsFileType};
     use std::collections::BTreeSet;
 
     #[test]
@@ -2129,6 +2253,98 @@ mod mode_sanitization_tests {
         assert_eq!(seen.len(), TOTAL_CHILDREN);
         assert_eq!(seen.first().copied(), Some(0));
         assert_eq!(seen.last().copied(), Some(TOTAL_CHILDREN - 1));
+    }
+
+    #[test]
+    fn acl_access_mode_prefers_named_user_entry_over_mode_bits() {
+        let attr = test_attr(0o644, 1000, 1000);
+        let entries = vec![
+            acl_entry("access", "user_obj", None, "rw-"),
+            acl_entry("access", "user", Some(2000), "r--"),
+            acl_entry("access", "group_obj", None, "---"),
+            acl_entry("access", "mask", None, "r--"),
+            acl_entry("access", "other", None, "---"),
+        ];
+
+        assert_eq!(
+            acl_entries_access_mode(&entries, &attr, 2000, 3000),
+            Some(0o4)
+        );
+        assert_eq!(
+            acl_entries_access_mode(&entries, &attr, 3000, 3000),
+            Some(0o0)
+        );
+    }
+
+    #[test]
+    fn acl_access_mode_applies_mask_to_group_class() {
+        let attr = test_attr(0o664, 1000, 2000);
+        let entries = vec![
+            acl_entry("access", "user_obj", None, "rw-"),
+            acl_entry("access", "group_obj", None, "rw-"),
+            acl_entry("access", "group", Some(3000), "rwx"),
+            acl_entry("access", "mask", None, "r--"),
+            acl_entry("access", "other", None, "---"),
+        ];
+
+        assert_eq!(
+            acl_entries_access_mode(&entries, &attr, 4000, 3000),
+            Some(0o4)
+        );
+        assert_eq!(
+            acl_entries_access_mode(&entries, &attr, 4000, 2000),
+            Some(0o4)
+        );
+    }
+
+    #[test]
+    fn access_mode_from_bits_remains_mode_fallback_without_acl() {
+        let attr = test_attr(0o640, 1000, 2000);
+
+        assert_eq!(access_mode_from_bits(&attr, 1000, 3000), 0o6);
+        assert_eq!(access_mode_from_bits(&attr, 3000, 2000), 0o4);
+        assert_eq!(access_mode_from_bits(&attr, 3000, 4000), 0o0);
+    }
+
+    #[test]
+    fn open_flags_map_to_access_masks() {
+        assert_eq!(
+            open_flags_access_mask(libc::O_RDONLY as u32),
+            libc::R_OK as u32
+        );
+        assert_eq!(
+            open_flags_access_mask(libc::O_WRONLY as u32),
+            libc::W_OK as u32
+        );
+        assert_eq!(
+            open_flags_access_mask(libc::O_RDWR as u32),
+            (libc::R_OK | libc::W_OK) as u32
+        );
+    }
+
+    fn acl_entry(scope: &str, tag: &str, id: Option<u32>, perm: &str) -> ControlAclEntry {
+        ControlAclEntry {
+            scope: scope.to_string(),
+            tag: tag.to_string(),
+            id,
+            perm: perm.to_string(),
+        }
+    }
+
+    fn test_attr(mode: u32, uid: u32, gid: u32) -> VfsFileAttr {
+        VfsFileAttr {
+            ino: 2,
+            size: 0,
+            blocks: 0,
+            kind: VfsFileType::File,
+            mode,
+            uid,
+            gid,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            nlink: 1,
+        }
     }
 }
 

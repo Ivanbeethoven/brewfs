@@ -1,6 +1,8 @@
 use crate::control::job::{JobInfo, JobOutcome, JobState};
 use crate::meta::store::{FileAttr, FileType, MetaStoreCapabilities};
 
+pub const CONTROL_ACL_XATTR_NAME: &str = "system.brewfs.acl";
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ControlRequest {
     Ping,

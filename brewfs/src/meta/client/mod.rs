@@ -5,8 +5,8 @@ pub mod session;
 use crate::chunk::SliceDesc;
 use crate::control::job::{GcJobResult, JobManager};
 use crate::control::protocol::{
-    ControlAclEntry, ControlDirectoryEntry, ControlFileKind, ControlPathMetadata, ControlRequest,
-    ControlResponse, ControlTrashEntry, validate_acl_entries,
+    CONTROL_ACL_XATTR_NAME, ControlAclEntry, ControlDirectoryEntry, ControlFileKind,
+    ControlPathMetadata, ControlRequest, ControlResponse, ControlTrashEntry, validate_acl_entries,
 };
 use crate::control::runtime::{InstanceRecord, RuntimeRegistry};
 use crate::control::server::{ControlHandler, ControlServer};
@@ -40,7 +40,6 @@ use cache::{InodeCache, OpenFileCache};
 use chrono::Utc;
 use hostname::get as get_hostname;
 
-const CONTROL_ACL_XATTR_NAME: &str = "system.brewfs.acl";
 const CONTROL_TRASH_XATTR_NAME: &str = "system.brewfs.trash";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
