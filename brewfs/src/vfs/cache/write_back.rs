@@ -230,8 +230,6 @@ impl WriteBackCache for FsWriteBackCache {
         let meta_path = key.meta_path(&self.root);
         let _ = fs::remove_file(&slice_path).await;
         let _ = fs::remove_file(&meta_path).await;
-        let dir = key.dir_path(&self.root);
-        let _ = fs::remove_dir(&dir).await;
         Ok(())
     }
 }
@@ -350,5 +348,42 @@ mod tests {
         let records = cache.recover().await.unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].length, 11);
+    }
+
+    #[tokio::test]
+    async fn remove_keeps_shared_chunk_directory_for_concurrent_slices() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), false);
+        let old_key = DirtySliceKey {
+            ino: 9,
+            chunk_id: 13,
+            local_seq: 21,
+            epoch: 0,
+        };
+        let new_key = DirtySliceKey {
+            local_seq: 22,
+            ..old_key
+        };
+
+        cache
+            .persist_slice(old_key, vec![Bytes::from_static(b"old")], 0)
+            .await
+            .unwrap();
+        cache.remove(&old_key).await.unwrap();
+
+        assert!(
+            old_key.dir_path(temp.path()).exists(),
+            "dirty slice cleanup must not remove the ino/chunk directory shared by newer slices"
+        );
+        cache
+            .persist_slice(new_key, vec![Bytes::from_static(b"new")], 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(new_key.slice_path(temp.path()))
+                .await
+                .unwrap(),
+            b"new"
+        );
     }
 }

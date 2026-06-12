@@ -68,6 +68,7 @@ const AUTO_FLUSH_MAX_AGE: Duration = Duration::from_millis(500);
 const MAX_UNFLUSHED_SLICES: usize = 3;
 const MAX_SLICES_THRESHOLD: usize = 800;
 const WRITE_MAX_WAIT: Duration = Duration::from_secs(30);
+const WRITEBACK_WRITE_MAX_WAIT: Duration = Duration::from_secs(300);
 const CACHED_SUB_BLOCK_IDLE_GRACE: Duration = Duration::from_secs(3);
 const CACHED_SUB_BLOCK_TOO_MANY_MIN_AGE: Duration = Duration::from_secs(1);
 const WRITEBACK_SOFT_BACKPRESSURE_MIN_SLEEP: Duration = Duration::from_millis(1);
@@ -114,6 +115,13 @@ fn decide_writeback_backpressure(
     }
 
     WritebackBackpressureDecision::Wait
+}
+
+fn write_buffer_max_wait(mode: WriteBackMode) -> Duration {
+    match mode {
+        WriteBackMode::CommitBeforeUpload => WRITEBACK_WRITE_MAX_WAIT,
+        WriteBackMode::UploadBeforeCommit => WRITE_MAX_WAIT,
+    }
 }
 
 fn truncate_flush_deadline() -> Duration {
@@ -272,8 +280,8 @@ pub(crate) struct SliceState {
     /// True while this slice's bytes are included in pending-upload accounting.
     recent_pending_accounted: bool,
     /// Bytes successfully persisted to the local writeback stage for this
-    /// slice. This is diagnostic-only for now; early metadata commit still
-    /// keeps the existing behavior.
+    /// slice. Commit-before-upload may publish metadata only after this covers
+    /// the whole sealed slice.
     writeback_persisted_bytes: u64,
     data: CacheSlice,
     usage: UsageGuard,
@@ -1784,8 +1792,9 @@ where
 
         // Above hard limit: aggressive sleep loop until buffer drains
         let mut total_wait = Duration::ZERO;
+        let max_wait = write_buffer_max_wait(self.shared.config.writeback_mode);
         while self.shared.buffer_usage.load(Ordering::Relaxed) > hard_limit {
-            if total_wait >= WRITE_MAX_WAIT {
+            if total_wait >= max_wait {
                 return Err(anyhow::anyhow!(
                     "Timeout waiting for write buffer after {:?}. Current usage: {} bytes, limit: {} bytes",
                     total_wait,
@@ -2498,14 +2507,26 @@ where
                                 shared_for_persist
                                     .recent_pending_upload
                                     .record_stage_finish(stage_start, data_len, result.is_ok());
-                                if result.is_ok() {
-                                    SliceHandle {
-                                        slice: &slice_for_persist,
-                                        shared: &shared_for_persist,
+                                match result {
+                                    Ok(()) => {
+                                        SliceHandle {
+                                            slice: &slice_for_persist,
+                                            shared: &shared_for_persist,
+                                        }
+                                        .mark_writeback_persisted(data_len);
+                                        Ok(())
                                     }
-                                    .mark_writeback_persisted(data_len);
+                                    Err(err) => {
+                                        let message =
+                                            format!("writeback stage persist failed: {err}");
+                                        SliceHandle {
+                                            slice: &slice_for_persist,
+                                            shared: &shared_for_persist,
+                                        }
+                                        .mark_failed(anyhow::anyhow!(message));
+                                        Err(err)
+                                    }
                                 }
-                                result
                             }
                         });
 
@@ -2545,10 +2566,11 @@ where
                         let (persist_result, result) =
                             join_best_effort_persist(persist, upload).await;
                         if let Some(Err(e)) = persist_result {
-                            tracing::debug!(
+                            warn!(
                                 ino, chunk_id, slice_id, error = ?e,
-                                "SSD persist skipped"
+                                "writeback stage persist failed"
                             );
+                            return Err(anyhow::anyhow!("writeback stage persist failed: {e}"));
                         }
 
                         match result {
@@ -2866,65 +2888,77 @@ where
                         let desc = handle.desc_for_commit();
 
                         if let Some(desc) = desc {
-                            let (claimed, commit_before_stage) = {
-                                let mut s = slice.lock();
-                                if s.meta_write_started {
-                                    (false, false)
-                                } else {
-                                    s.meta_write_started = true;
-                                    (
-                                        true,
-                                        shared.write_back.is_some()
-                                            && !s.writeback_fully_persisted(),
-                                    )
-                                }
+                            let stage_ready = {
+                                let s = slice.lock();
+                                shared.write_back.is_none() || s.writeback_fully_persisted()
                             };
+                            if !stage_ready {
+                                false
+                            } else {
+                                let (claimed, commit_before_stage) = {
+                                    let mut s = slice.lock();
+                                    if s.meta_write_started {
+                                        (false, false)
+                                    } else {
+                                        s.meta_write_started = true;
+                                        (
+                                            true,
+                                            shared.write_back.is_some()
+                                                && !s.writeback_fully_persisted(),
+                                        )
+                                    }
+                                };
 
-                            if !claimed {
-                                continue;
-                            }
-                            if commit_before_stage {
-                                shared.recent_pending_upload.record_commit_before_stage();
-                            }
-
-                            let (ino, chunk_index) = extract_ino_and_chunk_index(desc.chunk_id);
-                            let file_offset =
-                                chunk_index * shared.config.layout.chunk_size + desc.offset;
-                            let new_size = file_offset + desc.length;
-
-                            let result = shared
-                                .backend
-                                .meta()
-                                .write(ino, desc.chunk_id, desc, new_size)
-                                .await;
-
-                            match result {
-                                Ok(()) => {
-                                    commit_failures = 0;
-                                    shared.inode.set_committed_size(new_size);
-                                    shared.inode.add_estimated_allocated_bytes(
-                                        desc.length.as_usize() as u64,
-                                    );
-                                    let _ = shared
-                                        .reader
-                                        .invalidate(ino as u64, file_offset, desc.length.as_usize())
-                                        .await;
-                                    handle.mark_committed();
-                                    true
+                                if !claimed {
+                                    continue;
                                 }
-                                Err(err) => {
-                                    slice.lock().meta_write_started = false;
-                                    warn!(
-                                        ino,
-                                        chunk_id = desc.chunk_id,
-                                        slice_id = desc.slice_id,
-                                        offset = desc.offset,
-                                        len = desc.length,
-                                        new_size,
-                                        error = ?err,
-                                        "commit-before-upload metadata write failed; falling back to upload-before-commit wait"
-                                    );
-                                    false
+                                if commit_before_stage {
+                                    shared.recent_pending_upload.record_commit_before_stage();
+                                }
+
+                                let (ino, chunk_index) = extract_ino_and_chunk_index(desc.chunk_id);
+                                let file_offset =
+                                    chunk_index * shared.config.layout.chunk_size + desc.offset;
+                                let new_size = file_offset + desc.length;
+
+                                let result = shared
+                                    .backend
+                                    .meta()
+                                    .write(ino, desc.chunk_id, desc, new_size)
+                                    .await;
+
+                                match result {
+                                    Ok(()) => {
+                                        commit_failures = 0;
+                                        shared.inode.set_committed_size(new_size);
+                                        shared.inode.add_estimated_allocated_bytes(
+                                            desc.length.as_usize() as u64,
+                                        );
+                                        let _ = shared
+                                            .reader
+                                            .invalidate(
+                                                ino as u64,
+                                                file_offset,
+                                                desc.length.as_usize(),
+                                            )
+                                            .await;
+                                        handle.mark_committed();
+                                        true
+                                    }
+                                    Err(err) => {
+                                        slice.lock().meta_write_started = false;
+                                        warn!(
+                                            ino,
+                                            chunk_id = desc.chunk_id,
+                                            slice_id = desc.slice_id,
+                                            offset = desc.offset,
+                                            len = desc.length,
+                                            new_size,
+                                            error = ?err,
+                                            "commit-before-upload metadata write failed; falling back to upload-before-commit wait"
+                                        );
+                                        false
+                                    }
                                 }
                             }
                         } else {
@@ -4201,6 +4235,18 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_before_upload_extends_write_buffer_wait_budget() {
+        assert_eq!(
+            write_buffer_max_wait(WriteBackMode::UploadBeforeCommit),
+            WRITE_MAX_WAIT
+        );
+        assert!(
+            write_buffer_max_wait(WriteBackMode::CommitBeforeUpload) > WRITE_MAX_WAIT,
+            "commit-before-upload can legitimately wait on local stage plus remote upload"
+        );
+    }
+
+    #[test]
     fn test_writeback_phase_metrics_track_stage_and_remote_upload() {
         let state = Arc::new(RecentPendingUploadState::new());
 
@@ -4977,6 +5023,62 @@ mod tests {
         })
         .await
         .expect("dirty record should be removed after object upload completes");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_commit_before_upload_requires_writeback_stage_success() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(BlockingStore::new(true));
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
+        let ino = meta
+            .create_file(1, "stage_failure_blocks_commit.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let invalid_root = temp.path().join("not-a-directory");
+        std::fs::write(&invalid_root, b"not a directory").unwrap();
+        let write_back = Arc::new(
+            crate::vfs::cache::write_back::FsWriteBackCache::new_with_sync(invalid_root, false),
+        );
+        let writer = Arc::new(DataWriter::new(
+            test_config_with_writeback(layout, WriteBackMode::CommitBeforeUpload),
+            backend,
+            reader,
+            Some(write_back),
+        ));
+        let file_writer = writer.ensure_file(inode);
+
+        file_writer
+            .write_at(0, &vec![6u8; layout.block_size as usize])
+            .await
+            .unwrap();
+
+        let flush_result = timeout(Duration::from_secs(2), file_writer.flush())
+            .await
+            .expect("flush should not hang when local staging fails");
+        store.unblock();
+        let err = flush_result.expect_err("metadata must not commit after staging failure");
+        assert!(
+            err.to_string().contains("writeback failed"),
+            "unexpected flush error: {err:?}"
+        );
+
+        let breakdown = writer.dirty_breakdown().await;
+        assert_eq!(breakdown.stage_failures, 1);
+        assert_eq!(
+            breakdown.commit_before_stage_ops, 0,
+            "staging failures must block metadata commit-before-upload"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
