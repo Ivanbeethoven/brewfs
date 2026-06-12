@@ -1232,6 +1232,10 @@ struct RecentPendingUploadState {
     stage_us: AtomicU64,
     stage_failures: AtomicU64,
     commit_before_stage_ops: AtomicU64,
+    commit_wait_upload_ops: AtomicU64,
+    commit_wait_upload_us: AtomicU64,
+    commit_wait_retry_ops: AtomicU64,
+    commit_wait_retry_us: AtomicU64,
     slice_create_ops: AtomicU64,
     slice_reuse_ops: AtomicU64,
     slice_reject_older_unique_ops: AtomicU64,
@@ -1299,6 +1303,10 @@ impl RecentPendingUploadState {
             stage_us: AtomicU64::new(0),
             stage_failures: AtomicU64::new(0),
             commit_before_stage_ops: AtomicU64::new(0),
+            commit_wait_upload_ops: AtomicU64::new(0),
+            commit_wait_upload_us: AtomicU64::new(0),
+            commit_wait_retry_ops: AtomicU64::new(0),
+            commit_wait_retry_us: AtomicU64::new(0),
             slice_create_ops: AtomicU64::new(0),
             slice_reuse_ops: AtomicU64::new(0),
             slice_reject_older_unique_ops: AtomicU64::new(0),
@@ -1386,6 +1394,22 @@ impl RecentPendingUploadState {
 
     fn record_commit_before_stage(&self) {
         self.commit_before_stage_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_commit_wait_upload(&self, duration: Duration) {
+        self.commit_wait_upload_ops.fetch_add(1, Ordering::Relaxed);
+        self.commit_wait_upload_us.fetch_add(
+            duration.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_commit_wait_retry(&self, duration: Duration) {
+        self.commit_wait_retry_ops.fetch_add(1, Ordering::Relaxed);
+        self.commit_wait_retry_us.fetch_add(
+            duration.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     fn record_slice_create(&self) {
@@ -2700,11 +2724,14 @@ where
             }
 
             if !runtime.upload_done() {
-                if timeout(COMMIT_WAIT_SLICE, runtime.notify.notified())
+                let wait_start = Instant::now();
+                let wait_result = timeout(COMMIT_WAIT_SLICE, runtime.notify.notified())
                     .instrument(tracing::trace_span!("commit_chunk.wait_upload"))
-                    .await
-                    .is_ok()
-                {
+                    .await;
+                shared
+                    .recent_pending_upload
+                    .record_commit_wait_upload(wait_start.elapsed());
+                if wait_result.is_ok() {
                     continue;
                 }
 
@@ -3052,9 +3079,13 @@ where
                     backoff_ms = backoff.as_millis() as u64,
                     "commit_chunk retrying"
                 );
+                let wait_start = Instant::now();
                 tokio::time::sleep(backoff)
                     .instrument(tracing::trace_span!("commit_chunk.wait_retry"))
                     .await;
+                shared
+                    .recent_pending_upload
+                    .record_commit_wait_retry(wait_start.elapsed());
                 continue;
             }
 
@@ -3314,6 +3345,10 @@ pub(crate) struct WritebackDirtyBreakdown {
     pub stage_us: u64,
     pub stage_failures: u64,
     pub commit_before_stage_ops: u64,
+    pub commit_wait_upload_ops: u64,
+    pub commit_wait_upload_us: u64,
+    pub commit_wait_retry_ops: u64,
+    pub commit_wait_retry_us: u64,
     pub slice_create_ops: u64,
     pub slice_reuse_ops: u64,
     pub slice_reject_older_unique_ops: u64,
@@ -3451,6 +3486,22 @@ where
             commit_before_stage_ops: self
                 .recent_pending_upload
                 .commit_before_stage_ops
+                .load(Ordering::Relaxed),
+            commit_wait_upload_ops: self
+                .recent_pending_upload
+                .commit_wait_upload_ops
+                .load(Ordering::Relaxed),
+            commit_wait_upload_us: self
+                .recent_pending_upload
+                .commit_wait_upload_us
+                .load(Ordering::Relaxed),
+            commit_wait_retry_ops: self
+                .recent_pending_upload
+                .commit_wait_retry_ops
+                .load(Ordering::Relaxed),
+            commit_wait_retry_us: self
+                .recent_pending_upload
+                .commit_wait_retry_us
                 .load(Ordering::Relaxed),
             slice_create_ops: self
                 .recent_pending_upload
@@ -3942,6 +3993,8 @@ mod tests {
         }
 
         state.record_commit_before_stage();
+        state.record_commit_wait_upload(Duration::from_micros(21));
+        state.record_commit_wait_retry(Duration::from_micros(34));
 
         assert_eq!(state.stage_inflight_bytes.load(Ordering::Acquire), 0);
         assert_eq!(
@@ -3953,6 +4006,10 @@ mod tests {
         assert!(state.stage_us.load(Ordering::Relaxed) > 0);
         assert_eq!(state.stage_failures.load(Ordering::Relaxed), 0);
         assert_eq!(state.commit_before_stage_ops.load(Ordering::Relaxed), 1);
+        assert_eq!(state.commit_wait_upload_ops.load(Ordering::Relaxed), 1);
+        assert_eq!(state.commit_wait_upload_us.load(Ordering::Relaxed), 21);
+        assert_eq!(state.commit_wait_retry_ops.load(Ordering::Relaxed), 1);
+        assert_eq!(state.commit_wait_retry_us.load(Ordering::Relaxed), 34);
     }
 
     #[test]

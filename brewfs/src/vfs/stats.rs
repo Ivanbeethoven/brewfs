@@ -99,6 +99,10 @@ pub struct FsStatsSnapshot {
     pub writeback_stage_lat_us: u64,
     pub writeback_stage_failures: u64,
     pub writeback_commit_before_stage_ops: u64,
+    pub writeback_commit_wait_upload_ops: u64,
+    pub writeback_commit_wait_upload_us: u64,
+    pub writeback_commit_wait_retry_ops: u64,
+    pub writeback_commit_wait_retry_us: u64,
     pub writeback_slice_create_ops: u64,
     pub writeback_slice_reuse_ops: u64,
     pub writeback_slice_reject_older_unique_ops: u64,
@@ -382,6 +386,14 @@ pub struct FsStats {
     pub writeback_stage_failures: AtomicU64,
     /// Metadata commits that happened before local staging finished.
     pub writeback_commit_before_stage_ops: AtomicU64,
+    /// Commit-loop waits for a slice upload notification or timeout.
+    pub writeback_commit_wait_upload_ops: AtomicU64,
+    /// Total commit-loop upload wait duration in microseconds.
+    pub writeback_commit_wait_upload_us: AtomicU64,
+    /// Commit-loop retry backoff sleeps after commit conditions are not met.
+    pub writeback_commit_wait_retry_ops: AtomicU64,
+    /// Total commit-loop retry backoff duration in microseconds.
+    pub writeback_commit_wait_retry_us: AtomicU64,
     /// Newly-created writer slices.
     pub writeback_slice_create_ops: AtomicU64,
     /// Writes that reused an existing writer slice.
@@ -590,6 +602,10 @@ impl FsStats {
             writeback_stage_lat_us: AtomicU64::new(0),
             writeback_stage_failures: AtomicU64::new(0),
             writeback_commit_before_stage_ops: AtomicU64::new(0),
+            writeback_commit_wait_upload_ops: AtomicU64::new(0),
+            writeback_commit_wait_upload_us: AtomicU64::new(0),
+            writeback_commit_wait_retry_ops: AtomicU64::new(0),
+            writeback_commit_wait_retry_us: AtomicU64::new(0),
             writeback_slice_create_ops: AtomicU64::new(0),
             writeback_slice_reuse_ops: AtomicU64::new(0),
             writeback_slice_reject_older_unique_ops: AtomicU64::new(0),
@@ -751,6 +767,10 @@ impl FsStats {
             writeback_stage_lat_us: self.writeback_stage_lat_us.load(ORD),
             writeback_stage_failures: self.writeback_stage_failures.load(ORD),
             writeback_commit_before_stage_ops: self.writeback_commit_before_stage_ops.load(ORD),
+            writeback_commit_wait_upload_ops: self.writeback_commit_wait_upload_ops.load(ORD),
+            writeback_commit_wait_upload_us: self.writeback_commit_wait_upload_us.load(ORD),
+            writeback_commit_wait_retry_ops: self.writeback_commit_wait_retry_ops.load(ORD),
+            writeback_commit_wait_retry_us: self.writeback_commit_wait_retry_us.load(ORD),
             writeback_slice_create_ops: self.writeback_slice_create_ops.load(ORD),
             writeback_slice_reuse_ops: self.writeback_slice_reuse_ops.load(ORD),
             writeback_slice_reject_older_unique_ops: self
@@ -974,6 +994,19 @@ impl FsStats {
         self.writeback_stage_failures.store(stage_failures, ORD);
         self.writeback_commit_before_stage_ops
             .store(commit_before_stage_ops, ORD);
+    }
+
+    pub fn sync_writeback_commit_wait_metrics(
+        &self,
+        upload_ops: u64,
+        upload_us: u64,
+        retry_ops: u64,
+        retry_us: u64,
+    ) {
+        self.writeback_commit_wait_upload_ops.store(upload_ops, ORD);
+        self.writeback_commit_wait_upload_us.store(upload_us, ORD);
+        self.writeback_commit_wait_retry_ops.store(retry_ops, ORD);
+        self.writeback_commit_wait_retry_us.store(retry_us, ORD);
     }
 
     pub fn sync_writeback_slice_selection_metrics(
@@ -1566,6 +1599,22 @@ impl FsStats {
             snapshot.writeback_commit_before_stage_ops
         ));
         out.push_str(&format!(
+            "brewfs_writeback_commit_wait_upload_ops_total {}\n",
+            snapshot.writeback_commit_wait_upload_ops
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_commit_wait_upload_us_total {}\n",
+            snapshot.writeback_commit_wait_upload_us
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_commit_wait_retry_ops_total {}\n",
+            snapshot.writeback_commit_wait_retry_ops
+        ));
+        out.push_str(&format!(
+            "brewfs_writeback_commit_wait_retry_us_total {}\n",
+            snapshot.writeback_commit_wait_retry_us
+        ));
+        out.push_str(&format!(
             "brewfs_writeback_slice_create_ops_total {}\n",
             snapshot.writeback_slice_create_ops
         ));
@@ -1934,6 +1983,7 @@ mod tests {
         stats.add_writeback_backpressure_soft_sleep(Duration::from_micros(12));
         stats.add_writeback_backpressure_hard_wait(Duration::from_micros(34));
         stats.sync_writeback_phase_metrics(1, 2, 3, 4, 5, 6, 7);
+        stats.sync_writeback_commit_wait_metrics(40, 41, 42, 43);
         stats.sync_writeback_slice_selection_metrics(8, 9, 10, 11);
         stats.sync_writeback_freeze_metrics(12, 1024, 13, 2048, 14, 4096, 15, 8192, 16, 16384);
         stats.sync_writeback_upload_batch_metrics(
@@ -2001,6 +2051,10 @@ mod tests {
         assert!(output.contains("brewfs_writeback_stage_lat_us_total 5"));
         assert!(output.contains("brewfs_writeback_stage_failures_total 6"));
         assert!(output.contains("brewfs_writeback_commit_before_stage_ops_total 7"));
+        assert!(output.contains("brewfs_writeback_commit_wait_upload_ops_total 40"));
+        assert!(output.contains("brewfs_writeback_commit_wait_upload_us_total 41"));
+        assert!(output.contains("brewfs_writeback_commit_wait_retry_ops_total 42"));
+        assert!(output.contains("brewfs_writeback_commit_wait_retry_us_total 43"));
         assert!(output.contains("brewfs_writeback_slice_create_ops_total 8"));
         assert!(output.contains("brewfs_writeback_slice_reuse_ops_total 9"));
         assert!(output.contains("brewfs_writeback_slice_reject_older_unique_ops_total 10"));
@@ -2084,6 +2138,7 @@ mod tests {
         stats.add_writeback_backpressure_hard_wait(Duration::from_micros(55));
         stats.sync_writeback_backpressure_metrics(66, 77, 88, 99);
         stats.sync_writeback_phase_metrics(111, 222, 333, 444, 555, 666, 777);
+        stats.sync_writeback_commit_wait_metrics(778, 779, 780, 781);
         stats.sync_writeback_slice_selection_metrics(888, 999, 1000, 1001);
         stats.sync_writeback_freeze_metrics(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
         stats.sync_writeback_upload_batch_metrics(
@@ -2130,6 +2185,10 @@ mod tests {
         assert_eq!(snapshot.writeback_stage_lat_us, 555);
         assert_eq!(snapshot.writeback_stage_failures, 666);
         assert_eq!(snapshot.writeback_commit_before_stage_ops, 777);
+        assert_eq!(snapshot.writeback_commit_wait_upload_ops, 778);
+        assert_eq!(snapshot.writeback_commit_wait_upload_us, 779);
+        assert_eq!(snapshot.writeback_commit_wait_retry_ops, 780);
+        assert_eq!(snapshot.writeback_commit_wait_retry_us, 781);
         assert_eq!(snapshot.writeback_slice_create_ops, 888);
         assert_eq!(snapshot.writeback_slice_reuse_ops, 999);
         assert_eq!(snapshot.writeback_slice_reject_older_unique_ops, 1000);

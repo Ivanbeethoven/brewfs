@@ -69,6 +69,10 @@ brewfs_writeback_backpressure_soft_sleep_ops 12
 brewfs_writeback_backpressure_soft_sleep_us 36000
 brewfs_writeback_backpressure_hard_wait_ops 3
 brewfs_writeback_backpressure_hard_wait_us 9000
+brewfs_writeback_commit_wait_upload_ops_total $((put_ops / 2))
+brewfs_writeback_commit_wait_upload_us_total $((put_ops * 1000))
+brewfs_writeback_commit_wait_retry_ops_total $partial_tail_ops
+brewfs_writeback_commit_wait_retry_us_total $((partial_tail_ops * 2000))
 brewfs_writeback_slice_create_ops_total 20
 brewfs_writeback_slice_reuse_ops_total 100
 brewfs_writeback_slice_reject_older_unique_ops_total 2
@@ -221,6 +225,10 @@ grep -F $'stats	fio-randrw-direct1	s3_put_mib	128.000	256.000	+100.0	MiB' "$tmp_
 grep -F $'stats	fio-randrw-direct1	s3_get_mib	64.000	32.000	-50.0	MiB' "$tmp_dir/out.tsv" >/dev/null
 grep -F $'stats	fio-randrw-direct1	writeback_soft_sleep_ops	12.000	12.000	+0.0	ops' "$tmp_dir/out.tsv" >/dev/null
 grep -F $'stats	fio-randrw-direct1	writeback_hard_wait_ms	9.000	9.000	+0.0	ms' "$tmp_dir/out.tsv" >/dev/null
+grep -F $'stats	fio-randrw-direct1	writeback_commit_wait_upload_ops	16.000	32.000	+100.0	ops' "$tmp_dir/out.tsv" >/dev/null
+grep -F $'stats	fio-randrw-direct1	writeback_commit_wait_upload_ms	32.000	64.000	+100.0	ms' "$tmp_dir/out.tsv" >/dev/null
+grep -F $'stats	fio-randrw-direct1	writeback_commit_wait_retry_ops	2.000	4.000	+100.0	ops' "$tmp_dir/out.tsv" >/dev/null
+grep -F $'stats	fio-randrw-direct1	writeback_commit_wait_retry_ms	4.000	8.000	+100.0	ms' "$tmp_dir/out.tsv" >/dev/null
 grep -F $'stats	fio-randrw-direct1	writeback_slice_create_ops	20.000	20.000	+0.0	ops' "$tmp_dir/out.tsv" >/dev/null
 grep -F $'stats	fio-randrw-direct1	writeback_freeze_explicit_flush_ops	2.000	2.000	+0.0	ops' "$tmp_dir/out.tsv" >/dev/null
 grep -F $'stats	fio-randrw-direct1	writeback_upload_batch_mib	64.000	128.000	+100.0	MiB' "$tmp_dir/out.tsv" >/dev/null

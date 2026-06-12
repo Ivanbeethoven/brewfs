@@ -315,6 +315,10 @@ STAT_METRICS = {
     "brewfs_writeback_stage_lat_us_total": ("writeback_stage_total_ms", "ms", 1000.0),
     "brewfs_writeback_stage_failures_total": ("writeback_stage_failures", "ops", 1.0),
     "brewfs_writeback_commit_before_stage_ops_total": ("writeback_commit_before_stage_ops", "ops", 1.0),
+    "brewfs_writeback_commit_wait_upload_ops_total": ("writeback_commit_wait_upload_ops", "ops", 1.0),
+    "brewfs_writeback_commit_wait_upload_us_total": ("writeback_commit_wait_upload_ms", "ms", 1000.0),
+    "brewfs_writeback_commit_wait_retry_ops_total": ("writeback_commit_wait_retry_ops", "ops", 1.0),
+    "brewfs_writeback_commit_wait_retry_us_total": ("writeback_commit_wait_retry_ms", "ms", 1000.0),
     "brewfs_writeback_slice_create_ops_total": ("writeback_slice_create_ops", "ops", 1.0),
     "brewfs_writeback_slice_reuse_ops_total": ("writeback_slice_reuse_ops", "ops", 1.0),
     "brewfs_writeback_slice_reject_older_unique_ops_total": (

@@ -805,6 +805,12 @@ where
                         dirty.stage_failures,
                         dirty.commit_before_stage_ops,
                     );
+                    fuse_stats.sync_writeback_commit_wait_metrics(
+                        dirty.commit_wait_upload_ops,
+                        dirty.commit_wait_upload_us,
+                        dirty.commit_wait_retry_ops,
+                        dirty.commit_wait_retry_us,
+                    );
                     fuse_stats.sync_writeback_slice_selection_metrics(
                         dirty.slice_create_ops,
                         dirty.slice_reuse_ops,

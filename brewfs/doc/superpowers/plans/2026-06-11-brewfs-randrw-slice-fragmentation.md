@@ -1248,3 +1248,98 @@ Candidate M: add observability before behavior.
   durable local stage without increasing partial-tail object count or close
   tail.
 ```
+
+## 2026-06-12 Candidate M Results
+
+Implemented:
+
+- Added writeback commit-loop wait attribution for:
+  - `brewfs_writeback_commit_wait_upload_ops_total`
+  - `brewfs_writeback_commit_wait_upload_us_total`
+  - `brewfs_writeback_commit_wait_retry_ops_total`
+  - `brewfs_writeback_commit_wait_retry_us_total`
+- Exported the new counters through `.stats`, `FsStatsSnapshot`, and
+  `compare_artifacts.py`.
+- The instrumentation only records elapsed wait time around existing
+  `commit_chunk.wait_upload` and `commit_chunk.wait_retry` awaits. It does not
+  change upload, staging, metadata commit, or slice-selection behavior.
+
+Verification:
+
+```text
+cargo test -p brewfs --lib 'vfs::io::writer::tests::'
+cargo test -p brewfs --lib 'vfs::stats::tests::'
+cargo clippy -p brewfs --lib -- -D warnings
+bash brewfs/tools/perf/test_compare_artifacts.sh
+git diff --check
+```
+
+Perf artifacts:
+
+```text
+direct0 candidate: perf-run-1781226217-16996
+direct1 candidate: perf-run-1781226525-32139
+direct1 repeat:    perf-run-1781226953-26511
+```
+
+Direct0 versus Candidate J baseline `perf-run-1781217272-13985`:
+
+```text
+read_bw_mib_s=259.3 vs 242.1 (+7.1%)
+write_bw_mib_s=117.8 vs 110.2 (+6.9%)
+tool_wall_s=86 vs 80 (+7.5%)
+post_write_drain_s=0 vs 2 (-2s)
+post-drained PUT/GiB=2028.9 vs 1629.0 (+24.5%)
+commit_wait_upload_ops=15786
+commit_wait_upload_ms=1547475.9
+commit_wait_retry_ops=0
+```
+
+Direct1 first run versus Candidate J baseline `perf-run-1781217577-3420`:
+
+```text
+read_bw_mib_s=181.7 vs 189.3 (-4.0%)
+write_bw_mib_s=82.6 vs 85.7 (-3.6%)
+tool_wall_s=64 vs 61 (+4.9%)
+post_write_drain_s=22 vs 20 (+2s)
+post-drained PUT/GiB=258.1 vs 256.8 (+0.5%)
+commit_wait_upload_ops=2871
+commit_wait_upload_ms=264280.2
+commit_wait_retry_ops=0
+```
+
+Direct1 repeat versus the same baseline:
+
+```text
+read_bw_mib_s=209.1 vs 189.3 (+10.5%)
+write_bw_mib_s=95.4 vs 85.7 (+11.3%)
+tool_wall_s=61 vs 61 (+0.0%)
+post_write_drain_s=20 vs 20 (+0s)
+post-drained PUT/GiB=259.2 vs 256.8 (+0.9%)
+```
+
+Decision:
+
+- Accept Candidate M as observability, not as a throughput optimization.
+- Treat the first direct1 regression as run-to-run variance because the repeat
+  returned to equal wall/drain time and positive read/write throughput without
+  any code change.
+- The new attribution shows the commit loop is dominated by upload waits:
+  direct0 accumulated about 1,547s of upload wait across commit tasks; direct1
+  accumulated about 264s. Retry/backoff wait stayed at zero in both tests.
+
+Next target:
+
+```text
+Candidate N: reduce upload-wait amplification without adding metadata gates.
+  Start from the fact that commit retry is not the bottleneck. Focus on the
+  upload side:
+    - reduce direct0 partial-tail upload count and PUT/GiB;
+    - keep direct1 post-drained PUT/GiB within 2%;
+    - preserve direct1 wall/drain time;
+    - do not reintroduce strict metadata-before-stage gates until upload wait
+      attribution also splits by slice freeze reason and upload batch size.
+  First experiment should be low-risk observability or scheduling:
+    - expose average commit wait per upload batch/freeze reason, or
+    - prioritize larger/frozen upload batches before small partial-tail uploads.
+```
