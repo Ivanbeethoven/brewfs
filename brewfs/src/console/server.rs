@@ -1250,6 +1250,30 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["entries"][0]["tag"], "group");
 
+        let invalid_acl_body = serde_json::json!({
+            "entries": [{
+                "scope": "access",
+                "tag": "group_obj",
+                "perm": "read"
+            }]
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/volumes/{volume_id}/acl?path=/docs"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&invalid_acl_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_request");
+
         let response = app
             .oneshot(
                 Request::builder()
