@@ -1343,3 +1343,95 @@ Candidate N: reduce upload-wait amplification without adding metadata gates.
     - expose average commit wait per upload batch/freeze reason, or
     - prioritize larger/frozen upload batches before small partial-tail uploads.
 ```
+
+## 2026-06-12 Rejected Candidate N: Range-Correct Stage Coverage
+
+Hypothesis:
+
+- The current local writeback staging coverage counter is only a byte sum. If
+  the same range is staged twice, it can falsely mark a slice as fully staged.
+- A metadata-before-stage barrier cannot safely depend on that signal.
+- Track actual staged byte coverage first, then later use it as the barrier
+  condition.
+
+Implementation tried:
+
+- RED test:
+  `cargo test -p brewfs --lib 'vfs::io::writer::tests::test_slice_writeback_stage_completion_requires_all_bytes'`
+  failed because `record_writeback_persisted_range` did not exist.
+- First version: per-slice merged staged ranges.
+- Second version: lighter prefix-plus-tail-ranges representation so the common
+  in-order staging path is O(1) and only out-of-order staging keeps ranges.
+- `mark_writeback_persisted` was changed from byte-count only to
+  `(batch_offset, data_len)` coverage tracking.
+
+Functional verification passed for the candidate:
+
+```text
+cargo test -p brewfs --lib 'vfs::io::writer::tests::test_slice_writeback_stage_completion'
+cargo test -p brewfs --lib 'vfs::io::writer::tests::'
+cargo fmt --all --check
+cargo clippy -p brewfs --lib -- -D warnings
+git diff --check
+```
+
+Perf artifacts:
+
+```text
+merged-range candidate: perf-run-1781227742-1402
+direct1 repeat:         perf-run-1781228309-4833
+prefix-range candidate: perf-run-1781228820-3566
+```
+
+Key results versus Candidate M controls:
+
+```text
+Merged-range direct0:
+  read_bw_mib_s 259.3 -> 264.4 (+2.0%)
+  write_bw_mib_s 117.8 -> 119.8 (+1.7%)
+  post_write_drain_s 0 -> 12
+  post-drained PUT/GiB 2028.9 -> 1268.8 (-37.5%)
+
+Merged-range direct1 first run:
+  read_bw_mib_s 209.1 -> 121.8 (-41.8%)
+  write_bw_mib_s 95.4 -> 56.2 (-41.1%)
+  post_write_drain_s 20 -> 40
+
+Merged-range direct1 repeat:
+  read_bw_mib_s 209.1 -> 194.9 (-6.8%)
+  write_bw_mib_s 95.4 -> 88.5 (-7.2%)
+  post_write_drain_s 20 -> 27
+
+Prefix-range final run:
+  direct0 tool_wall_s 86 -> 91 (+5.8%)
+  direct0 post_write_drain_s 0 -> 8
+  direct1 read_bw_mib_s 209.1 -> 104.6 (-50.0%)
+  direct1 write_bw_mib_s 95.4 -> 48.3 (-49.4%)
+  direct1 post_write_drain_s 20 -> 42
+```
+
+Decision:
+
+- Reject and roll back Candidate N code.
+- The correctness issue is real, but the isolated implementation did not pass
+  the randrw perf gate. Some of the direct1 loss coincided with slow prefill
+  drain/object-store tail latency, but the final run still had enough wall,
+  drain, and throughput regression that it should not be committed.
+- Keep Candidate M's upload-wait metrics as the accepted base.
+
+Next target:
+
+```text
+Candidate O: upload-wait attribution by freeze reason and batch shape.
+  Add observability before another behavior change:
+    - count commit-wait upload time by freeze reason;
+    - count staged/uploaded batch size buckets;
+    - surface direct0 cached-only partial-tail upload pressure separately from
+      direct1 normal-only writeback pressure.
+  Accept only if direct0/direct1 randrw is neutral. Then choose the next
+  behavior candidate from measured wait source:
+    - if cached-only partial tails dominate, tune cached-origin idle/too-many
+      dispatch;
+    - if normal-only direct1 waits dominate, tune writeback upload scheduling
+      or backpressure, not staging coverage.
+```
