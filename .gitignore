@@ -13,6 +13,7 @@ results/
 
 # Large/generated test artifacts
 docker/compose-xfstests/artifacts/
+docker/compose-pjdfstest/artifacts/
 tests/scripts/xfstests-prebuilt/*.tar.gz
 !tests/scripts/xfstests-prebuilt/xfstests-prebuilt.tar.gz
 perf.data

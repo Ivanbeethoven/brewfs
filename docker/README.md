@@ -43,6 +43,33 @@ bash compose-xfstests/run_redis_ltp.sh --skip-tests "fanotify01 fanotify03"
 - `--skip-tests` 用于追加按 testcase 名称跳过
 - `--extra-args` 会继续透传给容器内 `runltp`
 
+## 容器内跑 pjdfstest POSIX 语义测试
+
+入口：`compose-pjdfstest/run_redis_pjdfstest.sh`
+
+```bash
+cd docker
+
+# 默认跑完整 pjdfstest tests/ 树
+bash compose-pjdfstest/run_redis_pjdfstest.sh
+
+# 只跑指定测试目录
+bash compose-pjdfstest/run_redis_pjdfstest.sh --tests "chmod chown"
+
+# 给 prove 透传额外参数
+bash compose-pjdfstest/run_redis_pjdfstest.sh --tests "chmod" --prove-args "-v"
+```
+
+说明：
+- 当前 pjdfstest compose 入口先支持 Redis 元数据后端，并默认使用 RustFS/S3 对象存储。
+- 测试容器会在 `/mnt/brewfs` 挂载 BrewFS，并从挂载目录内运行 `prove -r /opt/pjdfstest/tests`。
+- `--tests` 接受 pjdfstest `tests/` 下的相对路径列表，例如 `chmod`、`chown`、`rename/00.t`。
+- 产物目录：`docker/compose-pjdfstest/artifacts/run-*/`
+  - `pjdfstest.console.log` / `results/pjdfstest.log`：pjdfstest 输出
+  - `brewfs.log`：BrewFS FUSE 挂载日志
+  - `backend.yml`：本次运行生成的 BrewFS 配置
+  - `diagnostics/stats-pjdfstest-after.txt`：测试结束后的 `.stats` 快照（如果可读）
+
 ## 容器内跑 xfstests 压力工具 / perf
 
 入口：

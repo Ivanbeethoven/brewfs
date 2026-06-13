@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(realpath "$SCRIPT_DIR/../..")"
+PROJECT_DIR="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || realpath "$SCRIPT_DIR/..")"
 BIN_PATH="$PROJECT_DIR/target/release/brewfs"
 
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
