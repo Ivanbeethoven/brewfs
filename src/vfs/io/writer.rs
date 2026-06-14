@@ -279,6 +279,8 @@ pub(crate) struct SliceState {
     upload_task_active: bool,
     /// True while this slice's bytes are included in pending-upload accounting.
     recent_pending_accounted: bool,
+    /// Stable logical byte count added to pending-upload accounting.
+    recent_pending_accounted_bytes: u64,
     /// Bytes successfully persisted to the local writeback stage for this
     /// slice.
     writeback_persisted_bytes: u64,
@@ -337,6 +339,7 @@ impl SliceState {
             in_flight: 0,
             upload_task_active: false,
             recent_pending_accounted: false,
+            recent_pending_accounted_bytes: 0,
             writeback_persisted_bytes: 0,
             writeback_record_sealing: false,
             writeback_record_sealed: false,
@@ -688,15 +691,25 @@ where
         })
     }
 
-    fn clear_recent_pending_if_complete(&self, s: &mut SliceState) {
-        if s.recent_pending_accounted && s.upload_complete() {
-            let bytes = s.data.alloc_bytes();
-            s.recent_pending_accounted = false;
+    fn clear_recent_pending_accounting(&self, s: &mut SliceState) {
+        if !s.recent_pending_accounted {
+            return;
+        }
+        let bytes = s.recent_pending_accounted_bytes;
+        s.recent_pending_accounted = false;
+        s.recent_pending_accounted_bytes = 0;
+        if bytes > 0 {
             self.shared
                 .recent_pending_upload
                 .bytes
                 .fetch_sub(bytes, Ordering::AcqRel);
-            self.shared.recent_pending_upload.notify.notify_waiters();
+        }
+        self.shared.recent_pending_upload.notify.notify_waiters();
+    }
+
+    fn clear_recent_pending_if_complete(&self, s: &mut SliceState) {
+        if s.upload_complete() {
+            self.clear_recent_pending_accounting(s);
         }
     }
 
@@ -732,6 +745,7 @@ where
             s.in_flight = 0;
             s.upload_task_active = false;
             s.err = Some(message.clone());
+            self.clear_recent_pending_accounting(s);
 
             s.notify.notify_waiters();
         });
@@ -2778,8 +2792,10 @@ where
             if state.recent_pending_accounted || state.upload_complete() {
                 0
             } else {
+                let bytes = state.data.len();
                 state.recent_pending_accounted = true;
-                state.data.alloc_bytes()
+                state.recent_pending_accounted_bytes = bytes;
+                bytes
             }
         };
         if bytes > 0 {
@@ -5133,6 +5149,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_recent_pending_upload_accounting_uses_stable_logical_bytes() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(BlockingStore::new(true));
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
+        let ino = meta
+            .create_file(1, "pending_upload_partial_accounting.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = Arc::new(DataWriter::new(
+            test_config_with_writeback(layout, WriteBackMode::CommitBeforeUpload),
+            backend,
+            reader,
+            None,
+        ));
+        let file_writer = writer.ensure_file(inode);
+
+        file_writer.write_at(0, &vec![3u8; 1536]).await.unwrap();
+        timeout(Duration::from_secs(2), file_writer.flush())
+            .await
+            .expect("commit-before-upload flush should return while object upload is blocked")
+            .unwrap();
+
+        assert_eq!(
+            writer.recent_pending_upload_bytes(),
+            1536,
+            "pending upload accounting should use the committed logical slice length"
+        );
+
+        store.unblock();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if writer.recent_pending_upload_bytes() == 0 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pending-upload bytes should clear after upload completes");
+    }
+
+    #[tokio::test]
     async fn test_commit_before_upload_removes_writeback_record_after_upload() {
         let layout = ChunkLayout {
             chunk_size: 8 * 1024,
@@ -5933,6 +6001,69 @@ mod tests {
             .expect("write should finish")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_commit_before_upload_failed_upload_clears_recent_pending() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(FailingStore);
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store, meta.clone()));
+        let ino = meta
+            .create_file(1, "failed_upload_clears_pending.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = Arc::new(DataWriter::new(
+            test_config_with_writeback(layout, WriteBackMode::CommitBeforeUpload),
+            backend,
+            reader,
+            None,
+        ));
+        let file_writer = writer.ensure_file(inode);
+
+        file_writer
+            .write_at(0, &vec![1u8; layout.block_size as usize])
+            .await
+            .unwrap();
+
+        let first_flush = timeout(Duration::from_secs(2), file_writer.flush())
+            .await
+            .expect("initial flush should not hang after injected upload failure");
+        let err = match first_flush {
+            Ok(()) => timeout(Duration::from_secs(2), async {
+                loop {
+                    match file_writer.flush().await {
+                        Ok(()) => sleep(Duration::from_millis(10)).await,
+                        Err(err) => break err,
+                    }
+                }
+            })
+            .await
+            .expect("upload failure should become visible to a later flush"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("writeback failed"),
+            "unexpected flush error: {err:?}"
+        );
+        assert_eq!(
+            writer.recent_pending_upload_bytes(),
+            0,
+            "failed upload must not leave recent pending bytes that throttle later writes forever"
+        );
+        assert!(
+            file_writer.has_pending().await,
+            "writeback error should remain observable by later flush/fsync/close calls"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -247,7 +247,9 @@ impl VFSConfig {
                 .freeze_min_bytes(cache.dirty_slice_target_size)
                 .auto_flush_max_age(Duration::from_millis(cache.dirty_slice_max_age_ms))
                 .upload_concurrency(cache.upload_concurrency)
-                .writeback_mode(cache.writeback_mode),
+                .writeback_mode(cache.writeback_mode)
+                .writeback_recent_pending_soft_limit(cache.writeback_recent_pending_soft_bytes)
+                .writeback_recent_pending_hard_limit(cache.writeback_recent_pending_hard_bytes),
         );
 
         Self { read, write, cache }
@@ -273,6 +275,8 @@ mod tests {
             prefetch_max_bytes: 3 * 1024 * 1024,
             upload_concurrency: 7,
             writeback_mode: WriteBackMode::CommitBeforeUpload,
+            writeback_recent_pending_soft_bytes: 123,
+            writeback_recent_pending_hard_bytes: 456,
             ..CacheConfig::default()
         };
 
@@ -283,6 +287,8 @@ mod tests {
         assert_eq!(config.write.buffer_size, cache.write_memory_bytes);
         assert_eq!(config.write.freeze_min_bytes, cache.dirty_slice_target_size);
         assert_eq!(config.write.upload_concurrency, cache.upload_concurrency);
+        assert_eq!(config.write.writeback_recent_pending_soft_limit, 123);
+        assert_eq!(config.write.writeback_recent_pending_hard_limit, 456);
         assert_eq!(
             config.write.auto_flush_max_age,
             Duration::from_millis(cache.dirty_slice_max_age_ms)

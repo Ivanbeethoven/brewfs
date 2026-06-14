@@ -30,7 +30,7 @@ usage() {
   --local-fs                 改为使用本地目录作为对象存储
   --s3-writeback             启用 S3 commit-before-upload 写回语义（等价于 BREWFS_WRITEBACK_MODE=commit_before_upload）
   --writeback-throughput-profile
-                             启用 S3 writeback 全场景吞吐 profile（4GiB read/write buffer, 12GiB memory budget, S3 max concurrency=16, writeback upload concurrency=4, pending soft/hard=1GiB/2GiB, writeback persist fsync=false, compression=lz4, fuse workers=6, fio prefill drain+remount）
+                             启用 S3 writeback 全场景吞吐 profile（4GiB read/write buffer, 12GiB memory budget, S3 max concurrency=16, writer upload_concurrency=32, pending soft/hard=1GiB/2GiB, writeback persist fsync=false, compression=lz4, fuse workers=6, fio prefill drain+remount）
   --tools "<tool...>"        指定压力工具列表，默认: "fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
   --brewfs-bench           额外运行一次宿主机 cargo bench --bench brewfs_bench
   --bench-args "<args...>"   透传给 cargo bench 之后的 Criterion 参数

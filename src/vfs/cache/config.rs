@@ -71,6 +71,8 @@ pub struct CacheConfig {
     // Semantics
     pub strict_posix: bool,
     pub writeback_mode: WriteBackMode,
+    pub writeback_recent_pending_soft_bytes: u64,
+    pub writeback_recent_pending_hard_bytes: u64,
 
     // Disk safety
     pub min_free_disk_bytes: u64,
@@ -105,6 +107,8 @@ impl Default for CacheConfig {
             range_background_prefetch: true,
             strict_posix: true,
             writeback_mode: WriteBackMode::UploadBeforeCommit,
+            writeback_recent_pending_soft_bytes: 0,
+            writeback_recent_pending_hard_bytes: 0,
             min_free_disk_bytes: 1024 * 1024 * 1024,
             writeback_persist_sync: true,
             compression: Compression::Lz4,

@@ -198,6 +198,8 @@ EOF
             || -n "${BREWFS_COMPRESSION:-}" \
             || -n "${BREWFS_VERIFY_CACHE_CHECKSUM:-}" \
             || -n "${BREWFS_WRITEBACK_PERSIST_SYNC:-}" \
+            || -n "${BREWFS_WRITEBACK_RECENT_PENDING_SOFT_BYTES:-}" \
+            || -n "${BREWFS_WRITEBACK_RECENT_PENDING_HARD_BYTES:-}" \
             || -n "${BREWFS_UPLOAD_LIMIT_MIBPS:-}" \
             || -n "${BREWFS_DOWNLOAD_LIMIT_MIBPS:-}" \
             || -n "$writeback_mode" ]]; then
@@ -219,6 +221,8 @@ EOF
             [[ -n "${BREWFS_COMPRESSION:-}" ]] && echo "  compression: ${comp}"
             [[ -n "${BREWFS_VERIFY_CACHE_CHECKSUM:-}" ]] && echo "  verify_cache_checksum: ${BREWFS_VERIFY_CACHE_CHECKSUM}"
             [[ -n "${BREWFS_WRITEBACK_PERSIST_SYNC:-}" ]] && echo "  writeback_persist_sync: ${BREWFS_WRITEBACK_PERSIST_SYNC}"
+            [[ -n "${BREWFS_WRITEBACK_RECENT_PENDING_SOFT_BYTES:-}" ]] && echo "  writeback_recent_pending_soft_bytes: ${BREWFS_WRITEBACK_RECENT_PENDING_SOFT_BYTES}"
+            [[ -n "${BREWFS_WRITEBACK_RECENT_PENDING_HARD_BYTES:-}" ]] && echo "  writeback_recent_pending_hard_bytes: ${BREWFS_WRITEBACK_RECENT_PENDING_HARD_BYTES}"
             if [[ -n "$writeback_mode" ]]; then
                 echo "  writeback_mode: ${writeback_mode}"
             fi
@@ -1604,6 +1608,8 @@ if brewfs_stats_paths:
         stage_ops = metrics.get("brewfs_writeback_stage_ops_total", 0.0)
         stage_bytes = metrics.get("brewfs_writeback_stage_bytes_total", 0.0)
         stage_ms = metrics.get("brewfs_writeback_stage_lat_us_total", 0.0) / 1000.0
+        stage_s = metrics.get("brewfs_writeback_stage_lat_us_total", 0.0) / 1_000_000.0
+        commit_wait_s = metrics.get("brewfs_writeback_commit_wait_upload_us_total", 0.0) / 1_000_000.0
         stage_failures = metrics.get("brewfs_writeback_stage_failures_total", 0.0)
         commit_before_stage = metrics.get(
             "brewfs_writeback_commit_before_stage_ops_total",
@@ -1716,6 +1722,7 @@ if brewfs_stats_paths:
             f"GET={s3_get_avg_ms:.2f} ms, PUT={s3_put_avg_ms:.2f} ms | "
             f"{rel}; range={int(range_gets)}, full={int(full_gets)}, bg_prefetch={int(bg_prefetch)}, "
             f"stage={int(stage_ops)} ops/{fmt_mib(stage_bytes)}/{stage_ms:.1f} ms, "
+            f"foreground=stage {stage_s:.2f}s/commit_wait {commit_wait_s:.2f}s, "
             f"stage_fail={int(stage_failures)}, commit_before_stage={int(commit_before_stage)}, "
             f"remote_inflight={fmt_mib(remote_inflight)}, "
             f"slices=create {int(slice_create)}/reuse {int(slice_reuse)}/"
