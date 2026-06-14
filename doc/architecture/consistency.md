@@ -135,7 +135,7 @@ pub enum FileLockType {
 
 ## Version + CAS 并发控制
 
-`RedisMetaStore` 的 Chunk Slice List 修改使用版本号 CAS 方案（详见 `doc/redis-version-cas.md`）：
+`RedisMetaStore` 的 Chunk Slice List 修改使用版本号 CAS 方案（详见 `doc/architecture/redis-version-cas.md`）：
 
 - 每个 Chunk 的 Slice 列表有一个 version key（`c{ino}_{idx}:v`）
 - 任何修改操作（append/trim/replace）都必须递增 version
@@ -149,7 +149,7 @@ pub enum FileLockType {
 
 ## Rename 语义
 
-`doc/rename_design.md` 详细记录。BrewFS 的 rename 遵循 POSIX rename(2) 语义：
+`doc/architecture/rename_design.md` 详细记录。BrewFS 的 rename 遵循 POSIX rename(2) 语义：
 
 - **原子性**：元数据层事务保证，（Database 使用 DB 事务，Etcd 使用 etcd 事务，Redis 使用 Lua 脚本）
 - **RENAME_NOREPLACE**：目标存在时返回 EEXIST

@@ -236,4 +236,4 @@ cat /mnt/brewfs/.stats
 | OBJECT | get, get/s, put, put/s, del | S3 对象存储流量 |
 | CACHE | hit, miss, dirty | 缓存命中率与脏数据量 |
 
-详细文档见 `doc/stats-tool.md`。
+详细文档见 `doc/operations/stats-tool.md`。

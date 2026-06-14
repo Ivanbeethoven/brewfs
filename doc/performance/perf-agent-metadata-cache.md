@@ -210,8 +210,8 @@ Integration / perf：
 
 本文档自查命令：
 
-- `rg -n "当前 BrewFS|JuiceFS 对应机制|具体差距|建议改动|预期测试场景|风险" doc/perf-agent-metadata-cache.md`
-- `git diff --check -- doc/perf-agent-metadata-cache.md`
+- `rg -n "当前 BrewFS|JuiceFS 对应机制|具体差距|建议改动|预期测试场景|风险" doc/performance/perf-agent-metadata-cache.md`
+- `git diff --check -- doc/performance/perf-agent-metadata-cache.md`
 
 ## 风险
 

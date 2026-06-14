@@ -175,7 +175,7 @@ S3 相关参数说明：
 --meta-backend redis --meta-url redis://127.0.0.1:6379/0
 ```
 
-使用 Lua CAS 保证并发安全（详见 `doc/redis-version-cas.md`）。
+使用 Lua CAS 保证并发安全（详见 `doc/architecture/redis-version-cas.md`）。
 
 ## FUSE 并发配置
 
@@ -218,7 +218,7 @@ sudo brewfs mount /mnt/brewfs --privileged ...
 
 ## 元数据后端测试环境搭建
 
-`doc/docker-compose-test-guide.md` 提供了 Docker Compose 快速搭建测试环境的说明：
+`doc/testing/docker-compose-test-guide.md` 提供了 Docker Compose 快速搭建测试环境的说明：
 
 ```bash
 # 使用仓库中的 docker-compose.yml 启动所有服务

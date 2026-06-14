@@ -11,7 +11,7 @@ BrewFS 在多个层级实现缓存，减少元数据访问延迟和对象存储 
 
 ## 1. 元数据缓存
 
-详见 `doc/metadata.md` 的 MetaClient 部分。核心组件：
+详见 `doc/architecture/metadata.md` 的 MetaClient 部分。核心组件：
 
 **InodeCache**：双层存储
 - `Moka Cache` 管理 TTL + LRU 淘汰
@@ -42,7 +42,7 @@ BrewFS 在多个层级实现缓存，减少元数据访问延迟和对象存储 
 
 ## 3. VFS 写缓存
 
-写缓存在 `FileWriter` 中实现，详见 `doc/write-path.md`。
+写缓存在 `FileWriter` 中实现，详见 `doc/architecture/write-path.md`。
 
 - Writable Slice 在内存中累积数据
 - `dirty_slice_max_age_ms`（默认 500ms）或 `dirty_slice_target_size`（默认 64 MiB）触发 flush

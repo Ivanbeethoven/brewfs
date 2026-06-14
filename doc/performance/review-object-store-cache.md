@@ -91,7 +91,7 @@
 
 ### P2: S3 payload checksum 默认关闭与文档示例不一致，生产安全边界需要写清
 
-- 位置：`src/config.rs:388-391` 默认 `s3_disable_payload_checksum=true`；`src/cadapter/s3.rs:122-130` SDK checksum 设置；`doc/configuration.md:56-64` 示例写 `disable_payload_checksum: false`，表格又写默认 true。
+- 位置：`src/config.rs:388-391` 默认 `s3_disable_payload_checksum=true`；`src/cadapter/s3.rs:122-130` SDK checksum 设置；`doc/operations/configuration.md:56-64` 示例写 `disable_payload_checksum: false`，表格又写默认 true。
 - 原因：关闭 SDK payload checksum 对 RustFS/MinIO 可省 CPU，但对跨公网 AWS S3 或合规场景，安全/完整性语义不同。文档示例与实际默认不一致，容易让测试和部署 profile 混淆。
 - 建议改法：明确区分 `trusted-local-s3` 与 `aws-s3` profile：本地 RustFS 默认 true，公网/生产推荐显式评估；文档示例与代码默认对齐或注明差异。
 - 验证方式：配置解析测试覆盖默认值和 YAML override；用 AWS/MinIO/RustFS 分别跑 basic PUT/GET，确认 checksum setting 不影响兼容。

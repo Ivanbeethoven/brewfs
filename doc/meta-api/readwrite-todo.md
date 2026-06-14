@@ -7,8 +7,8 @@
 
 ### 1. API Surface & Behaviour Parity
 - [x] Audit `MetaClient` public methods vs. Go `baseMeta` (open/close/read/write/truncate/statfs) and document missing or stubbed ones.
-- [x] Draft `MetaStore` extension plan and supporting type list (see `doc/meta_client_api_extension_plan.md`).
-- [x] Record one-to-one API mapping and highlight duplicates/gaps (`doc/meta_client_api_mapping.md`).
+- [x] Draft `MetaStore` extension plan and supporting type list (see `doc/meta-api/api-extension-plan.md`).
+- [x] Record one-to-one API mapping and highlight duplicates/gaps (`doc/meta-api/api-mapping.md`).
 - [x] Implement `set_attr`/`open`/`close`/`link`/`stat_fs`/`symlink` on the database store backend with inline symlink target storage; track follow-up work for other backends.
 - [x] Wire `read_symlink`/readlink support through MetaClient + VFS once backends expose targets consistently (DatabaseMetaStore wired; other backends pending target storage).
 - [ ] Define Rust equivalents for session-aware helpers (atime update, handle caching, symlink cache) and decide scope for initial milestone.

@@ -85,18 +85,18 @@ fuse:
 - InMemoryMetaStore：alloc_inode、record_slice、update_size（支持截断收缩）
 - 已覆盖提交/回滚测试
 
-更多细节：参见 `doc/sdk.md` 与源码注释。
+更多细节：参见 `doc/operations/sdk.md` 与源码注释。
 
 ---
 
 ## 📚 文档
 - 文档索引：`doc/README.md`
-- 架构设计：`doc/arch.md`
-- 配置说明：`doc/configuration.md`
+- 架构设计：`doc/architecture/arch.md`
+- 配置说明：`doc/operations/configuration.md`
 - VFS 内部实现：`doc/vfs/README.md`
 - 测试与 CI：`doc/README.md#testing-and-ci`
 - 性能与 JuiceFS 对比：`doc/README.md#performance-and-juicefs-comparison`
-- SDK 使用：`doc/sdk.md`
+- SDK 使用：`doc/operations/sdk.md`
 
 ---
 

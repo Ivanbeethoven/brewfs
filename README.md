@@ -156,7 +156,7 @@ meta:
     namespace: tenant-a
 ```
 
-See [doc/configuration.md](doc/configuration.md) and the files under [examples/](examples/) for the full configuration surface.
+See [doc/operations/configuration.md](doc/operations/configuration.md) and the files under [examples/](examples/) for the full configuration surface.
 
 ## CLI
 
@@ -203,9 +203,9 @@ bash compose-xfstests/run_redis_xfstests.sh --s3 --cases "generic/001"
 More test and benchmark entry points:
 
 - [docker/README.md](docker/README.md)
-- [doc/docker-compose-test-guide.md](doc/docker-compose-test-guide.md)
-- [doc/bench.md](doc/bench.md)
-- [doc/fuzz_testing_guide.md](doc/fuzz_testing_guide.md)
+- [doc/testing/docker-compose-test-guide.md](doc/testing/docker-compose-test-guide.md)
+- [doc/testing/bench.md](doc/testing/bench.md)
+- [doc/testing/fuzz_testing_guide.md](doc/testing/fuzz_testing_guide.md)
 
 ## Feature Flags
 
@@ -228,19 +228,18 @@ Start with the [documentation index](doc/README.md).
 
 Common entry points:
 
-- [Configuration](doc/configuration.md)
-- [Architecture](doc/arch.md)
+- [Configuration](doc/operations/configuration.md)
+- [Architecture](doc/architecture/arch.md)
 - [VFS internals](doc/vfs/README.md)
 - [Testing and CI guides](doc/README.md#testing-and-ci)
 - [Performance and JuiceFS comparison](doc/README.md#performance-and-juicefs-comparison)
-- [Control plane](doc/control-plane.md)
+- [Control plane](doc/operations/control-plane.md)
 
 ## Repository Map
 
 - `src/`: core filesystem, metadata, chunk, object backend, FUSE, and CLI code.
 - `examples/`: SDK, S3, persistence, and local mount examples.
-- `doc/`: canonical design notes, operations guides, audits, and debugging notes.
-- `docs/`: compatibility pointer for older documentation paths.
+- `doc/`: canonical design notes, operations guides, performance plans, tests, and debugging notes.
 - `docker/`: compose stacks, xfstests/LTP/perf runners, and runtime image tooling.
 - `tests/`: integration and native stress tests.
 - `operator/`: Kubernetes operator prototype and CRD documentation.
