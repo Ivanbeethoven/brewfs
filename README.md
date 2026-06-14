@@ -221,38 +221,61 @@ Use these notes to understand where BrewFS intentionally differs from JuiceFS, w
 
 ### Latest Local Perf Snapshot
 
-The following snapshot was collected on 2026-06-14 with the Docker perf runners under `docker/compose-xfstests/`:
+The following snapshot was collected on 2026-06-14 with the full Docker perf
+runners under `docker/compose-xfstests/`:
 
 ```bash
-PERF_FIO_DIRECT=1 PERF_FIO_RUNTIME=20 PERF_FIO_SIZE=512m \
-  bash docker/compose-xfstests/run_redis_perf.sh --s3 --writeback-throughput-profile \
-  --tools "fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw"
+PERF_FIO_DIRECT=1 PERF_LOG_TO_CONSOLE=false \
+  bash docker/compose-xfstests/run_redis_perf.sh --s3 --writeback-throughput-profile
 
-PERF_FIO_DIRECT=1 PERF_FIO_RUNTIME=20 PERF_FIO_SIZE=512m \
-  bash docker/compose-xfstests/run_juicefs_perf.sh --writeback-throughput-profile \
-  --tools "fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw"
+PERF_FIO_DIRECT=1 PERF_LOG_TO_CONSOLE=false \
+  bash docker/compose-xfstests/run_juicefs_perf.sh --writeback-throughput-profile
 ```
 
 Artifacts:
 
-- BrewFS: `docker/compose-xfstests/artifacts/perf-run-1781450598-12940`
-- JuiceFS: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781453759-18759`
+- BrewFS: `docker/compose-xfstests/artifacts/perf-run-1781460414-19107`
+- JuiceFS: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781462374-29454`
 
-| Workload | BrewFS | JuiceFS | Comparison |
-| --- | --- | --- | --- |
-| `fio-bigwrite` | pass; W 183.04 MiB/s; W p99 18.743 ms; wall 23s | pass; W 3.52 GiB/s; W p99 0.018 ms; wall 2s | BrewFS is about 0.05x JuiceFS foreground write bandwidth. |
-| `fio-bigread` | pass; R 1.00 GiB/s; R p99 0.114 ms; wall 5s | pass; R 552.92 MiB/s; R p99 0.017 ms; wall 8s | BrewFS is about 1.85x JuiceFS big-read bandwidth in this run. |
-| `fio-seqread` | pass; R 3.37 GiB/s; R p99 0.005 ms; wall 20s | pass; R 3.47 GiB/s; R p99 0.002 ms; wall 20s | Sequential read is near parity, about 0.97x JuiceFS. |
-| `fio-seqwrite` | pass; W 89.28 MiB/s; W p99 27.132 ms; wall 52s | pass; W 582.63 MiB/s; W p99 0.006 ms; wall 76s | BrewFS is about 0.15x JuiceFS sequential-write bandwidth. |
-| `fio-randread` | pass; R 3.56 GiB/s; R p99 0.012 ms; wall 20s | pass; R 4.03 GiB/s; R p99 0.013 ms; wall 21s | BrewFS is about 0.88x JuiceFS random-read bandwidth. |
-| `fio-randwrite` | pass; W 67.16 MiB/s; W p99 87.556 ms; wall 130s | pass; W 642.69 MiB/s; W p99 0.012 ms; wall 74s | BrewFS is about 0.10x JuiceFS random-write bandwidth. |
-| `fio-randrw` | pass; R 125.44 MiB/s, W 55.32 MiB/s; R/W p99 0.008/87.556 ms; wall 144s | pass; R 236.71 MiB/s, W 109.68 MiB/s; R/W p99 0.023/0.055 ms; wall 21s | BrewFS is about 0.53x/0.50x JuiceFS mixed random read/write bandwidth. |
+All default perf tools passed on both filesystems.
+
+Wall seconds include close/flush tail. Fio bandwidth reports the active IO
+window, so both columns are useful when diagnosing writeback behavior.
+
+| Workload | BrewFS wall | JuiceFS wall | BrewFS fio BW | JuiceFS fio BW | BrewFS/JuiceFS BW |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `fio-bigwrite` | 1s | 1s | W 1350.9 MiB/s | W 4471.6 MiB/s | W 0.30x |
+| `fio-bigread` | 1s | 1s | R 1094.0 MiB/s | R 2723.4 MiB/s | R 0.40x |
+| `fio-seqread` | 61s | 60s | R 3488.8 MiB/s | R 3579.2 MiB/s | R 0.97x |
+| `fio-seqwrite` | 137s | 120s | W 57.7 MiB/s | W 294.6 MiB/s | W 0.20x |
+| `fio-randread` | 60s | 60s | R 3667.6 MiB/s | R 4323.5 MiB/s | R 0.85x |
+| `fio-randwrite` | 143s | 146s | W 69.7 MiB/s | W 287.8 MiB/s | W 0.24x |
+| `fio-randrw` | 161s | 61s | R 179.7 / W 80.4 MiB/s | R 183.8 / W 83.1 MiB/s | R 0.98x / W 0.97x |
+
+Metadata comparison from `metaperf`:
+
+| Operation | BrewFS | JuiceFS | BrewFS/JuiceFS |
+| --- | ---: | ---: | ---: |
+| `create` | 900 ops/s | 1318 ops/s | 0.68x |
+| `open` | 9762 ops/s | 23477 ops/s | 0.42x |
+| `stat` | 1022620 ops/s | 1025998 ops/s | 1.00x |
+| `readdir` | 64771 ops/s | 91093 ops/s | 0.71x |
+| `rename` | 1898 ops/s | 2670 ops/s | 0.71x |
 
 Interpretation:
 
-- `PERF_FIO_DIRECT=1` reduces Linux page-cache effects, but BrewFS read rows still show high internal cache hit rates in the generated report. Treat read bandwidth as a cache-aware regression signal, not a cold-object-store maximum.
-- JuiceFS writeback completes foreground writes much faster in this profile. BrewFS still pays a large writeback/upload tail in random-write and mixed random-read/write workloads, which is the main remaining gap shown by this snapshot.
-- Older JuiceFS `fio-randread` and `fio-randrw` rows failed with FIO read `Input/output error` because the perf runner cleared the local writeback cache after `sync` but before JuiceFS staging upload drained. The runner now waits for JuiceFS staging counters to reach zero before remounting and clearing cache, and the latest full JuiceFS run records all seven workloads as pass.
+- `PERF_FIO_DIRECT=1` reduces Linux page-cache effects; read bandwidth remains
+  a cache-aware regression signal rather than a pure cold-object-store maximum.
+- BrewFS sequential read is near parity with JuiceFS, and random read is within
+  the same order of magnitude.
+- BrewFS mixed `randrw` active IO bandwidth is now close to JuiceFS, but BrewFS
+  still has a much longer wall-time tail in that scenario.
+- The main remaining data-path gap is writeback throughput: BrewFS is about
+  0.20x of JuiceFS on sequential write and 0.24x on random write in this run.
+- The JuiceFS run emitted slow PUT, disk-cache timeout, and `readSlice context
+  canceled` warnings on the console, but completed all default scenarios as
+  pass. Treat the JuiceFS write numbers as the current local-run result rather
+  than an ideal upper bound for JuiceFS.
 
 ## Feature Flags
 
