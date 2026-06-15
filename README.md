@@ -327,6 +327,25 @@ Latest accepted BrewFS tuning:
 
 Latest rejected tuning checks:
 
+Commit wait 20ms polling check:
+
+```bash
+PERF_LOG_TO_CONSOLE=false CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0 \
+  bash docker/compose-xfstests/run_redis_perf.sh --s3 \
+  --writeback-throughput-profile \
+  --tools "fio-seqwrite fio-randwrite fio-randrw"
+```
+
+Artifact: `docker/compose-xfstests/artifacts/perf-run-1781541902-11410`.
+
+The candidate reduced `COMMIT_WAIT_SLICE` from 100ms to 20ms. Targeted
+writer/writeback tests passed and the focused run improved wall time for
+`fio-seqwrite`/`fio-randwrite`/`fio-randrw` to 136s/133s/154s, but
+`commit_wait_upload_ops` grew roughly 5x and `fio-randrw` active bandwidth
+fell to R 267.2 / W 119.6 MiB/s. The change was rejected and reverted because
+it traded polling pressure and active mixed bandwidth for a modest wall-time
+gain.
+
 Cached sub-block 4s idle-grace check:
 
 ```bash
