@@ -354,6 +354,34 @@ Latest accepted BrewFS tuning:
 
 Latest rejected tuning checks:
 
+Cached append older-unique reuse check:
+
+```bash
+PERF_LOG_TO_CONSOLE=false CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0 \
+  bash docker/compose-xfstests/run_redis_perf.sh --s3 \
+  --writeback-throughput-profile \
+  --tools "fio-seqwrite fio-randwrite fio-randrw"
+```
+
+Artifact:
+`docker/compose-xfstests/artifacts/perf-run-1781561001-27750`.
+
+The candidate followed JuiceFS's writable-slice append reuse more closely by
+allowing non-overlapping cached appends to reuse an existing writeback slice
+even when the FUSE write `unique` was older than the slice's first write. The
+TDD guard proved append reuse and preserved the older-unique rejection for
+overlapping writes, and all writer tests passed. The code was rejected and
+reverted because the focused perf run reduced some slice fragmentation but
+shifted cost into worse random-write and mixed workload latency. `fio-seqwrite`
+wall time improved, but `fio-randwrite` bandwidth/p99 and `fio-randrw`
+wall/active bandwidth/read p99 regressed versus the accepted full baseline.
+
+| Workload | Accepted baseline `perf-run-1781557543-11719` | Candidate `perf-run-1781561001-27750` | Decision |
+| --- | ---: | ---: | --- |
+| `fio-seqwrite` | 149s, W 73.5 MiB/s | 134s, W 74.4 MiB/s | narrow gain |
+| `fio-randwrite` | 139s, W 140.1 MiB/s, p99 31.9ms | 134s, W 135.2 MiB/s, p99 206.6ms | reject: bandwidth and p99 regression |
+| `fio-randrw` | 162s, R 315.5 / W 140.9 MiB/s, R p99 57.4ms | 167s, R 258.9 / W 115.7 MiB/s, R p99 240.1ms | reject: wall, bandwidth, and p99 regression |
+
 Redis readdir-plus attr warmup check:
 
 ```bash
