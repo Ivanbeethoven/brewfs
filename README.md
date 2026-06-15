@@ -275,6 +275,35 @@ Latest accepted BrewFS tuning:
 
 Latest rejected tuning checks:
 
+Writeback upload concurrency 6 check:
+
+```bash
+BREWFS_WRITEBACK_UPLOAD_CONCURRENCY=6 \
+PERF_FIO_RUNTIME=30 \
+  bash docker/compose-xfstests/run_redis_perf.sh --s3 \
+  --writeback-throughput-profile \
+  --tools "fio-seqwrite fio-randwrite fio-randrw"
+```
+
+Artifacts:
+
+- Focused candidate run:
+  `docker/compose-xfstests/artifacts/perf-run-1781493948-4895`
+- Focused default comparison:
+  `docker/compose-xfstests/artifacts/perf-run-1781484237-25679`
+
+The candidate raised the global commit-before-upload writeback upload pool from
+the throughput profile default of 4 to 6. It was not adopted: sequential write
+wall time improved, but active write bandwidth fell and random write regressed.
+The S3 PUT average latency also rose on the candidate run, indicating more
+object-store queueing rather than less writeback amplification.
+
+| Workload | Default focused baseline | Writeback upload concurrency 6 | Decision |
+| --- | ---: | ---: | --- |
+| `fio-seqwrite` | 142s, W 336.2 MiB/s | 136s, W 257.7 MiB/s | reject: wall gain came with much lower active BW and higher PUT latency |
+| `fio-randwrite` | 129s, W 125.5 MiB/s | 136s, W 108.7 MiB/s | reject: wall and active BW regression |
+| `fio-randrw` | 158s, R 192.6 / W 86.4 MiB/s | 157s, R 194.9 / W 87.3 MiB/s | neutral |
+
 Older-unique append slice-reuse check:
 
 ```bash
