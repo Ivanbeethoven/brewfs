@@ -23,6 +23,7 @@ use tracing::{debug, error, info, trace, warn};
 static DISK_CACHE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const DISK_CACHE_READ_CONCURRENCY: usize = 16;
 const DISK_CACHE_WRITE_CONCURRENCY: usize = 16;
+const DISK_HIT_FAST_PROMOTE_MAX_UTILIZATION_PER_MILLE: u64 = 800;
 
 /// Configuration for the intelligent dual-layer cache system.
 ///
@@ -1698,15 +1699,33 @@ impl ChunksCache {
         // Re-populate cold cache index so future lookups are faster
         self.cold_cache.insert(key.clone(), ()).await;
 
-        if self.policy.should_promote(key.clone()).await {
+        if self.should_fast_promote_disk_hit(value.len())
+            || self.policy.should_promote(key.clone()).await
+        {
             debug!("Promoting key to hot cache: {}", key);
-            let b = value.clone();
-            self.hot_bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
-            self.hot_cache.insert(key.clone(), b).await;
+            self.insert_hot(key, value.clone()).await;
         }
 
         self.update_utilization_metrics();
         Some(value)
+    }
+
+    fn should_fast_promote_disk_hit(&self, value_len: usize) -> bool {
+        if value_len == 0 || self.config.max_hot_bytes == 0 {
+            return false;
+        }
+
+        let current_bytes = self.hot_cache.weighted_size();
+        let next_bytes = current_bytes
+            .saturating_add(value_len as u64)
+            .saturating_add(64);
+        let fast_promote_ceiling = self
+            .config
+            .max_hot_bytes
+            .saturating_mul(DISK_HIT_FAST_PROMOTE_MAX_UTILIZATION_PER_MILLE)
+            / 1000;
+
+        next_bytes <= fast_promote_ceiling
     }
 
     /// Update cache utilization metrics (using byte-based utilization)
@@ -2182,6 +2201,86 @@ mod tests {
             .unwrap();
 
         assert_eq!(cache.get(&key.to_string()).await, Some(data));
+    }
+
+    #[tokio::test]
+    async fn disk_hit_promotes_to_hot_cache_when_hot_tier_has_room() {
+        let temp_dir = tempdir().unwrap();
+        let cache = ChunksCache::new_with_config(ChunksCacheConfig::with_budgets(
+            4 * 1024 * 1024,
+            16 * 1024 * 1024,
+            temp_dir.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+
+        let key = "disk-hit-fast-promote-key".to_string();
+        let data = vec![42u8; 128 * 1024];
+        cache.insert(&key, &data).await.unwrap();
+
+        cache.hot_cache.invalidate(&key).await;
+        cache.hot_cache.run_pending_tasks().await;
+        cache.hot_bytes.store(0, Ordering::Relaxed);
+        assert!(cache.hot_cache.get(&key).await.is_none());
+
+        assert_eq!(
+            cache
+                .get(&key)
+                .await
+                .expect("disk cache should contain key"),
+            bytes::Bytes::from(data)
+        );
+
+        cache.hot_cache.run_pending_tasks().await;
+        assert!(
+            cache.hot_cache.get(&key).await.is_some(),
+            "disk cache hits should warm the hot cache while memory budget is available"
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_hit_fast_promotion_respects_hot_tier_budget() {
+        let temp_dir = tempdir().unwrap();
+        let cache = ChunksCache::new_with_config(ChunksCacheConfig::with_budgets(
+            4 * 1024 * 1024,
+            16 * 1024 * 1024,
+            temp_dir.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+
+        cache
+            .insert_hot("hot-filler", bytes::Bytes::from(vec![1u8; 3 * 1024 * 1024]))
+            .await;
+        assert!(cache.hot_cache.weighted_size() > cache.config.max_hot_bytes * 700 / 1000);
+
+        let key = "disk-hit-budget-key".to_string();
+        let data = vec![24u8; 512 * 1024];
+        let next_weight = cache
+            .hot_cache
+            .weighted_size()
+            .saturating_add(data.len() as u64)
+            .saturating_add(64);
+        let fast_promote_ceiling =
+            cache.config.max_hot_bytes * DISK_HIT_FAST_PROMOTE_MAX_UTILIZATION_PER_MILLE / 1000;
+        assert!(next_weight > fast_promote_ceiling);
+
+        cache.disk_storage.store(&key, &data).await.unwrap();
+        cache.cold_cache.insert(key.clone(), ()).await;
+
+        assert_eq!(
+            cache
+                .get(&key)
+                .await
+                .expect("disk cache should contain key"),
+            bytes::Bytes::from(data)
+        );
+
+        cache.hot_cache.run_pending_tasks().await;
+        assert!(
+            cache.hot_cache.get(&key).await.is_none(),
+            "fast disk-hit promotion should stop before the hot tier is too full"
+        );
     }
 
     #[test]
