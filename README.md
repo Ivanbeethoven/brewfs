@@ -275,6 +275,37 @@ Latest accepted BrewFS tuning:
 
 Latest rejected tuning checks:
 
+Dirty slice file-handle cache check:
+
+```bash
+PERF_FIO_RUNTIME=30 \
+  bash docker/compose-xfstests/run_redis_perf.sh --s3 \
+  --writeback-throughput-profile \
+  --tools "fio-seqwrite fio-randwrite fio-randrw"
+
+bash docker/compose-xfstests/run_redis_perf.sh --s3 --writeback-throughput-profile
+```
+
+Artifacts:
+
+- Focused candidate run:
+  `docker/compose-xfstests/artifacts/perf-run-1781488136-5319`
+- Full candidate run:
+  `docker/compose-xfstests/artifacts/perf-run-1781488824-31222`
+
+The candidate reused an open local `.slice` file handle while a dirty slice was
+being staged, then closed it when the recoverable record was sealed. It was not
+adopted: the 30s focused run looked promising, but the full default run did not
+confirm the gain and regressed two primary wall-time checks. The code change was
+reverted.
+
+| Workload | Accepted BrewFS | File-handle cache full run | Decision |
+| --- | ---: | ---: | --- |
+| `fio-seqwrite` | 140s, W 73.2 MiB/s | 151s, W 71.6 MiB/s | reject: wall and active BW regression |
+| `fio-randwrite` | 153s, W 79.6 MiB/s | 152s, W 98.5 MiB/s | reject: active BW improved, wall gain not stable |
+| `fio-randrw` | 173s, R 170.2 / W 76.4 MiB/s | 176s, R 262.8 / W 117.8 MiB/s | reject: wall regression despite active BW gain |
+| `metaperf` | 353s | 357s | reject: metadata wall regression |
+
 Focused writeback slice-threshold check:
 
 ```bash
