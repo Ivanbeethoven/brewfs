@@ -4,7 +4,7 @@
 
 当前性能测试体系分成两条主线：
 
-1. `docker/compose-xfstests/run_redis_perf.sh` 启动 Redis + RustFS/MinIO/local-fs，再进入 `run_perf_in_container.sh` 跑 xfstests perf 工具和 fio profiles。默认覆盖 `fio-bigwrite`、`fio-bigread`、`fio-seqread`、`fio-seqwrite`、`fio-randread`、`fio-randwrite`、`fio-randrw`、`dirstress`、`dirperf`、`metaperf`、`looptest`。`--writeback-throughput-profile` 会启用 BrewFS S3 writeback、4GiB 读写内存 buffer、12GiB memory budget、S3 并发 16、writeback upload 并发 4、pending soft/hard 1GiB/2GiB、`writeback_persist_sync=false`、`compression=lz4`、FUSE workers 6，并对读类 fio 打开 prefill drain/remount/clear cache。
+1. `docker/compose-xfstests/run_redis_perf.sh` 启动 Redis + RustFS/MinIO/local-fs，再进入 `run_perf_in_container.sh` 跑 xfstests perf 工具和 fio profiles。默认覆盖 `fio-bigwrite`、`fio-bigread`、`fio-seqread`、`fio-seqwrite`、`fio-randread`、`fio-randwrite`、`fio-randrw`、`dirstress`、`dirperf`、`metaperf`、`looptest`。`--writeback-throughput-profile` 会启用 BrewFS S3 writeback、4GiB 读写内存 buffer、12GiB memory budget、S3 并发 16、writeback upload 并发 3、pending soft/hard 1GiB/2GiB、`writeback_persist_sync=false`、`compression=lz4`、FUSE workers 6，并对读类 fio 打开 prefill drain/remount/clear cache。
 2. `docker/compose-xfstests/run_juicefs_perf.sh` 与 `run_juicefs_perf_in_container.sh` 提供 JuiceFS 横向对比。`--writeback-throughput-profile` 默认启用 JuiceFS writeback、buffer 8192MiB、cache 4096MiB、upload/download concurrency 4/16、open-cache 1s/65536、compression none、backup-meta 0，并打开 prefill sync/remount/clear cache。
 3. `tools/perf/run_perf.sh` 是宿主机 profiling/flamegraph 脚本，默认 Redis + RustFS + BrewFS release/profiling build，fio workload 为 `seqwrite seqread randwrite randread randrw`，使用 `sync` ioengine、`direct=0`、runtime 60s，并额外跑 on-CPU/off-CPU `perf record`。
 
