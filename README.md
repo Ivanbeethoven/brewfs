@@ -301,6 +301,87 @@ Latest accepted BrewFS tuning:
 
 Latest rejected tuning checks:
 
+Compression-off comparison check:
+
+```bash
+BREWFS_COMPRESSION=none PERF_LOG_TO_CONSOLE=false \
+  bash docker/compose-xfstests/run_redis_perf.sh --s3 \
+  --writeback-throughput-profile \
+  --tools "fio-seqwrite fio-randwrite fio-randrw"
+```
+
+Artifact: `docker/compose-xfstests/artifacts/perf-run-1781513305-12460`.
+
+This was a configuration-only A/B against the accepted lz4 snapshot above. It
+improved `fio-randwrite` active bandwidth but hurt `fio-seqwrite`, slightly
+regressed `fio-randrw`, and worsened random-write p99 latency. It is not a safe
+default for the throughput profile.
+
+| Workload | Accepted lz4 snapshot | `BREWFS_COMPRESSION=none` | Decision |
+| --- | ---: | ---: | --- |
+| `fio-seqwrite` | 150s, W 72.8 MiB/s | 139s, W 67.7 MiB/s | reject: lower active BW |
+| `fio-randwrite` | 155s, W 78.6 MiB/s, p99 37.0ms | 141s, W 145.3 MiB/s, p99 208.7ms | reject: p99 regression |
+| `fio-randrw` | 161s, R 212.6 / W 95.5 MiB/s | 164s, R 203.8 / W 91.3 MiB/s | reject: wall and active BW regression |
+
+Older-unique append reuse check:
+
+```bash
+PERF_LOG_TO_CONSOLE=false \
+  bash docker/compose-xfstests/run_redis_perf.sh --s3 \
+  --writeback-throughput-profile \
+  --tools "fio-seqwrite fio-randwrite fio-randrw"
+```
+
+Artifact: `docker/compose-xfstests/artifacts/perf-run-1781514403-768`.
+
+The candidate allowed non-overlapping cached appends to reuse a slice even when
+the incoming FUSE unique id was older than the newest write already in that
+slice, while still rejecting older overlapping writes. Focused unit tests passed,
+but perf did not reduce the `reject_unique` pressure and mixed `fio-randrw`
+regressed materially, so the code was reverted.
+
+| Workload | Accepted snapshot | Older-unique append candidate | Decision |
+| --- | ---: | ---: | --- |
+| `fio-seqwrite` | 150s, W 72.8 MiB/s | 141s, W 72.6 MiB/s | reject: wall improved but no BW gain |
+| `fio-randwrite` | 155s, W 78.6 MiB/s | 138s, W 130.8 MiB/s | reject: narrow gain only |
+| `fio-randrw` | 161s, R 212.6 / W 95.5 MiB/s | 162s, R 186.5 / W 83.6 MiB/s | reject: mixed workload regression |
+
+Cached sub-block 10s age-safety check:
+
+```bash
+PERF_LOG_TO_CONSOLE=false \
+  bash docker/compose-xfstests/run_redis_perf.sh --s3 \
+  --writeback-throughput-profile \
+  --tools "fio-seqwrite fio-randwrite fio-randrw"
+
+PERF_FIO_DIRECT=1 PERF_LOG_TO_CONSOLE=false \
+  bash docker/compose-xfstests/run_redis_perf.sh --s3 \
+  --writeback-throughput-profile \
+  --tools "fio-seqwrite fio-randwrite fio-randrw"
+```
+
+Artifacts:
+
+- Buffered focused candidate:
+  `docker/compose-xfstests/artifacts/perf-run-1781515625-2009`
+- Direct-IO guard:
+  `docker/compose-xfstests/artifacts/perf-run-1781516260-7539`
+
+The candidate moved cached sub-block auto-freeze from the local 3s/1s idle and
+`tooMany` grace to a JuiceFS-like 10s age safety bound. Buffered writes improved
+in the focused run, but direct-IO `fio-seqwrite` regressed from 68s to 128s and
+write bandwidth slipped from 71.3 to 68.2 MiB/s. The code was reverted because
+the direct path is a required guard against page-cache masking.
+
+| Workload | Focused baseline | 10s age-safety candidate | Decision |
+| --- | ---: | ---: | --- |
+| `fio-seqwrite` direct=0 | 147s, W 71.7 MiB/s | 133s, W 90.0 MiB/s | promising buffered result |
+| `fio-randwrite` direct=0 | 138s, W 96.5 MiB/s | 136s, W 110.6 MiB/s | promising buffered result |
+| `fio-randrw` direct=0 | 161s, R 221.3 / W 99.4 MiB/s | 155s, R 201.8 / W 89.9 MiB/s | mixed active BW regression |
+| `fio-seqwrite` direct=1 | 68s, W 71.3 MiB/s | 128s, W 68.2 MiB/s | reject: direct wall regression |
+| `fio-randwrite` direct=1 | 153s, W 55.6 MiB/s | 148s, W 51.0 MiB/s | reject: active BW regression |
+| `fio-randrw` direct=1 | 173s, R 118.5 / W 53.3 MiB/s | 154s, R 126.9 / W 56.8 MiB/s | direct mixed improved but not enough to offset seqwrite |
+
 Uncompressed aligned vectored PUT fast-path check:
 
 ```bash
