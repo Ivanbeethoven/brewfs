@@ -309,6 +309,25 @@ permission checks again.
 
 Latest accepted BrewFS tuning:
 
+- `src/vfs/handles.rs` now returns up to 256 directory entries per
+  readdir/readdirplus batch instead of 50. This stays comfortably below common
+  FUSE reply-buffer limits while cutting userspace pagination for metaperf's
+  large directory scans. Focused default 4KiB `metaperf`
+  `docker/compose-xfstests/artifacts/perf-run-1781579177-18631` moved
+  `readdir` from `65443.4` to `110983.7 ops/s`, passing the same-cycle JuiceFS
+  focused result of `91338.6 ops/s`. The same run kept `create` at
+  `3053.1 ops/s`, `open` at `10060.0 ops/s`, `stat` at `1031608.2 ops/s`, and
+  `rename` at `1944.4 ops/s`; the small create/open movement is within focused
+  run noise, while the readdir win is large and targeted.
+
+  | Focused 4KiB `metaperf` | BrewFS sparse-zero `perf-run-1781575796-24729` | BrewFS readdir batch `perf-run-1781579177-18631` | JuiceFS `juicefs-perf-run-1781576125-3207` |
+  | --- | ---: | ---: | ---: |
+  | wall | 189s | 189s | 206s |
+  | `create` | 3059.3 ops/s | 3053.1 ops/s | 1361.4 ops/s |
+  | `open` | 10161.1 ops/s | 10060.0 ops/s | 23607.3 ops/s |
+  | `stat` | 1023493.1 ops/s | 1031608.2 ops/s | 1003843.3 ops/s |
+  | `readdir` | 65443.4 ops/s | 110983.7 ops/s | 91338.6 ops/s |
+  | `rename` | 1944.5 ops/s | 1944.4 ops/s | 2688.6 ops/s |
 - `src/vfs/fs/mod.rs` now treats small all-zero writes into sparse ranges as a
   metadata-only sparse extension. This follows the same performance idea as
   JuiceFS holes, but keeps BrewFS away from `slice_id=0` metadata because BrewFS
