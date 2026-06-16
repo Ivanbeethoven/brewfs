@@ -818,6 +818,169 @@ run_fio_profile() {
     wait_for_fio_post_write_drain "$tool"
 }
 
+generate_perf_report() {
+    python3 - "$artifact_dir" <<'PY'
+import csv
+import json
+import pathlib
+import sys
+
+artifact_dir = pathlib.Path(sys.argv[1])
+summary_path = artifact_dir / "perf-summary.tsv"
+profile_path = artifact_dir / "juicefs-profile.env"
+post_write_drain_path = artifact_dir / "post-write-drain.tsv"
+report_path = artifact_dir / "report.md"
+fio_json_paths = sorted((artifact_dir / "results").glob("fio*.json"))
+
+rows = []
+if summary_path.exists():
+    with summary_path.open(newline="") as f:
+        rows = list(csv.DictReader(f, delimiter="\t"))
+summary_by_tool = {row.get("tool", ""): row for row in rows}
+
+lines = [
+    "# JuiceFS Perf Report",
+    "",
+    "## Summary",
+    "",
+    "| Tool | Status | Seconds | Log |",
+    "| --- | --- | ---: | --- |",
+]
+
+for row in rows:
+    log = pathlib.Path(row.get("log", "")).name
+    lines.append(
+        f"| {row.get('tool', '')} | {row.get('status', '')} | "
+        f"{row.get('seconds', '')} | tools/{log} |"
+    )
+
+if profile_path.exists():
+    lines.extend([
+        "",
+        "## JuiceFS Profile",
+        "",
+        "| Key | Value |",
+        "| --- | --- |",
+    ])
+    for raw in profile_path.read_text(errors="replace").splitlines():
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        lines.append(f"| {key} | {value} |")
+
+if post_write_drain_path.exists():
+    with post_write_drain_path.open(newline="") as f:
+        drain_rows = [
+            row
+            for row in csv.DictReader(f, delimiter="\t")
+            if row.get("tool")
+        ]
+    if drain_rows:
+        lines.extend([
+            "",
+            "## Post-Write Drain",
+            "",
+            "| Tool | Drain seconds | Stage blocks | Stage bytes | Uploading | Put bytes | Get bytes |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ])
+        for row in drain_rows:
+            lines.append(
+                f"| {row.get('tool', '')} | {row.get('post_fio_drain_s', '')} | "
+                f"{row.get('stage_blocks', '')} | {row.get('stage_bytes', '')} | "
+                f"{row.get('uploading', '')} | {row.get('put_bytes', '')} | "
+                f"{row.get('get_bytes', '')} |"
+            )
+
+if fio_json_paths:
+    def num(value, default=0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def fmt_bytes(value):
+        value = num(value)
+        units = ["B", "KiB", "MiB", "GiB", "TiB"]
+        for unit in units:
+            if abs(value) < 1024 or unit == units[-1]:
+                return f"{value:.2f} {unit}"
+            value /= 1024
+        return f"{value:.2f} TiB"
+
+    def fmt_rate(value):
+        return f"{fmt_bytes(value)}/s"
+
+    def fmt_iops(value):
+        return f"{num(value):,.2f}"
+
+    def fmt_ms_from_ns(value):
+        return f"{num(value) / 1_000_000:.3f} ms"
+
+    def latency_percentile(op, pct):
+        percentiles = op.get("clat_ns", {}).get("percentile", {})
+        return percentiles.get(f"{pct:.6f}") or percentiles.get(str(pct))
+
+    lines.extend([
+        "",
+        "## Fio",
+        "",
+        "| Tool | Workload | Direct | BS | Jobs | Read BW | Read IOPS | Write BW | Write IOPS | Read P99 | Write P99 | Raw |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
+
+    runtime_rows = []
+    for fio_json_path in fio_json_paths:
+        data = json.loads(fio_json_path.read_text())
+        jobs = data.get("jobs", [])
+        if not jobs:
+            continue
+        options = next((job.get("job options", {}) for job in jobs if job.get("job options")), {})
+
+        def op_totals(op_name):
+            ops = [job.get(op_name, {}) for job in jobs]
+            runtimes = [num(op.get("runtime")) for op in ops if num(op.get("runtime")) > 0]
+            return {
+                "bw_bytes": sum(num(op.get("bw_bytes")) for op in ops),
+                "iops": sum(num(op.get("iops")) for op in ops),
+                "runtime_ms": max(runtimes) if runtimes else 0,
+                "p99_ns": max((num(latency_percentile(op, 99)) for op in ops), default=0),
+            }
+
+        read = op_totals("read")
+        write = op_totals("write")
+        tool_name = fio_json_path.stem
+        wall_seconds = num(summary_by_tool.get(tool_name, {}).get("seconds"))
+        active_runtime_ms = max(read["runtime_ms"], write["runtime_ms"])
+        runtime_rows.append((tool_name, options.get("direct", "unknown"), wall_seconds, active_runtime_ms))
+        lines.append(
+            f"| {tool_name} | {options.get('rw', 'unknown')} | {options.get('direct', 'unknown')} | "
+            f"{options.get('bs', 'unknown')} | {options.get('numjobs', 'unknown')} | "
+            f"{fmt_rate(read['bw_bytes'])} | {fmt_iops(read['iops'])} | "
+            f"{fmt_rate(write['bw_bytes'])} | {fmt_iops(write['iops'])} | "
+            f"{fmt_ms_from_ns(read['p99_ns'])} | {fmt_ms_from_ns(write['p99_ns'])} | "
+            f"results/{fio_json_path.name} |"
+        )
+
+    if runtime_rows:
+        lines.extend([
+            "",
+            "## Fio Runtime Accounting",
+            "",
+            "| Tool | Direct | Script wall | active_io_runtime | wall-active_io |",
+            "| --- | ---: | ---: | ---: | ---: |",
+        ])
+        for tool_name, direct, wall_seconds, active_runtime_ms in runtime_rows:
+            active_seconds = active_runtime_ms / 1000.0 if active_runtime_ms else 0.0
+            delta = wall_seconds - active_seconds if wall_seconds and active_seconds else 0.0
+            lines.append(
+                f"| {tool_name} | {direct} | {wall_seconds:.0f} s | "
+                f"{active_seconds:.3f} s | {delta:+.3f} s |"
+            )
+
+report_path.write_text("\n".join(lines) + "\n")
+PY
+}
+
 run_perf_suite() {
     local -a tools=()
     local status=0
@@ -903,6 +1066,7 @@ main() {
     run_perf_suite
     local status=$?
     set -e
+    generate_perf_report || true
 
     if [[ "$status" -eq 0 ]]; then
         ok "性能测试全部完成"

@@ -4573,6 +4573,30 @@ mod tests {
         }
     }
 
+    async fn wait_for_recent_pending_upload_bytes<B, M>(
+        writer: &Arc<DataWriter<B, M>>,
+        expected: u64,
+    ) where
+        B: BlockStore + Send + Sync + 'static,
+        M: MetaLayer + Send + Sync + 'static,
+    {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if writer.recent_pending_upload_bytes() == expected {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "recent pending upload bytes did not reach {expected}; got {}",
+                writer.recent_pending_upload_bytes()
+            )
+        });
+    }
+
     #[async_trait]
     impl BlockStore for BlockingStore {
         async fn write_fresh_range(
@@ -5116,11 +5140,7 @@ mod tests {
             breakdown.commit_before_stage_ops, 0,
             "metadata must not commit before the writeback stage record is sealed"
         );
-        assert_eq!(
-            writer.recent_pending_upload_bytes(),
-            layout.block_size as u64,
-            "remote upload should still be pending while S3 is blocked"
-        );
+        wait_for_recent_pending_upload_bytes(&writer, layout.block_size as u64).await;
 
         store.unblock();
     }
@@ -5161,10 +5181,7 @@ mod tests {
             .expect("commit-before-upload flush should return while object upload is blocked")
             .unwrap();
 
-        assert_eq!(
-            writer.recent_pending_upload_bytes(),
-            layout.block_size as u64
-        );
+        wait_for_recent_pending_upload_bytes(&writer, layout.block_size as u64).await;
 
         let stale_slice = {
             let guard = file_writer.shared.inner.lock().await;
@@ -5286,10 +5303,7 @@ mod tests {
             .expect("commit-before-upload flush should return while object upload is blocked")
             .unwrap();
 
-        assert_eq!(
-            writer.recent_pending_upload_bytes(),
-            layout.block_size as u64
-        );
+        wait_for_recent_pending_upload_bytes(&writer, layout.block_size as u64).await;
 
         store.unblock();
         timeout(Duration::from_secs(2), async {
@@ -5337,11 +5351,7 @@ mod tests {
             .expect("commit-before-upload flush should return while object upload is blocked")
             .unwrap();
 
-        assert_eq!(
-            writer.recent_pending_upload_bytes(),
-            1536,
-            "pending upload accounting should use the committed logical slice length"
-        );
+        wait_for_recent_pending_upload_bytes(&writer, 1536).await;
 
         store.unblock();
         timeout(Duration::from_secs(2), async {

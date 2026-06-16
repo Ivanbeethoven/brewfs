@@ -124,9 +124,10 @@
 ### P0 补充：direct matrix 已对齐，下一步补 report 口径
 
 - 位置：BrewFS `run_redis_perf.sh`/`run_perf_in_container.sh` 与 JuiceFS `run_juicefs_perf.sh`/`run_juicefs_perf_in_container.sh` 都支持 `PERF_FIO_DIRECT_MATRIX` 与 per-workload `PERF_FIO_*_DIRECT_MATRIX`。
-- 已验证：`docker/compose-xfstests/test_juicefs_direct_matrix.sh` 覆盖 matrix 展开和非法值拦截；小型 compose smoke `docker/compose-xfstests/artifacts/juicefs-perf-run-1781648479-21002` 生成了 `fio-seqwrite-direct0` 与 `fio-seqwrite-direct1` 两条 summary/result。
-- 剩余风险：direct 维度已经能在 artifact 中同构产出，但 BrewFS/JuiceFS 的报告字段仍不完全等价。横向分析时还需要统一 report 首页、fio runtime/wall/drain 字段、cache hygiene 和 JuiceFS stats/drain confidence。
-- 下一步建议：抽共享 fio/report parser 或先让 JuiceFS report 补齐 BrewFS report 的核心字段，使 direct matrix 结果能直接进入 README 对比表。
+- 已验证：`docker/compose-xfstests/test_juicefs_direct_matrix.sh` 覆盖 matrix 展开和非法值拦截；`docker/compose-xfstests/test_juicefs_perf_report.sh` 覆盖 JuiceFS `report.md` 生成；小型 compose smoke `docker/compose-xfstests/artifacts/juicefs-perf-run-1781648966-31124` 生成了 `fio-seqwrite-direct0` 与 `fio-seqwrite-direct1` 两条 summary/result/report。
+- 当前能力：JuiceFS artifact 已有基础 `report.md`，包含 summary、profile、post-write drain、fio runtime bandwidth/IOPS/p99、script wall 与 active IO runtime 对账。
+- 剩余风险：direct 维度和基础 report 已能在 artifact 中同构产出，但 BrewFS/JuiceFS 的深层诊断字段仍不完全等价。横向分析时还需要统一 cache hygiene、Redis commandstats、对象端 PUT/GET 字节、JuiceFS stats/drain confidence。
+- 下一步建议：抽共享 fio/report parser 或继续让 JuiceFS report 补齐 BrewFS report 的诊断字段，使 direct matrix 结果能直接进入 README 对比表。
 
 ### P0 补充：write workload 缺 post-write drain gate
 
@@ -151,6 +152,7 @@
 
 ### 下一轮优化接受标准
 
+- 本地 CI：每个 accepted 性能改动都必须先跑 `.github/workflows/ci.yml` 中对应的脚本检查和 Rust 测试；其中 `cargo test --workspace --lib --bins` 是硬门槛，不能只用 focused test 或 perf smoke 替代。
 - fio 全场景：`seqread`、`seqwrite`、`randread`、`randwrite`、`randrw`、`bigread`、`bigwrite`。
 - metadata：`metaperf` 至少覆盖 `create/open/stat/readdir/rename`，同时保留 Redis commandstats 和 cache hit/miss。
 - direct 矩阵：核心 fio 场景必须同时跑 `direct=0` 与 `direct=1`。

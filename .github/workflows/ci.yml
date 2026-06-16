@@ -65,6 +65,7 @@ jobs:
           bash -n docker/compose-xfstests/run_juicefs_perf.sh
           bash docker/compose-xfstests/test_perf_report_delta.sh
           bash docker/compose-xfstests/test_juicefs_direct_matrix.sh
+          bash docker/compose-xfstests/test_juicefs_perf_report.sh
 
       - name: Check workspace
         run: cargo check --workspace
