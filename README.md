@@ -285,46 +285,50 @@ seq/random workloads, `metaperf -t 8`, S3 writeback profiles, open-cache
 
 Artifacts:
 
-- BrewFS: `docker/compose-xfstests/artifacts/perf-run-1781585469-32747`
-- JuiceFS: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781584326-14116`
-- BrewFS standalone metadata guard:
-  `docker/compose-xfstests/artifacts/perf-run-1781586159-28465`
+- BrewFS: `docker/compose-xfstests/artifacts/perf-run-1781587688-20926`
+- JuiceFS: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781588148-5455`
 
 All selected tools passed: `fio-bigwrite fio-bigread fio-seqread fio-seqwrite
-fio-randread fio-randwrite fio-randrw metaperf`. A preceding default BrewFS run
-was stopped after the writeback tail grew too large for an interactive
-iteration; its incomplete artifact is not used for the table.
+fio-randread fio-randwrite fio-randrw metaperf`. The throughput profile now
+enables post-write drain accounting by default for both filesystems. BrewFS
+waits on `.stats` `pending/dirty/buffer_dirty`; JuiceFS waits on its
+staging/uploading counters after `sync`. The `tool+drain` columns below add
+`perf-summary.tsv` tool wall time to `post-write-drain.tsv` so writeback tail
+cost is visible without contaminating the next workload.
 
-| Workload | BrewFS wall | JuiceFS wall | BrewFS active BW | JuiceFS active BW | BrewFS/JuiceFS BW |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `fio-bigwrite` | 2s | 1s | W 1.03 GiB/s | W 3.21 GiB/s | W 0.32x |
-| `fio-bigread` | 1s | 1s | R 568.9 MiB/s | R 2.19 GiB/s | R 0.25x |
-| `fio-seqread` | 6s | 6s | R 1.82 GiB/s | R 2.47 GiB/s | R 0.74x |
-| `fio-seqwrite` | 52s | 21s | W 1.42 GiB/s | W 1011.4 MiB/s | W 1.44x |
-| `fio-randread` | 5s | 5s | R 714.1 MiB/s | R 3.19 GiB/s | R 0.22x |
-| `fio-randwrite` | 126s | 72s | W 1.64 GiB/s | W 2.23 GiB/s | W 0.74x |
-| `fio-randrw` | 25s | 6s | R 1.06 GiB/s / W 501.1 MiB/s | R 1.08 GiB/s / W 506.9 MiB/s | R 0.98x / W 0.99x |
+| Workload | BrewFS tool+drain | JuiceFS tool+drain | BrewFS post-drain | JuiceFS post-drain | BrewFS active BW | JuiceFS active BW | BrewFS/JuiceFS BW |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `fio-bigwrite` | 5s | 6s | 4s | 5s | W 1015.9 MiB/s | W 3.27 GiB/s | W 0.30x |
+| `fio-bigread` | 1s | 1s | n/a | n/a | R 672.8 MiB/s | R 2.22 GiB/s | R 0.30x |
+| `fio-seqread` | 6s | 6s | n/a | n/a | R 1.76 GiB/s | R 2.44 GiB/s | R 0.72x |
+| `fio-seqwrite` | 89s | 79s | 36s | 61s | W 1.40 GiB/s | W 970.5 MiB/s | W 1.48x |
+| `fio-randread` | 6s | 6s | n/a | n/a | R 598.0 MiB/s | R 3.11 GiB/s | R 0.19x |
+| `fio-randwrite` | 121s | 193s | 0s | 120s | W 1.63 GiB/s | W 2.33 GiB/s | W 0.70x |
+| `fio-randrw` | 29s | 61s | 0s | 55s | R 1009.3 / W 461.1 MiB/s | R 1.18 GiB/s / W 548.8 MiB/s | R 0.84x / W 0.84x |
 
 Short-matrix metadata comparison:
 
 | Operation | BrewFS | JuiceFS | BrewFS/JuiceFS |
 | --- | ---: | ---: | ---: |
-| `create` | 3475.9 ops/s | 1362.7 ops/s | 2.55x |
-| `open` | 10074.4 ops/s | 23565.2 ops/s | 0.43x |
-| `stat` | 1015321.2 ops/s | 1015054.7 ops/s | 1.00x |
-| `readdir` | 109094.6 ops/s | 91731.3 ops/s | 1.19x |
-| `rename` | 1923.2 ops/s | 2661.3 ops/s | 0.72x |
+| `create` | 2717.3 ops/s | 1350.3 ops/s | 2.01x |
+| `open` | 10152.6 ops/s | 23266.6 ops/s | 0.44x |
+| `stat` | 1018853.7 ops/s | 1015568.8 ops/s | 1.00x |
+| `readdir` | 107258.0 ops/s | 92098.7 ops/s | 1.16x |
+| `rename` | 1812.2 ops/s | 2663.1 ops/s | 0.68x |
 
 This run confirms the current shape of the gap: BrewFS can match or exceed
-JuiceFS on active sequential write, active mixed read/write bandwidth, `create`,
-`stat`, and `readdir`, but it still trails on cold/random read bandwidth,
-random-write wall time, and metadata `open`/`rename`. `fio-randwrite` and
-`fio-randrw` still show large close/flush tails even when active bandwidth is
-near JuiceFS, so writeback completion remains the primary bottleneck. The full
-short matrix reported `metaperf` wall at `187s` because `fio-randrw` left about
-`196 MiB` dirty data that drained during the next tool; the standalone metadata
-guard completed in `79s` with the same operation rates, confirming that metadata
-ops/sec did not regress.
+JuiceFS on active sequential write, `create`, `stat`, and `readdir`, while
+still trailing on big/cold/random read bandwidth, active random-write bandwidth,
+and metadata `open`/`rename`. The new drain accounting changes the interpretation
+of the write gap: `seqwrite` is close end-to-end (`89s` BrewFS versus `79s`
+JuiceFS) despite BrewFS spending more time inside the fio tool; `randwrite` and
+`randrw` now show BrewFS finishing sooner end-to-end on this local RustFS run
+because JuiceFS leaves large post-write drain tails (`120s` and `55s`). BrewFS
+still needs code work on foreground random-write waits (`121s` tool wall) and
+read throughput, rather than more blind pending-watermark tuning. JuiceFS also
+reported many 30s disk-cache write timeouts and slow S3 PUTs during the write
+heavy phases, so active bandwidth, tool wall, and post-drain should continue to
+be read together.
 
 Focused metadata diagnostics:
 

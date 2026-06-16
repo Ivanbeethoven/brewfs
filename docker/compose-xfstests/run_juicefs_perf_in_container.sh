@@ -45,6 +45,8 @@ env_or_default() {
 prepare_artifacts() {
     mkdir -p "$artifact_dir/results" "$artifact_dir/tools" "$artifact_dir/diagnostics"
     printf 'tool\tstatus\tseconds\tlog\n' >"$artifact_dir/perf-summary.tsv"
+    printf 'tool\tpost_fio_drain_s\tstage_blocks\tstage_bytes\tuploading\tput_bytes\tget_bytes\n' \
+        >"$artifact_dir/post-write-drain.tsv"
     write_juicefs_profile
 }
 
@@ -233,6 +235,20 @@ stats_snapshot_after_tool() {
     } >"$artifact_dir/diagnostics/juicefs-stats-${tool}-after.txt" 2>&1 || true
 }
 
+stats_snapshot_before_tool() {
+    local tool="$1"
+    local stats_path
+    {
+        date -Iseconds
+        echo
+        if stats_path="$(juicefs_stats_path 2>/dev/null)"; then
+            tr -d '\000' <"$stats_path"
+        else
+            echo "missing JuiceFS stats file under $mount_dir"
+        fi
+    } >"$artifact_dir/diagnostics/juicefs-stats-${tool}-before.txt" 2>&1 || true
+}
+
 juicefs_stat_value() {
     local metric="$1"
     local stats_path
@@ -303,6 +319,58 @@ wait_for_fio_prefill_drain() {
 
         if (( elapsed % 10 == 0 )); then
             info "  JuiceFS 写回等待中: stage_blocks=$staged_blocks stage_bytes=$staged_bytes uploading=$uploading put_bytes=$put_bytes get_bytes=$get_bytes elapsed=${elapsed}s"
+        fi
+        sleep "$interval"
+    done
+}
+
+wait_for_fio_post_write_drain() {
+    local tool="$1"
+    local timeout="${PERF_FIO_POST_WRITE_DRAIN_TIMEOUT_SECS:-600}"
+    local interval="${PERF_FIO_POST_WRITE_DRAIN_INTERVAL_SECS:-2}"
+    local threshold="${PERF_FIO_POST_WRITE_DRAIN_PENDING_BYTES:-0}"
+    local start now elapsed staged_blocks staged_bytes uploading put_bytes get_bytes
+
+    truthy "${PERF_FIO_POST_WRITE_DRAIN:-false}" || return 0
+    case "$tool" in
+        fio-seqwrite*|fio-randwrite*|fio-randrw*|fio-bigwrite*) ;;
+        *) return 0 ;;
+    esac
+
+    stats_snapshot_before_tool "${tool}-post-write-drained"
+    stats_snapshot_before_tool "${tool}-post-write-drain-timeout"
+    start="$(date +%s)"
+    info "等待 JuiceFS fio 写入后写回完成: $tool (stage_bytes<=${threshold}, timeout=${timeout}s)"
+    sync || true
+
+    while true; do
+        staged_blocks="$(numeric_juicefs_stat_or_zero juicefs_staging_blocks)"
+        staged_bytes="$(numeric_juicefs_stat_or_zero juicefs_staging_block_bytes)"
+        uploading="$(numeric_juicefs_stat_or_zero juicefs_object_request_uploading)"
+        put_bytes="$(numeric_juicefs_stat_or_zero juicefs_object_request_data_bytes_PUT)"
+        get_bytes="$(numeric_juicefs_stat_or_zero juicefs_object_request_data_bytes_GET)"
+
+        now="$(date +%s)"
+        elapsed="$((now - start))"
+
+        if (( staged_bytes <= threshold && staged_blocks == 0 && uploading == 0 )); then
+            ok "JuiceFS fio 写入后写回已完成: $tool (stage_blocks=$staged_blocks stage_bytes=$staged_bytes uploading=$uploading put_bytes=$put_bytes get_bytes=$get_bytes elapsed=${elapsed}s)"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$tool" "$elapsed" "$staged_blocks" "$staged_bytes" "$uploading" "$put_bytes" "$get_bytes" \
+                >>"$artifact_dir/post-write-drain.tsv"
+            stats_snapshot_after_tool "${tool}-post-write-drained"
+            return 0
+        fi
+
+        if (( elapsed >= timeout )); then
+            err "JuiceFS fio 写入后写回等待超时: $tool (stage_blocks=$staged_blocks stage_bytes=$staged_bytes uploading=$uploading put_bytes=$put_bytes get_bytes=$get_bytes elapsed=${elapsed}s)"
+            printf '%s\ttimeout:%s\t%s\t%s\t%s\t%s\t%s\n' "$tool" "$elapsed" "$staged_blocks" "$staged_bytes" "$uploading" "$put_bytes" "$get_bytes" \
+                >>"$artifact_dir/post-write-drain.tsv"
+            stats_snapshot_after_tool "${tool}-post-write-drain-timeout"
+            return 1
+        fi
+
+        if (( elapsed % 10 == 0 )); then
+            info "  JuiceFS 写后写回等待中: stage_blocks=$staged_blocks stage_bytes=$staged_bytes uploading=$uploading put_bytes=$put_bytes get_bytes=$get_bytes elapsed=${elapsed}s"
         fi
         sleep "$interval"
     done
@@ -711,6 +779,7 @@ run_fio_profile() {
     args+=(--write_lat_log="$lat_log_prefix" --log_avg_msec=1000)
     run_logged_tool "$tool" fio "${args[@]}"
     append_fio_log_summary "$json_path" "$artifact_dir/tools/${tool}.log" "$tool"
+    wait_for_fio_post_write_drain "$tool"
 }
 
 run_perf_suite() {
