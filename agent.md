@@ -27,7 +27,10 @@ Current primary gaps from the latest Redis plus S3/RustFS comparison:
 ## Reference Code
 
 - BrewFS code lives in this repository.
-- JuiceFS reference code is expected under `brewfs/juicefs/`.
+- JuiceFS reference code should live outside the BrewFS worktree, for example
+  `/mnt/slayerfs/juicefs`. If a user explicitly provides `brewfs/juicefs/`, it
+  may be read as a reference, but do not commit a JuiceFS source checkout into
+  this repository.
 - When comparing behavior, read JuiceFS code first and map it to BrewFS
   boundaries instead of transplanting abstractions mechanically.
 

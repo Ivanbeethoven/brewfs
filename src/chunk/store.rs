@@ -1,7 +1,7 @@
 //! Storage backends: asynchronous block-level IO traits and in-memory implementations.
 
 use crate::chunk::bandwidth::BandwidthLimiter;
-use crate::chunk::compress::{Compression, compress, decompress};
+use crate::chunk::compress::{Compression, compress, decompress_bytes};
 use crate::chunk::page_cache::{PageKey, ReadPageCache};
 use crate::chunk::singleflight::SingleFlight;
 use crate::utils::NumCastExt;
@@ -543,7 +543,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                     let raw_bytes = match raw {
                         Some(data) => {
                             object_metrics.record_get(data.len() as u64, started.elapsed());
-                            data
+                            Bytes::from(data)
                         }
                         None => {
                             object_metrics.record_get(0, started.elapsed());
@@ -551,12 +551,12 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                         }
                     };
                     let decompressed = if !matches!(compression, Compression::None) {
-                        decompress(&raw_bytes)
+                        decompress_bytes(raw_bytes)
                             .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))?
                     } else {
                         raw_bytes
                     };
-                    Ok::<_, anyhow::Error>(Bytes::from(decompressed))
+                    Ok::<_, anyhow::Error>(decompressed)
                 })
                 .await;
 
@@ -825,7 +825,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                     let raw_bytes = match raw {
                         Some(data) => {
                             object_metrics.record_get(data.len() as u64, started.elapsed());
-                            data
+                            Bytes::from(data)
                         }
                         None => {
                             object_metrics.record_get(0, started.elapsed());
@@ -834,12 +834,12 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                     };
                     // Decompress if compression is enabled (auto-detects from header)
                     let decompressed = if !matches!(compression, Compression::None) {
-                        decompress(&raw_bytes)
+                        decompress_bytes(raw_bytes)
                             .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))?
                     } else {
                         raw_bytes
                     };
-                    Ok::<_, anyhow::Error>(Bytes::from(decompressed))
+                    Ok::<_, anyhow::Error>(decompressed)
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("SingleFlight read failed: {e}"))?;

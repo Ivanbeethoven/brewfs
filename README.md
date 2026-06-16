@@ -330,6 +330,58 @@ reported many 30s disk-cache write timeouts and slow S3 PUTs during the write
 heavy phases, so active bandwidth, tool wall, and post-drain should continue to
 be read together.
 
+Focused 2026-06-16 read-path raw-fallback check:
+
+This focused check validates the LZ4 raw-fallback read optimization. BrewFS now
+reuses raw object payload buffers when an object has no compression header,
+instead of copying the 4MiB block into a fresh `Vec<u8>` before populating the
+block cache. The comparison used the same writeback throughput profile and the
+same short read/mixed sizes as the matrix above:
+
+```bash
+PERF_LOG_TO_CONSOLE=false CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0 \
+  PERF_FIO_BIGREAD_SIZE=64m PERF_FIO_SEQREAD_SIZE=128m \
+  PERF_FIO_RANDREAD_SIZE=128m PERF_FIO_RANDRW_SIZE=128m \
+  PERF_FIO_RUNTIME=5 PERF_FIO_POST_WRITE_DRAIN_TIMEOUT_SECS=300 \
+  bash docker/compose-xfstests/run_redis_perf.sh --s3 \
+  --writeback-throughput-profile \
+  --tools "fio-bigread fio-seqread fio-randread fio-randrw"
+
+PERF_LOG_TO_CONSOLE=false \
+  PERF_FIO_BIGREAD_SIZE=64m PERF_FIO_SEQREAD_SIZE=128m \
+  PERF_FIO_RANDREAD_SIZE=128m PERF_FIO_RANDRW_SIZE=128m \
+  PERF_FIO_RUNTIME=5 PERF_FIO_POST_WRITE_DRAIN_TIMEOUT_SECS=300 \
+  bash docker/compose-xfstests/run_juicefs_perf.sh \
+  --writeback-throughput-profile \
+  --tools "fio-bigread fio-seqread fio-randread fio-randrw"
+```
+
+Artifacts:
+
+- BrewFS previous lz4 short matrix:
+  `docker/compose-xfstests/artifacts/perf-run-1781587688-20926`
+- BrewFS raw-fallback candidate:
+  `docker/compose-xfstests/artifacts/perf-run-1781589987-5483`
+- JuiceFS dev reference, cloned from `juicedata/juicefs` at `fd52b9a`:
+  `docker/compose-xfstests/artifacts/juicefs-perf-run-1781590204-7256`
+
+| Workload | BrewFS previous | BrewFS raw-fallback | Delta | JuiceFS dev | BrewFS/JuiceFS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `fio-bigread` | R 672.8 MiB/s | R 679.9 MiB/s | +1.1% | R 2.26 GiB/s | R 0.29x |
+| `fio-seqread` | R 1.76 GiB/s | R 1.71 GiB/s | -2.7% | R 2.68 GiB/s | R 0.64x |
+| `fio-randread` | R 598.0 MiB/s | R 786.7 MiB/s | +31.6% | R 3.23 GiB/s | R 0.24x |
+| `fio-randrw` | R 751.3 / W 332.1 MiB/s focused baseline | R 727.1 / W 320.9 MiB/s | R -3.2% / W -3.4% | R 1.04 GiB/s / W 489.2 MiB/s | R 0.68x / W 0.66x |
+
+`fio-randrw` uses the earlier focused BrewFS baseline
+`docker/compose-xfstests/artifacts/perf-run-1781587228-9218` because the full
+short matrix's mixed result was inflated by run-order noise. The candidate's
+post-write drain was `4s`; the JuiceFS dev reference drained for `67s` and
+emitted several `context canceled` read/compact warnings during random read and
+mixed phases. The accepted conclusion is narrow: raw fallback reuse is a real
+random-read improvement and does not show a large mixed-workload regression, but
+it does not explain the remaining `bigread`/`seqread` gap. The next read-path
+target remains FUSE/read scheduling and object GET tail behavior.
+
 Focused metadata diagnostics:
 
 - Zero-byte `metaperf` isolates metadata from 4KiB small-file writeback. The
@@ -366,6 +418,25 @@ permission checks again.
 
 Latest accepted BrewFS tuning:
 
+- `src/chunk/compress.rs` now returns borrowed data for raw/no-header
+  decompression, and `src/chunk/store.rs` uses `decompress_bytes(Bytes)` so LZ4
+  raw fallback objects can move from object response to block cache without an
+  extra 4MiB copy. This follows the JuiceFS cached-store pattern of keeping the
+  downloaded object/page buffer as the cache payload when no transform is
+  required. TDD first added `test_raw_data_without_header_is_borrowed`, which
+  failed against the old `Vec<u8>` API; the final test set adds
+  `test_decompress_bytes_reuses_raw_buffer`.
+
+  Verification passed:
+  `cargo test -p brewfs chunk::compress::tests --lib`,
+  `cargo test -p brewfs chunk::store::tests --lib`,
+  `cargo fmt --all -- --check`, and `cargo check -p brewfs`. Focused compose
+  validation `docker/compose-xfstests/artifacts/perf-run-1781589987-5483`
+  moved lz4 `fio-randread` from `598.0` to `786.7 MiB/s` while keeping focused
+  `randrw` close to the prior focused baseline (`727.1/320.9 MiB/s` versus
+  `751.3/332.1 MiB/s`). `bigread` and `seqread` stayed essentially flat, so the
+  remaining read gap should be attacked in request scheduling and GET tail
+  control rather than raw-fallback copies.
 - `src/chunk/store.rs` no longer duplicates a decompressed full-block read into
   the 64KiB page cache before inserting the same block into the full block
   cache. `ObjectBlockStore::read_range` always checks the block cache first, so
