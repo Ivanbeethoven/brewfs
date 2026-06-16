@@ -22,13 +22,13 @@ pub enum CacheIntegrityMode {
 }
 
 /// Block size for checksum calculation (32KB, matching JuiceFS)
-const CS_BLOCK: usize = 32 * 1024;
+pub(crate) const CS_BLOCK: usize = 32 * 1024;
 
 /// Magic bytes to identify integrity-wrapped cache files.
-const MAGIC: [u8; 4] = [0x53, 0x46, 0x43, 0x31]; // "SFC1"
+pub(crate) const MAGIC: [u8; 4] = [0x53, 0x46, 0x43, 0x31]; // "SFC1"
 
 /// Header: [MAGIC(4)][data_len(4 bytes LE)]
-const HEADER_LEN: usize = 8;
+pub(crate) const HEADER_LEN: usize = 8;
 
 /// Encode data with CRC32C checksums for disk storage.
 /// Format: [MAGIC(4)][data_len_u32(4)][data][checksums]

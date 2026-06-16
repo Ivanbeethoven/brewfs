@@ -665,11 +665,31 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
     // Caller is responsible for zero-filling buf; this method only overwrites existing bytes.
     async fn read_range(&self, key: BlockKey, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         let len = buf.len();
+        if len == 0 {
+            tracing::Span::current().record("strategy", "empty");
+            tracing::Span::current().record("read_len", 0);
+            return Ok(());
+        }
+
         let key_str = Self::key_for(key);
 
         // Try cache first — blocks are immutable once committed, so a cache
         // hit is always valid regardless of read size or offset.
-        if let Some(cached) = self.block_cache.get(&key_str).await {
+        let full_block_read = offset == 0 && len >= self.config.block_size;
+        if !full_block_read
+            && let Some(read_len) = self
+                .block_cache
+                .get_range_into(&key_str, offset as usize, buf)
+                .await
+        {
+            tracing::trace!(key = %key_str, len = read_len, "block_cache range HIT");
+            tracing::Span::current().record("strategy", "cache_range_hit");
+            tracing::Span::current().record("read_len", read_len);
+            self.object_metrics.record_read_block_cache_hit();
+            return Ok(());
+        }
+
+        if full_block_read && let Some(cached) = self.block_cache.get(&key_str).await {
             tracing::trace!(key = %key_str, len = cached.len(), "block_cache HIT");
             tracing::Span::current().record("strategy", "cache_hit");
             self.object_metrics.record_read_block_cache_hit();
@@ -2060,6 +2080,108 @@ mod tests {
             *backend.get_object_calls.lock().unwrap(),
             1,
             "large read after background prefetch should hit block cache"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_partial_read_uses_disk_cache_range_when_unrequested_block_is_corrupt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::cadapter::client::{ObjectBackend, ObjectClient};
+        use async_trait::async_trait;
+        use std::{
+            io::{Seek, SeekFrom, Write},
+            sync::{Arc, Mutex},
+        };
+
+        const HEADER_LEN: u64 = 8;
+        const CHECKSUM_BLOCK: usize = 32 * 1024;
+
+        #[derive(Clone, Default)]
+        struct MockBackend {
+            get_object_calls: Arc<Mutex<usize>>,
+            get_object_range_calls: Arc<Mutex<usize>>,
+        }
+
+        #[async_trait]
+        impl ObjectBackend for MockBackend {
+            async fn put_object(&self, _key: &str, _data: &[u8]) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn get_object(&self, _key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                *self.get_object_calls.lock().unwrap() += 1;
+                Ok(None)
+            }
+
+            async fn get_object_range(
+                &self,
+                _key: &str,
+                _offset: u64,
+                _buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                *self.get_object_range_calls.lock().unwrap() += 1;
+                Ok(0)
+            }
+
+            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
+                Ok("test_etag".to_string())
+            }
+
+            async fn delete_object(&self, _key: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let backend = MockBackend::default();
+        let block: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let cache_dir = tempfile::tempdir()?;
+        let config = BlockStoreConfig {
+            block_size: 4 * 1024 * 1024,
+            range_read_threshold: 0.25,
+            compression: Compression::None,
+            ..Default::default()
+        };
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(backend.clone()),
+            ChunksCacheConfig::with_budgets(
+                16 * 1024 * 1024,
+                16 * 1024 * 1024,
+                cache_dir.path().to_path_buf(),
+            ),
+            config,
+        )
+        .await?;
+
+        let cache_key = "chunks/89/0".to_string();
+        store
+            .block_cache
+            .store_to_disk(&cache_key, Bytes::from(block.clone()))
+            .await?;
+
+        let cache_file = std::fs::read_dir(cache_dir.path())?
+            .filter_map(Result::ok)
+            .find(|entry| entry.path().is_file())
+            .expect("disk cache file should exist")
+            .path();
+        let mut file = std::fs::OpenOptions::new().write(true).open(&cache_file)?;
+        file.seek(SeekFrom::Start(HEADER_LEN + (CHECKSUM_BLOCK * 2) as u64))?;
+        file.write_all(&[0xFF])?;
+
+        let mut out = vec![0u8; 4096];
+        store.read_range((89, 0), 1024, &mut out).await?;
+
+        assert_eq!(out, block[1024..1024 + 4096]);
+        assert_eq!(
+            *backend.get_object_calls.lock().unwrap(),
+            0,
+            "partial disk cache hit should not fall back to full object read"
+        );
+        assert_eq!(
+            *backend.get_object_range_calls.lock().unwrap(),
+            0,
+            "partial disk cache hit should not fall back to object range read"
         );
 
         Ok(())
