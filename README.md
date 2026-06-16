@@ -671,6 +671,26 @@ Latest accepted BrewFS tuning:
 
 Latest rejected tuning checks:
 
+2026-06-16 hot-path micro-checks:
+
+The following small candidates were tested against accepted short baseline
+`docker/compose-xfstests/artifacts/perf-run-1781594407-19392` and then reverted.
+Their transient artifacts were removed after comparison to keep local storage
+bounded. All runs used the writeback throughput profile with fio `direct=0`,
+64MiB `fio-big*` data, 128MiB seq/random data, and 5s timed seq/random windows.
+
+| Candidate | Focused tools | Positive signal | Regression | Decision |
+| --- | --- | --- | --- | --- |
+| Disk-cache `store_with_permit` `write_vectored` | `fio-bigwrite fio-seqwrite fio-randwrite fio-randrw` | `randwrite` wall improved 135s -> 128s and PUTs/GiB fell 23.5% | bigwrite BW -5.5%, randwrite BW -6.2%, randwrite p999 41ms -> 1250ms, seqwrite wall 60s -> 89s, randrw BW -3% to -5% | reject: stage syscall shape is not the bottleneck |
+| Single-chunk dirty-overlay fast path | `fio-bigwrite fio-seqwrite fio-randwrite fio-randrw` | `randwrite` wall improved 135s -> 117s and PUTs/GiB fell 17.4% | bigwrite BW -5.6%, randrw read/write BW -3.7%/-5.1%, randread-tail-adjacent mixed p99 worsened, seqwrite wall 60s -> 83s | reject: mixed/seqwrite regression outweighs object-shape gain |
+| Skip disk-cache atime touch until eviction pressure | `fio-bigread fio-seqread fio-randread fio-randrw` | pure `randread` BW improved 1.68 GiB/s -> 1.84 GiB/s | seqread BW -9.5%, bigread BW -3.7%, randrw read/write BW -36.9%/-37.9%, randrw write p99 9.5ms -> 78.1ms | reject: pure read gain is not acceptable with randrw collapse |
+
+These results point away from micro-optimizing cache file writes, local overlay
+allocation shape, or unconditional atime skipping. The next useful attempt
+should target writeback slice batching/commit scheduling with explicit mixed
+workload guards, or isolate pure read-cache improvements behind a condition
+that is disabled while mixed writeback is active.
+
 Older FUSE unique append reuse:
 
 ```bash
