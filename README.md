@@ -688,11 +688,28 @@ writeback throughput profile with fio `direct=0`, 64MiB `fio-big*` data,
 | Raise writeback upload concurrency 6 -> 8 | `fio-bigwrite fio-seqwrite fio-randwrite fio-randrw` | seqwrite post-drain improved 32s -> 14s and randrw wall fell 34s -> 31s | bigwrite BW -8.8%, seqwrite BW -4.9%, randrw read/write BW -4.9%/-6.1%, randwrite p999 41ms -> 225ms | reject: more upload workers reduce drain but hurt active throughput and tail latency |
 | Background disk-cache atime touch | `fio-bigread fio-seqread fio-randread fio-randrw` | pure `randread` BW improved 1.68 GiB/s -> 1.88 GiB/s | bigread BW -1.5%, seqread BW -9.4%, randrw read/write BW -34.2%/-35.1%, randrw write p999 10.6ms -> 149.9ms | reject: atime deferral still destabilizes mixed reads/writes |
 | Disable disk-cache checksum verification | `fio-bigread fio-seqread fio-randread fio-randrw` | pure `randread` BW improved 1.68 GiB/s -> 1.90 GiB/s | bigread BW -3.0%, seqread BW -9.1%, randrw read/write BW -33.8%/-34.6%, randrw write p999 10.6ms -> 187.7ms | reject: checksum hotspot is real, but disabling verification is not a balanced profile |
+| DataFetcher single-block direct read plan | `fio-bigread fio-seqread fio-randread fio-randrw` | no material gain; seqread p99 improved 2.70ms -> 2.24ms versus `perf-run-1781613121-5053` | randread BW fell 1.86 -> 1.81 GiB/s and randrw fell R 982/W 446 -> R 970/W 440 MiB/s versus the latest focused baseline | reject: bypassing slice fragmentation setup is not the current read bottleneck |
 | Preallocate upload aggregation `Vec` | `fio-bigwrite fio-seqwrite fio-randwrite fio-randrw` | bigwrite BW +9.1%, randwrite BW +14.3%, seqwrite BW +2.2%, randwrite p99 45.4ms -> 33.4ms | seqwrite wall 66s -> 72s, randwrite wall 117s -> 131s, randrw read/write BW -3.9%/-4.5%, randrw write p99 4.6ms -> 9.4ms | reject: active-write gain does not survive wall-time and mixed-workload guards |
 | Share upload/stage chunk buffer with `Arc<[Bytes]>` | `fio-bigwrite fio-seqwrite fio-randwrite fio-randrw` | bigwrite BW +8.3%, seqwrite BW +9.2%, randwrite BW +13.0%, randwrite p99 45.4ms -> 30.0ms | seqwrite wall 66s -> 78s, randwrite wall 117s -> 123s, randrw read/write BW -4.6%/-4.7%, randrw write p99 4.6ms -> 9.5ms, randwrite PUTs/GiB +24.8% | reject: removing the Vec clone does not reduce object amplification and worsens wall/mixed guards |
 | Count only writable slices for `too_many` pressure | `fio-bigwrite fio-seqwrite fio-randwrite fio-randrw` | seqwrite wall 66s -> 65s, seqwrite PUTs/GiB -6.6%, seqwrite too_many tails 37 -> 0, randwrite BW +11.7%, randwrite p99 45.4ms -> 30.3ms | randwrite wall 117s -> 127s, randwrite PUTs/GiB +32.3%, randwrite partial-tail ratio 0.831 -> 0.885, randrw write p99 4.6ms -> 9.1ms, bigwrite BW -3.4% | reject: delayed too_many pressure shifts work into smaller randwrite objects and longer close/flush tail |
 | Enable compact profile defaults (`interval=2s`, `min_slice_count=3`) | `fio-bigwrite fio-seqwrite fio-randwrite fio-randrw` | bigwrite BW 911.0 MiB/s -> 1.04 GiB/s, seqwrite BW 1.29 -> 1.39 GiB/s, randwrite BW 1.56 -> 1.70 GiB/s, randrw wall 32s -> 12s | seqwrite wall 66s -> 83s, randwrite wall 117s -> 129s, randrw read/write BW 1.28 GiB/s / 600.0 MiB/s -> 845.7 / 384.1 MiB/s | reject as default: config pass-through is kept, but low-interval compaction hurts wall time and mixed throughput |
 | Redis rename outcome returned to `MetaClient` | `metaperf` | standalone `metaperf` wall was 187s, but this is not comparable to the full-matrix 248s after fio pressure | vs accepted same-parameter run: create 3470.4 -> 3174.0, open 10106.8 -> 9149.6, stat 1021723.6 -> 932515.8, readdir 109145.2 -> 98537.3, rename 1915.0 -> 1863.9 ops/s | reject: avoiding the destination prelookup did not improve the target rename path; code was reverted after local CI and focused perf |
+
+The DataFetcher single-block candidate artifact is
+`docker/compose-xfstests/artifacts/perf-run-1781630677-14774`; its same-parameter
+JuiceFS focused comparison is
+`docker/compose-xfstests/artifacts/juicefs-perf-run-1781630997-4241`.
+
+| Focused workload | BrewFS active BW | JuiceFS active BW | BrewFS/JuiceFS | BrewFS p99 | JuiceFS p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `fio-bigread` | R 1.24 GiB/s | R 2.29 GiB/s | R 0.54x | R 53.2ms | R 37.5ms |
+| `fio-seqread` | R 2.03 GiB/s | R 2.41 GiB/s | R 0.84x | R 2.2ms | R 2.0ms |
+| `fio-randread` | R 1.81 GiB/s | R 3.07 GiB/s | R 0.59x | R 26.6ms | R 9.9ms |
+| `fio-randrw` | R 969.9 / W 439.9 MiB/s | R 923.2 / W 419.5 MiB/s | R 1.05x / W 1.05x | R 44.3ms / W 9.6ms | R 206.6ms / W 13.3ms |
+
+BrewFS drained the `fio-randrw` post-write tail in 4s in this focused run;
+the local JuiceFS run drained in 66s and emitted several `readSlice` and compact
+`context canceled` warnings while still completing the fio tools successfully.
 
 The Redis rename-outcome artifact is
 `docker/compose-xfstests/artifacts/perf-run-1781627417-18180`. Before that

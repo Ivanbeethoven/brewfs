@@ -1,6 +1,6 @@
 FROM golang:1.25-bookworm AS builder
 WORKDIR /build
-COPY brewfs/juicefs/ ./
+COPY juicefs/ ./
 RUN make juicefs && cp juicefs /usr/local/bin/juicefs
 
 FROM debian:trixie-slim

@@ -11,6 +11,12 @@ writeback semantics, metadata hot paths, object-store IO shape, and benchmark
 discipline. BrewFS is not a JuiceFS fork; copy ideas only after understanding
 the local architecture.
 
+The active optimization goal includes the local CI gate as a hard prerequisite:
+before a perf run, README update, or commit is accepted, the Rust checks from
+`.github/workflows/ci.yml` must pass locally. If the local CI gate fails, the
+next goal step is to fix or quarantine that failure before continuing with
+performance work.
+
 Current primary gaps from the latest Redis plus S3/RustFS comparison:
 
 - Cold `bigread` and random reads still trail JuiceFS significantly; sequential
