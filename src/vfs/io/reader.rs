@@ -886,13 +886,15 @@ where
                     }
                 };
 
-                let mut fetcher = DataFetcher::with_slices(
+                DataFetcher::read_at_into_prepared(
                     self.config.layout,
                     chunk_id,
-                    &self.backend,
-                    (*slices_arc).clone(),
-                );
-                fetcher.read_at_into(offset.into(), buf).await
+                    self.backend.as_ref(),
+                    slices_arc.as_ref().as_slice(),
+                    offset.into(),
+                    buf,
+                )
+                .await
             }
             .await;
 

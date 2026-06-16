@@ -55,24 +55,6 @@ where
         }
     }
 
-    /// Create a DataFetcher with pre-fetched slice metadata, skipping
-    /// the meta.get_slices() call entirely.  Used by FileReader's
-    /// per-handle chunk→slice cache for repeated reads within the same chunk.
-    pub(crate) fn with_slices(
-        layout: ChunkLayout,
-        id: u64,
-        backend: &'a Backend<B, M>,
-        slices: Vec<SliceDesc>,
-    ) -> Self {
-        Self {
-            layout,
-            id,
-            backend,
-            prepared: true,
-            slices,
-        }
-    }
-
     /// Consume the fetcher and return the cached slice list so callers
     /// can reuse it for subsequent reads of the same chunk.
     pub(crate) fn into_slices(self) -> Vec<SliceDesc> {
@@ -215,20 +197,46 @@ where
     )]
     #[allow(dead_code)]
     pub(crate) async fn read_at_into(&mut self, offset: ChunkOffset, buf: &mut [u8]) -> Result<()> {
-        let offset = offset.get();
-        let len = buf.len();
-        if len == 0 {
-            return Ok(());
-        }
         ensure!(
             self.prepared,
             "DataFetcher::read_at_into requires prepare_slices() to run first"
         );
 
+        Self::read_at_into_prepared(
+            self.layout,
+            self.id,
+            self.backend,
+            &self.slices,
+            offset,
+            buf,
+        )
+        .await
+    }
+
+    #[tracing::instrument(
+        name = "DataFetcher.read_at_into_prepared",
+        level = "trace",
+        skip(backend, slices, buf),
+        fields(chunk_id = id, offset = offset.0, len = buf.len(), slice_count = slices.len())
+    )]
+    pub(crate) async fn read_at_into_prepared(
+        layout: ChunkLayout,
+        id: u64,
+        backend: &Backend<B, M>,
+        slices: &[SliceDesc],
+        offset: ChunkOffset,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        let offset = offset.get();
+        let len = buf.len();
+        if len == 0 {
+            return Ok(());
+        }
+
         let need_read = {
             let mut intervals = Intervals::new(offset, offset + len as u64);
             let mut need_read = Vec::new();
-            for slice in self.slices.iter().copied().rev() {
+            for slice in slices.iter().copied().rev() {
                 for (l, r) in intervals.cut(slice.offset, slice.offset + slice.length) {
                     need_read.push((l, r, slice));
                 }
@@ -237,8 +245,6 @@ where
             need_read
         };
 
-        let layout = self.layout;
-        let backend = self.backend;
         let mut cursor = 0;
         let mut tail = buf;
         let mut futures = FuturesUnordered::new();
@@ -400,6 +406,50 @@ mod tests {
                 .iter()
                 .all(|&b| b == 1)
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_at_into_prepared_borrows_slice_metadata() {
+        let layout = ChunkLayout::default();
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta = create_meta_store_from_url("sqlite::memory:")
+            .await
+            .unwrap()
+            .layer();
+        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
+
+        let data = vec![3u8; layout.block_size as usize];
+        let slice_id = meta.next_id(SLICE_ID_KEY).await.unwrap();
+        let uploader = DataUploader::new(layout, backend.as_ref());
+        uploader
+            .write_at_vectored(
+                slice_id as u64,
+                0u64.into(),
+                &[bytes::Bytes::copy_from_slice(&data)],
+            )
+            .await
+            .unwrap();
+
+        let slices = vec![SliceDesc {
+            slice_id: slice_id as u64,
+            chunk_id: 11,
+            offset: 0,
+            length: data.len() as u64,
+        }];
+        let mut out = vec![0u8; data.len()];
+
+        DataFetcher::read_at_into_prepared(
+            layout,
+            11,
+            backend.as_ref(),
+            &slices,
+            0u64.into(),
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, data);
     }
 
     #[tokio::test]

@@ -233,8 +233,8 @@ PERF_LOG_TO_CONSOLE=false \
 
 Artifacts:
 
-- BrewFS: `docker/compose-xfstests/artifacts/perf-run-1781637893-16859`
-- JuiceFS: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781639171-15800`
+- BrewFS: `docker/compose-xfstests/artifacts/perf-run-1781642920-30093`
+- JuiceFS: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781644124-17752`
 
 Local CI gate before accepting this perf iteration:
 `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace --lib --bins`
@@ -251,29 +251,41 @@ upper bound.
 
 | Workload | BrewFS wall+drain | JuiceFS wall+drain | BrewFS fio BW | JuiceFS fio BW | BrewFS/JuiceFS BW | BrewFS p99 | JuiceFS p99 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `fio-bigwrite` | 5s | 15s | W 1.01 GiB/s | W 3.21 GiB/s | W 0.32x | W 44.3ms | W 15.4ms |
-| `fio-bigread` | 1s | 1s | R 1.28 GiB/s | R 2.28 GiB/s | R 0.56x | R 56.4ms | R 42.7ms |
-| `fio-seqread` | 60s | 61s | R 2.15 GiB/s | R 2.40 GiB/s | R 0.90x | R 1.9ms | R 1.5ms |
-| `fio-seqwrite` | 134s | 205s | W 73.3 MiB/s | W 234.9 MiB/s | W 0.31x | W 15.9ms | W 329.3ms |
-| `fio-randread` | 60s | 60s | R 1.71 GiB/s | R 3.18 GiB/s | R 0.54x | R 20.1ms | R 7.2ms |
-| `fio-randwrite` | 153s | 230s | W 111.7 MiB/s | W 268.1 MiB/s | W 0.42x | W 35.9ms | W 333.4ms |
-| `fio-randrw` | 163s | 159s | R 275.3 / W 123.4 MiB/s | R 163.7 / W 74.8 MiB/s | R 1.68x / W 1.65x | R 244.3ms / W 20.6ms | R 792.7ms / W 10.8ms |
+| `fio-bigwrite` | 5s | 15s | W 1.02 GiB/s | W 2.92 GiB/s | W 0.35x | W 43.3ms | W 18.0ms |
+| `fio-bigread` | 1s | 1s | R 1.04 GiB/s | R 2.33 GiB/s | R 0.45x | R 217.1ms | R 48.5ms |
+| `fio-seqread` | 60s | 60s | R 2.02 GiB/s | R 2.36 GiB/s | R 0.85x | R 2.0ms | R 1.5ms |
+| `fio-seqwrite` | 140s | 223s | W 82.8 MiB/s | W 255.9 MiB/s | W 0.32x | W 14.1ms | W 329.3ms |
+| `fio-randread` | 60s | 60s | R 1.86 GiB/s | R 3.05 GiB/s | R 0.61x | R 15.1ms | R 7.4ms |
+| `fio-randwrite` | 143s | 229s | W 132.6 MiB/s | W 273.9 MiB/s | W 0.48x | W 45.9ms | W 333.4ms |
+| `fio-randrw` | 161s | 157s | R 291.6 / W 131.4 MiB/s | R 160.1 / W 73.0 MiB/s | R 1.82x / W 1.80x | R 162.5ms / W 23.7ms | R 826.3ms / W 14.5ms |
 
 Metadata comparison from `metaperf`:
 
 | Operation | BrewFS | JuiceFS | BrewFS/JuiceFS |
 | --- | ---: | ---: | ---: |
-| `create` | 3025.3 ops/s | 1233.4 ops/s | 2.45x |
-| `open` | 9556.3 ops/s | 22368.5 ops/s | 0.43x |
-| `stat` | 992476.1 ops/s | 970324.0 ops/s | 1.02x |
-| `readdir` | 100231.5 ops/s | 86694.9 ops/s | 1.16x |
-| `rename` | 1830.3 ops/s | 2530.8 ops/s | 0.72x |
+| `create` | 2874.0 ops/s | 1240.9 ops/s | 2.32x |
+| `open` | 9124.9 ops/s | 22171.5 ops/s | 0.41x |
+| `stat` | 941622.6 ops/s | 969291.3 ops/s | 0.97x |
+| `readdir` | 94424.9 ops/s | 86225.9 ops/s | 1.10x |
+| `rename` | 1776.0 ops/s | 2535.1 ops/s | 0.70x |
 
-The full `metaperf` tool wall time was `340s` on BrewFS and `196s` on JuiceFS.
-BrewFS is now ahead on `create`, `stat`, and `readdir` in this local run, but
-still trails badly on `open` and `rename`, and total metadata wall time remains
-high because the default 4KiB small-file scenario also exercises cleanup and
-object writeback around the metadata hot paths.
+The full `metaperf` tool wall time was `367s` on BrewFS and `198s` on JuiceFS.
+BrewFS is ahead on `create` and `readdir` in this local run, near parity on
+`stat`, but still trails badly on `open` and `rename`, and total metadata wall
+time remains high because the default 4KiB small-file scenario also exercises
+cleanup and object writeback around the metadata hot paths.
+
+This iteration borrowed cached slice metadata directly in the read hot path
+instead of cloning the per-handle slice vector for every cached chunk read.
+Compared with the previous full snapshot
+`docker/compose-xfstests/artifacts/perf-run-1781637893-16859`, BrewFS
+`fio-randread` improved from `1.71` to `1.86 GiB/s`, p99 improved from
+`20.1ms` to `15.1ms`, and internal `brewfs_fuse_read_avg_lat_us` fell from
+`35.95` to `27.25`. Mixed `fio-randrw` also moved from
+`R 275.3 / W 123.4 MiB/s` to `R 291.6 / W 131.4 MiB/s`. The same full run
+showed metadata noise/regression (`metaperf` wall `340s` to `367s`), so the
+next optimization target remains JuiceFS-style `open`/`rename` metadata path
+work, not another read-only micro-optimization.
 
 Additional 2026-06-16 short matrix:
 
@@ -524,6 +536,20 @@ permission checks again.
 
 Latest accepted BrewFS tuning:
 
+- `src/vfs/io/reader.rs` now reuses the per-handle cached chunk slice metadata
+  by borrowing the cached `Arc<[SliceDesc]>` through
+  `DataFetcher::read_at_into_prepared` instead of cloning the slice vector for
+  every cached read. This follows the JuiceFS cached-read direction of keeping
+  hot metadata attached to the open handle and spending the read path on data
+  copy rather than repeated allocation. TDD first added
+  `test_read_at_into_prepared_borrows_slice_metadata`, then the full local Rust
+  CI gate passed, including `cargo test --workspace --lib --bins` with
+  `500 passed; 0 failed; 158 ignored`. Focused `fio-randread`
+  `docker/compose-xfstests/artifacts/perf-run-1781642577-14869` reached
+  `2.16 GiB/s`; the accepted full matrix
+  `docker/compose-xfstests/artifacts/perf-run-1781642920-30093` kept the gain
+  at `1.86 GiB/s` versus the previous `1.71 GiB/s` and improved mixed
+  `fio-randrw` to `R 291.6 / W 131.4 MiB/s`.
 - `src/chunk/compress.rs` now returns borrowed data for raw/no-header
   decompression, and `src/chunk/store.rs` uses `decompress_bytes(Bytes)` so LZ4
   raw fallback objects can move from object response to block cache without an
