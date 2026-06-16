@@ -426,6 +426,38 @@ Latest accepted BrewFS tuning:
 
 Latest rejected tuning checks:
 
+Known-empty sparse inode slice-lookup skip:
+
+```bash
+PERF_LOG_TO_CONSOLE=false CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0 \
+  bash docker/compose-xfstests/run_redis_perf.sh --s3 \
+  --writeback-throughput-profile \
+  --tools "metaperf"
+```
+
+Artifact:
+`docker/compose-xfstests/artifacts/perf-run-1781578587-31108`.
+
+The candidate added a local inode hint for "no visible committed slices" so
+small all-zero writes into known sparse ranges could skip `meta.get_slices`.
+The focused 4KiB `metaperf` run showed no meaningful gain over the accepted
+sparse-zero baseline: `create` moved only from `3059.3` to `3069.8 ops/s`,
+`open` slipped from `10161.1` to `10152.0 ops/s`, and Redis `LRANGE` /
+`brewfs_meta_get_slices_cache_miss_total` only moved from `98600` to `98400`.
+That reduction is within workload file-count variance, so the code was
+reverted. A useful follow-up needs to trace the real FUSE setattr/writeback
+sequence or avoid per-file empty-slice metadata queries at the MetaClient layer.
+
+| Workload | Accepted sparse-zero `perf-run-1781575796-24729` | Candidate `perf-run-1781578587-31108` | Decision |
+| --- | ---: | ---: | --- |
+| `metaperf` wall | 189s | 188s | neutral |
+| `create` | 3059.3 ops/s | 3069.8 ops/s | noise-level gain |
+| `open` | 10161.1 ops/s | 10152.0 ops/s | reject: slight regression |
+| `stat` | 1023493.1 ops/s | 1027060.5 ops/s | neutral |
+| `readdir` | 65443.4 ops/s | 65520.1 ops/s | neutral |
+| `rename` | 1944.5 ops/s | 1946.2 ops/s | neutral |
+| slice metadata lookups | 98600 misses | 98400 misses | unchanged bottleneck |
+
 Uploaded committed overlay data release check:
 
 ```bash
