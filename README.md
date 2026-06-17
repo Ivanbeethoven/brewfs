@@ -233,12 +233,17 @@ PERF_LOG_TO_CONSOLE=false \
 
 Artifacts:
 
-- BrewFS: `docker/compose-xfstests/artifacts/perf-run-1781642920-30093`
-- JuiceFS: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781644124-17752`
+- BrewFS: `docker/compose-xfstests/artifacts/perf-run-1781655187-10091`
+- JuiceFS: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781652747-22579`
 
 Local CI gate before accepting this perf iteration:
-`CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace --lib --bins`
-passed locally. All default perf tools passed on both filesystems.
+the local Rust CI job was run through `cargo fmt --all --check`, perf script
+checks, `cargo check --workspace`, `cargo build --workspace`, BrewFS FUSE
+feature checks, `cargo test --workspace --lib --bins`, and
+`cargo clippy --workspace`. The workflow's `Test workspace` command passed with
+`441 passed; 0 failed; 159 ignored` for the library target and
+`503 passed; 0 failed; 159 ignored` for the BrewFS binary target. All default
+perf tools passed on both filesystems.
 
 `Wall+drain` is the tool wall time plus explicit post-write drain where a
 write workload has one. Fio bandwidth reports the active IO window, so both
@@ -251,41 +256,42 @@ upper bound.
 
 | Workload | BrewFS wall+drain | JuiceFS wall+drain | BrewFS fio BW | JuiceFS fio BW | BrewFS/JuiceFS BW | BrewFS p99 | JuiceFS p99 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `fio-bigwrite` | 5s | 15s | W 1.02 GiB/s | W 2.92 GiB/s | W 0.35x | W 43.3ms | W 18.0ms |
-| `fio-bigread` | 1s | 1s | R 1.04 GiB/s | R 2.33 GiB/s | R 0.45x | R 217.1ms | R 48.5ms |
-| `fio-seqread` | 60s | 60s | R 2.02 GiB/s | R 2.36 GiB/s | R 0.85x | R 2.0ms | R 1.5ms |
-| `fio-seqwrite` | 140s | 223s | W 82.8 MiB/s | W 255.9 MiB/s | W 0.32x | W 14.1ms | W 329.3ms |
-| `fio-randread` | 60s | 60s | R 1.86 GiB/s | R 3.05 GiB/s | R 0.61x | R 15.1ms | R 7.4ms |
-| `fio-randwrite` | 143s | 229s | W 132.6 MiB/s | W 273.9 MiB/s | W 0.48x | W 45.9ms | W 333.4ms |
-| `fio-randrw` | 161s | 157s | R 291.6 / W 131.4 MiB/s | R 160.1 / W 73.0 MiB/s | R 1.82x / W 1.80x | R 162.5ms / W 23.7ms | R 826.3ms / W 14.5ms |
+| `fio-bigwrite` | 5s | 15s | W 1.03 GiB/s | W 3.06 GiB/s | W 0.34x | W 41.2ms | W 15.3ms |
+| `fio-bigread` | 1s | 1s | R 1.28 GiB/s | R 2.34 GiB/s | R 0.55x | R 54.8ms | R 45.4ms |
+| `fio-seqread` | 60s | 61s | R 2.19 GiB/s | R 2.48 GiB/s | R 0.88x | R 1.9ms | R 1.5ms |
+| `fio-seqwrite` | 140s | 267s | W 76.2 MiB/s | W 280.3 MiB/s | W 0.27x | W 14.2ms | W 329.3ms |
+| `fio-randread` | 60s | 60s | R 1.69 GiB/s | R 3.09 GiB/s | R 0.55x | R 21.6ms | R 7.9ms |
+| `fio-randwrite` | 145s | 244s | W 112.3 MiB/s | W 271.5 MiB/s | W 0.41x | W 34.9ms | W 341.8ms |
+| `fio-randrw` | 163s | 162s | R 230.8 / W 103.5 MiB/s | R 146.4 / W 67.5 MiB/s | R 1.58x / W 1.53x | R 227.5ms / W 20.6ms | R 826.3ms / W 15.4ms |
 
 Metadata comparison from `metaperf`:
 
 | Operation | BrewFS | JuiceFS | BrewFS/JuiceFS |
 | --- | ---: | ---: | ---: |
-| `create` | 2874.0 ops/s | 1240.9 ops/s | 2.32x |
-| `open` | 9124.9 ops/s | 22171.5 ops/s | 0.41x |
-| `stat` | 941622.6 ops/s | 969291.3 ops/s | 0.97x |
-| `readdir` | 94424.9 ops/s | 86225.9 ops/s | 1.10x |
-| `rename` | 1776.0 ops/s | 2535.1 ops/s | 0.70x |
+| `create` | 3439.7 ops/s | 1014.7 ops/s | 3.39x |
+| `open` | 10181.1 ops/s | 23604.7 ops/s | 0.43x |
+| `stat` | 1039990.9 ops/s | 1030838.0 ops/s | 1.01x |
+| `readdir` | 102828.0 ops/s | 90194.2 ops/s | 1.14x |
+| `rename` | 2106.7 ops/s | 2677.0 ops/s | 0.79x |
 
-The full `metaperf` tool wall time was `367s` on BrewFS and `198s` on JuiceFS.
-BrewFS is ahead on `create` and `readdir` in this local run, near parity on
-`stat`, but still trails badly on `open` and `rename`, and total metadata wall
-time remains high because the default 4KiB small-file scenario also exercises
-cleanup and object writeback around the metadata hot paths.
+The full `metaperf` tool wall time was `405s` on BrewFS and `236s` on JuiceFS.
+BrewFS is ahead on `create`, `stat`, and `readdir` in this local run, but still
+trails JuiceFS on `open` and `rename`. The Redis rename-outcome optimization
+improved BrewFS full-matrix `rename` from the previous accepted `1776.0 ops/s`
+to `2106.7 ops/s`, while a final focused `metaperf` check
+`docker/compose-xfstests/artifacts/perf-run-1781654778-8755` reached
+`2133.5 ops/s`. Total metadata wall time remains high because the default 4KiB
+small-file scenario also exercises cleanup and object writeback around the
+metadata hot paths.
 
-This iteration borrowed cached slice metadata directly in the read hot path
-instead of cloning the per-handle slice vector for every cached chunk read.
-Compared with the previous full snapshot
-`docker/compose-xfstests/artifacts/perf-run-1781637893-16859`, BrewFS
-`fio-randread` improved from `1.71` to `1.86 GiB/s`, p99 improved from
-`20.1ms` to `15.1ms`, and internal `brewfs_fuse_read_avg_lat_us` fell from
-`35.95` to `27.25`. Mixed `fio-randrw` also moved from
-`R 275.3 / W 123.4 MiB/s` to `R 291.6 / W 131.4 MiB/s`. The same full run
-showed metadata noise/regression (`metaperf` wall `340s` to `367s`), so the
-next optimization target remains JuiceFS-style `open`/`rename` metadata path
-work, not another read-only micro-optimization.
+This iteration returns the atomic Redis rename Lua outcome to `MetaClient`, so
+the hot rename path no longer performs redundant source, destination, and new
+parent prelookups before the Redis transaction. The change keeps open-file cache
+correctness by invalidating both the moved inode and any replaced destination
+inode returned by the store. The data-plane fio profile is mixed: read-side
+throughput remains close on sequential reads, `randrw` still beats the local
+JuiceFS active bandwidth, but sequential and random writes remain the largest
+BrewFS/JuiceFS gap.
 
 Additional 2026-06-16 short matrix:
 
@@ -536,6 +542,21 @@ permission checks again.
 
 Latest accepted BrewFS tuning:
 
+- `src/meta/stores/redis/mod.rs` now exposes the atomic Redis rename Lua result
+  as a `RenameOutcome` for `MetaClient`, including the moved inode and any
+  replaced destination inode. `src/meta/client/mod.rs` uses that outcome to
+  invalidate open-file cache entries without doing redundant source,
+  destination, and new-parent prelookups on the common Redis path. TDD first
+  added `test_rename_overwrite_invalidates_open_file_cache_destination`, and a
+  Redis integration guard `test_meta_client_rename_avoids_redundant_prelookups`
+  passed against a live Redis container. The local Rust CI job passed through
+  fmt, perf script checks, workspace check/build, BrewFS feature checks,
+  `cargo test --workspace --lib --bins`, and clippy. Focused metaperf
+  `docker/compose-xfstests/artifacts/perf-run-1781654778-8755` improved rename
+  to `2133.5 ops/s` with no metadata subtest regression versus the same-profile
+  accepted baseline; the full matrix
+  `docker/compose-xfstests/artifacts/perf-run-1781655187-10091` kept rename at
+  `2106.7 ops/s` versus the previous accepted `1776.0 ops/s`.
 - `src/vfs/io/reader.rs` now reuses the per-handle cached chunk slice metadata
   by borrowing the cached `Arc<[SliceDesc]>` through
   `DataFetcher::read_at_into_prepared` instead of cloning the slice vector for
@@ -764,7 +785,7 @@ writeback throughput profile with fio `direct=0`, 64MiB `fio-big*` data,
 | Share upload/stage chunk buffer with `Arc<[Bytes]>` | `fio-bigwrite fio-seqwrite fio-randwrite fio-randrw` | bigwrite BW +8.3%, seqwrite BW +9.2%, randwrite BW +13.0%, randwrite p99 45.4ms -> 30.0ms | seqwrite wall 66s -> 78s, randwrite wall 117s -> 123s, randrw read/write BW -4.6%/-4.7%, randrw write p99 4.6ms -> 9.5ms, randwrite PUTs/GiB +24.8% | reject: removing the Vec clone does not reduce object amplification and worsens wall/mixed guards |
 | Count only writable slices for `too_many` pressure | `fio-bigwrite fio-seqwrite fio-randwrite fio-randrw` | seqwrite wall 66s -> 65s, seqwrite PUTs/GiB -6.6%, seqwrite too_many tails 37 -> 0, randwrite BW +11.7%, randwrite p99 45.4ms -> 30.3ms | randwrite wall 117s -> 127s, randwrite PUTs/GiB +32.3%, randwrite partial-tail ratio 0.831 -> 0.885, randrw write p99 4.6ms -> 9.1ms, bigwrite BW -3.4% | reject: delayed too_many pressure shifts work into smaller randwrite objects and longer close/flush tail |
 | Enable compact profile defaults (`interval=2s`, `min_slice_count=3`) | `fio-bigwrite fio-seqwrite fio-randwrite fio-randrw` | bigwrite BW 911.0 MiB/s -> 1.04 GiB/s, seqwrite BW 1.29 -> 1.39 GiB/s, randwrite BW 1.56 -> 1.70 GiB/s, randrw wall 32s -> 12s | seqwrite wall 66s -> 83s, randwrite wall 117s -> 129s, randrw read/write BW 1.28 GiB/s / 600.0 MiB/s -> 845.7 / 384.1 MiB/s | reject as default: config pass-through is kept, but low-interval compaction hurts wall time and mixed throughput |
-| Redis rename outcome returned to `MetaClient` | `metaperf` | standalone `metaperf` wall was 187s, but this is not comparable to the full-matrix 248s after fio pressure | vs accepted same-parameter run: create 3470.4 -> 3174.0, open 10106.8 -> 9149.6, stat 1021723.6 -> 932515.8, readdir 109145.2 -> 98537.3, rename 1915.0 -> 1863.9 ops/s | reject: avoiding the destination prelookup did not improve the target rename path; code was reverted after local CI and focused perf |
+| Early Redis rename outcome retry | `metaperf` | standalone `metaperf` wall was 187s, but this is not comparable to the full-matrix 248s after fio pressure | vs accepted same-parameter run: create 3470.4 -> 3174.0, open 10106.8 -> 9149.6, stat 1021723.6 -> 932515.8, readdir 109145.2 -> 98537.3, rename 1915.0 -> 1863.9 ops/s | reject: the early version only avoided part of the destination prelookup and regressed all metadata subtests; the later accepted `RenameOutcome` implementation above adds source/replaced inode cache invalidation tests and full-matrix perf evidence |
 
 The DataFetcher single-block candidate artifact is
 `docker/compose-xfstests/artifacts/perf-run-1781630677-14774`; its same-parameter
