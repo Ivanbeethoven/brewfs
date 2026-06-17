@@ -23,6 +23,12 @@ Current goal amendment: every performance iteration must run the workflow's
 evidence. A focused unit test is allowed during development, but it does not
 replace the CI test step for accepting an optimization.
 
+Goal acceptance rule: no BrewFS performance comparison, README table update, or
+optimization commit may be treated as accepted unless the local reproduction of
+the CI `Test workspace` step has passed in the same iteration. If that test
+fails, the active goal immediately switches to fixing, quarantining, or
+documenting the failure before any further performance tuning.
+
 Current primary gaps from the latest Redis plus S3/RustFS comparison:
 
 - Cold `bigread` and random reads still trail JuiceFS significantly; sequential
