@@ -349,7 +349,7 @@ Task 2 verification on 2026-06-17:
 - Modify: `src/vfs/io/writer.rs`
 - Test: `src/vfs/config.rs`
 
-- [ ] **Step 1: Write failing config test**
+- [x] **Step 1: Write failing config test**
 
 Add:
 
@@ -363,7 +363,7 @@ fn write_config_parses_cached_block_assembler_env() {
 }
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run:
 
@@ -373,11 +373,11 @@ cargo test -p brewfs vfs::config::tests::write_config_parses_cached_block_assemb
 
 Expected: fails because the config flag does not exist.
 
-- [ ] **Step 3: Add the disabled-by-default flag**
+- [x] **Step 3: Add the disabled-by-default flag**
 
 Add `cached_block_assembler: bool` to `WriteConfig`, parse `BREWFS_CACHED_BLOCK_ASSEMBLER=1|true|yes`, and keep the default `false`.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run:
 
@@ -386,6 +386,16 @@ cargo test -p brewfs vfs::config::tests::write_config_parses_cached_block_assemb
 ```
 
 Expected: pass.
+
+Task 3 verification on 2026-06-17:
+
+- RED: `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test -p brewfs vfs::config::tests::write_config_parses_cached_block_assembler_env` failed because `cached_block_assembler` and its builder method were missing.
+- GREEN: the same focused command passed with `1 passed; 0 failed` in both `src/lib.rs` and `src/main.rs` unit test targets.
+- `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test -p brewfs vfs::config::tests` passed with `4 passed; 0 failed` in both unit test targets after serializing the process-wide env var in tests.
+- `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo fmt --all --check` passed.
+- `git diff --check` passed.
+- Local CI `Test workspace` equivalent passed: `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace --lib --bins` finished with `510 passed; 0 failed; 159 ignored`.
+- Perf was not run for Task 3 because the new flag defaults off and the assembler is still not wired into runtime write-path behavior.
 
 ## Task 4: Wire Full-Block Assembly Into Cached Writes
 
