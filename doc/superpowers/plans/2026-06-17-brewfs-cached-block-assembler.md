@@ -8,6 +8,8 @@
 
 **Goal Addendum Verification:** After reverting the rejected writer wiring, the current worktree passed the local CI test gate with `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace --lib --bins`: `510 passed; 0 failed; 159 ignored`.
 
+**Perf Tooling Addendum:** `tools/perf/compare_artifacts.py` now reports `read_effective_wall_bw_mib_s`, `write_effective_wall_bw_mib_s`, and `*_effective_active_plus_drain_bw_mib_s` from fio IO bytes divided by script wall time and active-plus-drain time. Use these rows when accepting or rejecting writeback candidates; previous rejected attempts repeatedly improved fio active bandwidth while losing or barely moving the end-to-end user-visible throughput.
+
 **Architecture:** JuiceFS keeps page writes in a `wSlice`, uploads full blocks with `FlushTo`, and only finalizes the partial tail on `Flush`/`Close`; BrewFS currently turns many FUSE writeback-cache page writes into independent `SliceState`s, so explicit flush often stages and commits thousands of small cached-only tails. This plan adds a separate cached-write assembler that buffers page-sized cached writes per inode/chunk/block, emits full-block slices as soon as they are complete, and drains remaining partial runs only at explicit flush/truncate/close. The existing `SliceState` path remains the default until perf and correctness gates prove the assembler is safe.
 
 **Tech Stack:** Rust, Tokio, BrewFS `src/vfs/io/writer.rs`, `src/vfs/fs/mod.rs`, `src/vfs/config.rs`, existing Redis/S3 Docker perf runners, local GitHub Actions `Test workspace` reproduction.

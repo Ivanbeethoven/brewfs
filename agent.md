@@ -199,6 +199,11 @@ For fio scenarios, report both:
 - fio runtime bandwidth from `results/*.json`
 - effective throughput from total IO divided by `perf-summary.tsv` wall time
 
+`tools/perf/compare_artifacts.py` emits these as
+`read_effective_wall_bw_mib_s`, `write_effective_wall_bw_mib_s`, and
+`*_effective_active_plus_drain_bw_mib_s`; use them to catch candidates that
+only move work from fio runtime into close, flush, or post-write drain.
+
 Writeback can make fio foreground latency look good while background drain still
 dominates wall time. Prefer effective throughput when judging user-visible write
 performance.

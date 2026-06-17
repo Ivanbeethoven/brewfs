@@ -124,6 +124,11 @@ Compare artifacts with:
 python3 tools/perf/compare_artifacts.py <baseline-artifact> <candidate-artifact>
 ```
 
+Use the generated `*_effective_wall_bw_mib_s` and
+`*_effective_active_plus_drain_bw_mib_s` rows alongside fio active bandwidth;
+several rejected writeback candidates improved runtime BW while moving cost
+into close/flush/drain.
+
 Acceptance requires:
 
 - No correctness test regression.
