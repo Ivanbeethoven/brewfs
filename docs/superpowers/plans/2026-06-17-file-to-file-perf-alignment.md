@@ -2391,3 +2391,98 @@ Prioritize create/writeback partial-tail behavior before another metadata cache 
 3. Run writer tests plus `cargo test -p brewfs --lib rename -- --nocapture` as smoke coverage.
 4. Run isolated metadata-only perf first. Continue to full BrewFS/JuiceFS perf only if `create` or write-heavy fio has a real positive signal and other metadata ops stay inside the 5% budget.
 5. Commit only if the full perf contract validates the candidate; otherwise revert code and record the failed evidence here.
+
+### Round 18: rejected stage-before-upload and fused open-cache experiments
+
+Scope:
+
+This round continued from the current metadata gap (`create`, `open`, `rename`) and tried two small candidates. Both were reverted because neither satisfied the performance contract.
+
+#### 18A: stage-before-upload for small writeback batches
+
+Hypothesis:
+
+For small commit-before-upload batches, wait for local writeback staging before starting remote upload. This was intended to keep 4 KiB `metaperf create` from competing with S3 upload while preserving large-write concurrency.
+
+TDD coverage built during the attempt:
+
+```bash
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib vfs::io::writer::tests::test_commit_before_upload_stages_small_batch_before_remote_upload -- --exact --nocapture
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib commit_before_upload -- --nocapture
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib vfs::cache::write_back -- --nocapture
+```
+
+The focused tests passed after the implementation, but perf rejected the design:
+
+| Variant | Artifact | Result |
+| --- | --- | --- |
+| Stage first for `<=64KiB` | `docker/compose-xfstests/artifacts/perf-run-1781799132-23525` | `fio-randrw` prefill failed with `Input/output error`; `metaperf` failed to create its test directory; writeback stage failures reached `299`. |
+| Stage first for `<=4KiB` | `docker/compose-xfstests/artifacts/perf-run-1781799572-156` | `fio-randrw` prefill still failed with `Input/output error`; writeback stage failures reached `5397`; `metaperf create` was only `631.8 ops/s`, below the clean full baseline `658.4 ops/s`, and open/stat/rename collapsed under the damaged state. |
+
+Decision:
+
+Rejected and reverted. The candidate changed writeback ordering in a way that can leave the following workload seeing EIO during durable prefill. Do not retry stage-before-upload until `persist_slice_data`/stage-failure reasons are visible enough to explain the EIO path.
+
+#### 18B: fused open-cache hit and record-open
+
+Hypothesis:
+
+JuiceFS `openfiles.OpenCheck` returns the cached attr and increments refs in one locked operation. BrewFS hot `open_fresh_ino` currently calls `stat_for_open` and then `record_open`, which means a hot open-cache hit performs a second cache lookup/write. A fused `open_for_handle` API might reduce local hot-open overhead without changing Redis semantics.
+
+Focused RED/GREEN tests:
+
+```bash
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib meta::client::cache::tests::open_file_cache_cached_open_returns_attr_and_increments_ref_once -- --exact --nocapture
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib meta::client::tests::test_open_for_handle_uses_single_cached_open_hit -- --exact --nocapture
+```
+
+Additional smoke that passed with the candidate:
+
+```bash
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib open_file_cache -- --nocapture
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib test_open_fresh_by_ino_checks_current_attr_once -- --nocapture
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib test_open_defers_reader_until_first_read -- --nocapture
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib open_allows_root_for_cached_inode_when_parent_lacks_search_access -- --nocapture
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib open_rejects_cached_inode_when_parent_lacks_search_access -- --nocapture
+cargo fmt --check
+git diff --check
+```
+
+Metadata-only artifact:
+
+- Candidate: `docker/compose-xfstests/artifacts/perf-run-1781801170-24182`
+- Baseline: `docker/compose-xfstests/artifacts/perf-run-1781764009-8040`
+
+| Operation | Baseline ops/s | Candidate ops/s | Candidate / baseline |
+| --- | ---: | ---: | ---: |
+| create | 958.5 | 994.2 | 103.7% |
+| open | 10275.8 | 10333.5 | 100.6% |
+| stat | 1023339.2 | 1033328.7 | 101.0% |
+| readdir | 65561.4 | 64687.6 | 98.7% |
+| rename | 1928.7 | 1920.0 | 99.5% |
+
+Runner warnings were clean (`WARNING=0`, `timeout=0`, `slow request=0`, `slow operation=0`), so this is a valid negative signal. The target `open` improvement was only about `+0.6%`, far below the required `+5%` gate.
+
+Decision:
+
+Rejected and reverted. Do not keep or retry local open-cache bookkeeping changes unless a flamegraph shows a much larger local hot-open component. The current open gap is not explained by the extra cache lookup alone.
+
+#### Reset target after Round 18
+
+The next performance goal is not another metadata-cache guess. The highest-value next sequence is:
+
+1. Add or use existing diagnostics to expose why `persist_slice_data` fails under the stage-before-upload runs and why that surfaces as `fio-randrw` prefill EIO.
+2. Compare JuiceFS writeback close/prefill semantics against BrewFS commit-before-upload semantics for the 4 KiB create path.
+3. Only then attempt a small-file create/writeback optimization, with a focused test that proves close/fsync errors remain observable.
+4. Run a targeted gate with `fio-randwrite fio-randrw metaperf`; proceed to the full BrewFS/JuiceFS matrix only if the targeted gate is clean and `create` or write throughput improves by at least `5%`.
+5. If the next evidence shows writeback is too risky, switch to Redis Lua/commandstats for `rename`, because `rename` remains about `70%` of JuiceFS while `stat/readdir` are already near parity.
