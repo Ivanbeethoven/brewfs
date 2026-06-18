@@ -4,7 +4,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || realpath "$SCRIPT_DIR/..")"
-BIN_PATH="$PROJECT_DIR/target/release/brewfs"
+TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
+case "$TARGET_DIR" in
+    /*) ;;
+    *) TARGET_DIR="$PROJECT_DIR/$TARGET_DIR" ;;
+esac
+BIN_PATH="$TARGET_DIR/release/brewfs"
+DOCKER_BIN_PATH="$PROJECT_DIR/target/release/brewfs"
 
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 info() { log "INFO  $*"; }
@@ -55,5 +61,13 @@ fi
 after_size=$(stat -c%s "$BIN_PATH")
 chmod 755 "$BIN_PATH"
 
+if [[ "$BIN_PATH" != "$DOCKER_BIN_PATH" ]]; then
+    mkdir -p "$(dirname "$DOCKER_BIN_PATH")"
+    install -m 755 "$BIN_PATH" "$DOCKER_BIN_PATH"
+fi
+
 ok "宿主机二进制已就绪: $BIN_PATH"
+if [[ "$BIN_PATH" != "$DOCKER_BIN_PATH" ]]; then
+    info "Docker build context 二进制已同步: $DOCKER_BIN_PATH"
+fi
 info "二进制大小: ${before_size} -> ${after_size} 字节"

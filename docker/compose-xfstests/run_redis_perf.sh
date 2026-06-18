@@ -30,7 +30,7 @@ usage() {
   --local-fs                 改为使用本地目录作为对象存储
   --s3-writeback             启用 S3 commit-before-upload 写回语义（等价于 BREWFS_WRITEBACK_MODE=commit_before_upload）
   --writeback-throughput-profile
-                             启用 S3 writeback 全场景吞吐 profile（4GiB read/write buffer, 12GiB memory budget, S3 max concurrency=16, writeback upload concurrency=4, pending soft/hard=1GiB/2GiB, writeback persist fsync=false, compression=lz4, fuse workers=6, fio prefill drain+remount）
+                             启用 S3 writeback 全场景吞吐 profile（4GiB read/write memory+SSD cache, 12GiB memory budget, S3 max concurrency=16, writeback upload concurrency=4, pending soft/hard=1GiB/2GiB, writeback persist fsync=false, compression=none, full cache checksum, fuse workers=6, fuse max_background=512, fio prefill drain+remount）
   --tools "<tool...>"        指定压力工具列表，默认: "fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
   --brewfs-bench           额外运行一次宿主机 cargo bench --bench brewfs_bench
   --bench-args "<args...>"   透传给 cargo bench 之后的 Criterion 参数
@@ -143,6 +143,8 @@ export BREWFS_WRITEBACK_MODE="$BREWFS_WRITEBACK_MODE_VALUE"
 if [[ "$WRITEBACK_THROUGHPUT_PROFILE" == true ]]; then
     export BREWFS_READ_MEMORY_BYTES="${BREWFS_READ_MEMORY_BYTES:-4294967296}"
     export BREWFS_WRITE_MEMORY_BYTES="${BREWFS_WRITE_MEMORY_BYTES:-4294967296}"
+    export BREWFS_READ_SSD_BYTES="${BREWFS_READ_SSD_BYTES:-4294967296}"
+    export BREWFS_WRITE_SSD_BYTES="${BREWFS_WRITE_SSD_BYTES:-4294967296}"
     export BREWFS_MEMORY_BUDGET_BYTES="${BREWFS_MEMORY_BUDGET_BYTES:-12884901888}"
     export BREWFS_S3_MAX_CONCURRENCY="${BREWFS_S3_MAX_CONCURRENCY:-16}"
     export BREWFS_WRITEBACK_UPLOAD_CONCURRENCY="${BREWFS_WRITEBACK_UPLOAD_CONCURRENCY:-4}"
@@ -150,8 +152,10 @@ if [[ "$WRITEBACK_THROUGHPUT_PROFILE" == true ]]; then
     export BREWFS_WRITEBACK_RECENT_PENDING_SOFT_BYTES="${BREWFS_WRITEBACK_RECENT_PENDING_SOFT_BYTES:-1073741824}"
     export BREWFS_WRITEBACK_RECENT_PENDING_HARD_BYTES="${BREWFS_WRITEBACK_RECENT_PENDING_HARD_BYTES:-2147483648}"
     export BREWFS_WRITEBACK_PERSIST_SYNC="${BREWFS_WRITEBACK_PERSIST_SYNC:-false}"
-    export BREWFS_COMPRESSION="${BREWFS_COMPRESSION:-lz4}"
+    export BREWFS_COMPRESSION="${BREWFS_COMPRESSION:-none}"
+    export BREWFS_VERIFY_CACHE_CHECKSUM="${BREWFS_VERIFY_CACHE_CHECKSUM:-full}"
     export BREWFS_FUSE_WORKERS="${BREWFS_FUSE_WORKERS:-6}"
+    export BREWFS_FUSE_MAX_BACKGROUND="${BREWFS_FUSE_MAX_BACKGROUND:-512}"
     export BREWFS_METADATA_OPEN_CACHE_TTL_MS="${BREWFS_METADATA_OPEN_CACHE_TTL_MS:-1000}"
     export BREWFS_METADATA_OPEN_CACHE_CAPACITY="${BREWFS_METADATA_OPEN_CACHE_CAPACITY:-65536}"
     export PERF_FIO_PREFILL_DRAIN="${PERF_FIO_PREFILL_DRAIN:-true}"
@@ -233,6 +237,20 @@ run_brewfs_bench() {
     fi
 }
 
+write_warning_summary() {
+    local log_path="$1"
+    local summary_path="$2"
+
+    {
+        printf 'pattern\tcount\n'
+        for pattern in WARNING timeout 'slow request' 'slow operation'; do
+            local count
+            count=$(awk -v pat="$pattern" 'BEGIN { IGNORECASE = 1 } $0 ~ pat { c++ } END { print c + 0 }' "$log_path")
+            printf '%s\t%s\n' "$pattern" "$count"
+        done
+    } >"$summary_path"
+}
+
 info "构建宿主机 brewfs release 二进制（供镜像 COPY）"
 bash "$DOCKER_DIR/build_brewfs_host_binary.sh"
 
@@ -242,6 +260,9 @@ docker compose -f "$COMPOSE_FILE" build perf
 ts="$(date +%s)-$RANDOM"
 host_artifact_dir="$ARTIFACTS_DIR/perf-run-${ts}"
 mkdir -p "$host_artifact_dir"
+runner_console_log="$host_artifact_dir/runner-console.log"
+runner_warning_summary="$host_artifact_dir/runner-warning-summary.tsv"
+: >"$runner_console_log"
 
 export BREWFS_ARTIFACT_DIR="/artifacts/perf-run-${ts}"
 export BREWFS_S3_BUCKET="${BREWFS_S3_BUCKET:-brewfs-data}"
@@ -429,9 +450,10 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e BREWFS_WRITEBACK_MODE \
     -e BREWFS_VFS_TIMING \
     -e PERF_LOG_TO_CONSOLE \
-    perf
-container_status=$?
+    perf 2>&1 | tee "$runner_console_log"
+container_status=${PIPESTATUS[0]}
 set -e
+write_warning_summary "$runner_console_log" "$runner_warning_summary"
 
 bench_status=0
 if [[ "$RUN_BREWFS_BENCH" == true ]]; then

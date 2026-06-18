@@ -134,12 +134,29 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+write_warning_summary() {
+    local log_path="$1"
+    local summary_path="$2"
+
+    {
+        printf 'pattern\tcount\n'
+        for pattern in WARNING timeout 'slow request' 'slow operation'; do
+            local count
+            count=$(awk -v pat="$pattern" 'BEGIN { IGNORECASE = 1 } $0 ~ pat { c++ } END { print c + 0 }' "$log_path")
+            printf '%s\t%s\n' "$pattern" "$count"
+        done
+    } >"$summary_path"
+}
+
 info "构建 JuiceFS perf 镜像"
 docker compose -f "$COMPOSE_FILE" build perf
 
 ts="$(date +%s)-$RANDOM"
 host_artifact_dir="$ARTIFACTS_DIR/juicefs-perf-run-${ts}"
 mkdir -p "$host_artifact_dir"
+runner_console_log="$host_artifact_dir/runner-console.log"
+runner_warning_summary="$host_artifact_dir/runner-warning-summary.tsv"
+: >"$runner_console_log"
 
 export BREWFS_ARTIFACT_DIR="/artifacts/juicefs-perf-run-${ts}"
 export BREWFS_S3_BUCKET="${BREWFS_S3_BUCKET:-brewfs-data}"
@@ -251,9 +268,10 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e JFS_NO_USAGE_REPORT \
     -e JFS_CACHE_DIR \
     -e PERF_LOG_TO_CONSOLE \
-    perf
-container_status=$?
+    perf 2>&1 | tee "$runner_console_log"
+container_status=${PIPESTATUS[0]}
 set -e
+write_warning_summary "$runner_console_log" "$runner_warning_summary"
 
 ok "JuiceFS perf compose 运行结束 (container=$container_status)"
 ok "产物目录: $host_artifact_dir"

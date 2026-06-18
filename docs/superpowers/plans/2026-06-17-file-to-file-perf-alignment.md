@@ -1705,3 +1705,79 @@ Updated next target:
   - expose that as an additive store/client method so unsupported backends keep the current path;
   - benchmark a metadata-only micro path before running full perf, then still require the complete fio/metaperf suite before accepting.
 - For writeback, the repeated `randrw` regressions suggest that metadata changes are perturbing cache/writeback timing enough to expose the core mixed-workload bottleneck. The next non-metadata target should inspect writeback stage batching and dirty overlay pressure rather than create/open cache policy.
+
+### Round 12: lower metadata create-with-attr A/B
+
+Hypothesis:
+
+JuiceFS metadata create returns the fresh inode attr to the caller and avoids a post-create metadata stat in the common file-to-file create-open path. BrewFS `MetaClient::create_file` called `store.create_file` and then `store.stat` before inserting the inode cache entry. The candidate added an additive `MetaStore::create_file_with_attr` default method, implemented direct Redis/SQLite fast paths that returned the new `FileAttr` from the same Lua/transaction response, and changed `MetaClient::create_file` to insert the returned attr without an extra `store.stat`.
+
+TDD and local verification:
+
+```bash
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib test_create_file_with_attr_returns_fresh_attr -- --nocapture
+
+cargo fmt --check && git diff --check
+
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib test_meta_client_cache_metrics_track_stat_and_lookup -- --nocapture
+
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib test_optimistic_create_fallback_preserves_existing_semantics -- --nocapture
+
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib -- --nocapture
+```
+
+The focused test failed before the method existed and passed after the implementation. Full lib tests passed with 416 passed, 0 failed, 158 ignored before perf. The Redis ignored test could not run locally because no Redis was listening on `127.0.0.1:6379`; the Docker perf runs covered the Redis-backed path.
+
+Full perf artifacts:
+
+- BrewFS kept baseline: `docker/compose-xfstests/artifacts/perf-run-1781737544-9539`
+- BrewFS candidate full run: `docker/compose-xfstests/artifacts/perf-run-1781750066-14640`
+- JuiceFS latest comparison: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781746334-9398`
+- Candidate on short A/B: `docker/compose-xfstests/artifacts/perf-run-1781751169-26848`
+- Candidate off short A/B: `docker/compose-xfstests/artifacts/perf-run-1781751855-18732`
+
+FIO throughput:
+
+| Tool/op | BrewFS kept baseline | BrewFS candidate | JuiceFS latest | Candidate / kept |
+| --- | ---: | ---: | ---: | ---: |
+| `fio-bigread` | R 628.2 MiB/s | R 678.6 MiB/s | R 2398.1 MiB/s | 108.0% |
+| `fio-bigwrite` | W 1149.3 MiB/s | W 1105.8 MiB/s | W 3271.6 MiB/s | 96.2% |
+| `fio-seqread` | R 1754.0 MiB/s | R 1783.1 MiB/s | R 2508.7 MiB/s | 101.7% |
+| `fio-seqwrite` | W 69.2 MiB/s | W 67.9 MiB/s | W 255.9 MiB/s | 98.1% |
+| `fio-randread` | R 774.0 MiB/s | R 787.1 MiB/s | R 3310.8 MiB/s | 101.7% |
+| `fio-randwrite` | W 73.3 MiB/s | W 90.8 MiB/s | W 297.3 MiB/s | 124.0% |
+| `fio-randrw` | R 253.4 / W 113.8 MiB/s | R 195.2 / W 87.7 MiB/s | R 184.2 / W 83.4 MiB/s | R 77.0% / W 77.1% |
+
+Metadata:
+
+| Operation | BrewFS kept baseline | BrewFS candidate | JuiceFS latest | Candidate / kept |
+| --- | ---: | ---: | ---: | ---: |
+| create | 629.9 ops/s | 671.5 ops/s | 1365.5 ops/s | 106.6% |
+| open | 9271.0 ops/s | 9070.4 ops/s | 23568.2 ops/s | 97.8% |
+| stat | 1022440.1 ops/s | 983396.7 ops/s | 1018695.1 ops/s | 96.2% |
+| readdir | 64070.5 ops/s | 64755.3 ops/s | 67605.3 ops/s | 101.1% |
+| rename | 1903.7 ops/s | 1904.1 ops/s | 2720.8 ops/s | 100.0% |
+
+Short A/B isolation:
+
+| Artifact | Candidate state | `fio-randrw` | create | open | stat | readdir | rename |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `perf-run-1781751169-26848` | on | R 187.5 / W 83.8 MiB/s | 908.3 | 10218.7 | 1025710.8 | 65127.3 | 1903.6 |
+| `perf-run-1781751855-18732` | off | R 305.7 / W 136.6 MiB/s | 908.7 | 10220.5 | 1025894.1 | 64981.1 | 1901.3 |
+
+Decision: rejected and reverted. The full run showed a small create improvement but also `open`/`stat` regressions and lower `randrw`. More importantly, the short A/B run showed the metadata improvement was not caused by the candidate: with the code reverted, create/open/stat were effectively identical. Do not merge the lower create-with-attr fast path as a performance optimization unless future Redis command tracing proves it removes a measurable round trip in the exact metaperf create path.
+
+Harness update from this round:
+
+- `docker/compose-xfstests/run_redis_perf.sh`: `--writeback-throughput-profile` now explicitly sets the same SSD cache budgets, `BREWFS_FUSE_MAX_BACKGROUND=512`, and `BREWFS_VERIFY_CACHE_CHECKSUM=full` that were previously passed by hand in the best-known BrewFS command.
+- `docker/compose-xfstests/run_perf_in_container.sh`: `perf-profile.env` now records `BREWFS_READ_SSD_BYTES`, `BREWFS_WRITE_SSD_BYTES`, and `BREWFS_VERIFY_CACHE_CHECKSUM`.
+
+Updated next target:
+
+- Stop adding VFS/client-side metadata cache writes for create/open until Redis commandstats prove the exact round trip being removed.
+- Next metadata attempt should inspect Redis Lua/store transactions for `rename` and `create` with commandstats enabled, then target a path that reduces total Redis commands in the full `metaperf` run.
+- Next writeback attempt should focus on `randrw` variance and tail batching, because the A/B isolation showed mixed workload performance can swing independently of metadata-only changes.

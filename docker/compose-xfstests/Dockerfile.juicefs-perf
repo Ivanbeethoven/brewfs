@@ -1,6 +1,8 @@
 FROM golang:1.25-bookworm AS builder
 WORKDIR /build
-COPY brewfs/juicefs/ ./
+ARG JUICEFS_REPO=https://github.com/juicedata/juicefs.git
+ARG JUICEFS_REF=v1.3.1
+RUN git clone --depth 1 --branch "$JUICEFS_REF" "$JUICEFS_REPO" ./
 RUN make juicefs && cp juicefs /usr/local/bin/juicefs
 
 FROM debian:trixie-slim

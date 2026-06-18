@@ -45,6 +45,7 @@ env_or_default() {
 prepare_artifacts() {
     mkdir -p "$artifact_dir/results" "$artifact_dir/tools"
     printf 'tool\tstatus\tseconds\tlog\n' >"$artifact_dir/perf-summary.tsv"
+    write_perf_profile
     write_juicefs_profile
 }
 
@@ -53,6 +54,45 @@ truthy() {
         1|true|TRUE|yes|YES|on|ON) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+juicefs_mount_supports() {
+    local option="$1"
+    /usr/local/bin/juicefs mount --help 2>/dev/null | grep -q -- "$option"
+}
+
+write_perf_profile() {
+    local path="$artifact_dir/perf-profile.env"
+    cat >"$path" <<EOF
+PERF_TOOLS=${perf_tools}
+PERF_FIO_DIRECT=${PERF_FIO_DIRECT:-0}
+PERF_FIO_IOENGINE=${PERF_FIO_IOENGINE:-io_uring}
+PERF_FIO_IODEPTH=${PERF_FIO_IODEPTH:-1}
+PERF_FIO_PREFILL_DRAIN=${PERF_FIO_PREFILL_DRAIN:-false}
+PERF_FIO_PREFILL_REMOUNT=${PERF_FIO_PREFILL_REMOUNT:-false}
+PERF_FIO_COLD_READ_CLEAR_CACHE=${PERF_FIO_COLD_READ_CLEAR_CACHE:-false}
+PERF_FIO_DROP_CACHES=${PERF_FIO_DROP_CACHES:-false}
+PERF_FIO_COLD_READ=${PERF_FIO_COLD_READ:-false}
+PERF_FIO_COLD_READ_DROP_CACHES=${PERF_FIO_COLD_READ_DROP_CACHES:-false}
+PERF_FIO_DIRECT_MATRIX=${PERF_FIO_DIRECT_MATRIX:-}
+JFS_COMPRESS=${jfs_compress}
+JFS_WRITEBACK=${jfs_writeback}
+JFS_BUFFER_SIZE_MIB=${jfs_buffer_size_mib}
+JFS_CACHE_SIZE_MIB=${jfs_cache_size_mib}
+JFS_MAX_UPLOADS=${jfs_max_uploads}
+JFS_MAX_DOWNLOADS=${jfs_max_downloads}
+JFS_OPEN_CACHE=${jfs_open_cache}
+JFS_OPEN_CACHE_LIMIT=${jfs_open_cache_limit}
+JFS_BACKUP_META=${jfs_backup_meta}
+JFS_NO_USAGE_REPORT=${jfs_no_usage_report}
+JFS_CACHE_DIR=${jfs_cache_dir}
+EOF
+
+    {
+        echo
+        echo "# Raw PERF_FIO environment"
+        env | sort | grep '^PERF_FIO_' || true
+    } >>"$path"
 }
 
 write_juicefs_profile() {
@@ -145,6 +185,8 @@ format_juicefs() {
 }
 
 mount_juicefs() {
+    local effective_writeback="${1:-$jfs_writeback}"
+
     mkdir -p "$mount_dir"
     if mountpoint -q "$mount_dir" 2>/dev/null; then
         info "$mount_dir 已挂载，先卸载"
@@ -153,13 +195,19 @@ mount_juicefs() {
 
     local -a mount_args=("$meta_url" "$mount_dir" --enable-xattr)
 
-    if truthy "$jfs_writeback"; then
+    if truthy "$effective_writeback"; then
         mount_args+=(--writeback)
     fi
     [[ -n "$jfs_buffer_size_mib" ]] && mount_args+=(--buffer-size="$jfs_buffer_size_mib")
     [[ -n "$jfs_cache_size_mib" ]] && mount_args+=(--cache-size="$jfs_cache_size_mib")
     [[ -n "$jfs_max_uploads" ]] && mount_args+=(--max-uploads="$jfs_max_uploads")
-    [[ -n "$jfs_max_downloads" ]] && mount_args+=(--max-downloads="$jfs_max_downloads")
+    if [[ -n "$jfs_max_downloads" ]]; then
+        if juicefs_mount_supports "--max-downloads"; then
+            mount_args+=(--max-downloads="$jfs_max_downloads")
+        else
+            err "当前 JuiceFS 不支持 --max-downloads，跳过 JFS_MAX_DOWNLOADS=${jfs_max_downloads}"
+        fi
+    fi
     [[ -n "$jfs_open_cache" ]] && mount_args+=(--open-cache="$jfs_open_cache")
     [[ -n "$jfs_open_cache_limit" ]] && mount_args+=(--open-cache-limit="$jfs_open_cache_limit")
     [[ -n "$jfs_backup_meta" ]] && mount_args+=(--backup-meta="$jfs_backup_meta")
@@ -300,6 +348,8 @@ prepare_fio_dataset() {
     local ioengine="$8"
     local iodepth="$9"
     local prep_log="$artifact_dir/tools/${tool}-prepare.log"
+    local durable_prefill=false
+    local status=0
     local -a prep_args=(
         --name="$job_name"
         --directory="$work_dir"
@@ -315,8 +365,32 @@ prepare_fio_dataset() {
         --eta=never
     )
 
+    if truthy "$jfs_writeback" && {
+        truthy "${PERF_FIO_COLD_READ:-false}" \
+            || truthy "${PERF_FIO_PREFILL_REMOUNT:-false}" \
+            || truthy "${PERF_FIO_COLD_READ_CLEAR_CACHE:-false}";
+    }; then
+        durable_prefill=true
+    fi
+
+    if [[ "$durable_prefill" == true ]]; then
+        info "为 cold-read 预填充临时关闭 JuiceFS writeback: $tool"
+        cleanup
+        mount_juicefs false
+        mkdir -p "$work_dir"
+    fi
+
     info "预填充 fio 数据集: $tool"
-    fio "${prep_args[@]}" >"$prep_log" 2>&1
+    fio "${prep_args[@]}" >"$prep_log" 2>&1 || status=$?
+
+    if [[ "$durable_prefill" == true ]]; then
+        info "同步 durable 预填充并恢复 JuiceFS writeback: $tool"
+        sync || true
+        cleanup
+        mount_juicefs
+    fi
+
+    return "$status"
 }
 
 append_fio_log_summary() {
