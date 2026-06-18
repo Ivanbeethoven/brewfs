@@ -43,7 +43,7 @@ services:
       - ${RUSTFS_SECRET_KEY:-rustfsadmin}
       - /data
     volumes:
-      - rustfs-data-perf-redis:/data
+      - ${BREWFS_PERF_RUSTFS_DATA_MOUNT:-rustfs-data-perf-redis}:/data
     networks:
       - brewfs-xfstests
 
@@ -90,7 +90,7 @@ services:
       - --console-address
       - :9001
     volumes:
-      - minio-data-perf-redis:/data
+      - ${BREWFS_PERF_MINIO_DATA_MOUNT:-minio-data-perf-redis}:/data
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 2s
@@ -168,7 +168,7 @@ services:
     volumes:
       - ./artifacts:/artifacts
       - ./run_perf_in_container.sh:/usr/local/bin/run_perf_in_container.sh:ro
-      - brewfs-state-perf-redis:/var/lib/brewfs
+      - ${BREWFS_PERF_STATE_MOUNT:-brewfs-state-perf-redis}:/var/lib/brewfs
     networks:
       - brewfs-xfstests
 

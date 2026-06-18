@@ -1905,3 +1905,85 @@ Acceptance gate for the next code change:
 - Run focused Redis commandstats tests before and after the change.
 - Run the full BrewFS and JuiceFS perf contract again.
 - Keep only if the targeted metadata op improves by at least 5% and no fio or metadata scenario regresses by more than 5% versus the kept BrewFS baseline.
+
+### Round 15: strict same-round profile, rejected open-cache write-skip, and next target reset
+
+Scope:
+
+This round fixed a test-infrastructure issue first, then ran a strict same-profile BrewFS/JuiceFS comparison from `/data/slayer` backed storage. The Docker build initially failed because `tests/scripts/xfstests-prebuilt/xfstests-prebuilt.tar.gz` was checked out as a Git LFS pointer in the worktree while `.gitattributes` only tracked the stale `brewfs/tests/...` path. The round also made Redis and JuiceFS perf compose data/cache mounts configurable so full perf runs can use `/data/slayer` instead of cramped Docker named volumes.
+
+Harness changes kept:
+
+- `.gitattributes`: add the real `tests/scripts/xfstests-prebuilt/xfstests-prebuilt.tar.gz` LFS path.
+- `docker/compose-xfstests/docker-compose.redis-perf.yml`: allow `BREWFS_PERF_RUSTFS_DATA_MOUNT`, `BREWFS_PERF_MINIO_DATA_MOUNT`, and `BREWFS_PERF_STATE_MOUNT`.
+- `docker/compose-xfstests/docker-compose.juicefs-perf.yml`: allow `JUICEFS_PERF_RUSTFS_DATA_MOUNT` and `JUICEFS_PERF_STATE_MOUNT`.
+
+Same-round full artifacts:
+
+- BrewFS pre-candidate comparison: `docker/compose-xfstests/artifacts/perf-run-1781759751-16168`
+- BrewFS open-cache write-skip candidate: `docker/compose-xfstests/artifacts/perf-run-1781762455-1310`
+- JuiceFS same-profile comparison: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781760859-15737`
+
+Parameter audit result:
+
+An independent explorer confirmed the fio core profile is aligned in the latest artifacts: `direct=0`, `io_uring`, `iodepth=1`, 4 MiB block size, matching `size`, `numjobs`, `runtime`, and `rwmixread=70`. Remaining caveats:
+
+- JuiceFS records `JFS_MAX_DOWNLOADS=16`, but current v1.3.1 does not support `--max-downloads`; artifact records `JFS_MAX_DOWNLOADS_EFFECTIVE=unsupported`.
+- Read prefill semantics are close but not identical: BrewFS writes with writeback and drains `.stats`, while JuiceFS temporarily disables writeback for durable prefill.
+- Metadata tools currently run after write-heavy fio without a unified post-write drain/remount step on both filesystems. Future metadata gates should run in an isolated script or force equivalent drain before `metaperf`.
+- BrewFS `BREWFS_VERIFY_CACHE_CHECKSUM=full` remains part of the accepted integrity-oriented headline profile. Disabling it was previously rejected because it regressed `randrw` and `create`.
+
+Rejected candidate:
+
+The candidate skipped rewriting an `OpenFileCache` entry when `record_open` received an unchanged attr. This mirrors the JuiceFS observation that `OpenCheck` can return from the hot open-file map early. A focused TDD test proved the local mechanic:
+
+```bash
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib meta::client::cache::tests::open_file_cache_skips_entry_write_when_attr_is_unchanged -- --exact --nocapture
+```
+
+The focused test failed before the code change and passed after it. Related cache tests, `cargo fmt --check`, and `git diff --check` also passed. The full perf gate rejected the candidate because the target `open` metric did not improve.
+
+FIO throughput:
+
+| Tool/op | BrewFS before candidate | BrewFS candidate | JuiceFS same-round | Candidate / before |
+| --- | ---: | ---: | ---: | ---: |
+| `fio-bigread` | R 675.0 MiB/s | R 691.0 MiB/s | R 2438.1 MiB/s | 102.4% |
+| `fio-bigwrite` | W 1187.9 MiB/s | W 1224.9 MiB/s | W 3170.3 MiB/s | 103.1% |
+| `fio-seqread` | R 1721.1 MiB/s | R 1749.5 MiB/s | R 2487.1 MiB/s | 101.7% |
+| `fio-seqwrite` | W 68.8 MiB/s | W 68.4 MiB/s | W 230.8 MiB/s | 99.3% |
+| `fio-randread` | R 751.0 MiB/s | R 741.6 MiB/s | R 3292.9 MiB/s | 98.7% |
+| `fio-randwrite` | W 68.9 MiB/s | W 88.7 MiB/s | W 277.2 MiB/s | 128.6% |
+| `fio-randrw` | R 157.2 / W 70.5 MiB/s | R 177.6 / W 79.6 MiB/s | R 169.9 / W 77.4 MiB/s | 113.0% |
+
+Metadata:
+
+| Operation | BrewFS before candidate | BrewFS candidate | JuiceFS same-round | Candidate / before |
+| --- | ---: | ---: | ---: | ---: |
+| create | 599.0 ops/s | 612.9 ops/s | 1344.2 ops/s | 102.3% |
+| open | 9847.8 ops/s | 9702.0 ops/s | 23511.7 ops/s | 98.5% |
+| stat | 1022861.8 ops/s | 1019757.7 ops/s | 1015739.5 ops/s | 99.7% |
+| readdir | 63574.1 ops/s | 63883.9 ops/s | 66787.2 ops/s | 100.5% |
+| rename | 1876.6 ops/s | 1890.8 ops/s | 2727.0 ops/s | 100.8% |
+
+Runner warning summary:
+
+| Artifact | WARNING | timeout | slow request | slow operation |
+| --- | ---: | ---: | ---: | ---: |
+| BrewFS before candidate | 0 | 4 | 0 | 0 |
+| BrewFS candidate | 0 | 4 | 0 | 0 |
+| JuiceFS same-round | 3801 | 3772 | 16 | 5 |
+
+Decision: rejected and reverted. The fio improvements are useful evidence that write-heavy numbers are still highly sensitive to writeback batching and environment timing, but the code change targeted hot metadata open and regressed that target by 1.5%. It does not satisfy the +5% target-op gate.
+
+Reset goal for the next round:
+
+1. Split metadata performance testing into an isolated script that runs only `dirstress`, `dirperf`, `metaperf`, and `looptest` after a clean mount, so file-to-file metadata optimization is not contaminated by previous fio writeback state.
+2. For metadata, stop cache-seeding guesses and first add commandstats probes around `create`, `open`, and `rename` to identify which Redis calls remain on the hot path despite high open-cache hit counts.
+3. For read/write throughput, target writeback partial-tail aggregation. The latest BrewFS stats still show very high single-block upload batches and cached-only partial tails during write-heavy workloads, while JuiceFS remains much faster on pure writes despite noisy writeback warnings.
+
+Acceptance gate:
+
+- Run the new metadata-only script and the full BrewFS/JuiceFS perf contract.
+- Keep metadata changes only if the targeted metadata op improves by at least 5% and no metadata or fio scenario regresses by more than 5%.
+- Keep writeback changes only if `randwrite` or `seqwrite` improves, `randrw` stays within the 5% regression budget, and `metaperf` remains stable.
