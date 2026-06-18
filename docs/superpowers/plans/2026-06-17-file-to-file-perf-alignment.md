@@ -1987,3 +1987,153 @@ Acceptance gate:
 - Run the new metadata-only script and the full BrewFS/JuiceFS perf contract.
 - Keep metadata changes only if the targeted metadata op improves by at least 5% and no metadata or fio scenario regresses by more than 5%.
 - Keep writeback changes only if `randwrite` or `seqwrite` improves, `randrw` stays within the 5% regression budget, and `metaperf` remains stable.
+
+### Round 16: metadata commandstats gate and rejected validated-rename retry
+
+Scope:
+
+This round rechecked the BrewFS/JuiceFS file-to-file benchmark profile, ran isolated metadata-only comparison, split `metaperf` into single-operation commandstats probes, and retried the validated frontend rename idea under the stricter metadata gate. No code change was kept.
+
+Parameter audit:
+
+An independent read-only explorer compared `run_redis_perf.sh`, `run_redis_meta_perf.sh`, `run_juicefs_perf.sh`, the current README, this plan, and the latest artifacts. The workload parameters are now aligned for the buffered comparison profile:
+
+- `PERF_FIO_DIRECT=0`
+- `PERF_FIO_IOENGINE=io_uring`
+- `PERF_FIO_IODEPTH=1`
+- `PERF_FIO_PREFILL_DRAIN=true`
+- `PERF_FIO_PREFILL_REMOUNT=true`
+- `PERF_FIO_COLD_READ_CLEAR_CACHE=true`
+- `PERF_FIO_DROP_CACHES=false`
+- `PERF_FIO_DIRECT_MATRIX=`
+- Matching fio sizes, block sizes, `numjobs`, runtime, and `randrw` `rwmixread=70`.
+- Matching metadata tool args for `dirstress`, `dirperf`, `metaperf`, and `looptest`.
+
+Remaining caveats:
+
+- JuiceFS records `JFS_MAX_DOWNLOADS=16`, but v1.3.1 does not support `--max-downloads`; artifacts record it as unsupported.
+- BrewFS and JuiceFS still use different durable prefill/drain mechanics: BrewFS prefill writes through writeback then waits on `.stats`, while JuiceFS temporarily disables writeback for durable prefill.
+- Full perf runs execute metadata tools after fio, so isolated metadata-only artifacts are the cleaner signal for metadata tuning.
+- BrewFS keeps `BREWFS_VERIFY_CACHE_CHECKSUM=full` in the accepted integrity-oriented profile. That is not the absolute max-throughput checksum-disabled profile.
+
+Isolated metadata-only artifacts:
+
+- BrewFS baseline: `docker/compose-xfstests/artifacts/perf-run-1781764009-8040`
+- JuiceFS same-profile metadata: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781764245-28837`
+
+| Operation | BrewFS ops/s | JuiceFS ops/s | BrewFS / JuiceFS |
+| --- | ---: | ---: | ---: |
+| create | 958.5 | 1371.1 | 69.9% |
+| open | 10275.8 | 23586.3 | 43.6% |
+| stat | 1023339.2 | 1024804.7 | 99.9% |
+| readdir | 65561.4 | 67909.9 | 96.5% |
+| rename | 1928.7 | 2731.9 | 70.6% |
+
+Commandstats probes:
+
+- `create` remains dominated by data/writeback side effects: the create-only run produced `31001` FUSE writes, `31001` S3 PUTs, and `31001` single-block cached-only partial-tail explicit flush batches for 4 KiB files. This explains why a pure metadata create optimization can be hidden by writeback cost.
+- `open` is not failing because the open-file cache is disabled. The open-only run showed `317400` open-file cache hits and only `601` misses; the remaining gap is likely FUSE/open handle overhead and lookup path cost.
+- `rename` has the highest metadata command density: the rename-only run issued about `387609` `HGET`, `274566` `GET`, `200003` `SET`, and `143571` `EVALSHA` calls. This still makes rename a real gap, but the previous eager-preload removal and this round's frontend validated path both failed the perf gate.
+
+Rejected candidate:
+
+This round added `VFS::rename_at_validated` and routed FUSE rename through it so the source inode/type already checked by FUSE could be reused instead of repeating the VFS wrapper lookup/stat. The metadata layer and Redis Lua transaction still kept their own POSIX validation.
+
+Focused TDD and tests:
+
+```bash
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib vfs::fs::tests::rename_tests::rename_at_validated_preserves_same_dir_file_rename_semantics -- --exact
+```
+
+Red result before the implementation: compile failed because `rename_at_validated` did not exist.
+
+Green result after the implementation: 1 passed, 0 failed.
+
+```bash
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib rename -- --nocapture
+```
+
+Green result with the candidate: 18 passed, 0 failed, 28 ignored.
+
+Candidate metadata-only artifact:
+
+- BrewFS candidate: `docker/compose-xfstests/artifacts/perf-run-1781766483-21039`
+
+| Operation | BrewFS baseline | Candidate | Candidate / baseline |
+| --- | ---: | ---: | ---: |
+| create | 958.5 | 934.4 | 97.5% |
+| open | 10275.8 | 10235.1 | 99.6% |
+| stat | 1023339.2 | 1024567.7 | 100.1% |
+| readdir | 65561.4 | 65149.1 | 99.4% |
+| rename | 1928.7 | 1926.1 | 99.9% |
+
+Redis command totals were slightly lower in the candidate, but throughput did not improve. The candidate therefore did not reduce the dominant latency source.
+
+Local wider-test note:
+
+`cargo test -p brewfs --lib meta::client -- --nocapture` exposed two unrelated ACL fixture failures where tests submit incomplete POSIX access ACLs even though current validation requires `user_obj`, `group_obj`, and `other`. `cargo test -p brewfs --lib vfs::fs::tests -- --nocapture` exposed unrelated writeback/truncate failures and was interrupted after it had already failed. These are not caused by the reverted rename candidate, but they should be tracked before claiming broad local CI health.
+
+Rollback verification:
+
+After rejecting and reverting the candidate, the worktree had no code diff and:
+
+```bash
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib rename -- --nocapture
+```
+
+passed with 17 passed, 0 failed, 28 ignored.
+
+Same-round full clean-code verification:
+
+- BrewFS current full verification: `docker/compose-xfstests/artifacts/perf-run-1781767104-16907`
+- JuiceFS current same-profile full run: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781768201-32342`
+
+| Tool/op | BrewFS current | JuiceFS current | BrewFS / JuiceFS |
+| --- | ---: | ---: | ---: |
+| `fio-bigread` | R 683.6 MiB/s | R 2443.9 MiB/s | 28.0% |
+| `fio-bigwrite` | W 1103.4 MiB/s | W 2985.4 MiB/s | 37.0% |
+| `fio-seqread` | R 1703.2 MiB/s | R 2480.2 MiB/s | 68.7% |
+| `fio-seqwrite` | W 68.7 MiB/s | W 245.2 MiB/s | 28.0% |
+| `fio-randread` | R 712.4 MiB/s | R 3281.9 MiB/s | 21.7% |
+| `fio-randwrite` | W 86.8 MiB/s | W 278.4 MiB/s | 31.2% |
+| `fio-randrw` | R 162.2 / W 72.8 MiB/s | R 154.3 / W 70.5 MiB/s | R 105.1% / W 103.3% |
+
+| Operation | BrewFS current | JuiceFS current | BrewFS / JuiceFS |
+| --- | ---: | ---: | ---: |
+| create | 658.4 ops/s | 1330.8 ops/s | 49.5% |
+| open | 9088.7 ops/s | 23546.7 ops/s | 38.6% |
+| stat | 975689.1 ops/s | 1018190.6 ops/s | 95.8% |
+| readdir | 64647.7 ops/s | 67657.7 ops/s | 95.6% |
+| rename | 1902.5 ops/s | 2728.0 ops/s | 69.7% |
+
+Runner warning summary:
+
+| Artifact | WARNING | timeout | slow request | slow operation |
+| --- | ---: | ---: | ---: | ---: |
+| BrewFS current | 0 | 4 | 0 | 0 |
+| JuiceFS current | 2377 | 2355 | 8 | 9 |
+
+Interpretation:
+
+- BrewFS remains competitive only in the noisy buffered `randrw` profile.
+- Pure read gaps remain large: `fio-bigread` 28.0% of JuiceFS, `fio-randread` 21.7%.
+- Pure write gaps remain large: `fio-seqwrite` 28.0%, `fio-randwrite` 31.2%.
+- Metadata is stable for `stat` and `readdir`, but still materially behind for `create`, `open`, and `rename`.
+- JuiceFS write-path numbers in this run are noisy because the runner recorded thousands of timeout warnings, but BrewFS still loses pure write throughput even when JuiceFS is noisy.
+
+Decision:
+
+Reject and revert. The frontend validated rename idea does not meet the +5% targeted-op gate. Do not retry VFS-only rename wrapper changes unless a new commandstats probe proves a specific remaining round trip and the fix changes the dominant Redis/store path.
+
+Next target:
+
+Prioritize create/writeback partial-tail behavior before another metadata cache guess. The strongest current evidence is that `metaperf create` creates 4 KiB files but still triggers one S3 PUT and one single-block cached-only partial-tail explicit flush per file. A useful next code round should:
+
+1. Write a focused test around the writeback path that reproduces many tiny explicit flushes without requiring FUSE.
+2. Change exactly one batching condition for cached-only partial tails or explicit flush coalescing.
+3. Run writer tests plus `cargo test -p brewfs --lib rename -- --nocapture` as smoke coverage.
+4. Run isolated metadata-only perf first. Continue to full BrewFS/JuiceFS perf only if `create` or write-heavy fio has a real positive signal and other metadata ops stay inside the 5% budget.
+5. Commit only if the full perf contract validates the candidate; otherwise revert code and record the failed evidence here.
