@@ -1781,3 +1781,68 @@ Updated next target:
 - Stop adding VFS/client-side metadata cache writes for create/open until Redis commandstats prove the exact round trip being removed.
 - Next metadata attempt should inspect Redis Lua/store transactions for `rename` and `create` with commandstats enabled, then target a path that reduces total Redis commands in the full `metaperf` run.
 - Next writeback attempt should focus on `randrw` variance and tail batching, because the A/B isolation showed mixed workload performance can swing independently of metadata-only changes.
+
+### Round 13: current dirty runtime candidate full gate
+
+Scope:
+
+The worktree contained uncommitted runtime and correctness changes before this round, including writer overlay epoch/retry logic, late partial-overlap slice handling, isolated test cache roots, metadata filename errno mapping, ACL test fixture updates, and SQLite `file_meta.rdev` schema upgrade support. Treating the current worktree as authoritative, this round measured those changes as a runtime candidate before adding any new optimization on top.
+
+Local verification before perf:
+
+```bash
+cargo fmt --check && git diff --check
+bash tests/scripts/test_perf_profile_harness.sh
+
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib test_late_partial_overlap_creates_newest_slice -- --nocapture
+
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib test_fs_fuzz_parallel_read_write -- --nocapture
+```
+
+All commands passed. A previous full local lib run on the same worktree passed with 415 passed, 0 failed, 158 ignored.
+
+Full perf artifacts:
+
+- BrewFS kept baseline: `docker/compose-xfstests/artifacts/perf-run-1781737544-9539`
+- BrewFS current runtime candidate: `docker/compose-xfstests/artifacts/perf-run-1781752756-6134`
+- JuiceFS current comparison: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781753890-18033`
+
+FIO throughput:
+
+| Tool/op | BrewFS kept baseline | BrewFS current | JuiceFS current | Current / kept | Current / JuiceFS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `fio-bigread` | R 628.2 MiB/s | R 664.5 MiB/s | R 2455.6 MiB/s | 105.8% | 27.1% |
+| `fio-bigwrite` | W 1149.3 MiB/s | W 1098.7 MiB/s | W 3292.6 MiB/s | 95.6% | 33.4% |
+| `fio-seqread` | R 1754.0 MiB/s | R 1772.7 MiB/s | R 2499.3 MiB/s | 101.1% | 70.9% |
+| `fio-seqwrite` | W 69.2 MiB/s | W 70.2 MiB/s | W 255.6 MiB/s | 101.5% | 27.5% |
+| `fio-randread` | R 774.0 MiB/s | R 733.8 MiB/s | R 3289.2 MiB/s | 94.8% | 22.3% |
+| `fio-randwrite` | W 73.3 MiB/s | W 90.5 MiB/s | W 273.2 MiB/s | 123.5% | 33.1% |
+| `fio-randrw` | R 253.4 / W 113.8 MiB/s | R 202.2 / W 91.0 MiB/s | R 181.4 / W 82.8 MiB/s | R 79.8% / W 80.0% | R 111.4% / W 109.9% |
+
+Metadata:
+
+| Operation | BrewFS kept baseline | BrewFS current | JuiceFS current | Current / kept | Current / JuiceFS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| create | 629.9 ops/s | 626.2 ops/s | 1375.7 ops/s | 99.4% | 45.5% |
+| open | 9271.0 ops/s | 9737.8 ops/s | 23319.9 ops/s | 105.0% | 41.8% |
+| stat | 1022440.1 ops/s | 1027281.3 ops/s | 1022335.9 ops/s | 100.5% | 100.5% |
+| readdir | 64070.5 ops/s | 64267.6 ops/s | 67295.3 ops/s | 100.3% | 95.5% |
+| rename | 1903.7 ops/s | 1915.7 ops/s | 2735.8 ops/s | 100.6% | 70.0% |
+
+Runner warning summary:
+
+| Artifact | WARNING | timeout | slow request | slow operation |
+| --- | ---: | ---: | ---: | ---: |
+| BrewFS kept baseline | 0 | 4 | 0 | 0 |
+| BrewFS current | 0 | 4 | 0 | 0 |
+| JuiceFS current | 3872 | 3855 | 8 | 5 |
+
+Decision: do not commit the runtime candidate as a performance optimization. The candidate improved `open` and `randwrite`, but it violates the mixed workload regression budget: `fio-randrw` dropped by about 20% versus the kept BrewFS baseline, and `fio-randread` dropped 5.2%. The JuiceFS run is still useful as a same-parameter comparison, but the write-path numbers are noisy because JuiceFS produced thousands of cache write timeout warnings.
+
+Updated next target:
+
+- Split the current dirty runtime changes into correctness-only versus performance-sensitive pieces before considering commits.
+- For performance work, isolate the writer overlay/epoch changes with a clean A/B full run or a narrower `randrw` diagnostic before accepting any writer changes.
+- For metadata parity with JuiceFS, shift from cache seeding guesses to Redis commandstats/Lua transaction accounting around `open`, `create`, and `rename`.

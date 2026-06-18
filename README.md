@@ -60,33 +60,33 @@ Current Redis + S3-compatible RustFS perf runs use `fio` with `io_uring`, `iodep
 Artifacts:
 
 - BrewFS kept full run: `docker/compose-xfstests/artifacts/perf-run-1781737544-9539`
-- JuiceFS latest full run: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781746334-9398`
-- Latest rejected BrewFS full A/B: `docker/compose-xfstests/artifacts/perf-run-1781750066-14640`
+- JuiceFS latest full run: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781753890-18033`
+- Latest rejected BrewFS runtime candidate: `docker/compose-xfstests/artifacts/perf-run-1781752756-6134`
 - JuiceFS clean planning target: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781732616-8549`
 
-These artifacts include `perf-profile.env`, `runner-console.log`, and `runner-warning-summary.tsv`, which record the effective fio/filesystem tuning and flag noisy runs. The latest JuiceFS run completed with the aligned profile, but its writeback/cache path produced 4008 `WARNING` lines, 3991 timeout matches, 8 slow requests, and 5 slow operations, so the clean JuiceFS artifact remains the stable planning target. The table below reports the current kept BrewFS profile against the latest JuiceFS run and marks noisy writeback-sensitive results accordingly.
+These artifacts include `perf-profile.env`, `runner-console.log`, and `runner-warning-summary.tsv`, which record the effective fio/filesystem tuning and flag noisy runs. The latest JuiceFS run completed with the aligned profile, but its writeback/cache path produced 3872 `WARNING` lines, 3855 timeout matches, 8 slow requests, and 5 slow operations, so the clean JuiceFS artifact remains the stable planning target. The table below reports the current kept BrewFS profile against the latest JuiceFS run and marks noisy writeback-sensitive results accordingly.
 
 | fio tool | BrewFS MiB/s | JuiceFS MiB/s | BrewFS / JuiceFS |
 | --- | ---: | ---: | ---: |
-| `fio-bigread` | R 628.2 / W 0.0 | R 2398.1 / W 0.0 | 26.2% |
-| `fio-bigwrite` | R 0.0 / W 1149.3 | R 0.0 / W 3271.6 | 35.1% |
-| `fio-seqread` | R 1754.0 / W 0.0 | R 2508.7 / W 0.0 | 69.9% |
-| `fio-seqwrite` | R 0.0 / W 69.2 | R 0.0 / W 255.9 | 27.0% |
-| `fio-randread` | R 774.0 / W 0.0 | R 3310.8 / W 0.0 | 23.4% |
-| `fio-randwrite` | R 0.0 / W 73.3 | R 0.0 / W 297.3 | 24.7% |
-| `fio-randrw` | R 253.4 / W 113.8 | R 184.2 / W 83.4 | R 137.6% / W 136.5% |
+| `fio-bigread` | R 628.2 / W 0.0 | R 2455.6 / W 0.0 | 25.6% |
+| `fio-bigwrite` | R 0.0 / W 1149.3 | R 0.0 / W 3292.6 | 34.9% |
+| `fio-seqread` | R 1754.0 / W 0.0 | R 2499.3 / W 0.0 | 70.2% |
+| `fio-seqwrite` | R 0.0 / W 69.2 | R 0.0 / W 255.6 | 27.1% |
+| `fio-randread` | R 774.0 / W 0.0 | R 3289.2 / W 0.0 | 23.5% |
+| `fio-randwrite` | R 0.0 / W 73.3 | R 0.0 / W 273.2 | 26.8% |
+| `fio-randrw` | R 253.4 / W 113.8 | R 181.4 / W 82.8 | R 139.7% / W 137.4% |
 
 | metadata op | BrewFS ops/s | JuiceFS ops/s | BrewFS / JuiceFS |
 | --- | ---: | ---: | ---: |
-| create | 629.9 | 1365.5 | 46.1% |
-| open | 9271.0 | 23568.2 | 39.3% |
-| stat | 1022440.1 | 1018695.1 | 100.4% |
-| readdir | 64070.5 | 67605.3 | 94.8% |
-| rename | 1903.7 | 2720.8 | 70.0% |
+| create | 629.9 | 1375.7 | 45.8% |
+| open | 9271.0 | 23319.9 | 39.8% |
+| stat | 1022440.1 | 1022335.9 | 100.0% |
+| readdir | 64070.5 | 67295.3 | 95.2% |
+| rename | 1903.7 | 2735.8 | 69.6% |
 
 Current interpretation: BrewFS is near parity for `stat` and `readdir`, competitive on noisy `randrw`, but still trails JuiceFS heavily on random/cold reads, pure writes, `create`, `open`, and `rename`. The next tuning rounds focus on file-to-file metadata open/create/rename overhead and writeback partial-tail aggregation while preserving the full scenario regression budget.
 
-Latest rejected A/B: `docker/compose-xfstests/artifacts/perf-run-1781750066-14640` added an additive lower metadata create fast path that returned fresh attrs from Redis/SQLite create. The full run showed only a small `create` gain (`629.9 -> 671.5` ops/s) and lower `randrw` (`R 195.2 / W 87.7` MiB/s). Follow-up on/off A/B runs (`perf-run-1781751169-26848` with the candidate, `perf-run-1781751855-18732` reverted) showed the same metadata numbers without the candidate, so the code change was not a reliable cause of improvement and was reverted. Earlier rejected A/B `docker/compose-xfstests/artifacts/perf-run-1781748154-9951` changed FUSE `create` to use an attrs-at-create metadata fast path for new regular files. It fixed a setgid inheritance test locally, but it did not improve the target `create` path (`create` 629.9 -> 625.6 ops/s) and regressed `randrw` to R 177.2 / W 79.5 MiB/s, so the code change was reverted. Earlier rejected A/B `docker/compose-xfstests/artifacts/perf-run-1781745250-11404` seeded the open-file metadata cache from `open_with_cached_attr`; it regressed `create`, `open`, `randread`, and `randrw`. Earlier rejected A/B `docker/compose-xfstests/artifacts/perf-run-1781741772-12024` removed the post-rename eager preload in `MetaClient::rename`; it improved `rename` only by 0.6% and regressed read/mixed workloads. Earlier rejected A/B `docker/compose-xfstests/artifacts/perf-run-1781739942-2326` disabled BrewFS cache checksum verification; it improved `bigread` but regressed `randrw` and `create`, so the main snapshot keeps full checksum verification enabled.
+Latest rejected runtime candidate: `docker/compose-xfstests/artifacts/perf-run-1781752756-6134` tested the current dirty writer/overlay and metadata correctness worktree against the full profile. It improved `open` (`9271.0 -> 9737.8` ops/s) and `randwrite` (`73.3 -> 90.5` MiB/s), but regressed `randrw` to `R 202.2 / W 91.0` MiB/s, about 80% of the kept BrewFS baseline, and `randread` fell to 94.8%. The runtime candidate was therefore not committed as a performance optimization. Earlier rejected A/B `docker/compose-xfstests/artifacts/perf-run-1781750066-14640` added an additive lower metadata create fast path that returned fresh attrs from Redis/SQLite create. The full run showed only a small `create` gain (`629.9 -> 671.5` ops/s) and lower `randrw` (`R 195.2 / W 87.7` MiB/s). Follow-up on/off A/B runs (`perf-run-1781751169-26848` with the candidate, `perf-run-1781751855-18732` reverted) showed the same metadata numbers without the candidate, so the code change was not a reliable cause of improvement and was reverted. Earlier rejected A/B `docker/compose-xfstests/artifacts/perf-run-1781748154-9951` changed FUSE `create` to use an attrs-at-create metadata fast path for new regular files. It fixed a setgid inheritance test locally, but it did not improve the target `create` path (`create` 629.9 -> 625.6 ops/s) and regressed `randrw` to R 177.2 / W 79.5 MiB/s, so the code change was reverted. Earlier rejected A/B `docker/compose-xfstests/artifacts/perf-run-1781745250-11404` seeded the open-file metadata cache from `open_with_cached_attr`; it regressed `create`, `open`, `randread`, and `randrw`. Earlier rejected A/B `docker/compose-xfstests/artifacts/perf-run-1781741772-12024` removed the post-rename eager preload in `MetaClient::rename`; it improved `rename` only by 0.6% and regressed read/mixed workloads. Earlier rejected A/B `docker/compose-xfstests/artifacts/perf-run-1781739942-2326` disabled BrewFS cache checksum verification; it improved `bigread` but regressed `randrw` and `create`, so the main snapshot keeps full checksum verification enabled.
 
 ## Quick Start
 
