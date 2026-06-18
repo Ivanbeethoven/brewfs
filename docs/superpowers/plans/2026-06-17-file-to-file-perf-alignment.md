@@ -1628,3 +1628,80 @@ Updated next target:
   - return fresh attr directly from metadata create/mkdir/link style operations so FUSE/VFS does not need a follow-up stat;
   - add a validated internal rename/create path that carries known parent/source/destination inode context through a single metadata transaction, while preserving all existing POSIX error semantics and cache invalidation.
 - Continue measuring all fio scenarios, including `randrw`, before accepting any metadata optimization. This round again showed that a targeted metadata hypothesis can move unrelated read/write scenarios through cache pressure and noise.
+
+### Round 11: FUSE create attrs-at-create A/B
+
+Hypothesis:
+
+JuiceFS passes mode/cumask into metadata `Create` and receives fresh attr in one create-open path. BrewFS FUSE `create` used `create_file_at` first and then called `apply_new_entry_attrs`, which can issue a post-create setattr. The candidate tested a narrower attrs-at-create fast path for newly created regular files by calling `meta_create_node(FileType::File, mode, uid, gid, 0)` when the backend supports it, while falling back to the old path for unsupported backends or existing files.
+
+TDD signal:
+
+- Added `create_in_setgid_parent_inherits_parent_gid`.
+- The test failed before the implementation because the post-create setattr changed the new file gid from inherited parent gid `2000` to request gid `1000`.
+- The test passed after the attrs-at-create candidate.
+
+Local verification before perf:
+
+```bash
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib create_in_setgid_parent_inherits_parent_gid -- --nocapture
+
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib fuse::fuse_init_tests -- --nocapture
+
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib test_optimistic_create_fallback_preserves_existing_semantics -- --nocapture
+
+CARGO_TARGET_DIR=/data/slayer/brewfs-cargo-target CARGO_INCREMENTAL=0 \
+  cargo test -p brewfs --lib -- --nocapture
+```
+
+The candidate passed the focused setgid test, 34 `fuse_init_tests`, the VFS create fallback test, and full lib tests with 416 passed, 0 failed, 158 ignored. After rejection and rollback, `cargo fmt --check`, `git diff --check`, and full lib tests passed with 415 passed, 0 failed, 158 ignored.
+
+Full perf artifacts:
+
+- BrewFS kept baseline: `docker/compose-xfstests/artifacts/perf-run-1781737544-9539`
+- BrewFS attrs-at-create candidate: `docker/compose-xfstests/artifacts/perf-run-1781748154-9951`
+- JuiceFS latest comparison: `docker/compose-xfstests/artifacts/juicefs-perf-run-1781746334-9398`
+
+FIO throughput:
+
+| Tool/op | BrewFS kept baseline | BrewFS candidate | JuiceFS latest | Candidate / kept |
+| --- | ---: | ---: | ---: | ---: |
+| `fio-bigread` | R 628.2 MiB/s | R 681.8 MiB/s | R 2398.1 MiB/s | 108.5% |
+| `fio-bigwrite` | W 1149.3 MiB/s | W 1166.3 MiB/s | W 3271.6 MiB/s | 101.5% |
+| `fio-seqread` | R 1754.0 MiB/s | R 1808.6 MiB/s | R 2508.7 MiB/s | 103.1% |
+| `fio-seqwrite` | W 69.2 MiB/s | W 68.7 MiB/s | W 255.9 MiB/s | 99.3% |
+| `fio-randread` | R 774.0 MiB/s | R 755.2 MiB/s | R 3310.8 MiB/s | 97.6% |
+| `fio-randwrite` | W 73.3 MiB/s | W 88.9 MiB/s | W 297.3 MiB/s | 121.4% |
+| `fio-randrw` | R 253.4 / W 113.8 MiB/s | R 177.2 / W 79.5 MiB/s | R 184.2 / W 83.4 MiB/s | R 69.9% / W 69.9% |
+
+Metadata:
+
+| Operation | BrewFS kept baseline | BrewFS candidate | JuiceFS latest | Candidate / kept |
+| --- | ---: | ---: | ---: | ---: |
+| create | 629.9 ops/s | 625.6 ops/s | 1365.5 ops/s | 99.3% |
+| open | 9271.0 ops/s | 9635.0 ops/s | 23568.2 ops/s | 103.9% |
+| stat | 1022440.1 ops/s | 1009686.2 ops/s | 1018695.1 ops/s | 98.8% |
+| readdir | 64070.5 ops/s | 63617.9 ops/s | 67605.3 ops/s | 99.3% |
+| rename | 1903.7 ops/s | 1900.8 ops/s | 2720.8 ops/s | 99.9% |
+
+Runner warning summary:
+
+| Artifact | WARNING | timeout | slow request | slow operation |
+| --- | ---: | ---: | ---: | ---: |
+| BrewFS kept baseline | 0 | 4 | 0 | 0 |
+| BrewFS candidate | 0 | 4 | 0 | 0 |
+| JuiceFS latest | 4008 | 3991 | 8 | 5 |
+
+Decision: rejected and reverted. The candidate uncovered a real setgid inheritance correctness bug, but the performance result did not validate it as a safe optimization: `create` did not improve, and `randrw` regressed by about 30%. Do not merge this implementation as part of the performance branch.
+
+Updated next target:
+
+- Track the setgid inheritance issue separately as a correctness fix. A future correctness patch should include the red/green test but should be reviewed independently from the performance goal and measured for writeback side effects before merging.
+- The next performance attempt should avoid FUSE-level create rewiring. Focus lower in metadata storage:
+  - make Redis/SQLite create return the new `FileAttr` from the same transaction/Lua response and let `MetaClient` insert it without an extra `store.stat`;
+  - expose that as an additive store/client method so unsupported backends keep the current path;
+  - benchmark a metadata-only micro path before running full perf, then still require the complete fio/metaperf suite before accepting.
+- For writeback, the repeated `randrw` regressions suggest that metadata changes are perturbing cache/writeback timing enough to expose the core mixed-workload bottleneck. The next non-metadata target should inspect writeback stage batching and dirty overlay pressure rather than create/open cache policy.
