@@ -59,6 +59,7 @@ usage() {
   BREWFS_UPLOAD_LIMIT_MIBPS BREWFS_DOWNLOAD_LIMIT_MIBPS
   BREWFS_METADATA_OPEN_CACHE_TTL_MS BREWFS_METADATA_OPEN_CACHE_CAPACITY
   BREWFS_WRITEBACK_MODE=commit_before_upload 可启用 S3 写回语义
+  REDIS_PERF_DATA_MOUNT 可把 Redis AOF/RDB 数据挂到大容量目录或命名卷（例如 /data/slayer/brewfs-perf-redis）
   PERF_FIO_COLD_READ=true 可在读类 fio 预填充后等待写回 drain、清理 BrewFS 本地 cache root 并重挂载，再执行读测试
   PERF_FIO_DROP_CACHES=true 可在 cold-read 重挂载前尝试 drop_caches（失败时继续）
   PERF_LOG_TO_CONSOLE=true 可恢复压测工具日志输出到终端（默认关闭）

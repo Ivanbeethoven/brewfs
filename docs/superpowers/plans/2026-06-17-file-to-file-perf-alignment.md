@@ -2486,3 +2486,88 @@ The next performance goal is not another metadata-cache guess. The highest-value
 3. Only then attempt a small-file create/writeback optimization, with a focused test that proves close/fsync errors remain observable.
 4. Run a targeted gate with `fio-randwrite fio-randrw metaperf`; proceed to the full BrewFS/JuiceFS matrix only if the targeted gate is clean and `create` or write throughput improves by at least `5%`.
 5. If the next evidence shows writeback is too risky, switch to Redis Lua/commandstats for `rename`, because `rename` remains about `70%` of JuiceFS while `stat/readdir` are already near parity.
+
+### Round 19: perf gate reliability before the next writeback candidate
+
+Scope:
+
+Round 18's stage-before-upload artifacts contained real `fio-randrw` prefill EIO, but the failure chain was contaminated by Redis persistence failures. Before another writeback code attempt, this round made the perf harness able to place Redis AOF/RDB data on a caller-provided large-capacity path and reran the targeted gate on clean storage.
+
+Evidence from the rejected stage-before-upload run:
+
+- Failed artifact: `docker/compose-xfstests/artifacts/perf-run-1781799572-156`
+- `tools/fio-randrw-prepare.log` failed all four jobs at end fsync with `Input/output error`.
+- `brewfs.log` contained Redis `MISCONF` and `No space left on device`.
+- `diagnostics/redis-fio-randwrite-after.txt` had `total_error_replies:3940`, including rejected `SET` calls.
+- The clean kept baseline `docker/compose-xfstests/artifacts/perf-run-1781767104-16907` had `total_error_replies:0` at the same point.
+
+Harness fix kept:
+
+- `docker/compose-xfstests/docker-compose.redis-perf.yml`: Redis now mounts `${REDIS_PERF_DATA_MOUNT:-redis-data-perf}:/data`.
+- `docker/compose-xfstests/docker-compose.juicefs-perf.yml`: Redis now mounts `${REDIS_PERF_DATA_MOUNT:-redis-data-juicefs-perf}:/data`.
+- `run_redis_perf.sh` and `run_juicefs_perf.sh`: help text documents `REDIS_PERF_DATA_MOUNT`.
+- `tests/scripts/test_perf_profile_harness.sh`: asserts both runners and both compose files keep this knob.
+
+TDD/verification:
+
+```bash
+bash tests/scripts/test_perf_profile_harness.sh
+bash -n docker/compose-xfstests/run_redis_perf.sh
+bash -n docker/compose-xfstests/run_juicefs_perf.sh
+bash -n tests/scripts/test_perf_profile_harness.sh
+```
+
+The harness test failed before the compose/runner change because `run_redis_perf.sh` did not mention `REDIS_PERF_DATA_MOUNT`; it passed after the change.
+
+Storage cleanup:
+
+`/data/slayer/brewfs-perf-rustfs` held `116G` of generated RustFS perf data and `/data/slayer` had only `3.7G` free. The generated RustFS data was cleared, restoring `/data/slayer` to about `120G` free before the gate.
+
+Clean targeted gate:
+
+```bash
+REDIS_PERF_DATA_MOUNT=/data/slayer/brewfs-perf-redis \
+BREWFS_PERF_STATE_MOUNT=/data/slayer/brewfs-perf-state \
+BREWFS_PERF_RUSTFS_DATA_MOUNT=/data/slayer/brewfs-perf-rustfs \
+BREWFS_PERF_MINIO_DATA_MOUNT=/data/slayer/brewfs-perf-minio \
+bash docker/compose-xfstests/run_redis_perf.sh --s3 --writeback-throughput-profile \
+  --tools "fio-randwrite fio-randrw metaperf"
+```
+
+Artifact: `docker/compose-xfstests/artifacts/perf-run-1781801838-32315`
+
+| Tool/op | Result |
+| --- | ---: |
+| `fio-randwrite` | W `108.52 MiB/s`, pass |
+| `fio-randrw` | R `169.11 MiB/s` / W `75.85 MiB/s`, pass |
+| `metaperf create` | `560.4 ops/s` |
+| `metaperf open` | `9165.3 ops/s` |
+| `metaperf stat` | `1024250.2 ops/s` |
+| `metaperf readdir` | `63362.3 ops/s` |
+| `metaperf rename` | `1877.9 ops/s` |
+
+Reliability signals:
+
+- `fio-randrw` prefill completed: `pending=0 dirty=0 buffer_dirty=0`, no EIO.
+- `redis-fio-randwrite-after`: `total_error_replies:0`, all command `rejected_calls=0`.
+- `runner-warning-summary.tsv`: `WARNING=0`, `timeout=1`, `slow request=0`, `slow operation=0`.
+- `brewfs_writeback_stage_failures_total=0` after the full targeted gate.
+
+Remaining bottleneck from the clean run:
+
+- `metaperf create` is worse than prior clean full baseline (`560.4` vs `658.4 ops/s`) and `metaperf` took `366s`.
+- The writeback path still shows extreme small-batch amplification: after `metaperf`, `stage=57661 ops/8295.1 MiB`, `upload_batch=57661`, `upload_batch_single_block_ops=57644`, `partial_tail=56806`, and `partial_tail_explicit_flush_ops=39412`.
+- The issue is no longer Redis write rejection. It is create/writeback amplification and stage/upload overhead.
+
+JuiceFS comparison for the next candidate:
+
+- JuiceFS `pkg/chunk/cached_store.go` stages writeback blocks locally, but if staging fails or times out, it logs the failure and uploads the block directly to avoid surfacing EIO from the staging path.
+- BrewFS `spawn_flush_slice` currently treats `persist_slice_data` failure as a slice failure and returns `writeback stage persist failed`, even though remote upload may have succeeded.
+- Therefore the next code candidate should be a narrowly tested JuiceFS-style fallback for recoverable local stage failures, not another fixed delay or stage-before-upload ordering change.
+
+Next implementation gate:
+
+1. Add a focused writer test with a failing writeback stage and a successful remote upload. RED should prove the current code returns `writeback stage persist failed`.
+2. Implement a minimal fallback that keeps upload success usable when the local stage fails in the non-recovery-critical path, while preserving close/fsync error visibility for cases where remote upload fails.
+3. Run writer/writeback tests and the targeted gate above.
+4. Keep only if `fio-randwrite`, `fio-randrw`, and `metaperf create` improve or remain within the existing 5% regression budget with zero stage failures and zero Redis write rejections.
