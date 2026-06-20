@@ -1122,12 +1122,12 @@ where
                 shared: self.shared,
             };
 
-            if handle.can_write(offset, len).is_some() {
-                // Reject reuse if this write is older than the newest write
-                // already in the slice.  Without this check, an older concurrent
-                // FUSE write (lower unique) processed after a newer one could
-                // overwrite the newer data in the overlapping region.
-                if creation_unique != 0 {
+            if let Some(write_action) = handle.can_write(offset, len) {
+                // Reject overlap reuse if this write is older than the newest
+                // write already in the slice.  Older non-overlapping appends
+                // cannot overwrite newer bytes, and allowing them to coalesce
+                // avoids fragmenting cached writeback into sub-block slices.
+                if matches!(write_action, PageWriteAction::Overlap) && creation_unique != 0 {
                     let max_u = slice.lock().max_write_unique;
                     if max_u != 0 && creation_unique < max_u {
                         self.shared
@@ -2431,8 +2431,8 @@ where
                             break Err(anyhow::anyhow!(
                                 "flush timeout after {:?} for ino {ino}, {}/{} slices still pending: {:?}",
                                 deadline,
-                                ino,
                                 pending.len(),
+                                slices.len(),
                                 pending
                             ));
                         }
@@ -6004,6 +6004,65 @@ mod tests {
         assert_eq!(breakdown.live_cached_only_slices, 1);
         assert_eq!(breakdown.live_mixed_origin_slices, 1);
         assert_eq!(breakdown.live_unknown_origin_slices, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cached_older_append_reuses_slice_but_older_overlap_is_rejected() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store, meta.clone()));
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = Arc::new(DataWriter::new(
+            test_config_without_auto_flush(layout),
+            backend,
+            reader,
+            None,
+        ));
+        let ino = meta
+            .create_file(1, "cached_unique_append.txt".to_string())
+            .await
+            .unwrap();
+        let file_writer = writer.ensure_file(Inode::new(ino, 0));
+
+        file_writer
+            .write_at_cached(0, &[2u8; 1024], 20)
+            .await
+            .unwrap();
+        file_writer
+            .write_at_cached(1024, &[1u8; 1024], 10)
+            .await
+            .unwrap();
+
+        let after_append = writer.dirty_breakdown().await;
+        assert_eq!(
+            after_append.live_slices, 1,
+            "older non-overlapping append should keep coalescing in the current slice"
+        );
+        assert_eq!(after_append.slice_create_ops, 1);
+        assert_eq!(after_append.slice_reuse_ops, 1);
+        assert_eq!(after_append.slice_reject_older_unique_ops, 0);
+
+        file_writer
+            .write_at_cached(0, &[3u8; 1024], 5)
+            .await
+            .unwrap();
+
+        let after_overlap = writer.dirty_breakdown().await;
+        assert_eq!(
+            after_overlap.live_slices, 2,
+            "older overlapping write must still create a newer-visible slice boundary"
+        );
+        assert_eq!(after_overlap.slice_create_ops, 2);
+        assert_eq!(after_overlap.slice_reuse_ops, 1);
+        assert_eq!(after_overlap.slice_reject_older_unique_ops, 1);
     }
 
     #[tokio::test]
