@@ -2193,36 +2193,33 @@ where
         let layout = self.shared.config.layout;
         let spans = split_chunk_spans(layout, offset, buf.len());
 
-        // Pre-compute chunk IDs (propagate errors immediately).
-        let span_cids: Vec<_> = spans
-            .iter()
-            .map(|s| chunk_id_for(self.shared.inode.ino(), s.index))
-            .collect::<std::io::Result<Vec<_>>>()?;
-
         // Snapshot relevant slice Arcs under the inner lock, then release
         // immediately so that writes are not blocked during the data copy.
-        let slice_refs: Vec<Option<Vec<Arc<ParkingMutex<SliceState>>>>> = {
+        let slice_refs: Vec<Vec<Arc<ParkingMutex<SliceState>>>> = {
             let guard = self.shared.inner.lock().await;
-            span_cids
-                .iter()
-                .map(|cid| {
-                    guard.chunks.get(cid).map(|chunk| {
-                        chunk
-                            .recently_committed
-                            .iter()
-                            .chain(chunk.slices.iter())
-                            .cloned()
-                            .collect()
-                    })
-                })
-                .collect()
+            let mut refs = Vec::with_capacity(spans.len());
+            for span in &spans {
+                let cid = chunk_id_for(self.shared.inode.ino(), span.index)?;
+                let mut slices = Vec::new();
+                if let Some(chunk) = guard.chunks.get(&cid) {
+                    slices.reserve(chunk.recently_committed.len() + chunk.slices.len());
+                    for slice in &chunk.recently_committed {
+                        slices.push(slice.clone());
+                    }
+                    for slice in &chunk.slices {
+                        slices.push(slice.clone());
+                    }
+                }
+                refs.push(slices);
+            }
+            refs
         };
 
         let mut has_overlap = false;
-        for (span, slices_opt) in spans.iter().zip(slice_refs.iter()) {
-            let Some(slices) = slices_opt else {
+        for (span, slices) in spans.iter().zip(slice_refs.iter()) {
+            if slices.is_empty() {
                 continue;
-            };
+            }
             let span_start = span.offset;
             let span_end = span.offset + span.len;
             for slice in slices {
@@ -2245,10 +2242,10 @@ where
 
         let mut missing = crate::utils::Intervals::new(offset, offset + buf.len() as u64);
 
-        for (span, slices_opt) in spans.iter().zip(slice_refs.iter()) {
-            let Some(slices) = slices_opt else {
+        for (span, slices) in spans.iter().zip(slice_refs.iter()) {
+            if slices.is_empty() {
                 continue;
-            };
+            }
 
             let chunk_start = span.index * layout.chunk_size;
             let span_start = span.offset;
