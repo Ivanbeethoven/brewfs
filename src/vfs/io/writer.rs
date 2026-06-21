@@ -70,7 +70,6 @@ const MAX_SLICES_THRESHOLD: usize = 800;
 const WRITE_MAX_WAIT: Duration = Duration::from_secs(30);
 const WRITEBACK_WRITE_MAX_WAIT: Duration = Duration::from_secs(300);
 const CACHED_SUB_BLOCK_IDLE_GRACE: Duration = Duration::from_secs(3);
-const CACHED_SUB_BLOCK_AUTO_FREEZE_MIN_AGE: Duration = Duration::from_secs(10);
 const WRITEBACK_SOFT_BACKPRESSURE_MIN_SLEEP: Duration = Duration::from_millis(1);
 const WRITEBACK_SOFT_BACKPRESSURE_MAX_SLEEP: Duration = Duration::from_millis(6);
 /// Minimum number of bytes a Writable slice must hold before `should_freeze`
@@ -3640,8 +3639,8 @@ where
                     // already frozen the slice and kicked off the upload,
                     // so flush only waits for in-flight work to land.
                     let auto_flush_max = shared.config.auto_flush_max_age;
-                    let cached_auto_freeze_ready =
-                        !cached_sub_block || age > CACHED_SUB_BLOCK_AUTO_FREEZE_MIN_AGE;
+                    let cached_auto_freeze_ready = !cached_sub_block
+                        || age > shared.config.cached_sub_block_auto_freeze_min_age;
                     let cached_idle_grace = cached_sub_block && age <= CACHED_SUB_BLOCK_IDLE_GRACE;
                     let mut trigger = if age > auto_flush_max && !cached_sub_block {
                         Some(AutoFreezeTrigger::Age)

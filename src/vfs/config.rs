@@ -8,12 +8,21 @@ pub const DEFAULT_MAX_AHEAD: u64 = 64 * 1024 * 1024; // 64MB — 16 blocks pipel
 pub const DEFAULT_BUFFER_SIZE: u64 = 1024 * 1024 * 300; // 300MB
 pub const DEFAULT_WRITE_BUFFER_SIZE: u64 = 1024 * 1024 * 300; // 300MB
 pub const DEFAULT_FLUSH_ALL_INTERVAL: Duration = Duration::from_secs(5);
+pub const DEFAULT_CACHED_SUB_BLOCK_AUTO_FREEZE_MIN_AGE: Duration = Duration::from_secs(10);
 
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn env_duration_millis(name: &str, fallback: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(fallback)
 }
 
 #[derive(Clone)]
@@ -83,6 +92,8 @@ pub struct WriteConfig {
     pub writeback_mode: crate::vfs::cache::config::WriteBackMode,
     /// Experimental page-to-block assembler for cached writeback writes.
     pub cached_block_assembler: bool,
+    /// Minimum age before cached sub-block writeback slices may be auto-frozen.
+    pub cached_sub_block_auto_freeze_min_age: Duration,
     /// Soft limit for committed-but-not-uploaded dirty bytes. 0 disables this gate.
     pub writeback_recent_pending_soft_limit: u64,
     /// Hard limit for committed-but-not-uploaded dirty bytes. 0 falls back to the soft limit.
@@ -134,6 +145,10 @@ impl Default for WriteConfig {
             upload_concurrency: 32,
             writeback_mode,
             cached_block_assembler: env_flag_enabled("BREWFS_CACHED_BLOCK_ASSEMBLER"),
+            cached_sub_block_auto_freeze_min_age: env_duration_millis(
+                "BREWFS_CACHED_SUB_BLOCK_AUTO_FREEZE_MIN_AGE_MS",
+                DEFAULT_CACHED_SUB_BLOCK_AUTO_FREEZE_MIN_AGE,
+            ),
             writeback_recent_pending_soft_limit,
             writeback_recent_pending_hard_limit,
         }
@@ -198,6 +213,16 @@ impl WriteConfig {
     pub fn cached_block_assembler(self, cached_block_assembler: bool) -> Self {
         Self {
             cached_block_assembler,
+            ..self
+        }
+    }
+
+    pub fn cached_sub_block_auto_freeze_min_age(
+        self,
+        cached_sub_block_auto_freeze_min_age: Duration,
+    ) -> Self {
+        Self {
+            cached_sub_block_auto_freeze_min_age,
             ..self
         }
     }
@@ -318,6 +343,41 @@ mod tests {
         }
     }
 
+    fn with_cached_sub_block_auto_freeze_min_age_env(value: Option<&str>, f: impl FnOnce()) {
+        let _guard = env_lock().lock().unwrap();
+        let var = "BREWFS_CACHED_SUB_BLOCK_AUTO_FREEZE_MIN_AGE_MS";
+        let previous = std::env::var_os(var);
+        match value {
+            Some(value) => {
+                // SAFETY: This test serializes access to this process-wide env var
+                // and restores the previous value before releasing the lock.
+                unsafe { std::env::set_var(var, value) };
+            }
+            None => {
+                // SAFETY: This test serializes access to this process-wide env var
+                // and restores the previous value before releasing the lock.
+                unsafe { std::env::remove_var(var) };
+            }
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        match previous {
+            Some(previous) => {
+                // SAFETY: The lock above serializes writes to this env var.
+                unsafe { std::env::set_var(var, previous) };
+            }
+            None => {
+                // SAFETY: The lock above serializes writes to this env var.
+                unsafe { std::env::remove_var(var) };
+            }
+        }
+
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     #[test]
     fn vfs_config_applies_cache_budget_knobs() {
         let layout = ChunkLayout {
@@ -374,10 +434,15 @@ mod tests {
         let configured = WriteConfig::new(ChunkLayout::default())
             .writeback_recent_pending_soft_limit(123)
             .writeback_recent_pending_hard_limit(456)
-            .cached_block_assembler(true);
+            .cached_block_assembler(true)
+            .cached_sub_block_auto_freeze_min_age(Duration::from_millis(12_345));
         assert_eq!(configured.writeback_recent_pending_soft_limit, 123);
         assert_eq!(configured.writeback_recent_pending_hard_limit, 456);
         assert!(configured.cached_block_assembler);
+        assert_eq!(
+            configured.cached_sub_block_auto_freeze_min_age,
+            Duration::from_millis(12_345)
+        );
     }
 
     #[test]
@@ -385,6 +450,17 @@ mod tests {
         with_cached_block_assembler_env(Some("1"), || {
             let config = WriteConfig::new(ChunkLayout::default());
             assert!(config.cached_block_assembler);
+        });
+    }
+
+    #[test]
+    fn write_config_parses_cached_sub_block_auto_freeze_min_age_env() {
+        with_cached_sub_block_auto_freeze_min_age_env(Some("30000"), || {
+            let config = WriteConfig::new(ChunkLayout::default());
+            assert_eq!(
+                config.cached_sub_block_auto_freeze_min_age,
+                Duration::from_millis(30_000)
+            );
         });
     }
 }

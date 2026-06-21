@@ -30,7 +30,7 @@ usage() {
   --local-fs                 改为使用本地目录作为对象存储
   --s3-writeback             启用 S3 commit-before-upload 写回语义（等价于 BREWFS_WRITEBACK_MODE=commit_before_upload）
   --writeback-throughput-profile
-                             启用 S3 writeback 全场景吞吐 profile（4GiB read/write memory+SSD cache, 12GiB memory budget, S3 max concurrency=16, writer upload_concurrency=32, writeback upload concurrency=6, pending soft/hard=1GiB/2GiB, writeback persist fsync=false, compression=none, full cache checksum, fuse workers=6, fuse max_background=512, fio prefill drain+remount, write fio post-drain）
+                             启用 S3 writeback 全场景吞吐 profile（4GiB read/write memory+SSD cache, 12GiB memory budget, S3 max concurrency=16, writer upload_concurrency=32, writeback upload concurrency=6, pending soft/hard=1GiB/2GiB, cached sub-block auto-freeze min age=30s, writeback persist fsync=false, compression=none, full cache checksum, fuse workers=6, fuse max_background=512, fio prefill drain+remount, write fio post-drain）
   --tools "<tool...>"        指定压力工具列表，默认: "fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
   --brewfs-bench           额外运行一次宿主机 cargo bench --bench brewfs_bench
   --bench-args "<args...>"   透传给 cargo bench 之后的 Criterion 参数
@@ -51,6 +51,7 @@ usage() {
   PERF_FIO_COLD_READ_CLEAR_CACHE PERF_FIO_DROP_CACHES PERF_STATS_READ_TIMEOUT_SECS
   BREWFS_READ_MEMORY_BYTES BREWFS_READ_SSD_BYTES BREWFS_WRITE_MEMORY_BYTES BREWFS_WRITE_SSD_BYTES
   BREWFS_DIRTY_SLICE_TARGET_SIZE BREWFS_DIRTY_SLICE_MAX_AGE_MS BREWFS_UPLOAD_CONCURRENCY
+  BREWFS_CACHED_SUB_BLOCK_AUTO_FREEZE_MIN_AGE_MS
   BREWFS_PREFETCH_ENABLED BREWFS_PREFETCH_MAX_BYTES BREWFS_PREFETCH_CONCURRENCY BREWFS_RANGE_BACKGROUND_PREFETCH BREWFS_MEMORY_BUDGET_BYTES
   BREWFS_FUSE_WORKERS BREWFS_FUSE_MAX_BACKGROUND BREWFS_FUSE_READ_DIRECT_IO
   BREWFS_WRITEBACK_UPLOAD_CONCURRENCY
@@ -152,6 +153,7 @@ if [[ "$WRITEBACK_THROUGHPUT_PROFILE" == true ]]; then
     export BREWFS_S3_MAX_CONCURRENCY="${BREWFS_S3_MAX_CONCURRENCY:-16}"
     export BREWFS_WRITEBACK_UPLOAD_CONCURRENCY="${BREWFS_WRITEBACK_UPLOAD_CONCURRENCY:-6}"
     export BREWFS_UPLOAD_CONCURRENCY="${BREWFS_UPLOAD_CONCURRENCY:-32}"
+    export BREWFS_CACHED_SUB_BLOCK_AUTO_FREEZE_MIN_AGE_MS="${BREWFS_CACHED_SUB_BLOCK_AUTO_FREEZE_MIN_AGE_MS:-30000}"
     export BREWFS_WRITEBACK_RECENT_PENDING_SOFT_BYTES="${BREWFS_WRITEBACK_RECENT_PENDING_SOFT_BYTES:-1073741824}"
     export BREWFS_WRITEBACK_RECENT_PENDING_HARD_BYTES="${BREWFS_WRITEBACK_RECENT_PENDING_HARD_BYTES:-2147483648}"
     export BREWFS_WRITEBACK_PERSIST_SYNC="${BREWFS_WRITEBACK_PERSIST_SYNC:-false}"
@@ -450,6 +452,7 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e BREWFS_DIRTY_SLICE_TARGET_SIZE \
     -e BREWFS_DIRTY_SLICE_MAX_AGE_MS \
     -e BREWFS_UPLOAD_CONCURRENCY \
+    -e BREWFS_CACHED_SUB_BLOCK_AUTO_FREEZE_MIN_AGE_MS \
     -e BREWFS_PREFETCH_ENABLED \
     -e BREWFS_PREFETCH_MAX_BYTES \
     -e BREWFS_PREFETCH_CONCURRENCY \
