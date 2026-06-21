@@ -3559,12 +3559,18 @@ where
             {
                 let guard = shared.inner.lock().await;
                 let now = Instant::now();
-                let mut total_slices = 0usize;
-                let mut chunk_slices = Vec::new();
+                let total_slices = guard
+                    .chunks
+                    .values()
+                    .map(|chunk| chunk.slices.len())
+                    .sum::<usize>();
+                let mut chunk_slices = Vec::with_capacity(total_slices);
 
-                for chunk in guard.chunks.values() {
-                    total_slices += chunk.slices.len();
-                    chunk_slices.push(chunk.slices.iter().cloned().collect::<Vec<_>>());
+                for (chunk_idx, chunk) in guard.chunks.values().enumerate() {
+                    let half = chunk.slices.len() / 2;
+                    for (idx, slice) in chunk.slices.iter().enumerate() {
+                        chunk_slices.push((chunk_idx, idx, half, slice.clone()));
+                    }
                 }
                 drop(guard);
 
@@ -3574,8 +3580,7 @@ where
                 let block_sized_backlog = if too_many {
                     chunk_slices
                         .iter()
-                        .flat_map(|slices| slices.iter())
-                        .filter(|slice| {
+                        .filter(|(_, _, _, slice)| {
                             let guard = slice.lock();
                             guard.data.len() >= guard.data.block_size() as u64
                         })
@@ -3602,101 +3607,95 @@ where
                 // Randomly select a half of chunk to do extra flush to avoid jitter.
                 let pick_bit = (rand::rng().next_u64() & 1) as usize;
 
-                for (chunk_idx, slices) in chunk_slices.iter().enumerate() {
-                    let half = slices.len() / 2;
+                for (chunk_idx, idx, half, slice) in chunk_slices.iter() {
+                    let handle = SliceHandle {
+                        slice,
+                        shared: &shared,
+                    };
 
-                    for (idx, slice) in slices.iter().enumerate() {
-                        let handle = SliceHandle {
-                            slice,
-                            shared: &shared,
-                        };
+                    let (age, idle_time, data_len, writeable, cached_sub_block) =
+                        handle.with_ref(|s| {
+                            let data_len = s.data.len();
+                            let cached_sub_block =
+                                matches!(s.write_origin_kind(), WriteOriginKind::CachedOnly)
+                                    && data_len < s.data.block_size() as u64;
+                            (
+                                now.duration_since(s.started),
+                                now.duration_since(s.last_mod),
+                                data_len,
+                                matches!(s.state, SliceStatus::Writable),
+                                cached_sub_block,
+                            )
+                        });
 
-                        let (age, idle_time, data_len, writeable, cached_sub_block) = handle
-                            .with_ref(|s| {
-                                let data_len = s.data.len();
-                                let cached_sub_block =
-                                    matches!(s.write_origin_kind(), WriteOriginKind::CachedOnly)
-                                        && data_len < s.data.block_size() as u64;
-                                (
-                                    now.duration_since(s.started),
-                                    now.duration_since(s.last_mod),
-                                    data_len,
-                                    matches!(s.state, SliceStatus::Writable),
-                                    cached_sub_block,
-                                )
-                            });
+                    if !writeable || data_len == 0 {
+                        continue;
+                    }
 
-                        if !writeable || data_len == 0 {
+                    // Freeze Writable slices that have existed long enough
+                    // for a background upload cycle to be worthwhile.
+                    // The short AUTO_FLUSH_MAX_AGE threshold lets the
+                    // background path pre-empt foreground fsync: by the
+                    // time fsync calls flush(), auto_flush has usually
+                    // already frozen the slice and kicked off the upload,
+                    // so flush only waits for in-flight work to land.
+                    let auto_flush_max = shared.config.auto_flush_max_age;
+                    let cached_auto_freeze_ready =
+                        !cached_sub_block || age > CACHED_SUB_BLOCK_AUTO_FREEZE_MIN_AGE;
+                    let cached_idle_grace = cached_sub_block && age <= CACHED_SUB_BLOCK_IDLE_GRACE;
+                    let mut trigger = if age > auto_flush_max && !cached_sub_block {
+                        Some(AutoFreezeTrigger::Age)
+                    } else if idle_time > idle
+                        && age > idle
+                        && !cached_idle_grace
+                        && cached_auto_freeze_ready
+                    {
+                        Some(AutoFreezeTrigger::Idle)
+                    } else if age > FLUSH_DURATION && cached_auto_freeze_ready {
+                        Some(AutoFreezeTrigger::FlushDuration)
+                    } else {
+                        None
+                    };
+                    if trigger.is_none()
+                        && force_pressure_flush
+                        && idle_time >= Duration::from_millis(10)
+                    {
+                        trigger = Some(AutoFreezeTrigger::Pressure);
+                    }
+                    let cached_too_many_too_young = cached_sub_block && !cached_auto_freeze_ready;
+                    let cached_too_many_has_block_relief =
+                        cached_sub_block && too_many_has_block_sized_relief;
+                    if trigger.is_none()
+                        && too_many
+                        && !cached_too_many_too_young
+                        && !cached_too_many_has_block_relief
+                    {
+                        // idx <= half represents older slices.
+                        if *chunk_idx % 2 == pick_bit && idx <= half {
+                            trigger = Some(AutoFreezeTrigger::TooMany);
+                        }
+                    }
+                    // Proactive size-based flush: freeze slices with enough
+                    // data when the buffer is filling up, even if they haven't
+                    // reached auto_flush_max_age.
+                    if trigger.is_none()
+                        && buffer_high
+                        && data_len >= shared.config.freeze_min_bytes
+                        && idle_time >= Duration::from_millis(5)
+                    {
+                        trigger = Some(AutoFreezeTrigger::BufferHigh);
+                    }
+
+                    if let Some(trigger) = trigger {
+                        if !handle.freeze_auto_with_trigger(trigger) {
                             continue;
                         }
-
-                        // Freeze Writable slices that have existed long enough
-                        // for a background upload cycle to be worthwhile.
-                        // The short AUTO_FLUSH_MAX_AGE threshold lets the
-                        // background path pre-empt foreground fsync: by the
-                        // time fsync calls flush(), auto_flush has usually
-                        // already frozen the slice and kicked off the upload,
-                        // so flush only waits for in-flight work to land.
-                        let auto_flush_max = shared.config.auto_flush_max_age;
-                        let cached_auto_freeze_ready =
-                            !cached_sub_block || age > CACHED_SUB_BLOCK_AUTO_FREEZE_MIN_AGE;
-                        let cached_idle_grace =
-                            cached_sub_block && age <= CACHED_SUB_BLOCK_IDLE_GRACE;
-                        let mut trigger = if age > auto_flush_max && !cached_sub_block {
-                            Some(AutoFreezeTrigger::Age)
-                        } else if idle_time > idle
-                            && age > idle
-                            && !cached_idle_grace
-                            && cached_auto_freeze_ready
-                        {
-                            Some(AutoFreezeTrigger::Idle)
-                        } else if age > FLUSH_DURATION && cached_auto_freeze_ready {
-                            Some(AutoFreezeTrigger::FlushDuration)
-                        } else {
-                            None
-                        };
-                        if trigger.is_none()
-                            && force_pressure_flush
-                            && idle_time >= Duration::from_millis(10)
-                        {
-                            trigger = Some(AutoFreezeTrigger::Pressure);
-                        }
-                        let cached_too_many_too_young =
-                            cached_sub_block && !cached_auto_freeze_ready;
-                        let cached_too_many_has_block_relief =
-                            cached_sub_block && too_many_has_block_sized_relief;
-                        if trigger.is_none()
-                            && too_many
-                            && !cached_too_many_too_young
-                            && !cached_too_many_has_block_relief
-                        {
-                            // idx <= half represents older slices.
-                            if chunk_idx % 2 == pick_bit && idx <= half {
-                                trigger = Some(AutoFreezeTrigger::TooMany);
-                            }
-                        }
-                        // Proactive size-based flush: freeze slices with enough
-                        // data when the buffer is filling up, even if they haven't
-                        // reached auto_flush_max_age.
-                        if trigger.is_none()
-                            && buffer_high
-                            && data_len >= shared.config.freeze_min_bytes
-                            && idle_time >= Duration::from_millis(5)
-                        {
-                            trigger = Some(AutoFreezeTrigger::BufferHigh);
-                        }
-
-                        if let Some(trigger) = trigger {
-                            if !handle.freeze_auto_with_trigger(trigger) {
-                                continue;
-                            }
-                            tracing::debug!(
-                                age_ms = age.as_millis(),
-                                idle_ms = idle_time.as_millis(),
-                                "auto_flush: freezing slice"
-                            );
-                            to_flush.push(slice.clone());
-                        }
+                        tracing::debug!(
+                            age_ms = age.as_millis(),
+                            idle_ms = idle_time.as_millis(),
+                            "auto_flush: freezing slice"
+                        );
+                        to_flush.push(slice.clone());
                     }
                 }
             }

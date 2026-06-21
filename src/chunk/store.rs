@@ -575,6 +575,18 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
 }
 
 impl<B: ObjectBackend + Send + Sync + 'static> ObjectBlockStore<B> {
+    fn collect_bytes(parts: &[Bytes], total_len: usize) -> Bytes {
+        if parts.len() == 1 && parts[0].len() == total_len {
+            return parts[0].clone();
+        }
+
+        let mut data = Vec::with_capacity(total_len);
+        for part in parts {
+            data.extend_from_slice(part);
+        }
+        Bytes::from(data)
+    }
+
     async fn write_fresh_vectored_inner(
         &self,
         key: BlockKey,
@@ -589,19 +601,45 @@ impl<B: ObjectBackend + Send + Sync + 'static> ObjectBlockStore<B> {
         }
 
         let offset_usize = offset.as_usize();
-        let mut parts: Vec<Bytes> = Vec::new();
+        let upload_len = offset_usize + total_len;
+        if matches!(self.config.compression, Compression::None) {
+            let mut upload_chunks =
+                Vec::with_capacity(chunks.len() + usize::from(offset_usize > 0));
+            if offset_usize > 0 {
+                upload_chunks.extend(make_zero_bytes(offset_usize));
+            }
+            upload_chunks.extend(chunks);
+
+            self.bandwidth.acquire_upload(upload_len).await;
+            self.object_metrics
+                .record_put_prepare(prepare_started.elapsed());
+            let started = Instant::now();
+            self.client
+                .put_object_vectored(&key_str, upload_chunks.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
+            self.object_metrics
+                .record_put(upload_len as u64, started.elapsed());
+
+            let cache_started = Instant::now();
+            let full_block = Self::collect_bytes(&upload_chunks, upload_len);
+            self.populate_write_cache_after_upload(key_str, full_block)
+                .await;
+            self.object_metrics
+                .record_put_cache(cache_started.elapsed());
+
+            return Ok(total_len as u64);
+        }
+
+        let mut parts: Vec<Bytes> =
+            Vec::with_capacity(chunks.len() + usize::from(offset_usize > 0));
         if offset_usize > 0 {
             parts.extend(make_zero_bytes(offset_usize));
         }
         parts.extend(chunks);
 
         // Assemble full block (uncompressed) for cache population.
-        let full_block = Bytes::from(
-            parts
-                .iter()
-                .flat_map(|b| b.iter().copied())
-                .collect::<Vec<_>>(),
-        );
+        let full_block = Self::collect_bytes(&parts, upload_len);
 
         // Compress for S3 upload if configured (Cow avoids copy when incompressible)
         let compressed = compress(&full_block, self.config.compression);
@@ -1471,6 +1509,121 @@ mod tests {
         assert_eq!(
             store.block_cache.get(&"chunks/123/0".to_string()).await,
             Some(data.into())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_write_fresh_vectored_preserves_chunks_without_compression()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::cadapter::client::{ObjectBackend, ObjectClient};
+        use async_trait::async_trait;
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+
+        #[derive(Clone, Default)]
+        struct MockBackend {
+            data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            put_chunk_counts: Arc<Mutex<Vec<usize>>>,
+        }
+
+        #[async_trait]
+        impl ObjectBackend for MockBackend {
+            async fn put_object_vectored(
+                &self,
+                key: &str,
+                chunks: Vec<Bytes>,
+            ) -> anyhow::Result<()> {
+                self.put_chunk_counts.lock().unwrap().push(chunks.len());
+
+                let total_len = chunks.iter().map(Bytes::len).sum();
+                let mut data = Vec::with_capacity(total_len);
+                for chunk in chunks {
+                    data.extend_from_slice(&chunk);
+                }
+                self.data.lock().unwrap().insert(key.to_string(), data);
+                Ok(())
+            }
+
+            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), data.to_vec());
+                Ok(())
+            }
+
+            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(self.data.lock().unwrap().get(key).cloned())
+            }
+
+            async fn get_object_range(
+                &self,
+                key: &str,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                if let Some(data) = self.data.lock().unwrap().get(key) {
+                    let offset = offset as usize;
+                    let end = (offset + buf.len()).min(data.len());
+                    if offset < data.len() {
+                        let copy_len = end - offset;
+                        buf[..copy_len].copy_from_slice(&data[offset..end]);
+                        return Ok(copy_len);
+                    }
+                }
+                Ok(0)
+            }
+
+            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
+                Ok("test_etag".to_string())
+            }
+
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                self.data.lock().unwrap().remove(key);
+                Ok(())
+            }
+        }
+
+        let backend = MockBackend::default();
+        let cache_dir = tempfile::tempdir()?;
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(backend.clone()),
+            ChunksCacheConfig::with_budgets(
+                16 * 1024 * 1024,
+                16 * 1024 * 1024,
+                cache_dir.path().to_path_buf(),
+            ),
+            BlockStoreConfig {
+                block_size: 4 * 1024 * 1024,
+                compression: Compression::None,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let chunks = vec![
+            Bytes::from_static(b"hello "),
+            Bytes::from_static(b"vectored "),
+            Bytes::from_static(b"upload"),
+        ];
+        store.write_fresh_vectored((321, 0), 0, chunks).await?;
+
+        assert_eq!(
+            *backend.put_chunk_counts.lock().unwrap(),
+            vec![3],
+            "compression=None should pass original chunks to vectored-capable backends"
+        );
+        assert_eq!(
+            backend.data.lock().unwrap().get("chunks/321/0").cloned(),
+            Some(b"hello vectored upload".to_vec())
+        );
+        assert_eq!(
+            store.block_cache.get(&"chunks/321/0".to_string()).await,
+            Some(Bytes::from_static(b"hello vectored upload"))
         );
 
         Ok(())
