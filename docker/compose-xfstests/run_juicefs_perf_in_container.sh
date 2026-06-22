@@ -1000,6 +1000,23 @@ if fio_json_paths:
     def fmt_ms_from_ns(value):
         return f"{num(value) / 1_000_000:.3f} ms"
 
+    def fmt_seconds_from_ms(value):
+        value = num(value)
+        if value <= 0:
+            return "-"
+        return f"{value / 1000.0:.3f} s"
+
+    def fmt_delta_ms(value):
+        value = num(value)
+        sign = "+" if value >= 0 else "-"
+        return f"{sign}{abs(value) / 1000.0:.3f} s"
+
+    def fmt_ratio(value):
+        value = num(value)
+        if value <= 0:
+            return "-"
+        return f"{value:.2f}x"
+
     def latency_percentile(op, pct):
         percentiles = op.get("clat_ns", {}).get("percentile", {})
         return percentiles.get(f"{pct:.6f}") or percentiles.get(str(pct))
@@ -1034,8 +1051,30 @@ if fio_json_paths:
         write = op_totals("write")
         tool_name = fio_json_path.stem
         wall_seconds = num(summary_by_tool.get(tool_name, {}).get("seconds"))
+        raw_job_runtime_ms = max((num(job.get("job_runtime")) for job in jobs), default=0)
         active_runtime_ms = max(read["runtime_ms"], write["runtime_ms"])
-        runtime_rows.append((tool_name, options.get("direct", "unknown"), wall_seconds, active_runtime_ms))
+        wall_ms = wall_seconds * 1000.0 if wall_seconds > 0 else 0
+        wall_vs_job_ms = wall_ms - raw_job_runtime_ms if raw_job_runtime_ms > 0 and wall_ms > 0 else 0
+        wall_vs_active_ms = wall_ms - active_runtime_ms if active_runtime_ms > 0 and wall_ms > 0 else 0
+        wall_job_ratio = wall_ms / raw_job_runtime_ms if raw_job_runtime_ms > 0 and wall_ms > 0 else 0
+        wall_active_ratio = wall_ms / active_runtime_ms if active_runtime_ms > 0 and wall_ms > 0 else 0
+        tail = "-"
+        if wall_vs_active_ms > 5000 or wall_active_ratio > 1.15:
+            tail = "close/flush tail"
+        elif raw_job_runtime_ms > wall_ms > 0:
+            tail = "fio job_runtime aggregates jobs"
+        runtime_rows.append((
+            tool_name,
+            options.get("direct", "unknown"),
+            wall_seconds,
+            raw_job_runtime_ms,
+            wall_vs_job_ms,
+            wall_job_ratio,
+            active_runtime_ms,
+            wall_vs_active_ms,
+            wall_active_ratio,
+            tail,
+        ))
         lines.append(
             f"| {tool_name} | {options.get('rw', 'unknown')} | {options.get('direct', 'unknown')} | "
             f"{options.get('bs', 'unknown')} | {options.get('numjobs', 'unknown')} | "
@@ -1050,15 +1089,28 @@ if fio_json_paths:
             "",
             "## Fio Runtime Accounting",
             "",
-            "| Tool | Direct | Script wall | active_io_runtime | wall-active_io |",
-            "| --- | ---: | ---: | ---: | ---: |",
+            "Use `active_io_runtime` for close/flush tail detection; fio `job_runtime_ms` can aggregate multiple jobs under group reporting.",
+            "",
+            "| Tool | Direct | Script wall | fio job_runtime | wall-job_runtime | wall/job_runtime | active_io_runtime | wall-active_io | wall/active_io | Tail marker |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
         ])
-        for tool_name, direct, wall_seconds, active_runtime_ms in runtime_rows:
-            active_seconds = active_runtime_ms / 1000.0 if active_runtime_ms else 0.0
-            delta = wall_seconds - active_seconds if wall_seconds and active_seconds else 0.0
+        for (
+            tool_name,
+            direct,
+            wall_seconds,
+            raw_job_runtime_ms,
+            wall_vs_job_ms,
+            wall_job_ratio,
+            active_runtime_ms,
+            wall_vs_active_ms,
+            wall_active_ratio,
+            tail,
+        ) in runtime_rows:
             lines.append(
                 f"| {tool_name} | {direct} | {wall_seconds:.0f} s | "
-                f"{active_seconds:.3f} s | {delta:+.3f} s |"
+                f"{fmt_seconds_from_ms(raw_job_runtime_ms)} | {fmt_delta_ms(wall_vs_job_ms)} | "
+                f"{fmt_ratio(wall_job_ratio)} | {fmt_seconds_from_ms(active_runtime_ms)} | "
+                f"{fmt_delta_ms(wall_vs_active_ms)} | {fmt_ratio(wall_active_ratio)} | {tail} |"
             )
 
 report_path.write_text("\n".join(lines) + "\n")
