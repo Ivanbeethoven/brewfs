@@ -860,6 +860,8 @@ async fn test_compaction_gc_roundtrip_etcd() {
                 chunk_id: 11,
                 offset: 0,
                 length: 4096,
+                object_offset: 0,
+                object_size: 4096,
             },
         )
         .await
@@ -872,6 +874,8 @@ async fn test_compaction_gc_roundtrip_etcd() {
                 chunk_id: 22,
                 offset: 0,
                 length: 1024,
+                object_offset: 0,
+                object_size: 1024,
             },
         )
         .await
@@ -887,6 +891,8 @@ async fn test_compaction_gc_roundtrip_etcd() {
         chunk_id: 11,
         offset: 0,
         length: 2048,
+        object_offset: 0,
+        object_size: 2048,
     };
 
     store
@@ -926,12 +932,16 @@ async fn test_light_compaction_preserves_unreplaced_slices_etcd() {
         chunk_id: 55,
         offset: 0,
         length: 4096,
+        object_offset: 0,
+        object_size: 4096,
     };
     let replaced = SliceDesc {
         slice_id: 502,
         chunk_id: 55,
         offset: 1024,
         length: 1024,
+        object_offset: 0,
+        object_size: 1024,
     };
 
     store.append_slice(55, retained).await.unwrap();
@@ -965,6 +975,8 @@ async fn test_process_delayed_slices_removes_empty_chunk_key_etcd() {
         chunk_id: 66,
         offset: 0,
         length: 512,
+        object_offset: 0,
+        object_size: 512,
     };
     store.append_slice(66, original).await.unwrap();
 
@@ -996,6 +1008,8 @@ async fn test_uncommitted_gc_and_version_conflict_etcd() {
         chunk_id: 33,
         offset: 0,
         length: 512,
+        object_offset: 0,
+        object_size: 512,
     };
     store.append_slice(33, initial).await.unwrap();
 
@@ -1004,6 +1018,8 @@ async fn test_uncommitted_gc_and_version_conflict_etcd() {
         chunk_id: 33,
         offset: 0,
         length: 256,
+        object_offset: 0,
+        object_size: 256,
     };
     let delayed = SliceDesc::encode_delayed_data(&[initial], &[401]);
 
@@ -1104,6 +1120,8 @@ async fn test_chunk_compact_lock_blocks_write_until_release_etcd() {
                 chunk_id: 44,
                 offset: 0,
                 length: 128,
+                object_offset: 0,
+                object_size: 128,
             },
             128,
         )
@@ -1131,6 +1149,8 @@ async fn test_chunk_compact_lock_blocks_write_until_release_etcd() {
                 chunk_id: 44,
                 offset: 0,
                 length: 128,
+                object_offset: 0,
+                object_size: 128,
             },
             128,
         )
@@ -1217,6 +1237,8 @@ async fn test_expired_compact_lock_does_not_block_write_etcd() {
                 chunk_id: 91,
                 offset: 0,
                 length: 128,
+                object_offset: 0,
+                object_size: 128,
             },
             128,
         )
@@ -1250,6 +1272,8 @@ async fn test_truncate_updates_size_and_prunes_slices_etcd() {
                 chunk_id: chunk0,
                 offset: 0,
                 length: 1024,
+                object_offset: 0,
+                object_size: 1024,
             },
             2048,
         )
@@ -1264,6 +1288,8 @@ async fn test_truncate_updates_size_and_prunes_slices_etcd() {
                 chunk_id: chunk1,
                 offset: 0,
                 length: 1024,
+                object_offset: 0,
+                object_size: 1024,
             },
             2048,
         )
@@ -1280,6 +1306,8 @@ async fn test_truncate_updates_size_and_prunes_slices_etcd() {
             chunk_id: chunk0,
             offset: 0,
             length: 512,
+            object_offset: 0,
+            object_size: 512,
         }]
     );
     assert!(store.get_slices(chunk1).await.unwrap().is_empty());
@@ -1308,6 +1336,8 @@ async fn test_truncate_batches_large_chunk_deletes_etcd() {
                     chunk_id,
                     offset: 0,
                     length: chunk_size,
+                    object_offset: 0,
+                    object_size: chunk_size,
                 },
                 (idx + 1) * chunk_size,
             )
@@ -1340,6 +1370,8 @@ async fn test_replace_slices_for_compact_rejects_non_atomic_large_delayed_batch_
             chunk_id,
             offset: idx * 1024,
             length: 1024,
+            object_offset: 0,
+            object_size: 1024,
         };
         store.append_slice(chunk_id, slice).await.unwrap();
         slices.push(slice);
@@ -1401,6 +1433,8 @@ async fn test_list_chunk_ids_rotates_scan_window_etcd() {
                     chunk_id,
                     offset: 0,
                     length: 512,
+                    object_offset: 0,
+                    object_size: 512,
                 },
             )
             .await
@@ -1427,6 +1461,8 @@ async fn test_list_chunk_ids_does_not_duplicate_short_prefix_scan_etcd() {
                     chunk_id,
                     offset: 0,
                     length: 512,
+                    object_offset: 0,
+                    object_size: 512,
                 },
             )
             .await
@@ -1450,6 +1486,8 @@ async fn test_process_delayed_slices_filters_by_age_before_limit_etcd() {
             chunk_id,
             offset: idx * 10,
             length: 64,
+            object_offset: 0,
+            object_size: 64,
         };
         store.append_slice(chunk_id, slice).await.unwrap();
         let delayed = SliceDesc::encode_delayed_data(&[slice], &[slice.slice_id]);

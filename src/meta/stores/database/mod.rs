@@ -351,6 +351,7 @@ impl DatabaseMetaStore {
                 }
             }
         }
+        Self::ensure_slice_meta_physical_range_columns(db).await?;
 
         let index_stmt = Index::create()
             .if_not_exists()
@@ -404,6 +405,59 @@ impl DatabaseMetaStore {
             .map_err(MetaError::Database)?;
         info!("Root directory created successfully with inode 1");
 
+        Ok(())
+    }
+
+    async fn ensure_slice_meta_physical_range_columns(
+        db: &DatabaseConnection,
+    ) -> Result<(), MetaError> {
+        let builder = db.get_database_backend();
+        for stmt in [
+            sea_query::Table::alter()
+                .table(SliceMeta)
+                .add_column(
+                    sea_query::ColumnDef::new(slice_meta::Column::ObjectOffset)
+                        .big_integer()
+                        .not_null()
+                        .default(0),
+                )
+                .to_owned(),
+            sea_query::Table::alter()
+                .table(SliceMeta)
+                .add_column(
+                    sea_query::ColumnDef::new(slice_meta::Column::ObjectSize)
+                        .big_integer()
+                        .not_null()
+                        .default(0),
+                )
+                .to_owned(),
+        ] {
+            match db.execute(builder.build(&stmt)).await {
+                Ok(_) => {}
+                Err(err) => {
+                    let msg = err.to_string();
+                    if msg.contains("duplicate column")
+                        || msg.contains("already exists")
+                        || msg.contains("Duplicate column")
+                    {
+                        continue;
+                    }
+                    return Err(MetaError::Database(err));
+                }
+            }
+        }
+
+        let update_stmt = sea_query::Query::update()
+            .table(SliceMeta)
+            .value(
+                slice_meta::Column::ObjectSize,
+                sea_query::Expr::col(slice_meta::Column::Length),
+            )
+            .and_where(sea_query::Expr::col(slice_meta::Column::ObjectSize).eq(0))
+            .to_owned();
+        db.execute(builder.build(&update_stmt))
+            .await
+            .map_err(MetaError::Database)?;
         Ok(())
     }
 
@@ -2983,6 +3037,8 @@ impl MetaStore for DatabaseMetaStore {
             slice_id: Set(slice.slice_id as i64),
             offset: Set(slice.offset.as_i64()),
             length: Set(slice.length.as_i64()),
+            object_offset: Set(slice.object_offset.as_i64()),
+            object_size: Set(slice.physical_size().as_i64()),
             ..Default::default()
         };
         model.insert(&txn).await.map_err(MetaError::Database)?;
@@ -3019,6 +3075,8 @@ impl MetaStore for DatabaseMetaStore {
             slice_id: Set(slice.slice_id as i64),
             offset: Set(slice.offset.as_i64()),
             length: Set(slice.length.as_i64()),
+            object_offset: Set(slice.object_offset.as_i64()),
+            object_size: Set(slice.physical_size().as_i64()),
             ..Default::default()
         };
 
@@ -3065,6 +3123,89 @@ impl MetaStore for DatabaseMetaStore {
         {
             let mut perm = file.permission.clone();
             perm.mode &= !0o6000; // Clear setuid (04000) and setgid (02000) bits
+
+            let mut active: file_meta::ActiveModel = file.into();
+            active.permission = Set(perm);
+            active.update(&txn).await.map_err(MetaError::Database)?;
+        }
+
+        txn.commit().await.map_err(MetaError::Database)?;
+        Ok(())
+    }
+
+    async fn write_slices(
+        &self,
+        ino: i64,
+        chunk_id: u64,
+        slices: &[SliceDesc],
+        new_size: u64,
+    ) -> Result<(), MetaError> {
+        if slices.is_empty() {
+            return Ok(());
+        }
+        if self
+            .is_global_lock_held(
+                LockName::ChunkCompactLock(chunk_id),
+                CHUNK_LOCK_CHECK_TTL_SECS,
+            )
+            .await
+        {
+            return Err(MetaError::ContinueRetry(RetryReason::VersionConflict));
+        }
+
+        let txn = self.db.begin().await.map_err(MetaError::Database)?;
+
+        for slice in slices {
+            let model = slice_meta::ActiveModel {
+                chunk_id: Set(chunk_id as i64),
+                slice_id: Set(slice.slice_id as i64),
+                offset: Set(slice.offset.as_i64()),
+                length: Set(slice.length.as_i64()),
+                object_offset: Set(slice.object_offset.as_i64()),
+                object_size: Set(slice.physical_size().as_i64()),
+                ..Default::default()
+            };
+
+            if let Err(err) = model.insert(&txn).await {
+                let _ = txn.rollback().await;
+                return Err(MetaError::Database(err));
+            }
+        }
+
+        let now = Self::now_nanos();
+        let result = file_meta::Entity::update_many()
+            .col_expr(
+                file_meta::Column::Size,
+                sea_query::Expr::val(new_size as i64).into(),
+            )
+            .col_expr(
+                file_meta::Column::ModifyTime,
+                sea_query::Expr::val(now).into(),
+            )
+            .filter(file_meta::Column::Inode.eq(ino))
+            .filter(file_meta::Column::Size.lt(new_size as i64))
+            .exec(&txn)
+            .await
+            .map_err(MetaError::Database)?;
+
+        if result.rows_affected == 0 {
+            let exists = FileMeta::find_by_id(ino)
+                .one(&txn)
+                .await
+                .map_err(MetaError::Database)?;
+            if exists.is_none() {
+                let _ = txn.rollback().await;
+                return Err(MetaError::NotFound(ino));
+            }
+        }
+
+        if let Some(file) = FileMeta::find_by_id(ino)
+            .one(&txn)
+            .await
+            .map_err(MetaError::Database)?
+        {
+            let mut perm = file.permission.clone();
+            perm.mode &= !0o6000;
 
             let mut active: file_meta::ActiveModel = file.into();
             active.permission = Set(perm);
@@ -3410,6 +3551,8 @@ impl MetaStore for DatabaseMetaStore {
                 slice_id: Set(slice.slice_id as i64),
                 offset: Set(slice.offset.as_i64()),
                 length: Set(slice.length.as_i64()),
+                object_offset: Set(slice.object_offset.as_i64()),
+                object_size: Set(slice.physical_size().as_i64()),
                 ..Default::default()
             };
             model.insert(&txn).await.map_err(MetaError::Database)?;
@@ -3483,16 +3626,25 @@ impl MetaStore for DatabaseMetaStore {
             return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
         }
 
-        let current_map: HashMap<i64, (i64, i64)> = current_slices
+        let current_map: HashMap<i64, (i64, i64, i64, i64)> = current_slices
             .iter()
-            .map(|s| (s.slice_id, (s.offset, s.length)))
+            .map(|s| {
+                (
+                    s.slice_id,
+                    (s.offset, s.length, s.object_offset, s.object_size),
+                )
+            })
             .collect();
 
         for expected in expected_slices {
             let expected_id = expected.slice_id as i64;
             match current_map.get(&expected_id) {
-                Some((offset, length)) => {
-                    if *offset != expected.offset.as_i64() || *length != expected.length.as_i64() {
+                Some((offset, length, object_offset, object_size)) => {
+                    if *offset != expected.offset.as_i64()
+                        || *length != expected.length.as_i64()
+                        || *object_offset != expected.object_offset.as_i64()
+                        || *object_size != expected.physical_size().as_i64()
+                    {
                         warn!(
                             chunk_id = chunk_id,
                             slice_id = expected.slice_id,
@@ -3537,6 +3689,8 @@ impl MetaStore for DatabaseMetaStore {
                 slice_id: Set(slice.slice_id as i64),
                 offset: Set(slice.offset.as_i64()),
                 length: Set(slice.length.as_i64()),
+                object_offset: Set(slice.object_offset.as_i64()),
+                object_size: Set(slice.physical_size().as_i64()),
                 ..Default::default()
             };
             model.insert(&txn).await.map_err(MetaError::Database)?;

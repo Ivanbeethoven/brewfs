@@ -1095,6 +1095,8 @@ mod tests {
                     chunk_id: chunk_id_for(ino, 0).unwrap(),
                     offset,
                     length: head.len() as u64,
+                    object_offset: 0,
+                    object_size: head.len() as u64,
                 },
             )
             .await
@@ -1118,6 +1120,8 @@ mod tests {
                     chunk_id: chunk_id_for(ino, 1).unwrap(),
                     offset: 0,
                     length: tail.len() as u64,
+                    object_offset: 0,
+                    object_size: tail.len() as u64,
                 },
             )
             .await
@@ -1164,6 +1168,8 @@ mod tests {
                     chunk_id: chunk_id_for(ino, 0).unwrap(),
                     offset: 0,
                     length: data1.len() as u64,
+                    object_offset: 0,
+                    object_size: data1.len() as u64,
                 },
             )
             .await
@@ -1192,6 +1198,8 @@ mod tests {
                     chunk_id: chunk_id_for(ino, 0).unwrap(),
                     offset: 0,
                     length: data2.len() as u64,
+                    object_offset: 0,
+                    object_size: data2.len() as u64,
                 },
             )
             .await
@@ -1234,6 +1242,8 @@ mod tests {
                     chunk_id: chunk_id_for(ino, 0).unwrap(),
                     offset: 0,
                     length: data.len() as u64,
+                    object_offset: 0,
+                    object_size: data.len() as u64,
                 },
             )
             .await
@@ -1421,6 +1431,8 @@ mod tests {
                     chunk_id: chunk_id_for(ino, 0).unwrap(),
                     offset: 0,
                     length: data.len() as u64,
+                    object_offset: 0,
+                    object_size: data.len() as u64,
                 },
             )
             .await
@@ -1597,6 +1609,8 @@ mod tests {
                         chunk_id: chunk_id_for(ino, chunk_index).unwrap(),
                         offset: 0,
                         length: data.len() as u64,
+                        object_offset: 0,
+                        object_size: data.len() as u64,
                     },
                 )
                 .await
@@ -1643,6 +1657,8 @@ mod tests {
                     chunk_id: chunk_id_for(ino, 0).unwrap(),
                     offset: 0,
                     length: data.len() as u64,
+                    object_offset: 0,
+                    object_size: data.len() as u64,
                 },
             )
             .await
@@ -1687,6 +1703,8 @@ mod tests {
                     chunk_id: chunk_id_for(ino, 0).unwrap(),
                     offset: 0,
                     length: data.len() as u64,
+                    object_offset: 0,
+                    object_size: data.len() as u64,
                 },
             )
             .await

@@ -477,6 +477,8 @@ where
             slice_id,
             offset: record.chunk_offset,
             length: record.length,
+            object_offset: 0,
+            object_size: record.length,
         };
         let (ino, chunk_index) = crate::vfs::extract_ino_and_chunk_index(record.chunk_id);
         let file_offset = chunk_index * layout.chunk_size + desc.offset;

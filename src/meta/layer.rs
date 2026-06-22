@@ -296,6 +296,23 @@ pub trait MetaLayer: Send + Sync {
         new_size: u64,
     ) -> Result<(), MetaError>;
 
+    async fn write_slices(
+        &self,
+        ino: i64,
+        chunk_id: u64,
+        slices: &[SliceDesc],
+        new_size: u64,
+    ) -> Result<(), MetaError> {
+        let Some((first, rest)) = slices.split_first() else {
+            return Ok(());
+        };
+        self.write(ino, chunk_id, *first, new_size).await?;
+        for slice in rest {
+            self.append_slice(chunk_id, *slice).await?;
+        }
+        Ok(())
+    }
+
     // ---------- Metadata + ID utilities ----------
     async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError>;
 

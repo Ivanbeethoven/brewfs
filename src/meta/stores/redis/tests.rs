@@ -1955,12 +1955,16 @@ async fn test_truncate_rewrite_is_atomic_for_partial_chunk() {
             chunk_id,
             offset: 0,
             length: chunk_size,
+            object_offset: 0,
+            object_size: chunk_size,
         },
         crate::chunk::SliceDesc {
             slice_id: 12,
             chunk_id,
             offset: 0,
             length: chunk_size,
+            object_offset: 0,
+            object_size: chunk_size,
         },
     ];
     for desc in base {
@@ -1997,6 +2001,8 @@ async fn test_truncate_rewrite_never_exposes_empty_chunk_list() {
                 chunk_id,
                 offset: 0,
                 length: chunk_size,
+                object_offset: 0,
+                object_size: chunk_size,
             },
         )
         .await
@@ -2136,6 +2142,8 @@ async fn test_file_full_lifecycle_flow() {
         chunk_id,
         offset: 0,
         length: 4096,
+        object_offset: 0,
+        object_size: 4096,
     };
     store.write(ino, chunk_id, slice, 4096).await.unwrap();
 
@@ -3019,6 +3027,8 @@ async fn test_write_consistency() {
         chunk_id,
         offset: 0,
         length: 8192,
+        object_offset: 0,
+        object_size: 8192,
     };
     store.write(ino, chunk_id, slice, 8192).await.unwrap();
 
@@ -3053,6 +3063,8 @@ async fn test_truncate_consistency() {
                 chunk_id: chunk_id0,
                 offset: 0,
                 length: chunk_size,
+                object_offset: 0,
+                object_size: chunk_size,
             },
         )
         .await
@@ -3065,6 +3077,8 @@ async fn test_truncate_consistency() {
                 chunk_id: chunk_id1,
                 offset: 0,
                 length: chunk_size,
+                object_offset: 0,
+                object_size: chunk_size,
             },
         )
         .await
@@ -3108,6 +3122,8 @@ async fn test_delayed_slice_workflow_consistency() {
         chunk_id,
         offset: 0,
         length: 1024,
+        object_offset: 0,
+        object_size: 1024,
     };
     store.append_slice(chunk_id, old_slice).await.unwrap();
 
@@ -3116,6 +3132,8 @@ async fn test_delayed_slice_workflow_consistency() {
         chunk_id,
         offset: 0,
         length: 1024,
+        object_offset: 0,
+        object_size: 1024,
     };
     let delayed_data = crate::chunk::SliceDesc::encode_delayed_data(&[old_slice], &[401]);
     store

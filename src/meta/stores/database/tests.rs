@@ -123,6 +123,59 @@ async fn test_next_id_unique_across_store_instances() {
 }
 
 #[tokio::test]
+async fn test_slice_round_trip_preserves_object_range() {
+    let store = new_test_store().await;
+    let slice = SliceDesc {
+        slice_id: 77,
+        chunk_id: 42,
+        offset: 4096,
+        length: 1024,
+        object_offset: 2048,
+        object_size: 4096,
+    };
+
+    store.append_slice(42, slice).await.unwrap();
+
+    assert_eq!(store.get_slices(42).await.unwrap(), vec![slice]);
+}
+
+#[tokio::test]
+async fn test_write_slices_preserves_ordered_shared_object_views() {
+    let store = new_test_store().await;
+    let ino = store
+        .create_file(store.root_ino(), "multi-slice-object.bin".to_string())
+        .await
+        .unwrap();
+    let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+    let slices = [
+        SliceDesc {
+            slice_id: 9001,
+            chunk_id,
+            offset: 0,
+            length: 1024,
+            object_offset: 0,
+            object_size: 4096,
+        },
+        SliceDesc {
+            slice_id: 9001,
+            chunk_id,
+            offset: 8192,
+            length: 1024,
+            object_offset: 2048,
+            object_size: 4096,
+        },
+    ];
+
+    store
+        .write_slices(ino, chunk_id, &slices, 9216)
+        .await
+        .unwrap();
+
+    assert_eq!(store.get_slices(chunk_id).await.unwrap(), slices);
+    assert_eq!(store.stat(ino).await.unwrap().unwrap().size, 9216);
+}
+
+#[tokio::test]
 async fn sqlite_file_store_waits_for_transient_write_locks() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("transient-lock.db");

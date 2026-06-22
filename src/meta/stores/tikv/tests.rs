@@ -318,12 +318,16 @@ async fn tikv_transactional_file_data_schema() {
         chunk_id: 42,
         offset: 0,
         length: 128,
+        object_offset: 0,
+        object_size: 128,
     };
     let second = SliceDesc {
         slice_id: 8,
         chunk_id: 42,
         offset: 128,
         length: 64,
+        object_offset: 0,
+        object_size: 64,
     };
 
     store.write(file, 42, first, 128).await.unwrap();
@@ -342,6 +346,8 @@ async fn tikv_transactional_file_data_schema() {
                 chunk_id: 43,
                 offset: 0,
                 length: 32,
+                object_offset: 0,
+                object_size: 32,
             },
             32,
         )
@@ -379,12 +385,16 @@ async fn tikv_compaction_gc_workflow() {
         chunk_id: 11,
         offset: 0,
         length: 4096,
+        object_offset: 0,
+        object_size: 4096,
     };
     let replacement = SliceDesc {
         slice_id: 102,
         chunk_id: 11,
         offset: 0,
         length: 2048,
+        object_offset: 0,
+        object_size: 2048,
     };
     store.append_slice(11, initial).await.unwrap();
 

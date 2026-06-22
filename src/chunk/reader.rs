@@ -135,8 +135,9 @@ where
                 tail = rest;
                 cursor = start + len;
 
-                // The blocks to fetch must be computed relative to the slice itself.
-                let slice_offset = SliceOffset::from(l - slice.offset);
+                // The blocks to fetch must be computed relative to the
+                // physical object, not just the logical slice view.
+                let slice_offset = SliceOffset::from(slice.physical_offset_for(l));
                 let slice_len = r - l;
                 let slice_id = slice.slice_id;
 
@@ -259,7 +260,7 @@ where
             tail = rest;
             cursor = start + len;
 
-            let slice_offset = SliceOffset::from(l - slice.offset);
+            let slice_offset = SliceOffset::from(slice.physical_offset_for(l));
             let slice_len = r - l;
             let slice_id = slice.slice_id;
             let mut pos = 0_usize;
@@ -330,6 +331,8 @@ mod tests {
                     chunk_id: 7,
                     offset: layout.block_size as u64,
                     length: buf.len() as u64,
+                    object_offset: 0,
+                    object_size: buf.len() as u64,
                 },
             )
             .await
@@ -385,6 +388,8 @@ mod tests {
                 chunk_id: 7,
                 offset: layout.block_size as u64,
                 length: buf.len() as u64,
+                object_offset: 0,
+                object_size: buf.len() as u64,
             },
         )
         .await
@@ -406,6 +411,52 @@ mod tests {
                 .iter()
                 .all(|&b| b == 1)
         );
+    }
+
+    #[tokio::test]
+    async fn test_reader_uses_slicedesc_object_offset() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta = create_meta_store_from_url("sqlite::memory:")
+            .await
+            .unwrap()
+            .layer();
+        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
+        let data: Vec<u8> = (0..layout.block_size as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let slice_id = meta.next_id(SLICE_ID_KEY).await.unwrap() as u64;
+        let uploader = DataUploader::new(layout, backend.as_ref());
+        uploader
+            .write_at_vectored(
+                slice_id,
+                0u64.into(),
+                &[bytes::Bytes::copy_from_slice(&data)],
+            )
+            .await
+            .unwrap();
+        meta.append_slice(
+            77,
+            SliceDesc {
+                slice_id,
+                chunk_id: 77,
+                offset: 4096,
+                length: 1024,
+                object_offset: 2048,
+                object_size: layout.block_size as u64,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut reader = DataFetcher::new(layout, 77, backend.as_ref());
+        reader.prepare_slices().await.unwrap();
+        let out = reader.read_at(4096u64.into(), 1024).await.unwrap();
+
+        assert_eq!(out, data[2048..3072].to_vec());
     }
 
     #[tokio::test]
@@ -435,6 +486,8 @@ mod tests {
             chunk_id: 11,
             offset: 0,
             length: data.len() as u64,
+            object_offset: 0,
+            object_size: data.len() as u64,
         }];
         let mut out = vec![0u8; data.len()];
 
@@ -484,6 +537,8 @@ mod tests {
                 chunk_id: 3,
                 offset,
                 length: data.len() as u64,
+                object_offset: 0,
+                object_size: data.len() as u64,
             },
         )
         .await
@@ -528,6 +583,8 @@ mod tests {
                 chunk_id: 9,
                 offset: 0,
                 length: data1.len() as u64,
+                object_offset: 0,
+                object_size: data1.len() as u64,
             },
         )
         .await
@@ -549,6 +606,8 @@ mod tests {
                 chunk_id: 9,
                 offset: 1024,
                 length: data2.len() as u64,
+                object_offset: 0,
+                object_size: data2.len() as u64,
             },
         )
         .await

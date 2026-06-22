@@ -782,6 +782,23 @@ pub trait MetaStore: Send + Sync {
         new_size: u64,
     ) -> Result<(), MetaError>;
 
+    async fn write_slices(
+        &self,
+        ino: i64,
+        chunk_id: u64,
+        slices: &[SliceDesc],
+        new_size: u64,
+    ) -> Result<(), MetaError> {
+        let Some((first, rest)) = slices.split_first() else {
+            return Ok(());
+        };
+        self.write(ino, chunk_id, *first, new_size).await?;
+        for slice in rest {
+            self.append_slice(chunk_id, *slice).await?;
+        }
+        Ok(())
+    }
+
     async fn next_id(&self, key: &str) -> Result<i64, MetaError>;
     /// Allow downcasting to concrete types
     fn as_any(&self) -> &dyn std::any::Any;

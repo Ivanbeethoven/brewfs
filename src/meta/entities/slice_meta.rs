@@ -11,6 +11,8 @@ pub struct Model {
     pub chunk_id: i64,
     pub offset: i64,
     pub length: i64,
+    pub object_offset: i64,
+    pub object_size: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -25,6 +27,8 @@ impl From<Model> for SliceDesc {
             chunk_id: model.chunk_id as u64,
             offset: model.offset as u64,
             length: model.length as u64,
+            object_offset: model.object_offset as u64,
+            object_size: model.object_size as u64,
         }
     }
 }

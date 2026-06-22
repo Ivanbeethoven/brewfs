@@ -2854,6 +2854,49 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
 
     #[tracing::instrument(
         level = "trace",
+        skip(self, slices),
+        fields(ino, chunk_id, slice_count = slices.len(), new_size)
+    )]
+    async fn write_slices(
+        &self,
+        ino: i64,
+        chunk_id: u64,
+        slices: &[SliceDesc],
+        new_size: u64,
+    ) -> Result<(), MetaError> {
+        self.ensure_writable()?;
+        if slices.is_empty() {
+            return Ok(());
+        }
+
+        let inode = self.check_root(ino);
+        self.store
+            .write_slices(inode, chunk_id, slices, new_size)
+            .await?;
+
+        let (inode_from_chunk, chunk_index) = extract_ino_and_chunk_index(chunk_id);
+        for slice in slices {
+            self.inode_cache
+                .append_slice(inode_from_chunk, chunk_index, *slice)
+                .await;
+        }
+        self.invalidate_open_file_cache_inode(inode_from_chunk)
+            .await;
+
+        if let Some(node) = self.inode_cache.get_node(inode).await {
+            let mut attr = node.attr.write().await;
+            if new_size > attr.size {
+                attr.size = new_size;
+            }
+        }
+
+        self.inode_cache.invalidate_slices(ino, chunk_index).await;
+        self.invalidate_open_file_cache_checked(ino).await;
+        Ok(())
+    }
+
+    #[tracing::instrument(
+        level = "trace",
         skip(self, slice),
         fields(chunk_id, slice_id = slice.slice_id, offset = slice.offset, len = slice.length)
     )]
@@ -3185,6 +3228,8 @@ mod tests {
                 chunk_id,
                 offset: 0,
                 length: 100,
+                object_offset: 0,
+                object_size: 100,
             })
             .collect::<Vec<_>>();
 
@@ -3211,6 +3256,50 @@ mod tests {
         assert_eq!(test_slices, second);
         let metrics = client.metrics().snapshot();
         assert_eq!(metrics.get_slices_cache_hit, 1);
+    }
+
+    #[tokio::test]
+    async fn test_write_slices_updates_cache_and_size() {
+        let client = create_test_client().await;
+        let ino = client
+            .create_file(1, "multi_slice_write.bin".to_string())
+            .await
+            .unwrap();
+        let chunk_id = chunk_id_for(ino, 0).unwrap();
+        let slices = [
+            crate::chunk::SliceDesc {
+                slice_id: 7001,
+                chunk_id,
+                offset: 0,
+                length: 512,
+                object_offset: 0,
+                object_size: 2048,
+            },
+            crate::chunk::SliceDesc {
+                slice_id: 7001,
+                chunk_id,
+                offset: 4096,
+                length: 512,
+                object_offset: 1024,
+                object_size: 2048,
+            },
+        ];
+
+        client
+            .write_slices(ino, chunk_id, &slices, 4608)
+            .await
+            .unwrap();
+
+        assert_eq!(client.get_slices(chunk_id).await.unwrap(), slices);
+        assert_eq!(client.stat(ino).await.unwrap().unwrap().size, 4608);
+
+        let (cache_ino, chunk_index) = extract_ino_and_chunk_index(chunk_id);
+        let cached = client
+            .inode_cache
+            .get_slices(cache_ino, chunk_index)
+            .await
+            .unwrap();
+        assert_eq!(cached, slices);
     }
 
     #[tokio::test]
@@ -3581,6 +3670,8 @@ mod tests {
             chunk_id,
             offset: 0,
             length: 128,
+            object_offset: 0,
+            object_size: 128,
         }];
         client
             .inode_cache

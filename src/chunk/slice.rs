@@ -99,9 +99,35 @@ pub struct SliceDesc {
     pub offset: u64,
     /// Length in bytes.
     pub length: u64,
+    /// Offset inside the physical slice object. This lets metadata describe a
+    /// logical view into a larger uploaded object, matching JuiceFS-style
+    /// slice semantics without introducing a parallel descriptor type.
+    #[serde(default)]
+    pub object_offset: u64,
+    /// Full physical object size. Legacy descriptors omit this field; a zero
+    /// value is interpreted as `length` by `physical_size`.
+    #[serde(default)]
+    pub object_size: u64,
 }
 
 impl SliceDesc {
+    pub fn physical_size(&self) -> u64 {
+        if self.object_size == 0 {
+            self.length
+        } else {
+            self.object_size
+        }
+    }
+
+    pub fn physical_offset_for(&self, logical_offset: u64) -> u64 {
+        self.object_offset
+            .saturating_add(logical_offset.saturating_sub(self.offset))
+    }
+
+    pub fn logical_end(&self) -> u64 {
+        self.offset.saturating_add(self.length)
+    }
+
     /// Calculate the real fragmentation ratio using interval merging.
     ///
     /// Fragmentation = (total_slice_size - deduplicated_coverage) / total_slice_size
@@ -127,7 +153,7 @@ impl SliceDesc {
         let mut intervals: Vec<(u64, u64)> = slices
             .iter()
             .filter(|s| s.length > 0)
-            .map(|s| (s.offset, s.offset + s.length))
+            .map(|s| (s.offset, s.logical_end()))
             .collect();
         if intervals.is_empty() {
             return 0.0;
@@ -173,7 +199,7 @@ impl SliceDesc {
 
         for slice in sorted {
             let start = slice.offset;
-            let end = slice.offset + slice.length;
+            let end = slice.logical_end();
 
             // Check if fully covered by any single newer slice's range
             let is_fully_covered = covered_ranges
@@ -281,6 +307,8 @@ mod tests {
             chunk_id: 1,
             offset: 0,
             length: (DEFAULT_BLOCK_SIZE / 2) as u64,
+            object_offset: 0,
+            object_size: (DEFAULT_BLOCK_SIZE / 2) as u64,
         };
         let spans: Vec<BlockSpan> =
             block_span_iter_chunk(s.offset.into(), s.length, layout).collect();
@@ -299,6 +327,8 @@ mod tests {
             chunk_id: 1,
             offset: half as u64,
             length: layout.block_size as u64,
+            object_offset: 0,
+            object_size: layout.block_size as u64,
         };
         let spans: Vec<BlockSpan> =
             block_span_iter_chunk(s.offset.into(), s.length, layout).collect();
@@ -318,6 +348,8 @@ mod tests {
             chunk_id: 2,
             offset: 100,
             length: 4096,
+            object_offset: 0,
+            object_size: 4096,
         };
         let bytes = crate::meta::serialization::serialize_meta(&desc).unwrap();
         let recovered: SliceDesc = crate::meta::serialization::deserialize_meta(&bytes).unwrap();
@@ -333,6 +365,9 @@ mod tests {
         assert_eq!(desc.chunk_id, 2);
         assert_eq!(desc.offset, 100);
         assert_eq!(desc.length, 4096);
+        assert_eq!(desc.object_offset, 0);
+        assert_eq!(desc.physical_size(), 4096);
+        assert_eq!(desc.physical_offset_for(612), 512);
     }
 
     // ==================== calculate_fragmentation tests ====================
@@ -343,6 +378,8 @@ mod tests {
             chunk_id: 1,
             offset,
             length,
+            object_offset: 0,
+            object_size: length,
         }
     }
 

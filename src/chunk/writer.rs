@@ -325,6 +325,8 @@ mod tests {
                 chunk_id: 1,
                 offset,
                 length: data.len() as u64,
+                object_offset: 0,
+                object_size: data.len() as u64,
             },
         )
         .await
@@ -370,6 +372,8 @@ mod tests {
                 chunk_id: 8,
                 offset,
                 length: data.len() as u64,
+                object_offset: 0,
+                object_size: data.len() as u64,
             },
         )
         .await

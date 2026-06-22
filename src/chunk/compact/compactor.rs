@@ -213,6 +213,8 @@ where
             chunk_id,
             offset: 0,
             length: chunk_size,
+            object_offset: 0,
+            object_size: chunk_size,
         };
 
         let all_ids: Vec<u64> = slices.iter().map(|s| s.slice_id).collect();

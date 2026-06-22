@@ -899,6 +899,8 @@ where
                 chunk_id: s.chunk_id,
                 offset: s.offset,
                 length,
+                object_offset: 0,
+                object_size: length,
             })
         })
     }
