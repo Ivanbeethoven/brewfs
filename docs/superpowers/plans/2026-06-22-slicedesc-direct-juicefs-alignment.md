@@ -609,6 +609,167 @@ Next perf target:
   slices, smarter coalesced-slice freeze cadence, or adaptive coalescing size
   based on remote upload latency.
 
+## Task 9: Pipeline Cached Writeback Stage and Remote Upload
+
+**Files:**
+- Modify: `src/vfs/io/writer.rs`
+- Test: `src/vfs/io/writer.rs`
+
+The direct `SliceDesc` redesign has moved BrewFS from tiny random-write
+objects to larger physical slice objects. The remaining randwrite/randrw tail
+is now dominated by writeback backlog shape:
+
+```text
+fio-randwrite: stage=1977 ops / 10587.1MiB / 65229.57s foreground-stage time
+fio-randrw:    stage=2185 ops /  9105.3MiB / 95443.43s foreground-stage time
+```
+
+Cached writeback currently forces cached-only uploads through
+`join_writeback_stage_then_upload`, so each batch waits for local dirty-record
+staging before S3 upload starts. That minimizes orphaned remote uploads if local
+staging fails, but it serializes the two slowest parts of the writeback path.
+The correctness boundary we actually need is stricter and narrower:
+
+```text
+metadata commit must wait until the local writeback record is fully persisted
+and sealed; remote upload may run in parallel because an uncommitted remote
+object is not visible to readers.
+```
+
+- [x] **Step 1: Replace the strict stage-first unit test with a safety test**
+
+Change `test_writeback_stage_completes_before_upload_starts` into a test named:
+
+```rust
+test_cached_writeback_upload_can_overlap_stage
+```
+
+The test should call the same helper path used by `spawn_upload_task` and assert:
+
+```text
+persist and upload overlap in wall time,
+persist success is still observed before the upload task reports success.
+```
+
+Expected before implementation: fail because cached writeback still uses
+`join_writeback_stage_then_upload` and takes at least the sum of stage+upload
+latency.
+
+- [x] **Step 2: Keep commit-before-upload safety unchanged**
+
+Do not relax these existing behaviors:
+
+```text
+try_commit_before_upload_front() returns false until
+writeback_fully_persisted() is true.
+
+seal_writeback_record_if_ready() still runs before metadata write.
+
+metadata write still uses write_slices() with descriptors generated from the
+current in-memory segment list.
+```
+
+Focused command:
+
+```bash
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+cargo test -p brewfs --bin brewfs \
+  vfs::io::writer::tests::test_commit_before_upload_requires_writeback_stage_success \
+  vfs::io::writer::tests::test_commit_before_upload_seals_cached_shared_object_segments \
+  -- --nocapture
+```
+
+- [x] **Step 3: Try the concurrent persist/upload join for cached writeback**
+
+Remove the stage-first branch and keep `join_best_effort_persist()` as the
+common path behind the production `join_writeback_persist_and_upload()` helper:
+
+```rust
+let (persist_result, result) = join_best_effort_persist(persist, upload).await;
+if let Some(Err(e)) = persist_result {
+    return Err(anyhow::anyhow!("writeback stage persist failed: {e}"));
+}
+```
+
+Do not commit metadata from the upload future. Metadata commit must continue to
+happen only through `try_commit_before_upload_if_front()` after staging or
+through `commit_chunk()` after upload completion.
+
+2026-06-23 result: this candidate was implemented and tested, then rejected by
+perf and reverted from `src/vfs/io/writer.rs`. Do not assume the concurrent
+join helper exists in the current tree.
+
+- [x] **Step 4: Verify writer-focused tests**
+
+Run:
+
+```bash
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+cargo test -p brewfs --bin brewfs vfs::io::writer::tests:: -- --nocapture
+```
+
+Expected: all writer tests pass. If a test only encoded the old serial
+implementation rather than crash-safety semantics, update it to assert the
+new safety boundary instead.
+
+- [x] **Step 5: Run focused randwrite/randrw perf**
+
+Run:
+
+```bash
+PERF_TOOLS="fio-randwrite fio-randrw" \
+PERF_FIO_DIRECT=0 \
+PERF_FIO_IOENGINE=io_uring \
+PERF_FIO_IODEPTH=1 \
+PERF_FIO_PREFILL_DRAIN=true \
+PERF_FIO_PREFILL_REMOUNT=true \
+PERF_FIO_COLD_READ_CLEAR_CACHE=true \
+PERF_FIO_POST_WRITE_DRAIN=true \
+bash docker/compose-xfstests/run_redis_perf.sh \
+  --writeback-throughput-profile \
+  --tools "fio-randwrite fio-randrw"
+```
+
+Keep the change only if:
+
+```text
+randwrite wall <= previous kept run + 3%
+randrw wall <= previous kept run + 3%
+post-write drain improves or does not materially worsen
+stage foreground time drops materially in report.md
+```
+
+- [x] **Step 6: Commit or revert**
+
+If focused perf passes, commit:
+
+```bash
+git add src/vfs/io/writer.rs docs/superpowers/plans/2026-06-22-slicedesc-direct-juicefs-alignment.md
+git commit -m "Pipeline cached writeback uploads"
+```
+
+If focused perf fails, revert only the writer code and keep the planning note
+with a rejected-candidate row explaining the result.
+
+Rejected-candidate evidence:
+
+| Candidate | randwrite | randwrite drain | randwrite BW | randrw | randrw drain | randrw BW | Decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| Stage-first cached writeback baseline (`perf-run-1782235528-32223`) | 156s | 14s | 183.7 MiB/s write | 167s | 22s | 340.0/152.0 MiB/s read/write | Keep baseline |
+| Concurrent cached stage/upload (`perf-run-1782237073-14729`) | 151s | 22s | 167.0 MiB/s write | 165s | 23s | 282.4/126.3 MiB/s read/write | Reject; lower wall came from lower throughput, not better backend efficiency |
+
+The report showed stage time did not materially improve:
+
+```text
+baseline randwrite stage=1977 ops/10587.1 MiB/65229.57s, remote_inflight=969.5 MiB
+candidate randwrite stage=1988 ops/10560.1 MiB/64646.98s, remote_inflight=1295.3 MiB
+baseline randrw    stage=2185 ops/9105.3 MiB/95443.43s, remote_inflight=1294.9 MiB
+candidate randrw   stage=2102 ops/8790.8 MiB/98234.44s, remote_inflight=1011.6 MiB
+```
+
+Next attempt should focus on freeze cadence or adaptive coalescing size rather
+than simply overlapping local staging and remote upload.
+
 ## Required Verification Gates
 
 Run these before any commit that changes production Rust:
