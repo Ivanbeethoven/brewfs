@@ -579,6 +579,7 @@ post-write drain.
 | Segment coalescing + pending 256MiB/512MiB (`perf-run-1782231294-1729`) | 157s | 8s | 167s | 36s | randrw 328/147 MiB/s | Keep profile tuning; main workload improves while preserving BW |
 | Same plus write memory 1GiB (`perf-run-1782231983-5107`, randrw only) | n/a | n/a | 87s | 2s | randrw 139/62 MiB/s | Reject; tail improves by throttling too hard |
 | Same plus write memory 2GiB (`perf-run-1782232323-8641`, randrw only) | n/a | n/a | 86s | 0s | randrw 200/91 MiB/s | Reject; throughput loss still too large |
+| Split-view compaction + exact metadata replacement (`perf-run-1782235528-32223`) | 156s | 14s | 167s | 22s | randwrite 184 MiB/s; randrw 340/152 MiB/s | Keep; correctness architecture advances, randrw drain/BW improve, randwrite wall stable |
 
 Current interpretation:
 
@@ -594,6 +595,11 @@ Current interpretation:
   coalescing design and is safe to keep in the perf profile. Lowering write
   memory to 1GiB or 2GiB removes the tail by imposing too much foreground
   backpressure and loses too much randrw throughput.
+- Split-view compaction and exact metadata replacement do not regress the
+  randwrite/randrw hot path in the focused run. Randrw keeps the same 167s wall
+  time while improving post-write drain from 36s to 22s and bandwidth from
+  328/147 MiB/s to 340/152 MiB/s. Randwrite wall remains stable at 156s, though
+  post-write drain is noisier at 14s versus the previous 8s.
 
 Next perf target:
 
