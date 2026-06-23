@@ -11,7 +11,7 @@
 
 use super::reader::DataReader;
 use crate::chunk::writer::{DataUploader, UploadPriority};
-use crate::chunk::{BlockStore, SliceDesc};
+use crate::chunk::{BlockStore, ChunkLayout, SliceDesc};
 use crate::meta::backoff::backoff;
 use crate::meta::store::{MetaError, RetryReason};
 use crate::meta::{MetaLayer, SLICE_ID_KEY};
@@ -21,7 +21,7 @@ use crate::vfs::backend::Backend;
 use crate::vfs::cache::config::WriteBackMode;
 use crate::vfs::cache::page::CacheSlice;
 use crate::vfs::cache::page::WriteAction as PageWriteAction;
-use crate::vfs::cache::write_back::WriteBackCache;
+use crate::vfs::cache::write_back::{DirtySliceSegment, WriteBackCache};
 use crate::vfs::chunk_id_for;
 use crate::vfs::config::WriteConfig;
 use crate::vfs::extract_ino_and_chunk_index;
@@ -173,6 +173,23 @@ fn should_retry_meta_write(err: &MetaError) -> bool {
     }
 }
 
+fn commit_target_from_descs(descs: &[SliceDesc], layout: ChunkLayout) -> Option<(i64, u64, u64)> {
+    let first = descs.first()?;
+    let (ino, chunk_index) = extract_ino_and_chunk_index(first.chunk_id);
+    let max_logical_end = descs.iter().map(SliceDesc::logical_end).max()?;
+    let new_size = chunk_index
+        .saturating_mul(layout.chunk_size)
+        .saturating_add(max_logical_end);
+    Some((ino, chunk_index, new_size))
+}
+
+fn committed_logical_bytes(descs: &[SliceDesc]) -> u64 {
+    descs
+        .iter()
+        .map(|desc| desc.length)
+        .fold(0u64, u64::saturating_add)
+}
+
 struct UploadPlan {
     chunk_id: u64,
     data: Vec<(usize, Vec<Bytes>)>,
@@ -275,6 +292,40 @@ enum WriteOriginKind {
     Mixed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SliceSegment {
+    offset: u64,
+    length: u64,
+    object_offset: u64,
+}
+
+impl SliceSegment {
+    fn logical_end(&self) -> u64 {
+        self.offset.saturating_add(self.length)
+    }
+
+    fn contains_write_start(&self, offset: u64) -> bool {
+        offset >= self.offset && offset <= self.logical_end()
+    }
+
+    fn overlaps(&self, offset: u64, len: u64) -> bool {
+        let end = offset.saturating_add(len);
+        offset < self.logical_end() && self.offset < end
+    }
+
+    fn physical_offset_for(&self, logical_offset: u64) -> u64 {
+        self.object_offset
+            .saturating_add(logical_offset.saturating_sub(self.offset))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SliceWritePlan {
+    segment_index: Option<usize>,
+    physical_offset: u64,
+    action: PageWriteAction,
+}
+
 pub(crate) struct SliceState {
     state: SliceStatus,
     /// ID of the chunk it belongs to.
@@ -283,6 +334,8 @@ pub(crate) struct SliceState {
     slice_id: Option<u64>,
     /// Offset relative to the chunk start.
     offset: u64,
+    /// Logical ranges represented by this physical writeback object.
+    segments: Vec<SliceSegment>,
     /// Contiguous byte boundary of confirmed uploads (all blocks below this
     /// offset have completed their S3 PUT).
     uploaded: u64,
@@ -353,6 +406,7 @@ impl SliceState {
             slice_id: None,
             chunk_id,
             offset,
+            segments: Vec::new(),
             uploaded: 0,
             dispatched_end: 0,
             block_done: 0,
@@ -400,24 +454,101 @@ impl SliceState {
         self.writeback_data_fully_persisted() && self.writeback_record_sealed
     }
 
-    pub(crate) fn can_write(&self, offset: u64, len: usize) -> Option<PageWriteAction> {
-        if !matches!(self.state, SliceStatus::Writable) || offset < self.offset {
+    fn uploaded_or_dispatched_prefix(&self) -> u64 {
+        let size = self.data.block_size() as u64;
+        (self.dispatched_end as u64 * size).max(self.uploaded)
+    }
+
+    fn write_plan(&self, offset: u64, len: usize, origin: WriteOrigin) -> Option<SliceWritePlan> {
+        if !matches!(self.state, SliceStatus::Writable) {
             return None;
         }
 
-        let size = self.data.block_size();
-        let pending_start = self.dispatched_end as u64 * size as u64;
+        let len_u64 = len as u64;
+        let prefix_end = self.uploaded_or_dispatched_prefix();
 
-        let off_to_slice = offset - self.offset;
+        if self.segments.is_empty() {
+            if self.data.len() == 0 {
+                if offset != self.offset || self.data.len() < prefix_end {
+                    return None;
+                }
+                return self
+                    .data
+                    .can_write(0, len_u64)
+                    .map(|action| SliceWritePlan {
+                        segment_index: None,
+                        physical_offset: 0,
+                        action,
+                    });
+            }
 
-        // Uploaded/dispatched blocks cannot be overlapped.
-        if off_to_slice < pending_start.max(self.uploaded) {
+            if offset < self.offset {
+                return None;
+            }
+            let physical_offset = offset - self.offset;
+            if physical_offset < prefix_end {
+                return None;
+            }
+            return self
+                .data
+                .can_write(physical_offset, len_u64)
+                .map(|action| SliceWritePlan {
+                    segment_index: None,
+                    physical_offset,
+                    action,
+                });
+        }
+
+        let write_end = offset.saturating_add(len_u64);
+        for (idx, segment) in self.segments.iter().enumerate() {
+            if !segment.contains_write_start(offset) {
+                continue;
+            }
+            if offset < segment.logical_end() && write_end > segment.logical_end() {
+                return None;
+            }
+
+            let physical_offset = segment.physical_offset_for(offset);
+            if physical_offset < prefix_end {
+                return None;
+            }
+            if let Some(action) = self.data.can_write(physical_offset, len_u64) {
+                return Some(SliceWritePlan {
+                    segment_index: Some(idx),
+                    physical_offset,
+                    action,
+                });
+            }
+        }
+
+        if self
+            .segments
+            .iter()
+            .any(|segment| segment.overlaps(offset, len_u64))
+        {
             return None;
         }
 
-        // For this function, the `offset` is relative to the chunk start,
-        // whereas in `CacheSlice.append`, it is relative to the slice start.
-        self.data.can_write(off_to_slice, len as u64)
+        if !matches!(origin, WriteOrigin::Cached) || self.data.len() < prefix_end {
+            return None;
+        }
+
+        self.data
+            .can_write(self.data.len(), len_u64)
+            .map(|action| SliceWritePlan {
+                segment_index: None,
+                physical_offset: self.data.len(),
+                action,
+            })
+    }
+
+    pub(crate) fn can_write(
+        &self,
+        offset: u64,
+        len: usize,
+        origin: WriteOrigin,
+    ) -> Option<PageWriteAction> {
+        self.write_plan(offset, len, origin).map(|plan| plan.action)
     }
 
     #[tracing::instrument(level = "trace", skip(self, buf), fields(len = buf.len()))]
@@ -425,12 +556,70 @@ impl SliceState {
         &mut self,
         offset: u64,
         buf: &[u8],
-        action: PageWriteAction,
         origin: WriteOrigin,
     ) -> anyhow::Result<()> {
-        self.data.write(offset - self.offset, buf, action)?;
+        let plan = self
+            .write_plan(offset, buf.len(), origin)
+            .ok_or_else(|| anyhow::anyhow!("slice is not writable at offset {offset}"))?;
+        self.data.write(plan.physical_offset, buf, plan.action)?;
+
+        match (plan.action, plan.segment_index) {
+            (PageWriteAction::Append, Some(idx)) => {
+                self.segments[idx].length =
+                    self.segments[idx].length.saturating_add(buf.len() as u64);
+            }
+            (PageWriteAction::Append, None) => {
+                self.segments.push(SliceSegment {
+                    offset,
+                    length: buf.len() as u64,
+                    object_offset: plan.physical_offset,
+                });
+            }
+            (PageWriteAction::Overlap, _) => {}
+        }
+
         self.write_origin_mask |= origin.mask();
         self.last_mod = Instant::now();
+        Ok(())
+    }
+
+    fn logical_end(&self) -> u64 {
+        self.segments
+            .iter()
+            .map(SliceSegment::logical_end)
+            .max()
+            .unwrap_or_else(|| self.offset.saturating_add(self.data.len()))
+    }
+
+    fn logical_overlaps(&self, offset: u64, len: u64) -> bool {
+        if self.segments.is_empty() {
+            let end = self.offset.saturating_add(self.data.len());
+            return offset < end && self.offset < offset.saturating_add(len);
+        }
+        self.segments
+            .iter()
+            .any(|segment| segment.overlaps(offset, len))
+    }
+
+    fn copy_logical_range_into(&self, offset: u64, len: u64, dst: &mut [u8]) -> anyhow::Result<()> {
+        if self.segments.is_empty() {
+            self.data.copy_into(offset - self.offset, dst)?;
+            return Ok(());
+        }
+
+        for segment in &self.segments {
+            let start = offset.max(segment.offset);
+            let end = offset.saturating_add(len).min(segment.logical_end());
+            if start >= end {
+                continue;
+            }
+            let dst_start = (start - offset).as_usize();
+            let dst_end = (end - offset).as_usize();
+            self.data.copy_into(
+                segment.physical_offset_for(start),
+                &mut dst[dst_start..dst_end],
+            )?;
+        }
         Ok(())
     }
 
@@ -547,25 +736,26 @@ where
         f(&guard)
     }
 
-    fn can_write(&self, offset: u64, len: usize) -> Option<PageWriteAction> {
-        self.with_ref(|s| s.can_write(offset, len))
+    fn can_write(&self, offset: u64, len: usize, origin: WriteOrigin) -> Option<PageWriteAction> {
+        self.with_ref(|s| s.can_write(offset, len, origin))
     }
 
     fn rejects_dispatched_prefix(&self, offset: u64, len: usize) -> bool {
         self.with_ref(|s| {
-            if !matches!(s.state, SliceStatus::Writable) || offset < s.offset {
+            if !matches!(s.state, SliceStatus::Writable) {
                 return false;
             }
-            let write_end = offset.saturating_add(len as u64);
-            let slice_end = s.offset.saturating_add(s.data.len());
-            if offset >= slice_end || s.offset >= write_end {
+            if !s.logical_overlaps(offset, len as u64) {
                 return false;
             }
 
-            let block_size = s.data.block_size();
-            let pending_start = s.dispatched_end as u64 * block_size as u64;
-            let prefix_end = pending_start.max(s.uploaded);
-            offset - s.offset < prefix_end
+            s.segments.iter().any(|segment| {
+                if !segment.overlaps(offset, len as u64) {
+                    return false;
+                }
+                let start = offset.max(segment.offset);
+                segment.physical_offset_for(start) < s.uploaded_or_dispatched_prefix()
+            })
         })
     }
 
@@ -574,9 +764,9 @@ where
     }
 
     fn try_write(&self, offset: u64, buf: &[u8], origin: WriteOrigin) -> anyhow::Result<bool> {
-        let wrote = self.with_mut(|s| match s.can_write(offset, buf.len()) {
-            Some(action) => {
-                s.write(offset, buf, action, origin)?;
+        let wrote = self.with_mut(|s| match s.can_write(offset, buf.len(), origin) {
+            Some(_) => {
+                s.write(offset, buf, origin)?;
                 s.update_usage(s.data.alloc_bytes());
                 Ok::<bool, anyhow::Error>(true)
             }
@@ -735,7 +925,7 @@ where
 
     fn should_freeze(&self) -> bool {
         self.with_ref(|s| {
-            let end = s.offset + s.data.len();
+            let end = s.logical_end();
             let freeze_min = self.shared.config.freeze_min_bytes;
             end >= self.shared.config.layout.chunk_size || s.data.len() >= freeze_min
         })
@@ -783,7 +973,10 @@ where
 
     fn claim_writeback_record_seal(
         &self,
-    ) -> Option<(crate::vfs::cache::keys::DirtySliceKey, u64, u64)> {
+    ) -> Option<(
+        crate::vfs::cache::keys::DirtySliceKey,
+        Vec<DirtySliceSegment>,
+    )> {
         let ino = self.shared.inode.ino();
         self.with_mut(|s| {
             if matches!(s.state, SliceStatus::Writable)
@@ -796,6 +989,23 @@ where
 
             let slice_id = s.slice_id?;
             s.writeback_record_sealing = true;
+            let segments = if s.segments.is_empty() {
+                vec![DirtySliceSegment {
+                    chunk_offset: s.offset,
+                    length: s.data.len(),
+                    object_offset: 0,
+                }]
+            } else {
+                s.segments
+                    .iter()
+                    .filter(|segment| segment.length > 0)
+                    .map(|segment| DirtySliceSegment {
+                        chunk_offset: segment.offset,
+                        length: segment.length,
+                        object_offset: segment.object_offset,
+                    })
+                    .collect()
+            };
             Some((
                 crate::vfs::cache::keys::DirtySliceKey {
                     ino,
@@ -803,8 +1013,7 @@ where
                     local_seq: slice_id,
                     epoch: 0,
                 },
-                s.offset,
-                s.data.len(),
+                segments,
             ))
         })
     }
@@ -884,24 +1093,44 @@ where
         })
     }
 
-    fn desc_for_commit(&self) -> Option<SliceDesc> {
+    fn descs_for_commit(&self) -> Vec<SliceDesc> {
         self.with_ref(|s| {
-            let length = s.data.len();
             let slice_id = match s.slice_id {
                 Some(id) => id,
-                None => return None,
+                None => return Vec::new(),
             };
-            if length == 0 {
-                return None;
+            let object_size = s.data.len();
+            if object_size == 0 {
+                return Vec::new();
             }
-            Some(SliceDesc {
+            if !s.segments.is_empty() {
+                return s
+                    .segments
+                    .iter()
+                    .filter(|segment| segment.length > 0)
+                    .map(|segment| SliceDesc {
+                        slice_id,
+                        chunk_id: s.chunk_id,
+                        offset: segment.offset,
+                        length: segment.length,
+                        object_offset: segment.object_offset,
+                        object_size,
+                    })
+                    .collect();
+            }
+
+            let length = s.data.len();
+            if length == 0 {
+                return Vec::new();
+            }
+            vec![SliceDesc {
                 slice_id,
                 chunk_id: s.chunk_id,
                 offset: s.offset,
                 length,
                 object_offset: 0,
                 object_size: length,
-            })
+            }]
         })
     }
 
@@ -961,14 +1190,13 @@ where
             }
         }
 
-        let desc = match self.desc_for_commit() {
-            Some(d) => d,
-            None => return,
+        let descs = self.descs_for_commit();
+        let Some((ino, chunk_index, new_size)) =
+            commit_target_from_descs(&descs, self.shared.config.layout)
+        else {
+            return;
         };
-
-        let (ino, chunk_index) = crate::vfs::extract_ino_and_chunk_index(desc.chunk_id);
-        let new_size =
-            chunk_index * self.shared.config.layout.chunk_size + desc.offset + desc.length;
+        let first_desc = descs[0];
 
         let mut attempts = 0u32;
         loop {
@@ -976,33 +1204,35 @@ where
                 .shared
                 .backend
                 .meta()
-                .write(ino, desc.chunk_id, desc, new_size)
+                .write_slices(ino, first_desc.chunk_id, &descs, new_size)
                 .await
             {
                 Ok(()) => {
-                    self.shared
-                        .inode
-                        .add_estimated_allocated_bytes(desc.length.as_usize() as u64);
+                    self.shared.inode.add_estimated_allocated_bytes(
+                        committed_logical_bytes(&descs).as_usize() as u64,
+                    );
 
                     // Invalidate reader cache BEFORE marking committed so that
                     // when the flush loop sees the Committed state, the reader
                     // already has fresh data.  Otherwise flush can return while
                     // the reader still serves stale cached pages.
-                    let file_offset =
-                        chunk_index * self.shared.config.layout.chunk_size + desc.offset;
-                    let _ = self
-                        .shared
-                        .reader
-                        .invalidate(ino as u64, file_offset, desc.length.as_usize())
-                        .await;
+                    for desc in &descs {
+                        let file_offset =
+                            chunk_index * self.shared.config.layout.chunk_size + desc.offset;
+                        let _ = self
+                            .shared
+                            .reader
+                            .invalidate(ino as u64, file_offset, desc.length.as_usize())
+                            .await;
+                    }
 
                     self.mark_committed();
 
                     if let Some(wb) = &self.shared.write_back {
                         let key = crate::vfs::cache::keys::DirtySliceKey {
                             ino,
-                            chunk_id: desc.chunk_id,
-                            local_seq: desc.slice_id,
+                            chunk_id: first_desc.chunk_id,
+                            local_seq: first_desc.slice_id,
                             epoch: 0,
                         };
                         let _ = wb.remove(&key).await;
@@ -1019,8 +1249,9 @@ where
                     if retryable {
                         tracing::debug!(
                             ino,
-                            chunk_id = desc.chunk_id,
-                            slice_id = desc.slice_id,
+                            chunk_id = first_desc.chunk_id,
+                            slice_id = first_desc.slice_id,
+                            slice_count = descs.len(),
                             attempts,
                             error = ?err,
                             "try_commit exhausted retries, deferring to commit_chunk"
@@ -1030,14 +1261,14 @@ where
                     } else {
                         self.mark_failed(anyhow::anyhow!(
                             "try_commit failed for ino {ino}, chunk {}, slice {}: {err}",
-                            desc.chunk_id,
-                            desc.slice_id
+                            first_desc.chunk_id,
+                            first_desc.slice_id
                         ));
                         if let Some(wb) = &self.shared.write_back {
                             let key = crate::vfs::cache::keys::DirtySliceKey {
                                 ino,
-                                chunk_id: desc.chunk_id,
-                                local_seq: desc.slice_id,
+                                chunk_id: first_desc.chunk_id,
+                                local_seq: first_desc.slice_id,
                                 epoch: 0,
                             };
                             let _ = wb.remove(&key).await;
@@ -1098,6 +1329,7 @@ where
         offset: u64,
         len: usize,
         creation_unique: u64,
+        origin: WriteOrigin,
     ) -> anyhow::Result<(Arc<ParkingMutex<SliceState>>, WriteAction)> {
         let (chunk_id, mut slices) = {
             let chunk = self
@@ -1123,7 +1355,7 @@ where
                 shared: self.shared,
             };
 
-            if let Some(write_action) = handle.can_write(offset, len) {
+            if let Some(write_action) = handle.can_write(offset, len, origin) {
                 // Reject overlap reuse if this write is older than the newest
                 // write already in the slice.  Older non-overlapping appends
                 // cannot overwrite newer bytes, and allowing them to coalesce
@@ -1243,7 +1475,8 @@ where
         let mut failed_cnt = 0;
 
         loop {
-            let (slice, action) = self.find_slice_or_create(offset, buf.len(), creation_unique)?;
+            let (slice, action) =
+                self.find_slice_or_create(offset, buf.len(), creation_unique, origin)?;
             start_commit |= action.start_commit;
             flush.extend(action.flush);
 
@@ -2222,13 +2455,12 @@ where
                 continue;
             }
             let span_start = span.offset;
-            let span_end = span.offset + span.len;
             for slice in slices {
                 let state = slice.lock();
                 if !state.can_overlay_read() {
                     continue;
                 }
-                if span_start < state.offset + state.data.len() && state.offset < span_end {
+                if state.logical_overlaps(span_start, span.len) {
                     has_overlap = true;
                     break;
                 }
@@ -2263,20 +2495,42 @@ where
                     continue;
                 }
 
-                let slice_start = state.offset;
-                let slice_end = state.offset + state.data.len();
-                let read_start = span_start.max(slice_start);
-                let read_end = span_end.min(slice_end);
-                if read_start >= read_end {
+                if state.segments.is_empty() {
+                    let slice_start = state.offset;
+                    let slice_end = state.offset + state.data.len();
+                    let read_start = span_start.max(slice_start);
+                    let read_end = span_end.min(slice_end);
+                    if read_start >= read_end {
+                        continue;
+                    }
+
+                    let dst_start = (chunk_start + read_start - offset).as_usize();
+                    let dst_end = (chunk_start + read_end - offset).as_usize();
+                    state.copy_logical_range_into(
+                        read_start,
+                        read_end - read_start,
+                        &mut buf[dst_start..dst_end],
+                    )?;
+                    missing.cut(chunk_start + read_start, chunk_start + read_end);
                     continue;
                 }
 
-                let dst_start = (chunk_start + read_start - offset).as_usize();
-                let dst_end = (chunk_start + read_end - offset).as_usize();
-                state
-                    .data
-                    .copy_into(read_start - slice_start, &mut buf[dst_start..dst_end])?;
-                missing.cut(chunk_start + read_start, chunk_start + read_end);
+                for segment in &state.segments {
+                    let read_start = span_start.max(segment.offset);
+                    let read_end = span_end.min(segment.logical_end());
+                    if read_start >= read_end {
+                        continue;
+                    }
+
+                    let dst_start = (chunk_start + read_start - offset).as_usize();
+                    let dst_end = (chunk_start + read_end - offset).as_usize();
+                    state.copy_logical_range_into(
+                        read_start,
+                        read_end - read_start,
+                        &mut buf[dst_start..dst_end],
+                    )?;
+                    missing.cut(chunk_start + read_start, chunk_start + read_end);
+                }
             }
         }
 
@@ -2572,11 +2826,11 @@ where
         };
 
         let handle = SliceHandle { slice, shared };
-        let Some((key, chunk_offset, length)) = handle.claim_writeback_record_seal() else {
+        let Some((key, segments)) = handle.claim_writeback_record_seal() else {
             return Ok(false);
         };
 
-        match wb.seal_slice_record(key, chunk_offset, length).await {
+        match wb.seal_slice_record_segments(key, segments).await {
             Ok(()) => {
                 handle.mark_writeback_record_sealed();
                 Ok(true)
@@ -3018,14 +3272,18 @@ where
             return false;
         }
 
-        let Some(desc) = handle.desc_for_commit() else {
+        let descs = handle.descs_for_commit();
+        let Some((ino, chunk_index, new_size)) =
+            commit_target_from_descs(&descs, shared.config.layout)
+        else {
             return false;
         };
+        let first_desc = descs[0];
 
         if let Err(err) = Self::seal_writeback_record_if_ready(shared, slice).await {
             warn!(
-                chunk_id = desc.chunk_id,
-                slice_id = desc.slice_id,
+                chunk_id = first_desc.chunk_id,
+                slice_id = first_desc.slice_id,
                 error = ?err,
                 "writeback record seal failed before commit-before-upload"
             );
@@ -3060,26 +3318,25 @@ where
             shared.recent_pending_upload.record_commit_before_stage();
         }
 
-        let (ino, chunk_index) = extract_ino_and_chunk_index(desc.chunk_id);
-        let file_offset = chunk_index * shared.config.layout.chunk_size + desc.offset;
-        let new_size = file_offset + desc.length;
-
         let result = shared
             .backend
             .meta()
-            .write(ino, desc.chunk_id, desc, new_size)
+            .write_slices(ino, first_desc.chunk_id, &descs, new_size)
             .await;
 
         match result {
             Ok(()) => {
                 shared.inode.set_committed_size(new_size);
-                shared
-                    .inode
-                    .add_estimated_allocated_bytes(desc.length.as_usize() as u64);
-                let _ = shared
-                    .reader
-                    .invalidate(ino as u64, file_offset, desc.length.as_usize())
-                    .await;
+                shared.inode.add_estimated_allocated_bytes(
+                    committed_logical_bytes(&descs).as_usize() as u64,
+                );
+                for desc in &descs {
+                    let file_offset = chunk_index * shared.config.layout.chunk_size + desc.offset;
+                    let _ = shared
+                        .reader
+                        .invalidate(ino as u64, file_offset, desc.length.as_usize())
+                        .await;
+                }
                 handle.mark_committed();
                 true
             }
@@ -3087,10 +3344,9 @@ where
                 slice.lock().meta_write_started = false;
                 warn!(
                     ino,
-                    chunk_id = desc.chunk_id,
-                    slice_id = desc.slice_id,
-                    offset = desc.offset,
-                    len = desc.length,
+                    chunk_id = first_desc.chunk_id,
+                    slice_id = first_desc.slice_id,
+                    slice_count = descs.len(),
                     new_size,
                     error = ?err,
                     "commit-before-upload metadata write failed; falling back to upload-before-commit wait"
@@ -3323,29 +3579,27 @@ where
                         continue;
                     }
 
-                    let desc = SliceHandle {
+                    let descs = SliceHandle {
                         slice: &slice,
                         shared: &shared,
                     }
-                    .desc_for_commit();
+                    .descs_for_commit();
 
-                    if let Some(desc) = desc {
-                        let (ino, chunk_index) = extract_ino_and_chunk_index(desc.chunk_id);
-                        let file_offset =
-                            chunk_index * shared.config.layout.chunk_size + desc.offset;
-                        let new_size = file_offset + desc.length;
+                    if let Some((ino, chunk_index, new_size)) =
+                        commit_target_from_descs(&descs, shared.config.layout)
+                    {
+                        let first_desc = descs[0];
 
                         let result = shared
                             .backend
                             .meta()
-                            .write(ino, desc.chunk_id, desc, new_size)
+                            .write_slices(ino, first_desc.chunk_id, &descs, new_size)
                             .instrument(tracing::trace_span!(
                                 "commit_chunk.meta_write",
                                 ino,
-                                chunk_id = desc.chunk_id,
-                                slice_id = desc.slice_id,
-                                offset = desc.offset,
-                                len = desc.length,
+                                chunk_id = first_desc.chunk_id,
+                                slice_id = first_desc.slice_id,
+                                slice_count = descs.len(),
                                 new_size
                             ))
                             .await;
@@ -3360,20 +3614,19 @@ where
                                 let message = if retryable {
                                     format!(
                                         "metadata commit failed after {commit_failures} attempts for ino {ino}, chunk {}, slice {}: {err}",
-                                        desc.chunk_id, desc.slice_id
+                                        first_desc.chunk_id, first_desc.slice_id
                                     )
                                 } else {
                                     format!(
                                         "metadata commit failed with non-retryable error for ino {ino}, chunk {}, slice {}: {err}",
-                                        desc.chunk_id, desc.slice_id
+                                        first_desc.chunk_id, first_desc.slice_id
                                     )
                                 };
                                 warn!(
                                     ino,
-                                    chunk_id = desc.chunk_id,
-                                    slice_id = desc.slice_id,
-                                    offset = desc.offset,
-                                    len = desc.length,
+                                    chunk_id = first_desc.chunk_id,
+                                    slice_id = first_desc.slice_id,
+                                    slice_count = descs.len(),
                                     new_size,
                                     retry_failures = commit_failures,
                                     retryable,
@@ -3392,8 +3645,8 @@ where
                                 if let Some(wb) = &shared.write_back {
                                     let key = crate::vfs::cache::keys::DirtySliceKey {
                                         ino,
-                                        chunk_id: desc.chunk_id,
-                                        local_seq: desc.slice_id,
+                                        chunk_id: first_desc.chunk_id,
+                                        local_seq: first_desc.slice_id,
                                         epoch: 0,
                                     };
                                     let _ = wb.remove(&key).await;
@@ -3408,10 +3661,9 @@ where
                                 };
                                 warn!(
                                     ino,
-                                    chunk_id = desc.chunk_id,
-                                    slice_id = desc.slice_id,
-                                    offset = desc.offset,
-                                    len = desc.length,
+                                    chunk_id = first_desc.chunk_id,
+                                    slice_id = first_desc.slice_id,
+                                    slice_count = descs.len(),
                                     new_size,
                                     retry_failures = commit_failures,
                                     retry_backoff_ms = backoff.as_millis() as u64,
@@ -3424,16 +3676,16 @@ where
                             commit_failures = 0;
 
                             // Track committed bytes on the inode for accurate st_blocks.
-                            shared
-                                .inode
-                                .add_estimated_allocated_bytes(desc.length.as_usize() as u64);
+                            shared.inode.add_estimated_allocated_bytes(
+                                committed_logical_bytes(&descs).as_usize() as u64,
+                            );
 
                             // Clean up local SSD dirty copy now that data is committed.
                             if let Some(wb) = &shared.write_back {
                                 let key = crate::vfs::cache::keys::DirtySliceKey {
                                     ino,
-                                    chunk_id: desc.chunk_id,
-                                    local_seq: desc.slice_id,
+                                    chunk_id: first_desc.chunk_id,
+                                    local_seq: first_desc.slice_id,
                                     epoch: 0,
                                 };
                                 let _ = wb.remove(&key).await;
@@ -3442,16 +3694,20 @@ where
                             // Invalidate reader cache BEFORE marking committed.
                             // This ensures that when the flush loop observes
                             // Committed, the reader already serves fresh data.
-                            let _ = shared
-                                .reader
-                                .invalidate(ino as u64, file_offset, desc.length.as_usize())
-                                .instrument(tracing::trace_span!(
-                                    "commit_chunk.invalidate",
-                                    ino,
-                                    offset = file_offset,
-                                    len = desc.length
-                                ))
-                                .await;
+                            for desc in &descs {
+                                let file_offset =
+                                    chunk_index * shared.config.layout.chunk_size + desc.offset;
+                                let _ = shared
+                                    .reader
+                                    .invalidate(ino as u64, file_offset, desc.length.as_usize())
+                                    .instrument(tracing::trace_span!(
+                                        "commit_chunk.invalidate",
+                                        ino,
+                                        offset = file_offset,
+                                        len = desc.length
+                                    ))
+                                    .await;
+                            }
 
                             SliceHandle {
                                 slice: &slice,
@@ -3470,18 +3726,22 @@ where
                 // We must still invalidate the reader cache for this range so
                 // that reads after flush (where overlay_dirty is skipped because
                 // has_pending() returns false) fetch fresh data from S3.
-                let desc = SliceHandle {
+                let descs = SliceHandle {
                     slice: &slice,
                     shared: &shared,
                 }
-                .desc_for_commit();
-                if let Some(desc) = desc {
-                    let (ino_val, chunk_index) = extract_ino_and_chunk_index(desc.chunk_id);
-                    let file_offset = chunk_index * shared.config.layout.chunk_size + desc.offset;
-                    let _ = shared
-                        .reader
-                        .invalidate(ino_val as u64, file_offset, desc.length.as_usize())
-                        .await;
+                .descs_for_commit();
+                if let Some((ino_val, chunk_index, _)) =
+                    commit_target_from_descs(&descs, shared.config.layout)
+                {
+                    for desc in &descs {
+                        let file_offset =
+                            chunk_index * shared.config.layout.chunk_size + desc.offset;
+                        let _ = shared
+                            .reader
+                            .invalidate(ino_val as u64, file_offset, desc.length.as_usize())
+                            .await;
+                    }
                 }
                 should_pop = true;
             }
@@ -5003,8 +5263,12 @@ mod tests {
             .unwrap();
         slice.uploaded = layout.block_size as u64;
 
-        assert!(slice.can_write(0, 16).is_none());
-        assert!(slice.can_write(layout.block_size as u64, 16).is_some());
+        assert!(slice.can_write(0, 16, WriteOrigin::Normal).is_none());
+        assert!(
+            slice
+                .can_write(layout.block_size as u64, 16, WriteOrigin::Normal)
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -6063,6 +6327,224 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cached_non_contiguous_writes_commit_as_shared_object_views() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store, meta.clone()));
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = Arc::new(DataWriter::new(
+            test_config_without_auto_flush(layout),
+            backend.clone(),
+            reader,
+            None,
+        ));
+        let ino = meta
+            .create_file(1, "cached_shared_object_views.txt".to_string())
+            .await
+            .unwrap();
+        let file_writer = writer.ensure_file(Inode::new(ino, 0));
+
+        let first = vec![1u8; 1024];
+        let second = vec![2u8; 1024];
+        file_writer.write_at_cached(0, &first, 10).await.unwrap();
+        file_writer
+            .write_at_cached(8192, &second, 20)
+            .await
+            .unwrap();
+
+        let before_flush = writer.dirty_breakdown().await;
+        assert_eq!(
+            before_flush.live_slices, 1,
+            "non-contiguous cached writes should share one physical writeback slice"
+        );
+        assert_eq!(before_flush.slice_create_ops, 1);
+        assert_eq!(before_flush.slice_reuse_ops, 1);
+
+        file_writer.flush().await.unwrap();
+
+        let cid = chunk_id_for(ino, 0).unwrap();
+        let slices = meta_store.get_slices(cid).await.unwrap();
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].slice_id, slices[1].slice_id);
+        assert_eq!(slices[0].offset, 0);
+        assert_eq!(slices[0].length, first.len() as u64);
+        assert_eq!(slices[0].object_offset, 0);
+        assert_eq!(slices[0].object_size, 2048);
+        assert_eq!(slices[1].offset, 8192);
+        assert_eq!(slices[1].length, second.len() as u64);
+        assert_eq!(slices[1].object_offset, first.len() as u64);
+        assert_eq!(slices[1].object_size, 2048);
+
+        let mut fetcher = DataFetcher::new(layout, cid, backend.as_ref());
+        fetcher.prepare_slices().await.unwrap();
+        assert_eq!(
+            fetcher.read_at(0u64.into(), first.len()).await.unwrap(),
+            first
+        );
+        assert_eq!(
+            fetcher.read_at(8192u64.into(), second.len()).await.unwrap(),
+            second
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_commit_before_upload_seals_cached_shared_object_segments() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(BlockingStore::new(true));
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let write_back = Arc::new(
+            crate::vfs::cache::write_back::FsWriteBackCache::new_with_sync(
+                temp.path().to_path_buf(),
+                false,
+            ),
+        );
+        let writer = Arc::new(DataWriter::new(
+            test_config_with_writeback(layout, WriteBackMode::CommitBeforeUpload),
+            backend,
+            reader,
+            Some(write_back.clone()),
+        ));
+        let ino = meta
+            .create_file(1, "cached_shared_object_writeback_record.txt".to_string())
+            .await
+            .unwrap();
+        let file_writer = writer.ensure_file(Inode::new(ino, 0));
+
+        let first = vec![1u8; 1024];
+        let second = vec![2u8; 1024];
+        file_writer.write_at_cached(0, &first, 10).await.unwrap();
+        file_writer
+            .write_at_cached(8192, &second, 20)
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(2), file_writer.flush())
+            .await
+            .expect("commit-before-upload flush should return after local stage")
+            .unwrap();
+
+        let records = timeout(Duration::from_secs(2), async {
+            loop {
+                let records = write_back.recover().await.unwrap();
+                if records.len() == 1 && records[0].logical_segments().len() == 2 {
+                    break records;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("blocked remote upload should leave one segmented dirty record");
+        let segments = records[0].logical_segments();
+        assert_eq!(segments[0].chunk_offset, 0);
+        assert_eq!(segments[0].length, first.len() as u64);
+        assert_eq!(segments[0].object_offset, 0);
+        assert_eq!(segments[1].chunk_offset, 8192);
+        assert_eq!(segments[1].length, second.len() as u64);
+        assert_eq!(segments[1].object_offset, first.len() as u64);
+
+        let mut overlay = vec![0u8; 8192 + second.len()];
+        write_back
+            .overlay_dirty_range(ino, chunk_id_for(ino, 0).unwrap(), 0, &mut overlay)
+            .await
+            .unwrap();
+        assert_eq!(&overlay[..first.len()], first.as_slice());
+        assert_eq!(&overlay[8192..8192 + second.len()], second.as_slice());
+
+        store.unblock();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if writer.recent_pending_upload_bytes() == 0
+                    && write_back.recover().await.unwrap().is_empty()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("segmented dirty record should be removed after upload completes");
+    }
+
+    #[tokio::test]
+    async fn test_cached_non_contiguous_shared_object_overlay_reads() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store, meta.clone()));
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = Arc::new(DataWriter::new(
+            test_config_without_auto_flush(layout),
+            backend,
+            reader,
+            None,
+        ));
+        let ino = meta
+            .create_file(1, "cached_shared_object_overlay.txt".to_string())
+            .await
+            .unwrap();
+        let file_writer = writer.ensure_file(Inode::new(ino, 0));
+
+        let first = vec![3u8; 1024];
+        let second = vec![4u8; 1024];
+        file_writer.write_at_cached(0, &first, 10).await.unwrap();
+        file_writer
+            .write_at_cached(8192, &second, 20)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            file_writer
+                .read_dirty_if_fully_covered(0, first.len())
+                .await
+                .unwrap()
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            file_writer
+                .read_dirty_if_fully_covered(8192, second.len())
+                .await
+                .unwrap()
+                .unwrap(),
+            second
+        );
+        assert!(
+            file_writer
+                .read_dirty_if_fully_covered(0, 8192 + second.len())
+                .await
+                .unwrap()
+                .is_none(),
+            "overlay must not claim sparse holes are fully covered"
+        );
+    }
+
+    #[tokio::test]
     async fn test_upload_partial_tail_metrics_are_attributed_by_write_origin() {
         let layout = ChunkLayout {
             chunk_size: 16 * 1024,
@@ -6284,11 +6766,7 @@ mod tests {
 
         for idx in 0..(MAX_SLICES_THRESHOLD + 16) as u64 {
             file_writer
-                .write_at_cached(
-                    idx * layout.block_size as u64 * 2,
-                    &[idx as u8; 1024],
-                    idx + 1,
-                )
+                .write_at_cached(idx * layout.chunk_size, &[idx as u8; 1024], idx + 1)
                 .await
                 .unwrap();
         }
@@ -6332,20 +6810,16 @@ mod tests {
         let block_sized_slices = MAX_SLICES_THRESHOLD + 32;
         for idx in 0..block_sized_slices as u64 {
             file_writer
-                .write_at_cached(
-                    idx * layout.block_size as u64 * 2,
-                    &[idx as u8; 4096],
-                    idx + 1,
-                )
+                .write_at_cached(idx * layout.chunk_size, &[idx as u8; 4096], idx + 1)
                 .await
                 .unwrap();
         }
 
-        let cached_tail_base = block_sized_slices as u64 * layout.block_size as u64 * 2;
+        let cached_tail_base = block_sized_slices as u64 * layout.chunk_size;
         for idx in 0..32u64 {
             file_writer
                 .write_at_cached(
-                    cached_tail_base + idx * layout.block_size as u64 * 2,
+                    cached_tail_base + idx * layout.chunk_size,
                     &[idx as u8; 1024],
                     idx + 10_000,
                 )

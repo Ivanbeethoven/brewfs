@@ -350,7 +350,7 @@ If etcd/database test suites are cheap in this checkout, run them too. If they r
 
 Add unit tests where two descriptors have the same logical ranges but different `object_offset`. `calculate_fragmentation`, `remove_fully_covered`, and `find_replaced_ids` must use logical `offset/length`, not physical object offsets.
 
-- [ ] **Step 2: Update delayed deletion data**
+- [x] **Step 2: Update delayed deletion data**
 
 `encode_delayed_data` should encode `slice.physical_size()` rather than `slice.length`, so deleting a descriptor created from a larger physical object accounts for the whole object size when that slice id is removed.
 
@@ -457,7 +457,7 @@ Expected: the reader gets all three ranges from their correct physical offsets.
 - Modify: `src/vfs/cache/page.rs`
 - Test: writer tests.
 
-- [ ] **Step 1: Split SliceState logical view from physical object**
+- [x] **Step 1: Split SliceState logical view from physical object**
 
 Add a small logical-segment list to `SliceState`:
 
@@ -471,7 +471,7 @@ struct SliceSegment {
 
 `SliceState.data` remains the physical object buffer. `SliceState.offset` should stop being the only logical range. Existing contiguous writes can still merge into one segment.
 
-- [ ] **Step 2: Append non-overlapping random writes physically**
+- [x] **Step 2: Append non-overlapping random writes physically**
 
 When a writable slice cannot accept a write at the requested logical offset but has physical capacity left, append the new bytes to the physical object and add a `SliceSegment`:
 
@@ -490,7 +490,7 @@ the physical object would exceed chunk size / freeze limit,
 the write would create sparse zero-fill semantics.
 ```
 
-- [ ] **Step 3: Commit all logical segments**
+- [x] **Step 3: Commit all logical segments**
 
 Change `SliceHandle` from `desc_for_commit()` to `descs_for_commit()` returning ordered descriptors:
 
@@ -503,7 +503,7 @@ object_size = full physical object len
 
 Use `MetaLayer::write_slices` to commit them as an ordered list.
 
-- [ ] **Step 4: Preserve overlay reads**
+- [x] **Step 4: Preserve overlay reads**
 
 `overlay_dirty` and read-after-write must resolve logical offset through the segment list, not through `SliceState.offset` alone. Add tests where two non-contiguous cached writes share one physical object and are both readable before and after commit.
 
@@ -538,6 +538,44 @@ randwrite wall improves or remains within 3%,
 randrw wall improves or remains within 3%,
 reader/writer correctness tests pass.
 ```
+
+**2026-06-22 focused perf notes:**
+
+All runs used `fio-randwrite fio-randrw`, `direct=0`, `io_uring`, `iodepth=1`,
+S3/RustFS, Redis metadata, `commit_before_upload`, FUSE workers=6, and
+post-write drain.
+
+| Candidate | randwrite | randwrite drain | randrw | randrw drain | Fio BW summary | Decision |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| Historical pre-segment best (`perf-run-1782105644-31160`) | 154s | 1s | 177s | 0s | randrw 332/148 MiB/s | Baseline to beat |
+| Segment coalescing + old pending 1GiB/2GiB (`perf-run-1782121659-18935`) | 160s | 14s | 200s | 37s | randrw 265/119 MiB/s | Reject as-is; fewer PUTs but worse tail |
+| Segment coalescing + writeback permits=12 (`perf-run-1782122451-8578`) | 165s | 14s | 201s | timed out/interrupted | randrw pending/inflight grew to GiB scale | Reject; higher writeback concurrency worsens tail |
+| Segment coalescing + pending 256MiB/512MiB (`perf-run-1782231294-1729`) | 157s | 8s | 167s | 36s | randrw 328/147 MiB/s | Keep profile tuning; main workload improves while preserving BW |
+| Same plus write memory 1GiB (`perf-run-1782231983-5107`, randrw only) | n/a | n/a | 87s | 2s | randrw 139/62 MiB/s | Reject; tail improves by throttling too hard |
+| Same plus write memory 2GiB (`perf-run-1782232323-8641`, randrw only) | n/a | n/a | 86s | 0s | randrw 200/91 MiB/s | Reject; throughput loss still too large |
+
+Current interpretation:
+
+- Direct `SliceDesc` object-range support plus cached segment coalescing cuts
+  PUT/metadata amplification substantially. Example: randwrite PUT count drops
+  from about 23k to about 3k and upload batch average rises from about 0.4MiB
+  to about 5.4MiB.
+- The new bottleneck is writeback backlog shape, not descriptor correctness.
+  Large physical slice objects keep fewer objects in flight, but each object
+  has higher PUT latency; if the profile allows too much pending/dirty data,
+  close/post-drain carries a large tail.
+- Lowering pending soft/hard to 256MiB/512MiB is beneficial for the current
+  coalescing design and is safe to keep in the perf profile. Lowering write
+  memory to 1GiB or 2GiB removes the tail by imposing too much foreground
+  backpressure and loses too much randrw throughput.
+
+Next perf target:
+
+- Keep 4GiB write memory and pending 256MiB/512MiB.
+- Reduce post-drain without dropping randrw below 95% of the 4GiB throughput
+  run. Candidate directions: earlier remote-upload dispatch for staged dirty
+  slices, smarter coalesced-slice freeze cadence, or adaptive coalescing size
+  based on remote upload latency.
 
 ## Required Verification Gates
 

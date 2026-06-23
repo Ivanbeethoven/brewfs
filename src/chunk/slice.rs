@@ -221,22 +221,30 @@ impl SliceDesc {
     pub fn find_replaced_ids(original: &[SliceDesc], merged: &[SliceDesc]) -> Vec<u64> {
         let merged_ids: std::collections::HashSet<u64> =
             merged.iter().map(|s| s.slice_id).collect();
+        let mut seen = std::collections::HashSet::new();
         original
             .iter()
             .filter(|s| !merged_ids.contains(&s.slice_id))
-            .map(|s| s.slice_id)
+            .filter_map(|s| {
+                if seen.insert(s.slice_id) {
+                    Some(s.slice_id)
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
     /// Encode replaced slices into the delayed deletion binary format.
     pub fn encode_delayed_data(slices: &[SliceDesc], replaced_ids: &[u64]) -> Vec<u8> {
         let replaced_set: std::collections::HashSet<u64> = replaced_ids.iter().copied().collect();
+        let mut encoded = std::collections::HashSet::new();
         let mut buf = Vec::with_capacity(replaced_ids.len() * 20);
         for s in slices {
-            if replaced_set.contains(&s.slice_id) {
+            if replaced_set.contains(&s.slice_id) && encoded.insert(s.slice_id) {
                 buf.extend_from_slice(&s.slice_id.to_le_bytes());
                 buf.extend_from_slice(&s.offset.to_le_bytes());
-                let size = s.length.min(u32::MAX as u64) as u32;
+                let size = s.physical_size().min(u32::MAX as u64) as u32;
                 buf.extend_from_slice(&size.to_le_bytes());
             }
         }
@@ -515,5 +523,56 @@ mod tests {
         for i in 1..result.len() {
             assert!(result[i].offset >= result[i - 1].offset, "not sorted");
         }
+    }
+
+    #[test]
+    fn test_shared_object_replaced_ids_are_deduplicated() {
+        let original = vec![
+            SliceDesc {
+                slice_id: 7,
+                chunk_id: 1,
+                offset: 0,
+                length: 1024,
+                object_offset: 0,
+                object_size: 2048,
+            },
+            SliceDesc {
+                slice_id: 7,
+                chunk_id: 1,
+                offset: 8192,
+                length: 1024,
+                object_offset: 1024,
+                object_size: 2048,
+            },
+        ];
+
+        assert_eq!(SliceDesc::find_replaced_ids(&original, &[]), vec![7]);
+    }
+
+    #[test]
+    fn test_delayed_data_uses_physical_size_once_for_shared_object() {
+        let slices = vec![
+            SliceDesc {
+                slice_id: 7,
+                chunk_id: 1,
+                offset: 0,
+                length: 1024,
+                object_offset: 0,
+                object_size: 2048,
+            },
+            SliceDesc {
+                slice_id: 7,
+                chunk_id: 1,
+                offset: 8192,
+                length: 1024,
+                object_offset: 1024,
+                object_size: 2048,
+            },
+        ];
+
+        let encoded = SliceDesc::encode_delayed_data(&slices, &[7, 7]);
+        let decoded = SliceDesc::decode_delayed_data(&encoded).unwrap();
+
+        assert_eq!(decoded, vec![(7, 0, 2048)]);
     }
 }

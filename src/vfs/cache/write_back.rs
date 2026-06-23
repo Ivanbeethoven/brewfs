@@ -14,13 +14,39 @@ pub struct DirtySliceRecord {
     pub key: DirtySliceKey,
     pub ino: i64,
     pub chunk_id: u64,
+    /// Legacy single logical range. New records also populate `segments`.
     pub chunk_offset: u64,
     pub length: u64,
+    #[serde(default)]
+    pub segments: Vec<DirtySliceSegment>,
     pub remote_slice_id: Option<u64>,
     pub state: DirtySliceState,
     pub path: PathBuf,
     pub retry_count: u32,
     pub last_error: Option<String>,
+}
+
+/// Logical view into a locally persisted dirty slice file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DirtySliceSegment {
+    pub chunk_offset: u64,
+    pub length: u64,
+    #[serde(default)]
+    pub object_offset: u64,
+}
+
+impl DirtySliceRecord {
+    pub fn logical_segments(&self) -> Vec<DirtySliceSegment> {
+        if self.segments.is_empty() {
+            vec![DirtySliceSegment {
+                chunk_offset: self.chunk_offset,
+                length: self.length,
+                object_offset: 0,
+            }]
+        } else {
+            self.segments.clone()
+        }
+    }
 }
 
 /// Trait for a local SSD write-back cache.
@@ -43,6 +69,14 @@ pub trait WriteBackCache: Send + Sync {
         key: DirtySliceKey,
         chunk_offset: u64,
         length: u64,
+    ) -> anyhow::Result<()>;
+
+    /// Publish a dirty slice record with multiple logical views into one
+    /// physical local file.
+    async fn seal_slice_record_segments(
+        &self,
+        key: DirtySliceKey,
+        segments: Vec<DirtySliceSegment>,
     ) -> anyhow::Result<()>;
 
     /// Open a persisted slice for reading (used by the uploader).
@@ -194,25 +228,28 @@ impl FsWriteBackCache {
                 continue;
             }
 
-            let slice_start = record.chunk_offset;
-            let slice_end = slice_start + record.length;
             let buf_end = chunk_offset + buf.len() as u64;
 
-            let overlap_start = chunk_offset.max(slice_start);
-            let overlap_end = buf_end.min(slice_end);
-            if overlap_start >= overlap_end {
-                continue;
+            for segment in record.logical_segments() {
+                let slice_start = segment.chunk_offset;
+                let slice_end = slice_start + segment.length;
+
+                let overlap_start = chunk_offset.max(slice_start);
+                let overlap_end = buf_end.min(slice_end);
+                if overlap_start >= overlap_end {
+                    continue;
+                }
+
+                let file_offset = segment.object_offset + (overlap_start - slice_start);
+                let dst_start = (overlap_start - chunk_offset) as usize;
+                let dst_end = (overlap_end - chunk_offset) as usize;
+                let read_len = dst_end - dst_start;
+
+                let mut file = fs::File::open(&record.path).await?;
+                file.seek(std::io::SeekFrom::Start(file_offset)).await?;
+                file.read_exact(&mut buf[dst_start..dst_start + read_len])
+                    .await?;
             }
-
-            let file_offset = overlap_start - slice_start;
-            let dst_start = (overlap_start - chunk_offset) as usize;
-            let dst_end = (overlap_end - chunk_offset) as usize;
-            let read_len = dst_end - dst_start;
-
-            let mut file = fs::File::open(&record.path).await?;
-            file.seek(std::io::SeekFrom::Start(file_offset)).await?;
-            file.read_exact(&mut buf[dst_start..dst_start + read_len])
-                .await?;
         }
         Ok(())
     }
@@ -267,15 +304,50 @@ impl WriteBackCache for FsWriteBackCache {
         chunk_offset: u64,
         length: u64,
     ) -> anyhow::Result<()> {
+        self.seal_slice_record_segments(
+            key,
+            vec![DirtySliceSegment {
+                chunk_offset,
+                length,
+                object_offset: 0,
+            }],
+        )
+        .await
+    }
+
+    async fn seal_slice_record_segments(
+        &self,
+        key: DirtySliceKey,
+        segments: Vec<DirtySliceSegment>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !segments.is_empty(),
+            "writeback record for {:?} must contain at least one logical segment",
+            key
+        );
         let slice_path = key.slice_path(&self.root);
         let file_len = fs::metadata(&slice_path).await?.len();
-        anyhow::ensure!(
-            file_len >= length,
-            "writeback stage incomplete for {:?}: file length {} < sealed length {}",
-            key,
-            file_len,
-            length
-        );
+        for segment in &segments {
+            let end = segment.object_offset.saturating_add(segment.length);
+            anyhow::ensure!(
+                file_len >= end,
+                "writeback stage incomplete for {:?}: file length {} < segment end {}",
+                key,
+                file_len,
+                end
+            );
+        }
+        let chunk_offset = segments
+            .iter()
+            .map(|segment| segment.chunk_offset)
+            .min()
+            .unwrap();
+        let logical_end = segments
+            .iter()
+            .map(|segment| segment.chunk_offset.saturating_add(segment.length))
+            .max()
+            .unwrap();
+        let length = logical_end.saturating_sub(chunk_offset);
 
         let record = DirtySliceRecord {
             key,
@@ -283,6 +355,7 @@ impl WriteBackCache for FsWriteBackCache {
             chunk_id: key.chunk_id,
             chunk_offset,
             length,
+            segments,
             remote_slice_id: None,
             state: DirtySliceState::Sealed,
             path: slice_path,
@@ -460,6 +533,82 @@ mod tests {
         assert_eq!(records[0].chunk_offset, 4096);
         assert_eq!(records[0].length, 7);
         assert_eq!(records[0].state, DirtySliceState::Sealed);
+    }
+
+    #[test]
+    fn legacy_dirty_record_defaults_to_single_logical_segment() {
+        let json = br#"{
+            "key":{"ino":7,"chunk_id":11,"local_seq":17,"epoch":0},
+            "ino":7,
+            "chunk_id":11,
+            "chunk_offset":4096,
+            "length":7,
+            "remote_slice_id":null,
+            "state":"Sealed",
+            "path":"/tmp/dirty.slice",
+            "retry_count":0,
+            "last_error":null
+        }"#;
+
+        let record: DirtySliceRecord = serde_json::from_slice(json).unwrap();
+        assert_eq!(
+            record.logical_segments(),
+            vec![DirtySliceSegment {
+                chunk_offset: 4096,
+                length: 7,
+                object_offset: 0,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn segmented_record_overlays_physical_object_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), false);
+        let key = DirtySliceKey {
+            ino: 8,
+            chunk_id: 12,
+            local_seq: 18,
+            epoch: 0,
+        };
+
+        cache
+            .persist_slice_data(key, vec![Bytes::from_static(b"aaaabbbb")], 0)
+            .await
+            .unwrap();
+        cache
+            .seal_slice_record_segments(
+                key,
+                vec![
+                    DirtySliceSegment {
+                        chunk_offset: 0,
+                        length: 4,
+                        object_offset: 0,
+                    },
+                    DirtySliceSegment {
+                        chunk_offset: 8192,
+                        length: 4,
+                        object_offset: 4,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let records = cache.recover().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].chunk_offset, 0);
+        assert_eq!(records[0].length, 8196);
+        assert_eq!(records[0].logical_segments().len(), 2);
+
+        let mut buf = vec![0u8; 8200];
+        cache
+            .overlay_dirty_range(key.ino, key.chunk_id, 0, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..4], b"aaaa");
+        assert_eq!(&buf[4..8192], vec![0u8; 8188].as_slice());
+        assert_eq!(&buf[8192..8196], b"bbbb");
     }
 
     #[tokio::test]

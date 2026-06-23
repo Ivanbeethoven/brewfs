@@ -8,7 +8,7 @@ use crate::utils::zero::make_zero_bytes;
 use crate::vfs::config::WriteConfig;
 use bytes::{Bytes, BytesMut};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteAction {
     Overlap,
     Append,
