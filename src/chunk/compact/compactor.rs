@@ -162,19 +162,19 @@ where
             return Ok(None);
         }
 
-        let merged = SliceDesc::remove_fully_covered(slices);
+        let merged = SliceDesc::split_overlapped_views(slices);
         let replaced_ids = SliceDesc::find_replaced_ids(slices, &merged);
 
-        if replaced_ids.is_empty() {
+        if merged == slices {
             return Ok(None);
         }
 
         let delayed = SliceDesc::encode_delayed_data(slices, &replaced_ids);
 
-        // Atomic: delete old slice_meta + insert delayed records.
-        // Uses replace_slices_for_compact with NO new slices
+        // Atomic: replace the visible slice list and stage delayed records only
+        // for physical objects no longer referenced by any surviving view.
         self.meta_store
-            .replace_slices_for_compact(chunk_id, &[], &delayed)
+            .replace_slices_for_compact_with_version(chunk_id, &merged, &delayed, slices)
             .await?;
 
         let removed = replaced_ids.len();
@@ -306,8 +306,9 @@ where
         slice: &SliceDesc,
         dest: &mut [u8],
     ) -> Result<(), CompactorError> {
+        let physical_start = slice.physical_offset_for(slice.offset);
         let spans: Vec<_> =
-            block_span_iter_slice(SliceOffset(0), slice.length, self.layout).collect();
+            block_span_iter_slice(SliceOffset(physical_start), slice.length, self.layout).collect();
 
         let mut pos = 0usize;
         for span in spans {
@@ -391,5 +392,171 @@ pub enum CompactorError {
 impl From<anyhow::Error> for CompactorError {
     fn from(e: anyhow::Error) -> Self {
         CompactorError::BlockStoreError(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chunk::reader::DataFetcher;
+    use crate::chunk::store::InMemoryBlockStore;
+    use crate::meta::factory::create_meta_store_from_url;
+    use crate::vfs::backend::Backend;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_read_slice_data_into_uses_object_offset() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 1024,
+        };
+        let block_store = Arc::new(InMemoryBlockStore::new());
+        let meta = create_meta_store_from_url("sqlite::memory:")
+            .await
+            .unwrap()
+            .store();
+        let compactor = Compactor::with_layout(meta, block_store.clone(), layout);
+
+        let physical: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+        block_store
+            .write_fresh_range((42, 0), 0, &physical[..1024])
+            .await
+            .unwrap();
+        block_store
+            .write_fresh_range((42, 1), 0, &physical[1024..])
+            .await
+            .unwrap();
+
+        let slice = SliceDesc {
+            slice_id: 42,
+            chunk_id: 7,
+            offset: 4096,
+            length: 768,
+            object_offset: 640,
+            object_size: physical.len() as u64,
+        };
+        let mut dest = vec![0u8; slice.length as usize];
+
+        compactor
+            .read_slice_data_into(&slice, &mut dest)
+            .await
+            .unwrap();
+
+        assert_eq!(dest, physical[640..1408]);
+    }
+
+    #[tokio::test]
+    async fn test_compact_light_splits_partial_overlap_without_delaying_shared_object() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 1024,
+        };
+        let block_store = Arc::new(InMemoryBlockStore::new());
+        let meta = create_meta_store_from_url("sqlite::memory:")
+            .await
+            .unwrap()
+            .store();
+        let compactor = Compactor::with_layout(meta.clone(), block_store, layout);
+        let chunk_id = 7201;
+        let old = SliceDesc {
+            slice_id: 7,
+            chunk_id,
+            offset: 0,
+            length: 4096,
+            object_offset: 128,
+            object_size: 8192,
+        };
+        let new = SliceDesc {
+            slice_id: 8,
+            chunk_id,
+            offset: 1024,
+            length: 1024,
+            object_offset: 0,
+            object_size: 1024,
+        };
+        let expected = vec![
+            SliceDesc {
+                slice_id: 7,
+                chunk_id,
+                offset: 0,
+                length: 1024,
+                object_offset: 128,
+                object_size: 8192,
+            },
+            SliceDesc {
+                slice_id: 7,
+                chunk_id,
+                offset: 2048,
+                length: 2048,
+                object_offset: 2176,
+                object_size: 8192,
+            },
+            new,
+        ];
+
+        meta.append_slice(chunk_id, old).await.unwrap();
+        meta.append_slice(chunk_id, new).await.unwrap();
+
+        let removed = compactor.compact_light(chunk_id).await.unwrap();
+
+        assert_eq!(removed, Some(0));
+        assert_eq!(meta.get_slices(chunk_id).await.unwrap(), expected);
+        assert!(meta.process_delayed_slices(10, 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_compact_light_split_views_read_old_prefix_new_middle_old_suffix() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 1024,
+        };
+        let block_store = Arc::new(InMemoryBlockStore::new());
+        let handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = handle.store();
+        let backend = Arc::new(Backend::new(block_store.clone(), handle.layer()));
+        let compactor = Compactor::with_layout(meta.clone(), block_store.clone(), layout);
+        let chunk_id = 7202;
+        let old_data = vec![b'a'; 4096];
+        let new_data = vec![b'b'; 1024];
+
+        for (index, block) in old_data.chunks(layout.block_size as usize).enumerate() {
+            block_store
+                .write_fresh_range((7, index as u32), 0, block)
+                .await
+                .unwrap();
+        }
+        block_store
+            .write_fresh_range((8, 0), 0, &new_data)
+            .await
+            .unwrap();
+
+        let old = SliceDesc {
+            slice_id: 7,
+            chunk_id,
+            offset: 0,
+            length: old_data.len() as u64,
+            object_offset: 0,
+            object_size: old_data.len() as u64,
+        };
+        let new = SliceDesc {
+            slice_id: 8,
+            chunk_id,
+            offset: 1024,
+            length: new_data.len() as u64,
+            object_offset: 0,
+            object_size: new_data.len() as u64,
+        };
+        meta.append_slice(chunk_id, old).await.unwrap();
+        meta.append_slice(chunk_id, new).await.unwrap();
+
+        assert_eq!(compactor.compact_light(chunk_id).await.unwrap(), Some(0));
+
+        let mut fetcher = DataFetcher::new(layout, chunk_id, backend.as_ref());
+        fetcher.prepare_slices().await.unwrap();
+        let data = fetcher.read_at(0u64.into(), old_data.len()).await.unwrap();
+
+        assert_eq!(&data[..1024], vec![b'a'; 1024]);
+        assert_eq!(&data[1024..2048], vec![b'b'; 1024]);
+        assert_eq!(&data[2048..], vec![b'a'; 2048]);
     }
 }

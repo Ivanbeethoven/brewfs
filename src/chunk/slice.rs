@@ -177,43 +177,66 @@ impl SliceDesc {
         (total_size - merged_coverage) as f64 / total_size as f64
     }
 
-    /// Remove slices that are fully covered by newer slices.
+    /// Split older slices into logical views that exclude ranges covered by
+    /// newer slices, preserving their physical object offsets.
     ///
-    /// This is a conservative strategy for safe deletion: only slices whose
-    /// entire range `[offset, offset+length)` is contained within a single
-    /// newer slice are removed. Partially covered slices are kept intact
-    /// because their block data addressing depends on the original offset.
-    ///
-    /// Ordering: slices with higher `slice_id` are considered newer.
-    pub fn remove_fully_covered(slices: &[SliceDesc]) -> Vec<SliceDesc> {
+    /// Ordering follows the reader contract: lower `slice_id` entries are
+    /// older and remain earlier in the returned list, so reverse iteration
+    /// still sees newer slices first.
+    pub fn split_overlapped_views(slices: &[SliceDesc]) -> Vec<SliceDesc> {
         if slices.is_empty() {
-            return vec![];
+            return Vec::new();
         }
 
-        // Sort by slice_id descending (newest first)
-        let mut sorted: Vec<SliceDesc> = slices.to_vec();
+        let mut sorted = slices.to_vec();
         sorted.sort_by_key(|s| std::cmp::Reverse(s.slice_id));
 
         let mut covered_ranges: Vec<(u64, u64)> = Vec::new();
-        let mut result: Vec<SliceDesc> = Vec::new();
+        let mut result = Vec::new();
 
         for slice in sorted {
             let start = slice.offset;
             let end = slice.logical_end();
+            if start >= end {
+                continue;
+            }
 
-            // Check if fully covered by any single newer slice's range
-            let is_fully_covered = covered_ranges
-                .iter()
-                .any(|&(cs, ce)| start >= cs && end <= ce);
+            let mut visible = vec![(start, end)];
+            for &(covered_start, covered_end) in &covered_ranges {
+                let mut next = Vec::new();
+                for (part_start, part_end) in visible {
+                    if covered_end <= part_start || covered_start >= part_end {
+                        next.push((part_start, part_end));
+                        continue;
+                    }
 
-            if !is_fully_covered {
-                result.push(slice);
+                    if part_start < covered_start {
+                        next.push((part_start, part_end.min(covered_start)));
+                    }
+                    if covered_end < part_end {
+                        next.push((part_start.max(covered_end), part_end));
+                    }
+                }
+                visible = next;
+                if visible.is_empty() {
+                    break;
+                }
+            }
+
+            for (view_start, view_end) in visible {
+                result.push(SliceDesc {
+                    offset: view_start,
+                    length: view_end - view_start,
+                    object_offset: slice.physical_offset_for(view_start),
+                    object_size: slice.physical_size(),
+                    ..slice
+                });
             }
 
             covered_ranges.push((start, end));
         }
 
-        result.sort_by_key(|s| s.offset);
+        result.sort_by_key(|s| (s.slice_id, s.offset, s.object_offset));
         result
     }
 
@@ -459,70 +482,74 @@ mod tests {
         assert_eq!(SliceDesc::calculate_fragmentation(&slices), 0.0);
     }
 
-    // ==================== remove_fully_covered tests ====================
-
     #[test]
-    fn test_remove_fully_covered_empty() {
-        assert!(SliceDesc::remove_fully_covered(&[]).is_empty());
+    fn test_logical_coverage_ignores_object_offsets() {
+        let old = SliceDesc {
+            slice_id: 7,
+            chunk_id: 1,
+            offset: 0,
+            length: 1024,
+            object_offset: 2048,
+            object_size: 4096,
+        };
+        let new = SliceDesc {
+            slice_id: 8,
+            chunk_id: 1,
+            offset: 0,
+            length: 1024,
+            object_offset: 0,
+            object_size: 1024,
+        };
+        let slices = vec![old, new];
+
+        assert_eq!(SliceDesc::calculate_fragmentation(&slices), 0.5);
+        assert_eq!(SliceDesc::split_overlapped_views(&slices), vec![new]);
+        assert_eq!(SliceDesc::find_replaced_ids(&slices, &[new]), vec![7]);
     }
 
     #[test]
-    fn test_remove_fully_covered_no_overlap() {
-        let slices = vec![make_slice(1, 0, 50), make_slice(2, 100, 50)];
-        let result = SliceDesc::remove_fully_covered(&slices);
-        assert_eq!(result.len(), 2);
-    }
+    fn test_split_overlapped_views_preserves_uncovered_physical_offsets() {
+        let old = SliceDesc {
+            slice_id: 7,
+            chunk_id: 1,
+            offset: 0,
+            length: 4096,
+            object_offset: 128,
+            object_size: 8192,
+        };
+        let new = SliceDesc {
+            slice_id: 8,
+            chunk_id: 1,
+            offset: 1024,
+            length: 1024,
+            object_offset: 0,
+            object_size: 1024,
+        };
 
-    #[test]
-    fn test_remove_fully_covered_partial_overlap_kept() {
-        // [0,100) + [50,150) → neither fully covers the other
-        let slices = vec![make_slice(1, 0, 100), make_slice(2, 50, 100)];
-        let result = SliceDesc::remove_fully_covered(&slices);
-        assert_eq!(result.len(), 2, "partial overlap: both kept");
-    }
+        let result = SliceDesc::split_overlapped_views(&[old, new]);
 
-    #[test]
-    fn test_remove_fully_covered_full_coverage() {
-        // [10,60) fully inside [0,100) — slice 1 removed (newer slice 2 covers it)
-        let slices = vec![make_slice(1, 10, 50), make_slice(2, 0, 100)];
-        let result = SliceDesc::remove_fully_covered(&slices);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].slice_id, 2);
-    }
-
-    #[test]
-    fn test_remove_fully_covered_exact_same_range() {
-        // [0,100) + [0,100) — older one removed
-        let slices = vec![make_slice(1, 0, 100), make_slice(2, 0, 100)];
-        let result = SliceDesc::remove_fully_covered(&slices);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].slice_id, 2);
-    }
-
-    #[test]
-    fn test_remove_fully_covered_chain() {
-        // A⊂B⊂C → only C survives
-        let slices = vec![
-            make_slice(1, 10, 20),
-            make_slice(2, 5, 50),
-            make_slice(3, 0, 100),
-        ];
-        let result = SliceDesc::remove_fully_covered(&slices);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].slice_id, 3);
-    }
-
-    #[test]
-    fn test_remove_fully_covered_sorted_by_offset() {
-        let slices = vec![
-            make_slice(3, 200, 50),
-            make_slice(1, 0, 50),
-            make_slice(2, 100, 50),
-        ];
-        let result = SliceDesc::remove_fully_covered(&slices);
-        for i in 1..result.len() {
-            assert!(result[i].offset >= result[i - 1].offset, "not sorted");
-        }
+        assert_eq!(
+            result,
+            vec![
+                SliceDesc {
+                    slice_id: 7,
+                    chunk_id: 1,
+                    offset: 0,
+                    length: 1024,
+                    object_offset: 128,
+                    object_size: 8192,
+                },
+                SliceDesc {
+                    slice_id: 7,
+                    chunk_id: 1,
+                    offset: 2048,
+                    length: 2048,
+                    object_offset: 2176,
+                    object_size: 8192,
+                },
+                new,
+            ]
+        );
     }
 
     #[test]

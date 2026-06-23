@@ -176,6 +176,53 @@ async fn test_write_slices_preserves_ordered_shared_object_views() {
 }
 
 #[tokio::test]
+async fn test_replace_slices_for_compact_with_version_replaces_entire_slice_list() {
+    let store = new_test_store().await;
+    let chunk_id = 6112;
+    let original = SliceDesc {
+        slice_id: 9001,
+        chunk_id,
+        offset: 0,
+        length: 4096,
+        object_offset: 0,
+        object_size: 4096,
+    };
+    let replacement = [
+        SliceDesc {
+            slice_id: 9001,
+            chunk_id,
+            offset: 0,
+            length: 1024,
+            object_offset: 0,
+            object_size: 4096,
+        },
+        SliceDesc {
+            slice_id: 9001,
+            chunk_id,
+            offset: 2048,
+            length: 2048,
+            object_offset: 2048,
+            object_size: 4096,
+        },
+    ];
+
+    store.append_slice(chunk_id, original).await.unwrap();
+    store
+        .replace_slices_for_compact_with_version(chunk_id, &replacement, &[], &[original])
+        .await
+        .unwrap();
+
+    assert_eq!(store.get_slices(chunk_id).await.unwrap(), replacement);
+    assert!(
+        store
+            .process_delayed_slices(10, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn sqlite_file_store_waits_for_transient_write_locks() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("transient-lock.db");

@@ -3610,78 +3610,39 @@ impl MetaStore for DatabaseMetaStore {
 
         let current_slices: Vec<slice_meta::Model> = SliceMeta::find()
             .filter(slice_meta::Column::ChunkId.eq(chunk_id as i64))
+            .order_by_asc(slice_meta::Column::Id)
             .lock_exclusive()
             .all(&txn)
             .await
             .map_err(MetaError::Database)?;
 
-        if current_slices.len() != expected_slices.len() {
+        let current_descs: Vec<SliceDesc> = current_slices.into_iter().map(Into::into).collect();
+
+        if current_descs.len() != expected_slices.len() {
             warn!(
                 chunk_id = chunk_id,
                 expected_count = expected_slices.len(),
-                actual_count = current_slices.len(),
+                actual_count = current_descs.len(),
                 "Concurrent modification detected: slice count mismatch"
             );
             txn.rollback().await.map_err(MetaError::Database)?;
             return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
         }
 
-        let current_map: HashMap<i64, (i64, i64, i64, i64)> = current_slices
-            .iter()
-            .map(|s| {
-                (
-                    s.slice_id,
-                    (s.offset, s.length, s.object_offset, s.object_size),
-                )
-            })
-            .collect();
-
-        for expected in expected_slices {
-            let expected_id = expected.slice_id as i64;
-            match current_map.get(&expected_id) {
-                Some((offset, length, object_offset, object_size)) => {
-                    if *offset != expected.offset.as_i64()
-                        || *length != expected.length.as_i64()
-                        || *object_offset != expected.object_offset.as_i64()
-                        || *object_size != expected.physical_size().as_i64()
-                    {
-                        warn!(
-                            chunk_id = chunk_id,
-                            slice_id = expected.slice_id,
-                            expected_offset = expected.offset,
-                            expected_length = expected.length,
-                            actual_offset = offset,
-                            actual_length = length,
-                            "Concurrent modification detected: slice content changed"
-                        );
-                        txn.rollback().await.map_err(MetaError::Database)?;
-                        return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
-                    }
-                }
-                None => {
-                    warn!(
-                        chunk_id = chunk_id,
-                        slice_id = expected.slice_id,
-                        "Concurrent modification detected: slice missing"
-                    );
-                    txn.rollback().await.map_err(MetaError::Database)?;
-                    return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
-                }
-            }
+        if current_descs != expected_slices {
+            warn!(
+                chunk_id = chunk_id,
+                "Concurrent modification detected: slice list changed"
+            );
+            txn.rollback().await.map_err(MetaError::Database)?;
+            return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
         }
-        let slice_ids_to_delete: Vec<i64> = delayed_slices
-            .iter()
-            .map(|(slice_id, _, _)| *slice_id as i64)
-            .collect();
 
-        if !slice_ids_to_delete.is_empty() {
-            SliceMeta::delete_many()
-                .filter(slice_meta::Column::ChunkId.eq(chunk_id as i64))
-                .filter(slice_meta::Column::SliceId.is_in(slice_ids_to_delete))
-                .exec(&txn)
-                .await
-                .map_err(MetaError::Database)?;
-        }
+        SliceMeta::delete_many()
+            .filter(slice_meta::Column::ChunkId.eq(chunk_id as i64))
+            .exec(&txn)
+            .await
+            .map_err(MetaError::Database)?;
 
         for slice in new_slices {
             let model = slice_meta::ActiveModel {

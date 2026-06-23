@@ -88,6 +88,10 @@ const CHUNK_CAS_LUA: &str = r#"
     return 1
 "#;
 
+fn compact_expected_slices_match(current: &[SliceDesc], expected: &[SliceDesc]) -> bool {
+    current == expected
+}
+
 // Lua script for atomically releasing all locks held by a dead session.
 // Constructs plock keys dynamically from the locked set so the entire
 // cleanup is atomic — no TOCTOU window between reading locked_files and
@@ -3409,36 +3413,12 @@ impl MetaStore for RedisMetaStore {
                 return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
             }
 
-            let current_map: HashMap<u64, (u64, u64)> = current_slices
-                .iter()
-                .map(|s| (s.slice_id, (s.offset, s.length)))
-                .collect();
-
-            for expected in expected_slices {
-                match current_map.get(&expected.slice_id) {
-                    Some((offset, length)) => {
-                        if *offset != expected.offset || *length != expected.length {
-                            tracing::debug!(
-                                chunk_id = chunk_id,
-                                slice_id = expected.slice_id,
-                                expected_offset = expected.offset,
-                                expected_length = expected.length,
-                                actual_offset = offset,
-                                actual_length = length,
-                                "Concurrent modification detected: slice content changed"
-                            );
-                            return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
-                        }
-                    }
-                    None => {
-                        tracing::debug!(
-                            chunk_id = chunk_id,
-                            slice_id = expected.slice_id,
-                            "Concurrent modification detected: slice missing"
-                        );
-                        return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
-                    }
-                }
+            if !compact_expected_slices_match(&current_slices, expected_slices) {
+                tracing::debug!(
+                    chunk_id = chunk_id,
+                    "Concurrent modification detected: slice list changed"
+                );
+                return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
             }
 
             // Serialize new slices for the CAS.

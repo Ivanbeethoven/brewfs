@@ -346,17 +346,19 @@ If etcd/database test suites are cheap in this checkout, run them too. If they r
 - Modify: `src/chunk/slice.rs`
 - Test: `src/chunk/slice.rs`
 
-- [ ] **Step 1: Add tests for object-offset preserving coverage**
+- [x] **Step 1: Add tests for object-offset preserving coverage**
 
-Add unit tests where two descriptors have the same logical ranges but different `object_offset`. `calculate_fragmentation`, `remove_fully_covered`, and `find_replaced_ids` must use logical `offset/length`, not physical object offsets.
+Add unit tests where two descriptors have the same logical ranges but different `object_offset`. `calculate_fragmentation`, `split_overlapped_views`, and `find_replaced_ids` must use logical `offset/length`, not physical object offsets.
 
 - [x] **Step 2: Update delayed deletion data**
 
 `encode_delayed_data` should encode `slice.physical_size()` rather than `slice.length`, so deleting a descriptor created from a larger physical object accounts for the whole object size when that slice id is removed.
 
-For now, do not create multiple live descriptors sharing one `slice_id`. That requires refcount semantics and is a separate task.
+Shared physical-object views are allowed only when every surviving descriptor
+with that `slice_id` remains in metadata; delayed deletion must only stage slice
+ids that have no surviving descriptor.
 
-- [ ] **Step 3: Run compactor tests**
+- [x] **Step 3: Run compactor tests**
 
 Run:
 
@@ -422,7 +424,7 @@ Create two descriptors sharing the same `slice_id` but different logical offsets
 - Modify: `src/meta/stores/*`
 - Test: reader and compactor tests.
 
-- [ ] **Step 1: Implement safe split-view compaction**
+- [x] **Step 1: Implement safe split-view compaction**
 
 After Task 1-5 pass, add a compactor path that can preserve the uncovered left/right portions of an old physical slice by emitting descriptors with adjusted `object_offset` instead of forcing whole old slices to remain.
 
@@ -436,11 +438,11 @@ preserved old left:  logical [0, 1024), object_offset 0
 preserved old right: logical [2048, 4096), object_offset 2048
 ```
 
-- [ ] **Step 2: Do not delete shared physical objects**
+- [x] **Step 2: Do not delete shared physical objects**
 
 Before split-view compaction is enabled, add an object-reference check. If any surviving descriptor has the same `slice_id`, do not stage delayed deletion for that physical object.
 
-- [ ] **Step 3: Add tests for overlapping rewrite reads**
+- [x] **Step 3: Add tests for overlapping rewrite reads**
 
 Read the whole logical block after partial overwrite and verify:
 
@@ -449,6 +451,30 @@ old prefix + new middle + old suffix
 ```
 
 Expected: the reader gets all three ranges from their correct physical offsets.
+
+**2026-06-23 implementation notes:**
+
+- `SliceDesc::split_overlapped_views` now emits JuiceFS-style logical views for uncovered old-slice ranges while preserving physical `object_offset` and full `object_size`.
+- `compact_light` now uses versioned exact list replacement, so it can replace an old descriptor with retained left/right views without staging the shared physical object for delayed deletion.
+- `DatabaseMetaStore::replace_slices_for_compact_with_version` now compares and replaces the whole ordered slice list instead of deleting only delayed IDs. This is required when retained views reuse the same `slice_id`.
+- Redis versioned compact expected-state checks now compare the full ordered `SliceDesc` list, so same-object multi-view descriptors with different object offsets are not collapsed by `slice_id`.
+- `Compactor::read_slice_data_into` now reads from `slice.physical_offset_for(slice.offset)`, fixing heavy compact reads for logical views into larger physical objects.
+
+Focused verification:
+
+```bash
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+cargo test -p brewfs --bin brewfs chunk::slice::tests:: -- --nocapture
+
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+cargo test -p brewfs --bin brewfs chunk::compact:: -- --nocapture
+
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+cargo test -p brewfs --bin brewfs meta::stores::database::tests::test_replace_slices_for_compact_with_version_replaces_entire_slice_list -- --nocapture
+
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
+cargo test -p brewfs --bin brewfs meta::stores::redis::tests::compact_expected_slices_match_distinguishes_shared_object_views -- --nocapture
+```
 
 ## Task 8: Cached Random Write Batching on Top of New Descriptor Semantics
 

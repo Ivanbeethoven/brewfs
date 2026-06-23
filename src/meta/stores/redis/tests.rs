@@ -17,6 +17,43 @@ use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 #[test]
+fn compact_expected_slices_match_distinguishes_shared_object_views() {
+    let first = crate::chunk::SliceDesc {
+        slice_id: 42,
+        chunk_id: 9,
+        offset: 0,
+        length: 1024,
+        object_offset: 0,
+        object_size: 4096,
+    };
+    let second = crate::chunk::SliceDesc {
+        slice_id: 42,
+        chunk_id: 9,
+        offset: 8192,
+        length: 1024,
+        object_offset: 2048,
+        object_size: 4096,
+    };
+    let changed_physical_view = crate::chunk::SliceDesc {
+        object_offset: 1024,
+        ..second
+    };
+
+    assert!(super::compact_expected_slices_match(
+        &[first, second],
+        &[first, second]
+    ));
+    assert!(!super::compact_expected_slices_match(
+        &[first, second],
+        &[second, first]
+    ));
+    assert!(!super::compact_expected_slices_match(
+        &[first, second],
+        &[first, changed_physical_view]
+    ));
+}
+
+#[test]
 fn local_txlock_slot_is_stable_for_same_key() {
     assert_eq!(
         super::RedisMetaStore::local_lock_slot_for_key("c42_0"),
