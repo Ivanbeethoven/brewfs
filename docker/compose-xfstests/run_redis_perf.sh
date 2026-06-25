@@ -30,7 +30,7 @@ usage() {
   --local-fs                 改为使用本地目录作为对象存储
   --s3-writeback             启用 S3 commit-before-upload 写回语义（等价于 BREWFS_WRITEBACK_MODE=commit_before_upload）
   --writeback-throughput-profile
-                             启用 S3 writeback 全场景吞吐 profile（4GiB read/write memory+SSD cache, 12GiB memory budget, S3 max concurrency=16, writeback upload concurrency=4, pending soft/hard=1GiB/2GiB, writeback persist fsync=false, compression=none, full cache checksum, fuse workers=6, fuse max_background=512, fio prefill drain+remount）
+                             启用 S3 writeback 全场景吞吐 profile（cache root=/var/lib/brewfs/cache, 4GiB read/write memory+SSD cache, 12GiB memory budget, S3 max concurrency=16, writeback upload concurrency=4, pending soft/hard=1GiB/2GiB, writeback persist fsync=false, compression=none, full cache checksum, fuse workers=6, fuse max_background=512, fio prefill/post-write drain+remount）
   --tools "<tool...>"        指定压力工具列表，默认: "fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
   --brewfs-bench           额外运行一次宿主机 cargo bench --bench brewfs_bench
   --bench-args "<args...>"   透传给 cargo bench 之后的 Criterion 参数
@@ -147,6 +147,7 @@ fi
 export BREWFS_WRITEBACK_MODE="$BREWFS_WRITEBACK_MODE_VALUE"
 
 if [[ "$WRITEBACK_THROUGHPUT_PROFILE" == true ]]; then
+    export BREWFS_CACHE_ROOT="${BREWFS_CACHE_ROOT:-/var/lib/brewfs/cache}"
     export BREWFS_READ_MEMORY_BYTES="${BREWFS_READ_MEMORY_BYTES:-4294967296}"
     export BREWFS_WRITE_MEMORY_BYTES="${BREWFS_WRITE_MEMORY_BYTES:-4294967296}"
     export BREWFS_READ_SSD_BYTES="${BREWFS_READ_SSD_BYTES:-4294967296}"
@@ -168,6 +169,7 @@ if [[ "$WRITEBACK_THROUGHPUT_PROFILE" == true ]]; then
     export PERF_FIO_PREFILL_DRAIN="${PERF_FIO_PREFILL_DRAIN:-true}"
     export PERF_FIO_PREFILL_REMOUNT="${PERF_FIO_PREFILL_REMOUNT:-true}"
     export PERF_FIO_COLD_READ_CLEAR_CACHE="${PERF_FIO_COLD_READ_CLEAR_CACHE:-true}"
+    export PERF_FIO_POST_WRITE_DRAIN="${PERF_FIO_POST_WRITE_DRAIN:-true}"
 fi
 
 mkdir -p "$ARTIFACTS_DIR"

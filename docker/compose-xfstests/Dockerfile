@@ -37,7 +37,7 @@ RUN apt-get update && \
         udftools && \
     rm -rf /var/lib/apt/lists/*
 
-COPY target/release/brewfs /usr/local/bin/brewfs
+COPY target/docker/brewfs /usr/local/bin/brewfs
 COPY tests/scripts/xfstests-prebuilt/xfstests-prebuilt.tar.gz /opt/xfstests-prebuilt.tar.gz
 COPY tests/scripts/xfstests_slayer.exclude /opt/xfstests_slayer.exclude
 COPY docker/xfstests_report.sh /usr/local/bin/xfstests_report.sh
