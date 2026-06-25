@@ -45,7 +45,7 @@ jobs:
           cargo check -p brewfs --no-default-features --features fuse-io-uring-runtime
 
       - name: Test workspace
-        run: cargo test --workspace --lib --bins
+        run: cargo test --workspace --lib --bins -- --test-threads=1
 
       - name: Clippy
         run: cargo clippy --workspace
