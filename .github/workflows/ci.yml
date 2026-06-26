@@ -39,19 +39,13 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace
 
-      - name: Check rfuse3 runtime features
-        run: |
-          cargo check -p rfuse3 --no-default-features --features tokio-runtime
-          cargo check -p rfuse3 --no-default-features --features io-uring-runtime
-          cargo check -p rfuse3 --no-default-features --features async-io-runtime
-
       - name: Check BrewFS FUSE runtime features
         run: |
           cargo check -p brewfs --no-default-features --features fuse-tokio-runtime
           cargo check -p brewfs --no-default-features --features fuse-io-uring-runtime
 
       - name: Test workspace
-        run: cargo test --workspace --lib --bins
+        run: cargo test --workspace --lib --bins -- --test-threads=1
 
       - name: Clippy
         run: cargo clippy --workspace

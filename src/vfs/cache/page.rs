@@ -8,10 +8,11 @@ use crate::utils::zero::make_zero_bytes;
 use crate::vfs::config::WriteConfig;
 use bytes::{Bytes, BytesMut};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteAction {
     Overlap,
     Append,
+    GapAppend,
 }
 
 pub(crate) struct CacheSlice {
@@ -19,6 +20,7 @@ pub(crate) struct CacheSlice {
     len: u64,
     alloc_bytes: u64,
     pages: Vec<Option<Page>>,
+    written_ranges: Vec<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,16 +57,30 @@ impl CacheSlice {
             len: 0,
             alloc_bytes: 0,
             pages,
+            written_ranges: Vec::new(),
         }
     }
 
     pub(crate) fn can_write(&self, offset: u64, len: u64) -> Option<WriteAction> {
+        self.can_write_with_gap(offset, len, false)
+    }
+
+    pub(crate) fn can_write_with_gap(
+        &self,
+        offset: u64,
+        len: u64,
+        allow_gap: bool,
+    ) -> Option<WriteAction> {
         if self.can_append(offset) {
             return Some(WriteAction::Append);
         }
 
         if self.can_write_at(offset, len) {
             return Some(WriteAction::Overlap);
+        }
+
+        if allow_gap && self.can_gap_append(offset, len) {
+            return Some(WriteAction::GapAppend);
         }
 
         None
@@ -79,12 +95,39 @@ impl CacheSlice {
         match action {
             WriteAction::Append => self.append(buf),
             WriteAction::Overlap => self.write_at(offset, buf),
+            WriteAction::GapAppend => self.gap_append(offset, buf),
         }
     }
 
     pub(crate) fn can_write_at(&self, offset: u64, len: u64) -> bool {
         let end = offset.saturating_add(len);
         end <= self.len
+    }
+
+    pub(crate) fn can_gap_append(&self, offset: u64, len: u64) -> bool {
+        let end = offset.saturating_add(len);
+        offset > self.len && end <= self.config.layout.chunk_size
+    }
+
+    pub(crate) fn has_written_overlap(&self, offset: u64, len: u64) -> bool {
+        let end = offset.saturating_add(len);
+        if offset >= end {
+            return false;
+        }
+        self.written_ranges
+            .iter()
+            .any(|&(start, stop)| start < end && stop > offset)
+    }
+
+    pub(crate) fn contiguous_written_len(&self) -> u64 {
+        let mut cursor = 0;
+        for &(start, end) in &self.written_ranges {
+            if start > cursor {
+                break;
+            }
+            cursor = cursor.max(end);
+        }
+        cursor.min(self.len)
     }
 
     /// Use buffer to overlap specific range.
@@ -122,6 +165,7 @@ impl CacheSlice {
             }
         }
 
+        self.record_written(offset, offset + buf.len() as u64);
         Ok(())
     }
 
@@ -151,6 +195,19 @@ impl CacheSlice {
             self.len += read as u64;
         }
 
+        self.record_written(next_len - buf.len() as u64, next_len);
+        Ok(())
+    }
+
+    fn gap_append(&mut self, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        let end = offset.saturating_add(buf.len() as u64);
+        anyhow::ensure!(
+            offset > self.len && end <= self.config.layout.chunk_size,
+            "gap append exceeds slice bounds"
+        );
+
+        self.write_at(offset, buf)?;
+        self.len = end;
         Ok(())
     }
 
@@ -258,6 +315,28 @@ impl CacheSlice {
         freed
     }
 
+    pub(crate) fn truncate(&mut self, len: u64) -> anyhow::Result<u64> {
+        anyhow::ensure!(len <= self.len, "truncate exceeds slice length");
+
+        if len == self.len {
+            return Ok(0);
+        }
+
+        let page_size = self.config.page_size as u64;
+        let first_released = len.div_ceil(page_size).as_usize();
+        let mut freed = 0_u64;
+        for page in &mut self.pages[first_released..] {
+            if page.take().is_some() {
+                freed += page_size;
+            }
+        }
+
+        self.alloc_bytes = self.alloc_bytes.saturating_sub(freed);
+        self.len = len;
+        self.truncate_written(len);
+        Ok(freed)
+    }
+
     pub(crate) fn collect_pages(
         &mut self,
         start: usize,
@@ -353,6 +432,51 @@ impl CacheSlice {
     pub(crate) fn alloc_bytes(&self) -> u64 {
         self.alloc_bytes
     }
+
+    fn record_written(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+
+        let (mut merged_start, mut merged_end) = (start, end);
+        let mut out = Vec::with_capacity(self.written_ranges.len() + 1);
+        let mut inserted = false;
+
+        for &(range_start, range_end) in &self.written_ranges {
+            if range_end < merged_start {
+                out.push((range_start, range_end));
+            } else if merged_end < range_start {
+                if !inserted {
+                    out.push((merged_start, merged_end));
+                    inserted = true;
+                }
+                out.push((range_start, range_end));
+            } else {
+                merged_start = merged_start.min(range_start);
+                merged_end = merged_end.max(range_end);
+            }
+        }
+
+        if !inserted {
+            out.push((merged_start, merged_end));
+        }
+
+        self.written_ranges = out;
+    }
+
+    fn truncate_written(&mut self, len: u64) {
+        self.written_ranges = self
+            .written_ranges
+            .iter()
+            .filter_map(|&(start, end)| {
+                if start >= len {
+                    None
+                } else {
+                    Some((start, end.min(len)))
+                }
+            })
+            .collect();
+    }
 }
 
 #[derive(Clone)]
@@ -423,7 +547,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::chunk::ChunkLayout;
-    use crate::vfs::cache::page::CacheSlice;
+    use crate::vfs::cache::page::{CacheSlice, WriteAction};
     use crate::vfs::config::WriteConfig;
     use bytes::Bytes;
 
@@ -508,6 +632,21 @@ mod tests {
             pages_per_block + 1
         );
         assert_eq!(collect_all(&mut slice), data);
+    }
+
+    #[test]
+    fn test_truncate_releases_tail_pages_and_keeps_prefix() {
+        let (mut slice, data) = (CacheSlice::new(config()), patterned(4 * 1024 + 512, 13));
+
+        slice.append(&data).unwrap();
+        let before_alloc = slice.alloc_bytes();
+        let freed = slice.truncate(4 * 1024).unwrap();
+        slice.freeze();
+
+        assert!(freed > 0);
+        assert!(slice.alloc_bytes() < before_alloc);
+        assert_eq!(slice.len(), 4 * 1024);
+        assert_eq!(collect_all(&mut slice), data[..4 * 1024].to_vec());
     }
 
     #[test]
@@ -603,6 +742,66 @@ mod tests {
         assert!(slice.can_write_at(512, 512));
         assert!(!slice.can_write_at(1024, 1));
         assert!(!slice.can_write_at(900, 200));
+    }
+
+    #[test]
+    fn test_gap_append_extends_logical_len_with_zero_hole() {
+        let (mut slice, first, tail) = (
+            CacheSlice::new(config()),
+            patterned(512, 17),
+            patterned(256, 91),
+        );
+
+        slice.append(&first).unwrap();
+
+        assert_eq!(
+            slice.can_write_with_gap(1024, tail.len() as u64, false),
+            None
+        );
+        assert_eq!(
+            slice.can_write_with_gap(1024, tail.len() as u64, true),
+            Some(WriteAction::GapAppend)
+        );
+
+        slice.write(1024, &tail, WriteAction::GapAppend).unwrap();
+        assert_eq!(slice.contiguous_written_len(), first.len() as u64);
+        slice.freeze();
+
+        let mut expected = first.clone();
+        expected.extend(vec![0; 512]);
+        expected.extend_from_slice(&tail);
+
+        assert_eq!(slice.len(), expected.len() as u64);
+        assert_eq!(collect_all(&mut slice), expected);
+    }
+
+    #[test]
+    fn test_written_overlap_ignores_sparse_zero_hole_until_backfilled() {
+        let (mut slice, first, tail, middle) = (
+            CacheSlice::new(config()),
+            patterned(512, 17),
+            patterned(256, 91),
+            patterned(512, 131),
+        );
+
+        slice.append(&first).unwrap();
+        slice.write(1024, &tail, WriteAction::GapAppend).unwrap();
+
+        assert!(slice.has_written_overlap(0, 16));
+        assert!(!slice.has_written_overlap(512, 512));
+        assert!(slice.has_written_overlap(1024, 16));
+        assert_eq!(slice.contiguous_written_len(), first.len() as u64);
+
+        slice.write_at(512, &middle).unwrap();
+        assert_eq!(slice.contiguous_written_len(), 1280);
+        slice.freeze();
+
+        let mut expected = first.clone();
+        expected.extend_from_slice(&middle);
+        expected.extend_from_slice(&tail);
+
+        assert!(slice.has_written_overlap(512, 512));
+        assert_eq!(collect_all(&mut slice), expected);
     }
 
     #[test]

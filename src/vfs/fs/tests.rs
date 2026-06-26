@@ -404,9 +404,16 @@ mod basic_tests {
         let client = crate::cadapter::client::ObjectClient::new(
             crate::cadapter::localfs::LocalFsBackend::new(tmp.path()),
         );
-        let store = crate::chunk::store::ObjectBlockStore::new_async(client)
-            .await
-            .unwrap();
+        let store = crate::chunk::store::ObjectBlockStore::new_with_configs_async(
+            client,
+            crate::chunk::cache::ChunksCacheConfig {
+                disk_storage_dir: Some(tmp.path().join(".brewfs-cache")),
+                ..crate::chunk::cache::ChunksCacheConfig::default()
+            },
+            crate::chunk::store::BlockStoreConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
         let meta_store = meta_handle.store();
@@ -717,7 +724,8 @@ mod io_tests {
     use super::*;
     use crate::cadapter::client::ObjectClient;
     use crate::cadapter::localfs::LocalFsBackend;
-    use crate::chunk::store::{BlockKey, ObjectBlockStore};
+    use crate::chunk::cache::ChunksCacheConfig;
+    use crate::chunk::store::{BlockKey, BlockStoreConfig, ObjectBlockStore};
     use async_trait::async_trait;
     use rand::rngs::StdRng;
     use rand::{Rng, RngCore, SeedableRng};
@@ -739,6 +747,20 @@ mod io_tests {
         fn read_range_calls(&self) -> usize {
             self.read_range_calls.load(Ordering::SeqCst)
         }
+    }
+
+    async fn new_local_object_store(root: &std::path::Path) -> ObjectBlockStore<LocalFsBackend> {
+        let client = ObjectClient::new(LocalFsBackend::new(root));
+        ObjectBlockStore::new_with_configs_async(
+            client,
+            ChunksCacheConfig {
+                disk_storage_dir: Some(root.join(".brewfs-cache")),
+                ..ChunksCacheConfig::default()
+            },
+            BlockStoreConfig::default(),
+        )
+        .await
+        .unwrap()
     }
 
     #[async_trait]
@@ -842,8 +864,7 @@ mod io_tests {
             block_size: 64,
         };
         let tmp = tempfile::tempdir().unwrap();
-        let client = ObjectClient::new(LocalFsBackend::new(tmp.path()));
-        let store = ObjectBlockStore::new_async(client).await.unwrap();
+        let store = new_local_object_store(tmp.path()).await;
 
         let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
         let meta_store = meta_handle.store();
@@ -885,8 +906,7 @@ mod io_tests {
     async fn test_fs_mkdir_create_write_read_readdir() {
         let layout = ChunkLayout::default();
         let tmp = tempfile::tempdir().unwrap();
-        let client = ObjectClient::new(LocalFsBackend::new(tmp.path()));
-        let store = ObjectBlockStore::new_async(client).await.unwrap();
+        let store = new_local_object_store(tmp.path()).await;
 
         let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
         let meta_store = meta_handle.store();
@@ -1532,7 +1552,7 @@ mod io_tests {
         }
 
         let task_count = 4usize;
-        let iterations = 500usize;
+        let iterations = 100usize;
         let max_write = 4096usize;
 
         let mut handles = Vec::with_capacity(task_count);

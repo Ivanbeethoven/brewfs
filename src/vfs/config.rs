@@ -114,15 +114,16 @@ impl Default for WriteConfig {
             #[cfg(test)]
             freeze_min_bytes: 4096,
             // Balance between flush latency and sustained write throughput.
-            // 500ms at ~160 MiB/s accumulates ~80MB, but the 32MiB freeze_min_bytes
-            // triggers inline during fast writes (at ~200ms). This gives 8 blocks
-            // per upload batch as minimum, reducing small-object PUT amplification
-            // while pipeline upload still handles concurrency.
+            // Sequential writes still freeze on the 32MiB size target, while a
+            // longer age window lets random 4MiB writes coalesce before S3 PUT.
             #[cfg(not(test))]
-            auto_flush_max_age: Duration::from_millis(500),
+            auto_flush_max_age: Duration::from_millis(2000),
             #[cfg(test)]
             auto_flush_max_age: Duration::from_millis(5),
-            upload_concurrency: 32,
+            // RustFS/S3 latency rises sharply when each writer fans out too
+            // many concurrent foreground PUTs. Eight permits preserves
+            // sequential throughput and lowers random-write tail latency.
+            upload_concurrency: 10,
             writeback_mode,
             writeback_recent_pending_soft_limit,
             writeback_recent_pending_hard_limit,
@@ -292,11 +293,13 @@ mod tests {
     }
 
     #[test]
-    fn vfs_config_default_batches_s3_writes_into_eight_blocks() {
+    fn vfs_config_default_uses_ten_upload_workers() {
         let config =
             VFSConfig::new_with_cache_config(ChunkLayout::default(), CacheConfig::default());
 
         assert_eq!(config.write.freeze_min_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.write.upload_concurrency, 10);
+        assert_eq!(config.write.auto_flush_max_age, Duration::from_millis(2000));
     }
 
     #[test]

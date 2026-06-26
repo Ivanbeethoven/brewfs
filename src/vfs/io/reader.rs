@@ -12,6 +12,7 @@ use crate::meta::MetaLayer;
 use crate::utils::{Intervals, NumCastExt};
 use crate::vfs::Inode;
 use crate::vfs::backend::Backend;
+use crate::vfs::cache::prefetch::{PrefetchPriority, PrefetchTask, Prefetcher};
 use crate::vfs::chunk_id_for;
 use crate::vfs::config::ReadConfig;
 use crate::vfs::io::split_chunk_spans;
@@ -30,6 +31,24 @@ use tracing::Instrument;
 const DEFAULT_TOTAL_AHEAD_LIMIT: u64 = 256 * 1024 * 1024;
 const READ_SESSIONS: usize = 2;
 const MAX_SLICE_READ_RETRIES: u32 = 5;
+
+/// Send-able wrapper for one non-overlapping read output span.
+///
+/// SAFETY: Callers must build these from disjoint ranges of a stable backing
+/// buffer, then await all futures before the backing buffer is moved or dropped.
+struct ReadSpanBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+unsafe impl Send for ReadSpanBuf {}
+
+impl ReadSpanBuf {
+    /// SAFETY: the pointer must still be valid and uniquely owned by this span.
+    unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
 
 fn is_transient_read_error(e: &anyhow::Error) -> bool {
     let msg = format!("{e:?}").to_lowercase();
@@ -53,7 +72,7 @@ pub(crate) struct DataReader<B, M> {
     /// Per-handle readers, grouped by inode
     files: DashMap<u64, Vec<(u64, Arc<FileReader<B, M>>)>>, // ino -> (fh, reader)
     backend: Arc<Backend<B, M>>,
-    prefetcher: Option<Arc<dyn crate::vfs::cache::prefetch::Prefetcher>>,
+    prefetcher: Option<Arc<dyn Prefetcher>>,
     memory_budget: Option<MemoryBudget>,
 }
 
@@ -72,10 +91,7 @@ where
         }
     }
 
-    pub(crate) fn with_prefetcher(
-        mut self,
-        prefetcher: Arc<dyn crate::vfs::cache::prefetch::Prefetcher>,
-    ) -> Self {
+    pub(crate) fn with_prefetcher(mut self, prefetcher: Arc<dyn Prefetcher>) -> Self {
         self.prefetcher = Some(prefetcher);
         self
     }
@@ -133,10 +149,19 @@ where
         }
     }
 
-    /// Submit a prefetch task for the range following a completed read.
-    /// Called by the VFS after each successful read to warm the cache.
+    /// Submit a lightweight read-around task for the range following a
+    /// completed foreground read. BrewFS currently warms the shared object
+    /// block cache rather than FileReader-owned data buffers, so this remains
+    /// useful for true block-sized reads. Kernel-split sub-block FUSE reads are
+    /// intentionally ignored; prefetching after each fragment amplifies random
+    /// read workloads without reducing foreground copies.
     pub(crate) fn submit_prefetch(&self, ino: i64, fh: u64, offset: u64, read_len: u64) {
         if let Some(prefetcher) = &self.prefetcher {
+            let block_size = self.config.layout.block_size as u64;
+            if read_len < block_size {
+                return;
+            }
+
             if self
                 .memory_budget
                 .as_ref()
@@ -145,23 +170,21 @@ where
                 return;
             }
 
-            use crate::vfs::cache::prefetch::{PrefetchPriority, PrefetchTask};
-            let ahead_start = offset + read_len;
-            let mut ahead_len = read_len.max(self.config.layout.block_size as u64);
+            let mut ahead_len = read_len.max(block_size);
             if let Some(budget) = &self.memory_budget {
-                let block_size = self.config.layout.block_size as u64;
                 ahead_len = ((ahead_len as f64 * budget.readahead_factor()).ceil() as u64)
                     .max(block_size)
                     .min(self.config.max_ahead.max(block_size));
             }
-            let p = prefetcher.clone();
+
             let task = PrefetchTask {
                 ino,
-                start: ahead_start,
+                start: offset + read_len,
                 len: ahead_len,
                 priority: PrefetchPriority::Sequential,
                 owner_fh: fh,
             };
+            let p = prefetcher.clone();
             tokio::spawn(async move { p.submit(task).await });
         }
     }
@@ -284,9 +307,13 @@ impl Session {
     ) {
         let mut ahead = self.ahead;
 
-        if ahead == 0 && block_size <= max_ahead && (offset == 0 || self.total > len) {
-            // Start with 2 blocks to immediately fill the pipeline.
-            ahead = block_size.saturating_mul(2).min(max_ahead);
+        if ahead == 0
+            && block_size <= max_ahead
+            && (offset == 0 || (self.total > len && self.total >= block_size))
+        {
+            // Match JuiceFS' conservative initial readahead: start with one
+            // block, then grow if the stream proves sequential.
+            ahead = block_size.min(max_ahead);
         } else if ahead < max_ahead
             && self.total >= ahead
             && total_ahead_limit > usage.saturating_add(ahead.saturating_mul(4))
@@ -535,7 +562,8 @@ where
         offset: u64,
     ) -> Option<usize> {
         let sat = |s: &Session, offset: u64| {
-            s.last_off <= offset
+            s.total > 0
+                && s.last_off <= offset
                 && offset <= s.last_off + s.ahead + self.config.layout.block_size as u64
         };
 
@@ -561,7 +589,7 @@ where
     ) -> Option<usize> {
         let sat = |s: &Session, offset: u64| {
             let back = (s.ahead / 8).max(self.config.layout.block_size as u64);
-            offset < s.last_off && offset >= s.last_off.saturating_sub(back)
+            s.total > 0 && offset < s.last_off && offset >= s.last_off.saturating_sub(back)
         };
 
         let min_off = if sessions[0].last_off < sessions[1].last_off {
@@ -586,9 +614,11 @@ where
         len: usize,
     ) -> usize {
         if sessions[0].total == 0 {
+            sessions[0].reset(offset, len as u64);
             return 0;
         }
         if sessions[1].total == 0 {
+            sessions[1].reset(offset, len as u64);
             return 1;
         }
 
@@ -787,51 +817,39 @@ where
             );
         }
 
-        // Read demand data first — do not synchronously submit readahead
-        // before the foreground read.  The GlobalPrefetcher (VFS layer)
-        // handles asynchronous readahead after each successful read.
         let _ahead = self.check_session(offset, actual_len);
 
-        let mut chunks: Vec<Option<bytes::Bytes>> = vec![None; spans.len()];
+        let mut data = vec![0; actual_len];
         let result = async {
             let mut reads = FuturesUnordered::new();
-            for (idx, span) in spans.into_iter().enumerate() {
+            let mut cursor = 0;
+            for span in spans {
                 let span_len = span.len.as_usize();
+                let mut out = ReadSpanBuf {
+                    ptr: data[cursor..cursor + span_len].as_mut_ptr(),
+                    len: span_len,
+                };
+                cursor += span_len;
+
                 reads.push(async move {
-                    let data = self
-                        .read_chunk_span(span.index, span.offset, span_len)
-                        .await?;
-                    Ok::<_, anyhow::Error>((idx, data))
+                    // SAFETY: every ReadSpanBuf points at a disjoint range of
+                    // `data`, and all futures are awaited before `data` is used.
+                    let out = unsafe { out.as_mut_slice() };
+                    self.read_chunk_span_into(span.index, span.offset, out)
+                        .await
                 });
             }
 
             while let Some(res) = reads.next().await {
-                let (idx, data) = res?;
-                chunks[idx] = Some(data);
+                res?;
             }
 
-            Ok::<_, anyhow::Error>(actual_len)
+            Ok::<_, anyhow::Error>(())
         }
         .instrument(tracing::trace_span!("read_at.read_spans"))
         .await;
 
         drop(pin_guard);
-
-        // Assemble Bytes chunks into output
-        let data = if result.is_ok() {
-            let total: usize = chunks
-                .iter()
-                .filter_map(|chunk| chunk.as_ref())
-                .map(|chunk| chunk.len())
-                .sum();
-            let mut out = Vec::with_capacity(total);
-            for chunk in chunks.iter().filter_map(|chunk| chunk.as_ref()) {
-                out.extend_from_slice(chunk);
-            }
-            out
-        } else {
-            Vec::new()
-        };
 
         if should_clean {
             self.cleanup_invalid()
@@ -844,15 +862,12 @@ where
     // Read one chunk span directly into the caller buffer through DataFetcher →
     // BlockStore, using the per-handle chunk→slice metadata cache to skip
     // repeated meta queries within the same chunk.
-    /// Serve the chunk span directly from the block cache when possible,
-    /// returning the cached Bytes (zero-copy Arc bump).  Falls back to
-    /// DataFetcher for cache misses.
-    async fn read_chunk_span(
+    async fn read_chunk_span_into(
         &self,
         index: u64,
         offset: u64,
-        len: usize,
-    ) -> anyhow::Result<bytes::Bytes> {
+        out: &mut [u8],
+    ) -> anyhow::Result<()> {
         let chunk_id = chunk_id_for(self.inode.ino(), index)?;
 
         for attempt in 0..MAX_SLICE_READ_RETRIES {
@@ -870,21 +885,23 @@ where
                     }
                 };
 
-                let mut fetcher = DataFetcher::with_slices(
+                DataFetcher::read_at_into_from_slices(
                     self.config.layout,
                     chunk_id,
                     &self.backend,
-                    (*slices_arc).clone(),
-                );
-                fetcher.read_at(offset.into(), len).await
+                    slices_arc.as_slice(),
+                    offset.into(),
+                    out,
+                )
+                .await
             }
             .await;
 
             match result {
-                Ok(data) => {
-                    self.complete_demand_slices(index, offset, len, None::<&anyhow::Error>)
+                Ok(()) => {
+                    self.complete_demand_slices(index, offset, out.len(), None::<&anyhow::Error>)
                         .await;
-                    return Ok(bytes::Bytes::from(data));
+                    return Ok(());
                 }
                 Err(err)
                     if attempt + 1 < MAX_SLICE_READ_RETRIES && is_transient_read_error(&err) =>
@@ -898,7 +915,7 @@ where
                     tokio::time::sleep(retry_delay(attempt)).await;
                 }
                 Err(err) => {
-                    self.complete_demand_slices(index, offset, len, Some(&err))
+                    self.complete_demand_slices(index, offset, out.len(), Some(&err))
                         .await;
                     return Err(err);
                 }

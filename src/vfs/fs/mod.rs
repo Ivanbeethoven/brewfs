@@ -334,7 +334,10 @@ where
         }
         let reader = Arc::new(reader_builder);
 
-        let write_back = {
+        let write_back = if matches!(
+            config.cache.writeback_mode,
+            crate::vfs::cache::config::WriteBackMode::CommitBeforeUpload
+        ) {
             let cache_root = config.cache.cache_root.join("writeback");
             let _ = std::fs::create_dir_all(&cache_root);
             let wb = Arc::new(
@@ -344,9 +347,8 @@ where
                 ),
             );
 
-            // Crash recovery: scan for dirty slices from a previous session.
-            // Skip in test builds to avoid cross-test contamination from
-            // leftover dirty slice files in the shared temp directory.
+            // Crash recovery is only needed when metadata can be committed
+            // before object upload completes.
             #[cfg(not(test))]
             {
                 let wb_clone = wb.clone();
@@ -358,6 +360,8 @@ where
             }
 
             Some(wb)
+        } else {
+            None
         };
 
         let mut writer_builder =
@@ -579,6 +583,13 @@ where
     background_tasks: Option<VfsBackgroundTasks>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CreateFileAtResult {
+    pub(crate) ino: i64,
+    pub(crate) created: bool,
+    pub(crate) attrs_applied: bool,
+}
+
 impl<S, M> Clone for VFS<S, M>
 where
     S: BlockStore + Send + Sync + 'static,
@@ -795,6 +806,14 @@ where
                         dirty.backpressure_soft_sleep_us,
                         dirty.backpressure_hard_wait_ops,
                         dirty.backpressure_hard_wait_us,
+                    );
+                    fuse_stats.sync_writeback_buffer_backpressure_metrics(
+                        dirty.buffer_soft_sleep_ops,
+                        dirty.buffer_soft_sleep_us,
+                        dirty.buffer_moderate_sleep_ops,
+                        dirty.buffer_moderate_sleep_us,
+                        dirty.buffer_hard_sleep_ops,
+                        dirty.buffer_hard_sleep_us,
                     );
                     fuse_stats.sync_writeback_phase_metrics(
                         dirty.stage_inflight_bytes,
@@ -1385,14 +1404,18 @@ where
         self.mkdir_at_inner(parent_ino, name, false).await
     }
 
-    /// Create or open a regular file using a parent inode and entry name directly.
-    #[tracing::instrument(level = "debug", skip(self), fields(parent_ino, name, create_new))]
-    pub(crate) async fn create_file_at(
+    #[tracing::instrument(
+        level = "debug",
+        skip(self),
+        fields(parent_ino, name, create_new, has_attrs = create_attrs.is_some())
+    )]
+    async fn create_file_at_inner(
         &self,
         parent_ino: i64,
         name: &str,
         create_new: bool,
-    ) -> Result<i64, VfsError> {
+        create_attrs: Option<(u32, u32, u32)>,
+    ) -> Result<CreateFileAtResult, VfsError> {
         let _total_timer = self.vfs_timing_timer(
             &self.stats().vfs_create_total_ops,
             &self.stats().vfs_create_total_lat_us,
@@ -1406,11 +1429,39 @@ where
                 &self.stats().vfs_create_meta_ops,
                 &self.stats().vfs_create_meta_lat_us,
             );
-            self.meta_create_file(parent_ino, name.to_string()).await
+            if let Some((mode, uid, gid)) = create_attrs {
+                match self
+                    .meta_create_node(
+                        parent_ino,
+                        name.to_string(),
+                        FileType::File,
+                        mode,
+                        uid,
+                        gid,
+                        0,
+                    )
+                    .await
+                {
+                    Ok(ino) => Ok((ino, true)),
+                    Err(VfsError::Unsupported) => self
+                        .meta_create_file(parent_ino, name.to_string())
+                        .await
+                        .map(|ino| (ino, false)),
+                    Err(err) => Err(err),
+                }
+            } else {
+                self.meta_create_file(parent_ino, name.to_string())
+                    .await
+                    .map(|ino| (ino, false))
+            }
         };
 
         match create_result {
-            Ok(ino) => Ok(ino),
+            Ok((ino, attrs_applied)) => Ok(CreateFileAtResult {
+                ino,
+                created: true,
+                attrs_applied,
+            }),
             Err(VfsError::AlreadyExists { .. }) => {
                 if create_new {
                     return Err(VfsError::AlreadyExists {
@@ -1428,7 +1479,11 @@ where
                         path: PathHint::none(),
                     })
                 } else {
-                    Ok(existing)
+                    Ok(CreateFileAtResult {
+                        ino: existing,
+                        created: false,
+                        attrs_applied: false,
+                    })
                 }
             }
             Err(VfsError::NotFound { path }) => {
@@ -1443,6 +1498,45 @@ where
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Create or open a regular file using a parent inode and entry name directly.
+    #[tracing::instrument(level = "debug", skip(self), fields(parent_ino, name, create_new))]
+    pub(crate) async fn create_file_at(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        create_new: bool,
+    ) -> Result<i64, VfsError> {
+        Ok(self
+            .create_file_at_inner(parent_ino, name, create_new, None)
+            .await?
+            .ino)
+    }
+
+    /// Create or open a regular file and ask capable metadata backends to apply
+    /// mode/uid/gid in the same metadata mutation.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self),
+        fields(parent_ino, name, create_new, mode, uid, gid)
+    )]
+    pub(crate) async fn create_file_at_with_attrs(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        create_new: bool,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<CreateFileAtResult, VfsError> {
+        self.create_file_at_inner(
+            parent_ino,
+            name,
+            create_new,
+            Some((mode & 0o7777, uid, gid)),
+        )
+        .await
     }
 
     /// Create a non-directory special node using a parent inode and entry name.
@@ -1627,6 +1721,54 @@ where
         let new_parent_attr = self
             .meta_stat_required(new_parent_ino, PathHint::none())
             .await?;
+
+        self.rename_at_with_known_attrs(
+            old_parent_ino,
+            old_name,
+            new_parent_ino,
+            new_name.to_string(),
+            src_ino,
+            &src_attr,
+            &new_parent_attr,
+            None,
+        )
+        .await
+    }
+
+    /// Rename after the caller has already resolved the source inode and
+    /// destination parent attributes. This avoids duplicate lookup/stat work in
+    /// the FUSE rename path while keeping VFS-level circular-directory checks.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, src_attr, new_parent_attr),
+        fields(old_parent_ino, old_name, new_parent_ino, new_name, src_ino)
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn rename_at_with_known_attrs(
+        &self,
+        old_parent_ino: i64,
+        old_name: &str,
+        new_parent_ino: i64,
+        new_name: String,
+        src_ino: i64,
+        src_attr: &FileAttr,
+        new_parent_attr: &FileAttr,
+        known_dest_ino: Option<Option<i64>>,
+    ) -> Result<(), VfsError> {
+        if old_name.is_empty()
+            || new_name.is_empty()
+            || old_name.contains('/')
+            || old_name.contains('\0')
+            || new_name.contains('/')
+            || new_name.contains('\0')
+        {
+            return Err(VfsError::InvalidFilename);
+        }
+
+        if old_parent_ino == new_parent_ino && old_name == new_name {
+            return Ok(());
+        }
+
         if new_parent_attr.kind != FileType::Dir {
             return Err(VfsError::NotADirectory {
                 path: PathHint::none(),
@@ -1643,11 +1785,21 @@ where
             });
         }
 
-        self.meta_rename(
+        let (dest_ino, destination_checked) = match known_dest_ino {
+            Some(dest_ino) => (dest_ino, true),
+            None => (None, false),
+        };
+
+        self.meta_rename_with_known_attrs(
             old_parent_ino,
             old_name,
             new_parent_ino,
-            new_name.to_string(),
+            new_name,
+            src_ino,
+            src_attr.clone(),
+            new_parent_attr.clone(),
+            dest_ino,
+            destination_checked,
         )
         .await?;
 
@@ -2392,7 +2544,10 @@ where
                 &self.state.stats.vfs_read_handle_ops,
                 &self.state.stats.vfs_read_handle_lat_us,
             );
-            handle.read(offset, len).await.map_err(VfsError::from)?
+            handle
+                .read(offset, actual_len)
+                .await
+                .map_err(VfsError::from)?
         };
         {
             let _overlay_timer = self.vfs_timing_timer(
