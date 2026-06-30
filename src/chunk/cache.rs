@@ -235,12 +235,8 @@ impl ChunksCacheConfig {
 }
 
 fn recent_write_hot_capacity(max_hot_bytes: u64) -> u64 {
-    if max_hot_bytes == 0 {
-        return 0;
-    }
-    let three_quarters = max_hot_bytes.saturating_mul(3) / 4;
-    let floor = max_hot_bytes.min(64 * 1024 * 1024);
-    three_quarters.max(floor).min(3 * 1024 * 1024 * 1024)
+    const MAX_RECENT_WRITE_HOT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    max_hot_bytes.min(MAX_RECENT_WRITE_HOT_BYTES)
 }
 
 #[derive(Clone)]
@@ -2291,11 +2287,11 @@ mod tests {
         );
         assert_eq!(
             recent_write_hot_capacity(4 * 1024 * 1024 * 1024),
-            3 * 1024 * 1024 * 1024
+            4 * 1024 * 1024 * 1024
         );
         assert_eq!(
             recent_write_hot_capacity(16 * 1024 * 1024 * 1024),
-            3 * 1024 * 1024 * 1024
+            4 * 1024 * 1024 * 1024
         );
     }
 
