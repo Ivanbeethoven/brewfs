@@ -154,8 +154,12 @@ $env:BREWFS_APT_MIRROR = "http://<debian-mirror-host>" # optional
 pwsh docker/compose-xfstests/run_redis_perf_wslc.ps1
 ```
 
-The runner verifies the FUSE mount before running fio and writes machine-readable
-reports to `docker/compose-xfstests/artifacts/`.
+The default runner executes the same seven fio profiles as
+`run_redis_perf.sh` (`bigwrite`, `bigread`, sequential read/write, random
+read/write, and mixed random I/O), verifies the FUSE mount, and writes a
+separate JSON report for every profile. Each run receives a fresh directory
+under `docker/compose-xfstests/artifacts/`; select a smaller subset with, for
+example, `-Tools fio-seqwrite,fio-randrw`.
 
 ## Quick Start
 

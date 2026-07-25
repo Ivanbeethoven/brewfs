@@ -53,7 +53,7 @@ services:
     volumes:
       - ${BREWFS_BINARY_DIR:-../../target/docker}:/brewfs-bin:ro
       - ./wslc-tools:/wslc-tools:ro
-      - ./artifacts:/artifacts
+      - ${BREWFS_ARTIFACTS_DIR:-./artifacts}:/artifacts
 
 volumes:
   brewfs-redis-data:
