@@ -3,6 +3,8 @@ param(
     [string]$WslcCompose = $env:WSLC_COMPOSE,
     [string]$BrewfsBinaryDir,
     [string]$AptMirror = $env:BREWFS_APT_MIRROR,
+    [ValidateSet("s3", "local-fs")]
+    [string]$DataBackend = "s3",
     [switch]$Keep
 )
 
@@ -32,6 +34,7 @@ if (-not (Test-Path -LiteralPath $BrewfsBinary -PathType Leaf)) {
 
 New-Item -ItemType Directory -Path $ArtifactsDir -Force | Out-Null
 $env:BREWFS_BINARY_DIR = $BrewfsBinaryDir
+$env:BREWFS_DATA_BACKEND = $DataBackend
 if (-not $env:WSLC_COMPOSE_SDK_TIMEOUT_SECS) {
     $env:WSLC_COMPOSE_SDK_TIMEOUT_SECS = "0"
 }
@@ -65,6 +68,7 @@ try {
     }
 
     [pscustomobject]@{
+        DataBackend       = $DataBackend
         WriteMiBPerSecond = [math]::Round($writeJob.write.bw / 1024, 2)
         WriteIops         = [math]::Round($writeJob.write.iops, 2)
         ReadMiBPerSecond  = [math]::Round($readJob.read.bw / 1024, 2)
