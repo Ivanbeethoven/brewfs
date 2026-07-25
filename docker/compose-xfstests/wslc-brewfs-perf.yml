@@ -1,0 +1,38 @@
+services:
+  redis:
+    image: ${BREWFS_REDIS_IMAGE:-docker.io/library/redis:7.2-alpine}
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+    ports:
+      - "127.0.0.1:26379:6379"
+    volumes:
+      - brewfs-redis-data:/data
+
+  perf:
+    image: ${BREWFS_PERF_BASE_IMAGE:-docker.io/library/debian:trixie-slim}
+    privileged: true
+    depends_on:
+      - redis
+    command:
+      - sh
+      - -c
+      - while true; do sleep 3600; done
+    environment:
+      REDIS_URL: redis://redis:6379
+      BREWFS_META_BACKEND: redis
+      BREWFS_META_URL: redis://redis:6379/0
+      BREWFS_DATA_BACKEND: local-fs
+      BREWFS_DATA_DIR: /var/lib/brewfs/data
+      BREWFS_MOUNT_POINT: /mnt/brewfs
+      BREWFS_HOME: /var/lib/brewfs
+      BREWFS_APT_MIRROR: ${BREWFS_APT_MIRROR:-}
+      RUST_LOG: brewfs=info
+    volumes:
+      - ${BREWFS_BINARY_DIR:-../../target/docker}:/brewfs-bin:ro
+      - ./wslc-tools:/wslc-tools:ro
+      - ./artifacts:/artifacts
+
+volumes:
+  brewfs-redis-data:

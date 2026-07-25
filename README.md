@@ -143,6 +143,20 @@ JFS_COMPRESS=none \
   bash docker/compose-xfstests/run_juicefs_perf.sh --writeback-throughput-profile
 ```
 
+On Windows, the WSLC smoke benchmark requires a WSL Containers runtime that
+provides privileged containers with `/dev/fuse`, a Linux BrewFS binary at
+`target/docker/brewfs`, and `wslc-compose` on `PATH` (or in `WSLC_COMPOSE`):
+
+```powershell
+$env:WSLC_SDK_PATH = "<path-to-wslcsdk.dll>"
+$env:WSLC_REGISTRY_MIRROR = "<docker-hub-mirror-host>" # optional
+$env:BREWFS_APT_MIRROR = "http://<debian-mirror-host>" # optional
+pwsh docker/compose-xfstests/run_redis_perf_wslc.ps1
+```
+
+The runner verifies the FUSE mount before running fio and writes machine-readable
+reports to `docker/compose-xfstests/artifacts/`.
+
 ## Quick Start
 
 Install a complete single-node Linux stack with Redis, RustFS, systemd, and a BrewFS FUSE mount:
