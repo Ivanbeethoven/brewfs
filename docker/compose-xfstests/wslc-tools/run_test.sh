@@ -4,6 +4,9 @@ set -eu
 DEFAULT_FIO_TOOLS="fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw"
 MOUNT_DIR=/mnt/brewfs
 BREWFS_PID=""
+BREWFS_LOG=/artifacts/brewfs.log
+BREWFS_LOG_INITIALIZED=false
+BREWFS_CONFIG=/tmp/brewfs-wslc-perf.yaml
 
 echo "=== brewfs wslc-compose perf test ==="
 echo "Installing dependencies..."
@@ -34,6 +37,25 @@ mkdir -p "$MOUNT_DIR" /var/lib/brewfs/data /artifacts
 test -c /dev/fuse
 
 data_backend="${BREWFS_DATA_BACKEND:-s3}"
+# The WSLC guest currently has about 2 GiB of RAM. BrewFS's normal cache
+# defaults target larger Linux hosts and can let the mixed fio workload OOM the
+# mount process. Keep this runner bounded while allowing callers to override
+# each value for a larger WSLC guest.
+BREWFS_READ_MEMORY_BYTES="${BREWFS_READ_MEMORY_BYTES:-268435456}"
+BREWFS_WRITE_MEMORY_BYTES="${BREWFS_WRITE_MEMORY_BYTES:-134217728}"
+BREWFS_MEMORY_BUDGET_BYTES="${BREWFS_MEMORY_BUDGET_BYTES:-536870912}"
+
+write_brewfs_config() {
+    cat >"$BREWFS_CONFIG" <<EOF
+cache:
+  read_memory_bytes: ${BREWFS_READ_MEMORY_BYTES}
+  write_memory_bytes: ${BREWFS_WRITE_MEMORY_BYTES}
+  memory_budget_bytes: ${BREWFS_MEMORY_BUDGET_BYTES}
+EOF
+    cp "$BREWFS_CONFIG" /artifacts/brewfs-config.yaml
+}
+
+write_brewfs_config
 if [ "$data_backend" = "s3" ]; then
     : "${BREWFS_S3_BUCKET:?BREWFS_S3_BUCKET is required for the s3 backend}"
     : "${BREWFS_S3_ENDPOINT:?BREWFS_S3_ENDPOINT is required for the s3 backend}"
@@ -70,8 +92,14 @@ trap cleanup EXIT INT TERM
 
 start_brewfs() {
     echo "Starting brewfs..."
+    if [ "$BREWFS_LOG_INITIALIZED" = false ]; then
+        : >"$BREWFS_LOG"
+        BREWFS_LOG_INITIALIZED=true
+    else
+        printf '\n=== BrewFS remount ===\n' >>"$BREWFS_LOG"
+    fi
     if [ "$data_backend" = "s3" ]; then
-        /brewfs-bin/brewfs mount --privileged \
+        /brewfs-bin/brewfs mount --privileged --config "$BREWFS_CONFIG" \
             --meta-backend "${BREWFS_META_BACKEND:-redis}" \
             --meta-url "${BREWFS_META_URL:-redis://redis:6379/0}" \
             --data-backend s3 \
@@ -79,14 +107,14 @@ start_brewfs() {
             --s3-endpoint "$BREWFS_S3_ENDPOINT" \
             --s3-region "${BREWFS_S3_REGION:-us-east-1}" \
             --s3-force-path-style="${BREWFS_S3_FORCE_PATH_STYLE:-true}" \
-            "$MOUNT_DIR" &
+            "$MOUNT_DIR" >>"$BREWFS_LOG" 2>&1 &
     else
-        /brewfs-bin/brewfs mount --privileged \
+        /brewfs-bin/brewfs mount --privileged --config "$BREWFS_CONFIG" \
             --meta-backend "${BREWFS_META_BACKEND:-redis}" \
             --meta-url "${BREWFS_META_URL:-redis://redis:6379/0}" \
             --data-backend local-fs \
             --data-dir "${BREWFS_DATA_DIR:-/var/lib/brewfs/data}" \
-            "$MOUNT_DIR" &
+            "$MOUNT_DIR" >>"$BREWFS_LOG" 2>&1 &
     fi
     BREWFS_PID=$!
 
@@ -162,11 +190,15 @@ prepare_fio_dataset() {
         >"/artifacts/${tool}-prepare.log" 2>&1
 }
 
-remount_for_cold_read() {
-    echo "Remounting BrewFS before read profile..."
+remount_brewfs() {
     sync
     stop_brewfs
     start_brewfs
+}
+
+remount_for_cold_read() {
+    echo "Remounting BrewFS before read profile..."
+    remount_brewfs
 }
 
 run_fio_profile() {
@@ -317,20 +349,31 @@ run_fio_profile() {
 
 PERF_TOOLS="${PERF_TOOLS:-$DEFAULT_FIO_TOOLS}"
 printf '%s\n' "$PERF_TOOLS" > /artifacts/fio-profiles.txt
-env | sort | grep '^PERF_FIO_' > /artifacts/fio-environment.txt || true
+{
+    printf 'PERF_FIO_REMOUNT_BETWEEN_PROFILES=%s\n' "${PERF_FIO_REMOUNT_BETWEEN_PROFILES:-true}"
+    env | sort | grep '^PERF_FIO_' || true
+} > /artifacts/fio-environment.txt
 
 start_brewfs
+first_profile=true
 for tool in $PERF_TOOLS; do
+    if [ "$first_profile" = false ] && is_true "${PERF_FIO_REMOUNT_BETWEEN_PROFILES:-true}"; then
+        echo "Remounting BrewFS between fio profiles..."
+        remount_brewfs
+    fi
     run_fio_profile "$tool"
+    first_profile=false
 done
 
 if [ "$data_backend" = "s3" ]; then
     echo "Verifying fio data reached RustFS..."
     aws --endpoint-url "$BREWFS_S3_ENDPOINT" s3api list-objects-v2 \
         --bucket "$BREWFS_S3_BUCKET" \
+        --no-paginate \
         --output json >/artifacts/rustfs-objects.json
     object_count=$(aws --endpoint-url "$BREWFS_S3_ENDPOINT" s3api list-objects-v2 \
         --bucket "$BREWFS_S3_BUCKET" \
+        --no-paginate \
         --query 'length(Contents)' \
         --output text)
     test "$object_count" -gt 0

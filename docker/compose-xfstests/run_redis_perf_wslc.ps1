@@ -111,6 +111,22 @@ function Add-FioEnvironment {
         }
 }
 
+function Add-BrewfsCacheEnvironment {
+    param([System.Collections.Generic.List[string]]$Arguments)
+
+    @(
+        "BREWFS_READ_MEMORY_BYTES",
+        "BREWFS_WRITE_MEMORY_BYTES",
+        "BREWFS_MEMORY_BUDGET_BYTES"
+    ) | ForEach-Object {
+        $item = Get-Item -LiteralPath "Env:$_" -ErrorAction SilentlyContinue
+        if ($null -ne $item) {
+            $Arguments.Add("-e")
+            $Arguments.Add(("{0}={1}" -f @($_, $item.Value)))
+        }
+    }
+}
+
 function Read-FioReport {
     param([string]$Tool)
 
@@ -149,6 +165,9 @@ try {
     Start-WslcService -Service redis
     Start-WslcService -Service rustfs
     Start-WslcService -Service perf
+    # The SDK reports the container as started before its exec endpoint is
+    # consistently ready. Avoid racing the first benchmark command.
+    Start-Sleep -Seconds 2
 
     $execArgs = [System.Collections.Generic.List[string]]@("exec")
     if ($AptMirror) {
@@ -158,6 +177,7 @@ try {
     $execArgs.Add("-e")
     $execArgs.Add("PERF_TOOLS=$($Tools -join ' ')")
     Add-FioEnvironment -Arguments $execArgs
+    Add-BrewfsCacheEnvironment -Arguments $execArgs
     $execArgs.Add("perf")
     $execArgs.Add("sh")
     $execArgs.Add("/wslc-tools/run_test.sh")
