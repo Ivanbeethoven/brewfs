@@ -15,6 +15,7 @@ param(
         "fio-randrw"
     ),
     [string]$ArtifactsDir,
+    [string]$WslcStateRoot = $env:WSLC_COMPOSE_STATE_ROOT,
     [switch]$Keep
 )
 
@@ -22,7 +23,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = $PSScriptRoot
 $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
 $ComposeFile = Join-Path $ScriptDir "wslc-brewfs-perf.yml"
-$ProjectName = "brewfs-wslc-perf-{0}-{1}" -f (Get-Date -Format "yyyyMMddHHmmss"), $PID
+$ProjectPrefix = "brewfs-wslc-perf-{0}-{1}" -f (Get-Date -Format "yyyyMMddHHmmss"), $PID
 $SupportedTools = @(
     "fio-bigwrite",
     "fio-bigread",
@@ -41,9 +42,13 @@ if ($unknownTools.Count -ne 0) {
     throw "Unsupported fio profile(s): $($unknownTools -join ', '). Supported values: $($SupportedTools -join ', ')"
 }
 if (-not $ArtifactsDir) {
-    $ArtifactsDir = Join-Path (Join-Path $ScriptDir "artifacts") $ProjectName
+    $ArtifactsDir = Join-Path (Join-Path $ScriptDir "artifacts") $ProjectPrefix
 }
 $ArtifactsDir = [System.IO.Path]::GetFullPath($ArtifactsDir)
+if (-not $WslcStateRoot) {
+    $WslcStateRoot = Join-Path "D:\\wslc-compose-tests" $ProjectPrefix
+}
+$WslcStateRoot = [System.IO.Path]::GetFullPath($WslcStateRoot)
 
 if (-not $WslcCompose) {
     $command = Get-Command wslc-compose -ErrorAction SilentlyContinue
@@ -66,12 +71,16 @@ New-Item -ItemType Directory -Path $ArtifactsDir -Force | Out-Null
 $env:BREWFS_BINARY_DIR = $BrewfsBinaryDir
 $env:BREWFS_DATA_BACKEND = $DataBackend
 $env:BREWFS_ARTIFACTS_DIR = $ArtifactsDir
+$env:WSLC_COMPOSE_STATE_ROOT = $WslcStateRoot
 if (-not $env:WSLC_COMPOSE_SDK_TIMEOUT_SECS) {
     $env:WSLC_COMPOSE_SDK_TIMEOUT_SECS = "0"
 }
 
 function Invoke-WslcCompose {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$ComposeArgs)
+    param(
+        [string]$ProjectName,
+        [Parameter(ValueFromRemainingArguments = $true)][string[]]$ComposeArgs
+    )
 
     & $WslcCompose -f $ComposeFile -p $ProjectName @ComposeArgs
     if ($LASTEXITCODE -ne 0) {
@@ -80,13 +89,16 @@ function Invoke-WslcCompose {
 }
 
 function Start-WslcService {
-    param([string]$Service)
+    param(
+        [string]$ProjectName,
+        [string]$Service
+    )
 
     # Service creation is idempotent. Retry it because the WSLC SDK can
     # transiently drop an RPC response while it is bringing up a container.
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         try {
-            Invoke-WslcCompose -ComposeArgs @("up", "-d", $Service)
+            Invoke-WslcCompose -ProjectName $ProjectName -ComposeArgs @("up", "-d", $Service)
             return
         }
         catch {
@@ -97,6 +109,20 @@ function Start-WslcService {
             Start-Sleep -Seconds 2
         }
     }
+}
+
+function Test-RustfsObjectReport {
+    param([string]$Tool)
+
+    $objectPath = Join-Path $ArtifactsDir "rustfs-objects.json"
+    if (-not (Test-Path -LiteralPath $objectPath -PathType Leaf)) {
+        throw "Missing RustFS object report at $objectPath"
+    }
+    $objectReport = Get-Content -LiteralPath $objectPath -Raw | ConvertFrom-Json
+    if (-not $objectReport.Contents -or $objectReport.Contents.Count -eq 0) {
+        throw "fio completed but no data objects were found in RustFS for $Tool"
+    }
+    Copy-Item -LiteralPath $objectPath -Destination (Join-Path $ArtifactsDir "$Tool-rustfs-objects.json") -Force
 }
 
 function Add-FioEnvironment {
@@ -158,53 +184,51 @@ function Read-FioReport {
     }
 }
 
-try {
-    Write-Host "[wslc-compose] Starting project $ProjectName"
-    # WSLC SDK service creation is reliable when dependencies are started one
-    # at a time; a single multi-service up can lose its RPC response.
-    Start-WslcService -Service redis
-    Start-WslcService -Service rustfs
-    Start-WslcService -Service perf
-    # The SDK reports the container as started before its exec endpoint is
-    # consistently ready. Avoid racing the first benchmark command.
-    Start-Sleep -Seconds 2
+$reports = [System.Collections.Generic.List[object]]::new()
+for ($index = 0; $index -lt $Tools.Count; $index++) {
+    $tool = $Tools[$index]
+    $ProjectName = "$ProjectPrefix-$($index + 1)"
 
-    $execArgs = [System.Collections.Generic.List[string]]@("exec")
-    if ($AptMirror) {
+    try {
+        Write-Host "[wslc-compose] Starting project $ProjectName for $tool"
+        # A separate service lifecycle gives every profile an empty RustFS
+        # volume. This prevents large prefill datasets from exhausting the
+        # object-store disk before later profiles can run.
+        Start-WslcService -ProjectName $ProjectName -Service redis
+        Start-WslcService -ProjectName $ProjectName -Service rustfs
+        Start-WslcService -ProjectName $ProjectName -Service perf
+        Start-Sleep -Seconds 2
+
+        $execArgs = [System.Collections.Generic.List[string]]@("exec")
+        if ($AptMirror) {
+            $execArgs.Add("-e")
+            $execArgs.Add("BREWFS_APT_MIRROR=$AptMirror")
+        }
         $execArgs.Add("-e")
-        $execArgs.Add("BREWFS_APT_MIRROR=$AptMirror")
-    }
-    $execArgs.Add("-e")
-    $execArgs.Add("PERF_TOOLS=$($Tools -join ' ')")
-    Add-FioEnvironment -Arguments $execArgs
-    Add-BrewfsCacheEnvironment -Arguments $execArgs
-    $execArgs.Add("perf")
-    $execArgs.Add("sh")
-    $execArgs.Add("/wslc-tools/run_test.sh")
-    Invoke-WslcCompose -ComposeArgs $execArgs.ToArray()
+        $execArgs.Add("PERF_TOOLS=$tool")
+        Add-FioEnvironment -Arguments $execArgs
+        Add-BrewfsCacheEnvironment -Arguments $execArgs
+        $execArgs.Add("perf")
+        $execArgs.Add("sh")
+        $execArgs.Add("/wslc-tools/run_test.sh")
+        Invoke-WslcCompose -ProjectName $ProjectName -ComposeArgs $execArgs.ToArray()
 
-    $reports = @($Tools | ForEach-Object { Read-FioReport -Tool $_ })
-    if ($DataBackend -eq "s3") {
-        $objectPath = Join-Path $ArtifactsDir "rustfs-objects.json"
-        if (-not (Test-Path -LiteralPath $objectPath -PathType Leaf)) {
-            throw "Missing RustFS object report at $objectPath"
-        }
-        $objectReport = Get-Content -LiteralPath $objectPath -Raw | ConvertFrom-Json
-        if (-not $objectReport.Contents -or $objectReport.Contents.Count -eq 0) {
-            throw "fio completed but no data objects were found in RustFS"
+        $reports.Add((Read-FioReport -Tool $tool))
+        if ($DataBackend -eq "s3") {
+            Test-RustfsObjectReport -Tool $tool
         }
     }
+    finally {
+        if ($Keep) {
+            Write-Host "[wslc-compose] Keeping project $ProjectName"
+        }
+        else {
+            Write-Host "[wslc-compose] Cleaning up project $ProjectName"
+            & $WslcCompose -f $ComposeFile -p $ProjectName down --volumes --timeout 5
+        }
+    }
+}
 
-    Write-Host "[wslc-compose] Completed fio profiles against $DataBackend"
-    $reports | Format-Table Profile, ReadMiBPerSecond, ReadIops, WriteMiBPerSecond, WriteIops -AutoSize
-    Write-Host "[wslc-compose] Artifacts: $ArtifactsDir"
-}
-finally {
-    if ($Keep) {
-        Write-Host "[wslc-compose] Keeping project $ProjectName"
-    }
-    else {
-        Write-Host "[wslc-compose] Cleaning up project $ProjectName"
-        & $WslcCompose -f $ComposeFile -p $ProjectName down --volumes --timeout 5
-    }
-}
+Write-Host "[wslc-compose] Completed fio profiles against $DataBackend"
+$reports | Format-Table Profile, ReadMiBPerSecond, ReadIops, WriteMiBPerSecond, WriteIops -AutoSize
+Write-Host "[wslc-compose] Artifacts: $ArtifactsDir"

@@ -157,12 +157,11 @@ pwsh docker/compose-xfstests/run_redis_perf_wslc.ps1
 The default runner executes the same seven fio profiles as
 `run_redis_perf.sh` (`bigwrite`, `bigread`, sequential read/write, random
 read/write, and mixed random I/O), verifies the FUSE mount, and writes a
-separate JSON report for every profile. Each run receives a fresh directory
-under `docker/compose-xfstests/artifacts/`; select a smaller subset with, for
-example, `-Tools fio-seqwrite,fio-randrw`. To prevent write-cache debt from
-one profile affecting the next under WSLC, the runner remounts BrewFS between
-profiles by default; set `PERF_FIO_REMOUNT_BETWEEN_PROFILES=false` only when
-diagnosing shared-cache behavior.
+separate JSON report for every profile. `bigwrite` and `bigread` use eight
+1 GiB jobs (8 GiB total). Each profile receives its own Redis/RustFS lifecycle
+so large datasets cannot accumulate in one object-store volume. Artifacts are
+written under `docker/compose-xfstests/artifacts/`; select a smaller subset
+with, for example, `-Tools fio-seqwrite,fio-randrw`.
 
 The WSLC runner writes a constrained cache configuration to
 `brewfs-config.yaml` in the artifact directory. Its defaults are sized for the
