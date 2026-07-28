@@ -143,6 +143,32 @@ JFS_COMPRESS=none \
   bash docker/compose-xfstests/run_juicefs_perf.sh --writeback-throughput-profile
 ```
 
+On Windows, the WSLC smoke benchmark requires a WSL Containers runtime that
+provides privileged containers with `/dev/fuse`, a Linux BrewFS binary at
+`target/docker/brewfs`, and `wslc-compose` on `PATH` (or in `WSLC_COMPOSE`):
+
+```powershell
+$env:WSLC_SDK_PATH = "<path-to-wslcsdk.dll>"
+$env:WSLC_REGISTRY_MIRROR = "<docker-hub-mirror-host>" # optional
+$env:BREWFS_APT_MIRROR = "http://<debian-mirror-host>" # optional
+pwsh docker/compose-xfstests/run_redis_perf_wslc.ps1
+```
+
+The default runner executes the same seven fio profiles as
+`run_redis_perf.sh` (`bigwrite`, `bigread`, sequential read/write, random
+read/write, and mixed random I/O), verifies the FUSE mount, and writes a
+separate JSON report for every profile. `bigwrite` and `bigread` use eight
+1 GiB jobs (8 GiB total). Each profile receives its own Redis/RustFS lifecycle
+so large datasets cannot accumulate in one object-store volume. Artifacts are
+written under `docker/compose-xfstests/artifacts/`; select a smaller subset
+with, for example, `-Tools fio-seqwrite,fio-randrw`.
+
+The WSLC runner writes a constrained cache configuration to
+`brewfs-config.yaml` in the artifact directory. Its defaults are sized for the
+roughly 2 GiB WSLC guest and can be overridden with
+`BREWFS_READ_MEMORY_BYTES`, `BREWFS_WRITE_MEMORY_BYTES`, and
+`BREWFS_MEMORY_BUDGET_BYTES` when the guest has more memory.
+
 ## Quick Start
 
 Install a complete single-node Linux stack with Redis, RustFS, systemd, and a BrewFS FUSE mount:
