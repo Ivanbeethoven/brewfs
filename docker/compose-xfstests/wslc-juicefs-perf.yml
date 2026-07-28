@@ -1,0 +1,53 @@
+services:
+  redis:
+    image: ${JUICEFS_REDIS_IMAGE:-docker.io/library/redis:7.2-alpine}
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+    volumes:
+      - juicefs-redis-data:/data
+
+  rustfs:
+    image: ${JUICEFS_RUSTFS_IMAGE:-docker.io/rustfs/rustfs:latest}
+    command:
+      - /data
+    environment:
+      RUSTFS_ADDRESS: :9000
+      RUSTFS_CONSOLE_ENABLE: "false"
+      RUSTFS_ACCESS_KEY: ${AWS_ACCESS_KEY_ID:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${AWS_SECRET_ACCESS_KEY:-rustfsadmin}
+    volumes:
+      - juicefs-rustfs-data:/data
+
+  perf:
+    image: ${JUICEFS_PERF_BASE_IMAGE:-docker.io/library/debian:trixie-slim}
+    privileged: true
+    depends_on:
+      - redis
+      - rustfs
+    command:
+      - sh
+      - -c
+      - while true; do sleep 3600; done
+    environment:
+      REDIS_URL: redis://redis:6379
+      JUICEFS_META_URL: redis://redis:6379/1
+      JUICEFS_S3_BUCKET: ${JUICEFS_S3_BUCKET:-juicefs-data}
+      JUICEFS_S3_ENDPOINT: ${JUICEFS_S3_ENDPOINT:-http://rustfs:9000}
+      JUICEFS_S3_REGION: ${JUICEFS_S3_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-rustfsadmin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-rustfsadmin}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_EC2_METADATA_DISABLED: "true"
+      JUICEFS_MOUNT_POINT: /mnt/juicefs
+      JUICEFS_APT_MIRROR: ${JUICEFS_APT_MIRROR:-}
+      JUICEFS_INSTALL_URL: ${JUICEFS_INSTALL_URL:-https://d.juicefs.com/install}
+      PERF_TOOLS: ${PERF_TOOLS:-fio-bigwrite fio-bigread}
+    volumes:
+      - ./juicefs-tools:/juicefs-tools:ro
+      - ${JUICEFS_ARTIFACTS_DIR:-./artifacts}:/artifacts
+
+volumes:
+  juicefs-redis-data:
+  juicefs-rustfs-data:

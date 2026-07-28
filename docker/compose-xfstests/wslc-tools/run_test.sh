@@ -34,6 +34,10 @@ echo "Dependencies installed."
 echo "Setting up fuse..."
 modprobe fuse 2>/dev/null || true
 mkdir -p "$MOUNT_DIR" /var/lib/brewfs/data /artifacts
+if [ ! -c /dev/fuse ]; then
+    mknod /dev/fuse c 10 229
+    chmod 666 /dev/fuse
+fi
 test -c /dev/fuse
 
 data_backend="${BREWFS_DATA_BACKEND:-s3}"
