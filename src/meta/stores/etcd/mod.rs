@@ -2181,12 +2181,13 @@ impl MetaStore for EtcdMetaStore {
         skip(self),
         fields(old_parent, old_name, new_parent, new_name)
     )]
-    async fn rename(
+    async fn rename_with_mode(
         &self,
         old_parent: i64,
         old_name: &str,
         new_parent: i64,
         new_name: String,
+        noreplace: bool,
     ) -> Result<(), MetaError> {
         if old_parent == new_parent && old_name == new_name {
             return Ok(());
@@ -2225,6 +2226,12 @@ impl MetaStore for EtcdMetaStore {
                         .get_typed_json::<EtcdForwardEntry>(&new_forward_key)
                         .await?
                     {
+                        if noreplace {
+                            return Err(MetaError::AlreadyExists {
+                                parent: new_parent,
+                                name: new_name,
+                            });
+                        }
                         if replaced_forward.inode == entry_ino {
                             return Ok(entry_ino);
                         }
