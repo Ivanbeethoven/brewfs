@@ -1,7 +1,10 @@
 //! Storage backends: asynchronous block-level IO traits and in-memory implementations.
 
 use crate::chunk::bandwidth::BandwidthLimiter;
-use crate::chunk::compress::{Compression, compress, decompress_bytes};
+use crate::chunk::compress::{
+    Compression, PERSISTED_HEADER_LEN, PersistedHeader, decompress_bytes, decompress_framed_bytes,
+    encode_persisted_block, parse_persisted_header,
+};
 use crate::chunk::page_cache::{PageKey, ReadPageCache};
 use crate::chunk::singleflight::SingleFlight;
 use crate::utils::NumCastExt;
@@ -15,7 +18,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::executor::block_on;
 use hex::encode;
-use moka::{Entry, ops::compute::Op};
+use moka::{Entry, future::Cache, ops::compute::Op};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -284,7 +287,21 @@ impl BlockStore for InMemoryBlockStore {
     }
 }
 
-/// BlockStore backed by cadapter::client (key space `chunks/{chunk_id}/{block_index}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectLayout {
+    /// Versioned objects are self-describing because their namespace commits
+    /// them to the framed layout.
+    Versioned(Compression),
+    /// Legacy objects have no unambiguous encoding marker. Their decoding is
+    /// governed by the mount's legacy compatibility policy.
+    Legacy,
+}
+
+/// BlockStore backed by cadapter::client.
+///
+/// New blocks use `chunks-v2/{chunk_id}/{block_index}` and a mandatory framed
+/// payload. Existing `chunks/{chunk_id}/{block_index}` objects remain readable
+/// through an explicit legacy fallback.
 pub struct ObjectBlockStore<B: ObjectBackend> {
     client: Arc<ObjectClient<B>>,
     block_cache: ChunksCache,
@@ -294,6 +311,11 @@ pub struct ObjectBlockStore<B: ObjectBackend> {
     page_cache: ReadPageCache,
     /// SingleFlight controller for coalescing concurrent page-cache misses.
     page_flight: SingleFlight<PageKey, Bytes>,
+    /// Per-object layout classification. Chunk object keys are immutable, so a
+    /// classification remains valid for the lifetime of this store.
+    format_cache: Cache<BlockKey, ObjectLayout>,
+    /// Coalesces concurrent versioned-layout probes for an uncached object.
+    format_flight: SingleFlight<BlockKey, ObjectLayout>,
     /// SingleFlight controller for coalescing concurrent reads to the same block
     /// Thread-safe and shared across the store lifetime so concurrent requests can coalesce.
     read_flight: Arc<SingleFlight<BlockKey, Bytes>>,
@@ -398,6 +420,8 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             block_cache,
             page_cache,
             page_flight: SingleFlight::new(),
+            format_cache: Cache::new(4096),
+            format_flight: SingleFlight::new(),
             read_flight: Arc::new(SingleFlight::new()),
             range_prefetch_limit: Arc::new(Semaphore::new(8)),
             config,
@@ -445,6 +469,8 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             block_cache,
             page_cache,
             page_flight: SingleFlight::new(),
+            format_cache: Cache::new(4096),
+            format_flight: SingleFlight::new(),
             read_flight: Arc::new(SingleFlight::new()),
             range_prefetch_limit: Arc::new(Semaphore::new(8)),
             config: store_config,
@@ -470,6 +496,8 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             block_cache,
             page_cache,
             page_flight: SingleFlight::new(),
+            format_cache: Cache::new(4096),
+            format_flight: SingleFlight::new(),
             read_flight: Arc::new(SingleFlight::new()),
             range_prefetch_limit: Arc::new(Semaphore::new(8)),
             config: store_config,
@@ -488,6 +516,118 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
     fn key_for(key: BlockKey) -> String {
         let (chunk_id, block_index) = key;
         format!("chunks/{chunk_id}/{block_index}")
+    }
+
+    fn versioned_key_for(key: BlockKey) -> String {
+        let (chunk_id, block_index) = key;
+        format!("chunks-v2/{chunk_id}/{block_index}")
+    }
+
+    fn object_key_for(key: BlockKey, layout: ObjectLayout) -> String {
+        match layout {
+            ObjectLayout::Versioned(_) => Self::versioned_key_for(key),
+            ObjectLayout::Legacy => Self::key_for(key),
+        }
+    }
+
+    /// Resolve the object's namespace and, for versioned objects, its encoding.
+    ///
+    /// A non-empty `chunks-v2` object is required to contain a complete valid
+    /// frame. Only a zero-byte read is treated as "not versioned" and allowed
+    /// to fall back to the legacy namespace. This avoids classifying short or
+    /// malformed frames as raw data.
+    async fn resolve_object_layout(&self, key: BlockKey) -> anyhow::Result<ObjectLayout> {
+        if let Some(layout) = self.format_cache.get(&key).await {
+            return Ok(layout);
+        }
+
+        let versioned_key = Self::versioned_key_for(key);
+        let client = self.client.clone();
+        let bandwidth = self.bandwidth.clone();
+        let object_metrics = self.object_metrics.clone();
+        let format_cache = self.format_cache.clone();
+        let layout = self
+            .format_flight
+            .execute(key, || async move {
+                let mut header = [0u8; PERSISTED_HEADER_LEN];
+                let mut read = 0;
+
+                loop {
+                    bandwidth
+                        .acquire_download(PERSISTED_HEADER_LEN.saturating_sub(read))
+                        .await;
+                    let started = Instant::now();
+                    let read_len = client
+                        .get_object_range(&versioned_key, read as u64, &mut header[read..])
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "object store versioned header read failed: {versioned_key}, {error:?}"
+                            )
+                        })?;
+                    object_metrics.record_get(read_len as u64, started.elapsed());
+
+                    if read_len == 0 {
+                        if read == 0 {
+                            let layout = ObjectLayout::Legacy;
+                            format_cache.insert(key, layout).await;
+                            return Ok::<ObjectLayout, anyhow::Error>(layout);
+                        }
+                        anyhow::bail!(
+                            "truncated versioned block header for {versioned_key}: read {read} of {PERSISTED_HEADER_LEN} bytes"
+                        );
+                    }
+
+                    read += read_len;
+                    if read == PERSISTED_HEADER_LEN {
+                        break;
+                    }
+                }
+
+                let compression = match parse_persisted_header(&header) {
+                    PersistedHeader::Framed(compression) => compression,
+                    PersistedHeader::Incomplete => unreachable!("header buffer is complete"),
+                    PersistedHeader::NotFramed => {
+                        anyhow::bail!("missing versioned block header for {versioned_key}")
+                    }
+                    PersistedHeader::Invalid => {
+                        anyhow::bail!("unsupported versioned block header for {versioned_key}")
+                    }
+                };
+                let layout = ObjectLayout::Versioned(compression);
+                format_cache.insert(key, layout).await;
+                Ok(layout)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("object layout probe failed: {error}"))?;
+        Ok(*layout)
+    }
+
+    fn decode_object(
+        layout: ObjectLayout,
+        current_compression: Compression,
+        bytes: Bytes,
+    ) -> anyhow::Result<Bytes> {
+        match layout {
+            ObjectLayout::Versioned(_) => decompress_framed_bytes(bytes),
+            // Legacy `None` objects were written as arbitrary raw bytes. Do
+            // not inspect a magic-like prefix, since that would corrupt valid
+            // user data such as `SF\0\0payload`.
+            ObjectLayout::Legacy if matches!(current_compression, Compression::None) => Ok(bytes),
+            // Legacy compressed mounts retain the historical compatibility
+            // convention: valid legacy frames are decoded and non-frame bytes
+            // remain raw.
+            ObjectLayout::Legacy => decompress_bytes(bytes),
+        }
+    }
+
+    fn range_base_offset(layout: ObjectLayout, current_compression: Compression) -> Option<u64> {
+        match layout {
+            ObjectLayout::Versioned(Compression::None) => Some(PERSISTED_HEADER_LEN as u64),
+            ObjectLayout::Versioned(_) => None,
+            ObjectLayout::Legacy if matches!(current_compression, Compression::None) => Some(0),
+            ObjectLayout::Legacy => None,
+        }
     }
 
     async fn populate_write_cache_after_upload(&self, key: String, data: Bytes) {
@@ -559,19 +699,25 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         true
     }
 
-    fn prefetch_full_block_background(&self, key: BlockKey, key_str: String) {
+    fn prefetch_full_block_background(
+        &self,
+        key: BlockKey,
+        cache_key: String,
+        object_key: String,
+        layout: ObjectLayout,
+    ) {
         self.object_metrics.record_read_background_prefetch();
         let cache = self.block_cache.clone();
         let client = self.client.clone();
         let read_flight = self.read_flight.clone();
         let prefetch_limit = self.range_prefetch_limit.clone();
         let bandwidth = self.bandwidth.clone();
-        let compression = self.config.compression;
         let block_size = self.config.block_size;
+        let compression = self.config.compression;
         let object_metrics = self.object_metrics.clone();
 
         tokio::spawn(async move {
-            if cache.get(&key_str).await.is_some() {
+            if cache.get(&cache_key).await.is_some() {
                 return;
             }
 
@@ -579,7 +725,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                 object_metrics.record_read_background_prefetch_dropped();
                 return;
             };
-            if cache.get(&key_str).await.is_some() {
+            if cache.get(&cache_key).await.is_some() {
                 return;
             }
 
@@ -587,8 +733,8 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                 .execute(key, || async move {
                     bandwidth.acquire_download(block_size).await;
                     let started = Instant::now();
-                    let raw = client.get_object(&key_str).await.map_err(|e| {
-                        anyhow::anyhow!("object store get failed: {key_str}, {e:?}")
+                    let raw = client.get_object(&object_key).await.map_err(|e| {
+                        anyhow::anyhow!("object store get failed: {object_key}, {e:?}")
                     })?;
                     let raw_bytes = match raw {
                         Some(data) => {
@@ -600,12 +746,8 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                             return Ok(Bytes::new());
                         }
                     };
-                    let decompressed = if !matches!(compression, Compression::None) {
-                        decompress_bytes(raw_bytes)
-                            .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))?
-                    } else {
-                        raw_bytes
-                    };
+                    let decompressed = Self::decode_object(layout, compression, raw_bytes)
+                        .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))?;
                     Ok::<_, anyhow::Error>(decompressed)
                 })
                 .await;
@@ -613,7 +755,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             match block_data {
                 Ok(block_data) => {
                     cache
-                        .insert_opportunistic(Self::key_for(key), (*block_data).clone())
+                        .insert_opportunistic(cache_key, (*block_data).clone())
                         .await;
                 }
                 Err(err) => {
@@ -647,7 +789,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> ObjectBlockStore<B> {
         chunks: Vec<Bytes>,
     ) -> anyhow::Result<u64> {
         let prepare_started = Instant::now();
-        let key_str = Self::key_for(key);
+        let cache_key = Self::key_for(key);
+        let object_key = Self::versioned_key_for(key);
         let total_len = chunks.iter().map(|c| c.len()).sum::<usize>();
         if total_len == 0 {
             return Ok(0);
@@ -661,13 +804,10 @@ impl<B: ObjectBackend + Send + Sync + 'static> ObjectBlockStore<B> {
         parts.extend(chunks);
 
         let cache_block = Self::concat_bytes(&parts);
-        let upload_bytes = if matches!(self.config.compression, Compression::None) {
-            cache_block.clone()
-        } else {
-            match compress(&cache_block, self.config.compression) {
-                std::borrow::Cow::Borrowed(_) => cache_block.clone(),
-                std::borrow::Cow::Owned(v) => Bytes::from(v),
-            }
+        let upload_bytes = encode_persisted_block(&cache_block, self.config.compression);
+        let stored_compression = match parse_persisted_header(upload_bytes.as_ref()) {
+            PersistedHeader::Framed(compression) => compression,
+            _ => unreachable!("newly encoded persisted blocks are always framed"),
         };
         let upload_len = upload_bytes.len();
         self.bandwidth.acquire_upload(upload_len).await;
@@ -676,17 +816,20 @@ impl<B: ObjectBackend + Send + Sync + 'static> ObjectBlockStore<B> {
 
         let started = Instant::now();
         self.client
-            .put_object_vectored(&key_str, vec![upload_bytes])
+            .put_object_vectored(&object_key, vec![upload_bytes])
             .await
-            .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("object store put failed: {object_key}, {e:?}"))?;
         self.object_metrics
             .record_put(upload_len as u64, started.elapsed());
+        self.format_cache
+            .insert(key, ObjectLayout::Versioned(stored_compression))
+            .await;
 
         if self.config.populate_write_cache_after_upload
             && cache_block.len() <= self.config.block_size
         {
             let cache_started = Instant::now();
-            self.populate_write_cache_after_upload(key_str, cache_block)
+            self.populate_write_cache_after_upload(cache_key, cache_block)
                 .await;
             self.object_metrics
                 .record_put_cache(cache_started.elapsed());
@@ -784,29 +927,89 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         }
 
         let range_size_threshold = self.config.range_size_threshold();
+        let can_try_object_ranges = offset > 0 && len > 0 && len <= range_size_threshold;
 
-        if matches!(self.config.compression, Compression::None)
-            && offset > 0
-            && len <= range_size_threshold
+        if can_try_object_ranges
+            && let Some(block_data) = self.read_flight.try_piggyback(&key).await
         {
-            if let Some(block_data) = self.read_flight.try_piggyback(&key).await {
-                tracing::Span::current().record("strategy", "piggyback_full");
-                self.object_metrics.record_read_piggyback_full();
-                let block_data = block_data
-                    .map_err(|e| anyhow::anyhow!("SingleFlight piggyback read failed: {e}"))?;
+            tracing::Span::current().record("strategy", "piggyback_full");
+            self.object_metrics.record_read_piggyback_full();
+            let block_data = block_data
+                .map_err(|e| anyhow::anyhow!("SingleFlight piggyback read failed: {e}"))?;
 
-                let offset_usize = offset as usize;
-                let end = offset_usize + len;
-                let mut copy_len = 0;
-                if offset_usize < block_data.len() {
-                    let copy_end = end.min(block_data.len());
-                    copy_len = copy_end - offset_usize;
-                    buf[..copy_len].copy_from_slice(&block_data.as_ref()[offset_usize..copy_end]);
-                }
-                tracing::Span::current().record("read_len", copy_len);
-                return Ok(());
+            let offset_usize = offset as usize;
+            let end = offset_usize + len;
+            let mut copy_len = 0;
+            if offset_usize < block_data.len() {
+                let copy_end = end.min(block_data.len());
+                copy_len = copy_end - offset_usize;
+                buf[..copy_len].copy_from_slice(&block_data.as_ref()[offset_usize..copy_end]);
+            }
+            tracing::Span::current().record("read_len", copy_len);
+            return Ok(());
+        }
+
+        // Serve fully cached pages before resolving the remote object layout.
+        // The format cache has an independent eviction policy, so a page-cache
+        // hit must not become a network dependency when its format entry ages
+        // out.
+        if can_try_object_ranges {
+            let page_size = self.page_cache.page_size();
+            let start_page = offset as usize / page_size;
+            let end_page = (offset as usize + len - 1) / page_size;
+            let mut cached_pages = Vec::with_capacity(end_page - start_page + 1);
+            for page_idx in start_page..=end_page {
+                let cache_key: PageKey = (key.0, key.1, page_idx as u32);
+                let Some(page) = self.page_cache.get(&cache_key).await else {
+                    cached_pages.clear();
+                    break;
+                };
+                cached_pages.push(page);
             }
 
+            if !cached_pages.is_empty() {
+                let mut pos = 0;
+                for (page_idx, page_data) in (start_page..=end_page).zip(cached_pages) {
+                    let page_start = page_idx * page_size;
+                    let copy_start = if page_idx == start_page {
+                        offset as usize - page_start
+                    } else {
+                        0
+                    };
+                    let copy_end = if page_idx == end_page {
+                        (offset as usize + len).saturating_sub(page_start)
+                    } else {
+                        page_data.len()
+                    }
+                    .min(page_data.len());
+                    if copy_end > copy_start {
+                        let copy_len = copy_end - copy_start;
+                        buf[pos..pos + copy_len].copy_from_slice(&page_data[copy_start..copy_end]);
+                        pos += copy_len;
+                    }
+                }
+                tracing::Span::current().record("strategy", "page_cache_hit");
+                tracing::Span::current().record("read_len", pos);
+                self.object_metrics.record_read_page_cache_hit();
+                return Ok(());
+            }
+        }
+
+        // Only small reads need a layout decision before joining the full-read
+        // flight. Keeping the full-read probe inside that flight lets a
+        // concurrent small read piggyback instead of issuing its own probe.
+        let layout = if can_try_object_ranges {
+            Some(self.resolve_object_layout(key).await?)
+        } else {
+            None
+        };
+        let range_base =
+            layout.and_then(|layout| Self::range_base_offset(layout, self.config.compression));
+        let can_read_object_ranges = range_base.is_some();
+
+        if can_read_object_ranges {
+            let layout = layout.expect("range path resolved an object layout");
+            let object_key = Self::object_key_for(key, layout);
             // Small range read — serve via page-granularity cache so that
             // repeated small reads within the same 64KB page avoid a network
             // round-trip.
@@ -834,9 +1037,10 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                 } else {
                     tracing::Span::current().record("strategy", "page_cache_miss");
                     range_missed = true;
-                    let range_offset = page_start as u64;
+                    let range_offset =
+                        range_base.expect("range path has a base offset") + page_start as u64;
                     let range_len = page_end - page_start;
-                    let page_key_str = key_str.clone();
+                    let page_key_str = object_key.clone();
                     let page_object_metrics = object_metrics.clone();
                     let page = self
                         .page_flight
@@ -899,7 +1103,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                 && self.config.range_background_prefetch
                 && !self.try_promote_page_cache_to_block_cache(key).await
             {
-                self.prefetch_full_block_background(key, key_str);
+                self.prefetch_full_block_background(key, key_str, object_key, layout);
             }
             return Ok(());
         }
@@ -907,19 +1111,23 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         // Large read — fetch full block via SingleFlight, then cache it.
         tracing::Span::current().record("strategy", "coalesced_full");
         let client = &self.client;
-        let compression = self.config.compression;
         let object_metrics = self.object_metrics.clone();
+        let compression = self.config.compression;
 
         let block_data =
             self.read_flight
                 .execute(key, || async move {
-                    let key_str = Self::key_for(key);
+                    let layout = match layout {
+                        Some(layout) => layout,
+                        None => self.resolve_object_layout(key).await?,
+                    };
+                    let object_key = Self::object_key_for(key, layout);
                     self.bandwidth
                         .acquire_download(self.config.block_size)
                         .await;
                     let started = Instant::now();
-                    let raw = client.get_object(&key_str).await.map_err(|e| {
-                        anyhow::anyhow!("object store get failed: {key_str}, {e:?}")
+                    let raw = client.get_object(&object_key).await.map_err(|e| {
+                        anyhow::anyhow!("object store get failed: {object_key}, {e:?}")
                     })?;
                     object_metrics.record_read_full_get();
                     let raw_bytes = match raw {
@@ -932,13 +1140,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                             return Ok(Bytes::new());
                         }
                     };
-                    // Decompress if compression is enabled (auto-detects from header)
-                    let decompressed = if !matches!(compression, Compression::None) {
-                        decompress_bytes(raw_bytes)
-                            .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))?
-                    } else {
-                        raw_bytes
-                    };
+                    let decompressed = Self::decode_object(layout, compression, raw_bytes)
+                        .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))?;
                     Ok::<_, anyhow::Error>(decompressed)
                 })
                 .await
@@ -970,11 +1173,20 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         let start = block_index;
         let end = start + block_count.as_u32();
         for i in start..end {
-            let key_str = Self::key_for((chunk_id, i));
+            let block_key = (chunk_id, i);
+            let versioned_key = Self::versioned_key_for(block_key);
             self.client
-                .delete_object(&key_str)
+                .delete_object(&versioned_key)
                 .await
-                .map_err(|e| anyhow::anyhow!("object store delete failed: {key_str}, {e:?}"))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("object store delete failed: {versioned_key}, {e:?}")
+                })?;
+            let legacy_key = Self::key_for(block_key);
+            self.client
+                .delete_object(&legacy_key)
+                .await
+                .map_err(|e| anyhow::anyhow!("object store delete failed: {legacy_key}, {e:?}"))?;
+            self.format_cache.invalidate(&block_key).await;
             self.object_metrics.record_delete();
         }
         Ok(())
@@ -1032,6 +1244,136 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, data);
+    }
+
+    #[tokio::test]
+    async fn test_versioned_raw_magic_survives_none_remount() {
+        let object_dir = tempfile::tempdir().unwrap();
+        let writer_cache_dir = tempfile::tempdir().unwrap();
+        let reader_cache_dir = tempfile::tempdir().unwrap();
+        let raw = Bytes::from_static(b"SF\x00\x00payload that must remain byte-for-byte intact");
+        let config = BlockStoreConfig {
+            block_size: raw.len(),
+            compression: Compression::None,
+            range_background_prefetch: false,
+            ..Default::default()
+        };
+
+        let writer = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(LocalFsBackend::new(object_dir.path())),
+            ChunksCacheConfig::with_budgets(
+                1024 * 1024,
+                1024 * 1024,
+                writer_cache_dir.path().to_path_buf(),
+            ),
+            config.clone(),
+        )
+        .await
+        .unwrap();
+        writer.write_fresh_range((314, 0), 0, &raw).await.unwrap();
+
+        let reader = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(LocalFsBackend::new(object_dir.path())),
+            ChunksCacheConfig::with_budgets(
+                1024 * 1024,
+                1024 * 1024,
+                reader_cache_dir.path().to_path_buf(),
+            ),
+            config,
+        )
+        .await
+        .unwrap();
+        let mut actual = vec![0u8; raw.len()];
+        reader.read_range((314, 0), 0, &mut actual).await.unwrap();
+
+        assert_eq!(actual, raw);
+        assert!(object_dir.path().join("chunks-v2/314/0").exists());
+        assert!(!object_dir.path().join("chunks/314/0").exists());
+    }
+
+    #[tokio::test]
+    async fn test_legacy_raw_magic_survives_none_read() {
+        let object_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let raw = b"SF\x00\x00legacy bytes must remain byte-for-byte intact";
+        let legacy_path = object_dir.path().join("chunks/316/0");
+        tokio::fs::create_dir_all(legacy_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&legacy_path, raw).await.unwrap();
+
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(LocalFsBackend::new(object_dir.path())),
+            ChunksCacheConfig::with_budgets(
+                1024 * 1024,
+                1024 * 1024,
+                cache_dir.path().to_path_buf(),
+            ),
+            BlockStoreConfig {
+                block_size: raw.len(),
+                compression: Compression::None,
+                range_background_prefetch: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut actual = vec![0u8; raw.len()];
+        store.read_range((316, 0), 0, &mut actual).await.unwrap();
+        assert_eq!(actual, raw);
+    }
+
+    #[tokio::test]
+    async fn test_page_cache_hit_does_not_reprobe_evicted_layout() {
+        let object_dir = tempfile::tempdir().unwrap();
+        let writer_cache_dir = tempfile::tempdir().unwrap();
+        let reader_cache_dir = tempfile::tempdir().unwrap();
+        let raw = Bytes::from_static(b"SF\x00\x00page-cache-must-not-need-the-object-store");
+        let config = BlockStoreConfig {
+            block_size: raw.len(),
+            range_read_threshold: 1.0,
+            compression: Compression::None,
+            range_background_prefetch: false,
+            ..Default::default()
+        };
+
+        let writer = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(LocalFsBackend::new(object_dir.path())),
+            ChunksCacheConfig::with_budgets(
+                1024 * 1024,
+                1024 * 1024,
+                writer_cache_dir.path().to_path_buf(),
+            ),
+            config.clone(),
+        )
+        .await
+        .unwrap();
+        writer.write_fresh_range((315, 0), 0, &raw).await.unwrap();
+
+        let reader = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(LocalFsBackend::new(object_dir.path())),
+            ChunksCacheConfig::with_budgets(
+                1024 * 1024,
+                1024 * 1024,
+                reader_cache_dir.path().to_path_buf(),
+            ),
+            config,
+        )
+        .await
+        .unwrap();
+        let mut first = [0u8; 8];
+        reader.read_range((315, 0), 4, &mut first).await.unwrap();
+        assert_eq!(&first[..], &raw[4..12]);
+
+        tokio::fs::remove_file(object_dir.path().join("chunks-v2/315/0"))
+            .await
+            .unwrap();
+        reader.format_cache.invalidate(&(315, 0)).await;
+
+        let mut second = [0u8; 8];
+        reader.read_range((315, 0), 4, &mut second).await.unwrap();
+        assert_eq!(&second[..], &raw[4..12]);
     }
 
     #[tokio::test]
@@ -1203,8 +1545,8 @@ mod tests {
             "Small read at block start should use full block read"
         );
         assert_eq!(
-            stats.get_object_range_calls, 0,
-            "Small read at block start should not use range reads"
+            stats.get_object_range_calls, 1,
+            "A cold legacy block first probes the versioned namespace before its full read"
         );
 
         // Same read again should hit the full block cache.
@@ -1246,8 +1588,8 @@ mod tests {
             "Range miss should schedule one background full-block prefetch"
         );
         assert_eq!(
-            stats.get_object_range_calls, 8,
-            "Non-zero 512KB read should fetch 8 pages (8 x 64KB range reads)"
+            stats.get_object_range_calls, 9,
+            "Non-zero 512KB read should probe the format then fetch 8 pages"
         );
         for _ in 0..100 {
             if backend.get_stats().get_object_calls >= 1 {
@@ -1294,8 +1636,8 @@ mod tests {
             .expect("ObjectBlockStore exposes object metrics")
             .snapshot();
         assert_eq!(
-            disabled_stats.get_object_range_calls, 8,
-            "Disabled background prefetch should still serve the request via page ranges"
+            disabled_stats.get_object_range_calls, 9,
+            "Disabled background prefetch should probe the format then serve page ranges"
         );
         assert_eq!(
             disabled_stats.get_object_calls, 0,
@@ -1315,8 +1657,8 @@ mod tests {
         let stats = backend.get_stats();
         assert_eq!(stats.get_object_calls, 1, "Large read should use full read");
         assert_eq!(
-            stats.get_object_range_calls, 0,
-            "Large read should not use range read"
+            stats.get_object_range_calls, 1,
+            "Large read should probe the versioned layout before its full read"
         );
 
         // Concurrent large reads for a DIFFERENT (uncached) block should
@@ -1340,8 +1682,8 @@ mod tests {
             "Concurrent reads should coalesce to 1 call"
         );
         assert_eq!(
-            stats.get_object_range_calls, 0,
-            "Coalesced path should not fall back to range reads",
+            stats.get_object_range_calls, 1,
+            "Concurrent full reads should share one versioned-layout probe",
         );
 
         Ok(())
@@ -1442,7 +1784,11 @@ mod tests {
 
         assert_eq!(out, vec![0u8; 512 * 1024]);
         assert_eq!(*backend.get_object_calls.lock().unwrap(), 1);
-        assert_eq!(*backend.get_object_range_calls.lock().unwrap(), 0);
+        assert_eq!(
+            *backend.get_object_range_calls.lock().unwrap(),
+            1,
+            "a versioned-namespace probe precedes the legacy full-object read"
+        );
         assert!(
             store.page_cache.get(&(7, 0, 32)).await.is_none(),
             "full-block reads already populate block_cache, so duplicating the decompressed block into page_cache only adds copy/cache overhead"
@@ -1464,6 +1810,133 @@ mod tests {
             "subsequent reads should hit block_cache without range GETs"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remount_without_compression_decodes_persisted_compressed_block()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::cadapter::client::{ObjectBackend, ObjectClient};
+        use crate::chunk::compress::Compression;
+        use async_trait::async_trait;
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+
+        #[derive(Clone, Default)]
+        struct MockBackend {
+            data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            full_gets: Arc<Mutex<usize>>,
+            range_gets: Arc<Mutex<usize>>,
+            max_range_bytes: Arc<Mutex<Option<usize>>>,
+        }
+
+        #[async_trait]
+        impl ObjectBackend for MockBackend {
+            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), data.to_vec());
+                Ok(())
+            }
+
+            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                *self.full_gets.lock().unwrap() += 1;
+                Ok(self.data.lock().unwrap().get(key).cloned())
+            }
+
+            async fn get_object_range(
+                &self,
+                key: &str,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                *self.range_gets.lock().unwrap() += 1;
+                let objects = self.data.lock().unwrap();
+                let Some(data) = objects.get(key) else {
+                    return Ok(0);
+                };
+                let offset = offset as usize;
+                if offset >= data.len() {
+                    return Ok(0);
+                }
+                let mut len = (data.len() - offset).min(buf.len());
+                if let Some(max_range_bytes) = *self.max_range_bytes.lock().unwrap() {
+                    len = len.min(max_range_bytes);
+                }
+                buf[..len].copy_from_slice(&data[offset..offset + len]);
+                Ok(len)
+            }
+
+            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
+                Ok("test-etag".to_string())
+            }
+
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                self.data.lock().unwrap().remove(key);
+                Ok(())
+            }
+        }
+
+        let backend = MockBackend::default();
+        let raw: Vec<u8> = (0..(256 * 1024)).map(|index| (index % 16) as u8).collect();
+        let write_cache_dir = tempfile::tempdir()?;
+        let writer = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(backend.clone()),
+            ChunksCacheConfig::with_budgets(
+                16 * 1024 * 1024,
+                16 * 1024 * 1024,
+                write_cache_dir.path().to_path_buf(),
+            ),
+            BlockStoreConfig {
+                block_size: raw.len(),
+                compression: Compression::Lz4,
+                range_background_prefetch: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+        writer.write_fresh_range((17, 0), 0, &raw).await?;
+
+        // ObjectBackend permits a partial range result. The versioned header
+        // must be collected completely instead of caching this first fragment
+        // as a raw-object classification.
+        *backend.max_range_bytes.lock().unwrap() = Some(2);
+
+        // Simulate a remount whose current write setting is none after this
+        // block was committed with LZ4.
+        let cache_dir = tempfile::tempdir()?;
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(backend.clone()),
+            ChunksCacheConfig::with_budgets(
+                16 * 1024 * 1024,
+                16 * 1024 * 1024,
+                cache_dir.path().to_path_buf(),
+            ),
+            BlockStoreConfig {
+                block_size: raw.len(),
+                compression: Compression::None,
+                range_background_prefetch: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let offset = 16 * 1024;
+        let mut actual = vec![0xa5; 4096];
+        store
+            .read_range((17, 0), offset as u64, &mut actual)
+            .await?;
+
+        assert_eq!(actual, raw[offset..offset + actual.len()]);
+        assert_eq!(*backend.full_gets.lock().unwrap(), 1);
+        assert_eq!(
+            *backend.range_gets.lock().unwrap(),
+            2,
+            "the short versioned-header reads must be completed before the full-object read"
+        );
         Ok(())
     }
 
@@ -1778,7 +2251,10 @@ mod tests {
         store.write_fresh_range((10, 0), 0, &uploaded).await?;
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.put_ops, 1);
-        assert_eq!(snapshot.put_bytes, uploaded.len() as u64);
+        assert_eq!(
+            snapshot.put_bytes,
+            uploaded.len() as u64 + PERSISTED_HEADER_LEN as u64
+        );
         assert_eq!(snapshot.get_ops, 0);
 
         let full_block = vec![7u8; 64 * 1024];
@@ -1794,7 +2270,10 @@ mod tests {
         store.delete_range((11, 0), 1).await?;
 
         let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.get_ops, 1);
+        assert_eq!(
+            snapshot.get_ops, 2,
+            "a legacy full read probes the versioned namespace before fetching legacy data"
+        );
         assert_eq!(snapshot.get_bytes, full_block.len() as u64);
         assert_eq!(snapshot.put_ops, 1);
         assert_eq!(snapshot.del_ops, 1);
@@ -1806,7 +2285,7 @@ mod tests {
         store.read_range((11, 0), 0, &mut cached_out).await?;
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.read_block_cache_hits, 1);
-        assert_eq!(snapshot.get_ops, 1);
+        assert_eq!(snapshot.get_ops, 2);
 
         Ok(())
     }
@@ -1998,8 +2477,8 @@ mod tests {
 
         assert_eq!(
             *backend.get_object_range_calls.lock().unwrap(),
-            1,
-            "concurrent small reads for one page should share one range GET"
+            2,
+            "concurrent small reads should share one format probe and one page range GET"
         );
 
         for _ in 0..100 {
@@ -2161,8 +2640,8 @@ mod tests {
         assert_eq!(*backend.get_object_calls.lock().unwrap(), 1);
         assert_eq!(
             *backend.get_object_range_calls.lock().unwrap(),
-            0,
-            "small read should join the in-flight full-block read instead of issuing range GET"
+            1,
+            "the full read should issue one shared layout probe; the small read should piggyback without another range GET"
         );
 
         Ok(())
@@ -2264,7 +2743,11 @@ mod tests {
                 .map(|i| (i % 251) as u8)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(*backend.get_object_range_calls.lock().unwrap(), 1);
+        assert_eq!(
+            *backend.get_object_range_calls.lock().unwrap(),
+            2,
+            "one format probe and one page range GET are expected"
+        );
 
         for _ in 0..100 {
             if *backend.get_object_calls.lock().unwrap() >= 1 {
@@ -2537,7 +3020,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
         future::try_join_all(reads).await?;
-        assert_eq!(backend.get_object_range_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            backend.get_object_range_calls.load(Ordering::SeqCst),
+            4,
+            "each immutable object needs one cached format probe and one page range GET"
+        );
 
         for _ in 0..100 {
             if backend.get_object_calls.load(Ordering::SeqCst) >= 1 {
@@ -2665,7 +3152,11 @@ mod tests {
 
         let mut buf = vec![0u8; 4096];
         store.read_range((92, 0), 1024, &mut buf).await?;
-        assert_eq!(backend.get_object_range_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backend.get_object_range_calls.load(Ordering::SeqCst),
+            2,
+            "one format probe and one page range GET are expected"
+        );
 
         for _ in 0..20 {
             let snapshot = store
