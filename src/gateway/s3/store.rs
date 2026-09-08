@@ -125,8 +125,7 @@ where
     // ---- helpers ------------------------------------------------------------
 
     async fn stat_bucket_root(&self, bucket: &str) -> S3Result<FileAttr> {
-        let root = path::bucket_root(&self.opts.bucket_mode, bucket)
-            .map_err(Self::path_err)?;
+        let root = path::bucket_root(&self.opts.bucket_mode, bucket).map_err(Self::path_err)?;
         let attr = self.vfs.stat(&root).await.map_err(Self::err)?;
         if attr.kind != FileType::Dir {
             return Err(s3_error!(NoSuchBucket, "bucket not found: {bucket}"));
@@ -185,17 +184,13 @@ where
 
     fn mtime_timestamp(attr: &FileAttr) -> Option<Timestamp> {
         // VFS file attrs carry mtime in nanoseconds.
-        Some(Timestamp::from(UNIX_EPOCH + Duration::from_nanos(
-            attr.mtime.max(0) as u64,
-        )))
+        Some(Timestamp::from(
+            UNIX_EPOCH + Duration::from_nanos(attr.mtime.max(0) as u64),
+        ))
     }
 
     /// Streams a blob into `dst` (created/truncated), returning size and MD5.
-    async fn write_blob(
-        &self,
-        dst: &str,
-        body: &mut StreamingBlob,
-    ) -> S3Result<(u64, String)> {
+    async fn write_blob(&self, dst: &str, body: &mut StreamingBlob) -> S3Result<(u64, String)> {
         if self.vfs.exists(dst).await {
             self.vfs.unlink(dst).await.map_err(Self::err)?;
         }
@@ -212,10 +207,7 @@ where
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|e| s3_error!(InternalError, "body read: {e}"))?;
             if !chunk.is_empty() {
-                guard
-                    .write(offset, &chunk)
-                    .await
-                    .map_err(Self::err)?;
+                guard.write(offset, &chunk).await.map_err(Self::err)?;
                 md.consume(&chunk);
                 offset += chunk.len() as u64;
             }
@@ -228,17 +220,11 @@ where
     /// Reads a byte range of a file as a streaming blob. Chunks are produced
     /// by a spawned task and forwarded through an mpsc channel (the channel
     /// receiver is `Send + Sync`, as required by `StreamingBlob::wrap`).
-    fn read_stream(
-        &self,
-        attr: FileAttr,
-        offset: u64,
-        length: u64,
-    ) -> S3Result<StreamingBlob> {
+    fn read_stream(&self, attr: FileAttr, offset: u64, length: u64) -> S3Result<StreamingBlob> {
         let ino = attr.ino;
         let vfs = self.vfs.clone();
-        let (mut tx, rx) = futures::channel::mpsc::channel::<
-            Result<bytes::Bytes, std::io::Error>,
-        >(4);
+        let (mut tx, rx) =
+            futures::channel::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
         tokio::spawn(async move {
             let mut offset = offset;
             let mut remaining = length;
@@ -249,18 +235,15 @@ where
                 let guard = match vfs.stat_ino(ino).await {
                     Some(a) => vfs.open_guard(ino, a, true, false).await,
                     None => {
-                        let _ = tx
-                            .try_send(Err(std::io::Error::other(
-                                "object deleted during read",
-                            )));
+                        let _ =
+                            tx.try_send(Err(std::io::Error::other("object deleted during read")));
                         break;
                     }
                 };
                 let guard = match guard {
                     Ok(g) => g,
                     Err(e) => {
-                        let _ = tx
-                            .try_send(Err(std::io::Error::other(format!("open: {e}"))));
+                        let _ = tx.try_send(Err(std::io::Error::other(format!("open: {e}"))));
                         break;
                     }
                 };
@@ -268,10 +251,7 @@ where
                     Ok(data) => {
                         let n = data.len() as u64;
                         drop(guard);
-                        if tx
-                            .try_send(Ok(bytes::Bytes::from(data)))
-                            .is_err()
-                        {
+                        if tx.try_send(Ok(bytes::Bytes::from(data))).is_err() {
                             break;
                         }
                         offset += n;
@@ -279,8 +259,7 @@ where
                     }
                     Err(e) => {
                         drop(guard);
-                        let _ = tx
-                            .try_send(Err(std::io::Error::other(format!("read: {e}"))));
+                        let _ = tx.try_send(Err(std::io::Error::other(format!("read: {e}"))));
                         break;
                     }
                 }
@@ -479,7 +458,11 @@ where
         Ok(())
     }
 
-    async fn list_keys(&self, bucket: &str, query: ListQuery) -> S3Result<crate::gateway::s3::list::ListResult> {
+    async fn list_keys(
+        &self,
+        bucket: &str,
+        query: ListQuery,
+    ) -> S3Result<crate::gateway::s3::list::ListResult> {
         let mode = &self.opts.bucket_mode;
         let root = path::bucket_root(mode, bucket).map_err(Self::path_err)?;
         self.stat_bucket_root(bucket).await?;
@@ -518,7 +501,10 @@ impl<S> S3 for BrewFsS3<S>
 where
     S: BlockStore + Send + Sync + 'static,
 {
-    async fn create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
+    async fn create_bucket(
+        &self,
+        req: S3Request<CreateBucketInput>,
+    ) -> S3Result<S3Response<CreateBucketOutput>> {
         let input = req.input;
         let bucket = input.bucket.as_str().to_string();
         match &self.opts.bucket_mode {
@@ -538,17 +524,19 @@ where
                 let dir = format!("/{bucket}");
                 match self.vfs.mkdir_err(&dir).await {
                     Ok(_) => Ok(S3Response::new(CreateBucketOutput::default())),
-                    Err(crate::vfs::error::VfsError::AlreadyExists { .. }) => Err(s3_error!(
-                        BucketAlreadyOwnedByYou,
-                        "bucket already exists"
-                    )),
+                    Err(crate::vfs::error::VfsError::AlreadyExists { .. }) => {
+                        Err(s3_error!(BucketAlreadyOwnedByYou, "bucket already exists"))
+                    }
                     Err(e) => Err(Self::err(e)),
                 }
             }
         }
     }
 
-    async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
+    async fn delete_bucket(
+        &self,
+        req: S3Request<DeleteBucketInput>,
+    ) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
         let bucket = input.bucket.as_str().to_string();
         match &self.opts.bucket_mode {
@@ -572,12 +560,18 @@ where
         }
     }
 
-    async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
+    async fn head_bucket(
+        &self,
+        req: S3Request<HeadBucketInput>,
+    ) -> S3Result<S3Response<HeadBucketOutput>> {
         self.stat_bucket_root(req.input.bucket.as_str()).await?;
         Ok(S3Response::new(HeadBucketOutput::default()))
     }
 
-    async fn list_buckets(&self, _req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
+    async fn list_buckets(
+        &self,
+        _req: S3Request<ListBucketsInput>,
+    ) -> S3Result<S3Response<ListBucketsOutput>> {
         let owner = Owner::default();
         let buckets = match &self.opts.bucket_mode {
             BucketMode::Single { bucket } => vec![Bucket {
@@ -616,7 +610,10 @@ where
         Ok(S3Response::new(GetBucketLocationOutput::default()))
     }
 
-    async fn put_object(&self, mut req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+    async fn put_object(
+        &self,
+        mut req: S3Request<PutObjectInput>,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
         let input = &mut req.input;
         let bucket = input.bucket.as_str().to_string();
         let key = input.key.as_str().to_string();
@@ -710,7 +707,10 @@ where
         }))
     }
 
-    async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+    async fn get_object(
+        &self,
+        req: S3Request<GetObjectInput>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
         let bucket = input.bucket.as_str().to_string();
         let key = input.key.as_str().to_string();
@@ -729,7 +729,12 @@ where
                 body: Some(StreamingBlob::from_bytes(Default::default())),
                 content_length: Some(0),
                 e_tag: Some(ETag::Strong(etag)),
-                content_type: Some(meta.content_type.clone().map(ContentType::from).unwrap_or_else(|| ContentType::from(DEFAULT_CONTENT_TYPE))),
+                content_type: Some(
+                    meta.content_type
+                        .clone()
+                        .map(ContentType::from)
+                        .unwrap_or_else(|| ContentType::from(DEFAULT_CONTENT_TYPE)),
+                ),
                 last_modified: Self::mtime_timestamp(&attr),
                 accept_ranges: Some(AcceptRanges::from("bytes")),
                 ..Default::default()
@@ -752,14 +757,21 @@ where
             body: Some(body),
             content_length: Some(length as i64),
             e_tag: Some(ETag::Strong(etag)),
-            content_type: Some(meta.content_type.map(ContentType::from).unwrap_or_else(|| ContentType::from(DEFAULT_CONTENT_TYPE))),
+            content_type: Some(
+                meta.content_type
+                    .map(ContentType::from)
+                    .unwrap_or_else(|| ContentType::from(DEFAULT_CONTENT_TYPE)),
+            ),
             last_modified: Self::mtime_timestamp(&attr),
             accept_ranges: Some(AcceptRanges::from("bytes")),
             ..Default::default()
         }))
     }
 
-    async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
+    async fn head_object(
+        &self,
+        req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
         let input = req.input;
         let bucket = input.bucket.as_str().to_string();
         let key = input.key.as_str().to_string();
@@ -780,7 +792,11 @@ where
         Ok(S3Response::new(HeadObjectOutput {
             content_length: Some(attr.size as i64),
             e_tag: Some(ETag::Strong(etag)),
-            content_type: Some(meta.content_type.map(ContentType::from).unwrap_or_else(|| ContentType::from(DEFAULT_CONTENT_TYPE))),
+            content_type: Some(
+                meta.content_type
+                    .map(ContentType::from)
+                    .unwrap_or_else(|| ContentType::from(DEFAULT_CONTENT_TYPE)),
+            ),
             last_modified: Self::mtime_timestamp(&attr),
             metadata,
             accept_ranges: Some(AcceptRanges::from("bytes")),
@@ -788,7 +804,10 @@ where
         }))
     }
 
-    async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
+    async fn delete_object(
+        &self,
+        req: S3Request<DeleteObjectInput>,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let input = req.input;
         let bucket = input.bucket.as_str().to_string();
         let key = input.key.as_str().to_string();
@@ -801,7 +820,10 @@ where
         ))
     }
 
-    async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let input = req.input;
         let bucket = input.bucket.as_str().to_string();
         let objects = input.delete.objects;
@@ -811,7 +833,7 @@ where
         for obj in objects {
             let key = obj.key.as_str().to_string();
             let lock = self.lock_for(&bucket, &key);
-        let _guard = lock.lock().await;
+            let _guard = lock.lock().await;
             match self.delete_object_internal(&bucket, &key).await {
                 Ok(()) => deleted.push(DeletedObject {
                     key: Some(obj.key),
@@ -826,13 +848,24 @@ where
             }
         }
         Ok(S3Response::new(DeleteObjectsOutput {
-            deleted: if deleted.is_empty() { None } else { Some(deleted) },
-            errors: if errors.is_empty() { None } else { Some(errors) },
+            deleted: if deleted.is_empty() {
+                None
+            } else {
+                Some(deleted)
+            },
+            errors: if errors.is_empty() {
+                None
+            } else {
+                Some(errors)
+            },
             ..Default::default()
         }))
     }
 
-    async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
         let input = req.input;
         let dst_bucket = input.bucket.as_str().to_string();
         let dst_key = input.key.as_str().to_string();
@@ -845,7 +878,7 @@ where
                 return Err(s3_error!(
                     NotImplemented,
                     "only bucket/key copy sources are supported"
-                ))
+                ));
             }
         };
 
@@ -872,9 +905,14 @@ where
         );
         let meta = if replace {
             ObjectMeta {
-                content_type: input.content_type.as_ref().map(|ct| ct.as_str().to_string()),
+                content_type: input
+                    .content_type
+                    .as_ref()
+                    .map(|ct| ct.as_str().to_string()),
                 metadata: input.metadata.as_ref().map(|m| {
-                    m.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+                    m.iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect()
                 }),
             }
         } else {
@@ -888,8 +926,12 @@ where
         let etag = etag.unwrap_or_else(|| Self::fallback_etag(&final_attr));
 
         self.set_xattr(final_attr.ino, XATTR_ETAG, &etag).await?;
-        self.set_xattr(final_attr.ino, XATTR_META, &serde_json::to_string(&meta).unwrap())
-            .await?;
+        self.set_xattr(
+            final_attr.ino,
+            XATTR_META,
+            &serde_json::to_string(&meta).unwrap(),
+        )
+        .await?;
 
         let last_modified = Self::mtime_timestamp(&final_attr);
         tracing::debug!(bucket = %dst_bucket, key = %dst_key, size, "s3 copy_object");
@@ -903,13 +945,24 @@ where
         }))
     }
 
-    async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
+    async fn list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
         let input = req.input;
         let bucket = input.bucket.as_str().to_string();
         let query = ListQuery {
-            prefix: input.prefix.as_ref().map(|p| p.as_str().to_string()).unwrap_or_default(),
+            prefix: input
+                .prefix
+                .as_ref()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_default(),
             delimiter: input.delimiter.as_ref().map(|d| d.as_str().to_string()),
-            start_after: input.marker.as_ref().map(|m| m.as_str().to_string()).unwrap_or_default(),
+            start_after: input
+                .marker
+                .as_ref()
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default(),
             max_keys: input
                 .max_keys
                 .map(|m| usize::try_from(m).unwrap_or(1000))
@@ -944,13 +997,20 @@ where
             } else {
                 None
             },
-            contents: if contents.is_empty() { None } else { Some(contents) },
+            contents: if contents.is_empty() {
+                None
+            } else {
+                Some(contents)
+            },
             common_prefixes: prefixes_to_dto(&result.common_prefixes),
             ..Default::default()
         }))
     }
 
-    async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
+    async fn list_objects_v2(
+        &self,
+        req: S3Request<ListObjectsV2Input>,
+    ) -> S3Result<S3Response<ListObjectsV2Output>> {
         let input = req.input;
         let bucket = input.bucket.as_str().to_string();
         let start_after = input
@@ -964,7 +1024,11 @@ where
             .map(|t| t.as_str().to_string())
             .unwrap_or_default();
         let query = ListQuery {
-            prefix: input.prefix.as_ref().map(|p| p.as_str().to_string()).unwrap_or_default(),
+            prefix: input
+                .prefix
+                .as_ref()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_default(),
             delimiter: input.delimiter.as_ref().map(|d| d.as_str().to_string()),
             start_after: if continuation.is_empty() {
                 start_after
@@ -1008,7 +1072,11 @@ where
             } else {
                 None
             },
-            contents: if contents.is_empty() { None } else { Some(contents) },
+            contents: if contents.is_empty() {
+                None
+            } else {
+                Some(contents)
+            },
             common_prefixes: prefixes_to_dto(&result.common_prefixes),
             ..Default::default()
         }))
@@ -1022,7 +1090,10 @@ where
         let bucket = input.bucket.as_str().to_string();
         let key = input.key.as_str().to_string();
         if key.ends_with('/') {
-            return Err(s3_error!(InvalidArgument, "multipart key must not end with '/'"));
+            return Err(s3_error!(
+                InvalidArgument,
+                "multipart key must not end with '/'"
+            ));
         }
         self.stat_bucket_root(&bucket).await?;
         path::object_path(&self.opts.bucket_mode, &bucket, &key).map_err(Self::path_err)?;
@@ -1039,7 +1110,9 @@ where
                 .as_ref()
                 .map(|ct| ct.as_str().to_string()),
             metadata: input.metadata.as_ref().map(|m| {
-                m.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+                m.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect()
             }),
             initiated: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1047,7 +1120,11 @@ where
                 .unwrap_or(0),
         };
         let target_path = UploadMeta::target_path(&upload_id);
-        let ino = self.vfs.create_file(&target_path).await.map_err(Self::err)?;
+        let ino = self
+            .vfs
+            .create_file(&target_path)
+            .await
+            .map_err(Self::err)?;
         let attr = self.vfs.stat(&target_path).await.map_err(Self::err)?;
         let guard = self
             .vfs
@@ -1068,7 +1145,10 @@ where
         }))
     }
 
-    async fn upload_part(&self, mut req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+    async fn upload_part(
+        &self,
+        mut req: S3Request<UploadPartInput>,
+    ) -> S3Result<S3Response<UploadPartOutput>> {
         let upload_id = req.input.upload_id.clone();
         let part_number = req.input.part_number;
 
@@ -1093,7 +1173,10 @@ where
         }))
     }
 
-    async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
         let input = req.input;
         let upload_id = input.upload_id.clone();
         let meta = self.read_upload_meta(&upload_id).await?;
@@ -1224,8 +1307,8 @@ where
         }
         out_guard.close().await.map_err(Self::err)?;
 
-        let target = path::object_path(&self.opts.bucket_mode, &bucket, &key)
-            .map_err(Self::path_err)?;
+        let target =
+            path::object_path(&self.opts.bucket_mode, &bucket, &key).map_err(Self::path_err)?;
         if let Some(parent) = std::path::Path::new(&target).parent() {
             let parent = parent.to_string_lossy().to_string();
             if !parent.is_empty() {
@@ -1296,8 +1379,7 @@ where
                 // Reconstruct the upload id from the directory name.
                 let upload_id = upload.name.clone();
                 if let Ok(meta) = self.read_upload_meta(&upload_id).await {
-                    if meta.bucket == bucket
-                        && (prefix.is_empty() || meta.key.starts_with(&prefix))
+                    if meta.bucket == bucket && (prefix.is_empty() || meta.key.starts_with(&prefix))
                     {
                         uploads.push(MultipartUpload {
                             key: Some(ObjectKey::from(meta.key)),
@@ -1305,9 +1387,7 @@ where
                             initiated: Some(Timestamp::from(
                                 UNIX_EPOCH + Duration::from_secs(meta.initiated.max(0) as u64),
                             )),
-                            storage_class: Some(StorageClass::from_static(
-                                StorageClass::STANDARD,
-                            )),
+                            storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
                             ..Default::default()
                         });
                     }
@@ -1319,7 +1399,11 @@ where
 
         Ok(S3Response::new(ListMultipartUploadsOutput {
             bucket: Some(input.bucket),
-            uploads: if uploads.is_empty() { None } else { Some(uploads) },
+            uploads: if uploads.is_empty() {
+                None
+            } else {
+                Some(uploads)
+            },
             ..Default::default()
         }))
     }

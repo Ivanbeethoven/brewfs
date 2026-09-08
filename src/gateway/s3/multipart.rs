@@ -34,9 +34,7 @@ pub fn upload_dir(upload_id: &str) -> String {
     } else {
         "00".to_string()
     };
-    format!("{}/{}", uploads_dir(), hh)
-        + "/"
-        + upload_id
+    format!("{}/{}", uploads_dir(), hh) + "/" + upload_id
 }
 
 /// Path of a part file inside an upload directory.

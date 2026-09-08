@@ -109,7 +109,11 @@ impl ListCollector {
             }
         }
 
-        let key = if is_dir_object { format!("{full}/") } else { full };
+        let key = if is_dir_object {
+            format!("{full}/")
+        } else {
+            full
+        };
         self.objects.push(ListedObject {
             key,
             size,
@@ -253,8 +257,7 @@ mod tests {
             max_keys: 10,
             ..Default::default()
         });
-        c.common_prefixes
-            .insert("photos/".to_string());
+        c.common_prefixes.insert("photos/".to_string());
         c.objects = vec![obj("readme.txt")];
         let r = c.finish();
         assert_eq!(r.common_prefixes.len(), 1);

@@ -5,9 +5,9 @@ mod control;
 mod daemon;
 #[allow(dead_code)]
 mod fs;
+mod fuse;
 #[cfg(feature = "gateway-s3")]
 mod gateway;
-mod fuse;
 mod meta;
 mod posix;
 mod utils;
@@ -406,8 +406,8 @@ async fn gateway_cmd(args: GatewayArgs) -> anyhow::Result<()> {
 
 #[cfg(feature = "gateway-s3")]
 async fn gateway_s3_cmd(args: S3GatewayArgs) -> anyhow::Result<()> {
-    use crate::gateway::s3::{S3GatewayOptions, serve};
     use crate::gateway::s3::path::BucketMode;
+    use crate::gateway::s3::{S3GatewayOptions, serve};
 
     // The gateway does not own a FUSE mount point; use a placeholder so
     // MountConfig::from_sources validation passes.
@@ -437,9 +437,9 @@ async fn gateway_s3_cmd(args: S3GatewayArgs) -> anyhow::Result<()> {
     };
     let secret_key = match args.secret_key.as_deref() {
         Some(k) if !k.is_empty() => k.to_string(),
-        _ => anyhow::bail!(
-            "s3 gateway requires a secret key (--secret-key or BREWFS_S3_SECRET_KEY)"
-        ),
+        _ => {
+            anyhow::bail!("s3 gateway requires a secret key (--secret-key or BREWFS_S3_SECRET_KEY)")
+        }
     };
 
     let bucket_mode = if args.multi_buckets {
@@ -467,17 +467,34 @@ async fn gateway_s3_cmd(args: S3GatewayArgs) -> anyhow::Result<()> {
         DataBackendKind::LocalFs => {
             let client = create_localfs_client(&cfg)?;
             let store = create_object_store(client, layout, &cfg.cache).await?;
-            serve(store, create_meta_store(&cfg).await?, layout, cfg.compact.clone(), cfg.cache.clone(), opts).await
+            serve(
+                store,
+                create_meta_store(&cfg).await?,
+                layout,
+                cfg.compact.clone(),
+                cfg.cache.clone(),
+                opts,
+            )
+            .await
         }
         DataBackendKind::S3 => {
             let client = create_s3_client(&cfg).await?;
             let store = create_object_store(client, layout, &cfg.cache).await?;
-            serve(store, create_meta_store(&cfg).await?, layout, cfg.compact.clone(), cfg.cache.clone(), opts).await
+            serve(
+                store,
+                create_meta_store(&cfg).await?,
+                layout,
+                cfg.compact.clone(),
+                cfg.cache.clone(),
+                opts,
+            )
+            .await
         }
     }
 }
 
-fn validate_volume_format_support(format: VolumeFormat) -> anyhow::Result<()> {    match format {
+fn validate_volume_format_support(format: VolumeFormat) -> anyhow::Result<()> {
+    match format {
         VolumeFormat::FlatV1 => Ok(()),
         #[cfg(feature = "workspace-overlay")]
         VolumeFormat::WorkspaceV1 => Ok(()),

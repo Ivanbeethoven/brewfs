@@ -15,8 +15,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use s3s::service::S3ServiceBuilder;
 use s3s::auth::SimpleAuth;
+use s3s::service::S3ServiceBuilder;
 use tower::Service;
 
 use crate::chunk::store::BlockStore;
@@ -138,9 +138,7 @@ where
 }
 
 /// Removes multipart uploads older than 24h and staging files older than 24h.
-async fn cleanup_stale_uploads<S>(
-    vfs: &VFS<S, MetaClient<dyn MetaStore>>,
-) -> anyhow::Result<()>
+async fn cleanup_stale_uploads<S>(vfs: &VFS<S, MetaClient<dyn MetaStore>>) -> anyhow::Result<()>
 where
     S: BlockStore + Send + Sync + 'static,
 {
