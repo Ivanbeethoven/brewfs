@@ -179,7 +179,7 @@ mod tests {
             object_path(&mode, "data", "a/b.txt").unwrap(),
             "/data/a/b.txt"
         );
-        assert_eq!(bucket_root(&mode, "UP").is_err(), true);
+        assert!(bucket_root(&mode, "UP").is_err());
     }
 
     #[test]

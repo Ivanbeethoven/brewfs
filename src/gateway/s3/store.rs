@@ -732,8 +732,7 @@ where
                 content_type: Some(
                     meta.content_type
                         .clone()
-                        .map(ContentType::from)
-                        .unwrap_or_else(|| ContentType::from(DEFAULT_CONTENT_TYPE)),
+                        .unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_string()),
                 ),
                 last_modified: Self::mtime_timestamp(&attr),
                 accept_ranges: Some(AcceptRanges::from("bytes")),
@@ -759,8 +758,7 @@ where
             e_tag: Some(ETag::Strong(etag)),
             content_type: Some(
                 meta.content_type
-                    .map(ContentType::from)
-                    .unwrap_or_else(|| ContentType::from(DEFAULT_CONTENT_TYPE)),
+                    .unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_string()),
             ),
             last_modified: Self::mtime_timestamp(&attr),
             accept_ranges: Some(AcceptRanges::from("bytes")),
@@ -794,8 +792,7 @@ where
             e_tag: Some(ETag::Strong(etag)),
             content_type: Some(
                 meta.content_type
-                    .map(ContentType::from)
-                    .unwrap_or_else(|| ContentType::from(DEFAULT_CONTENT_TYPE)),
+                    .unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_string()),
             ),
             last_modified: Self::mtime_timestamp(&attr),
             metadata,
@@ -1184,11 +1181,11 @@ where
         let dir = multipart::upload_dir(&upload_id);
         let mut parts: Vec<(i64, u64, i64, Option<String>)> = Vec::new();
         for entry in self.read_dir_entries(&dir).await? {
-            if let Some(n) = parse_part_name(&entry.name) {
-                if let Some(attr) = self.vfs.stat_ino(entry.ino).await {
-                    let etag = self.read_etag(entry.ino).await;
-                    parts.push((n, attr.size, attr.mtime, etag));
-                }
+            if let Some(n) = parse_part_name(&entry.name)
+                && let Some(attr) = self.vfs.stat_ino(entry.ino).await
+            {
+                let etag = self.read_etag(entry.ino).await;
+                parts.push((n, attr.size, attr.mtime, etag));
             }
         }
         parts.sort_by_key(|p| p.0);
@@ -1238,10 +1235,9 @@ where
         let _guard = lock.lock().await;
 
         // Validate part ordering and etags.
-        let mut expected = 1i32;
         let mut part_etags: Vec<String> = Vec::with_capacity(completed.len());
         let mut part_files: Vec<(i64, String)> = Vec::with_capacity(completed.len());
-        for part in &completed {
+        for (expected, part) in (1i32..).zip(&completed) {
             let n = part.part_number.unwrap_or(0);
             if n != expected {
                 return Err(s3_error!(
@@ -1249,7 +1245,6 @@ where
                     "parts must be ascending starting at 1 (got {n}, expected {expected})"
                 ));
             }
-            expected += 1;
             let src = multipart::part_path(&upload_id, i64::from(n));
             let attr = match self.vfs.stat(&src).await {
                 Ok(a) => a,
@@ -1261,10 +1256,10 @@ where
                 return Err(s3_error!(EntityTooSmall, "part {n} is smaller than 5 MiB"));
             }
             let stored = self.read_etag(attr.ino).await;
-            if let (Some(want), Some(have)) = (part.e_tag.as_ref(), stored.as_ref()) {
-                if want.value() != have {
-                    return Err(s3_error!(InvalidPart, "etag mismatch on part {n}"));
-                }
+            if let (Some(want), Some(have)) = (part.e_tag.as_ref(), stored.as_ref())
+                && want.value() != have
+            {
+                return Err(s3_error!(InvalidPart, "etag mismatch on part {n}"));
             }
             part_etags.push(stored.unwrap_or_default());
             part_files.push((i64::from(n), src));
@@ -1375,24 +1370,21 @@ where
         for hh in self.read_dir_entries(&multipart::uploads_dir()).await? {
             let hh_dir = format!("{}/{}", multipart::uploads_dir(), hh.name);
             for upload in self.read_dir_entries(&hh_dir).await? {
-                let target = format!("{}/{}", hh_dir, upload.name);
-                // Reconstruct the upload id from the directory name.
                 let upload_id = upload.name.clone();
-                if let Ok(meta) = self.read_upload_meta(&upload_id).await {
-                    if meta.bucket == bucket && (prefix.is_empty() || meta.key.starts_with(&prefix))
-                    {
-                        uploads.push(MultipartUpload {
-                            key: Some(ObjectKey::from(meta.key)),
-                            upload_id: Some(MultipartUploadId::from(upload_id)),
-                            initiated: Some(Timestamp::from(
-                                UNIX_EPOCH + Duration::from_secs(meta.initiated.max(0) as u64),
-                            )),
-                            storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
-                            ..Default::default()
-                        });
-                    }
+                if let Ok(meta) = self.read_upload_meta(&upload_id).await
+                    && meta.bucket == bucket
+                    && (prefix.is_empty() || meta.key.starts_with(&prefix))
+                {
+                    uploads.push(MultipartUpload {
+                        key: Some(ObjectKey::from(meta.key)),
+                        upload_id: Some(MultipartUploadId::from(upload_id)),
+                        initiated: Some(Timestamp::from(
+                            UNIX_EPOCH + Duration::from_secs(meta.initiated.max(0) as u64),
+                        )),
+                        storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
+                        ..Default::default()
+                    });
                 }
-                let _ = target;
             }
         }
         uploads.sort_by(|a, b| a.key.cmp(&b.key));

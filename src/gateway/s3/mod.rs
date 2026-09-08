@@ -150,21 +150,21 @@ where
         for upload in read_children(vfs, &hh_dir).await {
             let dir = format!("{hh_dir}/{}", upload.name);
             let target = format!("{dir}/.target");
-            if let Ok(attr) = vfs.stat(&target).await {
-                if attr.mtime < cutoff_ns {
-                    let _ = remove_dir_all_rec(vfs, &dir).await;
-                    tracing::info!(dir = %dir, "cleaned stale multipart upload");
-                }
+            if let Ok(attr) = vfs.stat(&target).await
+                && attr.mtime < cutoff_ns
+            {
+                let _ = remove_dir_all_rec(vfs, &dir).await;
+                tracing::info!(dir = %dir, "cleaned stale multipart upload");
             }
         }
     }
     let tmp = multipart::tmp_dir();
     for entry in read_children(vfs, &tmp).await {
         let path = format!("{tmp}/{}", entry.name);
-        if let Ok(attr) = vfs.stat(&path).await {
-            if attr.mtime < cutoff_ns {
-                let _ = vfs.unlink(&path).await;
-            }
+        if let Ok(attr) = vfs.stat(&path).await
+            && attr.mtime < cutoff_ns
+        {
+            let _ = vfs.unlink(&path).await;
         }
     }
     Ok(())

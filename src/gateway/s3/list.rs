@@ -47,17 +47,6 @@ pub struct ListResult {
     pub next_marker: String,
 }
 
-impl ListResult {
-    /// Total number of returned entries (keys + common prefixes).
-    pub fn len(&self) -> usize {
-        self.objects.len() + self.common_prefixes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
 /// Collects entries during a directory walk, applying prefix/delimiter rules.
 #[derive(Debug, Default)]
 pub struct ListCollector {
@@ -79,6 +68,7 @@ impl ListCollector {
     ///
     /// `parent_key` is the parent path relative to the bucket root with a
     /// trailing `/` (empty for the root). `name` is the entry name.
+    #[allow(clippy::too_many_arguments)]
     pub fn push_entry(
         &mut self,
         parent_key: &str,
@@ -96,17 +86,16 @@ impl ListCollector {
             return;
         }
 
-        if let Some(delim) = self.query.delimiter.clone() {
-            if let Some(rel) = full.strip_prefix(&self.query.prefix) {
-                if let Some(idx) = rel.find(&delim) {
-                    let end = self.query.prefix.len() + idx + delim.len();
-                    let cp = full[..end].to_string();
-                    if cp > self.query.start_after || self.query.start_after.is_empty() {
-                        self.common_prefixes.insert(cp);
-                    }
-                    return;
-                }
+        if let Some(delim) = self.query.delimiter.clone()
+            && let Some(rel) = full.strip_prefix(&self.query.prefix)
+            && let Some(idx) = rel.find(&delim)
+        {
+            let end = self.query.prefix.len() + idx + delim.len();
+            let cp = full[..end].to_string();
+            if cp > self.query.start_after || self.query.start_after.is_empty() {
+                self.common_prefixes.insert(cp);
             }
+            return;
         }
 
         let key = if is_dir_object {
