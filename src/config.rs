@@ -68,9 +68,57 @@ pub enum Command {
     /// Run the BrewFS web console.
     Console(ConsoleArgs),
 
+    /// Run protocol gateways that expose a BrewFS volume over S3/WebDAV/NFS
+    /// without a FUSE mount.
+    #[cfg(feature = "gateway-s3")]
+    Gateway(Box<GatewayArgs>),
+
     /// Run a direct S3 object PUT benchmark without going through FUSE.
     #[command(hide = true)]
     ObjectPutBench(ObjectPutBenchArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GatewayProtocol {
+    /// S3-compatible gateway (see doc/protocols/s3-gateway.md).
+    S3(S3GatewayArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct GatewayArgs {
+    #[command(subcommand)]
+    pub protocol: GatewayProtocol,
+}
+
+#[derive(Args, Debug)]
+pub struct S3GatewayArgs {
+    /// HTTP listen address of the S3 endpoint.
+    #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:9000")]
+    pub listen: std::net::SocketAddr,
+
+    /// Static access key for SigV4 (or env BREWFS_S3_ACCESS_KEY).
+    #[arg(long, value_name = "KEY", env = "BREWFS_S3_ACCESS_KEY")]
+    pub access_key: Option<String>,
+
+    /// Static secret key for SigV4 (or env BREWFS_S3_SECRET_KEY).
+    #[arg(long, value_name = "KEY", env = "BREWFS_S3_SECRET_KEY")]
+    pub secret_key: Option<String>,
+
+    /// Bucket name exposed in single-bucket mode (defaults to "brewfs").
+    #[arg(long, value_name = "NAME", default_value = "brewfs")]
+    pub bucket: String,
+
+    /// Expose top-level directories as buckets instead of a single bucket.
+    #[arg(long, default_value_t = false)]
+    pub multi_buckets: bool,
+
+    /// Hide directory objects in listings.
+    #[arg(long, default_value_t = false)]
+    pub hide_dir_objects: bool,
+
+    /// Volume backend options; the same set accepted by `brewfs mount`.
+    #[command(flatten)]
+    pub mount: MountArgs,
 }
 
 #[derive(Args, Debug, Clone)]

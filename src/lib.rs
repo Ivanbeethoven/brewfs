@@ -4,6 +4,8 @@
 
 pub mod cadapter;
 pub mod chunk;
+#[cfg(feature = "gateway-s3")]
+pub mod gateway;
 pub(crate) mod control;
 pub mod daemon;
 pub(crate) mod fs;
