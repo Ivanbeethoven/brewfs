@@ -4,12 +4,12 @@
 
 pub mod cadapter;
 pub mod chunk;
-#[cfg(feature = "gateway-s3")]
-pub mod gateway;
 pub(crate) mod control;
 pub mod daemon;
 pub(crate) mod fs;
 pub mod fuse;
+#[cfg(feature = "gateway-s3")]
+pub mod gateway;
 // Expose meta for E2E testing - tests should rely on design contracts, not impl details
 pub mod meta;
 pub(crate) mod posix;
