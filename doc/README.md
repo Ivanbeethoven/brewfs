@@ -27,6 +27,7 @@ plans under `doc/` unless a tool explicitly requires another location.
 | [meta-api/](meta-api/) | Meta client API audit, mapping, extension plan, and read/write follow-up work. |
 | [juicefs/](juicefs/) | JuiceFS internals notes used for cross-project comparison. |
 | [gap/](gap/) | BrewFS/JuiceFS module gap analysis and iteration roadmap. |
+| [protocols/](protocols/) | Multi-protocol gateway specs (S3, WebDAV, NFS), shared conventions, and the milestone roadmap. |
 | [vfs/](vfs/) | VFS module-specific implementation guide. |
 | [bugfix/](bugfix/) | Historical bug investigations and fix notes that are still useful for regression context. |
 | [superpowers/](superpowers/) | Dated agent plans and specs. Treat these as historical execution records unless a plan is explicitly current. |
