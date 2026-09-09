@@ -110,6 +110,19 @@ jobs:
       - name: Clippy workspace overlay
         run: cargo clippy --workspace --all-targets --features workspace-overlay -- -D warnings
 
+      - name: Test workspace operator
+        working-directory: operator/brewfs-operator
+        run: |
+          cargo check
+          cargo test --features workspace-operator
+          cargo clippy --features workspace-operator --all-targets -- -D warnings
+
+      - name: Verify generated operator CRDs
+        working-directory: operator/brewfs-operator
+        run: |
+          cargo run --features workspace-operator -- crdgen > /tmp/brewfs-operator-crd.yaml
+          diff -u manifests/crd.yaml /tmp/brewfs-operator-crd.yaml
+
   docker-workspace-overlay-smoke:
     name: Docker workspace overlay smoke (${{ matrix.meta-backend }})
     runs-on: ubuntu-latest
@@ -161,7 +174,6 @@ jobs:
           name: workspace-overlay-smoke-${{ matrix.meta-backend }}-artifacts
           path: docker/compose-xfstests/artifacts/**
           if-no-files-found: warn
-
   docker-workspace-overlay:
     name: Docker workspace overlay (${{ matrix.meta-backend }})
     runs-on: ubuntu-latest

@@ -7,6 +7,16 @@
 - `BrewFSCluster`：管理 Redis、RustFS 和 BrewFS 配置
 - `BrewFSMount`：专门管理挂载工作负载
 
+编译时启用 `workspace-operator` 后，还提供面向 agent workspace 的三个生命周期资源：
+
+- `BrewFSWorkspace`：从 cluster root 或不可变 snapshot 创建固定两层 workspace
+- `BrewFSWorkspaceMount`：运行单副本 FUSE sidecar 与 agent containers，并持有独占写租约
+- `BrewFSWorkspaceSnapshot`：在 workspace quiesce 后 seal 并固定精确 revision
+
+完整生命周期、不可变 lower 保证和架构图见
+`../../doc/superpowers/specs/2026-09-03-brewfs-workspace-operator-lifecycle-spec.md`；可运行示例见
+`manifests/example-workspace.yaml`。
+
 详细文档入口：
 
 - `docs/README.md`
@@ -209,11 +219,23 @@ cd operator/brewfs-operator
 cargo run -- run
 ```
 
+启用 workspace controller（生产镜像默认按此 feature 构建）：
+
+```bash
+cargo run --features workspace-operator -- run
+```
+
 打印 CRD YAML：
 
 ```bash
 cd operator/brewfs-operator
 cargo run -- crdgen
+```
+
+包含 workspace CRD 的生成命令：
+
+```bash
+cargo run --features workspace-operator -- crdgen
 ```
 
 BrewFS runtime 和 operator 镜像由 `.github/workflows/docker-images.yml` 发布：
@@ -275,6 +297,13 @@ package 公开后，上面这组 secret/patch 就不需要了。
 kubectl apply -k manifests
 kubectl apply -f manifests/example-cluster.yaml
 kubectl apply -f manifests/example-mount.yaml
+```
+
+创建一个 agent workspace 及其单写挂载工作负载：
+
+```bash
+kubectl apply -f manifests/example-workspace.yaml
+kubectl get brewfsworkspaces,brewfsworkspacemounts,brewfsworkspacesnapshots
 ```
 
 ## 后续演进方向

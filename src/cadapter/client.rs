@@ -16,6 +16,14 @@ pub trait ObjectBackend: Send + Sync {
 
     async fn put_object(&self, key: &str, data: &[u8]) -> Result<()>;
 
+    /// Atomically create an object and fail if the key already exists with
+    /// different content. An identical object may be accepted as an
+    /// idempotent retry after an ambiguous network result. Backends must not
+    /// emulate this with a racy HEAD followed by PUT.
+    async fn put_object_create_only(&self, _key: &str, _data: &[u8]) -> Result<()> {
+        anyhow::bail!("object backend does not support atomic create-only PUT")
+    }
+
     async fn get_object(&self, key: &str) -> Result<Option<Vec<u8>>>;
 
     /// Get a range of bytes from an object.
@@ -50,6 +58,10 @@ impl<B: ObjectBackend> ObjectClient<B> {
 
     pub async fn put_object_vectored(&self, key: &str, chunks: Vec<Bytes>) -> Result<()> {
         self.backend.put_object_vectored(key, chunks).await
+    }
+
+    pub async fn put_object_create_only(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.backend.put_object_create_only(key, data).await
     }
 
     pub async fn get_object(&self, key: &str) -> Result<Option<Vec<u8>>> {
