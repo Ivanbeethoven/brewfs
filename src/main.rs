@@ -406,7 +406,7 @@ async fn gateway_cmd(args: GatewayArgs) -> anyhow::Result<()> {
 
 #[cfg(feature = "gateway-s3")]
 async fn gateway_s3_cmd(args: S3GatewayArgs) -> anyhow::Result<()> {
-    use crate::gateway::s3::path::BucketMode;
+    use crate::gateway::s3::path::{BucketMode, is_valid_bucket_name};
     use crate::gateway::s3::{S3GatewayOptions, serve};
 
     // The gateway does not own a FUSE mount point; use a placeholder so
@@ -445,6 +445,9 @@ async fn gateway_s3_cmd(args: S3GatewayArgs) -> anyhow::Result<()> {
     let bucket_mode = if args.multi_buckets {
         BucketMode::Multi
     } else {
+        if !is_valid_bucket_name(&args.bucket) {
+            anyhow::bail!("invalid S3 bucket name: {}", args.bucket);
+        }
         BucketMode::Single {
             bucket: args.bucket,
         }

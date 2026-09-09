@@ -25,16 +25,17 @@ pub fn tmp_dir() -> String {
     format!("{}/tmp", crate::gateway::s3_sys_dir())
 }
 
+/// Returns whether an upload id uses the gateway's generated on-disk format.
+pub fn is_valid_upload_id(upload_id: &str) -> bool {
+    upload_id.len() == 32 && upload_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Directory of one multipart upload.
 pub fn upload_dir(upload_id: &str) -> String {
-    // Fan out by the first two characters of the upload id so a flat
-    // directory never holds unbounded entries.
-    let hh: String = if upload_id.len() >= 2 {
-        upload_id[..2].to_string()
-    } else {
-        "00".to_string()
-    };
-    format!("{}/{}", uploads_dir(), hh) + "/" + upload_id
+    // Generated upload ids are ASCII hex. `get` keeps this helper total for
+    // malformed ids supplied at the protocol boundary.
+    let hh = upload_id.get(..2).unwrap_or("00");
+    format!("{}/{hh}/{upload_id}", uploads_dir())
 }
 
 /// Path of a part file inside an upload directory.
@@ -92,15 +93,18 @@ mod tests {
 
     #[test]
     fn upload_paths() {
-        let id = "0123456789abcdef";
+        let id = "0123456789abcdef0123456789abcdef";
         assert_eq!(
             upload_dir(id),
-            "/.brewfs.sys/s3/uploads/01/0123456789abcdef"
+            "/.brewfs.sys/s3/uploads/01/0123456789abcdef0123456789abcdef"
         );
         assert_eq!(
             part_path(id, 3),
-            "/.brewfs.sys/s3/uploads/01/0123456789abcdef/part-3"
+            "/.brewfs.sys/s3/uploads/01/0123456789abcdef0123456789abcdef/part-3"
         );
+        assert!(is_valid_upload_id(id));
+        assert!(!is_valid_upload_id("a😀"));
+        assert_eq!(upload_dir("a😀"), "/.brewfs.sys/s3/uploads/00/a😀");
     }
 
     #[test]

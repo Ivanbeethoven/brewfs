@@ -90,36 +90,31 @@ where
         hide_dir_objects: opts.hide_dir_objects,
     };
 
-    // Hidden system directories.
-    {
-        let probe = BrewFsS3::new(vfs.clone(), s3_options.clone());
-        probe
-            .vfs()
-            .mkdir_p(&multipart::uploads_dir())
-            .await
-            .map_err(|e| anyhow::anyhow!("create uploads dir: {e}"))?;
-        probe
-            .vfs()
-            .mkdir_p(&multipart::tmp_dir())
-            .await
-            .map_err(|e| anyhow::anyhow!("create tmp dir: {e}"))?;
-    }
+    let s3 = BrewFsS3::new(vfs, s3_options);
+    s3.vfs()
+        .mkdir_p(&multipart::uploads_dir())
+        .await
+        .map_err(|e| anyhow::anyhow!("create uploads dir: {e}"))?;
+    s3.vfs()
+        .mkdir_p(&multipart::tmp_dir())
+        .await
+        .map_err(|e| anyhow::anyhow!("create tmp dir: {e}"))?;
 
     // Periodic cleanup of stale multipart state (best effort).
     {
-        let cleanup_vfs = vfs.clone();
+        let cleanup_s3 = s3.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3600));
             loop {
                 interval.tick().await;
-                if let Err(e) = cleanup_stale_uploads(&cleanup_vfs).await {
+                if let Err(e) = cleanup_stale_uploads(&cleanup_s3).await {
                     tracing::warn!(error = %e, "s3 gateway cleanup task failed");
                 }
             }
         });
     }
 
-    let mut builder = S3ServiceBuilder::new(BrewFsS3::new(vfs, s3_options));
+    let mut builder = S3ServiceBuilder::new(s3);
     builder.set_auth(SimpleAuth::from_single(
         opts.access_key.clone(),
         opts.secret_key.clone(),
@@ -138,29 +133,50 @@ where
 }
 
 /// Removes multipart uploads older than 24h and staging files older than 24h.
-async fn cleanup_stale_uploads<S>(vfs: &VFS<S, MetaClient<dyn MetaStore>>) -> anyhow::Result<()>
+async fn cleanup_stale_uploads<S>(s3: &BrewFsS3<S>) -> anyhow::Result<()>
 where
     S: BlockStore + Send + Sync + 'static,
 {
+    let vfs = s3.vfs();
     let cutoff = chrono::Utc::now().timestamp() - 24 * 3600;
     let cutoff_ns = cutoff * 1_000_000_000; // VFS attrs carry mtime in nanos.
     let uploads = multipart::uploads_dir();
     for hh in read_children(vfs, &uploads).await {
         let hh_dir = format!("{uploads}/{}", hh.name);
         for upload in read_children(vfs, &hh_dir).await {
-            let dir = format!("{hh_dir}/{}", upload.name);
-            let target = format!("{dir}/.target");
-            if let Ok(attr) = vfs.stat(&target).await
-                && attr.mtime < cutoff_ns
-            {
-                let _ = remove_dir_all_rec(vfs, &dir).await;
-                tracing::info!(dir = %dir, "cleaned stale multipart upload");
+            let upload_id = upload.name;
+            let dir = format!("{hh_dir}/{upload_id}");
+            let Ok(meta) = s3.read_upload_meta(&upload_id).await else {
+                if let Ok(attr) = vfs.stat(&dir).await
+                    && attr.mtime < cutoff_ns
+                    && remove_dir_all_rec(vfs, &dir).await.is_ok()
+                {
+                    tracing::info!(dir = %dir, "cleaned unreadable stale multipart upload");
+                }
+                continue;
+            };
+            if meta.initiated >= cutoff {
+                continue;
+            }
+            let lock = s3.lock_for(&meta.bucket, &meta.key);
+            let _guard = lock.lock().await;
+            let Ok(meta) = s3.read_upload_meta(&upload_id).await else {
+                continue;
+            };
+            if meta.initiated < cutoff {
+                let dir = multipart::upload_dir(&upload_id);
+                if remove_dir_all_rec(vfs, &dir).await.is_ok() {
+                    tracing::info!(dir = %dir, "cleaned stale multipart upload");
+                }
             }
         }
     }
     let tmp = multipart::tmp_dir();
     for entry in read_children(vfs, &tmp).await {
         let path = format!("{tmp}/{}", entry.name);
+        if s3.staging_path_is_active(&path) {
+            continue;
+        }
         if let Ok(attr) = vfs.stat(&path).await
             && attr.mtime < cutoff_ns
         {
@@ -186,7 +202,15 @@ where
     let Ok(fh) = vfs.opendir(attr.ino).await else {
         return Vec::new();
     };
-    let entries = vfs.readdir(fh, 0).unwrap_or_default();
+    let mut entries = Vec::new();
+    let mut offset = 0;
+    while let Some(page) = vfs.readdir(fh, offset) {
+        if page.is_empty() {
+            break;
+        }
+        offset += page.len() as u64;
+        entries.extend(page);
+    }
     let _ = vfs.closedir(fh);
     entries
 }
@@ -204,13 +228,20 @@ where
     let attr = vfs.stat(path).await?;
     if attr.kind == crate::meta::store::FileType::Dir {
         if let Ok(fh) = vfs.opendir(attr.ino).await {
-            if let Some(entries) = vfs.readdir(fh, 0) {
-                for entry in entries {
-                    let child = format!("{path}/{}", entry.name);
-                    let _ = remove_dir_all_rec(vfs, &child).await;
+            let mut entries = Vec::new();
+            let mut offset = 0;
+            while let Some(page) = vfs.readdir(fh, offset) {
+                if page.is_empty() {
+                    break;
                 }
+                offset += page.len() as u64;
+                entries.extend(page);
             }
             let _ = vfs.closedir(fh);
+            for entry in entries {
+                let child = format!("{path}/{}", entry.name);
+                remove_dir_all_rec(vfs, &child).await?;
+            }
         }
         vfs.rmdir(path).await
     } else {
