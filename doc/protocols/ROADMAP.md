@@ -5,24 +5,27 @@
 
 ## 现状（2026-09）
 
-- BrewFS 对外接口：FUSE mount、console（管理面）、control plane；无任何数据面协议网关。
-- `doc/gap/` 将 `gateway`/`webdav` 标为 P2（"视产品方向"）、`06-roadmap.md` 建议"核心稳定后再做网关"。
-  本路线图正式立项推进，理由：核心 POSIX 正确性基线已达成（708 xfstests 全后端通过，
-  见 README「POSIX Correctness」），协议网关反向成为生态短板。
+- S3 网关 M1 已由 PR #83 合入：支持 single/multi bucket、核心对象操作、multipart、静态 SigV4
+  密钥和流式数据路径；SQLite + LocalFS 上 76 项 boto3 E2E 与 22 项单元测试通过。
+- **Redis metadata + RustFS data backend 尚未做 S3 gateway E2E**。仓库已有该后端组合的
+  FUSE/POSIX、xfstests 与性能验证，但不能替代对 `brewfs gateway s3` 端点的协议验证。
+- WebDAV、NFS 与 S3 完整兼容性仍按以下里程碑推进。
 
 ## 里程碑
 
 | 里程碑 | 内容 | 验收标准 | 状态 |
 |---|---|---|---|
-| **M0** 设计立项 | 本目录全部 spec + 路线图 | 文档评审通过（PR 合入） | ✅ 本 PR |
-| **M1** S3 网关 MVP | `brewfs gateway s3`：单 bucket、核心对象操作（Put/Get/Head/Delete/List/Copy）、multipart 全流程、静态密钥、流式数据路径 | 集成测试（aws-sdk-s3 断言）通过；`aws s3 cp/ls/rm` + `mc` e2e 通过；S3 写入 ↔ FUSE 读取交叉验证 | 🚧 进行中 |
-| **M2** WebDAV 网关 | `brewfs gateway webdav`：§3 方法全表、memls、Basic auth、TLS | `litmus` basic/copymove/props/locks 全过；davfs2 挂载读写；Windows 网络驱动器映射冒烟 | ⬜ |
-| **M3** S3 完整化 | 多 bucket、tagging、GetObjectAttributes、条件头、跨实例锁（`/.brewfs.sys/locks/`）、CORS、rustls | `mc` 全功能回归；多实例并发写同一 key 无撕裂 | ⬜ |
-| **M4** NFS 网关 | `brewfs gateway nfs`：NFSv3+mount 全映射表、squash、COMMIT 语义、`InodeAccess` 公开 wrapper | `mount -t nfs -o vers=3` 冒烟；xfstests NFS 子集；NFS ↔ FUSE 交叉验证 | ⬜ |
-| **M5** 生产化 | 三协议指标（tracing/Prometheus 埋点）、CI 准入矩阵接入 compose、部署文档（systemd/k8s/operator sidecar）、性能基线报告 | CI 全绿；性能报告达到各 spec §性能目标 | ⬜ |
+| **M0** 设计立项 | 本目录全部 spec + 路线图 | 文档评审通过（PR 合入） | PR #82 评审中 |
+| **M1** S3 网关 MVP | `brewfs gateway s3`：single/multi bucket、核心对象操作、multipart、静态密钥、流式数据路径及单实例一致性边界 | SQLite + LocalFS：76 项 boto3 E2E、22 项单元测试、并发/生命周期专项回归及 CI 全绿 | 已完成（PR #83） |
+| **M2** WebDAV 网关 | `brewfs gateway webdav`：§3 方法全表、memls、Basic auth、TLS | `litmus` basic/copymove/props/locks 全过；davfs2 挂载读写；Windows 网络驱动器映射冒烟 | 未开始 |
+| **M3** S3 兼容性与后端矩阵 | Redis + RustFS gateway E2E/重启/跨端验证；tagging、GetObjectAttributes、条件头、list/CopySource 扩展、CORS；带租约/fencing 的跨实例锁 | Redis + RustFS 跑同一 boto3 suite 且 0 failure；AWS CLI/`mc`/s3fs/presigned URL smoke；双网关故障注入无撕裂或删桶重建 | 未开始 |
+| **M4** NFS 网关 | `brewfs gateway nfs`：NFSv3+mount 全映射表、squash、COMMIT 语义、`InodeAccess` 公开 wrapper | `mount -t nfs -o vers=3` 冒烟；xfstests NFS 子集；NFS ↔ FUSE 交叉验证 | 未开始 |
+| **M5** 生产化 | 多身份/ACL/policy/STS、原生 TLS、三协议 tracing/Prometheus、CI compose 准入、部署文档与性能/soak 基线 | CI 全绿；安全模型评审通过；性能报告达到各 spec 目标；Redis + RustFS 24h soak 无数据或 metadata 丢失 | 未开始 |
 
 ## 远期（未排期）
 
+- S3 高级数据语义：Versioning、SSE、Object Lock/Retention、Lifecycle、Notification、
+  Replication、Inventory 和 SelectObjectContent；详细依赖见 [s3-gateway.md](s3-gateway.md) §12；
 - SMB：FUSE + Samba 重导出文档（过渡）；原生实现待 Rust 生态或自研决策；
 - NFSv4：见 [nfs.md](nfs.md) §9；
 - NLM：见 [nfs.md](nfs.md) §6；
@@ -32,6 +35,8 @@
 ## 工作方式约定
 
 - 每个里程碑 = 至少一个 PR：spec 先行（本目录），代码随后；行为变更、测试、文档同 PR；
-- 所有 e2e 验证可在本地 WSL（Ubuntu-22.04）复现：sqlite meta + local-fs data + 真实客户端；
+- 默认开发 e2e 可在本地 WSL（Ubuntu-22.04）使用 SQLite + LocalFS + 真实客户端复现；
+- 每个已宣称支持的生产后端组合必须单独跑协议 endpoint E2E；底层 FUSE/VFS 测试不能替代网关测试；
+- S3 的 Redis + RustFS 最小 smoke 纳入普通 CI，完整回归、重启和故障注入进入定时/手动 workflow；
 - 依赖 crate（s3s/dav-server/nfsserve）版本升级需单独 PR 并附兼容性说明；
 - 协议互通性回归：任何涉及 VFS/meta 的核心改动，需跑 `tests/` 下协议集成测试冒烟。

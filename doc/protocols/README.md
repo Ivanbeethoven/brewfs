@@ -5,7 +5,7 @@
 
 | 协议 | Spec | 状态 |
 |---|---|---|
-| S3 Gateway | [s3-gateway.md](s3-gateway.md) | 已立项，首个实现目标 |
+| S3 Gateway | [s3-gateway.md](s3-gateway.md) | M1 已实现（PR #83）；M3 兼容性/后端矩阵规划中 |
 | WebDAV（网盘） | [webdav.md](webdav.md) | 已立项 |
 | NFS | [nfs.md](nfs.md) | 已立项 |
 | 其他协议评估 | 见本文 §6 | SMB / SFTP / HDFS 等 |
@@ -61,13 +61,14 @@ BrewFS 核心对前端暴露三层抽象（详见 `doc/architecture/arch.md` 与
 
 | 层 | 类型 | 特点 | 适用协议 |
 |---|---|---|---|
-| SDK | `Client` / `ClientBackend`（`src/sdk_fs.rs`） | path-based、`io::Result`、公开稳定 API | WebDAV、S3 |
-| VFS | `VFS<S, M>`（`src/vfs/fs/mod.rs`） | path-based 公开 + inode/handle 内部 API | NFS（需要 inode 文件句柄） |
+| SDK | `Client` / `ClientBackend`（`src/sdk_fs.rs`） | path-based、`io::Result`、公开稳定 API | WebDAV |
+| VFS | `VFS<S, M>`（`src/vfs/fs/mod.rs`） | path-based 公开 + inode/handle 内部 API | S3、NFS（NFS 需要 inode 文件句柄） |
 | FUSE | `impl asyncfuse::raw::Filesystem for VFS` | 内核挂载 | —（已存在） |
 
 约定：
 
-- **WebDAV / S3 网关基于 `Client`**：路径天然映射 URL，无需 inode；
+- **WebDAV 网关基于 `Client`**：路径天然映射 URL，无需 inode；
+- **S3 网关直接使用 `VFS`**：对象流、原子发布、xattr 与 inode snapshot 需要 VFS 原语；
 - **NFS 网关基于 `VFS`**：NFSv3 的文件句柄需要稳定的 inode 号，且是无状态协议（无 open/close），
   需要直接使用 VFS 的 inode 级 API。当前 `VFS` 的 `*_ino` / `*_at` 方法为 `pub(crate)`，
   NFS 实现时需要：提升可见性，或新增公开 wrapper（推荐后者，见 [nfs.md](nfs.md) §3）。
