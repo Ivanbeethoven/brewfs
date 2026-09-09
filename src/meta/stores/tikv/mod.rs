@@ -12,7 +12,7 @@ use crate::meta::file_lock::{
 };
 use crate::meta::store::{
     CreateEntryResult, DirEntry, FileAttr, FileType, MetaError, MetaStore, MetaStoreCapabilities,
-    OpenFlags, RetryReason, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
+    OpenFlags, RenameOutcome, RetryReason, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
     stat_fs_snapshot_from_usage, stat_fs_used_bytes,
 };
 use crate::meta::{INODE_ID_KEY, SLICE_ID_KEY};
@@ -1765,9 +1765,19 @@ impl MetaStore for TiKvMetaStore {
         new_parent: i64,
         new_name: String,
         noreplace: bool,
-    ) -> Result<(), MetaError> {
+    ) -> Result<RenameOutcome, MetaError> {
         if old_parent == new_parent && old_name == new_name {
-            return Ok(());
+            let ino = self
+                .lookup(old_parent, old_name)
+                .await?
+                .ok_or(MetaError::NotFound(old_parent))?;
+            return Ok(RenameOutcome {
+                ino,
+                replaced_ino: None,
+                source_is_dir: false,
+                replaced_is_dir: false,
+                renamed: false,
+            });
         }
 
         let operation = "rename";
@@ -1825,6 +1835,10 @@ impl MetaStore for TiKvMetaStore {
                     .as_deref()
                     .map(Self::decode_dentry)
                     .transpose()?;
+                let replaced_ino = destination
+                    .as_ref()
+                    .map(|entry| entry.ino)
+                    .filter(|&ino| ino != source_dentry.ino);
                 if noreplace && destination.is_some() {
                     return Err(MetaError::AlreadyExists {
                         parent: new_parent,
@@ -1851,10 +1865,17 @@ impl MetaStore for TiKvMetaStore {
                 let now = Self::now();
                 let mut old_parent_nlink_delta = 0;
                 let mut new_parent_nlink_delta = 0;
+                let mut destination_is_dir = false;
 
                 if let Some(dest_dentry) = destination {
                     if dest_dentry.ino == source_dentry.ino {
-                        return Ok(());
+                        return Ok(RenameOutcome {
+                            ino: source_dentry.ino,
+                            replaced_ino: None,
+                            source_is_dir: source_node.kind == StoredNodeKind::Dir,
+                            replaced_is_dir: false,
+                            renamed: false,
+                        });
                     }
 
                     let dest_inode_key = store.inode_key(dest_dentry.ino);
@@ -1864,6 +1885,7 @@ impl MetaStore for TiKvMetaStore {
                         .map(Self::decode_node)
                         .transpose()?
                         .ok_or(MetaError::NotFound(dest_dentry.ino))?;
+                    destination_is_dir = dest_node.kind == StoredNodeKind::Dir;
 
                     match (source_node.kind, dest_node.kind) {
                         (StoredNodeKind::Dir, StoredNodeKind::Dir) => {
@@ -1955,7 +1977,14 @@ impl MetaStore for TiKvMetaStore {
 
                 store
                     .txn_put_dentry(txn, new_parent, &new_name, &source_dentry, operation)
-                    .await
+                    .await?;
+                Ok(RenameOutcome {
+                    ino: source_dentry.ino,
+                    replaced_ino,
+                    source_is_dir: source_node.kind == StoredNodeKind::Dir,
+                    replaced_is_dir: destination_is_dir,
+                    renamed: true,
+                })
             })
         })
         .await
