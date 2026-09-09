@@ -2616,7 +2616,11 @@ impl MetaStore for DatabaseMetaStore {
             if let Some(ctime) = req.ctime {
                 create_time = ctime;
             } else if ctime_update {
-                create_time = now;
+                let next_ctime = create_time
+                    .div_euclid(1_000_000_000)
+                    .saturating_add(1)
+                    .saturating_mul(1_000_000_000);
+                create_time = now.max(next_ctime);
             }
 
             let kind = if file.symlink_target.is_some() {
@@ -2712,7 +2716,11 @@ impl MetaStore for DatabaseMetaStore {
             if let Some(ctime) = req.ctime {
                 create_time = ctime;
             } else if ctime_update {
-                create_time = now;
+                let next_ctime = create_time
+                    .div_euclid(1_000_000_000)
+                    .saturating_add(1)
+                    .saturating_mul(1_000_000_000);
+                create_time = now.max(next_ctime);
             }
 
             let mut active: access_meta::ActiveModel = dir.into();

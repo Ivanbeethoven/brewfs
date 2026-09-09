@@ -2232,7 +2232,15 @@ impl MetaStore for TiKvMetaStore {
                 if let Some(ctime) = req.ctime {
                     node.ctime = ctime;
                 } else if ctime_update {
-                    node.ctime = now;
+                    // ctime is an ordering marker; protect it from queued
+                    // FUSE requests and wall-clock adjustments. pjdfstest
+                    // reads st_ctime with second precision.
+                    let next_ctime = node
+                        .ctime
+                        .div_euclid(1_000_000_000)
+                        .saturating_add(1)
+                        .saturating_mul(1_000_000_000);
+                    node.ctime = now.max(next_ctime);
                 }
 
                 store.txn_put_node(txn, &node, operation).await?;

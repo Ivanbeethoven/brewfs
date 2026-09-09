@@ -322,6 +322,12 @@ pub struct MetaClient<T: MetaStore + ?Sized> {
     /// Kept separate from trie for O(1) inode-to-paths lookup
     /// it's absolute path.
     inode_to_paths: Arc<DashMap<i64, Vec<String>>>,
+    /// Serializes attribute mutations for the same inode.  FUSE may issue
+    /// setattr requests concurrently (for example, a path reached through a
+    /// symlink can overlap a direct request).  Keeping this lock per inode
+    /// preserves the fast path for unrelated files while ensuring that
+    /// metadata stores observe a linear order for ctime and ownership updates.
+    attr_locks: Arc<DashMap<i64, Arc<Mutex<()>>>>,
     metrics: Arc<MetaClientMetrics>,
 
     /// Manages background session heartbeats when enabled by callers.
@@ -433,6 +439,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
                 .build(),
             path_trie: Arc::new(PathTrie::new()),
             inode_to_paths: Arc::new(DashMap::new()),
+            attr_locks: Arc::new(DashMap::new()),
             metrics: Arc::new(MetaClientMetrics::default()),
             session_manager: Arc::new(SessionManager::new(store.clone())),
             job_manager: Arc::new(JobManager::default()),
@@ -2616,6 +2623,12 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
 
         self.inode_cache.remove_child(parent, name).await;
         if let Some(ino) = target_ino {
+            // The store-level unlink updates the target's nlink/ctime even
+            // when the parent directory was not present in the inode cache.
+            // In that case remove_child cannot invalidate the target entry,
+            // so explicitly drop it to ensure the next stat observes the
+            // post-unlink metadata (notably for hard-linked special files).
+            self.inode_cache.invalidate_inode(ino).await;
             self.invalidate_open_file_cache_inode(ino).await;
         }
         self.touch_cached_parent_after_namespace_mutation(parent)
@@ -3007,6 +3020,12 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
     ) -> Result<FileAttr, MetaError> {
         self.ensure_writable()?;
         let inode = self.check_root(ino);
+        let attr_lock = self
+            .attr_locks
+            .entry(inode)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _attr_guard = attr_lock.lock().await;
         let timestamp_only = Self::timestamp_only_setattr(req, &flags);
         let attr = self.store.set_attr(inode, req, flags).await?;
         if !self.inode_cache.refresh_attr(inode, attr.clone()).await {
