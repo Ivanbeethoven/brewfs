@@ -6,6 +6,8 @@ mod daemon;
 #[allow(dead_code)]
 mod fs;
 mod fuse;
+#[cfg(feature = "gateway-s3")]
+mod gateway;
 mod meta;
 mod posix;
 mod utils;
@@ -104,6 +106,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Gc(args) => gc_cmd(args).await,
         Command::Info(args) => info_cmd(args).await,
         Command::Console(args) => console::serve_cmd(args).await,
+        #[cfg(feature = "gateway-s3")]
+        Command::Gateway(args) => gateway_cmd(*args).await,
         Command::ObjectPutBench(args) => object_put_bench_cmd(args).await,
     };
     shutdown_flame();
@@ -389,6 +393,105 @@ async fn mount_cmd(args: MountConfig) -> anyhow::Result<()> {
             tracing::info!("mount startup s3 client ready");
             let store = create_object_store(client, layout, &args.cache).await?;
             dispatch_mount(layout, store, &args).await
+        }
+    }
+}
+
+#[cfg(feature = "gateway-s3")]
+async fn gateway_cmd(args: GatewayArgs) -> anyhow::Result<()> {
+    match args.protocol {
+        GatewayProtocol::S3(s3) => gateway_s3_cmd(s3).await,
+    }
+}
+
+#[cfg(feature = "gateway-s3")]
+async fn gateway_s3_cmd(args: S3GatewayArgs) -> anyhow::Result<()> {
+    use crate::gateway::s3::path::{BucketMode, is_valid_bucket_name};
+    use crate::gateway::s3::{S3GatewayOptions, serve};
+
+    // The gateway does not own a FUSE mount point; use a placeholder so
+    // MountConfig::from_sources validation passes.
+    let mut mount_args = args.mount;
+    if mount_args.mount_point.is_none() {
+        mount_args.mount_point = Some(std::path::PathBuf::from("/brewfs-s3-gateway"));
+    }
+    let cfg = MountConfig::from_sources(mount_args)?;
+    if cfg.volume_format != VolumeFormat::FlatV1 {
+        anyhow::bail!("s3 gateway only supports volume_format=flat-v1");
+    }
+    validate_volume_format_support(cfg.volume_format)?;
+
+    if cfg.chunk_size < cfg.block_size as u64 {
+        anyhow::bail!("chunk_size must be >= block_size");
+    }
+    let layout = ChunkLayout {
+        chunk_size: cfg.chunk_size,
+        block_size: cfg.block_size,
+    };
+
+    let access_key = match args.access_key.as_deref() {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => anyhow::bail!(
+            "s3 gateway requires an access key (--access-key or BREWFS_S3_ACCESS_KEY)"
+        ),
+    };
+    let secret_key = match args.secret_key.as_deref() {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => {
+            anyhow::bail!("s3 gateway requires a secret key (--secret-key or BREWFS_S3_SECRET_KEY)")
+        }
+    };
+
+    let bucket_mode = if args.multi_buckets {
+        BucketMode::Multi
+    } else {
+        if !is_valid_bucket_name(&args.bucket) {
+            anyhow::bail!("invalid S3 bucket name: {}", args.bucket);
+        }
+        BucketMode::Single {
+            bucket: args.bucket,
+        }
+    };
+    let opts = S3GatewayOptions {
+        listen_addr: args.listen,
+        access_key,
+        secret_key,
+        bucket_mode,
+        hide_dir_objects: args.hide_dir_objects,
+    };
+
+    tracing::info!(
+        listen = %opts.listen_addr,
+        data_backend = ?cfg.data_backend,
+        meta_backend = ?cfg.meta_backend,
+        "s3 gateway startup begin"
+    );
+    match cfg.data_backend {
+        DataBackendKind::LocalFs => {
+            let client = create_localfs_client(&cfg)?;
+            let store = create_object_store(client, layout, &cfg.cache).await?;
+            serve(
+                store,
+                create_meta_store(&cfg).await?,
+                layout,
+                cfg.compact.clone(),
+                cfg.cache.clone(),
+                opts,
+            )
+            .await
+        }
+        DataBackendKind::S3 => {
+            let client = create_s3_client(&cfg).await?;
+            let store = create_object_store(client, layout, &cfg.cache).await?;
+            serve(
+                store,
+                create_meta_store(&cfg).await?,
+                layout,
+                cfg.compact.clone(),
+                cfg.cache.clone(),
+                opts,
+            )
+            .await
         }
     }
 }
