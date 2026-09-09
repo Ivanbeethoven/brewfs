@@ -3076,17 +3076,7 @@ impl MetaStore for RedisMetaStore {
         if let Some(ctime) = req.ctime {
             node.attr.ctime = ctime;
         } else if ctime_update {
-            // ctime is an ordering marker.  FUSE requests can be queued
-            // concurrently and wall-clock time is not guaranteed to be
-            // monotonic.  pjdfstest reads st_ctime with second precision, so
-            // advance to the next second whenever the clock has not done so.
-            let next_ctime = node
-                .attr
-                .ctime
-                .div_euclid(1_000_000_000)
-                .saturating_add(1)
-                .saturating_mul(1_000_000_000);
-            node.attr.ctime = now.max(next_ctime);
+            node.attr.ctime = now;
         }
 
         self.node_cache.invalidate(&ino).await;
