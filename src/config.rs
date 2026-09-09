@@ -1,6 +1,8 @@
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use url::Url;
 
 use crate::chunk::bandwidth::BandwidthConfig;
 use crate::chunk::cache_integrity::CacheIntegrityMode;
@@ -732,6 +734,157 @@ impl MountConfig {
             compact,
         })
     }
+
+    /// Derive a stable, non-secret identity for the persistent state owned by
+    /// a flat volume. Both halves are required: metadata identifies the inode
+    /// and slice namespace, while the data backend identifies the objects to
+    /// which those slice IDs refer.
+    pub(crate) fn flat_volume_cache_scope(&self) -> anyhow::Result<String> {
+        let mut parts = vec!["flat-v1".to_string()];
+
+        match self.meta_backend {
+            MetaBackendKind::Sqlx => {
+                parts.push("meta:sqlx".to_string());
+                if crate::meta::stores::database::is_sqlite_memory_url(&self.meta_url) {
+                    // In-memory metadata has no identity that survives a
+                    // restart, so it must never recover persistent cache state
+                    // produced by an earlier mount.
+                    parts.push(format!("ephemeral:{}", uuid::Uuid::new_v4()));
+                } else {
+                    parts.push(scrubbed_url_identity(&self.meta_url));
+                }
+            }
+            MetaBackendKind::Redis => {
+                parts.push("meta:redis".to_string());
+                parts.push(scrubbed_url_identity(&self.meta_url));
+            }
+            MetaBackendKind::Etcd => {
+                parts.push("meta:etcd".to_string());
+                let mut endpoints = self
+                    .meta_etcd_urls
+                    .iter()
+                    .map(|endpoint| scrubbed_url_identity(endpoint))
+                    .collect::<Vec<_>>();
+                endpoints.sort_unstable();
+                parts.extend(endpoints);
+            }
+            MetaBackendKind::TiKv => {
+                parts.push("meta:tikv".to_string());
+                let mut endpoints = self
+                    .meta_tikv_pd_endpoints
+                    .iter()
+                    .map(|endpoint| scrubbed_url_identity(endpoint))
+                    .collect::<Vec<_>>();
+                endpoints.sort_unstable();
+                parts.extend(endpoints);
+                parts.push(format!("namespace:{}", self.meta_tikv_namespace));
+            }
+        }
+
+        match self.data_backend {
+            DataBackendKind::LocalFs => {
+                parts.push("data:localfs".to_string());
+                // Keep this lexical rather than canonical: the identity must
+                // not change merely because the directory is created between
+                // two mounts, and treating symlink aliases as separate cache
+                // owners is safe.
+                let identity = std::path::absolute(&self.data_dir)?;
+                parts.push(identity.to_string_lossy().into_owned());
+            }
+            DataBackendKind::S3 => {
+                parts.push("data:s3".to_string());
+                parts.push(format!(
+                    "endpoint:{}",
+                    self.s3_endpoint
+                        .as_deref()
+                        .map(scrubbed_url_identity)
+                        // Without an explicit endpoint the AWS SDK may resolve
+                        // a different service from the environment or active
+                        // profile. Do not persistently reuse cache state when
+                        // that identity cannot be derived from MountConfig.
+                        .unwrap_or_else(|| format!("ephemeral:{}", uuid::Uuid::new_v4()))
+                ));
+                parts.push(format!(
+                    "bucket:{}",
+                    self.s3_bucket.as_deref().unwrap_or_default()
+                ));
+                parts.push(format!(
+                    "region:{}",
+                    self.s3_region.as_deref().unwrap_or_default()
+                ));
+            }
+        }
+
+        let mut hasher = Sha256::new();
+        for part in parts {
+            hasher.update((part.len() as u64).to_be_bytes());
+            hasher.update(part.as_bytes());
+        }
+        Ok(hex::encode(hasher.finalize()))
+    }
+}
+
+fn scrubbed_url_identity(raw: &str) -> String {
+    fn is_secret_query_key(key: &str) -> bool {
+        let key = key.to_ascii_lowercase().replace('-', "_");
+        key.contains("password")
+            || key.contains("passwd")
+            || key.contains("secret")
+            || key.contains("credential")
+            || key == "token"
+            || key.starts_with("token_")
+            || key.ends_with("_token")
+            || key == "api_key"
+            || key == "access_key"
+            || key == "access_key_id"
+            || key == "signature"
+            || key.ends_with("_signature")
+            || key == "authorization"
+    }
+
+    fn scrub(mut url: Url) -> String {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        let mut query = url
+            .query_pairs()
+            .map(|(key, value)| {
+                let key = key.into_owned();
+                let value = if is_secret_query_key(&key) {
+                    "<redacted>".to_string()
+                } else {
+                    value.into_owned()
+                };
+                (key, value)
+            })
+            .collect::<Vec<_>>();
+        query.sort_unstable();
+        url.set_query(None);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(
+                query
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            );
+        }
+        url.set_fragment(None);
+        url.to_string()
+    }
+
+    let raw = raw.trim();
+    if let Ok(url) = Url::parse(raw)
+        && url.has_host()
+    {
+        return scrub(url);
+    }
+    if let Ok(url) = Url::parse(&format!("http://{raw}"))
+        && url.has_host()
+    {
+        return scrub(url)
+            .strip_prefix("http://")
+            .unwrap_or(raw)
+            .to_string();
+    }
+    raw.to_string()
 }
 
 impl CacheFileConfig {
@@ -1434,6 +1587,132 @@ cache:
         let _ = std::fs::remove_file(path);
 
         assert!(err.to_string().contains("requires data.backend=s3"));
+    }
+
+    #[test]
+    fn flat_cache_scope_is_stable_across_credential_rotation() {
+        let data_dir = std::env::temp_dir().join("brewfs-flat-cache-scope-data");
+        let mut first = empty_mount_args(None, Some(PathBuf::from("/mnt/first")));
+        first.data_backend = Some(DataBackendKind::S3);
+        first.s3_bucket = Some("volume-bucket".to_string());
+        first.s3_region = Some("us-test-1".to_string());
+        first.s3_endpoint =
+            Some("https://alice:old-secret@objects.example.test?token=old".to_string());
+        first.meta_url = Some(
+            "postgres://alice:old-secret@metadata.example.test/brewfs?password=old".to_string(),
+        );
+        first.data_dir = Some(data_dir.clone());
+
+        let mut second = first.clone();
+        second.s3_endpoint =
+            Some("https://bob:new-secret@objects.example.test?token=new".to_string());
+        second.meta_url =
+            Some("postgres://bob:new-secret@metadata.example.test/brewfs?password=new".to_string());
+
+        let first = MountConfig::from_sources(first).unwrap();
+        let second = MountConfig::from_sources(second).unwrap();
+        assert_eq!(
+            first.flat_volume_cache_scope().unwrap(),
+            second.flat_volume_cache_scope().unwrap()
+        );
+    }
+
+    #[test]
+    fn flat_cache_scope_changes_with_either_volume_identity() {
+        let mut base = empty_mount_args(None, Some(PathBuf::from("/mnt/base")));
+        base.data_dir = Some(PathBuf::from("/var/lib/brewfs/objects-a"));
+        base.meta_url = Some("postgres://metadata.example.test/volume-a".to_string());
+
+        let mut other_metadata = base.clone();
+        other_metadata.meta_url = Some("postgres://metadata.example.test/volume-b".to_string());
+        let mut other_objects = base.clone();
+        other_objects.data_dir = Some(PathBuf::from("/var/lib/brewfs/objects-b"));
+
+        let base = MountConfig::from_sources(base).unwrap();
+        let other_metadata = MountConfig::from_sources(other_metadata).unwrap();
+        let other_objects = MountConfig::from_sources(other_objects).unwrap();
+        let base_scope = base.flat_volume_cache_scope().unwrap();
+
+        assert_ne!(
+            base_scope,
+            other_metadata.flat_volume_cache_scope().unwrap()
+        );
+        assert_ne!(base_scope, other_objects.flat_volume_cache_scope().unwrap());
+    }
+
+    #[test]
+    fn flat_cache_scope_preserves_non_secret_metadata_query_identity() {
+        let mut first = empty_mount_args(None, Some(PathBuf::from("/mnt/first")));
+        first.data_dir = Some(PathBuf::from("/var/lib/brewfs/objects"));
+        first.meta_url = Some(
+            "postgres://metadata.example.test/brewfs?options=-csearch_path%3Dvolume_a&password=old"
+                .to_string(),
+        );
+
+        let mut second = first.clone();
+        second.meta_url = Some(
+            "postgres://metadata.example.test/brewfs?password=new&options=-csearch_path%3Dvolume_b"
+                .to_string(),
+        );
+        let mut reordered = first.clone();
+        reordered.meta_url = Some(
+            "postgres://metadata.example.test/brewfs?password=rotated&options=-csearch_path%3Dvolume_a"
+                .to_string(),
+        );
+
+        let first = MountConfig::from_sources(first).unwrap();
+        let second = MountConfig::from_sources(second).unwrap();
+        let reordered = MountConfig::from_sources(reordered).unwrap();
+        assert_eq!(
+            first.flat_volume_cache_scope().unwrap(),
+            reordered.flat_volume_cache_scope().unwrap()
+        );
+        assert_ne!(
+            first.flat_volume_cache_scope().unwrap(),
+            second.flat_volume_cache_scope().unwrap()
+        );
+    }
+
+    #[test]
+    fn implicit_s3_endpoint_never_reuses_persistent_cache_scope() {
+        let mut args = empty_mount_args(None, Some(PathBuf::from("/mnt/first")));
+        args.data_backend = Some(DataBackendKind::S3);
+        args.s3_bucket = Some("volume-bucket".to_string());
+        args.s3_region = Some("us-test-1".to_string());
+        args.meta_url = Some("postgres://metadata.example.test/brewfs".to_string());
+
+        let first = MountConfig::from_sources(args).unwrap();
+        let second = first.clone();
+        assert_ne!(
+            first.flat_volume_cache_scope().unwrap(),
+            second.flat_volume_cache_scope().unwrap()
+        );
+    }
+
+    #[test]
+    fn in_memory_metadata_never_reuses_persistent_cache_scope() {
+        let first =
+            MountConfig::from_sources(empty_mount_args(None, Some(PathBuf::from("/mnt/first"))))
+                .unwrap();
+        let second = first.clone();
+
+        assert_ne!(
+            first.flat_volume_cache_scope().unwrap(),
+            second.flat_volume_cache_scope().unwrap()
+        );
+    }
+
+    #[test]
+    fn sqlite_file_memory_metadata_never_reuses_persistent_cache_scope() {
+        let mut args = empty_mount_args(None, Some(PathBuf::from("/mnt/first")));
+        args.meta_url = Some("sqlite:file::memory:?cache=shared".to_string());
+
+        let first = MountConfig::from_sources(args).unwrap();
+        let second = first.clone();
+        assert_ne!(
+            first.flat_volume_cache_scope().unwrap(),
+            second.flat_volume_cache_scope().unwrap()
+        );
     }
 
     #[test]
