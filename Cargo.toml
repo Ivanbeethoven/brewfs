@@ -63,6 +63,7 @@ blake3 = "1.8"
 builder-pattern = "0.4.2"
 bytes = "1.10.1"
 object_store = { version = "0.13", features = ["aws"] }
+s3s = "0.15"
 caps = "0.5.5"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.49", features = ["derive"] }
@@ -303,11 +304,14 @@ lz4_flex = { workspace = true }
 zstd = { workspace = true }
 governor = { workspace = true }
 blake3 = { workspace = true, optional = true }
+s3s = { workspace = true, optional = true }
+tower = { workspace = true, features = ["util"], optional = true }
 
 [features]
-default = ["fuse-io-uring-runtime"]
+default = ["fuse-io-uring-runtime", "gateway-s3"]
 fuse-io-uring-runtime = ["asyncfuse/io-uring-runtime"]
 fuse-tokio-runtime = ["asyncfuse/tokio-runtime"]
+gateway-s3 = ["dep:s3s", "dep:tower"]
 workspace-overlay = ["dep:bincode", "dep:blake3"]
 profiling = ["dep:tracing-flame", "dep:tracing-chrome", "dep:console-subscriber"]
 jemalloc = ["dep:tikv-jemallocator"]

@@ -32,6 +32,10 @@ on:
           - link-symlink-heavy
           - write-smallfile
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
@@ -82,9 +86,6 @@ jobs:
           bash docker/compose-xfstests/test_juicefs_direct_matrix.sh
           bash docker/compose-xfstests/test_juicefs_perf_report.sh
 
-      - name: Check workspace
-        run: cargo check --workspace
-
       - name: Build workspace
         run: cargo build --workspace
 
@@ -97,9 +98,6 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --lib --bins -- --test-threads=1
-
-      - name: Test workspace overlay
-        run: cargo test --workspace --features workspace-overlay -- --test-threads=1
 
       - name: Test all features
         run: cargo test --workspace --all-features -- --test-threads=1
