@@ -26,6 +26,7 @@ impl<M: MetaStore> MetaHandle<M> {
         (self.store, self.layer)
     }
 
+    #[allow(dead_code)]
     pub fn store(&self) -> Arc<M> {
         Arc::clone(&self.store)
     }

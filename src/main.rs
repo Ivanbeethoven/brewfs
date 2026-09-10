@@ -6,7 +6,7 @@ mod daemon;
 #[allow(dead_code)]
 mod fs;
 mod fuse;
-#[cfg(feature = "gateway-s3")]
+#[cfg(any(feature = "gateway-s3", feature = "gateway-webdav"))]
 mod gateway;
 mod meta;
 mod posix;
@@ -61,7 +61,6 @@ use crate::meta::config::{
     CacheConfig as MetaCacheConfig, ClientOptions, Config, DatabaseConfig, DatabaseType,
     MetaClientConfig,
 };
-use crate::meta::factory::MetaStoreFactory;
 use crate::meta::layer::MetaLayer;
 use crate::meta::stores::{DatabaseMetaStore, EtcdMetaStore, RedisMetaStore, TiKvMetaStore};
 use crate::vfs::fs::VFS;
@@ -106,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Gc(args) => gc_cmd(args).await,
         Command::Info(args) => info_cmd(args).await,
         Command::Console(args) => console::serve_cmd(args).await,
-        #[cfg(feature = "gateway-s3")]
+        #[cfg(any(feature = "gateway-s3", feature = "gateway-webdav"))]
         Command::Gateway(args) => gateway_cmd(*args).await,
         Command::ObjectPutBench(args) => object_put_bench_cmd(args).await,
     };
@@ -411,10 +410,13 @@ async fn mount_cmd(mut args: MountConfig) -> anyhow::Result<()> {
     }
 }
 
-#[cfg(feature = "gateway-s3")]
+#[cfg(any(feature = "gateway-s3", feature = "gateway-webdav"))]
 async fn gateway_cmd(args: GatewayArgs) -> anyhow::Result<()> {
     match args.protocol {
+        #[cfg(feature = "gateway-s3")]
         GatewayProtocol::S3(s3) => gateway_s3_cmd(s3).await,
+        #[cfg(feature = "gateway-webdav")]
+        GatewayProtocol::WebDav(webdav) => gateway_webdav_cmd(webdav).await,
     }
 }
 
@@ -671,6 +673,104 @@ mod flat_cache_namespace_tests {
             std::fs::read(legacy_chunks.join("legacy-entry")).unwrap(),
             b"untouched"
         );
+    }
+#[cfg(feature = "gateway-webdav")]
+async fn gateway_webdav_cmd(args: WebDavGatewayArgs) -> anyhow::Result<()> {
+    use crate::gateway::webdav::{TlsOptions, WebDavGatewayOptions, serve};
+
+    let WebDavGatewayArgs {
+        listen,
+        user,
+        password,
+        tls_cert,
+        tls_key,
+        allow_anonymous,
+        atomic_put,
+        mut mount,
+    } = args;
+
+    let credentials = match (user, password, allow_anonymous) {
+        (Some(user), Some(password), false) if !user.is_empty() && !password.is_empty() => {
+            Some((user, password))
+        }
+        (None, None, true) => None,
+        (None, None, false) => anyhow::bail!(
+            "webdav gateway requires --user and --password; pass --allow-anonymous to explicitly allow unauthenticated access"
+        ),
+        (Some(_), Some(_), true) => {
+            anyhow::bail!("webdav gateway cannot combine --allow-anonymous with --user/--password")
+        }
+        _ => anyhow::bail!("webdav gateway requires nonempty --user and --password together"),
+    };
+    let tls = match (tls_cert, tls_key) {
+        (None, None) => None,
+        (Some(cert), Some(key)) => Some(TlsOptions { cert, key }),
+        _ => anyhow::bail!("webdav gateway requires both --tls-cert and --tls-key"),
+    };
+    if credentials.is_some() && tls.is_none() && !listen.ip().is_loopback() {
+        anyhow::bail!(
+            "webdav Basic authentication requires TLS when --listen is not a loopback address"
+        );
+    }
+
+    if mount.mount_point.is_none() {
+        mount.mount_point = Some(std::path::PathBuf::from("/brewfs-webdav-gateway"));
+    }
+    let cfg = MountConfig::from_sources(mount)?;
+    if cfg.volume_format != VolumeFormat::FlatV1 {
+        anyhow::bail!("webdav gateway only supports volume_format=flat-v1");
+    }
+    validate_volume_format_support(cfg.volume_format)?;
+
+    if cfg.chunk_size < cfg.block_size as u64 {
+        anyhow::bail!("chunk_size must be >= block_size");
+    }
+    let layout = ChunkLayout {
+        chunk_size: cfg.chunk_size,
+        block_size: cfg.block_size,
+    };
+    let opts = WebDavGatewayOptions {
+        listen_addr: listen,
+        credentials,
+        tls,
+        atomic_put,
+    };
+
+    tracing::info!(
+        listen = %opts.listen_addr,
+        data_backend = ?cfg.data_backend,
+        meta_backend = ?cfg.meta_backend,
+        tls = opts.tls.is_some(),
+        atomic_put = opts.atomic_put,
+        "webdav gateway startup begin"
+    );
+    match cfg.data_backend {
+        DataBackendKind::LocalFs => {
+            let client = create_localfs_client(&cfg)?;
+            let store = create_object_store(client, layout, &cfg.cache, false).await?;
+            serve(
+                store,
+                create_meta_store(&cfg).await?,
+                layout,
+                cfg.compact.clone(),
+                cfg.cache.clone(),
+                opts,
+            )
+            .await
+        }
+        DataBackendKind::S3 => {
+            let client = create_s3_client(&cfg).await?;
+            let store = create_object_store(client, layout, &cfg.cache, false).await?;
+            serve(
+                store,
+                create_meta_store(&cfg).await?,
+                layout,
+                cfg.compact.clone(),
+                cfg.cache.clone(),
+                opts,
+            )
+            .await
+        }
     }
 }
 
@@ -1624,8 +1724,7 @@ async fn create_meta_store(args: &MountConfig) -> anyhow::Result<Arc<dyn MetaSto
                 client,
                 compact,
             };
-            let handle = MetaStoreFactory::<DatabaseMetaStore>::create_from_config(config).await?;
-            Ok(handle.store() as Arc<dyn MetaStore>)
+            Ok(Arc::new(DatabaseMetaStore::from_config(config).await?) as Arc<dyn MetaStore>)
         }
         MetaBackendKind::Etcd => {
             if args.meta_etcd_urls.is_empty() {
@@ -1645,8 +1744,7 @@ async fn create_meta_store(args: &MountConfig) -> anyhow::Result<Arc<dyn MetaSto
                 client,
                 compact,
             };
-            let handle = MetaStoreFactory::<EtcdMetaStore>::create_from_config(config).await?;
-            Ok(handle.store() as Arc<dyn MetaStore>)
+            Ok(Arc::new(EtcdMetaStore::from_config(config).await?) as Arc<dyn MetaStore>)
         }
         MetaBackendKind::Redis => {
             let client = ClientOptions::default();
@@ -1662,8 +1760,7 @@ async fn create_meta_store(args: &MountConfig) -> anyhow::Result<Arc<dyn MetaSto
                 client,
                 compact,
             };
-            let handle = MetaStoreFactory::<RedisMetaStore>::create_from_config(config).await?;
-            Ok(handle.store() as Arc<dyn MetaStore>)
+            Ok(Arc::new(RedisMetaStore::from_config(config).await?) as Arc<dyn MetaStore>)
         }
         MetaBackendKind::TiKv => {
             if args.meta_tikv_pd_endpoints.is_empty() {
@@ -1684,8 +1781,7 @@ async fn create_meta_store(args: &MountConfig) -> anyhow::Result<Arc<dyn MetaSto
                 client,
                 compact,
             };
-            let handle = MetaStoreFactory::<TiKvMetaStore>::create_from_config(config).await?;
-            Ok(handle.store() as Arc<dyn MetaStore>)
+            Ok(Arc::new(TiKvMetaStore::from_config(config).await?) as Arc<dyn MetaStore>)
         }
     }
 }
