@@ -498,7 +498,7 @@ where
             #[cfg(not(feature = "workspace-overlay"))]
             let cache_root = config.cache.cache_root.join("writeback");
             let _ = std::fs::create_dir_all(&cache_root);
-            let wb = Arc::new(if config.cache.persist_write_cache_after_upload {
+            let wb = if config.cache.persist_write_cache_after_upload {
                 crate::vfs::cache::write_back::FsWriteBackCache::new_with_sync_and_read_cache(
                     cache_root,
                     config.cache.writeback_persist_sync,
@@ -510,7 +510,8 @@ where
                     cache_root,
                     config.cache.writeback_persist_sync,
                 )
-            });
+            };
+            let wb = Arc::new(wb.with_volume_scope(config.cache.volume_scope.clone()));
 
             // Crash recovery is only needed when metadata can be committed
             // before object upload completes.

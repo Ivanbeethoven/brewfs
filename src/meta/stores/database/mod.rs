@@ -21,7 +21,6 @@ use crate::meta::store::{
     stat_fs_snapshot_from_usage, stat_fs_used_bytes,
 };
 use crate::meta::{INODE_ID_KEY, Permission, SLICE_ID_KEY};
-
 use crate::utils::NumCastExt;
 use crate::vfs::chunk_id_for;
 use crate::vfs::fs::FileType;
@@ -45,6 +44,10 @@ use tokio::select;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, warn};
+
+pub(crate) fn is_sqlite_memory_url(url: &str) -> bool {
+    url.contains("file::memory:") || url.contains("::memory:")
+}
 
 const DATABASE_ACL_RULES_XATTR_NAME: &str = "system.brewfs.acl.rules";
 
@@ -276,7 +279,7 @@ impl DatabaseMetaStore {
                 let mut opts = ConnectOptions::new(url.clone());
                 if url.contains("file::memory:") {
                     opts.max_connections(1).min_connections(1);
-                } else if url.contains("::memory:") {
+                } else if is_sqlite_memory_url(url) {
                     opts.max_connections(5).min_connections(1);
                 } else {
                     // Reads and standalone writes may use the pool concurrently. Deferred
