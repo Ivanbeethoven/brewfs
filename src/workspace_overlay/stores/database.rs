@@ -765,7 +765,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(backend)?
-        .ok_or_else(|| WorkspaceError::Backend(format!("snapshot not found: {id}")))?;
+        .ok_or(WorkspaceError::SnapshotNotFound(id))?;
         decode_snapshot(&row)
     }
 
@@ -789,7 +789,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             .await
             .map_err(backend)?;
         if result.rows_affected() != 1 {
-            return Err(WorkspaceError::Backend(format!("snapshot not found: {id}")));
+            return Err(WorkspaceError::SnapshotNotFound(id));
         }
         Ok(())
     }

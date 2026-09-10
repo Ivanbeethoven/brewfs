@@ -142,6 +142,12 @@ pub struct MountArgs {
     #[cfg_attr(not(feature = "workspace-overlay"), arg(skip))]
     pub workspace_namespace: Option<String>,
 
+    /// Disable mount-local workspace recovery and garbage collection. The
+    /// Kubernetes operator owns those control-plane duties in this mode.
+    #[cfg_attr(feature = "workspace-overlay", arg(long, default_value_t = false))]
+    #[cfg_attr(not(feature = "workspace-overlay"), arg(skip))]
+    pub workspace_operator_managed: bool,
+
     /// Directory to mount the filesystem.
     #[arg(value_name = "MOUNT_POINT")]
     pub mount_point: Option<PathBuf>,
@@ -456,6 +462,8 @@ pub struct MountFileConfig {
     pub volume_format: Option<VolumeFormat>,
     pub workspace: Option<uuid::Uuid>,
     pub workspace_namespace: Option<String>,
+    #[serde(default)]
+    pub workspace_operator_managed: bool,
     pub data: Option<DataFileConfig>,
     pub meta: Option<MetaFileConfig>,
     pub layout: Option<LayoutFileConfig>,
@@ -570,6 +578,7 @@ pub struct MountConfig {
     pub volume_format: VolumeFormat,
     pub workspace: Option<uuid::Uuid>,
     pub workspace_namespace: String,
+    pub workspace_operator_managed: bool,
     pub data_backend: DataBackendKind,
     pub data_dir: PathBuf,
     pub s3_bucket: Option<String>,
@@ -669,6 +678,8 @@ impl MountConfig {
                 .workspace_namespace
                 .or(file_cfg.workspace_namespace)
                 .unwrap_or_else(|| "brewfs".to_string()),
+            workspace_operator_managed: args.workspace_operator_managed
+                || file_cfg.workspace_operator_managed,
             data_backend,
             data_dir: args
                 .data_dir
@@ -872,6 +883,7 @@ mod tests {
             volume_format: None,
             workspace: None,
             workspace_namespace: None,
+            workspace_operator_managed: false,
             mount_point,
             data_backend: None,
             data_dir: None,
@@ -1013,6 +1025,7 @@ mod tests {
             volume_format: None,
             workspace: None,
             workspace_namespace: None,
+            workspace_operator_managed: false,
             mount_point: Some(PathBuf::from("/mnt/slayer")),
             data_backend: None,
             data_dir: None,
@@ -1079,6 +1092,7 @@ mod tests {
             volume_format: None,
             workspace: None,
             workspace_namespace: None,
+            workspace_operator_managed: false,
             mount_point: Some(PathBuf::from("/mnt/slayer")),
             data_backend: None,
             data_dir: None,
@@ -1123,6 +1137,23 @@ mod tests {
 
         assert_eq!(config.volume_format, VolumeFormat::WorkspaceV1);
         assert_eq!(config.workspace, Some(uuid::Uuid::from_u128(0x77)));
+    }
+
+    #[test]
+    fn workspace_operator_managed_mode_is_opt_in() {
+        let mut args = empty_mount_args(None, Some(PathBuf::from("/mnt/workspace")));
+        assert!(
+            !MountConfig::from_sources(args.clone())
+                .unwrap()
+                .workspace_operator_managed
+        );
+
+        args.workspace_operator_managed = true;
+        assert!(
+            MountConfig::from_sources(args)
+                .unwrap()
+                .workspace_operator_managed
+        );
     }
 
     #[test]

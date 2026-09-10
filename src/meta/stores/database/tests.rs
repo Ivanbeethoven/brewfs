@@ -1418,6 +1418,22 @@ async fn test_chown_updates_uid_and_gid() {
 }
 
 #[tokio::test]
+async fn test_chown_ctime_does_not_advance_past_wall_clock() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let mut attr = store.stat(root).await.unwrap().unwrap();
+    for uid in [1000, 1001, 1002] {
+        attr = store.chown(root, Some(uid), None).await.unwrap();
+    }
+
+    assert!(
+        attr.ctime <= DatabaseMetaStore::now_nanos(),
+        "ctime must describe when the metadata change happened, not a synthetic future time"
+    );
+}
+
+#[tokio::test]
 async fn test_chown_uid_only() {
     let store = new_test_store().await;
     let parent = store.root_ino();

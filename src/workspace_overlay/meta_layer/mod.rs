@@ -1822,9 +1822,9 @@ fn workspace_to_meta(error: WorkspaceError) -> MetaError {
         WorkspaceError::FeatureNotCompiled(feature) => {
             MetaError::NotSupported(format!("feature {feature} is not compiled"))
         }
-        WorkspaceError::WorkspaceNotFound(_) | WorkspaceError::LayerNotFound(_) => {
-            MetaError::NotFound(1)
-        }
+        WorkspaceError::WorkspaceNotFound(_)
+        | WorkspaceError::LayerNotFound(_)
+        | WorkspaceError::SnapshotNotFound(_) => MetaError::NotFound(1),
         WorkspaceError::LeaseNotFound(_) => {
             MetaError::Io(std::io::Error::from_raw_os_error(libc::ESTALE))
         }

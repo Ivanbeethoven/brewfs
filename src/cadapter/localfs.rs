@@ -171,6 +171,43 @@ impl ObjectBackend for LocalFsBackend {
         Ok(())
     }
 
+    async fn put_object_create_only(&self, key: &str, data: &[u8]) -> Result<()> {
+        let path = self.path_for(key);
+        if let Some(dir) = path.parent() {
+            self.ensure_dir(dir).await?;
+        }
+        let temporary =
+            path.with_extension(format!("brewfs-create-{}", uuid::Uuid::now_v7().simple()));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await?;
+        if let Err(error) = async {
+            file.write_all(data).await?;
+            file.sync_all().await
+        }
+        .await
+        {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(error.into());
+        }
+        drop(file);
+        let linked = fs::hard_link(&temporary, &path).await;
+        let _ = fs::remove_file(&temporary).await;
+        match linked {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if fs::read(&path).await?.as_slice() == data {
+                    Ok(())
+                } else {
+                    Err(error.into())
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     #[tracing::instrument(name = "LocalFsBackend.get_object", level = "trace", skip(self))]
     async fn get_object(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let path = self.path_for(key);
@@ -260,5 +297,35 @@ impl ObjectBackend for LocalFsBackend {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn create_only_put_never_overwrites_an_existing_object() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = LocalFsBackend::new(root.path());
+
+        backend
+            .put_object_create_only("chunks/1/0", b"lower")
+            .await
+            .unwrap();
+        backend
+            .put_object_create_only("chunks/1/0", b"lower")
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .put_object_create_only("chunks/1/0", b"replacement")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            backend.get_object("chunks/1/0").await.unwrap(),
+            Some(b"lower".to_vec())
+        );
     }
 }

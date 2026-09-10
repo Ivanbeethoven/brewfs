@@ -55,6 +55,14 @@ pub async fn reconcile_cluster(
     let namespace = cluster
         .namespace()
         .ok_or_else(|| anyhow!("BrewFSCluster must be namespaced"))?;
+    #[cfg(feature = "workspace-operator")]
+    if crate::workspace::controller::guard_cluster_workspace_lifecycle(
+        &cluster, &client, &namespace,
+    )
+    .await?
+    {
+        return Ok(Action::await_change());
+    }
     let owner = cluster
         .controller_owner_ref(&())
         .ok_or_else(|| anyhow!("failed to build owner reference"))?;
@@ -68,6 +76,9 @@ pub async fn reconcile_cluster(
     apply_rustfs_init_job(&client, &namespace, &cluster, &owner).await?;
     apply_brewfs_config(&client, &namespace, &cluster, &owner).await?;
     patch_cluster_status(&client, &namespace, &cluster).await?;
+    #[cfg(feature = "workspace-operator")]
+    crate::workspace::controller::reconcile_cluster_workspace(&cluster, &client, &namespace)
+        .await?;
 
     Ok(Action::requeue(Duration::from_secs(300)))
 }
@@ -1569,7 +1580,7 @@ fn consumer_rendered_containers(
     }
 }
 
-fn render_consumer_container(
+pub(crate) fn render_consumer_container(
     container: &ConsumerContainerSpec,
     default_mount_path: &str,
     shared_volume_name: &str,
@@ -1632,7 +1643,7 @@ fn render_consumer_volume_mount(spec: &ConsumerVolumeMountSpec) -> VolumeMount {
     }
 }
 
-fn consumer_extra_volumes(specs: &[ConsumerVolumeSpec]) -> Vec<Volume> {
+pub(crate) fn consumer_extra_volumes(specs: &[ConsumerVolumeSpec]) -> Vec<Volume> {
     specs.iter().map(render_consumer_volume).collect()
 }
 
@@ -1870,6 +1881,11 @@ fn cluster_ready_status(
         rustfs_service: Some(rustfs_name(&cluster_name)),
         bucket: Some(cluster.spec.rustfs.bucket.clone()),
         config_map: Some(cluster_config_map_name(&cluster_name)),
+        #[cfg(feature = "workspace-operator")]
+        workspace: cluster
+            .status
+            .as_ref()
+            .and_then(|status| status.workspace.clone()),
         last_reconciled_at,
     }
 }
@@ -1885,6 +1901,16 @@ fn cluster_status_semantically_equal(
         && current.rustfs_service == desired.rustfs_service
         && current.bucket == desired.bucket
         && current.config_map == desired.config_map
+        && {
+            #[cfg(feature = "workspace-operator")]
+            {
+                current.workspace == desired.workspace
+            }
+            #[cfg(not(feature = "workspace-operator"))]
+            {
+                true
+            }
+        }
 }
 
 fn mount_status_semantically_equal(
@@ -1942,6 +1968,7 @@ async fn patch_cluster_status(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn patch_mount_status(
     client: &kube::Client,
     namespace: &str,
@@ -2066,6 +2093,8 @@ mod tests {
                 redis: RedisSpec::default(),
                 rustfs: RustFsSpec::default(),
                 mount_config: MountConfigSpec::default(),
+                #[cfg(feature = "workspace-operator")]
+                workspace: None,
             },
             status: None,
         };
@@ -2121,6 +2150,8 @@ mod tests {
                 redis: RedisSpec::default(),
                 rustfs: RustFsSpec::default(),
                 mount_config: MountConfigSpec::default(),
+                #[cfg(feature = "workspace-operator")]
+                workspace: None,
             },
             status: None,
         };
@@ -2200,6 +2231,8 @@ mod tests {
             rustfs_service: Some("demo-rustfs".to_string()),
             bucket: Some("brewfs-data".to_string()),
             config_map: Some("demo-brewfs-config".to_string()),
+            #[cfg(feature = "workspace-operator")]
+            workspace: None,
             last_reconciled_at: Some(Utc::now()),
         };
         let mut desired = current.clone();

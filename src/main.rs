@@ -385,13 +385,25 @@ async fn mount_cmd(args: MountConfig) -> anyhow::Result<()> {
         DataBackendKind::LocalFs => {
             let client = create_localfs_client(&args)?;
             tracing::info!("mount startup localfs client ready");
-            let store = create_object_store(client, layout, &args.cache).await?;
+            let store = create_object_store(
+                client,
+                layout,
+                &args.cache,
+                args.volume_format == VolumeFormat::WorkspaceV1,
+            )
+            .await?;
             dispatch_mount(layout, store, &args).await
         }
         DataBackendKind::S3 => {
             let client = create_s3_client(&args).await?;
             tracing::info!("mount startup s3 client ready");
-            let store = create_object_store(client, layout, &args.cache).await?;
+            let store = create_object_store(
+                client,
+                layout,
+                &args.cache,
+                args.volume_format == VolumeFormat::WorkspaceV1,
+            )
+            .await?;
             dispatch_mount(layout, store, &args).await
         }
     }
@@ -469,7 +481,7 @@ async fn gateway_s3_cmd(args: S3GatewayArgs) -> anyhow::Result<()> {
     match cfg.data_backend {
         DataBackendKind::LocalFs => {
             let client = create_localfs_client(&cfg)?;
-            let store = create_object_store(client, layout, &cfg.cache).await?;
+            let store = create_object_store(client, layout, &cfg.cache, false).await?;
             serve(
                 store,
                 create_meta_store(&cfg).await?,
@@ -482,7 +494,7 @@ async fn gateway_s3_cmd(args: S3GatewayArgs) -> anyhow::Result<()> {
         }
         DataBackendKind::S3 => {
             let client = create_s3_client(&cfg).await?;
-            let store = create_object_store(client, layout, &cfg.cache).await?;
+            let store = create_object_store(client, layout, &cfg.cache, false).await?;
             serve(
                 store,
                 create_meta_store(&cfg).await?,
@@ -531,6 +543,7 @@ async fn create_object_store<B>(
     client: ObjectClient<B>,
     layout: ChunkLayout,
     cache: &crate::vfs::cache::config::CacheConfig,
+    create_only_writes: bool,
 ) -> anyhow::Result<ObjectBlockStore<B>>
 where
     B: ObjectBackend + Send + Sync + 'static,
@@ -554,6 +567,7 @@ where
         persist_write_cache_after_upload: cache.persist_write_cache_after_upload
             && !reuse_writeback_stage,
         persistent_slice_cache_dir: reuse_writeback_stage.then(|| cache.cache_root.join("chunks")),
+        create_only_writes,
         ..BlockStoreConfig::default()
     };
     let bandwidth = BandwidthLimiter::new(&cache.bandwidth);
@@ -861,7 +875,7 @@ where
     println!("mounted at {}", mount_point.display());
     let mut handle = handle;
     tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
+        signal = shutdown_signal() => {
             signal?;
             println!("unmounting...");
             handle.unmount().await?;
@@ -942,9 +956,11 @@ where
             header.schema_version
         )
     }
-    WorkspaceLifecycle::new(workspace_store.clone())
-        .recover_incomplete_seals()
-        .await?;
+    if !args.workspace_operator_managed {
+        WorkspaceLifecycle::new(workspace_store.clone())
+            .recover_incomplete_seals()
+            .await?;
+    }
 
     let generation = new_workspace_holder_generation();
     let session = WorkspaceMountSession::acquire(
@@ -957,7 +973,9 @@ where
     .await?;
     let block_store = Arc::new(store);
     let gc_cancel = tokio_util::sync::CancellationToken::new();
-    let gc_task = {
+    let gc_task = if args.workspace_operator_managed {
+        None
+    } else {
         let cancel = gc_cancel.clone();
         let gc = WorkspaceGc::new(
             workspace_store.clone(),
@@ -966,7 +984,7 @@ where
             DEFAULT_LEASE_TTL.saturating_mul(2),
             DEFAULT_LEASE_TTL.saturating_mul(2),
         );
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(DEFAULT_LEASE_TTL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await;
@@ -980,7 +998,7 @@ where
                     }
                 }
             }
-        })
+        }))
     };
     let mount_result = async {
         let meta_layer = Arc::new(WorkspaceMetaLayer::with_chunk_size(
@@ -1016,7 +1034,7 @@ where
         );
         let mut handle = handle;
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
+            signal = shutdown_signal() => {
                 signal?;
                 println!("unmounting...");
                 handle.unmount().await?;
@@ -1029,11 +1047,30 @@ where
     }
     .await;
     gc_cancel.cancel();
-    let _ = gc_task.await;
+    if let Some(gc_task) = gc_task {
+        let _ = gc_task.await;
+    }
     let release_result = session.release().await;
     mount_result?;
     release_result?;
     Ok(())
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }
 
 #[cfg(feature = "workspace-overlay")]

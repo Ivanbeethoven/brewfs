@@ -58,7 +58,7 @@ jobs:
       - name: Build and push BrewFS operator image
         uses: docker/build-push-action@v6
         with:
-          context: operator/brewfs-operator
+          context: .
           file: operator/brewfs-operator/Dockerfile
           push: true
           tags: |
