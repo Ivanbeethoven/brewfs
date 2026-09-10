@@ -113,6 +113,22 @@ async fn rename_exchange_and_hardlink_update_dentries_and_nlink_atomically() {
 }
 
 #[tokio::test]
+async fn rename_onto_same_inode_keeps_both_hard_links() {
+    let meta = test_meta().await;
+    let root = meta.root_ino();
+    let file = meta.create_file(root, "file".into()).await.unwrap();
+    meta.link(file, root, "alias").await.unwrap();
+
+    meta.rename(root, "file", root, "alias".into())
+        .await
+        .unwrap();
+
+    assert_eq!(meta.lookup(root, "file").await.unwrap(), Some(file));
+    assert_eq!(meta.lookup(root, "alias").await.unwrap(), Some(file));
+    assert_eq!(meta.stat(file).await.unwrap().unwrap().nlink, 2);
+}
+
+#[tokio::test]
 async fn symlink_setattr_and_xattr_mutations_round_trip() {
     let meta = test_meta().await;
     let root = meta.root_ino();
