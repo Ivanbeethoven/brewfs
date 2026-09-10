@@ -107,7 +107,7 @@ cargo test --no-default-features --features "gateway-webdav,fuse-tokio-runtime" 
 在低内存、单任务构建参数（`CARGO_BUILD_JOBS=1`、`CARGO_INCREMENTAL=0`、关闭 debug info）下还完成了：
 
 - `cargo test --workspace --lib --bins -- --test-threads=1`：`679 passed, 0 failed, 175 ignored`
-- `cargo test --workspace --all-features -- --test-threads=1`：`732 passed, 0 failed, 177 ignored`
+- `cargo test --workspace --all-features -- --test-threads=1`：`751 passed, 0 failed, 177 ignored`
 - WebDAV-only `cargo clippy ... -- -D warnings`：通过
 - Redis（无 xattr）能力冒烟：OPTIONS、读写、活属性和基本 WebDAV 操作通过；脚本结果为 `65 passed, 4 failed`，4 项均为 dead-property 持久化断言，`PROPPATCH` 按后端能力正确返回 507
 - 使用可写 SQLite、无效 PEM 证书/私钥启动：在 TLS 加载阶段失败，无监听端口、无 orphan gateway 进程

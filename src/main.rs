@@ -618,6 +618,7 @@ mod flat_cache_namespace_tests {
             ObjectClient::new(LocalFsBackend::new(&first.data_dir)),
             layout,
             &first.cache,
+            false,
         )
         .await
         .unwrap();
@@ -625,6 +626,7 @@ mod flat_cache_namespace_tests {
             ObjectClient::new(LocalFsBackend::new(&second.data_dir)),
             layout,
             &second.cache,
+            false,
         )
         .await
         .unwrap();
@@ -646,6 +648,7 @@ mod flat_cache_namespace_tests {
             ObjectClient::new(LocalFsBackend::new(&first.data_dir)),
             layout,
             &first.cache,
+            false,
         )
         .await
         .unwrap();
@@ -653,6 +656,7 @@ mod flat_cache_namespace_tests {
             ObjectClient::new(LocalFsBackend::new(&second.data_dir)),
             layout,
             &second.cache,
+            false,
         )
         .await
         .unwrap();
@@ -674,6 +678,8 @@ mod flat_cache_namespace_tests {
             b"untouched"
         );
     }
+}
+
 #[cfg(feature = "gateway-webdav")]
 async fn gateway_webdav_cmd(args: WebDavGatewayArgs) -> anyhow::Result<()> {
     use crate::gateway::webdav::{TlsOptions, WebDavGatewayOptions, serve};
