@@ -39,6 +39,7 @@ where
     active_staging: Arc<DashSet<String>>,
 }
 
+#[derive(Debug)]
 struct ResolvedPath {
     parent_ino: i64,
     name: String,
@@ -156,7 +157,10 @@ where
                 });
             }
             if attr.kind != FileType::Dir {
-                return Err(FsError::Forbidden);
+                // dav_server maps FsError::NotFound to 409 Conflict for
+                // MKCOL and friends; an intermediate component that is not
+                // a directory means the parent of the target is missing.
+                return Err(FsError::NotFound);
             }
             parent_ino = ino;
         }
@@ -180,6 +184,25 @@ where
 
     async fn resolve_parent(&self, path: &str) -> Result<ResolvedPath, FsError> {
         self.resolve_path(path, false).await
+    }
+
+    /// Re-resolves the parent of `path` after a mutation lock has been taken
+    /// and verifies it still resolves to `expected_parent_ino`. Guards
+    /// against the pre-lock resolution going stale when the parent directory
+    /// is concurrently replaced; dav_server maps `FsError::NotFound` to
+    /// 409 Conflict for MKCOL and to a client-error status elsewhere.
+    async fn recheck_parent(&self, path: &str, expected_parent_ino: i64) -> Result<(), FsError> {
+        let resolved = self.resolve_parent(path).await?;
+        if resolved.parent_ino != expected_parent_ino {
+            tracing::warn!(
+                path,
+                expected_parent_ino,
+                actual_parent_ino = resolved.parent_ino,
+                "WebDAV parent directory changed during mutation"
+            );
+            return Err(FsError::NotFound);
+        }
+        Ok(())
     }
 
     async fn read_children_ino(
@@ -295,7 +318,9 @@ where
         }
         let resolved = self.resolve_parent(&path).await?;
         let mutation_guard = if options.write || options.create || options.create_new {
-            Some(self.lock_for(&path).lock_owned().await)
+            let guard = self.lock_for(&path).lock_owned().await;
+            self.recheck_parent(&path, resolved.parent_ino).await?;
+            Some(guard)
         } else {
             None
         };
@@ -332,7 +357,13 @@ where
         let (storage_path, storage_ino, staging_path, staging_parent_ino, staging_name, attr) =
             if atomic {
                 let staging = self.reserve_staging();
-                let staging_resolved = self.resolve_parent(&staging).await?;
+                let staging_resolved = match self.resolve_parent(&staging).await {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        self.active_staging.remove(&staging);
+                        return Err(error);
+                    }
+                };
                 let staging_ino = match self
                     .vfs
                     .create_file_at(staging_resolved.parent_ino, &staging_resolved.name, true)
@@ -522,6 +553,7 @@ where
                 return Err(FsError::Exists);
             }
             let _guard = self.lock_for(&path).lock_owned().await;
+            self.recheck_parent(&path, resolved.parent_ino).await?;
             self.vfs
                 .mkdir_at_new(resolved.parent_ino, &resolved.name)
                 .await
@@ -543,6 +575,7 @@ where
                 return Err(FsError::Forbidden);
             }
             let _guard = self.lock_for(&path).lock_owned().await;
+            self.recheck_parent(&path, resolved.parent_ino).await?;
             let result = self.vfs.rmdir_at(resolved.parent_ino, &resolved.name).await;
             if matches!(result, Err(VfsError::DirectoryNotEmpty { .. })) {
                 super::mark_directory_not_empty();
@@ -564,6 +597,7 @@ where
                 return Err(FsError::Forbidden);
             }
             let _guard = self.lock_for(&path).lock_owned().await;
+            self.recheck_parent(&path, resolved.parent_ino).await?;
             self.vfs
                 .unlink_at_with_known_attr(resolved.parent_ino, &resolved.name, ino, attr)
                 .await
@@ -584,6 +618,8 @@ where
             }
             let destination = self.resolve_parent(&to).await?;
             let _guards = self.lock_paths(&from, &to).await;
+            self.recheck_parent(&from, source.parent_ino).await?;
+            self.recheck_parent(&to, destination.parent_ino).await?;
             self.vfs
                 .rename_at_noreplace(
                     source.parent_ino,
@@ -608,8 +644,15 @@ where
             }
             let destination = self.resolve_parent(&to).await?;
             let _guards = self.lock_paths(&from, &to).await;
+            self.recheck_parent(&to, destination.parent_ino).await?;
             let staging = self.reserve_staging();
-            let staging_parent = self.resolve_parent(&staging).await?;
+            let staging_parent = match self.resolve_parent(&staging).await {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    self.active_staging.remove(&staging);
+                    return Err(error);
+                }
+            };
             let result = async {
                 let destination_ino = self
                     .vfs
@@ -618,15 +661,21 @@ where
                     .map_err(map_vfs_error)?;
                 self.copy_exact(&source.1, destination_ino).await?;
                 self.copy_dead_props(source.0, destination_ino).await?;
-                self.vfs
+                let rename = self
+                    .vfs
                     .rename_at_noreplace(
                         staging_parent.parent_ino,
                         &staging_parent.name,
                         destination.parent_ino,
                         &destination.name,
                     )
-                    .await
-                    .map_err(map_vfs_error)
+                    .await;
+                if let Err(VfsError::DirectoryNotEmpty { .. }) = rename {
+                    // Mirror remove_dir: dav_server renders this as 405,
+                    // which the request layer rewrites to 409 Conflict.
+                    super::mark_directory_not_empty();
+                }
+                rename.map_err(map_vfs_error)
             }
             .await;
             if result.is_err() {
@@ -650,6 +699,7 @@ where
                 return Err(FsError::NotFound);
             };
             let _guard = self.lock_for(&path).lock_owned().await;
+            self.recheck_parent(&path, resolved.parent_ino).await?;
             self.vfs
                 .set_attr(
                     ino,
@@ -675,6 +725,7 @@ where
                 return Err(FsError::NotFound);
             };
             let _guard = self.lock_for(&path).lock_owned().await;
+            self.recheck_parent(&path, resolved.parent_ino).await?;
             self.vfs
                 .set_attr(
                     ino,
@@ -714,6 +765,7 @@ where
                 return Err(FsError::NotFound);
             };
             let _guard = self.lock_for(&path).lock_owned().await;
+            self.recheck_parent(&path, resolved.parent_ino).await?;
             let raw = self.read_dead_props(ino).await?;
             let (encoded, statuses) = props::apply(raw.as_deref(), patch)?;
             if let Some(encoded) = encoded {
@@ -940,6 +992,12 @@ where
                         .await
                 };
                 if let Err(error) = result {
+                    if self.create_new && matches!(error, VfsError::AlreadyExists { .. }) {
+                        // A create-new flush that loses a race against an
+                        // existing file is a failed If-None-Match: *
+                        // precondition, not a method-not-allowed conflict.
+                        super::mark_precondition_failed();
+                    }
                     self.cleanup_staging().await;
                     return Err(map_vfs_error(error));
                 }
@@ -967,20 +1025,29 @@ where
         let vfs = self.vfs.clone();
         let active = self.active_staging.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _mutation_guard = mutation_guard;
-                if let Some(guard) = guard {
-                    let _ = guard.close().await;
-                }
-                if let Some(path) = staging {
-                    if !staging_name.is_empty() {
-                        let _ = vfs.unlink_at(staging_parent_ino, &staging_name).await;
-                    } else {
-                        let _ = vfs.unlink(&path).await;
+            // `Handle::spawn` panics when the runtime is already shutting
+            // down; skipping cleanup is safe because the hourly staging
+            // sweep removes abandoned staging files, and Drop must never
+            // panic.
+            let spawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.spawn(async move {
+                    let _mutation_guard = mutation_guard;
+                    if let Some(guard) = guard {
+                        let _ = guard.close().await;
                     }
-                    active.remove(&path);
-                }
-            });
+                    if let Some(path) = staging {
+                        if !staging_name.is_empty() {
+                            let _ = vfs.unlink_at(staging_parent_ino, &staging_name).await;
+                        } else {
+                            let _ = vfs.unlink(&path).await;
+                        }
+                        active.remove(&path);
+                    }
+                })
+            }));
+            if spawn.is_err() {
+                tracing::warn!("WebDAV file cleanup skipped: tokio runtime is shutting down");
+            }
         }
     }
 }
@@ -1188,5 +1255,97 @@ mod tests {
     #[test]
     fn lock_shards_group_descendants() {
         assert_eq!(lock_shard("/docs"), lock_shard("/docs/a/b"));
+    }
+
+    mod with_vfs {
+        use super::*;
+        use crate::chunk::layout::ChunkLayout;
+        use crate::chunk::store::InMemoryBlockStore;
+        use crate::meta::client::MetaClientOptions;
+        use crate::meta::config::{CompactConfig, MetaClientConfig};
+        use crate::meta::factory::create_meta_store_from_url;
+        use crate::vfs::cache::config::CacheConfig;
+
+        async fn test_dav_fs() -> BrewFsDavFs<InMemoryBlockStore> {
+            let meta_handle = create_meta_store_from_url("sqlite::memory:")
+                .await
+                .expect("create sqlite meta store");
+            let meta: Arc<dyn MetaStore> = meta_handle.store();
+            let config = MetaClientConfig::default();
+            let meta_client = MetaClient::with_options(
+                meta,
+                config.capacity.clone(),
+                config.effective_ttl(),
+                MetaClientOptions::default(),
+            );
+            let vfs = VFS::with_meta_layer_with_cache_config(
+                ChunkLayout::default(),
+                Arc::new(InMemoryBlockStore::new()),
+                meta_client,
+                CompactConfig::default(),
+                CacheConfig::default(),
+            )
+            .expect("create VFS");
+            BrewFsDavFs::new(vfs, false, false)
+        }
+
+        #[tokio::test]
+        async fn intermediate_file_component_maps_to_not_found() {
+            let dav = test_dav_fs().await;
+            let root = dav.vfs.root_ino();
+            dav.vfs
+                .create_file_at(root, "file", true)
+                .await
+                .expect("create file");
+            let error = dav.resolve_parent("/file/child").await.unwrap_err();
+            assert_eq!(error, FsError::NotFound);
+        }
+
+        #[tokio::test]
+        async fn parent_recheck_accepts_unchanged_parent() {
+            let dav = test_dav_fs().await;
+            let root = dav.vfs.root_ino();
+            dav.vfs.mkdir_at_new(root, "dir").await.expect("mkdir");
+            assert!(
+                dav.recheck_parent("/dir/file", dav.vfs.root_ino())
+                    .await
+                    .is_err()
+            );
+            let (dir_ino, _) = dav.resolve_existing("/dir").await.unwrap();
+            assert!(dav.recheck_parent("/dir/file", dir_ino).await.is_ok());
+        }
+
+        #[tokio::test]
+        async fn parent_recheck_rejects_replaced_parent() {
+            let dav = test_dav_fs().await;
+            let root = dav.vfs.root_ino();
+            dav.vfs.mkdir_at_new(root, "a").await.expect("mkdir a");
+            let (a_ino, _) = dav.resolve_existing("/a").await.unwrap();
+            dav.vfs
+                .mkdir_at_new(a_ino, "sub")
+                .await
+                .expect("mkdir a/sub");
+            let resolved = dav.resolve_parent("/a/sub/file").await.unwrap();
+            let old_sub_ino = resolved.parent_ino;
+            assert!(dav.recheck_parent("/a/sub/file", old_sub_ino).await.is_ok());
+
+            // Move the original tree away and recreate the same names. The
+            // old "sub" inode is still occupied by "c/sub", so the fresh
+            // "a/sub" is guaranteed to resolve to a different inode.
+            dav.vfs
+                .rename_at_noreplace(root, "a", root, "c")
+                .await
+                .expect("rename a to c");
+            dav.vfs.mkdir_at_new(root, "a").await.expect("mkdir a");
+            let (new_a_ino, _) = dav.resolve_existing("/a").await.unwrap();
+            dav.vfs
+                .mkdir_at_new(new_a_ino, "sub")
+                .await
+                .expect("mkdir a/sub");
+            assert_eq!(
+                dav.recheck_parent("/a/sub/file", old_sub_ino).await,
+                Err(FsError::NotFound)
+            );
+        }
     }
 }
