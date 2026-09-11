@@ -848,6 +848,11 @@ const UNLINK_LUA: &str = r#"
 // Atomically remove a tombstoned inode and all of its xattrs during final GC.
 // KEYS[1] = inode node key, KEYS[2] = deleted-inode hash, KEYS[3] = xattr hash
 // ARGV[1] = inode field in the deleted-inode hash
+//
+// Idempotent by design: if the node is already gone (e.g. a concurrent GC run
+// finished the cleanup first), the stale tombstone index entry and any orphaned
+// xattr hash are still removed and the script reports success, so GC batches
+// never abort on a lost race.
 const REMOVE_FILE_METADATA_LUA: &str = r#"
     local function key_type(key)
         local reply = redis.call('TYPE', key)
@@ -859,7 +864,9 @@ const REMOVE_FILE_METADATA_LUA: &str = r#"
 
     local node_type = key_type(KEYS[1])
     if node_type == 'none' then
-        return cjson.encode({ok=false, error='not_found'})
+        redis.call('HDEL', KEYS[2], ARGV[1])
+        redis.call('DEL', KEYS[3])
+        return cjson.encode({ok=true})
     end
     if node_type ~= 'string' then
         return cjson.encode({ok=false, error='corrupt_node'})
@@ -1444,6 +1451,13 @@ const RENAME_EXCHANGE_LUA: &str = r#"
 // KEYS[1] = inode node key, KEYS[2] = xattr hash key
 // ARGV[1] = xattr name, ARGV[2] = value, ARGV[3] = create-only,
 // ARGV[4] = replace-only, ARGV[5] = new ctime
+//
+// Known limitation: like the other node-mutating scripts here, this re-encodes
+// the whole node JSON via cjson. Lua numbers are doubles, so nanosecond
+// timestamps above 2^53 lose precision on the round trip — an xattr-only
+// update therefore passively truncates mtime/atime (and other ns timestamps)
+// to roughly microsecond granularity. A ms-granularity timestamp migration is
+// tracked separately and is out of scope for this script.
 const SET_XATTR_LUA: &str = r#"
     local function key_type(key)
         local reply = redis.call('TYPE', key)
@@ -1495,6 +1509,7 @@ const SET_XATTR_LUA: &str = r#"
 // Atomically remove one xattr and update the inode ctime.
 // KEYS[1] = inode node key, KEYS[2] = xattr hash key
 // ARGV[1] = xattr name, ARGV[2] = new ctime
+// Same cjson ns-timestamp truncation caveat as SET_XATTR_LUA above.
 const REMOVE_XATTR_LUA: &str = r#"
     local function key_type(key)
         local reply = redis.call('TYPE', key)
@@ -2546,6 +2561,12 @@ impl MetaStore for RedisMetaStore {
                 parent: inode,
                 name: name.to_string(),
             }),
+            // Convention: `xattr_not_found` deliberately reuses
+            // MetaError::NotFound(inode) instead of a dedicated variant so the
+            // Redis and database stores share one mapping. This is safe at the
+            // syscall boundary: the FUSE layer pre-checks inode existence
+            // (ENOENT) and maps VfsError::NotFound to ENODATA for xattr
+            // operations, giving XATTR_REPLACE the correct errno.
             Some("xattr_not_found") => Err(MetaError::NotFound(inode)),
             Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
             Some("corrupt_xattr") => Err(MetaError::Internal("corrupt xattr data".into())),
@@ -3796,7 +3817,8 @@ impl MetaStore for RedisMetaStore {
             .map_err(|e| MetaError::Internal(format!("Lua response parse error: {e}")))?;
 
         match response.error.as_deref() {
-            Some("not_found") => Err(MetaError::NotFound(ino)),
+            // The script treats a missing node as already-GC'd success, so
+            // `remove_file_metadata` is idempotent for concurrent GC runs.
             Some("not_deleted") => Err(MetaError::Internal(
                 "File is not marked as deleted".to_string(),
             )),

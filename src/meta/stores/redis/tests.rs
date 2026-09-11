@@ -4735,3 +4735,100 @@ async fn test_redis_xattr_inode_cleanup() {
         Err(MetaError::NotFound(found)) if found == file
     ));
 }
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_remove_file_metadata_is_idempotent() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let file = store
+        .create_file(root, "gc-me.txt".to_string())
+        .await
+        .unwrap();
+    store.set_xattr(file, "user.gc", b"gone", 0).await.unwrap();
+    store.unlink(root, "gc-me.txt").await.unwrap();
+
+    store.remove_file_metadata(file).await.unwrap();
+    // A concurrent GC run must not fail when the tombstone is already gone:
+    // the script reports success and clears stale index/xattr leftovers.
+    store.remove_file_metadata(file).await.unwrap();
+
+    let deleted = store.get_deleted_files().await.unwrap();
+    assert!(
+        !deleted.contains(&file),
+        "stale tombstone entry must be removed from the deleted set"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_rename_lua_dir_over_dir_removes_destination_xattrs() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let src_ino = store.mkdir(root, "src".to_string()).await.unwrap();
+    let dst_ino = store.mkdir(root, "dst".to_string()).await.unwrap();
+    store
+        .set_xattr(dst_ino, "user.stale", b"stale", 0)
+        .await
+        .unwrap();
+
+    store
+        .rename(root, "src", root, "dst".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(store.lookup(root, "dst").await.unwrap(), Some(src_ino));
+    assert!(store.get_node(dst_ino).await.unwrap().is_none());
+    let mut conn = store.conn.clone();
+    let dst_xattr_exists: bool = conn.exists(store.xattr_key(dst_ino)).await.unwrap();
+    assert!(
+        !dst_xattr_exists,
+        "replaced directory xattrs must be deleted with the inode"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_rename_lua_file_over_file_preserves_destination_xattrs() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let src_ino = store
+        .create_file(root, "src.txt".to_string())
+        .await
+        .unwrap();
+    let dst_ino = store
+        .create_file(root, "dst.txt".to_string())
+        .await
+        .unwrap();
+    store
+        .set_xattr(dst_ino, "user.keep", b"kept", 0)
+        .await
+        .unwrap();
+
+    store
+        .rename(root, "src.txt", root, "dst.txt".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(store.lookup(root, "dst.txt").await.unwrap(), Some(src_ino));
+    // The overwritten file inode is tombstoned rather than freed so open
+    // handles keep observing its state until final GC; its xattrs are
+    // therefore preserved alongside the tombstone (GC's remove_file_metadata
+    // deletes them later).
+    assert_eq!(
+        store.get_xattr(dst_ino, "user.keep").await.unwrap(),
+        Some(b"kept".to_vec())
+    );
+    let mut conn = store.conn.clone();
+    let dst_xattr_exists: bool = conn.exists(store.xattr_key(dst_ino)).await.unwrap();
+    assert!(
+        dst_xattr_exists,
+        "tombstoned destination xattrs must be preserved until GC"
+    );
+}
