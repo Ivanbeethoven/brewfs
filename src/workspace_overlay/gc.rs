@@ -160,7 +160,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::chunk::{InMemoryBlockStore, SliceDesc};
+    use crate::chunk::{InMemoryBlockStore, IncompleteBlockRead, SliceDesc};
     use crate::meta::MetaLayer;
     use crate::workspace_overlay::catalog::{CreateVolumeRoot, RecordOrphanSlice, WorkspaceStore};
     use crate::workspace_overlay::ids::{LayerId, WorkspaceId};
@@ -316,7 +316,11 @@ mod tests {
         assert!(report.deleted_layers.contains(&orphan_layer_id));
         assert!(store.load_layer(orphan_layer_id).await.is_err());
         let mut output = [9; 6];
-        blocks.read_range((88, 0), 0, &mut output).await.unwrap();
+        let error = blocks
+            .read_range((88, 0), 0, &mut output)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<IncompleteBlockRead>().is_some());
         assert_eq!(output, [9; 6]);
         session.release().await.unwrap();
     }
