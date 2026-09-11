@@ -324,6 +324,11 @@ pub struct MetaStoreCapabilities {
 pub struct RenameOutcome {
     pub ino: i64,
     pub replaced_ino: Option<i64>,
+    pub source_is_dir: bool,
+    pub replaced_is_dir: bool,
+    /// False when source and destination resolved to the same inode and the
+    /// backend left both names unchanged.
+    pub renamed: bool,
 }
 
 /// Directory entry
@@ -713,8 +718,9 @@ pub trait MetaStore: Send + Sync {
         new_parent: i64,
         new_name: String,
     ) -> Result<(), MetaError> {
-        self.rename_with_mode(old_parent, old_name, new_parent, new_name, false)
+        self.rename_with_outcome(old_parent, old_name, new_parent, new_name)
             .await
+            .map(|_| ())
     }
 
     /// Atomically rename an entry only if `new_parent/new_name` is absent.
@@ -731,6 +737,7 @@ pub trait MetaStore: Send + Sync {
     ) -> Result<(), MetaError> {
         self.rename_with_mode(old_parent, old_name, new_parent, new_name, true)
             .await
+            .map(|_| ())
     }
 
     /// Backend implementation for ordinary and no-replace rename.
@@ -741,7 +748,7 @@ pub trait MetaStore: Send + Sync {
         new_parent: i64,
         new_name: String,
         noreplace: bool,
-    ) -> Result<(), MetaError>;
+    ) -> Result<RenameOutcome, MetaError>;
 
     async fn rename_with_outcome(
         &self,
@@ -750,26 +757,8 @@ pub trait MetaStore: Send + Sync {
         new_parent: i64,
         new_name: String,
     ) -> Result<RenameOutcome, MetaError> {
-        if old_parent == new_parent && old_name == new_name {
-            let ino = self
-                .lookup(old_parent, old_name)
-                .await?
-                .ok_or(MetaError::NotFound(old_parent))?;
-            return Ok(RenameOutcome {
-                ino,
-                replaced_ino: None,
-            });
-        }
-
-        let ino = self
-            .lookup(old_parent, old_name)
-            .await?
-            .ok_or(MetaError::NotFound(old_parent))?;
-        let replaced_ino = self.lookup(new_parent, &new_name).await?;
-        let replaced_ino = replaced_ino.filter(|&replaced| replaced != ino);
-        self.rename(old_parent, old_name, new_parent, new_name)
-            .await?;
-        Ok(RenameOutcome { ino, replaced_ino })
+        self.rename_with_mode(old_parent, old_name, new_parent, new_name, false)
+            .await
     }
 
     /// Atomically exchange two files (RENAME_EXCHANGE)

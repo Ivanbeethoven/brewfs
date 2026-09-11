@@ -1143,65 +1143,6 @@ where
                 .map_err(|e| meta_error_to_io(&old, e))?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, old.clone()))?;
 
-            if let Ok(Some((dest_ino, dest_kind))) = self.meta_layer().lookup_path(&new).await {
-                let new_dir_ino = if &new_dir == "/" {
-                    self.meta_layer().root_ino()
-                } else {
-                    self.meta_layer()
-                        .lookup_path(&new_dir)
-                        .await
-                        .map_err(|e| meta_error_to_io(&new_dir, e))?
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, new_dir.clone()))?
-                        .0
-                };
-                let new_parent_attr = self
-                    .meta_layer()
-                    .stat(new_dir_ino)
-                    .await
-                    .map_err(|e| meta_error_to_io(&new_dir, e))?
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, new_dir.clone()))?;
-                if new_parent_attr.kind != FileType::Dir {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotADirectory,
-                        new_dir.clone(),
-                    ));
-                }
-                self.check_access(
-                    &new_parent_attr,
-                    AccessMask::WRITE | AccessMask::EXEC,
-                    &new_dir,
-                )?;
-
-                if dest_kind == FileType::Dir {
-                    if src_attr.kind != FileType::Dir {
-                        return Err(io::Error::new(io::ErrorKind::NotADirectory, new.clone()));
-                    }
-                    let children = self
-                        .meta_layer()
-                        .readdir(dest_ino)
-                        .await
-                        .map_err(|e| meta_error_to_io(&new, e))?;
-                    if !children.is_empty() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::DirectoryNotEmpty,
-                            new.clone(),
-                        ));
-                    }
-                    self.meta_layer()
-                        .rmdir(new_dir_ino, &new_name)
-                        .await
-                        .map_err(|e| meta_error_to_io(&new, e))?;
-                } else {
-                    if src_attr.kind == FileType::Dir {
-                        return Err(io::Error::new(io::ErrorKind::NotADirectory, new.clone()));
-                    }
-                    self.meta_layer()
-                        .unlink(new_dir_ino, &new_name)
-                        .await
-                        .map_err(|e| meta_error_to_io(&new, e))?;
-                }
-            }
-
             let new_dir_ino = if &new_dir == "/" {
                 self.meta_layer().root_ino()
             } else {
@@ -1231,7 +1172,17 @@ where
                 &new_dir,
             )?;
             self.meta_layer()
-                .rename(old_parent_ino, &old_name, new_dir_ino, new_name)
+                .rename_with_known_attrs(
+                    old_parent_ino,
+                    &old_name,
+                    new_dir_ino,
+                    new_name,
+                    src_ino,
+                    src_attr,
+                    new_parent_attr,
+                    None,
+                    false,
+                )
                 .await
                 .map_err(|e| meta_error_to_io(&new, e))?;
             Ok(())
@@ -2206,6 +2157,63 @@ mod tests {
         let entries = fs.readdir("/test").await.unwrap();
         assert!(entries.iter().any(|e| e.name == "hello.txt"));
         assert!(entries.iter().any(|e| e.name == "subdir"));
+    }
+
+    #[tokio::test]
+    async fn test_rename_same_inode_is_a_noop() {
+        let fs = create_test_fs().await;
+        let file = fs.create_file("/file").await.unwrap();
+        let normalized = fs.create_file("/normalized").await.unwrap();
+        fs.mkdir("/directory").await.unwrap();
+        let directory = fs.stat("/directory").await.unwrap().inode();
+
+        for (old, new, expected) in [
+            ("/file", "/file", file),
+            ("/normalized", "//normalized", normalized),
+            ("/directory", "/directory", directory),
+        ] {
+            fs.rename(old, new).await.unwrap();
+            assert_eq!(fs.stat(old).await.unwrap().inode(), expected);
+        }
+
+        fs.link("/file", "/alias").await.unwrap();
+        fs.rename("/file", "/alias").await.unwrap();
+        assert_eq!(fs.stat("/file").await.unwrap().inode(), file);
+        assert_eq!(fs.stat("/alias").await.unwrap().inode(), file);
+    }
+
+    #[tokio::test]
+    async fn test_rename_atomically_replaces_destination() {
+        let fs = create_test_fs().await;
+        let source = fs.create("/source").await.unwrap();
+        source.write(b"source-data").await.unwrap();
+        let source_ino = source.inode();
+        let destination = fs.create("/destination").await.unwrap();
+        destination.write(b"old-data").await.unwrap();
+
+        fs.rename("/source", "/destination").await.unwrap();
+
+        assert!(fs.stat("/source").await.is_err());
+        assert_eq!(fs.stat("/destination").await.unwrap().inode(), source_ino);
+        let replacement = fs
+            .open("/destination", OpenFlags::read_only())
+            .await
+            .unwrap();
+        let mut data = [0u8; 11];
+        let len = replacement.read(&mut data).await.unwrap();
+        assert_eq!(&data[..len], b"source-data");
+    }
+
+    #[tokio::test]
+    async fn test_failed_rename_preserves_destination() {
+        let fs = create_test_fs().await;
+        fs.create_file("/source").await.unwrap();
+        fs.mkdir("/destination").await.unwrap();
+        let destination = fs.stat("/destination").await.unwrap().inode();
+
+        assert!(fs.rename("/source", "/destination").await.is_err());
+        assert!(fs.stat("/source").await.unwrap().is_file());
+        assert_eq!(fs.stat("/destination").await.unwrap().inode(), destination);
     }
 
     #[tokio::test]

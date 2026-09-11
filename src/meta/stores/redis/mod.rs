@@ -15,8 +15,8 @@ use crate::meta::file_lock::{
 };
 use crate::meta::store::{
     CreateEntryResult, DirEntry, DirStat, FileAttr, FileType, LockName, MetaError, MetaStore,
-    RetryReason, SetAttrFlags, SetAttrRequest, StatFsSnapshot, stat_fs_snapshot_from_usage,
-    stat_fs_used_bytes,
+    RenameOutcome, RetryReason, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
+    stat_fs_snapshot_from_usage, stat_fs_used_bytes,
 };
 use crate::meta::{INODE_ID_KEY, SLICE_ID_KEY};
 use async_trait::async_trait;
@@ -1056,13 +1056,14 @@ const RENAME_LUA: &str = r#"
     -- replaced atomically; no window for concurrent renames to observe a partial state).
     local new_parent_nlink_adj = 0
     local replaced_ino = nil
+    local replaced_is_dir = false
     local dest_ino_str = redis.call('HGET', new_parent_dir_key, new_name)
     if dest_ino_str then
         if noreplace then
             return cjson.encode({ok=false, error="already_exists", ino=tonumber(dest_ino_str)})
         end
         if dest_ino_str == dentry_ino then
-            return cjson.encode({ok=true, ino=child_ino})
+            return cjson.encode({ok=true, ino=child_ino, source_is_dir=child_node.kind == "Dir", renamed=false})
         end
         replaced_ino = tonumber(dest_ino_str)
         local dest_node_key = node_prefix .. dest_ino_str
@@ -1077,6 +1078,7 @@ const RENAME_LUA: &str = r#"
 
         local src_kind = child_node.kind
         local dest_kind = dest_node.kind
+        replaced_is_dir = dest_kind == "Dir"
 
         if src_kind == "Dir" and dest_kind == "Dir" then
             -- Destination directory must be empty
@@ -1198,7 +1200,7 @@ const RENAME_LUA: &str = r#"
     new_parent_node.attr.ctime = timestamp
     redis.call('SET', new_parent_node_key, cjson.encode(new_parent_node))
 
-    return cjson.encode({ok=true, ino=child_ino, replaced_ino=replaced_ino})
+    return cjson.encode({ok=true, ino=child_ino, replaced_ino=replaced_ino, source_is_dir=child_node.kind == "Dir", replaced_is_dir=replaced_is_dir})
 "#;
 
 const RENAME_EXCHANGE_LUA: &str = r#"
@@ -1442,6 +1444,12 @@ struct LuaResponse {
     node: Option<String>,
     #[serde(default)]
     replaced_ino: Option<i64>,
+    #[serde(default)]
+    renamed: Option<bool>,
+    #[serde(default)]
+    source_is_dir: Option<bool>,
+    #[serde(default)]
+    replaced_is_dir: Option<bool>,
     #[serde(default)]
     msg: Option<String>, // For Internal error details
 }
@@ -2775,12 +2783,11 @@ impl MetaStore for RedisMetaStore {
         new_parent: i64,
         new_name: String,
         noreplace: bool,
-    ) -> Result<(), MetaError> {
+    ) -> Result<RenameOutcome, MetaError> {
         if !noreplace {
             return self
                 .rename_with_outcome(old_parent, old_name, new_parent, new_name)
-                .await
-                .map(|_| ());
+                .await;
         }
 
         let old_parent_dir_key = self.dir_key(old_parent);
@@ -2831,7 +2838,13 @@ impl MetaStore for RedisMetaStore {
                     .ok_or_else(|| MetaError::Internal("missing ino in rename response".into()))?;
                 self.invalidate_nodes(&[old_parent, new_parent, child])
                     .await;
-                Ok(())
+                Ok(RenameOutcome {
+                    ino: child,
+                    replaced_ino: None,
+                    source_is_dir: response.source_is_dir.unwrap_or(false),
+                    replaced_is_dir: false,
+                    renamed: true,
+                })
             }
             None => Err(MetaError::Internal("unexpected Lua response".into())),
         }
@@ -2853,6 +2866,9 @@ impl MetaStore for RedisMetaStore {
             return Ok(crate::meta::store::RenameOutcome {
                 ino,
                 replaced_ino: None,
+                source_is_dir: false,
+                replaced_is_dir: false,
+                renamed: false,
             });
         }
 
@@ -2917,6 +2933,9 @@ impl MetaStore for RedisMetaStore {
                 Ok(crate::meta::store::RenameOutcome {
                     ino: child,
                     replaced_ino,
+                    source_is_dir: response.source_is_dir.unwrap_or(false),
+                    replaced_is_dir: response.replaced_is_dir.unwrap_or(false),
+                    renamed: response.renamed.unwrap_or(true),
                 })
             }
             None => Err(MetaError::Internal("unexpected Lua response".into())),

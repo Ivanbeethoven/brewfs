@@ -303,6 +303,7 @@ redis = { workspace = true }
 bincode = { workspace = true, optional = true }
 if-addrs = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
+url = { workspace = true }
 parking_lot = { workspace = true }
 tikv-jemallocator = { workspace = true, optional = true }
 tikv-client = { workspace = true }

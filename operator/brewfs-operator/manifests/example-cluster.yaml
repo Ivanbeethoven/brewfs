@@ -11,3 +11,11 @@ spec:
     mountPoint: /mnt/brewfs
     chunkSize: 67108864
     blockSize: 4194304
+  workspace:
+    enabled: true
+    catalogBackend: Redis
+    namespace: demo-workspaces
+    leaseTtlSeconds: 30
+    heartbeatSeconds: 10
+    gcGraceSeconds: 60
+    catalogStorageSize: 5Gi

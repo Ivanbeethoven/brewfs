@@ -358,6 +358,9 @@ pub struct BlockStoreConfig {
     /// When configured, a block-cache miss can be served from the immutable
     /// slice staged by commit-before-upload writeback.
     pub persistent_slice_cache_dir: Option<PathBuf>,
+    /// Require atomic create-only object writes. Workspace volumes enable this
+    /// so a key collision can never overwrite a block reachable from a lower.
+    pub create_only_writes: bool,
 }
 
 impl Default for BlockStoreConfig {
@@ -372,6 +375,7 @@ impl Default for BlockStoreConfig {
             populate_write_cache_after_upload: true,
             persist_write_cache_after_upload: false,
             persistent_slice_cache_dir: None,
+            create_only_writes: false,
         }
     }
 }
@@ -815,10 +819,19 @@ impl<B: ObjectBackend + Send + Sync + 'static> ObjectBlockStore<B> {
             .record_put_prepare(prepare_started.elapsed());
 
         let started = Instant::now();
-        self.client
-            .put_object_vectored(&object_key, vec![upload_bytes])
-            .await
-            .map_err(|e| anyhow::anyhow!("object store put failed: {object_key}, {e:?}"))?;
+        if self.config.create_only_writes {
+            self.client
+                .put_object_create_only(&object_key, &upload_bytes)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("create-only object put failed: {object_key}, {e:?}")
+                })?;
+        } else {
+            self.client
+                .put_object_vectored(&object_key, vec![upload_bytes])
+                .await
+                .map_err(|e| anyhow::anyhow!("object store put failed: {object_key}, {e:?}"))?;
+        }
         self.object_metrics
             .record_put(upload_len as u64, started.elapsed());
         self.format_cache

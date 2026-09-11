@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use super::ids::{LayerId, LeaseId, WorkspaceId};
+use super::ids::{LayerId, LeaseId, SnapshotId, WorkspaceId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConflictDetail {
@@ -24,6 +24,8 @@ pub enum WorkspaceError {
     LayerNotFound(LayerId),
     #[error("lease not found: {0}")]
     LeaseNotFound(LeaseId),
+    #[error("snapshot not found: {0}")]
+    SnapshotNotFound(SnapshotId),
     #[error("workspace is busy")]
     Busy,
     #[error("workspace writer was fenced")]

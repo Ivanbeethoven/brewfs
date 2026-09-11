@@ -1233,6 +1233,7 @@ dependencies = [
  "tracing-chrome",
  "tracing-flame",
  "tracing-subscriber",
+ "url",
  "uuid",
  "zstd",
 ]

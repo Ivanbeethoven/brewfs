@@ -786,29 +786,7 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         if let Some(destination) = destination.as_ref()
             && destination.ino == source.ino
         {
-            // POSIX rename onto another hard link to the same inode removes
-            // only the old name.
-            source_inode.nlink = source_inode
-                .nlink
-                .checked_sub(1)
-                .ok_or_else(|| MetaError::Internal("inode link count underflow".into()))?;
-            source_inode.ctime_ns = now_ns()?;
-            let guard = self.guard().await;
-            source_inode.layer_id = guard.expected_head_layer_id;
-            source_inode.sequence = 0;
-            self.store
-                .apply_namespace_mutation(NamespaceMutation {
-                    guard,
-                    dentries: vec![DentryDelta::whiteout(
-                        source_inode.layer_id,
-                        old_parent,
-                        old_name.as_bytes().to_vec(),
-                        0,
-                    )],
-                    inodes: vec![source_inode],
-                })
-                .await
-                .map_err(workspace_to_meta)?;
+            // POSIX rename onto another hard link to the same inode is a no-op.
             return Ok(());
         }
 
@@ -1822,9 +1800,9 @@ fn workspace_to_meta(error: WorkspaceError) -> MetaError {
         WorkspaceError::FeatureNotCompiled(feature) => {
             MetaError::NotSupported(format!("feature {feature} is not compiled"))
         }
-        WorkspaceError::WorkspaceNotFound(_) | WorkspaceError::LayerNotFound(_) => {
-            MetaError::NotFound(1)
-        }
+        WorkspaceError::WorkspaceNotFound(_)
+        | WorkspaceError::LayerNotFound(_)
+        | WorkspaceError::SnapshotNotFound(_) => MetaError::NotFound(1),
         WorkspaceError::LeaseNotFound(_) => {
             MetaError::Io(std::io::Error::from_raw_os_error(libc::ESTALE))
         }

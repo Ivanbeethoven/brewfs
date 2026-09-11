@@ -24,6 +24,7 @@ const CONTROL_KEY: &[u8] = b"control";
 const HOT_WORKSPACE_PREFIX: &[u8] = b"hot/workspace/";
 const HOT_LAYER_PREFIX: &[u8] = b"hot/layer/";
 const HOT_LEASE_PREFIX: &[u8] = b"hot/lease/";
+const HOT_SNAPSHOT_PREFIX: &[u8] = b"hot/snapshot/";
 const HOT_ALLOCATOR_PREFIX: &[u8] = b"hot/allocator/";
 const ENVELOPE_MAGIC: &[u8; 8] = b"BWSKV001";
 const CAS_MAX_RETRIES: usize = 64;
@@ -174,6 +175,11 @@ where
             state.leases.insert(row.lease_id, row);
             raw.insert(entry.key, Some(entry.value));
         }
+        for entry in self.backend.scan_prefix(HOT_SNAPSHOT_PREFIX).await? {
+            let row: SnapshotRecord = decode(&entry.value)?;
+            state.snapshots.insert(row.snapshot_id, row);
+            raw.insert(entry.key, Some(entry.value));
+        }
         for entry in self.backend.scan_prefix(HOT_ALLOCATOR_PREFIX).await? {
             let name = allocator_name_from_key(&entry.key)?;
             let value: i64 = decode(&entry.value)?;
@@ -296,7 +302,16 @@ where
     }
 
     async fn initialize_workspace_schema(&self) -> Result<(), WorkspaceError> {
-        self.update_control(|_, _| Ok(())).await
+        self.update_control(|state, writes| {
+            // Snapshot point reads use the hot mirror. Rewriting these entries is
+            // also the online migration for catalogs created before that mirror
+            // existed; the topology document remains the source of truth.
+            for snapshot in state.snapshots.values() {
+                writes.push(put(hot_snapshot_key(snapshot.snapshot_id), snapshot)?);
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn load_volume_header(&self) -> Result<Option<VolumeHeader>, WorkspaceError> {
@@ -586,12 +601,10 @@ where
     }
 
     async fn load_snapshot(&self, id: SnapshotId) -> Result<SnapshotRecord, WorkspaceError> {
-        self.load_control()
+        self.load_hot(hot_snapshot_key(id))
             .await?
-            .snapshots
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| WorkspaceError::Backend(format!("snapshot not found: {id}")))
+            .1
+            .ok_or(WorkspaceError::SnapshotNotFound(id))
     }
 
     async fn list_snapshots(&self) -> Result<Vec<SnapshotRecord>, WorkspaceError> {
@@ -611,7 +624,7 @@ where
                 .snapshots
                 .remove(&id)
                 .map(|_| ())
-                .ok_or_else(|| WorkspaceError::Backend(format!("snapshot not found: {id}")))
+                .ok_or(WorkspaceError::SnapshotNotFound(id))
         })
         .await
     }
@@ -1930,6 +1943,10 @@ fn hot_lease_key(id: LeaseId) -> Vec<u8> {
     format!("hot/lease/{id}").into_bytes()
 }
 
+fn hot_snapshot_key(id: SnapshotId) -> Vec<u8> {
+    [HOT_SNAPSHOT_PREFIX, id.to_string().as_bytes()].concat()
+}
+
 fn hot_allocator_key(name: &str) -> Vec<u8> {
     format!("hot/allocator/{name}").into_bytes()
 }
@@ -1938,6 +1955,7 @@ fn is_hot_key(key: &[u8]) -> bool {
     key.starts_with(HOT_WORKSPACE_PREFIX)
         || key.starts_with(HOT_LAYER_PREFIX)
         || key.starts_with(HOT_LEASE_PREFIX)
+        || key.starts_with(HOT_SNAPSHOT_PREFIX)
         || key.starts_with(HOT_ALLOCATOR_PREFIX)
 }
 
@@ -1962,6 +1980,9 @@ fn append_hot_diff(
     })?;
     append_map_diff(&before.leases, &after.leases, writes, |id| {
         hot_lease_key(*id)
+    })?;
+    append_map_diff(&before.snapshots, &after.snapshots, writes, |id| {
+        hot_snapshot_key(*id)
     })?;
     append_map_diff(&before.allocators, &after.allocators, writes, |name| {
         hot_allocator_key(name)
@@ -2379,7 +2400,7 @@ mod tests {
         AcquireLease, AdvanceSeal, AppendDataExtent, BeginSeal, CreateVolumeRoot, CreateWorkspace,
         DentryQuery, HeadGuard, NamespaceMutation, WorkspaceStore,
     };
-    use crate::workspace_overlay::ids::{JournalId, LeaseId};
+    use crate::workspace_overlay::ids::{JournalId, LeaseId, SnapshotId};
     use crate::workspace_overlay::stores::redis::RedisWorkspaceBackend;
     use crate::workspace_overlay::stores::tikv::TiKvWorkspaceBackend;
 
@@ -2530,6 +2551,21 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(store.backend.scans.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_snapshot_is_a_typed_point_lookup_without_scan() {
+        let (store, _workspace, _lease, _guard) = initialized().await;
+        let scans_before = store.backend.scans.load(Ordering::Relaxed);
+        let snapshot_id = SnapshotId::from_uuid(id(99));
+
+        let error = store.load_snapshot(snapshot_id).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            WorkspaceError::SnapshotNotFound(id) if id == snapshot_id
+        ));
+        assert_eq!(store.backend.scans.load(Ordering::Relaxed), scans_before);
     }
 
     #[tokio::test]

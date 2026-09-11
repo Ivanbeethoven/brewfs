@@ -90,10 +90,6 @@ impl InodeEntry {
         }
     }
 
-    pub(crate) async fn set_parent(&self, parent_ino: i64) {
-        *self.parent.write().await = Some(parent_ino);
-    }
-
     pub(crate) async fn clear_parent(&self) {
         *self.parent.write().await = None;
     }

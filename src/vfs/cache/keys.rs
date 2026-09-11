@@ -50,12 +50,17 @@ impl DirtySliceKey {
         root: &std::path::Path,
         chunk_offset: u64,
         length: u64,
+        volume_scope_fingerprint: Option<&str>,
     ) -> std::path::PathBuf {
+        let scope_suffix = volume_scope_fingerprint
+            .map(|scope| format!("_{scope}"))
+            .unwrap_or_default();
         self.dir_path(root).join(format!(
-            "{}_{}_{}.sealed",
+            "{}_{}_{}{}.sealed",
             self.file_stem(),
             chunk_offset,
-            length
+            length,
+            scope_suffix
         ))
     }
 
@@ -63,10 +68,10 @@ impl DirtySliceKey {
         format!("{}_", self.file_stem())
     }
 
-    pub(crate) fn parse_sealed_file_name(name: &str) -> Option<(Self, u64, u64)> {
+    pub(crate) fn parse_sealed_file_name(name: &str) -> Option<(Self, u64, u64, Option<String>)> {
         let stem = name.strip_suffix(".sealed")?;
         let parts: Vec<&str> = stem.split('_').collect();
-        if parts.len() != 6 {
+        if !matches!(parts.len(), 6 | 7) {
             return None;
         }
         Some((
@@ -78,6 +83,7 @@ impl DirtySliceKey {
             },
             parts[4].parse().ok()?,
             parts[5].parse().ok()?,
+            parts.get(6).map(|scope| (*scope).to_string()),
         ))
     }
 
@@ -157,14 +163,24 @@ mod tests {
             epoch: 3,
         };
 
-        let path = key.sealed_slice_path(root, 4096, 8192);
+        let path = key.sealed_slice_path(root, 4096, 8192, None);
         let file_name = path.file_name().unwrap().to_str().unwrap();
-        let (parsed_key, chunk_offset, length) =
+        let (parsed_key, chunk_offset, length, volume_scope) =
             DirtySliceKey::parse_sealed_file_name(file_name).unwrap();
 
         assert_eq!(parsed_key, key);
         assert_eq!(chunk_offset, 4096);
         assert_eq!(length, 8192);
+        assert!(volume_scope.is_none());
+
+        let scoped_path = key.sealed_slice_path(root, 4096, 8192, Some("abc123"));
+        let scoped_name = scoped_path.file_name().unwrap().to_str().unwrap();
+        let (parsed_key, chunk_offset, length, volume_scope) =
+            DirtySliceKey::parse_sealed_file_name(scoped_name).unwrap();
+        assert_eq!(parsed_key, key);
+        assert_eq!(chunk_offset, 4096);
+        assert_eq!(length, 8192);
+        assert_eq!(volume_scope.as_deref(), Some("abc123"));
     }
 }
 

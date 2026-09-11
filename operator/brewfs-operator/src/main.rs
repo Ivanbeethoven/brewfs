@@ -1,5 +1,7 @@
 mod crd;
 mod reconciler;
+#[cfg(feature = "workspace-operator")]
+mod workspace;
 
 use std::sync::Arc;
 
@@ -15,6 +17,8 @@ use tracing::{error, info};
 
 use crate::crd::{BrewFSCluster, BrewFSMount};
 use crate::reconciler::OperatorContext;
+#[cfg(feature = "workspace-operator")]
+use crate::workspace::crd::{BrewFSWorkspace, BrewFSWorkspaceMount, BrewFSWorkspaceSnapshot};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -62,7 +66,17 @@ fn print_crd() -> anyhow::Result<()> {
         .context("serialize BrewFSCluster CRD to YAML")?;
     let mount_crd =
         serde_yaml::to_string(&BrewFSMount::crd()).context("serialize BrewFSMount CRD to YAML")?;
-    println!("{cluster_crd}---\n{mount_crd}");
+    print!("{cluster_crd}---\n{mount_crd}");
+    #[cfg(feature = "workspace-operator")]
+    {
+        let workspace_crd = serde_yaml::to_string(&BrewFSWorkspace::crd())
+            .context("serialize BrewFSWorkspace CRD to YAML")?;
+        let workspace_mount_crd = serde_yaml::to_string(&BrewFSWorkspaceMount::crd())
+            .context("serialize BrewFSWorkspaceMount CRD to YAML")?;
+        let workspace_snapshot_crd = serde_yaml::to_string(&BrewFSWorkspaceSnapshot::crd())
+            .context("serialize BrewFSWorkspaceSnapshot CRD to YAML")?;
+        print!("---\n{workspace_crd}---\n{workspace_mount_crd}---\n{workspace_snapshot_crd}");
+    }
     Ok(())
 }
 
@@ -74,7 +88,7 @@ async fn run_controller() -> anyhow::Result<()> {
         client: client.clone(),
     });
     let cluster_api: Api<BrewFSCluster> = Api::all(client.clone());
-    let mount_api: Api<BrewFSMount> = Api::all(client);
+    let mount_api: Api<BrewFSMount> = Api::all(client.clone());
 
     info!("starting BrewFS controllers");
 
@@ -112,6 +126,72 @@ async fn run_controller() -> anyhow::Result<()> {
             }
         });
 
+    #[cfg(feature = "workspace-operator")]
+    {
+        let workspace_controller = Controller::new(
+            Api::<BrewFSWorkspace>::all(client.clone()),
+            watcher::Config::default(),
+        )
+        .run(
+            workspace::controller::reconcile_workspace,
+            workspace::controller::error_policy_workspace,
+            context.clone(),
+        )
+        .for_each(|result| async move {
+            match result {
+                Ok((object_ref, action)) => {
+                    info!(name = %object_ref.name, ?action, "reconciled BrewFSWorkspace");
+                }
+                Err(error) => error!(?error, "BrewFSWorkspace reconcile loop error"),
+            }
+        });
+
+        let workspace_mount_controller = Controller::new(
+            Api::<BrewFSWorkspaceMount>::all(client.clone()),
+            watcher::Config::default(),
+        )
+        .run(
+            workspace::controller::reconcile_workspace_mount,
+            workspace::controller::error_policy_mount,
+            context.clone(),
+        )
+        .for_each(|result| async move {
+            match result {
+                Ok((object_ref, action)) => {
+                    info!(name = %object_ref.name, ?action, "reconciled BrewFSWorkspaceMount");
+                }
+                Err(error) => error!(?error, "BrewFSWorkspaceMount reconcile loop error"),
+            }
+        });
+
+        let workspace_snapshot_controller = Controller::new(
+            Api::<BrewFSWorkspaceSnapshot>::all(client),
+            watcher::Config::default(),
+        )
+        .run(
+            workspace::controller::reconcile_workspace_snapshot,
+            workspace::controller::error_policy_snapshot,
+            context,
+        )
+        .for_each(|result| async move {
+            match result {
+                Ok((object_ref, action)) => {
+                    info!(name = %object_ref.name, ?action, "reconciled BrewFSWorkspaceSnapshot");
+                }
+                Err(error) => error!(?error, "BrewFSWorkspaceSnapshot reconcile loop error"),
+            }
+        });
+
+        tokio::join!(
+            cluster_controller,
+            mount_controller,
+            workspace_controller,
+            workspace_mount_controller,
+            workspace_snapshot_controller
+        );
+    }
+
+    #[cfg(not(feature = "workspace-operator"))]
     tokio::join!(cluster_controller, mount_controller);
 
     Ok(())

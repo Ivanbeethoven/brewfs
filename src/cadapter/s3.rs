@@ -576,6 +576,32 @@ impl ObjectBackend for S3Backend {
         self.multipart_upload(key, data).await
     }
 
+    #[tracing::instrument(level = "debug", skip(self, data), fields(key, size = data.len()))]
+    async fn put_object_create_only(&self, key: &str, data: &[u8]) -> Result<()> {
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&self.config.bucket)
+            .key(key)
+            .if_none_match("*")
+            .body(SdkBody::from(data.to_vec()).into());
+        if self.config.enable_md5 {
+            request = request.content_md5(Self::md5_base64(data));
+        }
+        let result = if self.config.disable_payload_checksum {
+            request.customize().disable_payload_signing().send().await
+        } else {
+            request.send().await
+        };
+        if let Err(error) = result {
+            if self.get_object(key).await?.as_deref() == Some(data) {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(level = "debug", skip(self), fields(key))]
     async fn get_object(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let resp = self

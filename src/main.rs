@@ -357,7 +357,7 @@ fn init_tracing() {
     }
 }
 
-async fn mount_cmd(args: MountConfig) -> anyhow::Result<()> {
+async fn mount_cmd(mut args: MountConfig) -> anyhow::Result<()> {
     validate_volume_format_support(args.volume_format)?;
     if !args.mount_point.exists() {
         std::fs::create_dir_all(&args.mount_point)?;
@@ -369,6 +369,8 @@ async fn mount_cmd(args: MountConfig) -> anyhow::Result<()> {
     if args.chunk_size < args.block_size as u64 {
         anyhow::bail!("chunk_size must be >= block_size");
     }
+
+    namespace_flat_volume_cache(&mut args)?;
 
     let layout = ChunkLayout {
         chunk_size: args.chunk_size,
@@ -385,13 +387,25 @@ async fn mount_cmd(args: MountConfig) -> anyhow::Result<()> {
         DataBackendKind::LocalFs => {
             let client = create_localfs_client(&args)?;
             tracing::info!("mount startup localfs client ready");
-            let store = create_object_store(client, layout, &args.cache).await?;
+            let store = create_object_store(
+                client,
+                layout,
+                &args.cache,
+                args.volume_format == VolumeFormat::WorkspaceV1,
+            )
+            .await?;
             dispatch_mount(layout, store, &args).await
         }
         DataBackendKind::S3 => {
             let client = create_s3_client(&args).await?;
             tracing::info!("mount startup s3 client ready");
-            let store = create_object_store(client, layout, &args.cache).await?;
+            let store = create_object_store(
+                client,
+                layout,
+                &args.cache,
+                args.volume_format == VolumeFormat::WorkspaceV1,
+            )
+            .await?;
             dispatch_mount(layout, store, &args).await
         }
     }
@@ -415,7 +429,7 @@ async fn gateway_s3_cmd(args: S3GatewayArgs) -> anyhow::Result<()> {
     if mount_args.mount_point.is_none() {
         mount_args.mount_point = Some(std::path::PathBuf::from("/brewfs-s3-gateway"));
     }
-    let cfg = MountConfig::from_sources(mount_args)?;
+    let mut cfg = MountConfig::from_sources(mount_args)?;
     if cfg.volume_format != VolumeFormat::FlatV1 {
         anyhow::bail!("s3 gateway only supports volume_format=flat-v1");
     }
@@ -424,6 +438,7 @@ async fn gateway_s3_cmd(args: S3GatewayArgs) -> anyhow::Result<()> {
     if cfg.chunk_size < cfg.block_size as u64 {
         anyhow::bail!("chunk_size must be >= block_size");
     }
+    namespace_flat_volume_cache(&mut cfg)?;
     let layout = ChunkLayout {
         chunk_size: cfg.chunk_size,
         block_size: cfg.block_size,
@@ -469,7 +484,7 @@ async fn gateway_s3_cmd(args: S3GatewayArgs) -> anyhow::Result<()> {
     match cfg.data_backend {
         DataBackendKind::LocalFs => {
             let client = create_localfs_client(&cfg)?;
-            let store = create_object_store(client, layout, &cfg.cache).await?;
+            let store = create_object_store(client, layout, &cfg.cache, false).await?;
             serve(
                 store,
                 create_meta_store(&cfg).await?,
@@ -482,7 +497,7 @@ async fn gateway_s3_cmd(args: S3GatewayArgs) -> anyhow::Result<()> {
         }
         DataBackendKind::S3 => {
             let client = create_s3_client(&cfg).await?;
-            let store = create_object_store(client, layout, &cfg.cache).await?;
+            let store = create_object_store(client, layout, &cfg.cache, false).await?;
             serve(
                 store,
                 create_meta_store(&cfg).await?,
@@ -493,6 +508,169 @@ async fn gateway_s3_cmd(args: S3GatewayArgs) -> anyhow::Result<()> {
             )
             .await
         }
+    }
+}
+
+fn namespace_flat_volume_cache(args: &mut MountConfig) -> anyhow::Result<()> {
+    if args.volume_format != VolumeFormat::FlatV1 {
+        return Ok(());
+    }
+
+    let unscoped_root = args.cache.cache_root.clone();
+    let scope = args.flat_volume_cache_scope()?;
+    for legacy_path in [
+        unscoped_root.join("chunks"),
+        unscoped_root.join("writeback"),
+    ] {
+        if legacy_path.exists() {
+            tracing::warn!(
+                path = %legacy_path.display(),
+                "ignoring legacy unscoped flat-volume cache state"
+            );
+        }
+    }
+    args.cache.cache_root = unscoped_root.join("flat-v1").join(&scope);
+    args.cache.volume_scope = Some(scope.clone());
+    tracing::info!(
+        volume_scope = %scope,
+        cache_root = %args.cache.cache_root.display(),
+        "flat-volume cache namespace selected"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod flat_cache_namespace_tests {
+    use super::*;
+
+    fn flat_config(
+        mount_point: &std::path::Path,
+        data_dir: &std::path::Path,
+        meta_url: &str,
+        shared_cache_root: &std::path::Path,
+    ) -> MountConfig {
+        let cli = Cli::parse_from([
+            "brewfs",
+            "mount",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--meta-url",
+            meta_url,
+            mount_point.to_str().unwrap(),
+        ]);
+        let Command::Mount(args) = cli.cmd else {
+            unreachable!()
+        };
+        let mut config = MountConfig::from_sources(*args).unwrap();
+        config.block_size = 16;
+        config.chunk_size = 64;
+        config.cache.cache_root = shared_cache_root.to_path_buf();
+        config.cache.read_memory_bytes = 1024 * 1024;
+        config.cache.read_ssd_bytes = 1024 * 1024;
+        config.cache.persist_write_cache_after_upload = true;
+        namespace_flat_volume_cache(&mut config).unwrap();
+        config
+    }
+
+    #[tokio::test]
+    async fn flat_volumes_isolate_clean_cache_for_overlapping_slice_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().join("cache");
+        let legacy_chunks = cache_root.join("chunks");
+        std::fs::create_dir_all(&legacy_chunks).unwrap();
+        std::fs::write(legacy_chunks.join("legacy-entry"), b"untouched").unwrap();
+
+        let first = flat_config(
+            &temp.path().join("mount-a"),
+            &temp.path().join("objects-a"),
+            "postgres://metadata.example.test/volume-a",
+            &cache_root,
+        );
+        let second = flat_config(
+            &temp.path().join("mount-b"),
+            &temp.path().join("objects-b"),
+            "postgres://metadata.example.test/volume-b",
+            &cache_root,
+        );
+        assert_ne!(first.cache.cache_root, second.cache.cache_root);
+        assert!(
+            first
+                .cache
+                .cache_root
+                .starts_with(cache_root.join("flat-v1"))
+        );
+        assert!(
+            second
+                .cache
+                .cache_root
+                .starts_with(cache_root.join("flat-v1"))
+        );
+
+        std::fs::create_dir_all(&first.data_dir).unwrap();
+        std::fs::create_dir_all(&second.data_dir).unwrap();
+        let layout = ChunkLayout {
+            chunk_size: 64,
+            block_size: 16,
+        };
+        let first_writer = create_object_store(
+            ObjectClient::new(LocalFsBackend::new(&first.data_dir)),
+            layout,
+            &first.cache,
+        )
+        .await
+        .unwrap();
+        let second_writer = create_object_store(
+            ObjectClient::new(LocalFsBackend::new(&second.data_dir)),
+            layout,
+            &second.cache,
+        )
+        .await
+        .unwrap();
+        first_writer
+            .write_fresh_range((77, 0), 0, b"first-volume-123")
+            .await
+            .unwrap();
+        second_writer
+            .write_fresh_range((77, 0), 0, b"second-volume-12")
+            .await
+            .unwrap();
+        drop(first_writer);
+        drop(second_writer);
+
+        // Force both remounts to rely on their persistent clean-cache trees.
+        std::fs::remove_dir_all(&first.data_dir).unwrap();
+        std::fs::remove_dir_all(&second.data_dir).unwrap();
+        let first_reader = create_object_store(
+            ObjectClient::new(LocalFsBackend::new(&first.data_dir)),
+            layout,
+            &first.cache,
+        )
+        .await
+        .unwrap();
+        let second_reader = create_object_store(
+            ObjectClient::new(LocalFsBackend::new(&second.data_dir)),
+            layout,
+            &second.cache,
+        )
+        .await
+        .unwrap();
+        let mut first_out = [0_u8; 16];
+        let mut second_out = [0_u8; 16];
+        first_reader
+            .read_range((77, 0), 0, &mut first_out)
+            .await
+            .unwrap();
+        second_reader
+            .read_range((77, 0), 0, &mut second_out)
+            .await
+            .unwrap();
+
+        assert_eq!(&first_out, b"first-volume-123");
+        assert_eq!(&second_out, b"second-volume-12");
+        assert_eq!(
+            std::fs::read(legacy_chunks.join("legacy-entry")).unwrap(),
+            b"untouched"
+        );
     }
 }
 
@@ -531,6 +709,7 @@ async fn create_object_store<B>(
     client: ObjectClient<B>,
     layout: ChunkLayout,
     cache: &crate::vfs::cache::config::CacheConfig,
+    create_only_writes: bool,
 ) -> anyhow::Result<ObjectBlockStore<B>>
 where
     B: ObjectBackend + Send + Sync + 'static,
@@ -554,6 +733,7 @@ where
         persist_write_cache_after_upload: cache.persist_write_cache_after_upload
             && !reuse_writeback_stage,
         persistent_slice_cache_dir: reuse_writeback_stage.then(|| cache.cache_root.join("chunks")),
+        create_only_writes,
         ..BlockStoreConfig::default()
     };
     let bandwidth = BandwidthLimiter::new(&cache.bandwidth);
@@ -861,7 +1041,7 @@ where
     println!("mounted at {}", mount_point.display());
     let mut handle = handle;
     tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
+        signal = shutdown_signal() => {
             signal?;
             println!("unmounting...");
             handle.unmount().await?;
@@ -942,9 +1122,11 @@ where
             header.schema_version
         )
     }
-    WorkspaceLifecycle::new(workspace_store.clone())
-        .recover_incomplete_seals()
-        .await?;
+    if !args.workspace_operator_managed {
+        WorkspaceLifecycle::new(workspace_store.clone())
+            .recover_incomplete_seals()
+            .await?;
+    }
 
     let generation = new_workspace_holder_generation();
     let session = WorkspaceMountSession::acquire(
@@ -957,7 +1139,9 @@ where
     .await?;
     let block_store = Arc::new(store);
     let gc_cancel = tokio_util::sync::CancellationToken::new();
-    let gc_task = {
+    let gc_task = if args.workspace_operator_managed {
+        None
+    } else {
         let cancel = gc_cancel.clone();
         let gc = WorkspaceGc::new(
             workspace_store.clone(),
@@ -966,7 +1150,7 @@ where
             DEFAULT_LEASE_TTL.saturating_mul(2),
             DEFAULT_LEASE_TTL.saturating_mul(2),
         );
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(DEFAULT_LEASE_TTL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await;
@@ -980,7 +1164,7 @@ where
                     }
                 }
             }
-        })
+        }))
     };
     let mount_result = async {
         let meta_layer = Arc::new(WorkspaceMetaLayer::with_chunk_size(
@@ -1016,7 +1200,7 @@ where
         );
         let mut handle = handle;
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
+            signal = shutdown_signal() => {
                 signal?;
                 println!("unmounting...");
                 handle.unmount().await?;
@@ -1029,11 +1213,30 @@ where
     }
     .await;
     gc_cancel.cancel();
-    let _ = gc_task.await;
+    if let Some(gc_task) = gc_task {
+        let _ = gc_task.await;
+    }
     let release_result = session.release().await;
     mount_result?;
     release_result?;
     Ok(())
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }
 
 #[cfg(feature = "workspace-overlay")]

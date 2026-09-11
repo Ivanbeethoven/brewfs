@@ -5,6 +5,9 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "workspace-operator")]
+use crate::workspace::crd::{WorkspaceClusterSpec, WorkspaceClusterStatus};
+
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[kube(
     group = "storage.brewfs.io",
@@ -22,6 +25,9 @@ pub struct BrewFSClusterSpec {
     pub rustfs: RustFsSpec,
     #[serde(default, rename = "mountConfig")]
     pub mount_config: MountConfigSpec,
+    #[cfg(feature = "workspace-operator")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceClusterSpec>,
 }
 
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
@@ -85,6 +91,9 @@ pub struct BrewFSClusterStatus {
     pub bucket: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_map: Option<String>,
+    #[cfg(feature = "workspace-operator")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceClusterStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_reconciled_at: Option<DateTime<Utc>>,
 }

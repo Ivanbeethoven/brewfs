@@ -45,6 +45,10 @@ pub enum WriteBackMode {
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
     pub cache_root: PathBuf,
+    /// Runtime-only identity of the flat volume that owns this cache tree.
+    /// Configuration parsing leaves this unset; mount startup derives it from
+    /// the metadata and object-store identities before constructing the VFS.
+    pub volume_scope: Option<String>,
 
     // Read cache budgets
     pub read_memory_bytes: u64,
@@ -96,6 +100,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             cache_root: default_cache_root(),
+            volume_scope: None,
             read_memory_bytes: 4096 * 1024 * 1024,
             read_ssd_bytes: 20 * 1024 * 1024 * 1024,
             write_memory_bytes: 384 * 1024 * 1024,

@@ -1,0 +1,32 @@
+apiVersion: storage.brewfs.io/v1alpha1
+kind: BrewFSWorkspace
+metadata:
+  name: agent-one
+spec:
+  clusterRef:
+    name: demo
+  source:
+    kind: ClusterRoot
+  desiredState: Active
+  deletionPolicy: Delete
+---
+apiVersion: storage.brewfs.io/v1alpha1
+kind: BrewFSWorkspaceMount
+metadata:
+  name: agent-one
+spec:
+  workspaceRef:
+    name: agent-one
+  mountPath: /workspace
+  image: ghcr.io/brewfs/brewfs:latest
+  cache:
+    mode: WriteBack
+    size: 20Gi
+    reclaimPolicy: Delete
+  terminationGracePeriodSeconds: 90
+  agent:
+    containers:
+      - name: agent
+        image: ubuntu:24.04
+        command: ["/bin/sh", "-ec"]
+        args: ["sleep infinity"]
