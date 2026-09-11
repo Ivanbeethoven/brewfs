@@ -34,6 +34,9 @@ final class BrewFsNative {
   static final int UNSUPPORTED = -11;
   static final int STALE_HANDLE = -12;
 
+  /** Maximum single native I/O size (must stay in sync with the ABI max_io). */
+  static final int MAX_IO = 16 * 1024 * 1024;
+
   interface Api extends Library {
     int brewfs_v1_abi_version();
     int brewfs_v1_client_open(BrewFsClientOptions options, PointerByReference output);
@@ -171,18 +174,22 @@ final class BrewFsNative {
     return output.getValue();
   }
 
-  static int read(Pointer file, byte[] buffer, long offset, boolean positioned) throws IOException {
+  static int read(Pointer file, byte[] buffer, int length, long offset, boolean positioned)
+      throws IOException {
+    if (length < 0 || length > buffer.length) throw new IndexOutOfBoundsException();
     long[] output = new long[1];
-    check(positioned ? API.brewfs_v1_pread(file, offset, buffer, buffer.length, output)
-        : API.brewfs_v1_read(file, buffer, buffer.length, output));
-    return checkedLength(output[0], buffer.length);
+    check(positioned ? API.brewfs_v1_pread(file, offset, buffer, length, output)
+        : API.brewfs_v1_read(file, buffer, length, output));
+    return checkedLength(output[0], length);
   }
 
-  static int write(Pointer file, byte[] data, long offset, boolean positioned) throws IOException {
+  static int write(Pointer file, byte[] data, int length, long offset, boolean positioned)
+      throws IOException {
+    if (length < 0 || length > data.length) throw new IndexOutOfBoundsException();
     long[] output = new long[1];
-    check(positioned ? API.brewfs_v1_pwrite(file, offset, data, data.length, output)
-        : API.brewfs_v1_write(file, data, data.length, output));
-    return checkedLength(output[0], data.length);
+    check(positioned ? API.brewfs_v1_pwrite(file, offset, data, length, output)
+        : API.brewfs_v1_write(file, data, length, output));
+    return checkedLength(output[0], length);
   }
 
   static void closeClient(Pointer client) throws IOException { check(API.brewfs_v1_client_close(client)); }

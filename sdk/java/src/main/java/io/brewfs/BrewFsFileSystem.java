@@ -11,6 +11,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.util.Progressable;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -31,17 +32,24 @@ public final class BrewFsFileSystem extends FileSystem {
 
   private PointerState nativeClient;
   private URI uri;
-  private Path workingDirectory;
+  private volatile Path workingDirectory;
 
   @Override
   public synchronized void initialize(URI name, Configuration conf) throws IOException {
     super.initialize(name, conf);
+    PointerState previous = nativeClient;
+    if (previous != null && previous.closed.compareAndSet(false, true)) {
+      BrewFsNative.closeClient(previous.pointer);
+    }
     this.uri = name;
     String dataDir = conf.get("brewfs.data.dir");
     if (dataDir == null || dataDir.isEmpty()) {
       throw new IOException("brewfs.data.dir must be configured for the experimental adapter");
     }
-    String metadataUrl = conf.get("brewfs.metadata.url", "sqlite::memory:");
+    // Default metadata URL (when unset) is a persistent SQLite catalog under
+    // the data dir, applied by the native layer; an in-memory catalog would
+    // make clients sharing a data dir invisible to each other.
+    String metadataUrl = conf.get("brewfs.metadata.url");
     int uid = conf.getInt("brewfs.uid", 0);
     int gid = conf.getInt("brewfs.gid", 0);
     boolean enforce = conf.getBoolean("brewfs.enforce.permissions", false);
@@ -102,21 +110,35 @@ public final class BrewFsFileSystem extends FileSystem {
 
   @Override
   public FSDataOutputStream append(Path path, int bufferSize, Progressable progress) throws IOException {
-    Pointer file = BrewFsNative.open(client(), pathBytes(qualify(path)),
+    Path qualified = qualify(path);
+    Pointer file = BrewFsNative.open(client(), pathBytes(qualified),
         BrewFsNative.OPEN_WRITE | BrewFsNative.OPEN_APPEND, 0);
-    return new FSDataOutputStream(new NativeOutputStream(file), statistics);
+    // Native positioned writes are absolute, so an append stream must start
+    // at the current end of the file.
+    long end = BrewFsNative.stat(client(), pathBytes(qualified)).size;
+    return new FSDataOutputStream(new NativeOutputStream(file, end), statistics);
   }
 
   @Override
   public boolean rename(Path source, Path destination) throws IOException {
-    BrewFsNative.rename(client(), pathBytes(qualify(source)), pathBytes(qualify(destination)));
-    return true;
+    try {
+      BrewFsNative.rename(client(), pathBytes(qualify(source)), pathBytes(qualify(destination)));
+      return true;
+    } catch (FileNotFoundException e) {
+      // Hadoop contract: rename returns false when the source is missing.
+      return false;
+    }
   }
 
   @Override
   public boolean delete(Path path, boolean recursive) throws IOException {
-    BrewFsNative.delete(client(), pathBytes(qualify(path)), recursive);
-    return true;
+    try {
+      BrewFsNative.delete(client(), pathBytes(qualify(path)), recursive);
+      return true;
+    } catch (FileNotFoundException e) {
+      // Hadoop contract: delete returns false when the path is missing.
+      return false;
+    }
   }
 
   @Override
@@ -215,23 +237,35 @@ public final class BrewFsFileSystem extends FileSystem {
     public int read(byte[] buffer, int offset, int length) throws IOException {
       check(buffer, offset, length);
       if (length == 0) return 0;
-      byte[] temporary = new byte[length];
-      int count = BrewFsNative.read(file, temporary, position, false);
-      if (count == 0) return -1;
-      System.arraycopy(temporary, 0, buffer, offset, count);
-      position += count;
-      return count;
+      int total = 0;
+      byte[] chunk = new byte[Math.min(length, BrewFsNative.MAX_IO)];
+      while (total < length) {
+        int want = Math.min(length - total, chunk.length);
+        int count = BrewFsNative.read(file, chunk, want, position, false);
+        if (count <= 0) break;
+        System.arraycopy(chunk, 0, buffer, offset + total, count);
+        position += count;
+        total += count;
+        if (count < want) break; // EOF
+      }
+      return total == 0 ? -1 : total;
     }
 
     @Override
     public int read(long position, byte[] buffer, int offset, int length) throws IOException {
       check(buffer, offset, length);
       if (length == 0) return 0;
-      byte[] temporary = new byte[length];
-      int count = BrewFsNative.read(file, temporary, position, true);
-      if (count == 0) return -1;
-      System.arraycopy(temporary, 0, buffer, offset, count);
-      return count;
+      int total = 0;
+      byte[] chunk = new byte[Math.min(length, BrewFsNative.MAX_IO)];
+      while (total < length) {
+        int want = Math.min(length - total, chunk.length);
+        int count = BrewFsNative.read(file, chunk, want, position + total, true);
+        if (count <= 0) break;
+        System.arraycopy(chunk, 0, buffer, offset + total, count);
+        total += count;
+        if (count < want) break; // EOF
+      }
+      return total == 0 ? -1 : total;
     }
 
     @Override
@@ -268,7 +302,12 @@ public final class BrewFsFileSystem extends FileSystem {
     private long position;
     private boolean closed;
 
-    NativeOutputStream(Pointer file) { this.file = file; }
+    NativeOutputStream(Pointer file) { this(file, 0); }
+
+    NativeOutputStream(Pointer file, long position) {
+      this.file = file;
+      this.position = position;
+    }
 
     @Override
     public void write(int value) throws IOException { write(new byte[] {(byte) value}, 0, 1); }
@@ -277,12 +316,13 @@ public final class BrewFsFileSystem extends FileSystem {
     public void write(byte[] buffer, int offset, int length) throws IOException {
       if (buffer == null || offset < 0 || length < 0 || offset > buffer.length - length)
         throw new IndexOutOfBoundsException();
+      // Respect the native max_io limit by splitting large buffers.
+      byte[] chunk = new byte[Math.min(length, BrewFsNative.MAX_IO)];
       int sent = 0;
       while (sent < length) {
-        int remaining = length - sent;
-        byte[] temporary = new byte[remaining];
-        System.arraycopy(buffer, offset + sent, temporary, 0, remaining);
-        int count = BrewFsNative.write(file, temporary, position, true);
+        int want = Math.min(length - sent, chunk.length);
+        System.arraycopy(buffer, offset + sent, chunk, 0, want);
+        int count = BrewFsNative.write(file, chunk, want, position, true);
         if (count <= 0) throw new IOException("native write made no progress");
         position += count;
         sent += count;

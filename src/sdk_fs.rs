@@ -673,27 +673,30 @@ where
     }
 
     async fn flush(&self, path: &str) -> io::Result<()> {
-        let file = self
-            .filesystem()
-            .open(path, OpenFlags::read_write())
-            .await?;
-        file.flush().await
+        // Path-based durability boundary: open a fresh handle because the
+        // caller only identified the file by path. A file that was deleted
+        // after the caller's handle was opened has nothing left to flush.
+        match self.filesystem().open(path, OpenFlags::read_write()).await {
+            Ok(file) => file.flush().await,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     async fn sync_data(&self, path: &str) -> io::Result<()> {
-        let file = self
-            .filesystem()
-            .open(path, OpenFlags::read_write())
-            .await?;
-        file.fsync(true).await
+        match self.filesystem().open(path, OpenFlags::read_write()).await {
+            Ok(file) => file.fsync(true).await,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     async fn sync_all(&self, path: &str) -> io::Result<()> {
-        let file = self
-            .filesystem()
-            .open(path, OpenFlags::read_write())
-            .await?;
-        file.fsync(false).await
+        match self.filesystem().open(path, OpenFlags::read_write()).await {
+            Ok(file) => file.fsync(false).await,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     async fn symlink(&self, link_path: &str, target: &str) -> io::Result<MetaFileAttr> {
@@ -1193,17 +1196,29 @@ impl File {
     }
 
     /// Synchronize all file data and metadata to storage.
+    ///
+    /// Read-only handles have nothing to sync and return success without
+    /// touching the backend, matching std::fs flush semantics for readers.
     pub async fn sync_all(&self) -> io::Result<()> {
+        if !self.opts.write && !self.opts.append {
+            return Ok(());
+        }
         self.client.sync_all(&self.path).await
     }
 
     /// Synchronize file data to storage (without metadata).
     pub async fn sync_data(&self) -> io::Result<()> {
+        if !self.opts.write && !self.opts.append {
+            return Ok(());
+        }
         self.client.sync_data(&self.path).await
     }
 
     /// Flush internal buffers and return writeback errors.
     pub async fn flush(&self) -> io::Result<()> {
+        if !self.opts.write && !self.opts.append {
+            return Ok(());
+        }
         self.client.flush(&self.path).await
     }
 }
@@ -1694,6 +1709,41 @@ mod tests {
 
         let meta = fs.metadata("/t.txt").await.unwrap();
         assert_eq!(meta.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn sync_on_read_only_file_is_noop() {
+        let (_tmp, fs) = local_client().await;
+
+        let mut w = OpenOptions::new();
+        w.write(true).create(true).truncate(true);
+        let writer = fs.open(&w, "/ro.txt").await.unwrap();
+        writer.write_all(b"hello").await.unwrap();
+
+        let mut r = OpenOptions::new();
+        r.read(true);
+        let reader = fs.open(&r, "/ro.txt").await.unwrap();
+        // Read-only handles must not error (e.g. PermissionDenied) on the
+        // durability methods even though the backend syncs by path.
+        reader.flush().await.unwrap();
+        reader.sync_data().await.unwrap();
+        reader.sync_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_after_delete_is_success() {
+        let (_tmp, fs) = local_client().await;
+
+        let mut w = OpenOptions::new();
+        w.write(true).create(true).truncate(true);
+        let file = fs.open(&w, "/gone.txt").await.unwrap();
+        file.write_all(b"hello").await.unwrap();
+
+        fs.remove_file("/gone.txt").await.unwrap();
+        // Flushing a handle whose path was deleted must not error.
+        file.flush().await.unwrap();
+        file.sync_data().await.unwrap();
+        file.sync_all().await.unwrap();
     }
 
     #[tokio::test]

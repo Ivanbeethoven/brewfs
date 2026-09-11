@@ -17,7 +17,6 @@ use crate::meta::factory::create_meta_store_from_url;
 use crate::meta::store::{FileType, SetAttrFlags, SetAttrRequest};
 use crate::meta::stores::DatabaseMetaStore;
 use std::cell::RefCell;
-use std::ffi::c_void;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
@@ -303,11 +302,18 @@ fn decode_text(ptr: *const u8, len: usize, label: &str) -> Result<String, BrewFs
     Ok(text.to_string())
 }
 
+/// Validate a caller-provided `struct_size` field.
+///
+/// `struct_size` must be the first field of every options/output struct so
+/// that callers can be validated before the rest of the struct is touched.
+/// `0` ("unset") and any value smaller than the ABI v1 size are rejected;
+/// larger values are accepted for forward compatibility (only the v1 fields
+/// are read or written).
 fn validate_struct_size(actual: u32, required: usize, label: &str) -> Result<(), BrewFsStatus> {
-    if actual != 0 && (actual as usize) < required {
+    if (actual as usize) < required {
         return Err(set_error(
             BrewFsStatus::InvalidArgument,
-            format!("{label}.struct_size is smaller than ABI v1 minimum"),
+            format!("{label}.struct_size ({actual}) is smaller than ABI v1 minimum ({required})"),
         ));
     }
     Ok(())
@@ -433,11 +439,6 @@ async fn build_local_client(
 }
 
 fn open_flags(options: &BrewFsOpenOptionsV1) -> Result<OpenFlags, BrewFsStatus> {
-    validate_struct_size(
-        options.struct_size,
-        std::mem::size_of::<BrewFsOpenOptionsV1>(),
-        "open options",
-    )?;
     let known = OPEN_READ | OPEN_WRITE | OPEN_CREATE | OPEN_TRUNCATE | OPEN_EXCLUSIVE | OPEN_APPEND;
     if options.flags & !known != 0 {
         return Err(set_error(
@@ -498,14 +499,17 @@ pub extern "C" fn brewfs_v1_client_open(
                 reserved: [0; 3],
             }
         } else {
-            // SAFETY: options is borrowed only for this call.
+            // SAFETY: struct_size is the first field, so only these bytes are
+            // read before the struct contents are validated.
+            let declared = unsafe { (*options).struct_size };
+            validate_struct_size(
+                declared,
+                std::mem::size_of::<BrewFsClientOptionsV1>(),
+                "client options",
+            )?;
+            // SAFETY: options is non-null, validated, and borrowed only for this call.
             unsafe { *options }
         };
-        validate_struct_size(
-            options.struct_size,
-            std::mem::size_of::<BrewFsClientOptionsV1>(),
-            "client options",
-        )?;
         let data_dir = if options.data_dir.is_null() && options.data_dir_len == 0 {
             std::env::temp_dir()
                 .join("brewfs-hdfs-sdk")
@@ -515,7 +519,10 @@ pub extern "C" fn brewfs_v1_client_open(
             decode_text(options.data_dir, options.data_dir_len, "data_dir")?
         };
         let metadata_url = if options.metadata_url.is_null() && options.metadata_url_len == 0 {
-            "sqlite::memory:".to_string()
+            // Default to a persistent SQLite catalog under the data dir so
+            // that multiple clients (or a restarted process) pointing at the
+            // same data dir share the same metadata.
+            format!("sqlite://{data_dir}/metadata.db?mode=rwc")
         } else {
             decode_text(
                 options.metadata_url,
@@ -596,6 +603,14 @@ pub unsafe extern "C" fn brewfs_v1_open(
             return fail(BrewFsStatus::InvalidArgument, "open options is null");
         }
         let path = decode_path(path, path_len)?;
+        // SAFETY: struct_size is the first field, so only these bytes are
+        // read before the struct contents are validated.
+        let declared = unsafe { (*options).struct_size };
+        validate_struct_size(
+            declared,
+            std::mem::size_of::<BrewFsOpenOptionsV1>(),
+            "open options",
+        )?;
         // SAFETY: options is non-null and borrowed for this call.
         let options = unsafe { &*options };
         let flags = open_flags(options)?;
@@ -845,7 +860,8 @@ pub unsafe extern "C" fn brewfs_v1_stat(
         if output.is_null() {
             return fail(BrewFsStatus::InvalidArgument, "stat output is null");
         }
-        // SAFETY: output is caller-owned writable storage.
+        // SAFETY: output is caller-owned writable storage; struct_size is the
+        // first field, so only these bytes are read before validation.
         let output_size = unsafe { (*output).struct_size };
         validate_struct_size(
             output_size,
@@ -871,6 +887,14 @@ pub unsafe extern "C" fn brewfs_v1_statfs(
         if output.is_null() {
             return fail(BrewFsStatus::InvalidArgument, "statfs output is null");
         }
+        // SAFETY: output is caller-owned writable storage; struct_size is the
+        // first field, so only these bytes are read before validation.
+        let output_size = unsafe { (*output).struct_size };
+        validate_struct_size(
+            output_size,
+            std::mem::size_of::<BrewFsStatFsV1>(),
+            "statfs output",
+        )?;
         let stat = io_result(client.inner.runtime.block_on(client.inner.fs.stat_fs()))?;
         // SAFETY: output is caller-owned and non-null.
         unsafe {
@@ -958,15 +982,17 @@ pub unsafe extern "C" fn brewfs_v1_delete(
             );
         }
         let result = async {
-            if recursive != 0 {
-                remove_dir_all(&client.inner.fs, &path).await
-            } else {
-                let stat = client.inner.fs.stat(&path).await?;
-                if stat.is_dir() {
-                    client.inner.fs.rmdir(&path).await
+            let stat = client.inner.fs.stat(&path).await?;
+            if stat.is_dir() {
+                if recursive != 0 {
+                    remove_dir_all(&client.inner.fs, &path).await
                 } else {
-                    client.inner.fs.unlink(&path).await
+                    client.inner.fs.rmdir(&path).await
                 }
+            } else {
+                // HDFS semantics: deleting a plain file succeeds regardless of
+                // the recursive flag.
+                client.inner.fs.unlink(&path).await
             }
         };
         io_result(client.inner.runtime.block_on(result))?;
@@ -1032,13 +1058,16 @@ pub unsafe extern "C" fn brewfs_v1_setattr(
             return fail(BrewFsStatus::InvalidArgument, "setattr input is null");
         }
         let path = decode_path(path, path_len)?;
-        // SAFETY: input is non-null and borrowed for this call.
-        let input = unsafe { &*input };
+        // SAFETY: struct_size is the first field, so only these bytes are read
+        // before the struct contents are validated.
+        let declared = unsafe { (*input).struct_size };
         validate_struct_size(
-            input.struct_size,
+            declared,
             std::mem::size_of::<BrewFsSetAttrV1>(),
             "setattr input",
         )?;
+        // SAFETY: input is non-null and borrowed for this call.
+        let input = unsafe { &*input };
         let known = SET_MODE | SET_UID | SET_GID | SET_SIZE | SET_ATIME | SET_MTIME;
         if input.valid_mask & !known != 0 {
             return fail(BrewFsStatus::InvalidArgument, "unknown setattr fields");
@@ -1353,9 +1382,6 @@ pub unsafe extern "C" fn brewfs_v1_last_error(
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn brewfs_v1_free(_pointer: *mut c_void) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1430,5 +1456,178 @@ mod tests {
         assert_eq!(&output[..read], data);
         assert_eq!(unsafe { brewfs_v1_file_close(file) }, BrewFsStatus::Ok);
         assert_eq!(unsafe { brewfs_v1_client_close(client) }, BrewFsStatus::Ok);
+    }
+
+    #[test]
+    fn validate_struct_size_rejects_zero_and_undersized() {
+        let required = std::mem::size_of::<BrewFsOpenOptionsV1>();
+        assert!(validate_struct_size(0, required, "options").is_err());
+        assert!(validate_struct_size(required as u32 - 1, required, "options").is_err());
+        assert!(validate_struct_size(required as u32, required, "options").is_ok());
+        assert!(validate_struct_size(required as u32 + 16, required, "options").is_ok());
+    }
+
+    #[test]
+    fn client_open_rejects_bad_struct_size() {
+        let mut options = BrewFsClientOptionsV1 {
+            struct_size: 0,
+            flags: 0,
+            data_dir: ptr::null(),
+            data_dir_len: 0,
+            metadata_url: ptr::null(),
+            metadata_url_len: 0,
+            chunk_size: 0,
+            block_size: 0,
+            uid: 0,
+            gid: 0,
+            enforce_permissions: 0,
+            reserved: [0; 3],
+        };
+        let mut client = ptr::null_mut();
+        assert_eq!(
+            brewfs_v1_client_open(&mut options, &mut client),
+            BrewFsStatus::InvalidArgument
+        );
+        options.struct_size = 4;
+        assert_eq!(
+            brewfs_v1_client_open(&mut options, &mut client),
+            BrewFsStatus::InvalidArgument
+        );
+        assert!(client.is_null());
+    }
+
+    #[test]
+    fn stat_rejects_bad_output_struct_size() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().to_string_lossy().into_owned();
+        let client = open_test_client(&root);
+        let path = b"/stat-guard";
+        let mut output = BrewFsStatV1::default();
+        output.struct_size = 0;
+        assert_eq!(
+            unsafe { brewfs_v1_stat(client, path.as_ptr(), path.len(), &mut output) },
+            BrewFsStatus::InvalidArgument
+        );
+        output.struct_size = 4;
+        assert_eq!(
+            unsafe { brewfs_v1_stat(client, path.as_ptr(), path.len(), &mut output) },
+            BrewFsStatus::InvalidArgument
+        );
+        let mut statfs = BrewFsStatFsV1::default();
+        statfs.struct_size = 0;
+        assert_eq!(
+            unsafe { brewfs_v1_statfs(client, &mut statfs) },
+            BrewFsStatus::InvalidArgument
+        );
+        assert_eq!(unsafe { brewfs_v1_client_close(client) }, BrewFsStatus::Ok);
+    }
+
+    #[test]
+    fn delete_recursive_succeeds_for_plain_file() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().to_string_lossy().into_owned();
+        let client = open_test_client(&root);
+        let path = b"/plain-file";
+        let mut file = ptr::null_mut();
+        let open_options = BrewFsOpenOptionsV1 {
+            struct_size: std::mem::size_of::<BrewFsOpenOptionsV1>() as u32,
+            flags: OPEN_WRITE | OPEN_CREATE | OPEN_TRUNCATE,
+            mode: 0o644,
+        };
+        assert_eq!(
+            unsafe { brewfs_v1_open(client, path.as_ptr(), path.len(), &open_options, &mut file) },
+            BrewFsStatus::Ok
+        );
+        assert_eq!(unsafe { brewfs_v1_file_close(file) }, BrewFsStatus::Ok);
+        assert_eq!(
+            unsafe { brewfs_v1_delete(client, path.as_ptr(), path.len(), 1) },
+            BrewFsStatus::Ok
+        );
+        assert_eq!(unsafe { brewfs_v1_client_close(client) }, BrewFsStatus::Ok);
+    }
+
+    #[test]
+    fn append_contract_starts_at_end_of_file() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().to_string_lossy().into_owned();
+        let client = open_test_client(&root);
+        let path = b"/appended";
+        let create = BrewFsOpenOptionsV1 {
+            struct_size: std::mem::size_of::<BrewFsOpenOptionsV1>() as u32,
+            flags: OPEN_WRITE | OPEN_CREATE | OPEN_TRUNCATE,
+            mode: 0o644,
+        };
+        let mut file = ptr::null_mut();
+        assert_eq!(
+            unsafe { brewfs_v1_open(client, path.as_ptr(), path.len(), &create, &mut file) },
+            BrewFsStatus::Ok
+        );
+        let first = b"hello";
+        let mut written = 0;
+        assert_eq!(
+            unsafe { brewfs_v1_pwrite(file, 0, first.as_ptr(), first.len(), &mut written) },
+            BrewFsStatus::Ok
+        );
+        assert_eq!(unsafe { brewfs_v1_file_close(file) }, BrewFsStatus::Ok);
+
+        // The Hadoop adapter opens with OPEN_APPEND and resumes writing at the
+        // size reported by stat; verify that contract end to end.
+        let append = BrewFsOpenOptionsV1 {
+            struct_size: std::mem::size_of::<BrewFsOpenOptionsV1>() as u32,
+            flags: OPEN_WRITE | OPEN_APPEND,
+            mode: 0,
+        };
+        let mut file = ptr::null_mut();
+        assert_eq!(
+            unsafe { brewfs_v1_open(client, path.as_ptr(), path.len(), &append, &mut file) },
+            BrewFsStatus::Ok
+        );
+        let mut stat = BrewFsStatV1::default();
+        stat.struct_size = std::mem::size_of::<BrewFsStatV1>() as u32;
+        assert_eq!(
+            unsafe { brewfs_v1_stat(client, path.as_ptr(), path.len(), &mut stat) },
+            BrewFsStatus::Ok
+        );
+        assert_eq!(stat.size, first.len() as u64);
+        let second = b" world";
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                brewfs_v1_pwrite(file, stat.size, second.as_ptr(), second.len(), &mut written)
+            },
+            BrewFsStatus::Ok
+        );
+        assert_eq!(unsafe { brewfs_v1_file_close(file) }, BrewFsStatus::Ok);
+        let mut stat = BrewFsStatV1::default();
+        stat.struct_size = std::mem::size_of::<BrewFsStatV1>() as u32;
+        assert_eq!(
+            unsafe { brewfs_v1_stat(client, path.as_ptr(), path.len(), &mut stat) },
+            BrewFsStatus::Ok
+        );
+        assert_eq!(stat.size, (first.len() + second.len()) as u64);
+        assert_eq!(unsafe { brewfs_v1_client_close(client) }, BrewFsStatus::Ok);
+    }
+
+    fn open_test_client(root: &str) -> *mut BrewFsClient {
+        let mut options = BrewFsClientOptionsV1 {
+            struct_size: std::mem::size_of::<BrewFsClientOptionsV1>() as u32,
+            flags: 0,
+            data_dir: root.as_ptr(),
+            data_dir_len: root.len(),
+            metadata_url: ptr::null(),
+            metadata_url_len: 0,
+            chunk_size: 64 * 1024,
+            block_size: 4096,
+            uid: 0,
+            gid: 0,
+            enforce_permissions: 0,
+            reserved: [0; 3],
+        };
+        let mut client = ptr::null_mut();
+        assert_eq!(
+            brewfs_v1_client_open(&mut options, &mut client),
+            BrewFsStatus::Ok
+        );
+        client
     }
 }

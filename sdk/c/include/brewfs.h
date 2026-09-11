@@ -174,7 +174,6 @@ brewfs_status_t brewfs_v1_remove_xattr(
 uint64_t brewfs_v1_capabilities(void);
 brewfs_status_t brewfs_v1_last_error(
     uint8_t *output, size_t capacity, size_t *required_length);
-void brewfs_v1_free(void *pointer);
 
 #ifdef __cplusplus
 }
