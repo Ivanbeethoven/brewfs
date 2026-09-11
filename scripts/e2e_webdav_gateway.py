@@ -98,6 +98,15 @@ GET_COLOR = b'''<?xml version="1.0"?>
 <D:propfind xmlns:D="DAV:" xmlns:x="urn:brewfs:test">
   <D:prop><x:color/></D:prop>
 </D:propfind>'''
+REMOVE_MISSING_AND_SET = b'''<?xml version="1.0"?>
+<D:propertyupdate xmlns:D="DAV:" xmlns:x="urn:brewfs:test">
+  <D:set><D:prop><x:transactional>must-not-persist</x:transactional></D:prop></D:set>
+  <D:remove><D:prop><x:missing/></D:prop></D:remove>
+</D:propertyupdate>'''
+GET_TRANSACTIONAL = b'''<?xml version="1.0"?>
+<D:propfind xmlns:D="DAV:" xmlns:x="urn:brewfs:test">
+  <D:prop><x:transactional/></D:prop>
+</D:propfind>'''
 LOCK_INFO = b'''<?xml version="1.0"?>
 <D:lockinfo xmlns:D="DAV:">
   <D:lockscope><D:exclusive/></D:lockscope>
@@ -146,6 +155,7 @@ check(
 status, headers, body = request("GET", "/docs/readme.txt")
 check("GET roundtrip", status == 200 and body == original, f"status={status} body={body!r}")
 check("GET returns ETag", bool(headers.get("etag")), str(headers))
+etag_before_property = headers.get("etag")
 status, headers, body = request("HEAD", "/docs/readme.txt")
 check("HEAD size", status == 200 and body == b"" and headers.get("content-length") == str(len(original)), str(headers))
 status, headers, body = request("GET", "/docs/readme.txt", headers={"Range": "bytes=6-10"})
@@ -177,11 +187,21 @@ status, _, body = request("PROPFIND", "/", ALLPROP, {**XML_HEADERS, "Depth": "in
 check("Depth infinity PROPFIND", status == 207 and b"readme.txt" in body, f"status={status} body={body[:400]!r}")
 check("system namespace hidden from root", b".brewfs.sys" not in body, body[:400])
 expect_status("PROPPATCH set", request("PROPPATCH", "/docs/readme.txt", COLOR_PROP, XML_HEADERS), 207)
+status, headers, _ = request("GET", "/docs/readme.txt")
+check("dead property changes ETag", status == 200 and headers.get("etag") != etag_before_property, str(headers))
+expect_status(
+    "stale If-Match rejected",
+    request("PUT", "/docs/readme.txt", b"stale", {"If-Match": '"stale"'}),
+    412,
+)
 status, _, body = request("PROPFIND", "/docs/readme.txt", GET_COLOR, {**XML_HEADERS, "Depth": "0"})
 check("dead property roundtrip", status == 207 and b"blue" in body and b"color" in body, f"status={status} body={body[:400]!r}")
 expect_status("PUT replaces content", request("PUT", "/docs/readme.txt", b"replacement"), 204)
 status, _, body = request("PROPFIND", "/docs/readme.txt", GET_COLOR, {**XML_HEADERS, "Depth": "0"})
 check("PUT preserves dead property", status == 207 and b"blue" in body, f"status={status} body={body[:400]!r}")
+expect_status("PROPPATCH transactional failure", request("PROPPATCH", "/docs/readme.txt", REMOVE_MISSING_AND_SET, XML_HEADERS), 207)
+status, _, body = request("PROPFIND", "/docs/readme.txt", GET_TRANSACTIONAL, {**XML_HEADERS, "Depth": "0"})
+check("failed PROPPATCH does not publish partial update", b"transactional" not in body, f"status={status} body={body[:400]!r}")
 
 print("== COPY and MOVE ==")
 copy_headers = {"Destination": destination("/docs/copied.txt"), "Overwrite": "F"}

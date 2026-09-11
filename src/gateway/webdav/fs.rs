@@ -11,7 +11,7 @@ use dav_server::fs::{
     DavDirEntry, DavFile, DavFileSystem, DavMetaData, DavProp, FsError, FsFuture, FsResult,
     FsStream, OpenOptions, ReadDirMeta,
 };
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::chunk::store::BlockStore;
@@ -37,6 +37,12 @@ where
     props_supported: bool,
     locks: Arc<[Arc<Mutex<()>>; LOCK_SHARDS]>,
     active_staging: Arc<DashSet<String>>,
+}
+
+struct ResolvedPath {
+    parent_ino: i64,
+    name: String,
+    target: Option<(i64, FileAttr)>,
 }
 
 impl<S> Clone for BrewFsDavFs<S>
@@ -82,8 +88,17 @@ where
 
     pub async fn cleanup_stale_staging(&self) -> anyhow::Result<()> {
         let dir = staging_dir();
+        let (dir_ino, dir_attr) = self
+            .resolve_existing(&dir)
+            .await
+            .map_err(|error| anyhow::anyhow!("read WebDAV staging directory {dir}: {error:?}"))?;
+        if dir_attr.kind != FileType::Dir {
+            return Err(anyhow::anyhow!(
+                "WebDAV staging path is not a directory: {dir}"
+            ));
+        }
         let entries = self
-            .read_children(&dir)
+            .read_children_ino(dir_ino)
             .await
             .map_err(|error| anyhow::anyhow!("read WebDAV staging directory {dir}: {error:?}"))?;
         let cutoff = SystemTime::now()
@@ -94,24 +109,77 @@ where
             if self.active_staging.contains(&path) {
                 continue;
             }
-            if let Ok(attr) = self.vfs.stat(&path).await
+            if let Some(attr) = self.vfs.stat_ino(entry.ino).await
                 && system_time(attr.mtime).is_ok_and(|mtime| mtime < cutoff)
             {
-                let _ = self.vfs.unlink(&path).await;
+                let _ = self.vfs.unlink_at(dir_ino, &entry.name).await;
             }
         }
         Ok(())
     }
 
-    async fn read_children(
+    async fn resolve_path(
         &self,
         path: &str,
-    ) -> Result<Vec<crate::meta::store::DirEntry>, FsError> {
-        let attr = self.vfs.stat(path).await.map_err(map_vfs_error)?;
-        if attr.kind != FileType::Dir {
+        require_existing: bool,
+    ) -> Result<ResolvedPath, FsError> {
+        if path == "/" {
             return Err(FsError::Forbidden);
         }
-        self.read_children_ino(attr.ino).await
+        let components: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        let mut parent_ino = self.vfs.root_ino();
+        for (index, component) in components.iter().enumerate() {
+            let is_leaf = index + 1 == components.len();
+            let entry = self
+                .vfs
+                .child_attr_of(parent_ino, component)
+                .await
+                .map_err(map_vfs_error)?;
+            let Some((ino, attr)) = entry else {
+                if is_leaf && !require_existing {
+                    return Ok(ResolvedPath {
+                        parent_ino,
+                        name: (*component).to_string(),
+                        target: None,
+                    });
+                }
+                return Err(FsError::NotFound);
+            };
+            if attr.kind == FileType::Symlink {
+                return Err(FsError::Forbidden);
+            }
+            if is_leaf {
+                return Ok(ResolvedPath {
+                    parent_ino,
+                    name: (*component).to_string(),
+                    target: Some((ino, attr)),
+                });
+            }
+            if attr.kind != FileType::Dir {
+                return Err(FsError::Forbidden);
+            }
+            parent_ino = ino;
+        }
+        Err(FsError::Forbidden)
+    }
+
+    async fn resolve_existing(&self, path: &str) -> Result<(i64, FileAttr), FsError> {
+        if path == "/" {
+            return self
+                .vfs
+                .stat_ino(self.vfs.root_ino())
+                .await
+                .map(|attr| (self.vfs.root_ino(), attr))
+                .ok_or(FsError::NotFound);
+        }
+        self.resolve_path(path, true)
+            .await?
+            .target
+            .ok_or(FsError::NotFound)
+    }
+
+    async fn resolve_parent(&self, path: &str) -> Result<ResolvedPath, FsError> {
+        self.resolve_path(path, false).await
     }
 
     async fn read_children_ino(
@@ -142,40 +210,9 @@ where
         }
     }
 
-    async fn validate_path(&self, path: &str) -> Result<(), FsError> {
-        if path == "/" {
-            return Ok(());
-        }
-
-        let components: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-        let root = self.vfs.stat("/").await.map_err(map_vfs_error)?;
-        let mut parent_ino = root.ino;
-        for (index, component) in components.iter().enumerate() {
-            let Some(entry) = self
-                .read_children_ino(parent_ino)
-                .await?
-                .into_iter()
-                .find(|entry| entry.name == *component)
-            else {
-                return Ok(());
-            };
-            if entry.kind == FileType::Symlink {
-                return Err(FsError::Forbidden);
-            }
-            if index + 1 < components.len() {
-                if entry.kind != FileType::Dir {
-                    return Ok(());
-                }
-                parent_ino = entry.ino;
-            }
-        }
-        Ok(())
-    }
-
     fn lock_for(&self, path: &str) -> Arc<Mutex<()>> {
         self.locks[lock_shard(path)].clone()
     }
-
     async fn lock_paths(&self, first: &str, second: &str) -> Vec<OwnedMutexGuard<()>> {
         let first_shard = lock_shard(first);
         let second_shard = lock_shard(second);
@@ -200,7 +237,12 @@ where
     }
 
     async fn discard_staging(&self, path: &str) {
-        let _ = self.vfs.unlink(path).await;
+        if let Ok(resolved) = self.resolve_parent(path).await {
+            let _ = self
+                .vfs
+                .unlink_at(resolved.parent_ino, &resolved.name)
+                .await;
+        }
         self.active_staging.remove(path);
     }
 
@@ -245,27 +287,40 @@ where
         path: String,
         options: OpenOptions,
     ) -> Result<Box<dyn DavFile>, FsError> {
-        self.validate_path(&path).await?;
+        if path == "/" {
+            return Err(FsError::Forbidden);
+        }
         if options.write || options.create || options.create_new || options.truncate {
             ensure_mutable(&path)?;
         }
+        let resolved = self.resolve_parent(&path).await?;
         let mutation_guard = if options.write || options.create || options.create_new {
             Some(self.lock_for(&path).lock_owned().await)
         } else {
             None
         };
 
-        let existing = match self.vfs.stat(&path).await {
-            Ok(attr) => Some(attr),
-            Err(VfsError::NotFound { .. }) => None,
-            Err(error) => return Err(map_vfs_error(error)),
+        let existing = if mutation_guard.is_some() {
+            self.vfs
+                .child_attr_of(resolved.parent_ino, &resolved.name)
+                .await
+                .map_err(map_vfs_error)?
+        } else {
+            resolved.target
         };
+        if let Some(expected) = super::current_request_if_match()
+            && options.write
+            && !if_match_satisfied(&expected, existing.as_ref().map(|(_, attr)| attr))
+        {
+            super::mark_precondition_failed();
+            return Err(FsError::GeneralFailure);
+        }
         if options.create_new && existing.is_some() {
             return Err(FsError::Exists);
         }
         if existing
             .as_ref()
-            .is_some_and(|attr| attr.kind != FileType::File)
+            .is_some_and(|(_, attr)| attr.kind != FileType::File)
         {
             return Err(FsError::Forbidden);
         }
@@ -274,58 +329,83 @@ where
         }
 
         let atomic = self.atomic_put && options.write && !super::current_request_is_lock();
-        let (storage_path, staging_path) = if atomic {
-            let staging = self.reserve_staging();
-            if let Err(error) = self
-                .vfs
-                .create_file_in_existing_dir_err(&staging, true)
-                .await
-            {
-                self.active_staging.remove(&staging);
-                return Err(map_vfs_error(error));
-            }
-            let staging_attr = match self.vfs.stat(&staging).await {
-                Ok(attr) => attr,
-                Err(error) => {
-                    self.discard_staging(&staging).await;
-                    return Err(map_vfs_error(error));
-                }
-            };
-            if let Some(source) = existing.as_ref() {
-                if !options.truncate
-                    && let Err(error) = self.copy_exact(source, staging_attr.ino).await
-                {
-                    self.discard_staging(&staging).await;
-                    return Err(error);
-                }
-                if let Err(error) = self.copy_dead_props(source.ino, staging_attr.ino).await {
-                    self.discard_staging(&staging).await;
-                    return Err(error);
-                }
-            }
-            (staging.clone(), Some(staging))
-        } else {
-            if existing.is_none() {
-                self.vfs
-                    .create_file_in_existing_dir_err(&path, options.create_new)
+        let (storage_path, storage_ino, staging_path, staging_parent_ino, staging_name, attr) =
+            if atomic {
+                let staging = self.reserve_staging();
+                let staging_resolved = self.resolve_parent(&staging).await?;
+                let staging_ino = match self
+                    .vfs
+                    .create_file_at(staging_resolved.parent_ino, &staging_resolved.name, true)
                     .await
-                    .map_err(map_vfs_error)?;
-            }
-            if options.truncate {
-                self.vfs.truncate(&path, 0).await.map_err(map_vfs_error)?;
-            }
-            (path.clone(), None)
-        };
-
-        let attr = match self.vfs.stat(&storage_path).await {
-            Ok(attr) => attr,
-            Err(error) => {
-                if let Some(staging) = staging_path.as_deref() {
-                    self.discard_staging(staging).await;
+                {
+                    Ok(ino) => ino,
+                    Err(error) => {
+                        self.active_staging.remove(&staging);
+                        return Err(map_vfs_error(error));
+                    }
+                };
+                let mut staging_attr = match self.vfs.stat_ino(staging_ino).await {
+                    Some(attr) => attr,
+                    None => {
+                        self.discard_staging(&staging).await;
+                        return Err(FsError::NotFound);
+                    }
+                };
+                if let Some((source_ino, source_attr)) = existing.as_ref() {
+                    if !options.truncate
+                        && let Err(error) = self.copy_exact(source_attr, staging_ino).await
+                    {
+                        self.discard_staging(&staging).await;
+                        return Err(error);
+                    }
+                    if let Err(error) = self.copy_dead_props(*source_ino, staging_ino).await {
+                        self.discard_staging(&staging).await;
+                        return Err(error);
+                    }
+                    staging_attr = match self.vfs.stat_ino(staging_ino).await {
+                        Some(attr) => attr,
+                        None => {
+                            self.discard_staging(&staging).await;
+                            return Err(FsError::NotFound);
+                        }
+                    };
                 }
-                return Err(map_vfs_error(error));
-            }
-        };
+                (
+                    staging.clone(),
+                    staging_ino,
+                    Some(staging),
+                    staging_resolved.parent_ino,
+                    staging_resolved.name,
+                    staging_attr,
+                )
+            } else {
+                let (ino, _attr) = match existing {
+                    Some(existing) => existing,
+                    None => {
+                        let ino = self
+                            .vfs
+                            .create_file_at(resolved.parent_ino, &resolved.name, options.create_new)
+                            .await
+                            .map_err(map_vfs_error)?;
+                        let attr = self.vfs.stat_ino(ino).await.ok_or(FsError::NotFound)?;
+                        (ino, attr)
+                    }
+                };
+                if options.truncate {
+                    self.vfs
+                        .truncate_inode(ino, 0)
+                        .await
+                        .map_err(map_vfs_error)?;
+                }
+                (
+                    path.clone(),
+                    ino,
+                    None,
+                    0,
+                    String::new(),
+                    self.vfs.stat_ino(ino).await.ok_or(FsError::NotFound)?,
+                )
+            };
         let position = if options.append { attr.size } else { 0 };
         let guard = match self
             .vfs
@@ -343,8 +423,13 @@ where
         Ok(Box::new(BrewFsDavFile {
             vfs: self.vfs.clone(),
             target_path: path,
+            target_parent_ino: resolved.parent_ino,
+            target_name: resolved.name,
             storage_path,
+            storage_ino,
             staging_path,
+            staging_parent_ino,
+            staging_name,
             active_staging: self.active_staging.clone(),
             guard: Some(guard),
             mutation_guard,
@@ -352,6 +437,7 @@ where
             logical_size: attr.size,
             append: options.append,
             create_new: options.create_new,
+            if_match: super::current_request_if_match(),
             expected_body_size: options.size,
             bytes_written: 0,
         }))
@@ -391,27 +477,29 @@ where
     ) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         async move {
             let path = to_vfs_path(path)?;
-            self.validate_path(&path).await?;
-            let entries = self.read_children(&path).await?;
-            let mut result: Vec<FsResult<Box<dyn DavDirEntry>>> = Vec::new();
-            for entry in entries {
-                if path == "/" && entry.name == ".brewfs.sys" {
-                    continue;
-                }
-                let child = if path == "/" {
-                    format!("/{}", entry.name)
-                } else {
-                    format!("{path}/{}", entry.name)
-                };
-                match self.vfs.stat(&child).await {
-                    Ok(attr) => result.push(Ok(Box::new(BrewFsDavDirEntry {
-                        name: entry.name.into_bytes(),
-                        attr,
-                    }))),
-                    Err(error) => result.push(Err(map_vfs_error(error))),
-                }
+            let (directory_ino, directory_attr) = self.resolve_existing(&path).await?;
+            if directory_attr.kind != FileType::Dir {
+                return Err(FsError::Forbidden);
             }
-            Ok(Box::pin(futures_util::stream::iter(result)) as FsStream<Box<dyn DavDirEntry>>)
+            let entries = self.read_children_ino(directory_ino).await?;
+            let results = futures_util::stream::iter(entries.into_iter().filter_map(|entry| {
+                if path == "/" && entry.name == ".brewfs.sys" {
+                    return None;
+                }
+                Some(async move {
+                    match self.vfs.stat_ino(entry.ino).await {
+                        Some(attr) => Ok(Box::new(BrewFsDavDirEntry {
+                            name: entry.name.into_bytes(),
+                            attr,
+                        }) as Box<dyn DavDirEntry>),
+                        None => Err(FsError::NotFound),
+                    }
+                })
+            }))
+            .buffered(32)
+            .collect::<Vec<_>>()
+            .await;
+            Ok(Box::pin(futures_util::stream::iter(results)) as FsStream<Box<dyn DavDirEntry>>)
         }
         .boxed()
     }
@@ -419,8 +507,7 @@ where
     fn metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, Box<dyn DavMetaData>> {
         async move {
             let path = to_vfs_path(path)?;
-            self.validate_path(&path).await?;
-            let attr = self.vfs.stat(&path).await.map_err(map_vfs_error)?;
+            let (_, attr) = self.resolve_existing(&path).await?;
             Ok(Box::new(BrewFsDavMetaData(attr)) as Box<dyn DavMetaData>)
         }
         .boxed()
@@ -429,13 +516,16 @@ where
     fn create_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
         async move {
             let path = to_vfs_path(path)?;
-            self.validate_path(&path).await?;
             ensure_mutable(&path)?;
-            let _guard = self.lock_for(&path).lock_owned().await;
-            if self.vfs.stat(&path).await.is_ok() {
+            let resolved = self.resolve_parent(&path).await?;
+            if resolved.target.is_some() {
                 return Err(FsError::Exists);
             }
-            self.vfs.mkdir_err(&path).await.map_err(map_vfs_error)?;
+            let _guard = self.lock_for(&path).lock_owned().await;
+            self.vfs
+                .mkdir_at_new(resolved.parent_ino, &resolved.name)
+                .await
+                .map_err(map_vfs_error)?;
             Ok(())
         }
         .boxed()
@@ -444,10 +534,16 @@ where
     fn remove_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
         async move {
             let path = to_vfs_path(path)?;
-            self.validate_path(&path).await?;
             ensure_mutable(&path)?;
+            let resolved = self.resolve_parent(&path).await?;
+            let Some((_, attr)) = resolved.target else {
+                return Err(FsError::NotFound);
+            };
+            if attr.kind != FileType::Dir {
+                return Err(FsError::Forbidden);
+            }
             let _guard = self.lock_for(&path).lock_owned().await;
-            let result = self.vfs.rmdir(&path).await;
+            let result = self.vfs.rmdir_at(resolved.parent_ino, &resolved.name).await;
             if matches!(result, Err(VfsError::DirectoryNotEmpty { .. })) {
                 super::mark_directory_not_empty();
             }
@@ -459,10 +555,19 @@ where
     fn remove_file<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
         async move {
             let path = to_vfs_path(path)?;
-            self.validate_path(&path).await?;
             ensure_mutable(&path)?;
+            let resolved = self.resolve_parent(&path).await?;
+            let Some((ino, attr)) = resolved.target else {
+                return Err(FsError::NotFound);
+            };
+            if attr.kind == FileType::Dir {
+                return Err(FsError::Forbidden);
+            }
             let _guard = self.lock_for(&path).lock_owned().await;
-            self.vfs.unlink(&path).await.map_err(map_vfs_error)
+            self.vfs
+                .unlink_at_with_known_attr(resolved.parent_ino, &resolved.name, ino, attr)
+                .await
+                .map_err(map_vfs_error)
         }
         .boxed()
     }
@@ -471,13 +576,21 @@ where
         async move {
             let from = to_vfs_path(from)?;
             let to = to_vfs_path(to)?;
-            self.validate_path(&from).await?;
-            self.validate_path(&to).await?;
             ensure_mutable(&from)?;
             ensure_mutable(&to)?;
+            let source = self.resolve_parent(&from).await?;
+            if source.target.is_none() {
+                return Err(FsError::NotFound);
+            }
+            let destination = self.resolve_parent(&to).await?;
             let _guards = self.lock_paths(&from, &to).await;
             self.vfs
-                .rename_noreplace(&from, &to)
+                .rename_at_noreplace(
+                    source.parent_ino,
+                    &source.name,
+                    destination.parent_ino,
+                    &destination.name,
+                )
                 .await
                 .map_err(map_vfs_error)
         }
@@ -488,31 +601,39 @@ where
         async move {
             let from = to_vfs_path(from)?;
             let to = to_vfs_path(to)?;
-            self.validate_path(&from).await?;
-            self.validate_path(&to).await?;
             ensure_mutable(&to)?;
-            let _guards = self.lock_paths(&from, &to).await;
-            let source = self.vfs.stat(&from).await.map_err(map_vfs_error)?;
-            if source.kind != FileType::File {
+            let source = self.resolve_existing(&from).await?;
+            if source.1.kind != FileType::File {
                 return Err(FsError::Forbidden);
             }
+            let destination = self.resolve_parent(&to).await?;
+            let _guards = self.lock_paths(&from, &to).await;
             let staging = self.reserve_staging();
+            let staging_parent = self.resolve_parent(&staging).await?;
             let result = async {
                 let destination_ino = self
                     .vfs
-                    .create_file_in_existing_dir_err(&staging, true)
+                    .create_file_at(staging_parent.parent_ino, &staging_parent.name, true)
                     .await
                     .map_err(map_vfs_error)?;
-                self.copy_exact(&source, destination_ino).await?;
-                self.copy_dead_props(source.ino, destination_ino).await?;
+                self.copy_exact(&source.1, destination_ino).await?;
+                self.copy_dead_props(source.0, destination_ino).await?;
                 self.vfs
-                    .rename_noreplace(&staging, &to)
+                    .rename_at_noreplace(
+                        staging_parent.parent_ino,
+                        &staging_parent.name,
+                        destination.parent_ino,
+                        &destination.name,
+                    )
                     .await
                     .map_err(map_vfs_error)
             }
             .await;
             if result.is_err() {
-                let _ = self.vfs.unlink(&staging).await;
+                let _ = self
+                    .vfs
+                    .unlink_at(staging_parent.parent_ino, &staging_parent.name)
+                    .await;
             }
             self.active_staging.remove(&staging);
             result
@@ -523,13 +644,15 @@ where
     fn set_accessed<'a>(&'a self, path: &'a DavPath, tm: SystemTime) -> FsFuture<'a, ()> {
         async move {
             let path = to_vfs_path(path)?;
-            self.validate_path(&path).await?;
             ensure_mutable(&path)?;
+            let resolved = self.resolve_parent(&path).await?;
+            let Some((ino, _)) = resolved.target else {
+                return Err(FsError::NotFound);
+            };
             let _guard = self.lock_for(&path).lock_owned().await;
-            let attr = self.vfs.stat(&path).await.map_err(map_vfs_error)?;
             self.vfs
                 .set_attr(
-                    attr.ino,
+                    ino,
                     &SetAttrRequest {
                         atime: Some(system_time_nanos(tm)?),
                         ..Default::default()
@@ -546,13 +669,15 @@ where
     fn set_modified<'a>(&'a self, path: &'a DavPath, tm: SystemTime) -> FsFuture<'a, ()> {
         async move {
             let path = to_vfs_path(path)?;
-            self.validate_path(&path).await?;
             ensure_mutable(&path)?;
+            let resolved = self.resolve_parent(&path).await?;
+            let Some((ino, _)) = resolved.target else {
+                return Err(FsError::NotFound);
+            };
             let _guard = self.lock_for(&path).lock_owned().await;
-            let attr = self.vfs.stat(&path).await.map_err(map_vfs_error)?;
             self.vfs
                 .set_attr(
-                    attr.ino,
+                    ino,
                     &SetAttrRequest {
                         mtime: Some(system_time_nanos(tm)?),
                         ..Default::default()
@@ -583,15 +708,17 @@ where
                 return Err(FsError::InsufficientStorage);
             }
             let path = to_vfs_path(path)?;
-            self.validate_path(&path).await?;
             ensure_mutable(&path)?;
+            let resolved = self.resolve_parent(&path).await?;
+            let Some((ino, _)) = resolved.target else {
+                return Err(FsError::NotFound);
+            };
             let _guard = self.lock_for(&path).lock_owned().await;
-            let attr = self.vfs.stat(&path).await.map_err(map_vfs_error)?;
-            let raw = self.read_dead_props(attr.ino).await?;
+            let raw = self.read_dead_props(ino).await?;
             let (encoded, statuses) = props::apply(raw.as_deref(), patch)?;
             if let Some(encoded) = encoded {
                 self.vfs
-                    .set_xattr_ino(attr.ino, XATTR_DEAD_PROPS, &encoded, 0)
+                    .set_xattr_ino(ino, XATTR_DEAD_PROPS, &encoded, 0)
                     .await
                     .map_err(map_vfs_error)?;
             }
@@ -603,8 +730,7 @@ where
     fn get_props<'a>(&'a self, path: &'a DavPath, do_content: bool) -> FsFuture<'a, Vec<DavProp>> {
         async move {
             let path = to_vfs_path(path)?;
-            self.validate_path(&path).await?;
-            let attr = self.vfs.stat(&path).await.map_err(map_vfs_error)?;
+            let (_, attr) = self.resolve_existing(&path).await?;
             let raw = self.read_dead_props(attr.ino).await?;
             props::list(raw.as_deref(), do_content)
         }
@@ -614,8 +740,7 @@ where
     fn get_prop<'a>(&'a self, path: &'a DavPath, prop: DavProp) -> FsFuture<'a, Vec<u8>> {
         async move {
             let path = to_vfs_path(path)?;
-            self.validate_path(&path).await?;
-            let attr = self.vfs.stat(&path).await.map_err(map_vfs_error)?;
+            let (_, attr) = self.resolve_existing(&path).await?;
             let raw = self.read_dead_props(attr.ino).await?;
             props::get(raw.as_deref(), &prop)
         }
@@ -629,8 +754,13 @@ where
 {
     vfs: VFS<S, MetaClient<dyn MetaStore>>,
     target_path: String,
+    target_parent_ino: i64,
+    target_name: String,
     storage_path: String,
+    storage_ino: i64,
     staging_path: Option<String>,
+    staging_parent_ino: i64,
+    staging_name: String,
     active_staging: Arc<DashSet<String>>,
     guard: Option<FileGuard<S, MetaClient<dyn MetaStore>>>,
     mutation_guard: Option<OwnedMutexGuard<()>>,
@@ -638,6 +768,7 @@ where
     logical_size: u64,
     append: bool,
     create_new: bool,
+    if_match: Option<String>,
     expected_body_size: Option<u64>,
     bytes_written: u64,
 }
@@ -688,7 +819,10 @@ where
 
     async fn cleanup_staging(&mut self) {
         if let Some(path) = self.staging_path.take() {
-            let _ = self.vfs.unlink(&path).await;
+            let _ = self
+                .vfs
+                .unlink_at(self.staging_parent_ino, &self.staging_name)
+                .await;
             self.active_staging.remove(&path);
         }
     }
@@ -700,12 +834,11 @@ where
 {
     fn metadata(&'_ mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
         async move {
-            let path = if self.staging_path.is_some() {
-                &self.storage_path
-            } else {
-                &self.target_path
-            };
-            let mut attr = self.vfs.stat(path).await.map_err(map_vfs_error)?;
+            let mut attr = self
+                .vfs
+                .stat_ino(self.storage_ino)
+                .await
+                .ok_or(FsError::NotFound)?;
             attr.size = self.logical_size;
             Ok(Box::new(BrewFsDavMetaData(attr)) as Box<dyn DavMetaData>)
         }
@@ -775,10 +908,36 @@ where
                 return Err(map_vfs_error(error));
             }
             if let Some(staging) = self.staging_path.clone() {
+                if let Some(if_match) = &self.if_match {
+                    let current = self
+                        .vfs
+                        .child_attr_of(self.target_parent_ino, &self.target_name)
+                        .await
+                        .map_err(map_vfs_error)?;
+                    if !if_match_satisfied(if_match, current.as_ref().map(|(_, attr)| attr)) {
+                        self.cleanup_staging().await;
+                        super::mark_precondition_failed();
+                        return Err(FsError::GeneralFailure);
+                    }
+                }
                 let result = if self.create_new {
-                    self.vfs.rename_noreplace(&staging, &self.target_path).await
+                    self.vfs
+                        .rename_at_noreplace(
+                            self.staging_parent_ino,
+                            &self.staging_name,
+                            self.target_parent_ino,
+                            &self.target_name,
+                        )
+                        .await
                 } else {
-                    self.vfs.rename(&staging, &self.target_path).await
+                    self.vfs
+                        .rename_at(
+                            self.staging_parent_ino,
+                            &self.staging_name,
+                            self.target_parent_ino,
+                            &self.target_name,
+                        )
+                        .await
                 };
                 if let Err(error) = result {
                     self.cleanup_staging().await;
@@ -802,6 +961,8 @@ where
     fn drop(&mut self) {
         let guard = self.guard.take();
         let staging = self.staging_path.take();
+        let staging_parent_ino = self.staging_parent_ino;
+        let staging_name = self.staging_name.clone();
         let mutation_guard = self.mutation_guard.take();
         let vfs = self.vfs.clone();
         let active = self.active_staging.clone();
@@ -812,7 +973,11 @@ where
                     let _ = guard.close().await;
                 }
                 if let Some(path) = staging {
-                    let _ = vfs.unlink(&path).await;
+                    if !staging_name.is_empty() {
+                        let _ = vfs.unlink_at(staging_parent_ino, &staging_name).await;
+                    } else {
+                        let _ = vfs.unlink(&path).await;
+                    }
                     active.remove(&path);
                 }
             });
@@ -873,10 +1038,7 @@ impl DavMetaData for BrewFsDavMetaData {
     }
 
     fn etag(&self) -> Option<String> {
-        Some(format!(
-            "{:x}-{:x}-{:x}",
-            self.0.ino, self.0.mtime, self.0.size
-        ))
+        Some(etag_value(&self.0))
     }
 
     fn accessed(&self) -> FsResult<SystemTime> {
@@ -890,6 +1052,21 @@ impl DavMetaData for BrewFsDavMetaData {
     fn executable(&self) -> FsResult<bool> {
         Ok(self.0.mode & 0o111 != 0)
     }
+}
+
+fn etag_value(attr: &FileAttr) -> String {
+    format!(
+        "{:x}-{:x}-{:x}-{:x}",
+        attr.ino, attr.mtime, attr.ctime, attr.size
+    )
+}
+
+fn if_match_satisfied(value: &str, attr: Option<&FileAttr>) -> bool {
+    let Some(attr) = attr else {
+        return false;
+    };
+    let expected = format!("\"{}\"", etag_value(attr));
+    value.trim() == "*" || value.split(',').any(|tag| tag.trim() == expected)
 }
 
 fn staging_dir() -> String {
@@ -983,6 +1160,29 @@ mod tests {
     fn seek_rejects_before_start() {
         assert_eq!(checked_seek(3, -4), Err(FsError::Forbidden));
         assert_eq!(checked_seek(3, -3), Ok(0));
+    }
+
+    #[test]
+    fn if_match_uses_metadata_version() {
+        let attr = FileAttr {
+            ino: 7,
+            size: 11,
+            blocks: 1,
+            kind: FileType::File,
+            mode: 0,
+            rdev: 0,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            mtime: 2,
+            ctime: 3,
+            nlink: 1,
+        };
+        let tag = format!("\"{}\"", etag_value(&attr));
+        assert!(if_match_satisfied(&tag, Some(&attr)));
+        assert!(if_match_satisfied("*", Some(&attr)));
+        assert!(!if_match_satisfied("\"stale\"", Some(&attr)));
+        assert!(!if_match_satisfied("*", None));
     }
 
     #[test]

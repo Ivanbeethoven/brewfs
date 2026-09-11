@@ -115,6 +115,18 @@ pub fn apply(raw: Option<&[u8]>, patch: Vec<(bool, DavProp)>) -> Result<ApplyRes
         }
     }
 
+    if let Some(failure) = statuses
+        .iter()
+        .position(|(status, _)| *status != StatusCode::OK)
+    {
+        for (index, (status, _)) in statuses.iter_mut().enumerate() {
+            if index != failure && *status == StatusCode::OK {
+                *status = StatusCode::FAILED_DEPENDENCY;
+            }
+        }
+        return Ok((None, statuses));
+    }
+
     let encoded = serde_json::to_vec(&props.into_values().collect::<Vec<_>>())
         .map_err(|_| FsError::GeneralFailure)?;
     if encoded.len() > MAX_DEAD_PROPS_SIZE {
@@ -162,6 +174,21 @@ mod tests {
         let (_, statuses) =
             apply(None, vec![(false, prop("missing", None))]).expect("bounded result");
         assert_eq!(statuses[0].0, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn mixed_failed_patch_does_not_persist_successful_operations() {
+        let (encoded, statuses) = apply(
+            None,
+            vec![
+                (true, prop("new", Some(b"value"))),
+                (false, prop("missing", None)),
+            ],
+        )
+        .expect("apply property patch");
+        assert!(encoded.is_none());
+        assert_eq!(statuses[0].0, StatusCode::FAILED_DEPENDENCY);
+        assert_eq!(statuses[1].0, StatusCode::NOT_FOUND);
     }
 
     #[test]

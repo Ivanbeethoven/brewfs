@@ -73,10 +73,10 @@ python3 scripts/e2e_webdav_gateway.py
 
 **2026-09-10 在 WSL Ubuntu-22.04 的实际结果：**
 
-- 认证 + 原子 PUT/PATCH + HTTP：`RESULT: 75 passed, 0 failed`
-- 认证 + 直接写回（`--atomic-put false`）：`RESULT: 75 passed, 0 failed`
-- 显式匿名 + 原子 PUT/PATCH：`RESULT: 73 passed, 0 failed`；认证拒绝相关的 2 项按匿名模式跳过
-- 认证 + 自签名 HTTPS：`RESULT: 75 passed, 0 failed`；随后发送 SIGINT，TLS listener 优雅退出、端口关闭且退出码为 0
+- 认证 + 原子 PUT/PATCH + HTTP：`RESULT: 79 passed, 0 failed`
+- 认证 + 直接写回（`--atomic-put false`）：`RESULT: 79 passed, 0 failed`
+- 显式匿名 + 原子 PUT/PATCH：`RESULT: 77 passed, 0 failed`；认证拒绝相关的 2 项按匿名模式跳过
+- 认证 + 自签名 HTTPS：`RESULT: 79 passed, 0 failed`；随后发送 SIGINT，TLS listener 优雅退出、端口关闭且退出码为 0
 
 此次共享 metadata store 生命周期修复还做了跨协议回归：
 
@@ -102,12 +102,12 @@ python3 scripts/e2e_webdav_gateway.py
 cargo test --no-default-features --features "gateway-webdav,fuse-tokio-runtime" webdav --lib
 ```
 
-当前 WebDAV 聚焦测试为 17 个用例，覆盖路径映射、顶层 Destination 的内部空父路径、保留命名空间、时间转换、seek 边界、认证、请求方法作用域、`Content-Range` 和 body 长度，以及属性上限/事务性更新。
+当前 WebDAV 聚焦测试为 19 个用例，覆盖路径映射、顶层 Destination 的内部空父路径、保留命名空间、时间转换、seek 边界、认证、请求方法作用域、`Content-Range` 和 body 长度、ETag/条件写，以及属性上限/事务性更新。
 
 在低内存、单任务构建参数（`CARGO_BUILD_JOBS=1`、`CARGO_INCREMENTAL=0`、关闭 debug info）下还完成了：
 
 - `cargo test --workspace --lib --bins -- --test-threads=1`：`679 passed, 0 failed, 175 ignored`
-- `cargo test --workspace --all-features -- --test-threads=1`：`751 passed, 0 failed, 177 ignored`
+- `cargo test --workspace --all-features -- --test-threads=1`：`753 passed, 0 failed, 177 ignored`
 - WebDAV-only `cargo clippy ... -- -D warnings`：通过
 - Redis（无 xattr）能力冒烟：OPTIONS、读写、活属性和基本 WebDAV 操作通过；脚本结果为 `65 passed, 4 failed`，4 项均为 dead-property 持久化断言，`PROPPATCH` 按后端能力正确返回 507
 - 使用可写 SQLite、无效 PEM 证书/私钥启动：在 TLS 加载阶段失败，无监听端口、无 orphan gateway 进程
@@ -153,8 +153,8 @@ GW_ENDPOINT=https://127.0.0.1:19105 GW_INSECURE_TLS=1 \
 
 - DeltaV、CalDAV、CardDAV、DASL/SEARCH、ACL 和多用户授权不在范围内。
 - WebDAV 锁使用进程内 `MemLs`，重启丢失，跨网关实例不互斥，也不映射 POSIX/FUSE 锁。
-- 进程内路径锁仅用于同一 WebDAV 实例；与其他进程或其他实例的并发一致性由 VFS/meta 原子操作边界保证。
-- 原子模式保证成功 flush 后发布；直接模式可能在客户端断连或 body 长度错误时留下部分目标内容，适合需要传统直接写回语义的客户端，不适合要求全有或全无发布的场景。
+- 进程内路径锁仅用于同一 WebDAV 实例；路径操作使用 parent-inode 解析并拒绝中间 symlink，避免通过路径重解析进入保留命名空间；跨进程条件写仍依赖共享 metadata backend 的原子边界。
+- WebDAV 使用与 mount/S3 相同的 flat-v1 cache namespace，并按 metadata backend 使用相应的 MetaClient TTL。- 原子模式保证成功 flush 后发布；直接模式可能在客户端断连或 body 长度错误时留下部分目标内容，适合需要传统直接写回语义的客户端，不适合要求全有或全无发布的场景。
 - 原子模式会校验 `Content-Length`、`X-Expected-Entity-Length` 和 `Content-Range` 声明的 body 长度；完全不带长度声明的 chunked 上传目前没有可配置的请求体上限，生产部署应在前置代理限制请求大小。
 - staging 清理的 active 集合是进程内状态；多个网关实例共享同一 staging 目录时，应避免并发运行清理任务，或在外部调度时协调实例生命周期。
 - 明文 HTTP 的优雅关闭会等待在途请求自然结束；TLS listener 额外提供最长 30 秒的关闭期限。

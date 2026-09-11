@@ -58,7 +58,7 @@ use crate::fuse::mount::{FuseConcurrencyConfig, mount_vfs_privileged, mount_vfs_
 use crate::meta::MetaStore;
 use crate::meta::client::MetaClient;
 use crate::meta::config::{
-    CacheConfig as MetaCacheConfig, ClientOptions, Config, DatabaseConfig, DatabaseType,
+    CacheConfig as MetaCacheConfig, CacheTtl, ClientOptions, Config, DatabaseConfig, DatabaseType,
     MetaClientConfig,
 };
 use crate::meta::layer::MetaLayer;
@@ -722,11 +722,12 @@ async fn gateway_webdav_cmd(args: WebDavGatewayArgs) -> anyhow::Result<()> {
     if mount.mount_point.is_none() {
         mount.mount_point = Some(std::path::PathBuf::from("/brewfs-webdav-gateway"));
     }
-    let cfg = MountConfig::from_sources(mount)?;
+    let mut cfg = MountConfig::from_sources(mount)?;
     if cfg.volume_format != VolumeFormat::FlatV1 {
         anyhow::bail!("webdav gateway only supports volume_format=flat-v1");
     }
     validate_volume_format_support(cfg.volume_format)?;
+    namespace_flat_volume_cache(&mut cfg)?;
 
     if cfg.chunk_size < cfg.block_size as u64 {
         anyhow::bail!("chunk_size must be >= block_size");
@@ -740,6 +741,14 @@ async fn gateway_webdav_cmd(args: WebDavGatewayArgs) -> anyhow::Result<()> {
         credentials,
         tls,
         atomic_put,
+    };
+    let meta_ttl = match cfg.meta_backend {
+        MetaBackendKind::Sqlx => {
+            CacheTtl::for_backend(database_type_from_url(&cfg.meta_url).backend_type())
+        }
+        MetaBackendKind::Etcd => CacheTtl::for_backend("etcd"),
+        MetaBackendKind::Redis => CacheTtl::for_backend("redis"),
+        MetaBackendKind::TiKv => CacheTtl::for_backend("tikv"),
     };
 
     tracing::info!(
@@ -760,6 +769,7 @@ async fn gateway_webdav_cmd(args: WebDavGatewayArgs) -> anyhow::Result<()> {
                 layout,
                 cfg.compact.clone(),
                 cfg.cache.clone(),
+                meta_ttl.clone(),
                 opts,
             )
             .await
@@ -773,6 +783,7 @@ async fn gateway_webdav_cmd(args: WebDavGatewayArgs) -> anyhow::Result<()> {
                 layout,
                 cfg.compact.clone(),
                 cfg.cache.clone(),
+                meta_ttl,
                 opts,
             )
             .await

@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use crate::chunk::store::BlockStore;
 use crate::meta::MetaStore;
 use crate::meta::client::MetaClient;
-use crate::meta::config::{CompactConfig, MetaClientConfig};
+use crate::meta::config::{CacheTtl, CompactConfig, MetaClientConfig};
 use crate::meta::layer::MetaLayer;
 use crate::vfs::cache::config::CacheConfig as VfsCacheConfig;
 use crate::vfs::fs::VFS;
@@ -37,18 +37,33 @@ use self::fs::BrewFsDavFs;
 tokio::task_local! {
     static REQUEST_METHOD: Method;
     static REQUEST_FLAGS: Arc<RequestFlags>;
+    static REQUEST_IF_MATCH: Option<String>;
 }
 
 #[derive(Default)]
 struct RequestFlags {
     invalid_body_length: AtomicBool,
     directory_not_empty: AtomicBool,
+    precondition_failed: AtomicBool,
+}
+
+pub(super) fn mark_precondition_failed() {
+    let _ = REQUEST_FLAGS.try_with(|flags| {
+        flags.precondition_failed.store(true, Ordering::Relaxed);
+    });
 }
 
 pub(super) fn mark_directory_not_empty() {
     let _ = REQUEST_FLAGS.try_with(|flags| {
         flags.directory_not_empty.store(true, Ordering::Relaxed);
     });
+}
+
+pub(super) fn current_request_if_match() -> Option<String> {
+    REQUEST_IF_MATCH
+        .try_with(|value| value.clone())
+        .ok()
+        .flatten()
 }
 
 pub(super) fn current_request_is_lock() -> bool {
@@ -118,13 +133,17 @@ pub async fn serve<S>(
     layout: crate::chunk::ChunkLayout,
     compact: CompactConfig,
     cache: VfsCacheConfig,
+    meta_ttl: CacheTtl,
     opts: WebDavGatewayOptions,
 ) -> anyhow::Result<()>
 where
     S: BlockStore + Send + Sync + 'static,
 {
     let props_supported = meta.capabilities().xattr;
-    let mut config = MetaClientConfig::default();
+    let mut config = MetaClientConfig {
+        ttl: meta_ttl,
+        ..Default::default()
+    };
     config.options.mount_point = Some("brewfs-gateway-webdav".to_string());
     let meta_client = MetaClient::with_options(
         meta,
@@ -281,6 +300,11 @@ async fn webdav_request(
             None
         };
     let request_flags = Arc::new(RequestFlags::default());
+    let if_match = request
+        .headers()
+        .get("if-match")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let request = if let Some(expected_size) = expected_size {
         request.map(|body| bounded_body(body, expected_size, request_flags.clone()))
     } else {
@@ -308,7 +332,10 @@ async fn webdav_request(
             method,
             REQUEST_FLAGS.scope(
                 request_flags.clone(),
-                state.handler.handle_guarded(request, principal, ()),
+                REQUEST_IF_MATCH.scope(
+                    if_match,
+                    state.handler.handle_guarded(request, principal, ()),
+                ),
             ),
         )
         .await;
@@ -316,6 +343,8 @@ async fn webdav_request(
     let mut response = Response::from_parts(parts, Body::new(body));
     if request_flags.invalid_body_length.load(Ordering::Relaxed) {
         *response.status_mut() = StatusCode::BAD_REQUEST;
+    } else if request_flags.precondition_failed.load(Ordering::Relaxed) {
+        *response.status_mut() = StatusCode::PRECONDITION_FAILED;
     } else if request_flags.directory_not_empty.load(Ordering::Relaxed)
         && response.status() == StatusCode::METHOD_NOT_ALLOWED
     {

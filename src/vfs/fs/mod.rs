@@ -792,6 +792,19 @@ where
     background_tasks: Option<VfsBackgroundTasks>,
 }
 
+impl<S, M> Drop for VFS<S, M>
+where
+    S: BlockStore + Send + Sync + 'static,
+    M: MetaLayer + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        if let Some(tasks) = self.background_tasks.take() {
+            tasks.compaction_handle.abort();
+            tasks.gc_handle.abort();
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CreateFileAtResult {
     pub(crate) ino: i64,
