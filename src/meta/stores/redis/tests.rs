@@ -77,8 +77,13 @@ async fn local_txlock_serializes_same_primary_key() {
     assert_eq!(max_active.load(Ordering::SeqCst), 1);
 }
 
+fn redis_test_url() -> String {
+    std::env::var("BREWFS_REDIS_TEST_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string())
+}
+
 async fn cleanup_test_data() -> Result<(), MetaError> {
-    let url = "redis://127.0.0.1:6379/0";
+    let url = redis_test_url();
     let client = redis::Client::open(url)
         .map_err(|e| MetaError::Config(format!("Failed to create Redis client: {}", e)))?;
     let mut conn = client
@@ -103,7 +108,7 @@ fn test_config() -> Config {
     Config {
         database: DatabaseConfig {
             db_config: DatabaseType::Redis {
-                url: "redis://127.0.0.1:6379/0".to_string(),
+                url: redis_test_url(),
             },
         },
         cache: CacheConfig::default(),
@@ -125,7 +130,7 @@ fn shared_db_config() -> Config {
     Config {
         database: DatabaseConfig {
             db_config: DatabaseType::Redis {
-                url: "redis://127.0.0.1:6379/0".to_string(),
+                url: redis_test_url(),
             },
         },
         cache: CacheConfig::default(),
@@ -4554,4 +4559,179 @@ async fn test_blocking_set_plock_succeeds_after_unlink_releases_lock() {
         "set_plock on tombstoned inode after unlock should succeed, got: {:?}",
         result
     );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_redis_xattr_crud_flags_and_binary_values() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    assert!(store.capabilities().xattr);
+
+    let inode = store
+        .create_file(root, "xattr-crud.bin".to_string())
+        .await
+        .unwrap();
+    assert_eq!(store.get_xattr(inode, "missing").await.unwrap(), None);
+    assert!(store.list_xattr(inode).await.unwrap().is_empty());
+
+    store.node_cache.invalidate(&inode).await;
+    let before = store.stat(inode).await.unwrap().unwrap();
+    store
+        .set_xattr(inode, "user.test", b"first", 0)
+        .await
+        .unwrap();
+    let after_create = store.stat(inode).await.unwrap().unwrap();
+    assert!(after_create.ctime > before.ctime);
+    assert_eq!(after_create.mtime, before.mtime);
+    assert_eq!(
+        store.get_xattr(inode, "user.test").await.unwrap(),
+        Some(b"first".to_vec())
+    );
+
+    store
+        .set_xattr(inode, "user.test", b"second", 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_xattr(inode, "user.test").await.unwrap(),
+        Some(b"second".to_vec())
+    );
+
+    let create_result = store
+        .set_xattr(inode, "user.test", b"third", libc::XATTR_CREATE as u32)
+        .await;
+    assert!(matches!(
+        create_result,
+        Err(MetaError::AlreadyExists { parent, name }) if parent == inode && name == "user.test"
+    ));
+
+    let replace_missing = store
+        .set_xattr(inode, "user.missing", b"value", libc::XATTR_REPLACE as u32)
+        .await;
+    assert!(matches!(replace_missing, Err(MetaError::NotFound(found)) if found == inode));
+
+    let binary = vec![0, 0xff, 0x80, b'\n', 0];
+    store
+        .set_xattr(inode, "user.binary", &binary, 0)
+        .await
+        .unwrap();
+    store.set_xattr(inode, "user.empty", &[], 0).await.unwrap();
+    assert_eq!(
+        store.get_xattr(inode, "user.binary").await.unwrap(),
+        Some(binary)
+    );
+    assert_eq!(
+        store.get_xattr(inode, "user.empty").await.unwrap(),
+        Some(Vec::new())
+    );
+
+    let mut names = store.list_xattr(inode).await.unwrap();
+    names.sort();
+    assert_eq!(names, vec!["user.binary", "user.empty", "user.test"]);
+
+    store.remove_xattr(inode, "user.test").await.unwrap();
+    assert_eq!(store.get_xattr(inode, "user.test").await.unwrap(), None);
+    assert!(matches!(
+        store.remove_xattr(inode, "user.test").await,
+        Err(MetaError::NotFound(found)) if found == inode
+    ));
+
+    for operation in [
+        store.get_xattr(999_999, "x").await.map(|_| ()),
+        store.list_xattr(999_999).await.map(|_| ()),
+        store.remove_xattr(999_999, "x").await,
+        store.set_xattr(999_999, "x", b"x", 0).await,
+    ] {
+        assert!(matches!(operation, Err(MetaError::NotFound(found)) if found == 999_999));
+    }
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_redis_xattr_create_is_atomic_across_store_instances() {
+    let store_a = new_test_store().await;
+    let root = store_a.root_ino();
+    let inode = store_a
+        .create_file(root, "xattr-race".to_string())
+        .await
+        .unwrap();
+    let store_b = RedisMetaStore::from_config(test_config()).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let barrier_a = barrier.clone();
+    let task_a = tokio::spawn(async move {
+        barrier_a.wait().await;
+        store_a
+            .set_xattr(inode, "user.race", b"value-a", libc::XATTR_CREATE as u32)
+            .await
+    });
+    let barrier_b = barrier.clone();
+    let task_b = tokio::spawn(async move {
+        barrier_b.wait().await;
+        store_b
+            .set_xattr(inode, "user.race", b"value-b", libc::XATTR_CREATE as u32)
+            .await
+    });
+
+    let result_a = task_a.await.unwrap();
+    let result_b = task_b.await.unwrap();
+    let results = [result_a, result_b];
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "exactly one XATTR_CREATE contender must succeed: {results:?}"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(MetaError::AlreadyExists { .. })))
+            .count(),
+        1,
+        "exactly one XATTR_CREATE contender must lose: {results:?}"
+    );
+
+    let verifier = RedisMetaStore::from_config(test_config()).await.unwrap();
+    let value = verifier.get_xattr(inode, "user.race").await.unwrap();
+    assert!(value == Some(b"value-a".to_vec()) || value == Some(b"value-b".to_vec()));
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_redis_xattr_inode_cleanup() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let dir = store.mkdir(root, "xattr-dir".to_string()).await.unwrap();
+    store
+        .set_xattr(dir, "user.dir", b"directory", 0)
+        .await
+        .unwrap();
+    store.rmdir(root, "xattr-dir").await.unwrap();
+    let mut conn = store.conn.clone();
+    let dir_xattr_exists: bool = conn.exists(store.xattr_key(dir)).await.unwrap();
+    assert!(!dir_xattr_exists);
+
+    let file = store
+        .create_file(root, "xattr-file".to_string())
+        .await
+        .unwrap();
+    store
+        .set_xattr(file, "user.file", b"file", 0)
+        .await
+        .unwrap();
+    store.unlink(root, "xattr-file").await.unwrap();
+    assert_eq!(
+        store.get_xattr(file, "user.file").await.unwrap(),
+        Some(b"file".to_vec())
+    );
+    store.remove_file_metadata(file).await.unwrap();
+    let file_xattr_exists: bool = conn.exists(store.xattr_key(file)).await.unwrap();
+    assert!(!file_xattr_exists);
+    assert!(matches!(
+        store.get_xattr(file, "user.file").await,
+        Err(MetaError::NotFound(found)) if found == file
+    ));
 }
