@@ -9,7 +9,8 @@
   密钥和流式数据路径；SQLite + LocalFS 上 76 项 boto3 E2E 与 22 项单元测试通过。
 - **Redis metadata + RustFS data backend 尚未做 S3 gateway E2E**。仓库已有该后端组合的
   FUSE/POSIX、xfstests 与性能验证，但不能替代对 `brewfs gateway s3` 端点的协议验证。
-- WebDAV、NFS 与 S3 完整兼容性仍按以下里程碑推进。
+- WebDAV MVP 已在 PR #88 实现并通过本地协议 E2E：认证/匿名、原子/direct-write、HTTPS、COPY/MOVE、LOCK/PROPPATCH、ETag/条件写和路径安全均有验证；litmus、davfs2、Windows WebClient、Finder、rclone 等真实客户端验收仍待完成。
+- NFS 与 S3 完整兼容性仍按以下里程碑推进。
 
 ## 里程碑
 
@@ -17,7 +18,7 @@
 |---|---|---|---|
 | **M0** 设计立项 | 本目录全部 spec + 路线图 | 文档评审通过（PR 合入） | PR #82 评审中 |
 | **M1** S3 网关 MVP | `brewfs gateway s3`：single/multi bucket、核心对象操作、multipart、静态密钥、流式数据路径及单实例一致性边界 | SQLite + LocalFS：76 项 boto3 E2E、22 项单元测试、并发/生命周期专项回归及 CI 全绿 | 已完成（PR #83） |
-| **M2** WebDAV 网关 | `brewfs gateway webdav`：§3 方法全表、memls、Basic auth、TLS | `litmus` basic/copymove/props/locks 全过；davfs2 挂载读写；Windows 网络驱动器映射冒烟 | 未开始 |
+| **M2** WebDAV 网关 | `brewfs gateway webdav`：§3 方法全表、memls、Basic auth、TLS、原子写、dead properties、条件写 | 本地协议 E2E 与 focused tests 通过；litmus、davfs2、Windows 网络驱动器、Finder、rclone 仍需外部客户端验收 | 实现完成，兼容性验收待完成 |
 | **M3** S3 兼容性与后端矩阵 | Redis + RustFS gateway E2E/重启/跨端验证；tagging、GetObjectAttributes、条件头、list/CopySource 扩展、CORS；带租约/fencing 的跨实例锁 | Redis + RustFS 跑同一 boto3 suite 且 0 failure；AWS CLI/`mc`/s3fs/presigned URL smoke；双网关故障注入无撕裂或删桶重建 | 未开始 |
 | **M4** NFS 网关 | `brewfs gateway nfs`：NFSv3+mount 全映射表、squash、COMMIT 语义、`InodeAccess` 公开 wrapper | `mount -t nfs -o vers=3` 冒烟；xfstests NFS 子集；NFS ↔ FUSE 交叉验证 | 未开始 |
 | **M5** 生产化 | 多身份/ACL/policy/STS、原生 TLS、三协议 tracing/Prometheus、CI compose 准入、部署文档与性能/soak 基线 | CI 全绿；安全模型评审通过；性能报告达到各 spec 目标；Redis + RustFS 24h soak 无数据或 metadata 丢失 | 未开始 |
