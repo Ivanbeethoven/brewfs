@@ -50,7 +50,7 @@ Windows 网络驱动器 / Finder / davfs2 / rclone
 | `PUT` | `create_file` + 流式写 + `flush` | MVP 直接写最终路径；`--atomic-put` 选项切换为 tmp+rename（总设计 §3.3），默认开启见 §5 |
 | `MKCOL` | `mkdir`（父不存在 → 409 `Conflict`；已存在 → 405） | |
 | `DELETE` | 文件 `unlink`；目录 `remove_dir_all`（递归，RFC 要求） | 递归删除限并发（默认 8，防大目录惊群） |
-| `PROPFIND` | depth=0 `stat`；depth=1 `readdir` + bounded concurrent `stat_ino` | 属性集：`displayname/getcontentlength/getlastmodified/creationdate/resourcetype/getetag`（inode+mtime+ctime+size 合成 etag）+ dead props |
+| `PROPFIND` | depth=0 `stat`；depth=1 `readdir` + bounded concurrent `stat_ino`；depth=infinity 一律拒绝（`501` + `propfind-finite-depth`） | 属性集：`displayname/getcontentlength/getlastmodified/creationdate/resourcetype/getetag`（inode+mtime+ctime+size 合成 etag）+ dead props |
 | `PROPPATCH` | dead properties 读写 xattr `brewfs.dav.deadprops`（JSON map） | 活属性（getcontentlength 等）set → 409；xattr 不可用时整请求 507 |
 | `COPY` | 流式服务端复制（read→write），目录递归；`Overwrite: F` → create_new | 后续可用 chunk 级克隆优化 |
 | `MOVE` | `rename`（同 volume 内恒真）；`Overwrite: F` → `RENAME_NOREPLACE` | |

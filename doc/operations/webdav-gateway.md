@@ -14,7 +14,7 @@ WebDAV 网关直接访问 BrewFS 的 metadata/data backend，**不需要先挂�
 - Basic Auth，或显式启用的匿名读写；
 - 原生 HTTP 或 PEM 证书 HTTPS；
 - GET、HEAD、Range GET、PUT、PATCH；
-- MKCOL、递归 DELETE、Depth 0/1/infinity PROPFIND；
+- MKCOL、递归 DELETE、Depth 0/1 PROPFIND（`Depth: infinity` 一律拒绝，返回 501）；
 - PROPPATCH dead properties；
 - COPY、MOVE、Overwrite `T/F`；
 - LOCK、UNLOCK 和 lock-null resource；
@@ -426,7 +426,7 @@ curl --fail -u testuser:testpass -X OPTIONS \
 - `PROPPATCH` 在无 xattr backend 上返回 `507` 是预期能力限制；普通读写仍可工作。
 - 默认原子写入在 body 校验或 flush 失败时保留旧目标；`--atomic-put false` 可能留下部分目标内容。
 - 完全没有长度声明的 chunked 上传没有网关级可配置上限，生产环境应在反向代理限制请求体大小。
-- `Depth: infinity` 和超大目录会产生大量 metadata 工作，应优先使用有限深度。
+- `Depth: infinity` 的 PROPFIND/REPORT 会被网关直接拒绝（`501 Not Implemented`，`propfind-finite-depth` 错误体，RFC 4918 §9.1 允许），请使用 Depth 0/1。
 - metadata cache 提供 close-to-open 语义；其他协议刚写入的数据可能在 TTL 内短暂不可见。
 - WebDAV lock 只在当前进程有效，重启、另一个 gateway 实例和 FUSE/POSIX lock 不共享状态。
 

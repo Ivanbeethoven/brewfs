@@ -12,9 +12,9 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::{
-    AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, HeaderValue, WWW_AUTHENTICATE,
+    AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue, WWW_AUTHENTICATE,
 };
-use axum::http::{Method, Request, Response, StatusCode};
+use axum::http::{HeaderMap, Method, Request, Response, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use dav_server::DavHandler;
@@ -311,22 +311,13 @@ async fn webdav_request(
         request
     };
     let method = request.method().clone();
-    let request = if method.as_str() == "PROPFIND"
-        && request
-            .headers()
-            .get("depth")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.eq_ignore_ascii_case("infinity"))
-        && !request.headers().contains_key("x-litmus")
-    {
-        let mut request = request;
-        request
-            .headers_mut()
-            .insert("x-litmus", HeaderValue::from_static("brewfs-infinity"));
-        request
-    } else {
-        request
-    };
+    // RFC 4918 §9.1 allows servers to refuse infinite-depth PROPFIND.
+    // dav-server 0.11 gates this on the `x-litmus` header (a litmus test
+    // suite escape hatch), so gate it here instead where it applies to
+    // every client.
+    if infinite_depth_requested(&method, request.headers()) {
+        return infinite_depth_rejected();
+    }
     let response = REQUEST_METHOD
         .scope(
             method,
@@ -413,6 +404,27 @@ fn bounded_body(body: Body, expected_size: u64, invalid_body_length: Arc<Request
     Body::from_stream(chunks.chain(eof))
 }
 
+fn infinite_depth_requested(method: &Method, headers: &HeaderMap) -> bool {
+    matches!(method.as_str(), "PROPFIND" | "REPORT")
+        && headers
+            .get("depth")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("infinity"))
+}
+
+fn infinite_depth_rejected() -> Response<Body> {
+    // 501 matches dav-server 0.11's own infinite-depth PROPFIND response
+    // (`propfind-finite-depth` error element).
+    Response::builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .header(CONTENT_TYPE, "application/xml; charset=utf-8")
+        .body(Body::from(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<D:error xmlns:D="DAV:"><D:propfind-finite-depth/></D:error>"#,
+        ))
+        .expect("valid infinite-depth response")
+}
+
 fn unauthorized() -> Response<Body> {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
@@ -464,6 +476,36 @@ mod tests {
             !REQUEST_METHOD
                 .scope(Method::PUT, async { current_request_is_lock() })
                 .await
+        );
+    }
+
+    #[test]
+    fn infinite_depth_gating_matches_only_propfind_and_report() {
+        let depth = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("depth", HeaderValue::from_static(value));
+            headers
+        };
+        let propfind = Method::from_bytes(b"PROPFIND").unwrap();
+        let report = Method::from_bytes(b"REPORT").unwrap();
+
+        assert!(infinite_depth_requested(&propfind, &depth("infinity")));
+        assert!(infinite_depth_requested(&report, &depth("infinity")));
+        assert!(infinite_depth_requested(&propfind, &depth("INFINITY")));
+        assert!(!infinite_depth_requested(&Method::GET, &depth("infinity")));
+        assert!(!infinite_depth_requested(&Method::PUT, &depth("infinity")));
+        assert!(!infinite_depth_requested(&propfind, &depth("1")));
+        assert!(!infinite_depth_requested(&propfind, &depth("0")));
+        assert!(!infinite_depth_requested(&propfind, &HeaderMap::new()));
+    }
+
+    #[test]
+    fn infinite_depth_response_is_501_with_dav_error_body() {
+        let response = infinite_depth_rejected();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/xml; charset=utf-8")),
         );
     }
 
