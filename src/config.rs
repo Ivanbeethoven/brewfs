@@ -72,7 +72,7 @@ pub enum Command {
 
     /// Run protocol gateways that expose a BrewFS volume over S3/WebDAV/NFS
     /// without a FUSE mount.
-    #[cfg(feature = "gateway-s3")]
+    #[cfg(any(feature = "gateway-s3", feature = "gateway-webdav"))]
     Gateway(Box<GatewayArgs>),
 
     /// Run a direct S3 object PUT benchmark without going through FUSE.
@@ -80,18 +80,63 @@ pub enum Command {
     ObjectPutBench(ObjectPutBenchArgs),
 }
 
+#[cfg(any(feature = "gateway-s3", feature = "gateway-webdav"))]
 #[derive(Subcommand, Debug)]
 pub enum GatewayProtocol {
     /// S3-compatible gateway (see doc/protocols/s3-gateway.md).
+    #[cfg(feature = "gateway-s3")]
     S3(S3GatewayArgs),
+
+    /// WebDAV gateway for filesystem clients.
+    #[cfg(feature = "gateway-webdav")]
+    #[command(name = "webdav")]
+    WebDav(WebDavGatewayArgs),
 }
 
+#[cfg(any(feature = "gateway-s3", feature = "gateway-webdav"))]
 #[derive(Args, Debug)]
 pub struct GatewayArgs {
     #[command(subcommand)]
     pub protocol: GatewayProtocol,
 }
 
+#[cfg(feature = "gateway-webdav")]
+#[derive(Args, Debug)]
+pub struct WebDavGatewayArgs {
+    /// HTTP or HTTPS listen address of the WebDAV endpoint.
+    #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:9001")]
+    pub listen: std::net::SocketAddr,
+
+    /// Basic authentication username (or env BREWFS_WEBDAV_USER).
+    #[arg(long, value_name = "USER", env = "BREWFS_WEBDAV_USER")]
+    pub user: Option<String>,
+
+    /// Basic authentication password (or env BREWFS_WEBDAV_PASSWORD).
+    #[arg(long, value_name = "PASSWORD", env = "BREWFS_WEBDAV_PASSWORD")]
+    pub password: Option<String>,
+
+    /// PEM certificate chain for HTTPS.
+    #[arg(long, value_name = "FILE", env = "BREWFS_WEBDAV_TLS_CERT")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// PEM private key for HTTPS.
+    #[arg(long, value_name = "FILE", env = "BREWFS_WEBDAV_TLS_KEY")]
+    pub tls_key: Option<PathBuf>,
+
+    /// Allow unauthenticated read/write access.
+    #[arg(long, default_value_t = false)]
+    pub allow_anonymous: bool,
+
+    /// Publish PUT/PATCH content atomically after a successful flush.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub atomic_put: bool,
+
+    /// Volume backend options; the same set accepted by `brewfs mount`.
+    #[command(flatten)]
+    pub mount: MountArgs,
+}
+
+#[cfg(feature = "gateway-s3")]
 #[derive(Args, Debug)]
 pub struct S3GatewayArgs {
     /// HTTP listen address of the S3 endpoint.

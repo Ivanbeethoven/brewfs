@@ -1,8 +1,8 @@
 # WebDAV Gateway Spec（网盘接入）
 
-状态：已立项
+状态：M2 MVP 已实现；真实客户端兼容性（litmus、davfs2、Windows WebClient、Finder、rclone）仍待独立验收
 依赖：`dav-server = "0.11"`（feature `gateway-webdav`）
-CLI：`brewfs gateway webdav --listen <addr> [--user u --password p] [后端参数...]`
+CLI：`brewfs gateway webdav --listen <addr> [--user u --password p | --allow-anonymous] [后端参数...]`
 
 ## 1. 目标与非目标
 
@@ -29,18 +29,18 @@ CLI：`brewfs gateway webdav --listen <addr> [--user u --password p] [后端参�
 Windows 网络驱动器 / Finder / davfs2 / rclone
       │ HTTP(S) WebDAV
       ▼
-┌──────────────┐  DavFileSystem/DavFile traits  ┌───────────────┐  Client (path ops)
-│ dav-server    │ ─────────────────────────────▶ │ BrewFsDavFs    │ ──────────────▶ Client ─▶ VFS
+┌──────────────┐  DavFileSystem/DavFile traits  ┌────────────────────┐  parent-inode operations
+│ dav-server    │ ─────────────────────────────▶ │ BrewFsDavFs          │ ───────────────────▶ VFS
 │ (axum 集成)   │                                │ (src/gateway/webdav)│
-└──────────────┘                                └───────────────┘
+└──────────────┘                                └────────────────────┘
         │ lock system: memls (MVP) → VFS plock (后续)
         │ dead props: xattr brewfs.dav.deadprops
 ```
 
 - dav-server 负责 HTTP 方法解析、PROPFIND XML、lock 语义框架；我们实现
   `DavFileSystem`（路径级操作）与 `DavFile`（读写句柄）两个 trait；
-- 基于 SDK `Client`；句柄即 `Client::OpenOptions` 打开的 `File`；
-- axum 集成：dav-server 的 `DavHandler` 作为 axum service 挂载，认证走 axum middleware。
+- 基于 VFS 的 parent-inode/path component 操作，拒绝中间 symlink 和内部 namespace 逃逸；条件写使用 ETag/ctime 重新检查。
+- flat-v1 cache 使用 volume namespace；metadata client 使用 backend-specific TTL。
 
 ## 3. 方法映射表
 
@@ -50,7 +50,7 @@ Windows 网络驱动器 / Finder / davfs2 / rclone
 | `PUT` | `create_file` + 流式写 + `flush` | MVP 直接写最终路径；`--atomic-put` 选项切换为 tmp+rename（总设计 §3.3），默认开启见 §5 |
 | `MKCOL` | `mkdir`（父不存在 → 409 `Conflict`；已存在 → 405） | |
 | `DELETE` | 文件 `unlink`；目录 `remove_dir_all`（递归，RFC 要求） | 递归删除限并发（默认 8，防大目录惊群） |
-| `PROPFIND` | depth=0 `stat`；depth=1 `readdir` + 逐条 stat | 属性集：`displayname/getcontentlength/getlastmodified/creationdate/resourcetype/getetag`（inode+mtime+size 合成弱 etag）+ dead props |
+| `PROPFIND` | depth=0 `stat`；depth=1 `readdir` + bounded concurrent `stat_ino`；depth=infinity 一律拒绝（`501` + `propfind-finite-depth`） | 属性集：`displayname/getcontentlength/getlastmodified/creationdate/resourcetype/getetag`（inode+mtime+ctime+size 合成 etag）+ dead props |
 | `PROPPATCH` | dead properties 读写 xattr `brewfs.dav.deadprops`（JSON map） | 活属性（getcontentlength 等）set → 409；xattr 不可用时整请求 507 |
 | `COPY` | 流式服务端复制（read→write），目录递归；`Overwrite: F` → create_new | 后续可用 chunk 级克隆优化 |
 | `MOVE` | `rename`（同 volume 内恒真）；`Overwrite: F` → `RENAME_NOREPLACE` | |
@@ -89,27 +89,26 @@ Windows 网络驱动器 / Finder / davfs2 / rclone
 
 约定：
 
-1. 默认 `--atomic-put=false`（直接写最终路径）：与多数客户端的分段/覆盖行为兼容最好，
-   也是 davfs2/rclone 期望的语义；
-2. `--atomic-put=true` 时启用 tmp+rename（整请求完成才可见）：适合归档类一次性写入，
-   但会破坏依赖"创建后分段写"的客户端 —— 文档中写明取舍；
-3. 无论哪种模式，`flush` 失败必须返回 507/500 而不是静默成功（写回缓存场景下的关键正确性）。
+1. 默认 `--atomic-put=true`（原子发布）：成功 flush 后整请求才可见，适合归档类一次性写入；
+2. `--atomic-put=false` 时启用直接写最终路径：与依赖创建后分段写、传统同步工具的行为兼容最好，但客户端断连或 body 长度错误时可能留下部分目标内容；
+3. 原子模式会保留旧目标直到完整请求成功，且会重新检查 `If-Match`；无论哪种模式，`flush` 失败必须返回错误而不是静默成功；
 
 ## 6. 认证与安全
 
 - `--user/--password`（或 env `BREWFS_WEBDAV_USER/BREWFS_WEBDAV_PASSWORD`）启用 HTTP Basic；
-  未配置 = 匿名读写（仅限可信网络，启动时打 warning）；
+  未配置凭据时必须显式传 `--allow-anonymous`，否则启动失败；匿名模式仅限可信网络；
+- 非 loopback listener 使用 Basic Auth 时必须同时启用 TLS；loopback 明文 HTTP 仅用于本地验证；
 - **Windows 网盘映射的现实约束**：Windows WebClient 默认仅允许 HTTPS 上的 Basic auth
   （否则需改注册表 `BasicAuthLevel=2`）。因此：
   - MVP 提供 `--tls-cert/--tls-key`（rustls）原生 HTTPS —— 这是 Windows 免注册表映射的前提；
-  - 文档给出 `net use Z: https://host:port/` 与注册表两种路径的完整操作步骤；
+  - 使用指南给出 `net use Z: https://host:port/` 与证书信任步骤；
 - 后续：Bearer token（复用 console `AuthConfig` 模式）、多用户。
 
 ## 7. 各客户端兼容性注意点（写入部署文档）
 
 | 客户端 | 注意点 |
 |---|---|
-| Windows redirector | 大文件默认限 50MB（注册表 `FileSizeLimitInBytes`）；会先发 OPTIONS/PROPFIND 探测根路径；中文路径需 UTF-8 percent-encoding（dav-server 已处理） |
+| Windows redirector | 大文件默认限 50MB（注册表 `FileSizeLimitInBytes`）；会先发 OPTIONS/PROPFIND 探测根路径；中文路径需 UTF-8 percent-encoding；HTTPS 是推荐配置 |
 | macOS Finder | 会创建 `.DS_Store`、`._*`（AppleDouble）文件；建议文档说明而非过滤 |
 | davfs2 | 依赖 LOCK 可用；`use_locks 1` 默认；大文件写入走内核页缓存，close 时才 flush——flush 错误必须如实返回 |
 | rclone | 默认 chunked 上传关闭，行为良好；`--vfs-cache-mode writes` 时接近本地盘语义 |
@@ -135,17 +134,17 @@ Windows 网络驱动器 / Finder / davfs2 / rclone
 ```
 brewfs gateway webdav \
   --listen 0.0.0.0:9001 \
-  [--user u --password p] \
+  [--user u --password p | --allow-anonymous] \
   [--tls-cert c.pem --tls-key k.pem] \
-  [--atomic-put] \
-  [--delete-concurrency 8] \
+  [--atomic-put true|false] \
   <与 mount 相同的后端参数>
 ```
 
 ## 11. 里程碑
 
-- **M2（首个实现）**：§3 全表 + memls + Basic auth + TLS + litmus 通过 + davfs2/Windows 冒烟。
-- **后续**：分布式锁、Bearer token、`--atomic-put` 默认值再评估、Web 文件管理器（console 侧）。
+- **M2（实现完成）**：§3 全表 + memls + Basic auth + TLS + 原子 PUT/PATCH + dead properties；本地协议 E2E 已通过。
+- **M2 外部客户端验收（待完成）**：litmus basic/copymove/props/locks、davfs2 挂载读写、Windows 网络驱动器、Finder 和 rclone 冒烟；当前仅有协议级 Python E2E，不能替代这些客户端验收。
+- **后续**：分布式锁、Bearer token、多用户和 Web 文件管理器（console 侧）。
 
 ## 12. 参考
 

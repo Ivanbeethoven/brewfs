@@ -275,6 +275,8 @@ The [testing guide](doc/testing/docker-compose-test-guide.md) covers Redis, TiKV
 - [Architecture](doc/architecture/arch.md)
 - [Configuration](doc/operations/configuration.md)
 - [Binary deployment](doc/operations/binary-deployment.md)
+- [WebDAV gateway usage](doc/operations/webdav-gateway.md)
+- [Protocol gateway index](doc/protocols/README.md)
 - [Benchmark guide](doc/testing/bench.md)
 - [BrewFS/JuiceFS gap analysis](doc/gap/README.md)
 
