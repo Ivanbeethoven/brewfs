@@ -5,6 +5,7 @@ use crate::meta::config::{
 };
 use crate::meta::factory::MetaStoreFactory;
 use crate::meta::store::{FileType, MetaStore};
+use crate::vfs::chunk_id_for;
 
 #[test]
 fn special_node_round_trip_preserves_kind_mode_and_rdev() {
@@ -122,6 +123,81 @@ fn key_schema_uses_namespace_prefixes() {
         TiKvMetaStore::scoped_key("tenant-a", "counter/brewfs:next_inode_id"),
         b"tenant-a/counter/brewfs:next_inode_id".to_vec()
     );
+}
+
+#[test]
+fn truncate_discovers_stale_mappings_and_stages_removed_ranges() {
+    let ino = 42;
+    let chunk0 = chunk_id_for(ino, 0).unwrap();
+    let chunk1 = chunk_id_for(ino, 1).unwrap();
+    let other_inode = chunk_id_for(ino + 1, 1).unwrap();
+    assert_eq!(
+        chunk_ids_for_truncate(ino, 1, &[chunk0, chunk1, other_inode]),
+        vec![chunk1]
+    );
+
+    let slices = vec![
+        SliceDesc {
+            slice_id: 1,
+            chunk_id: chunk0,
+            offset: 0,
+            length: 80,
+        },
+        SliceDesc {
+            slice_id: 2,
+            chunk_id: chunk0,
+            offset: 80,
+            length: 40,
+        },
+    ];
+    assert_eq!(
+        delayed_slices_for_truncate(&slices, Some(100)),
+        vec![(2, 100, 20)]
+    );
+    assert_eq!(
+        delayed_slices_for_truncate(&slices, None),
+        vec![(1, 0, 80), (2, 80, 40)]
+    );
+}
+
+#[test]
+fn chunk_version_keys_are_separate_from_slice_mappings() {
+    assert_eq!(
+        TiKvMetaStore::scoped_key("tenant-a", "chunk_version/42"),
+        b"tenant-a/chunk_version/42".to_vec()
+    );
+}
+
+#[test]
+fn resizing_preserves_sparse_blocks_on_extension_and_clamps_on_shrink() {
+    let allocated_blocks = 8;
+    assert_eq!(
+        preserve_blocks_on_resize(allocated_blocks, 4096, 1 << 30),
+        allocated_blocks,
+        "extending a sparse file must not claim newly allocated blocks"
+    );
+    assert_eq!(
+        preserve_blocks_on_resize(allocated_blocks, 4096, 1024),
+        2,
+        "shrinking must clamp blocks to the new logical size"
+    );
+    assert_eq!(
+        preserve_blocks_on_resize(allocated_blocks, 4096, 4096),
+        allocated_blocks
+    );
+}
+
+#[test]
+fn trim_slices_safely_handles_overflowing_slice_end() {
+    let mut slices = vec![SliceDesc {
+        slice_id: 7,
+        chunk_id: 42,
+        offset: 1,
+        length: u64::MAX,
+    }];
+    trim_slices_safely(&mut slices, 10);
+    assert_eq!(slices.len(), 1);
+    assert_eq!(slices[0].length, 9);
 }
 
 #[test]
@@ -663,6 +739,84 @@ async fn tikv_rename_exchange_swaps_entries() {
     assert_eq!(store.lookup(root, "b").await.unwrap(), Some(a));
     assert_eq!(store.get_paths(a).await.unwrap(), vec!["/b".to_string()]);
     assert_eq!(store.get_paths(b).await.unwrap(), vec!["/a".to_string()]);
+}
+
+#[tokio::test]
+#[ignore = "requires a running TiKV/PD cluster; set BREWFS_TIKV_PD_ENDPOINTS"]
+async fn tikv_truncate_prunes_slices_before_extension_and_restart() {
+    let config = integration_config("truncate-slices");
+    let store = TiKvMetaStore::from_config(config.clone())
+        .await
+        .expect("tikv store should connect");
+    store.initialize().await.unwrap();
+    let root = store.root_ino();
+    let ino = store
+        .create_file(root, "truncate".to_string())
+        .await
+        .unwrap();
+    let chunk_size = 1024;
+    let chunk0 = chunk_id_for(ino, 0).unwrap();
+    let chunk1 = chunk_id_for(ino, 1).unwrap();
+
+    store
+        .write(
+            ino,
+            chunk0,
+            SliceDesc {
+                slice_id: 1,
+                chunk_id: chunk0,
+                offset: 0,
+                length: 800,
+            },
+            800,
+        )
+        .await
+        .unwrap();
+    store
+        .write(
+            ino,
+            chunk0,
+            SliceDesc {
+                slice_id: 2,
+                chunk_id: chunk0,
+                offset: 800,
+                length: 224,
+            },
+            1024,
+        )
+        .await
+        .unwrap();
+    store
+        .write(
+            ino,
+            chunk1,
+            SliceDesc {
+                slice_id: 3,
+                chunk_id: chunk1,
+                offset: 0,
+                length: 128,
+            },
+            1152,
+        )
+        .await
+        .unwrap();
+
+    store.truncate(ino, 600, chunk_size).await.unwrap();
+    assert_eq!(store.get_slices(chunk0).await.unwrap().len(), 1);
+    assert_eq!(store.get_slices(chunk0).await.unwrap()[0].length, 600);
+    assert!(store.get_slices(chunk1).await.unwrap().is_empty());
+    assert_eq!(store.stat(ino).await.unwrap().unwrap().size, 600);
+
+    store.truncate(ino, 1200, chunk_size).await.unwrap();
+    assert_eq!(store.get_slices(chunk0).await.unwrap()[0].length, 600);
+    assert!(store.get_slices(chunk1).await.unwrap().is_empty());
+    assert_eq!(store.stat(ino).await.unwrap().unwrap().size, 1200);
+
+    let restarted = TiKvMetaStore::from_config(config)
+        .await
+        .expect("recreated tikv store should connect");
+    assert_eq!(restarted.get_slices(chunk0).await.unwrap()[0].length, 600);
+    assert!(restarted.get_slices(chunk1).await.unwrap().is_empty());
 }
 
 #[tokio::test]

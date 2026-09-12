@@ -15,7 +15,9 @@ use crate::meta::store::{
     OpenFlags, RenameOutcome, RetryReason, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
     stat_fs_snapshot_from_usage, stat_fs_used_bytes,
 };
+use crate::meta::stores::{TrimAction, trim_action};
 use crate::meta::{INODE_ID_KEY, SLICE_ID_KEY};
+use crate::vfs::{chunk_id_for, extract_ino_and_chunk_index};
 use async_trait::async_trait;
 use chrono::Utc;
 use rand::{RngCore, rng};
@@ -52,6 +54,59 @@ const DELAYED_ID_COUNTER: &str = "gc/delayed/id";
 const UNCOMMITTED_ID_COUNTER: &str = "gc/uncommitted/id";
 
 type TiKvTxnFuture<'txn, T> = Pin<Box<dyn Future<Output = Result<T, MetaError>> + Send + 'txn>>;
+
+fn chunk_ids_for_truncate(ino: i64, drop_start: u64, chunk_ids: &[u64]) -> Vec<u64> {
+    chunk_ids
+        .iter()
+        .copied()
+        .filter(|chunk_id| {
+            let (chunk_ino, chunk_index) = extract_ino_and_chunk_index(*chunk_id);
+            chunk_ino == ino && chunk_index >= drop_start
+        })
+        .collect()
+}
+
+fn delayed_slices_for_truncate(
+    slices: &[SliceDesc],
+    cutoff_offset: Option<u64>,
+) -> Vec<(u64, u64, u32)> {
+    slices
+        .iter()
+        .filter_map(|slice| {
+            let end = slice.offset.saturating_add(slice.length);
+            let (offset, size) = match cutoff_offset {
+                Some(cutoff) if slice.offset >= cutoff => {
+                    (slice.offset, slice.length.min(u32::MAX as u64))
+                }
+                Some(cutoff) if end > cutoff => (cutoff, end - cutoff),
+                Some(_) => return None,
+                None => (slice.offset, slice.length),
+            };
+            Some((slice.slice_id, offset, size.min(u32::MAX as u64) as u32))
+        })
+        .collect()
+}
+
+fn preserve_blocks_on_resize(blocks: u64, old_size: u64, new_size: u64) -> u64 {
+    if new_size < old_size {
+        blocks.min(new_size.div_ceil(512))
+    } else {
+        blocks
+    }
+}
+
+fn trim_slices_safely(slices: &mut Vec<SliceDesc>, cutoff_offset: u64) {
+    slices.retain_mut(
+        |slice| match trim_action(slice.offset, slice.length, cutoff_offset) {
+            TrimAction::Keep => true,
+            TrimAction::Drop => false,
+            TrimAction::Truncate(length) => {
+                slice.length = length;
+                true
+            }
+        },
+    );
+}
 
 #[derive(Debug, Clone, Copy)]
 struct CounterLease {
@@ -160,6 +215,10 @@ impl TiKvMetaStore {
 
     pub(crate) fn chunk_key(&self, chunk_id: u64) -> Vec<u8> {
         self.key_bytes(&format!("chunk/{chunk_id}"))
+    }
+
+    fn chunk_version_key(&self, chunk_id: u64) -> Vec<u8> {
+        self.key_bytes(&format!("chunk_version/{chunk_id}"))
     }
 
     fn chunk_prefix(&self) -> Vec<u8> {
@@ -905,10 +964,129 @@ impl TiKvMetaStore {
     ) -> Result<(), MetaError> {
         let chunk_key = self.chunk_key(chunk_id);
         if slices.is_empty() {
-            Self::txn_delete_raw(txn, chunk_key, operation).await
+            Self::txn_delete_raw(txn, chunk_key, operation).await?;
         } else {
-            Self::txn_put_raw(txn, chunk_key, Self::encode(&slices)?, operation).await
+            Self::txn_put_raw(txn, chunk_key, Self::encode(&slices)?, operation).await?;
         }
+        self.txn_bump_chunk_version(txn, chunk_id, operation).await
+    }
+
+    async fn txn_bump_chunk_version(
+        &self,
+        txn: &mut Transaction,
+        chunk_id: u64,
+        operation: &str,
+    ) -> Result<(), MetaError> {
+        let version_key = self.chunk_version_key(chunk_id);
+        let current = Self::txn_get_raw(txn, version_key.clone(), true, operation)
+            .await?
+            .as_deref()
+            .map(Self::decode_counter)
+            .transpose()?
+            .unwrap_or(0);
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| MetaError::Internal("TiKV chunk version overflow".to_string()))?;
+        Self::txn_put_raw(txn, version_key, Self::encode(&next)?, operation).await
+    }
+
+    async fn txn_prune_slices_for_truncate(
+        &self,
+        txn: &mut Transaction,
+        ino: i64,
+        new_size: u64,
+        old_size: u64,
+        chunk_size: u64,
+        operation: &str,
+    ) -> Result<(), MetaError> {
+        if chunk_size == 0 {
+            return Err(MetaError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "chunk size must be greater than zero",
+            )));
+        }
+        if new_size >= old_size {
+            return Ok(());
+        }
+
+        let cutoff_chunk = new_size / chunk_size;
+        let cutoff_offset = new_size % chunk_size;
+        let drop_start = if cutoff_offset == 0 {
+            cutoff_chunk
+        } else {
+            cutoff_chunk + 1
+        };
+
+        if cutoff_offset > 0 {
+            let chunk_id = chunk_id_for(ino, cutoff_chunk).map_err(MetaError::Io)?;
+            let mut slices = self.txn_get_slices(txn, chunk_id, true, operation).await?;
+            let delayed_slices = delayed_slices_for_truncate(&slices, Some(cutoff_offset));
+            trim_slices_safely(&mut slices, cutoff_offset);
+            self.txn_put_slices_or_delete(txn, chunk_id, &slices, operation)
+                .await?;
+            self.txn_stage_delayed_slice_records(
+                txn,
+                chunk_id,
+                &delayed_slices,
+                Self::now_secs(),
+                operation,
+            )
+            .await?;
+        }
+
+        // Discover persisted mappings instead of trusting the inode's logical
+        // size. This handles legacy stale mappings and sparse files without
+        // walking every logical chunk up to old_size.
+        let prefix = self.chunk_prefix();
+        let pairs = Self::txn_scan_prefix(txn, prefix.clone(), None, operation).await?;
+        let mut persisted_chunk_ids = Vec::new();
+        for pair in pairs {
+            let key: Vec<u8> = pair.key().clone().into();
+            let suffix = std::str::from_utf8(&key[prefix.len()..]).map_err(|error| {
+                MetaError::Serialization(format!("TiKV chunk key is not UTF-8: {error}"))
+            })?;
+            let Ok(chunk_id) = suffix.parse::<u64>() else {
+                continue;
+            };
+            persisted_chunk_ids.push(chunk_id);
+        }
+
+        let chunk_ids = chunk_ids_for_truncate(ino, drop_start, &persisted_chunk_ids);
+        if chunk_ids.is_empty() {
+            return Ok(());
+        }
+        let locked_chunks = Self::txn_batch_get_for_update_raw(
+            txn,
+            chunk_ids
+                .iter()
+                .map(|chunk_id| self.chunk_key(*chunk_id))
+                .collect(),
+            operation,
+        )
+        .await?;
+        for chunk_id in chunk_ids {
+            let slices = locked_chunks
+                .get(&self.chunk_key(chunk_id))
+                .map(|bytes| Self::decode_slices(bytes))
+                .transpose()?
+                .unwrap_or_default();
+            if slices.is_empty() {
+                continue;
+            }
+            let delayed_slices = delayed_slices_for_truncate(&slices, None);
+            self.txn_put_slices_or_delete(txn, chunk_id, &[], operation)
+                .await?;
+            self.txn_stage_delayed_slice_records(
+                txn,
+                chunk_id,
+                &delayed_slices,
+                Self::now_secs(),
+                operation,
+            )
+            .await?;
+        }
+
+        Ok(())
     }
 
     async fn txn_stage_delayed_slice_records(
@@ -2133,6 +2311,41 @@ impl MetaStore for TiKvMetaStore {
         .await
     }
 
+    async fn truncate(&self, ino: i64, size: u64, chunk_size: u64) -> Result<(), MetaError> {
+        let operation = "truncate";
+        self.write_txn(operation, |store, txn| {
+            Box::pin(async move {
+                let mut node = store
+                    .txn_get_node(txn, ino, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(ino))?;
+                if node.kind != StoredNodeKind::File {
+                    return Err(MetaError::NotSupported(
+                        "TiKV truncate currently supports only regular files".to_string(),
+                    ));
+                }
+
+                let old_size = node.size;
+                if size != old_size {
+                    store
+                        .txn_prune_slices_for_truncate(
+                            txn, ino, size, old_size, chunk_size, operation,
+                        )
+                        .await?;
+                    let now = Self::now();
+                    node.size = size;
+                    node.blocks = preserve_blocks_on_resize(node.blocks, old_size, size);
+                    node.mtime = now;
+                    node.ctime = now;
+                    store.txn_put_node(txn, &node, operation).await?;
+                }
+
+                Ok(())
+            })
+        })
+        .await
+    }
+
     async fn set_file_size(&self, ino: i64, size: u64) -> Result<(), MetaError> {
         let operation = "set_file_size";
         self.write_txn(operation, |store, txn| {
@@ -2146,9 +2359,10 @@ impl MetaStore for TiKvMetaStore {
                         "TiKV set_file_size currently supports only regular files".to_string(),
                     ));
                 }
+                let old_size = node.size;
                 let now = Self::now();
                 node.size = size;
-                node.blocks = size.div_ceil(512);
+                node.blocks = preserve_blocks_on_resize(node.blocks, old_size, size);
                 node.mtime = now;
                 node.ctime = now;
                 store.txn_put_node(txn, &node, operation).await
@@ -2174,7 +2388,6 @@ impl MetaStore for TiKvMetaStore {
                 if size > node.size {
                     let now = Self::now();
                     node.size = size;
-                    node.blocks = size.div_ceil(512);
                     node.mtime = now;
                     node.ctime = now;
                     store.txn_put_node(txn, &node, operation).await?;
@@ -2235,8 +2448,9 @@ impl MetaStore for TiKvMetaStore {
                         ));
                     }
                     if node.size != size {
+                        let old_size = node.size;
                         node.size = size;
-                        node.blocks = size.div_ceil(512);
+                        node.blocks = preserve_blocks_on_resize(node.blocks, old_size, size);
                         node.mtime = now;
                     }
                     ctime_update = true;
@@ -2519,6 +2733,58 @@ impl MetaStore for TiKvMetaStore {
         let operation = "get_slices";
         self.read_txn(operation, |store, txn| {
             Box::pin(async move { store.txn_get_slices(txn, chunk_id, false, operation).await })
+        })
+        .await
+    }
+
+    async fn get_slices_with_version(
+        &self,
+        chunk_id: u64,
+    ) -> Result<(Option<u64>, Vec<SliceDesc>), MetaError> {
+        let operation = "get_slices_with_version";
+        self.read_txn(operation, |store, txn| {
+            Box::pin(async move {
+                let slices = store
+                    .txn_get_slices(txn, chunk_id, false, operation)
+                    .await?;
+                let version =
+                    Self::txn_get_raw(txn, store.chunk_version_key(chunk_id), false, operation)
+                        .await?
+                        .as_deref()
+                        .map(Self::decode_counter)
+                        .transpose()?
+                        .map(|version| {
+                            u64::try_from(version).map_err(|_| {
+                                MetaError::Serialization(
+                                    "TiKV chunk version must be non-negative".to_string(),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                Ok((version, slices))
+            })
+        })
+        .await
+    }
+
+    async fn get_chunk_version(&self, chunk_id: u64) -> Result<Option<u64>, MetaError> {
+        let operation = "get_chunk_version";
+        self.read_txn(operation, |store, txn| {
+            Box::pin(async move {
+                Self::txn_get_raw(txn, store.chunk_version_key(chunk_id), false, operation)
+                    .await?
+                    .as_deref()
+                    .map(Self::decode_counter)
+                    .transpose()?
+                    .map(|version| {
+                        u64::try_from(version).map_err(|_| {
+                            MetaError::Serialization(
+                                "TiKV chunk version must be non-negative".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()
+            })
         })
         .await
     }
