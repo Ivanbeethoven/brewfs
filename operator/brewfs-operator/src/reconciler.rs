@@ -6,7 +6,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context as _};
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::{
-    DaemonSet, DaemonSetSpec, Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec,
+    DaemonSet, DaemonSetSpec, Deployment, DeploymentSpec, DeploymentStrategy, StatefulSet,
+    StatefulSetSpec,
 };
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
@@ -90,6 +91,7 @@ pub async fn reconcile_cluster(
 
     apply_rustfs_secret(&client, &namespace, &cluster, &owner).await?;
     apply_rustfs_pvc(&client, &namespace, &cluster, &owner).await?;
+    apply_redis_pvc(&client, &namespace, &cluster, &owner).await?;
     apply_redis_service(&client, &namespace, &cluster, &owner).await?;
     apply_redis_deployment(&client, &namespace, &cluster, &owner).await?;
     apply_rustfs_service(&client, &namespace, &cluster, &owner).await?;
@@ -101,13 +103,36 @@ pub async fn reconcile_cluster(
             return Ok(Action::requeue(Duration::from_secs(5)));
         }
     }
+    let redis_pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &namespace);
+    let redis_pvc = redis_pvc_api
+        .get_opt(&redis_pvc_name(&cluster.name_any()))
+        .await
+        .context("observe Redis PVC")?;
+    let redis_deployment_api: Api<Deployment> = Api::namespaced(client.clone(), &namespace);
+    let redis_deployment = redis_deployment_api
+        .get_opt(&redis_name(&cluster.name_any()))
+        .await
+        .context("observe Redis Deployment")?;
+    if !redis_pvc.as_ref().is_some_and(pvc_is_bound)
+        || !redis_deployment.as_ref().is_some_and(deployment_is_ready)
+    {
+        patch_cluster_status_phase(
+            &client,
+            &namespace,
+            &cluster,
+            "Progressing",
+            "waiting for Redis PVC and Deployment readiness",
+        )
+        .await?;
+        return Ok(Action::requeue(Duration::from_secs(5)));
+    }
     apply_brewfs_config(&client, &namespace, &cluster, &owner).await?;
     patch_cluster_status(
         &client,
         &namespace,
         &cluster,
         "Ready",
-        "Backend resources reconciled and RustFS initialization completed",
+        "Backend resources reconciled and Redis persistence is ready",
     )
     .await?;
     #[cfg(feature = "workspace-operator")]
@@ -437,6 +462,10 @@ fn rustfs_job_name_for_hash(cluster_name: &str, hash: &str) -> String {
     format!("{prefix}{SUFFIX}{}", &hash[..HASH_LEN])
 }
 
+fn redis_pvc_name(cluster_name: &str) -> String {
+    format!("{cluster_name}-redis-data")
+}
+
 fn cluster_config_map_name(cluster_name: &str) -> String {
     format!("{cluster_name}-brewfs-config")
 }
@@ -511,6 +540,39 @@ async fn apply_rustfs_pvc(
     apply(&api, &name, &desired).await
 }
 
+fn build_redis_pvc(cluster: &BrewFSCluster, owner: &OwnerReference) -> PersistentVolumeClaim {
+    let cluster_name = cluster.name_any();
+    let name = redis_pvc_name(&cluster_name);
+    PersistentVolumeClaim {
+        metadata: object_meta(name, labels(&cluster_name, "redis-storage"), owner),
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+            storage_class_name: cluster.spec.redis.storage_class_name.clone(),
+            resources: Some(k8s_openapi::api::core::v1::VolumeResourceRequirements {
+                requests: Some(BTreeMap::from([(
+                    "storage".to_string(),
+                    Quantity(cluster.spec.redis.storage_size.clone()),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+async fn apply_redis_pvc(
+    client: &kube::Client,
+    namespace: &str,
+    cluster: &BrewFSCluster,
+    owner: &OwnerReference,
+) -> Result<(), anyhow::Error> {
+    let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
+    let name = redis_pvc_name(&cluster.name_any());
+    let desired = build_redis_pvc(cluster, owner);
+    apply(&api, &name, &desired).await
+}
+
 async fn apply_redis_service(
     client: &kube::Client,
     namespace: &str,
@@ -542,20 +604,19 @@ async fn apply_redis_service(
     apply(&api, &name, &desired).await
 }
 
-async fn apply_redis_deployment(
-    client: &kube::Client,
-    namespace: &str,
-    cluster: &BrewFSCluster,
-    owner: &OwnerReference,
-) -> Result<(), anyhow::Error> {
-    let api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+fn build_redis_deployment(cluster: &BrewFSCluster, owner: &OwnerReference) -> Deployment {
     let cluster_name = cluster.name_any();
     let name = redis_name(&cluster_name);
     let match_labels = labels(&cluster_name, "redis");
-    let desired = Deployment {
+    let pvc_name = redis_pvc_name(&cluster_name);
+    Deployment {
         metadata: object_meta(name.clone(), match_labels.clone(), owner),
         spec: Some(DeploymentSpec {
             replicas: Some(1),
+            strategy: Some(DeploymentStrategy {
+                type_: Some("Recreate".to_string()),
+                ..DeploymentStrategy::default()
+            }),
             selector: LabelSelector {
                 match_labels: Some(match_labels.clone()),
                 ..LabelSelector::default()
@@ -571,6 +632,8 @@ async fn apply_redis_deployment(
                         image: Some(cluster.spec.redis.image.clone()),
                         args: Some(vec![
                             "redis-server".to_string(),
+                            "--dir".to_string(),
+                            "/data".to_string(),
                             "--appendonly".to_string(),
                             "yes".to_string(),
                             "--appendfsync".to_string(),
@@ -581,15 +644,41 @@ async fn apply_redis_deployment(
                             name: Some("redis".to_string()),
                             ..ContainerPort::default()
                         }]),
+                        volume_mounts: Some(vec![VolumeMount {
+                            name: "data".to_string(),
+                            mount_path: "/data".to_string(),
+                            ..VolumeMount::default()
+                        }]),
                         ..Container::default()
                     }],
+                    volumes: Some(vec![Volume {
+                        name: "data".to_string(),
+                        persistent_volume_claim: Some(
+                            k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+                                claim_name: pvc_name,
+                                ..Default::default()
+                            },
+                        ),
+                        ..Volume::default()
+                    }]),
                     ..PodSpec::default()
                 }),
             },
             ..DeploymentSpec::default()
         }),
         ..Deployment::default()
-    };
+    }
+}
+
+async fn apply_redis_deployment(
+    client: &kube::Client,
+    namespace: &str,
+    cluster: &BrewFSCluster,
+    owner: &OwnerReference,
+) -> Result<(), anyhow::Error> {
+    let api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    let name = redis_name(&cluster.name_any());
+    let desired = build_redis_deployment(cluster, owner);
     apply(&api, &name, &desired).await
 }
 
@@ -2200,6 +2289,26 @@ fn cluster_ready_status(
     }
 }
 
+fn pvc_is_bound(pvc: &PersistentVolumeClaim) -> bool {
+    pvc.status
+        .as_ref()
+        .and_then(|status| status.phase.as_deref())
+        == Some("Bound")
+}
+
+fn deployment_is_ready(deployment: &Deployment) -> bool {
+    let Some(status) = deployment.status.as_ref() else {
+        return false;
+    };
+    let Some(spec) = deployment.spec.as_ref() else {
+        return false;
+    };
+    let desired = spec.replicas.unwrap_or(1);
+    status.observed_generation == deployment.metadata.generation
+        && status.updated_replicas == Some(desired)
+        && status.available_replicas == Some(desired)
+}
+
 fn cluster_status_semantically_equal(
     current: &BrewFSClusterStatus,
     desired: &BrewFSClusterStatus,
@@ -2269,6 +2378,38 @@ async fn patch_cluster_status(
         "apiVersion": "storage.brewfs.io/v1alpha1",
         "kind": "BrewFSCluster",
         "status": status,
+    });
+    api.patch_status(
+        &cluster_name,
+        &PatchParams::apply("brewfs-operator").force(),
+        &Patch::Apply(&patch),
+    )
+    .await
+    .with_context(|| format!("patch status for {cluster_name}"))?;
+    Ok(())
+}
+
+async fn patch_cluster_status_phase(
+    client: &kube::Client,
+    namespace: &str,
+    cluster: &BrewFSCluster,
+    phase: &str,
+    message: &str,
+) -> Result<(), anyhow::Error> {
+    let api: Api<BrewFSCluster> = Api::namespaced(client.clone(), namespace);
+    let cluster_name = cluster.name_any();
+    let mut status = cluster_ready_status(
+        cluster,
+        "Ready",
+        "Backend resources reconciled and Redis persistence is ready",
+        None,
+    );
+    status.phase = phase.to_string();
+    status.message = message.to_string();
+    let patch = json!({
+        "apiVersion": "storage.brewfs.io/v1alpha1",
+        "kind": "BrewFSCluster",
+        "status": BrewFSClusterStatus { last_reconciled_at: Some(Utc::now()), ..status },
     });
     api.patch_status(
         &cluster_name,
