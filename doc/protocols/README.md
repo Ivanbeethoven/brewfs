@@ -6,7 +6,7 @@
 | 协议 | Spec | 状态 |
 |---|---|---|
 | S3 Gateway | [s3-gateway.md](s3-gateway.md) | M1 已实现（PR #83）；M3 兼容性/后端矩阵规划中 |
-| WebDAV（网盘） | [webdav.md](webdav.md) | 已立项 |
+| WebDAV（网盘） | [webdav.md](webdav.md) / [使用指南](../operations/webdav-gateway.md) / [验证说明](webdav-gateway-verification.md) | M2 MVP 已实现；外部客户端兼容性待验收 |
 | NFS | [nfs.md](nfs.md) | 已立项 |
 | 其他协议评估 | 见本文 §6 | SMB / SFTP / HDFS 等 |
 

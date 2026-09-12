@@ -129,6 +129,22 @@ fn is_posix_acl_xattr(name: &str) -> bool {
     matches!(name, "system.posix_acl_access" | "system.posix_acl_default")
 }
 
+/// Xattr names in the `system.*` namespace are reserved for kernel POSIX ACL
+/// semantics and BrewFS control-plane metadata (e.g. `system.brewfs.acl`,
+/// `system.brewfs.trash`). Those are written through the meta client, never by
+/// untrusted FUSE clients, so they are hidden from the FUSE xattr interface.
+fn is_internal_xattr(name: &str) -> bool {
+    name.starts_with("system.")
+}
+
+/// POSIX reserves the `user.*` namespace for unprivileged extended attributes;
+/// FUSE clients may only write names in that namespace. Non-`user.` namespaces
+/// (`system.*`, `trusted.*`, `security.*`, ...) require privileges the FUSE
+/// layer does not model, so writes to them are rejected with EPERM.
+fn is_user_xattr_name(name: &str) -> bool {
+    name.starts_with("user.")
+}
+
 /// Virtual inode for the `.stats` file exposed at the mount root.
 /// Uses a high inode number unlikely to collide with real inodes.
 const STATS_INODE: u64 = 0x7FFF_FFFF_0000_0003;
@@ -2131,6 +2147,12 @@ where
         if is_posix_acl_xattr(&name) {
             return Err(libc::EOPNOTSUPP.into());
         }
+        // Control-plane xattrs such as `system.brewfs.acl` drive permission
+        // decisions, so untrusted clients must never be able to write (and
+        // thereby overwrite) them.
+        if !is_user_xattr_name(&name) {
+            return Err(libc::EPERM.into());
+        }
         self.set_xattr_ino(inode as i64, &name, value, flags)
             .await
             .map_err(|e| match e {
@@ -2154,6 +2176,10 @@ where
         let name = name.to_string_lossy();
         if is_posix_acl_xattr(&name) {
             return Err(libc::EOPNOTSUPP.into());
+        }
+        if is_internal_xattr(&name) {
+            // Internal control-plane xattrs are hidden from FUSE clients.
+            return Err(libc::ENODATA.into());
         }
         let value = self
             .get_xattr_ino(inode as i64, &name)
@@ -2184,7 +2210,10 @@ where
                 _ => Errno::from(libc::EIO),
             })?
             .into_iter()
-            .filter(|name| !is_posix_acl_xattr(name))
+            // Hide reserved namespaces: POSIX ACL names and internal
+            // control-plane metadata (system.brewfs.*) must not be listed to
+            // untrusted clients.
+            .filter(|name| !is_internal_xattr(name))
             .collect::<Vec<_>>();
         let total_len: usize = names.iter().map(|n| n.len() + 1).sum();
         if size == 0 {
@@ -2208,6 +2237,9 @@ where
         let name = name.to_string_lossy();
         if is_posix_acl_xattr(&name) {
             return Err(libc::EOPNOTSUPP.into());
+        }
+        if !is_user_xattr_name(&name) {
+            return Err(libc::EPERM.into());
         }
         self.remove_xattr_ino(inode as i64, &name)
             .await
@@ -4323,6 +4355,166 @@ mod fuse_init_tests {
         assert!(is_posix_acl_xattr("system.posix_acl_default"));
         assert!(!is_posix_acl_xattr(CONTROL_ACL_XATTR_NAME));
         assert!(!is_posix_acl_xattr("user.test"));
+    }
+
+    #[test]
+    fn user_xattr_namespace_policy_rejects_reserved_namespaces() {
+        assert!(is_user_xattr_name("user.test"));
+        assert!(is_user_xattr_name("user."));
+        assert!(!is_user_xattr_name("system.brewfs.acl"));
+        assert!(!is_user_xattr_name("trusted.foo"));
+        assert!(!is_user_xattr_name("security.selinux"));
+        assert!(!is_user_xattr_name("userspace"));
+
+        assert!(is_internal_xattr("system.brewfs.acl"));
+        assert!(is_internal_xattr("system.brewfs.trash"));
+        assert!(is_internal_xattr("system.posix_acl_access"));
+        assert!(!is_internal_xattr("user.test"));
+        assert!(!is_internal_xattr("trusted.foo"));
+    }
+
+    #[tokio::test]
+    async fn setxattr_rejects_reserved_namespaces_but_allows_user_namespace() {
+        let fs = new_fuse_test_vfs().await;
+        fs.create_file("/file.txt").await.unwrap();
+        let attr = fs.stat("/file.txt").await.unwrap();
+
+        for name in [
+            "system.brewfs.acl",
+            "system.brewfs.trash",
+            "trusted.external",
+            "security.selinux",
+        ] {
+            let err = Filesystem::setxattr(
+                &fs,
+                Request::default(),
+                attr.ino as u64,
+                OsStr::new(name),
+                b"{}",
+                0,
+                0,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err, Errno::from(libc::EPERM), "unexpected errno for {name}");
+        }
+
+        // The Linux POSIX ACL interception path is unchanged.
+        let err = Filesystem::setxattr(
+            &fs,
+            Request::default(),
+            attr.ino as u64,
+            OsStr::new("system.posix_acl_access"),
+            b"raw-acl",
+            0,
+            0,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, Errno::from(libc::EOPNOTSUPP));
+
+        Filesystem::setxattr(
+            &fs,
+            Request::default(),
+            attr.ino as u64,
+            OsStr::new("user.ok"),
+            b"v",
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn internal_control_xattrs_are_hidden_from_getxattr_and_listxattr() {
+        let fs = new_fuse_test_vfs().await;
+        fs.create_file("/file.txt").await.unwrap();
+        let attr = fs.stat("/file.txt").await.unwrap();
+
+        Filesystem::setxattr(
+            &fs,
+            Request::default(),
+            attr.ino as u64,
+            OsStr::new("user.visible"),
+            b"1",
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+        // Plant control-plane metadata the way the meta client does: directly
+        // through the store, bypassing the FUSE entry points.
+        fs.set_xattr_ino(attr.ino as i64, "system.brewfs.acl", b"[]", 0)
+            .await
+            .unwrap();
+
+        let err = Filesystem::getxattr(
+            &fs,
+            Request::default(),
+            attr.ino as u64,
+            OsStr::new("system.brewfs.acl"),
+            0,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, Errno::from(libc::ENODATA));
+
+        let reply = Filesystem::listxattr(&fs, Request::default(), attr.ino as u64, 0)
+            .await
+            .unwrap();
+        let ReplyXAttr::Size(size) = reply else {
+            panic!("size probe should return ReplyXAttr::Size, got {reply:?}");
+        };
+        assert_eq!(size as usize, "user.visible\0".len());
+    }
+
+    #[tokio::test]
+    async fn removexattr_rejects_internal_control_xattrs() {
+        let fs = new_fuse_test_vfs().await;
+        fs.create_file("/file.txt").await.unwrap();
+        let attr = fs.stat("/file.txt").await.unwrap();
+
+        fs.set_xattr_ino(attr.ino as i64, "system.brewfs.trash", b"{}", 0)
+            .await
+            .unwrap();
+        Filesystem::setxattr(
+            &fs,
+            Request::default(),
+            attr.ino as u64,
+            OsStr::new("user.tmp"),
+            b"v",
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+
+        let err = Filesystem::removexattr(
+            &fs,
+            Request::default(),
+            attr.ino as u64,
+            OsStr::new("system.brewfs.trash"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, Errno::from(libc::EPERM));
+        assert!(
+            fs.get_xattr_ino(attr.ino as i64, "system.brewfs.trash")
+                .await
+                .unwrap()
+                .is_some(),
+            "control-plane xattr must survive a rejected remove"
+        );
+
+        Filesystem::removexattr(
+            &fs,
+            Request::default(),
+            attr.ino as u64,
+            OsStr::new("user.tmp"),
+        )
+        .await
+        .unwrap();
     }
 
     #[test]

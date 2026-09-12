@@ -13,10 +13,19 @@
 /// volume root. See `doc/protocols/README.md` §3.1.
 pub const SYS_DIR: &str = "/.brewfs.sys";
 
+#[cfg(feature = "gateway-s3")]
 /// Returns the S3 gateway subsystem directory under [`SYS_DIR`].
 pub fn s3_sys_dir() -> String {
     format!("{SYS_DIR}/s3")
 }
 
+#[cfg(feature = "gateway-webdav")]
+pub fn webdav_sys_dir() -> String {
+    format!("{SYS_DIR}/webdav")
+}
+
 #[cfg(feature = "gateway-s3")]
 pub mod s3;
+
+#[cfg(feature = "gateway-webdav")]
+pub mod webdav;

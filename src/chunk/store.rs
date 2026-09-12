@@ -67,6 +67,11 @@ pub trait BlockStore {
         data: &[u8],
     ) -> anyhow::Result<u64>;
 
+    /// Read exactly `buf.len()` bytes from a metadata-referenced block.
+    ///
+    /// Sparse holes are represented by the absence of slice metadata, so a
+    /// missing block or a block that does not cover the requested range is
+    /// corruption and must return [`IncompleteBlockRead`].
     async fn read_range(&self, key: BlockKey, offset: u64, buf: &mut [u8]) -> anyhow::Result<()>;
 
     /// Delete `block_count` blocks starting from `key.1` (block_index) for slice `key.0`.
@@ -93,6 +98,39 @@ pub trait BlockStore {
 }
 
 pub type BlockKey = (u64 /*slice_id*/, u32 /*block_index*/);
+
+/// A metadata-referenced block did not contain the complete requested range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "incomplete block read for slice {slice_id} block {block_index}: requested {expected} bytes at offset {offset}, received {actual}"
+)]
+pub struct IncompleteBlockRead {
+    pub slice_id: u64,
+    pub block_index: u32,
+    pub offset: u64,
+    pub expected: usize,
+    pub actual: usize,
+}
+
+fn require_complete_read(
+    key: BlockKey,
+    offset: u64,
+    expected: usize,
+    actual: usize,
+) -> anyhow::Result<()> {
+    if actual == expected {
+        return Ok(());
+    }
+
+    Err(IncompleteBlockRead {
+        slice_id: key.0,
+        block_index: key.1,
+        offset,
+        expected,
+        actual,
+    }
+    .into())
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ObjectStoreStatsSnapshot {
@@ -260,19 +298,17 @@ impl BlockStore for InMemoryBlockStore {
         Ok(data.len() as u64)
     }
 
-    // Caller is responsible for zero-filling buf; this method only overwrites existing bytes.
     async fn read_range(&self, key: BlockKey, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         let guard = self.map.read().await;
-        if let Some(src) = guard.get(&key) {
-            let start = offset.as_usize();
-            let end = start + buf.len();
-            let copy_end = end.min(src.len());
-            if copy_end > start {
-                let len = copy_end - start;
-                buf[..len].copy_from_slice(&src[start..copy_end]);
-            }
+        let Some(src) = guard.get(&key) else {
+            return require_complete_read(key, offset, buf.len(), 0);
+        };
+        let start = offset.as_usize();
+        let available = src.len().saturating_sub(start).min(buf.len());
+        if available > 0 {
+            buf[..available].copy_from_slice(&src[start..start + available]);
         }
-        Ok(())
+        require_complete_read(key, offset, buf.len(), available)
     }
 
     async fn delete_range(&self, key: BlockKey, block_count: u64) -> anyhow::Result<()> {
@@ -681,7 +717,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                 Err(_) => return None,
             }
         }
-        (read_len > 0).then_some(read_len)
+        (read_len == buf.len()).then_some(read_len)
     }
 
     async fn try_promote_page_cache_to_block_cache(&self, key: BlockKey) -> bool {
@@ -882,7 +918,6 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         skip(self, buf),
         fields(key = ?key, offset, len = buf.len(), read_len = tracing::field::Empty, strategy = tracing::field::Empty)
     )]
-    // Caller is responsible for zero-filling buf; this method only overwrites existing bytes.
     async fn read_range(&self, key: BlockKey, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         let len = buf.len();
         if len == 0 {
@@ -910,17 +945,22 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         }
 
         if full_block_read && let Some(cached) = self.block_cache.get(&key_str).await {
-            tracing::trace!(key = %key_str, len = cached.len(), "block_cache HIT");
-            tracing::Span::current().record("strategy", "cache_hit");
-            self.object_metrics.record_read_block_cache_hit();
             let offset_usize = offset as usize;
-            let end = (offset_usize + len).min(cached.len());
-            if offset_usize < cached.len() {
-                let copy_len = end - offset_usize;
-                buf[..copy_len].copy_from_slice(&cached[offset_usize..end]);
-                tracing::Span::current().record("read_len", copy_len);
+            if cached.len().saturating_sub(offset_usize) >= len {
+                tracing::trace!(key = %key_str, len = cached.len(), "block_cache HIT");
+                tracing::Span::current().record("strategy", "cache_hit");
+                tracing::Span::current().record("read_len", len);
+                self.object_metrics.record_read_block_cache_hit();
+                buf.copy_from_slice(&cached[offset_usize..offset_usize + len]);
+                return Ok(());
             }
-            return Ok(());
+            tracing::trace!(
+                key = %key_str,
+                cached_len = cached.len(),
+                offset,
+                len,
+                "block_cache entry does not cover requested range"
+            );
         }
 
         if let Some(read_len) = self.read_persistent_slice_cache(key, offset, buf).await {
@@ -959,7 +999,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                 buf[..copy_len].copy_from_slice(&block_data.as_ref()[offset_usize..copy_end]);
             }
             tracing::Span::current().record("read_len", copy_len);
-            return Ok(());
+            return require_complete_read(key, offset, len, copy_len);
         }
 
         // Serve fully cached pages before resolving the remote object layout.
@@ -981,7 +1021,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             }
 
             if !cached_pages.is_empty() {
-                let mut pos = 0;
+                let mut total_read = 0;
                 for (page_idx, page_data) in (start_page..=end_page).zip(cached_pages) {
                     let page_start = page_idx * page_size;
                     let copy_start = if page_idx == start_page {
@@ -989,22 +1029,24 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                     } else {
                         0
                     };
-                    let copy_end = if page_idx == end_page {
+                    let requested_end = if page_idx == end_page {
                         (offset as usize + len).saturating_sub(page_start)
                     } else {
-                        page_data.len()
-                    }
-                    .min(page_data.len());
+                        page_size
+                    };
+                    let copy_end = requested_end.min(page_data.len());
                     if copy_end > copy_start {
                         let copy_len = copy_end - copy_start;
-                        buf[pos..pos + copy_len].copy_from_slice(&page_data[copy_start..copy_end]);
-                        pos += copy_len;
+                        let output_start = page_start + copy_start - offset as usize;
+                        buf[output_start..output_start + copy_len]
+                            .copy_from_slice(&page_data[copy_start..copy_end]);
+                        total_read += copy_len;
                     }
                 }
                 tracing::Span::current().record("strategy", "page_cache_hit");
-                tracing::Span::current().record("read_len", pos);
+                tracing::Span::current().record("read_len", total_read);
                 self.object_metrics.record_read_page_cache_hit();
-                return Ok(());
+                return require_complete_read(key, offset, len, total_read);
             }
         }
 
@@ -1034,7 +1076,6 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             let client = &self.client;
             let page_cache = &self.page_cache;
             let object_metrics = self.object_metrics.clone();
-            let mut pos: usize = 0;
             let mut total_read: usize = 0;
             let mut range_missed = false;
 
@@ -1076,7 +1117,9 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                             page_object_metrics.record_get(read_len as u64, started.elapsed());
                             page_buf.truncate(read_len);
                             let page_bytes = Bytes::from(page_buf);
-                            page_cache.insert(cache_key, page_bytes.clone()).await;
+                            if read_len == range_len {
+                                page_cache.insert(cache_key, page_bytes.clone()).await;
+                            }
                             Ok(page_bytes)
                         })
                         .await
@@ -1090,16 +1133,17 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                 } else {
                     0
                 };
-                let copy_end = if page_idx == end_page {
+                let requested_end = if page_idx == end_page {
                     (offset as usize + len).saturating_sub(page_start)
                 } else {
-                    page_data.len()
+                    page_end - page_start
                 };
-                let copy_end = copy_end.min(page_data.len());
+                let copy_end = requested_end.min(page_data.len());
                 if copy_end > copy_start {
                     let copy_len = copy_end - copy_start;
-                    buf[pos..pos + copy_len].copy_from_slice(&page_data[copy_start..copy_end]);
-                    pos += copy_len;
+                    let output_start = page_start + copy_start - offset as usize;
+                    buf[output_start..output_start + copy_len]
+                        .copy_from_slice(&page_data[copy_start..copy_end]);
                     total_read += copy_len;
                 }
             }
@@ -1111,8 +1155,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             } else {
                 self.object_metrics.record_read_page_cache_hit();
             }
+            require_complete_read(key, offset, len, total_read)?;
             if range_missed
-                && total_read > 0
                 && self.config.range_background_prefetch
                 && !self.try_promote_page_cache_to_block_cache(key).await
             {
@@ -1170,6 +1214,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             buf[..copy_len].copy_from_slice(&block_data.as_ref()[offset_usize..copy_end]);
         }
         tracing::Span::current().record("read_len", copy_len);
+
+        require_complete_read(key, offset, len, copy_len)?;
 
         // Populate caches after serving the read — the hot cache insert is
         // fast (in-memory) so we await it to ensure subsequent reads hit.
@@ -1237,6 +1283,131 @@ mod tests {
     use crate::cadapter::client::ObjectClient;
     use crate::cadapter::localfs::LocalFsBackend;
     use crate::chunk::layout::ChunkLayout;
+
+    async fn local_object_store(
+        object_dir: &Path,
+        cache_dir: &Path,
+        block_size: usize,
+    ) -> ObjectBlockStore<LocalFsBackend> {
+        ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(LocalFsBackend::new(object_dir)),
+            ChunksCacheConfig::with_budgets(1024 * 1024, 1024 * 1024, cache_dir.to_path_buf()),
+            BlockStoreConfig {
+                block_size,
+                range_read_threshold: 1.0,
+                compression: Compression::None,
+                populate_write_cache_after_upload: false,
+                range_background_prefetch: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn assert_incomplete_read(
+        error: &anyhow::Error,
+        key: BlockKey,
+        offset: u64,
+        expected: usize,
+        actual: usize,
+    ) {
+        let error = error
+            .downcast_ref::<IncompleteBlockRead>()
+            .expect("read must return a typed incomplete-block error");
+        assert_eq!(error.slice_id, key.0);
+        assert_eq!(error.block_index, key.1);
+        assert_eq!(error.offset, offset);
+        assert_eq!(error.expected, expected);
+        assert_eq!(error.actual, actual);
+    }
+
+    #[tokio::test]
+    async fn missing_and_truncated_referenced_blocks_fail_exact_reads() {
+        const BLOCK_SIZE: usize = 4096;
+        let object_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let store = local_object_store(object_dir.path(), cache_dir.path(), BLOCK_SIZE).await;
+
+        let mut full = vec![0u8; BLOCK_SIZE];
+        let missing_full = store.read_range((600, 0), 0, &mut full).await.unwrap_err();
+        assert_incomplete_read(&missing_full, (600, 0), 0, BLOCK_SIZE, 0);
+
+        let mut range = [0u8; 32];
+        let missing_range = store
+            .read_range((601, 0), 2048, &mut range)
+            .await
+            .unwrap_err();
+        assert_incomplete_read(&missing_range, (601, 0), 2048, range.len(), 0);
+
+        for slice_id in [602, 603] {
+            let object_path =
+                object_dir
+                    .path()
+                    .join(ObjectBlockStore::<LocalFsBackend>::versioned_key_for((
+                        slice_id, 0,
+                    )));
+            tokio::fs::create_dir_all(object_path.parent().unwrap())
+                .await
+                .unwrap();
+            let mut framed = encode_persisted_block(&vec![7u8; BLOCK_SIZE], Compression::None);
+            framed.truncate(PERSISTED_HEADER_LEN + 1024);
+            tokio::fs::write(object_path, framed).await.unwrap();
+        }
+
+        full.fill(0);
+        let truncated_full = store.read_range((602, 0), 0, &mut full).await.unwrap_err();
+        assert_incomplete_read(&truncated_full, (602, 0), 0, BLOCK_SIZE, 1024);
+
+        range.fill(0);
+        let truncated_range = store
+            .read_range((603, 0), 2048, &mut range)
+            .await
+            .unwrap_err();
+        assert_incomplete_read(&truncated_range, (603, 0), 2048, range.len(), 0);
+        assert!(
+            store.page_cache.get(&(603, 0, 0)).await.is_none(),
+            "a short object-store response must not enter the page cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_short_tail_block_still_serves_covered_ranges() {
+        const BLOCK_SIZE: usize = 4096;
+        let object_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let store = local_object_store(object_dir.path(), cache_dir.path(), BLOCK_SIZE).await;
+        let data = vec![9u8; 1024];
+
+        for slice_id in [604, 605] {
+            let object_path =
+                object_dir
+                    .path()
+                    .join(ObjectBlockStore::<LocalFsBackend>::versioned_key_for((
+                        slice_id, 0,
+                    )));
+            tokio::fs::create_dir_all(object_path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(
+                object_path,
+                encode_persisted_block(&data, Compression::None),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut full_tail = vec![0u8; data.len()];
+        store.read_range((604, 0), 0, &mut full_tail).await.unwrap();
+        assert_eq!(full_tail, data);
+
+        let mut tail_range = [0u8; 24];
+        store
+            .read_range((605, 0), 1000, &mut tail_range)
+            .await
+            .unwrap();
+        assert_eq!(tail_range, [9u8; 24]);
+    }
 
     #[tokio::test]
     async fn test_localfs_block_store_put_get() {

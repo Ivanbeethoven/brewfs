@@ -56,7 +56,9 @@ plans under `doc/` unless a tool explicitly requires another location.
 | Observability | [operations/observability.md](operations/observability.md) |
 | Profiling | [operations/profiling.md](operations/profiling.md) |
 | Stats tool | [operations/stats-tool.md](operations/stats-tool.md) |
-| SDK | [operations/sdk.md](operations/sdk.md) |
+| WebDAV gateway usage | [operations/webdav-gateway.md](operations/webdav-gateway.md) |
+| WebDAV protocol spec | [protocols/webdav.md](protocols/webdav.md) |
+| WebDAV verification | [protocols/webdav-gateway-verification.md](protocols/webdav-gateway-verification.md) |
 
 ## Testing And CI
 
