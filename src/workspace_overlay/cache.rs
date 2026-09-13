@@ -56,11 +56,11 @@ impl WorkspaceResolverCache {
     }
 
     pub fn invalidate_inode(&self, workspace_id: WorkspaceId, ino: i64) {
-        self.invalidate_matching(|key| key.workspace_id == workspace_id && key.ino == ino);
+        self.invalidate_matching(move |key| key.workspace_id == workspace_id && key.ino == ino);
     }
 
     pub fn invalidate_workspace(&self, workspace_id: WorkspaceId) {
-        self.invalidate_matching(|key| key.workspace_id == workspace_id);
+        self.invalidate_matching(move |key| key.workspace_id == workspace_id);
     }
 
     fn invalidate_matching(
