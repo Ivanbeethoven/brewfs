@@ -973,11 +973,17 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         let left = self
             .resolve_dentry_entry(old_parent, old_name.as_bytes())
             .await?
-            .ok_or(MetaError::NotFound(old_parent))?;
+            .ok_or_else(|| MetaError::EntryNotFound {
+                parent: old_parent,
+                name: old_name.to_owned(),
+            })?;
         let right = self
             .resolve_dentry_entry(new_parent, new_name.as_bytes())
             .await?
-            .ok_or(MetaError::NotFound(new_parent))?;
+            .ok_or_else(|| MetaError::EntryNotFound {
+                parent: new_parent,
+                name: new_name.to_owned(),
+            })?;
         if old_parent == new_parent && old_name == new_name {
             return Ok(());
         }

@@ -13,7 +13,7 @@ use crate::meta::store::{
 use crate::posix::NAME_MAX;
 use asyncfuse::notify::Notify as FuseNotify;
 use dashmap::{DashMap, Entry};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -2227,9 +2227,15 @@ where
         mut parent_ino: i64,
         ancestor_ino: i64,
     ) -> Result<bool, VfsError> {
+        let mut visited = HashSet::new();
         while parent_ino != self.core.root {
             if parent_ino == ancestor_ino {
                 return Ok(true);
+            }
+            if !visited.insert(parent_ino) {
+                return Err(VfsError::CircularRename {
+                    path: PathHint::none(),
+                });
             }
             match self.meta_get_dir_parent(parent_ino).await? {
                 Some(next) if next != parent_ino => parent_ino = next,

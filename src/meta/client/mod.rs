@@ -2085,7 +2085,7 @@ fn control_invalid_request(message: impl Into<String>) -> ControlResponse {
 
 fn control_meta_error(err: MetaError) -> ControlResponse {
     let code = match &err {
-        MetaError::NotFound(_) => "not_found",
+        MetaError::NotFound(_) | MetaError::EntryNotFound { .. } => "not_found",
         MetaError::NotDirectory(_) => "not_directory",
         MetaError::AlreadyExists { .. } => "already_exists",
         MetaError::InvalidPath(_) | MetaError::InvalidFilename => "invalid_path",

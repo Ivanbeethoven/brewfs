@@ -129,33 +129,53 @@ async fn rename_onto_same_inode_keeps_both_hard_links() {
 }
 
 #[tokio::test]
-async fn rename_exchange_rejects_ancestor_in_both_directions() {
+async fn rename_exchange_rejects_descendants() {
     let meta = test_meta().await;
     let root = meta.root_ino();
     let ancestor = meta.mkdir(root, "ancestor".into()).await.unwrap();
-    let descendant = meta.mkdir(ancestor, "descendant".into()).await.unwrap();
+    let intermediate = meta.mkdir(ancestor, "intermediate".into()).await.unwrap();
+    let descendant = meta.mkdir(intermediate, "descendant".into()).await.unwrap();
+    let file = meta.create_file(ancestor, "file".into()).await.unwrap();
 
     let error = meta
-        .rename_exchange(root, "ancestor", ancestor, "descendant")
+        .rename_exchange(root, "ancestor", intermediate, "descendant")
         .await
         .unwrap_err();
     assert!(matches!(error, MetaError::InvalidPath(_)));
     assert_eq!(meta.lookup(root, "ancestor").await.unwrap(), Some(ancestor));
     assert_eq!(
-        meta.lookup(ancestor, "descendant").await.unwrap(),
+        meta.lookup(intermediate, "descendant").await.unwrap(),
         Some(descendant)
     );
 
     let error = meta
-        .rename_exchange(ancestor, "descendant", root, "ancestor")
+        .rename_exchange(intermediate, "descendant", root, "ancestor")
         .await
         .unwrap_err();
     assert!(matches!(error, MetaError::InvalidPath(_)));
     assert_eq!(meta.lookup(root, "ancestor").await.unwrap(), Some(ancestor));
     assert_eq!(
-        meta.lookup(ancestor, "descendant").await.unwrap(),
+        meta.lookup(intermediate, "descendant").await.unwrap(),
         Some(descendant)
     );
+
+    let error = meta
+        .rename_exchange(root, "ancestor", ancestor, "file")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaError::InvalidPath(_)));
+    assert_eq!(meta.lookup(root, "ancestor").await.unwrap(), Some(ancestor));
+    assert_eq!(meta.lookup(ancestor, "file").await.unwrap(), Some(file));
+
+    let error = meta
+        .rename_exchange(root, "missing", ancestor, "file")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MetaError::EntryNotFound { parent, name }
+            if parent == root && name == "missing"
+    ));
 }
 
 #[tokio::test]

@@ -376,7 +376,9 @@ fn access_log_sender(config: &FileSystemConfig) -> Option<mpsc::Sender<AccessLog
 
 fn meta_error_to_io(path: &str, err: MetaError) -> io::Error {
     let kind = match err {
-        MetaError::NotFound(_) | MetaError::ParentNotFound(_) => io::ErrorKind::NotFound,
+        MetaError::NotFound(_) | MetaError::EntryNotFound { .. } | MetaError::ParentNotFound(_) => {
+            io::ErrorKind::NotFound
+        }
         MetaError::AlreadyExists { .. } => io::ErrorKind::AlreadyExists,
         MetaError::NotDirectory(_) => io::ErrorKind::NotADirectory,
         MetaError::DirectoryNotEmpty(_) => io::ErrorKind::DirectoryNotEmpty,

@@ -487,6 +487,9 @@ pub enum MetaError {
     #[error("Entry not found: {0}")]
     NotFound(i64),
 
+    #[error("Entry not found: {name} in parent {parent}")]
+    EntryNotFound { parent: i64, name: String },
+
     #[error("Parent directory not found: {0}")]
     ParentNotFound(i64),
 
@@ -776,14 +779,20 @@ pub trait MetaStore: Send + Sync {
             return Ok(());
         }
 
-        let old_ino = self
-            .lookup(old_parent, old_name)
-            .await?
-            .ok_or(MetaError::NotFound(old_parent))?;
-        let new_ino = self
-            .lookup(new_parent, new_name)
-            .await?
-            .ok_or(MetaError::NotFound(new_parent))?;
+        let old_ino =
+            self.lookup(old_parent, old_name)
+                .await?
+                .ok_or_else(|| MetaError::EntryNotFound {
+                    parent: old_parent,
+                    name: old_name.to_owned(),
+                })?;
+        let new_ino =
+            self.lookup(new_parent, new_name)
+                .await?
+                .ok_or_else(|| MetaError::EntryNotFound {
+                    parent: new_parent,
+                    name: new_name.to_owned(),
+                })?;
         if old_ino == new_ino {
             return Ok(());
         }

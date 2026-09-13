@@ -756,17 +756,25 @@ async fn test_hardlink_dentry_binding_cross_dir_move_rename() {
 }
 
 #[tokio::test]
-async fn rename_exchange_rejects_ancestor_in_both_directions_at_store_boundary() {
+async fn rename_exchange_rejects_descendants_at_store_boundary() {
     let store = new_test_store().await;
     let root = store.root_ino();
     let ancestor = store.mkdir(root, "ancestor".to_string()).await.unwrap();
+    let intermediate = store
+        .mkdir(ancestor, "intermediate".to_string())
+        .await
+        .unwrap();
     let descendant = store
-        .mkdir(ancestor, "descendant".to_string())
+        .mkdir(intermediate, "descendant".to_string())
+        .await
+        .unwrap();
+    let file = store
+        .create_file(ancestor, "file".to_string())
         .await
         .unwrap();
 
     let error = store
-        .rename_exchange(root, "ancestor", ancestor, "descendant")
+        .rename_exchange(root, "ancestor", intermediate, "descendant")
         .await
         .unwrap_err();
     assert!(matches!(error, MetaError::InvalidPath(_)));
@@ -775,12 +783,12 @@ async fn rename_exchange_rejects_ancestor_in_both_directions_at_store_boundary()
         Some(ancestor)
     );
     assert_eq!(
-        store.lookup(ancestor, "descendant").await.unwrap(),
+        store.lookup(intermediate, "descendant").await.unwrap(),
         Some(descendant)
     );
 
     let error = store
-        .rename_exchange(ancestor, "descendant", root, "ancestor")
+        .rename_exchange(intermediate, "descendant", root, "ancestor")
         .await
         .unwrap_err();
     assert!(matches!(error, MetaError::InvalidPath(_)));
@@ -789,9 +797,30 @@ async fn rename_exchange_rejects_ancestor_in_both_directions_at_store_boundary()
         Some(ancestor)
     );
     assert_eq!(
-        store.lookup(ancestor, "descendant").await.unwrap(),
+        store.lookup(intermediate, "descendant").await.unwrap(),
         Some(descendant)
     );
+
+    let error = store
+        .rename_exchange(root, "ancestor", ancestor, "file")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaError::InvalidPath(_)));
+    assert_eq!(
+        store.lookup(root, "ancestor").await.unwrap(),
+        Some(ancestor)
+    );
+    assert_eq!(store.lookup(ancestor, "file").await.unwrap(), Some(file));
+
+    let error = store
+        .rename_exchange(root, "missing", ancestor, "file")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MetaError::EntryNotFound { parent, name }
+            if parent == root && name == "missing"
+    ));
 }
 
 #[tokio::test]
