@@ -83,6 +83,12 @@ bucket 初始化 `Job` 会在 RustFS 可达后循环尝试：
 
 直到 bucket 已存在或创建成功。
 
+The init Job name includes a deterministic hash of the effective RustFS
+initialization template. Changing the endpoint port, bucket, or region creates
+a new Job instead of attempting to mutate the immutable Pod template of the
+previous generation. Superseded Jobs owned by the cluster, including the
+legacy fixed-name Job, are removed after the replacement is applied.
+
 ## `mountConfig`
 
 字段：
