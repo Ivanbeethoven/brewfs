@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +21,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use kube::api::{Api, DeleteParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
+use kube::runtime::events::{Event, EventType, Recorder, Reporter};
 use kube::Resource;
 use kube::ResourceExt;
 use serde::de::DeserializeOwned;
@@ -215,6 +216,7 @@ pub async fn reconcile_mount(
         consumer_mount_path = Some(consumer.mount_path.clone());
 
         if let Some(host_mount_path) = &mount.spec.host_mount_path {
+            publish_consumer_label_conflicts(&client, &mount, consumer).await;
             let consumer_name = apply_consumer_workload(
                 &client,
                 &namespace,
@@ -849,8 +851,7 @@ async fn apply_consumer_workload(
     let mount_name = mount.name_any();
     let workload_name = consumer_workload_name(&mount_name);
     let match_labels = labels(&mount_name, "consumer");
-    let mut workload_labels = match_labels.clone();
-    workload_labels.extend(consumer.workload_labels.clone());
+    let workload_labels = build_consumer_workload_labels(consumer, match_labels.clone());
     let workload_annotations = consumer.workload_annotations.clone();
     let template = build_consumer_pod_template(consumer, host_mount_path, match_labels.clone());
     let headless_service_name = consumer_headless_service_name(&mount_name);
@@ -1167,8 +1168,7 @@ fn build_consumer_pod_template(
     host_mount_path: &str,
     match_labels: BTreeMap<String, String>,
 ) -> PodTemplateSpec {
-    let mut labels = match_labels;
-    labels.extend(consumer.pod_labels.clone());
+    let labels = merge_operator_labels(&consumer.pod_labels, match_labels);
 
     let mut annotations = consumer.pod_annotations.clone();
     annotations.insert(
@@ -1218,6 +1218,86 @@ fn build_consumer_pod_template(
             ..PodSpec::default()
         }),
     }
+}
+
+fn build_consumer_workload_labels(
+    consumer: &MountConsumerSpec,
+    match_labels: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    merge_operator_labels(&consumer.workload_labels, match_labels)
+}
+
+fn conflicting_consumer_label_keys(
+    consumer: &MountConsumerSpec,
+    operator_labels: &BTreeMap<String, String>,
+) -> Vec<String> {
+    consumer
+        .pod_labels
+        .iter()
+        .chain(consumer.workload_labels.iter())
+        .filter_map(|(key, value)| {
+            operator_labels
+                .get(key)
+                .filter(|operator_value| *operator_value != value)
+                .map(|_| key.clone())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+async fn publish_consumer_label_conflicts(
+    client: &kube::Client,
+    mount: &BrewFSMount,
+    consumer: &MountConsumerSpec,
+) {
+    let Some(generation) = mount.metadata.generation else {
+        return;
+    };
+    if mount
+        .status
+        .as_ref()
+        .and_then(|status| status.observed_generation)
+        == Some(generation)
+    {
+        return;
+    }
+
+    let conflicts = conflicting_consumer_label_keys(consumer, &labels(&mount.name_any(), "consumer"));
+    if conflicts.is_empty() {
+        return;
+    }
+
+    let recorder = Recorder::new(
+        client.clone(),
+        Reporter::from("brewfs-operator"),
+        mount.object_ref(&()),
+    );
+    let note = format!(
+        "Consumer labels override reserved operator labels; operator values are used for: {}",
+        conflicts.join(", ")
+    );
+    if let Err(error) = recorder
+        .publish(Event {
+            type_: EventType::Warning,
+            reason: "ReservedLabelOverride".to_string(),
+            note: Some(note),
+            action: "BuildConsumerWorkload".to_string(),
+            secondary: None,
+        })
+        .await
+    {
+        tracing::warn!(?error, mount = %mount.name_any(), "failed to publish consumer label conflict event");
+    }
+}
+
+fn merge_operator_labels(
+    user_labels: &BTreeMap<String, String>,
+    operator_labels: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut labels = user_labels.clone();
+    labels.extend(operator_labels);
+    labels
 }
 
 fn mount_state_volume(mount: &BrewFSMount) -> Volume {
@@ -2272,5 +2352,90 @@ mod tests {
 
         desired.ready_replicas = Some(0);
         assert!(!mount_status_semantically_equal(&current, &desired));
+    }
+
+    #[test]
+    fn conflicting_consumer_label_keys_only_include_reserved_overrides() {
+        let mut consumer: MountConsumerSpec =
+            serde_json::from_value(json!({})).expect("default consumer spec");
+        consumer.pod_labels = BTreeMap::from([
+            (
+                "app.kubernetes.io/component".to_string(),
+                "wrong".to_string(),
+            ),
+            (
+                "app.kubernetes.io/name".to_string(),
+                "brewfs".to_string(),
+            ),
+            ("example.com/custom".to_string(), "kept".to_string()),
+        ]);
+        consumer.workload_labels = BTreeMap::from([
+            (
+                "app.kubernetes.io/component".to_string(),
+                "also-wrong".to_string(),
+            ),
+            ("app.kubernetes.io/instance".to_string(), "wrong".to_string()),
+        ]);
+
+        assert_eq!(
+            conflicting_consumer_label_keys(&consumer, &labels("demo-mount", "consumer")),
+            vec![
+                "app.kubernetes.io/component".to_string(),
+                "app.kubernetes.io/instance".to_string(),
+            ]
+        );
+    }
+
+
+    #[test]
+    fn consumer_pod_labels_cannot_override_selectors() {
+        let mut consumer: MountConsumerSpec =
+            serde_json::from_value(json!({})).expect("default consumer spec");
+        consumer.pod_labels = BTreeMap::from([
+            (
+                "app.kubernetes.io/component".to_string(),
+                "overridden".to_string(),
+            ),
+            ("example.com/custom".to_string(), "kept".to_string()),
+        ]);
+        consumer.workload_labels = BTreeMap::from([
+            (
+                "app.kubernetes.io/component".to_string(),
+                "overridden".to_string(),
+            ),
+            ("example.com/workload".to_string(), "kept".to_string()),
+        ]);
+        let selector_labels = labels("demo-mount", "consumer");
+
+        let template = build_consumer_pod_template(&consumer, "/mnt/demo", selector_labels.clone());
+        let template_labels = template
+            .metadata
+            .and_then(|metadata| metadata.labels)
+            .expect("consumer pod template labels");
+
+        assert_eq!(
+            template_labels
+                .get("app.kubernetes.io/component")
+                .map(String::as_str),
+            Some("consumer")
+        );
+        assert_eq!(
+            template_labels.get("example.com/custom").map(String::as_str),
+            Some("kept")
+        );
+
+        let workload_labels = build_consumer_workload_labels(&consumer, selector_labels);
+        assert_eq!(
+            workload_labels
+                .get("app.kubernetes.io/component")
+                .map(String::as_str),
+            Some("consumer")
+        );
+        assert_eq!(
+            workload_labels
+                .get("example.com/workload")
+                .map(String::as_str),
+            Some("kept")
+        );
     }
 }
