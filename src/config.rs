@@ -551,6 +551,7 @@ pub struct MetaFileConfig {
     pub tikv: Option<TiKvMetaFileConfig>,
     pub open_file_cache_ttl_ms: Option<u64>,
     pub open_file_cache_capacity: Option<u64>,
+    pub read_plan_cache_max_weight: Option<u64>,
     pub allow_write_open_cache: Option<bool>,
     pub slice_version_check_interval_ms: Option<u64>,
 }
@@ -642,6 +643,7 @@ pub struct MountConfig {
     pub meta_tikv_namespace: String,
     pub meta_open_file_cache_ttl_ms: Option<u64>,
     pub meta_open_file_cache_capacity: Option<u64>,
+    pub meta_read_plan_cache_max_weight: Option<u64>,
     pub meta_allow_write_open_cache: bool,
     pub meta_slice_version_check_interval_ms: Option<u64>,
     pub chunk_size: u64,
@@ -716,6 +718,9 @@ impl MountConfig {
             MetaBackendKind::Etcd => None,
             MetaBackendKind::TiKv => None,
         };
+        if meta_cfg.read_plan_cache_max_weight == Some(0) {
+            anyhow::bail!("meta.read_plan_cache_max_weight must be greater than 0");
+        }
 
         Ok(Self {
             mount_point,
@@ -767,6 +772,7 @@ impl MountConfig {
                 .unwrap_or_else(crate::meta::config::default_tikv_namespace),
             meta_open_file_cache_ttl_ms: meta_cfg.open_file_cache_ttl_ms,
             meta_open_file_cache_capacity: meta_cfg.open_file_cache_capacity,
+            meta_read_plan_cache_max_weight: meta_cfg.read_plan_cache_max_weight,
             meta_allow_write_open_cache: meta_cfg.allow_write_open_cache.unwrap_or(false),
             meta_slice_version_check_interval_ms: meta_cfg.slice_version_check_interval_ms,
             chunk_size: args
@@ -1419,6 +1425,7 @@ mount_point: /mnt/slayer
 meta:
   open_file_cache_ttl_ms: 1000
   open_file_cache_capacity: 65536
+  read_plan_cache_max_weight: 32768
   allow_write_open_cache: true
   slice_version_check_interval_ms: 250
 "#,
@@ -1430,8 +1437,33 @@ meta:
 
         assert_eq!(config.meta_open_file_cache_ttl_ms, Some(1000));
         assert_eq!(config.meta_open_file_cache_capacity, Some(65536));
+        assert_eq!(config.meta_read_plan_cache_max_weight, Some(32768));
         assert!(config.meta_allow_write_open_cache);
         assert_eq!(config.meta_slice_version_check_interval_ms, Some(250));
+    }
+
+    #[test]
+    fn mount_config_rejects_zero_read_plan_cache_weight() {
+        let path = std::env::temp_dir().join(format!(
+            "brewfs-read-plan-cache-config-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(
+            &path,
+            "mount_point: /mnt/slayer\nmeta:\n  read_plan_cache_max_weight: 0\n",
+        )
+        .unwrap();
+
+        let error = MountConfig::from_sources(empty_mount_args(Some(path.clone()), None))
+            .expect_err("zero read-plan cache weight should be rejected");
+        let _ = std::fs::remove_file(path);
+
+        assert!(
+            error
+                .to_string()
+                .contains("meta.read_plan_cache_max_weight must be greater than 0")
+        );
     }
 
     #[test]

@@ -102,6 +102,11 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         layer
     }
 
+    pub fn with_read_plan_cache_max_weight(mut self, max_weight: u64) -> Self {
+        self.resolver_cache = WorkspaceResolverCache::with_capacity(max_weight);
+        self
+    }
+
     pub fn store(&self) -> &Arc<W> {
         &self.store
     }
