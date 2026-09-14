@@ -2717,55 +2717,32 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         self.store
             .rename_exchange(old_parent, old_name, new_parent, new_name)
             .await?;
-        self.invalidate_open_file_cache_inode(old_ino).await;
-        self.invalidate_open_file_cache_inode(new_ino).await;
-
-        debug!("MetaClient: rename_exchange completed, updating cache");
-
-        // Update cache to reflect the exchange
-        let cache_result = async {
-            // Invalidate replaced child caches while preserving the parent child
-            // maps we rebuild below.
-            self.inode_cache.invalidate_inode(old_ino).await;
-            self.inode_cache.invalidate_inode(new_ino).await;
-
-            // Invalidate path caches
-            self.invalidate_parent_after_namespace_mutation(old_parent)
-                .await;
-            if old_parent != new_parent {
-                self.invalidate_parent_after_namespace_mutation(new_parent)
-                    .await;
+        let mut affected_inodes = HashSet::from([old_ino, new_ino]);
+        let (current_old, current_new) = tokio::join!(
+            self.store.lookup(old_parent, old_name),
+            self.store.lookup(new_parent, new_name),
+        );
+        for lookup in [current_old, current_new] {
+            match lookup {
+                Ok(Some(ino)) => {
+                    affected_inodes.insert(ino);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(%error, "failed to refresh inode after rename exchange");
+                }
             }
-
-            // Update directory entries
-            // Remove old entries
-            self.inode_cache.remove_child(old_parent, old_name).await;
-            self.inode_cache.remove_child(new_parent, new_name).await;
-
-            // Add swapped entries
-            self.inode_cache
-                .ensure_node_in_cache(old_parent, &self.store, None)
-                .await?;
-            self.inode_cache
-                .ensure_node_in_cache(new_parent, &self.store, None)
-                .await?;
-
-            self.inode_cache
-                .add_child(old_parent, old_name.to_string(), new_ino)
-                .await;
-            self.inode_cache
-                .add_child(new_parent, new_name.to_string(), old_ino)
-                .await;
-
-            Ok::<(), MetaError>(())
         }
-        .await;
+        for ino in affected_inodes {
+            self.invalidate_open_file_cache_inode(ino).await;
+            self.inode_cache.invalidate_inode(ino).await;
+        }
 
-        if let Err(cache_err) = cache_result {
-            warn!(
-                "MetaClient: cache update failed after successful rename_exchange: {}",
-                cache_err
-            );
+        self.invalidate_parent_path(old_parent).await;
+        self.inode_cache.invalidate_inode(old_parent).await;
+        if old_parent != new_parent {
+            self.invalidate_parent_path(new_parent).await;
+            self.inode_cache.invalidate_inode(new_parent).await;
         }
 
         Ok(())
@@ -5206,6 +5183,26 @@ mod tests {
         // Verify new file is accessible
         let ino_file3 = client.resolve_path("/dira/file3.txt").await.unwrap();
         assert_eq!(ino_file3, _file3);
+    }
+
+    #[tokio::test]
+    async fn rename_exchange_does_not_restore_stale_child_cache_entries() {
+        let client = create_test_client().await;
+        let root = client.root.load(std::sync::atomic::Ordering::Relaxed);
+        let a = client.create_file(root, "a".into()).await.unwrap();
+        let b = client.create_file(root, "b".into()).await.unwrap();
+        assert_eq!(client.lookup(root, "a").await.unwrap(), Some(a));
+        assert_eq!(client.lookup(root, "b").await.unwrap(), Some(b));
+
+        client
+            .store
+            .rename_exchange(root, "a", root, "b")
+            .await
+            .unwrap();
+        client.rename_exchange(root, "a", root, "b").await.unwrap();
+
+        assert_eq!(client.lookup(root, "a").await.unwrap(), Some(a));
+        assert_eq!(client.lookup(root, "b").await.unwrap(), Some(b));
     }
 
     #[tokio::test]

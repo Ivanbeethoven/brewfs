@@ -963,7 +963,7 @@ mod basic_tests {
         let ancestor = raw_meta.mkdir(root, "ancestor".into()).await.unwrap();
         let descendant = raw_meta.mkdir(ancestor, "descendant".into()).await.unwrap();
         raw_meta
-            .rename(root, "ancestor", descendant, "ancestor".into())
+            .set_directory_parent_for_test(ancestor, descendant)
             .await
             .unwrap();
 
