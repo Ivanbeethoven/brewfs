@@ -8,6 +8,7 @@ use crate::meta::client::{MetaClientOptions, OpenFileCacheConfig};
 use crate::meta::config::MetaClientConfig;
 use crate::meta::factory::create_meta_store_from_url;
 use crate::meta::file_lock::FileLockType;
+use crate::meta::store::MetaStore;
 use crate::posix::NAME_MAX;
 use crate::vfs::fs::VFS;
 use std::sync::Arc;
@@ -897,6 +898,86 @@ mod basic_tests {
 
         assert_eq!(file_a_attr_after.ino, file_b_attr_before.ino);
         assert_eq!(file_b_attr_after.ino, file_a_attr_before.ino);
+    }
+
+    #[tokio::test]
+    async fn test_rename_exchange_rejects_descendants_in_both_directions() {
+        let fs = new_basic_fs().await;
+        fs.mkdir_p("/a/b/c").await.unwrap();
+        fs.create_file("/a/file").await.unwrap();
+        let a_ino = fs.stat("/a").await.unwrap().ino;
+        let c_ino = fs.stat("/a/b/c").await.unwrap().ino;
+        let file_ino = fs.stat("/a/file").await.unwrap().ino;
+        let flags = crate::vfs::fs::RenameFlags {
+            noreplace: false,
+            exchange: true,
+            whiteout: false,
+        };
+
+        let descendant_target = fs
+            .rename_with_flags("/a", "/a/b/c", flags)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            descendant_target,
+            crate::vfs::error::VfsError::CircularRename { .. }
+        ));
+        assert_eq!(fs.stat("/a").await.unwrap().ino, a_ino);
+        assert_eq!(fs.stat("/a/b/c").await.unwrap().ino, c_ino);
+
+        let ancestor_target = fs
+            .rename_with_flags("/a/b/c", "/a", flags)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            ancestor_target,
+            crate::vfs::error::VfsError::CircularRename { .. }
+        ));
+        assert_eq!(fs.stat("/a").await.unwrap().ino, a_ino);
+        assert_eq!(fs.stat("/a/b/c").await.unwrap().ino, c_ino);
+
+        let file_target = fs
+            .rename_with_flags("/a", "/a/file", flags)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            file_target,
+            crate::vfs::error::VfsError::CircularRename { .. }
+        ));
+        assert_eq!(fs.stat("/a").await.unwrap().ino, a_ino);
+        assert_eq!(fs.stat("/a/file").await.unwrap().ino, file_ino);
+    }
+
+    #[tokio::test]
+    async fn test_parent_ancestry_walk_rejects_existing_cycle() {
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let raw_meta = meta_handle.store();
+        let fs = VFS::new(
+            ChunkLayout::default(),
+            InMemoryBlockStore::new(),
+            raw_meta.clone(),
+        )
+        .await
+        .unwrap();
+        let root = fs.root_ino();
+        let ancestor = raw_meta.mkdir(root, "ancestor".into()).await.unwrap();
+        let descendant = raw_meta.mkdir(ancestor, "descendant".into()).await.unwrap();
+        raw_meta
+            .set_directory_parent_for_test(ancestor, descendant)
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            fs.parent_is_descendant_of(ancestor, root),
+        )
+        .await
+        .expect("ancestry walk must terminate")
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::vfs::error::VfsError::CircularRename { .. }
+        ));
     }
 
     #[tokio::test]

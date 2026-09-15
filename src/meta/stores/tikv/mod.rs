@@ -226,6 +226,7 @@ impl TiKvMetaStore {
         let message = error.to_string();
         let lower = message.to_ascii_lowercase();
         if lower.contains("write conflict")
+            || lower.contains("deadlock")
             || lower.contains("pessimisticlock")
             || lower.contains("lock conflict")
             || lower.contains("txnlock")
@@ -698,6 +699,45 @@ impl TiKvMetaStore {
             return Err(MetaError::NotDirectory(ino));
         }
         Ok(node)
+    }
+
+    async fn validate_directory_move_in_txn(
+        &self,
+        txn: &mut Transaction,
+        mut parent: i64,
+        ancestor: i64,
+        operation: &str,
+    ) -> Result<(), MetaError> {
+        let mut visited = HashSet::new();
+        loop {
+            if parent == ancestor {
+                return Err(MetaError::InvalidPath(format!(
+                    "cannot move directory inode {ancestor} below itself"
+                )));
+            }
+            if parent == self.root_ino() {
+                return Ok(());
+            }
+            if !visited.insert(parent) {
+                return Err(MetaError::InvalidPath(format!(
+                    "directory ancestry contains a cycle at inode {parent}"
+                )));
+            }
+            let node = self
+                .txn_get_node(txn, parent, true, operation)
+                .await?
+                .ok_or_else(|| {
+                    MetaError::InvalidPath(format!(
+                        "directory ancestry references missing inode {parent}"
+                    ))
+                })?;
+            if node.kind != StoredNodeKind::Dir || node.parent == parent {
+                return Err(MetaError::InvalidPath(format!(
+                    "invalid directory ancestry at inode {parent}"
+                )));
+            }
+            parent = node.parent;
+        }
     }
 
     async fn txn_next_counter(
@@ -1861,6 +1901,16 @@ impl MetaStore for TiKvMetaStore {
                 if source_node.deleted || source_node.nlink == 0 {
                     return Err(MetaError::NotFound(source_dentry.ino));
                 }
+                if source_node.kind == StoredNodeKind::Dir {
+                    store
+                        .validate_directory_move_in_txn(
+                            txn,
+                            new_parent,
+                            source_dentry.ino,
+                            operation,
+                        )
+                        .await?;
+                }
 
                 let now = Self::now();
                 let mut old_parent_nlink_delta = 0;
@@ -2046,6 +2096,16 @@ impl MetaStore for TiKvMetaStore {
                 }
                 if new_node.deleted || new_node.nlink == 0 {
                     return Err(MetaError::NotFound(new_dentry.ino));
+                }
+                if old_node.kind == StoredNodeKind::Dir {
+                    store
+                        .validate_directory_move_in_txn(txn, new_parent, old_dentry.ino, operation)
+                        .await?;
+                }
+                if new_node.kind == StoredNodeKind::Dir {
+                    store
+                        .validate_directory_move_in_txn(txn, old_parent, new_dentry.ino, operation)
+                        .await?;
                 }
 
                 let now = Self::now();

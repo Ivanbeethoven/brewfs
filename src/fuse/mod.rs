@@ -2849,7 +2849,7 @@ fn acl_perm_bits(perm: &str) -> Option<u32> {
 impl From<MetaError> for Errno {
     fn from(val: MetaError) -> Self {
         let code = match val {
-            MetaError::NotFound(_) => libc::ENOENT,
+            MetaError::NotFound(_) | MetaError::EntryNotFound { .. } => libc::ENOENT,
             MetaError::ParentNotFound(_) => libc::ENOENT,
             MetaError::NotDirectory(_) => libc::ENOTDIR,
             MetaError::DirectoryNotEmpty(_) => libc::ENOTEMPTY,
