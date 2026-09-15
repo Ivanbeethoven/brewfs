@@ -482,6 +482,7 @@ impl JsonSchema for RedisSpec {
             "port".to_string(),
             Schema::Object(SchemaObject {
                 instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Integer))),
+                format: Some("int32".to_string()),
                 metadata: Some(Box::new(schemars::schema::Metadata {
                     default: Some(json!(default_redis_port())),
                     ..Default::default()
