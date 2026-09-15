@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,7 +6,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context as _};
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::{
-    DaemonSet, DaemonSetSpec, Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec,
+    DaemonSet, DaemonSetSpec, Deployment, DeploymentSpec, DeploymentStrategy, StatefulSet,
+    StatefulSetSpec,
 };
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
@@ -19,8 +20,9 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
-use kube::api::{Api, DeleteParams, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
+use kube::runtime::events::{Event, EventType, Recorder, Reporter};
 use kube::Resource;
 use kube::ResourceExt;
 use serde::de::DeserializeOwned;
@@ -47,6 +49,23 @@ pub enum ReconcileError {
     Anyhow(#[from] anyhow::Error),
 }
 
+async fn cluster_snapshot_is_current(
+    client: &kube::Client,
+    namespace: &str,
+    cluster: &BrewFSCluster,
+) -> Result<bool, anyhow::Error> {
+    let api: Api<BrewFSCluster> = Api::namespaced(client.clone(), namespace);
+    let Some(current) = api
+        .get_opt(&cluster.name_any())
+        .await
+        .context("reload BrewFSCluster generation before reconciliation")?
+    else {
+        return Ok(false);
+    };
+    Ok(current.metadata.uid == cluster.metadata.uid
+        && current.metadata.generation == cluster.metadata.generation)
+}
+
 pub async fn reconcile_cluster(
     cluster: Arc<BrewFSCluster>,
     ctx: Arc<OperatorContext>,
@@ -55,6 +74,9 @@ pub async fn reconcile_cluster(
     let namespace = cluster
         .namespace()
         .ok_or_else(|| anyhow!("BrewFSCluster must be namespaced"))?;
+    if !cluster_snapshot_is_current(&client, &namespace, &cluster).await? {
+        return Ok(Action::requeue(Duration::from_secs(1)));
+    }
     #[cfg(feature = "workspace-operator")]
     if crate::workspace::controller::guard_cluster_workspace_lifecycle(
         &cluster, &client, &namespace,
@@ -69,13 +91,50 @@ pub async fn reconcile_cluster(
 
     apply_rustfs_secret(&client, &namespace, &cluster, &owner).await?;
     apply_rustfs_pvc(&client, &namespace, &cluster, &owner).await?;
+    apply_redis_pvc(&client, &namespace, &cluster, &owner).await?;
     apply_redis_service(&client, &namespace, &cluster, &owner).await?;
     apply_redis_deployment(&client, &namespace, &cluster, &owner).await?;
     apply_rustfs_service(&client, &namespace, &cluster, &owner).await?;
     apply_rustfs_deployment(&client, &namespace, &cluster, &owner).await?;
-    apply_rustfs_init_job(&client, &namespace, &cluster, &owner).await?;
+    match reconcile_rustfs_init_job(&client, &namespace, &cluster, &owner).await? {
+        RustFsInitJobState::Complete => {}
+        RustFsInitJobState::Progressing(message) => {
+            patch_cluster_status(&client, &namespace, &cluster, "Progressing", &message).await?;
+            return Ok(Action::requeue(Duration::from_secs(5)));
+        }
+    }
+    let redis_pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &namespace);
+    let redis_pvc = redis_pvc_api
+        .get_opt(&redis_pvc_name(&cluster.name_any()))
+        .await
+        .context("observe Redis PVC")?;
+    let redis_deployment_api: Api<Deployment> = Api::namespaced(client.clone(), &namespace);
+    let redis_deployment = redis_deployment_api
+        .get_opt(&redis_name(&cluster.name_any()))
+        .await
+        .context("observe Redis Deployment")?;
+    if !redis_pvc.as_ref().is_some_and(pvc_is_bound)
+        || !redis_deployment.as_ref().is_some_and(deployment_is_ready)
+    {
+        patch_cluster_status_phase(
+            &client,
+            &namespace,
+            &cluster,
+            "Progressing",
+            "waiting for Redis PVC and Deployment readiness",
+        )
+        .await?;
+        return Ok(Action::requeue(Duration::from_secs(5)));
+    }
     apply_brewfs_config(&client, &namespace, &cluster, &owner).await?;
-    patch_cluster_status(&client, &namespace, &cluster).await?;
+    patch_cluster_status(
+        &client,
+        &namespace,
+        &cluster,
+        "Ready",
+        "Backend resources reconciled and Redis persistence is ready",
+    )
+    .await?;
     #[cfg(feature = "workspace-operator")]
     crate::workspace::controller::reconcile_cluster_workspace(&cluster, &client, &namespace)
         .await?;
@@ -215,6 +274,7 @@ pub async fn reconcile_mount(
         consumer_mount_path = Some(consumer.mount_path.clone());
 
         if let Some(host_mount_path) = &mount.spec.host_mount_path {
+            publish_consumer_label_conflicts(&client, &mount, consumer).await;
             let consumer_name = apply_consumer_workload(
                 &client,
                 &namespace,
@@ -362,8 +422,48 @@ fn rustfs_pvc_name(cluster_name: &str) -> String {
     format!("{cluster_name}-rustfs-data")
 }
 
-fn rustfs_job_name(cluster_name: &str) -> String {
-    format!("{cluster_name}-rustfs-init")
+const RUSTFS_INIT_TEMPLATE_HASH_ANNOTATION: &str = "storage.brewfs.io/rustfs-init-template-hash";
+const RUSTFS_INIT_GENERATION_ANNOTATION: &str = "storage.brewfs.io/rustfs-init-generation";
+
+#[cfg(test)]
+fn rustfs_job_template_hash(cluster: &BrewFSCluster) -> String {
+    rustfs_job_template_hash_for(&rustfs_init_pod_template(cluster))
+}
+
+fn rustfs_job_template_hash_for(template: &PodTemplateSpec) -> String {
+    // Serialize the exact immutable PodTemplateSpec used by the Job so every
+    // template field participates in the stable fingerprint.
+    let bytes = serde_json::to_vec(template).expect("RustFS init PodTemplateSpec is serializable");
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[cfg(test)]
+fn rustfs_job_name(cluster: &BrewFSCluster) -> String {
+    let cluster_name = cluster.name_any();
+    let hash = rustfs_job_template_hash(cluster);
+    rustfs_job_name_for_hash(&cluster_name, &hash)
+}
+
+fn rustfs_job_name_for_hash(cluster_name: &str, hash: &str) -> String {
+    const SUFFIX: &str = "-rustfs-init-";
+    const HASH_LEN: usize = 12;
+    const MAX_NAME_LEN: usize = 63;
+
+    let max_cluster_len = MAX_NAME_LEN - SUFFIX.len() - HASH_LEN;
+    let mut prefix: String = cluster_name.chars().take(max_cluster_len).collect();
+    while prefix.ends_with('-') {
+        prefix.pop();
+    }
+    format!("{prefix}{SUFFIX}{}", &hash[..HASH_LEN])
+}
+
+fn redis_pvc_name(cluster_name: &str) -> String {
+    format!("{cluster_name}-redis-data")
 }
 
 fn cluster_config_map_name(cluster_name: &str) -> String {
@@ -440,6 +540,39 @@ async fn apply_rustfs_pvc(
     apply(&api, &name, &desired).await
 }
 
+fn build_redis_pvc(cluster: &BrewFSCluster, owner: &OwnerReference) -> PersistentVolumeClaim {
+    let cluster_name = cluster.name_any();
+    let name = redis_pvc_name(&cluster_name);
+    PersistentVolumeClaim {
+        metadata: object_meta(name, labels(&cluster_name, "redis-storage"), owner),
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+            storage_class_name: cluster.spec.redis.storage_class_name.clone(),
+            resources: Some(k8s_openapi::api::core::v1::VolumeResourceRequirements {
+                requests: Some(BTreeMap::from([(
+                    "storage".to_string(),
+                    Quantity(cluster.spec.redis.storage_size.clone()),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+async fn apply_redis_pvc(
+    client: &kube::Client,
+    namespace: &str,
+    cluster: &BrewFSCluster,
+    owner: &OwnerReference,
+) -> Result<(), anyhow::Error> {
+    let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
+    let name = redis_pvc_name(&cluster.name_any());
+    let desired = build_redis_pvc(cluster, owner);
+    apply(&api, &name, &desired).await
+}
+
 async fn apply_redis_service(
     client: &kube::Client,
     namespace: &str,
@@ -471,20 +604,19 @@ async fn apply_redis_service(
     apply(&api, &name, &desired).await
 }
 
-async fn apply_redis_deployment(
-    client: &kube::Client,
-    namespace: &str,
-    cluster: &BrewFSCluster,
-    owner: &OwnerReference,
-) -> Result<(), anyhow::Error> {
-    let api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+fn build_redis_deployment(cluster: &BrewFSCluster, owner: &OwnerReference) -> Deployment {
     let cluster_name = cluster.name_any();
     let name = redis_name(&cluster_name);
     let match_labels = labels(&cluster_name, "redis");
-    let desired = Deployment {
+    let pvc_name = redis_pvc_name(&cluster_name);
+    Deployment {
         metadata: object_meta(name.clone(), match_labels.clone(), owner),
         spec: Some(DeploymentSpec {
             replicas: Some(1),
+            strategy: Some(DeploymentStrategy {
+                type_: Some("Recreate".to_string()),
+                ..DeploymentStrategy::default()
+            }),
             selector: LabelSelector {
                 match_labels: Some(match_labels.clone()),
                 ..LabelSelector::default()
@@ -500,6 +632,8 @@ async fn apply_redis_deployment(
                         image: Some(cluster.spec.redis.image.clone()),
                         args: Some(vec![
                             "redis-server".to_string(),
+                            "--dir".to_string(),
+                            "/data".to_string(),
                             "--appendonly".to_string(),
                             "yes".to_string(),
                             "--appendfsync".to_string(),
@@ -510,15 +644,41 @@ async fn apply_redis_deployment(
                             name: Some("redis".to_string()),
                             ..ContainerPort::default()
                         }]),
+                        volume_mounts: Some(vec![VolumeMount {
+                            name: "data".to_string(),
+                            mount_path: "/data".to_string(),
+                            ..VolumeMount::default()
+                        }]),
                         ..Container::default()
                     }],
+                    volumes: Some(vec![Volume {
+                        name: "data".to_string(),
+                        persistent_volume_claim: Some(
+                            k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+                                claim_name: pvc_name,
+                                ..Default::default()
+                            },
+                        ),
+                        ..Volume::default()
+                    }]),
                     ..PodSpec::default()
                 }),
             },
             ..DeploymentSpec::default()
         }),
         ..Deployment::default()
-    };
+    }
+}
+
+async fn apply_redis_deployment(
+    client: &kube::Client,
+    namespace: &str,
+    cluster: &BrewFSCluster,
+    owner: &OwnerReference,
+) -> Result<(), anyhow::Error> {
+    let api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    let name = redis_name(&cluster.name_any());
+    let desired = build_redis_deployment(cluster, owner);
     apply(&api, &name, &desired).await
 }
 
@@ -576,6 +736,77 @@ fn rustfs_container_args(port: i32, access_key: &str, secret_key: &str) -> Vec<S
         secret_key.to_string(),
         "/data".to_string(),
     ]
+}
+
+fn rustfs_init_pod_template(cluster: &BrewFSCluster) -> PodTemplateSpec {
+    let cluster_name = cluster.name_any();
+    let rustfs_name = rustfs_name(&cluster_name);
+    let secret_name = rustfs_secret_name(&cluster_name);
+    let bucket = cluster.spec.rustfs.bucket.clone();
+    let endpoint = format!("http://{}:{}", rustfs_name, cluster.spec.rustfs.port);
+    PodTemplateSpec {
+        metadata: Some(ObjectMeta {
+            labels: Some(labels(&cluster_name, "rustfs-init")),
+            ..ObjectMeta::default()
+        }),
+        spec: Some(PodSpec {
+            restart_policy: Some("Never".to_string()),
+            containers: vec![Container {
+                name: "rustfs-init".to_string(),
+                image: Some("amazon/aws-cli:latest".to_string()),
+                command: Some(vec![
+                    "/bin/sh".to_string(),
+                    "-ec".to_string(),
+                    format!(
+                        "mkdir -p /root/.aws && \
+printf '[default]\\ns3 =\\n  addressing_style = path\\n' > /root/.aws/config && \
+timeout 180 sh -ec 'while true; do \
+aws --endpoint-url {endpoint} s3api create-bucket --bucket {bucket} >/dev/null 2>&1 && exit 0; \
+aws --endpoint-url {endpoint} s3api head-bucket --bucket {bucket} >/dev/null 2>&1 && exit 0; \
+sleep 2; done'"
+                    ),
+                ]),
+                env: Some(vec![
+                    EnvVar {
+                        name: "AWS_ACCESS_KEY_ID".to_string(),
+                        value_from: Some(EnvVarSource {
+                            secret_key_ref: Some(SecretKeySelector {
+                                key: "accessKey".to_string(),
+                                name: secret_name.clone(),
+                                ..SecretKeySelector::default()
+                            }),
+                            ..EnvVarSource::default()
+                        }),
+                        ..EnvVar::default()
+                    },
+                    EnvVar {
+                        name: "AWS_SECRET_ACCESS_KEY".to_string(),
+                        value_from: Some(EnvVarSource {
+                            secret_key_ref: Some(SecretKeySelector {
+                                key: "secretKey".to_string(),
+                                name: secret_name,
+                                ..SecretKeySelector::default()
+                            }),
+                            ..EnvVarSource::default()
+                        }),
+                        ..EnvVar::default()
+                    },
+                    EnvVar {
+                        name: "AWS_DEFAULT_REGION".to_string(),
+                        value: Some(cluster.spec.rustfs.region.clone()),
+                        ..EnvVar::default()
+                    },
+                    EnvVar {
+                        name: "AWS_EC2_METADATA_DISABLED".to_string(),
+                        value: Some("true".to_string()),
+                        ..EnvVar::default()
+                    },
+                ]),
+                ..Container::default()
+            }],
+            ..PodSpec::default()
+        }),
+    }
 }
 
 async fn apply_rustfs_deployment(
@@ -677,91 +908,178 @@ async fn apply_rustfs_deployment(
     apply(&api, &name, &desired).await
 }
 
-async fn apply_rustfs_init_job(
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RustFsInitJobState {
+    Progressing(String),
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RustFsInitJobObservation {
+    Pending,
+    Failed,
+    Complete,
+}
+
+fn observe_rustfs_init_job(job: &Job) -> RustFsInitJobObservation {
+    let Some(status) = job.status.as_ref() else {
+        return RustFsInitJobObservation::Pending;
+    };
+    let conditions = status.conditions.as_deref().unwrap_or_default();
+    if status.succeeded.unwrap_or_default() > 0
+        || conditions
+            .iter()
+            .any(|condition| condition.type_ == "Complete" && condition.status == "True")
+    {
+        RustFsInitJobObservation::Complete
+    } else if status.failed.unwrap_or_default() > 0
+        || conditions
+            .iter()
+            .any(|condition| condition.type_ == "Failed" && condition.status == "True")
+    {
+        RustFsInitJobObservation::Failed
+    } else {
+        RustFsInitJobObservation::Pending
+    }
+}
+
+fn job_has_controller_owner(job: &Job, owner: &OwnerReference) -> bool {
+    job.metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|reference| {
+            reference.controller == Some(true)
+                && reference.uid == owner.uid
+                && reference.kind == owner.kind
+                && reference.name == owner.name
+        })
+}
+
+fn rustfs_init_job_generation(job: &Job) -> Option<i64> {
+    job.metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(RUSTFS_INIT_GENERATION_ANNOTATION))
+        .and_then(|generation| generation.parse().ok())
+}
+
+fn should_delete_superseded_rustfs_init_job(
+    job: &Job,
+    desired_name: &str,
+    owner: &OwnerReference,
+    current_generation: i64,
+) -> bool {
+    job.name_any() != desired_name
+        && job_has_controller_owner(job, owner)
+        && rustfs_init_job_generation(job)
+            .map(|generation| generation <= current_generation)
+            .unwrap_or(true)
+}
+
+async fn delete_rustfs_init_job(
+    api: &Api<Job>,
+    name: &str,
+    reason: &str,
+) -> Result<(), anyhow::Error> {
+    match api.delete(name, &DeleteParams::default()).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(error)) if error.code == 404 => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("delete {reason} RustFS init Job {name}")),
+    }
+}
+
+async fn reconcile_rustfs_init_job(
     client: &kube::Client,
     namespace: &str,
     cluster: &BrewFSCluster,
     owner: &OwnerReference,
-) -> Result<(), anyhow::Error> {
+) -> Result<RustFsInitJobState, anyhow::Error> {
     let api: Api<Job> = Api::namespaced(client.clone(), namespace);
     let cluster_name = cluster.name_any();
-    let name = rustfs_job_name(&cluster_name);
-    let rustfs_name = rustfs_name(&cluster_name);
-    let secret_name = rustfs_secret_name(&cluster_name);
-    let bucket = cluster.spec.rustfs.bucket.clone();
-    let endpoint = format!("http://{}:{}", rustfs_name, cluster.spec.rustfs.port);
+    let generation = cluster.metadata.generation.unwrap_or_default();
+    let template = rustfs_init_pod_template(cluster);
+    let template_hash = rustfs_job_template_hash_for(&template);
+    let name = rustfs_job_name_for_hash(&cluster_name, &template_hash);
     let desired = Job {
-        metadata: object_meta(name.clone(), labels(&cluster_name, "rustfs-init"), owner),
+        metadata: object_meta_with_annotations(
+            name.clone(),
+            labels(&cluster_name, "rustfs-init"),
+            BTreeMap::from([
+                (
+                    RUSTFS_INIT_TEMPLATE_HASH_ANNOTATION.to_string(),
+                    template_hash,
+                ),
+                (
+                    RUSTFS_INIT_GENERATION_ANNOTATION.to_string(),
+                    generation.to_string(),
+                ),
+            ]),
+            owner,
+        ),
         spec: Some(JobSpec {
             backoff_limit: Some(3),
-            template: PodTemplateSpec {
-                metadata: Some(ObjectMeta {
-                    labels: Some(labels(&cluster_name, "rustfs-init")),
-                    ..ObjectMeta::default()
-                }),
-                spec: Some(PodSpec {
-                    restart_policy: Some("Never".to_string()),
-                    containers: vec![Container {
-                        name: "rustfs-init".to_string(),
-                        image: Some("amazon/aws-cli:latest".to_string()),
-                        command: Some(vec![
-                            "/bin/sh".to_string(),
-                            "-ec".to_string(),
-                            format!(
-                                "mkdir -p /root/.aws && \
-printf '[default]\\ns3 =\\n  addressing_style = path\\n' > /root/.aws/config && \
-timeout 180 sh -ec 'while true; do \
-aws --endpoint-url {endpoint} s3api create-bucket --bucket {bucket} >/dev/null 2>&1 && exit 0; \
-aws --endpoint-url {endpoint} s3api head-bucket --bucket {bucket} >/dev/null 2>&1 && exit 0; \
-sleep 2; done'"
-                            ),
-                        ]),
-                        env: Some(vec![
-                            EnvVar {
-                                name: "AWS_ACCESS_KEY_ID".to_string(),
-                                value_from: Some(EnvVarSource {
-                                    secret_key_ref: Some(SecretKeySelector {
-                                        key: "accessKey".to_string(),
-                                        name: secret_name.clone(),
-                                        ..SecretKeySelector::default()
-                                    }),
-                                    ..EnvVarSource::default()
-                                }),
-                                ..EnvVar::default()
-                            },
-                            EnvVar {
-                                name: "AWS_SECRET_ACCESS_KEY".to_string(),
-                                value_from: Some(EnvVarSource {
-                                    secret_key_ref: Some(SecretKeySelector {
-                                        key: "secretKey".to_string(),
-                                        name: secret_name,
-                                        ..SecretKeySelector::default()
-                                    }),
-                                    ..EnvVarSource::default()
-                                }),
-                                ..EnvVar::default()
-                            },
-                            EnvVar {
-                                name: "AWS_DEFAULT_REGION".to_string(),
-                                value: Some(cluster.spec.rustfs.region.clone()),
-                                ..EnvVar::default()
-                            },
-                            EnvVar {
-                                name: "AWS_EC2_METADATA_DISABLED".to_string(),
-                                value: Some("true".to_string()),
-                                ..EnvVar::default()
-                            },
-                        ]),
-                        ..Container::default()
-                    }],
-                    ..PodSpec::default()
-                }),
-            },
+            template,
             ..JobSpec::default()
         }),
         ..Job::default()
     };
-    apply(&api, &name, &desired).await
+
+    let selector = format!(
+        "app.kubernetes.io/instance={cluster_name},app.kubernetes.io/component=rustfs-init"
+    );
+    let jobs = api.list(&ListParams::default().labels(&selector)).await?;
+    let mut waiting_for_cleanup = false;
+    for old_job in jobs {
+        if should_delete_superseded_rustfs_init_job(&old_job, &name, owner, generation) {
+            let old_name = old_job.name_any();
+            waiting_for_cleanup = true;
+            if old_job.metadata.deletion_timestamp.is_none() {
+                delete_rustfs_init_job(&api, &old_name, "superseded").await?;
+            }
+        }
+    }
+    if waiting_for_cleanup {
+        return Ok(RustFsInitJobState::Progressing(
+            "waiting for superseded RustFS init Jobs to be deleted".to_string(),
+        ));
+    }
+
+    if !cluster_snapshot_is_current(client, namespace, cluster).await? {
+        return Ok(RustFsInitJobState::Progressing(
+            "waiting for the current BrewFSCluster generation".to_string(),
+        ));
+    }
+
+    let Some(current) = api
+        .get_opt(&name)
+        .await
+        .with_context(|| format!("load RustFS init Job {name}"))?
+    else {
+        apply(&api, &name, &desired).await?;
+        return Ok(RustFsInitJobState::Progressing(format!(
+            "waiting for RustFS init Job {name} to complete"
+        )));
+    };
+    if !job_has_controller_owner(&current, owner) {
+        return Err(anyhow!(
+            "RustFS init Job {name} is not controlled by BrewFSCluster {cluster_name}"
+        ));
+    }
+
+    match observe_rustfs_init_job(&current) {
+        RustFsInitJobObservation::Complete => Ok(RustFsInitJobState::Complete),
+        RustFsInitJobObservation::Failed => {
+            delete_rustfs_init_job(&api, &name, "failed").await?;
+            Ok(RustFsInitJobState::Progressing(format!(
+                "RustFS init Job {name} failed; waiting to retry"
+            )))
+        }
+        RustFsInitJobObservation::Pending => Ok(RustFsInitJobState::Progressing(format!(
+            "waiting for RustFS init Job {name} to complete"
+        ))),
+    }
 }
 
 async fn apply_brewfs_config(
@@ -849,8 +1167,7 @@ async fn apply_consumer_workload(
     let mount_name = mount.name_any();
     let workload_name = consumer_workload_name(&mount_name);
     let match_labels = labels(&mount_name, "consumer");
-    let mut workload_labels = match_labels.clone();
-    workload_labels.extend(consumer.workload_labels.clone());
+    let workload_labels = build_consumer_workload_labels(consumer, match_labels.clone());
     let workload_annotations = consumer.workload_annotations.clone();
     let template = build_consumer_pod_template(consumer, host_mount_path, match_labels.clone());
     let headless_service_name = consumer_headless_service_name(&mount_name);
@@ -1167,8 +1484,7 @@ fn build_consumer_pod_template(
     host_mount_path: &str,
     match_labels: BTreeMap<String, String>,
 ) -> PodTemplateSpec {
-    let mut labels = match_labels;
-    labels.extend(consumer.pod_labels.clone());
+    let labels = merge_operator_labels(&consumer.pod_labels, match_labels);
 
     let mut annotations = consumer.pod_annotations.clone();
     annotations.insert(
@@ -1218,6 +1534,87 @@ fn build_consumer_pod_template(
             ..PodSpec::default()
         }),
     }
+}
+
+fn build_consumer_workload_labels(
+    consumer: &MountConsumerSpec,
+    match_labels: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    merge_operator_labels(&consumer.workload_labels, match_labels)
+}
+
+fn conflicting_consumer_label_keys(
+    consumer: &MountConsumerSpec,
+    operator_labels: &BTreeMap<String, String>,
+) -> Vec<String> {
+    consumer
+        .pod_labels
+        .iter()
+        .chain(consumer.workload_labels.iter())
+        .filter_map(|(key, value)| {
+            operator_labels
+                .get(key)
+                .filter(|operator_value| *operator_value != value)
+                .map(|_| key.clone())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+async fn publish_consumer_label_conflicts(
+    client: &kube::Client,
+    mount: &BrewFSMount,
+    consumer: &MountConsumerSpec,
+) {
+    let Some(generation) = mount.metadata.generation else {
+        return;
+    };
+    if mount
+        .status
+        .as_ref()
+        .and_then(|status| status.observed_generation)
+        == Some(generation)
+    {
+        return;
+    }
+
+    let conflicts =
+        conflicting_consumer_label_keys(consumer, &labels(&mount.name_any(), "consumer"));
+    if conflicts.is_empty() {
+        return;
+    }
+
+    let recorder = Recorder::new(
+        client.clone(),
+        Reporter::from("brewfs-operator"),
+        mount.object_ref(&()),
+    );
+    let note = format!(
+        "Consumer labels override reserved operator labels; operator values are used for: {}",
+        conflicts.join(", ")
+    );
+    if let Err(error) = recorder
+        .publish(Event {
+            type_: EventType::Warning,
+            reason: "ReservedLabelOverride".to_string(),
+            note: Some(note),
+            action: "BuildConsumerWorkload".to_string(),
+            secondary: None,
+        })
+        .await
+    {
+        tracing::warn!(?error, mount = %mount.name_any(), "failed to publish consumer label conflict event");
+    }
+}
+
+fn merge_operator_labels(
+    user_labels: &BTreeMap<String, String>,
+    operator_labels: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut labels = user_labels.clone();
+    labels.extend(operator_labels);
+    labels
 }
 
 fn mount_state_volume(mount: &BrewFSMount) -> Volume {
@@ -1870,13 +2267,15 @@ layout:\n  chunk_size: {chunk_size}\n  block_size: {block_size}\n",
 
 fn cluster_ready_status(
     cluster: &BrewFSCluster,
+    phase: &str,
+    message: &str,
     last_reconciled_at: Option<DateTime<Utc>>,
 ) -> BrewFSClusterStatus {
     let cluster_name = cluster.name_any();
     BrewFSClusterStatus {
         observed_generation: cluster.metadata.generation,
-        phase: "Ready".to_string(),
-        message: "Backend resources reconciled".to_string(),
+        phase: phase.to_string(),
+        message: message.to_string(),
         redis_service: Some(redis_name(&cluster_name)),
         rustfs_service: Some(rustfs_name(&cluster_name)),
         bucket: Some(cluster.spec.rustfs.bucket.clone()),
@@ -1888,6 +2287,26 @@ fn cluster_ready_status(
             .and_then(|status| status.workspace.clone()),
         last_reconciled_at,
     }
+}
+
+fn pvc_is_bound(pvc: &PersistentVolumeClaim) -> bool {
+    pvc.status
+        .as_ref()
+        .and_then(|status| status.phase.as_deref())
+        == Some("Bound")
+}
+
+fn deployment_is_ready(deployment: &Deployment) -> bool {
+    let Some(status) = deployment.status.as_ref() else {
+        return false;
+    };
+    let Some(spec) = deployment.spec.as_ref() else {
+        return false;
+    };
+    let desired = spec.replicas.unwrap_or(1);
+    status.observed_generation == deployment.metadata.generation
+        && status.updated_replicas == Some(desired)
+        && status.available_replicas == Some(desired)
 }
 
 fn cluster_status_semantically_equal(
@@ -1939,10 +2358,12 @@ async fn patch_cluster_status(
     client: &kube::Client,
     namespace: &str,
     cluster: &BrewFSCluster,
+    phase: &str,
+    message: &str,
 ) -> Result<(), anyhow::Error> {
     let api: Api<BrewFSCluster> = Api::namespaced(client.clone(), namespace);
     let cluster_name = cluster.name_any();
-    let desired = cluster_ready_status(cluster, None);
+    let desired = cluster_ready_status(cluster, phase, message, None);
     if cluster
         .status
         .as_ref()
@@ -1951,12 +2372,44 @@ async fn patch_cluster_status(
         return Ok(());
     }
 
-    let status = cluster_ready_status(cluster, Some(Utc::now()));
+    let status = cluster_ready_status(cluster, phase, message, Some(Utc::now()));
 
     let patch = json!({
         "apiVersion": "storage.brewfs.io/v1alpha1",
         "kind": "BrewFSCluster",
         "status": status,
+    });
+    api.patch_status(
+        &cluster_name,
+        &PatchParams::apply("brewfs-operator").force(),
+        &Patch::Apply(&patch),
+    )
+    .await
+    .with_context(|| format!("patch status for {cluster_name}"))?;
+    Ok(())
+}
+
+async fn patch_cluster_status_phase(
+    client: &kube::Client,
+    namespace: &str,
+    cluster: &BrewFSCluster,
+    phase: &str,
+    message: &str,
+) -> Result<(), anyhow::Error> {
+    let api: Api<BrewFSCluster> = Api::namespaced(client.clone(), namespace);
+    let cluster_name = cluster.name_any();
+    let mut status = cluster_ready_status(
+        cluster,
+        "Ready",
+        "Backend resources reconciled and Redis persistence is ready",
+        None,
+    );
+    status.phase = phase.to_string();
+    status.message = message.to_string();
+    let patch = json!({
+        "apiVersion": "storage.brewfs.io/v1alpha1",
+        "kind": "BrewFSCluster",
+        "status": BrewFSClusterStatus { last_reconciled_at: Some(Utc::now()), ..status },
     });
     api.patch_status(
         &cluster_name,
@@ -2079,6 +2532,175 @@ mod tests {
             ]
         );
         assert!(!args.iter().any(|arg| arg == "--server-domains"));
+    }
+
+    #[test]
+    fn rustfs_init_job_name_changes_with_effective_template() {
+        let mut cluster = BrewFSCluster {
+            metadata: ObjectMeta {
+                name: Some("demo".to_string()),
+                ..ObjectMeta::default()
+            },
+            spec: BrewFSClusterSpec {
+                redis: RedisSpec::default(),
+                rustfs: RustFsSpec::default(),
+                mount_config: MountConfigSpec::default(),
+                #[cfg(feature = "workspace-operator")]
+                workspace: None,
+            },
+            status: None,
+        };
+
+        let initial_name = rustfs_job_name(&cluster);
+        let initial_hash = rustfs_job_template_hash(&cluster);
+        assert_eq!(initial_name.len(), "demo-rustfs-init-".len() + 12);
+        assert!(initial_name.ends_with(&initial_hash[..12]));
+        assert_eq!(initial_hash, rustfs_job_template_hash(&cluster));
+
+        cluster.spec.rustfs.port += 1;
+        assert_ne!(initial_name, rustfs_job_name(&cluster));
+        cluster.spec.rustfs.port -= 1;
+        cluster.spec.rustfs.bucket.push_str("-changed");
+        assert_ne!(initial_name, rustfs_job_name(&cluster));
+        cluster.spec.rustfs.bucket = RustFsSpec::default().bucket;
+        cluster.spec.rustfs.region.push_str("-changed");
+        assert_ne!(initial_name, rustfs_job_name(&cluster));
+
+        let template = rustfs_init_pod_template(&cluster);
+        let mut changed_template = template.clone();
+        changed_template
+            .spec
+            .as_mut()
+            .expect("init pod spec")
+            .restart_policy = Some("Always".to_string());
+        assert_ne!(
+            rustfs_job_template_hash_for(&template),
+            rustfs_job_template_hash_for(&changed_template)
+        );
+    }
+
+    #[test]
+    fn rustfs_init_job_state_requires_observed_completion() {
+        assert_eq!(
+            observe_rustfs_init_job(&Job::default()),
+            RustFsInitJobObservation::Pending
+        );
+        let pending = Job {
+            status: Some(k8s_openapi::api::batch::v1::JobStatus {
+                active: Some(1),
+                ..Default::default()
+            }),
+            ..Job::default()
+        };
+        assert_eq!(
+            observe_rustfs_init_job(&pending),
+            RustFsInitJobObservation::Pending
+        );
+        let failed = Job {
+            status: Some(k8s_openapi::api::batch::v1::JobStatus {
+                failed: Some(3),
+                ..Default::default()
+            }),
+            ..Job::default()
+        };
+        assert_eq!(
+            observe_rustfs_init_job(&failed),
+            RustFsInitJobObservation::Failed
+        );
+        let complete = Job {
+            status: Some(k8s_openapi::api::batch::v1::JobStatus {
+                succeeded: Some(1),
+                ..Default::default()
+            }),
+            ..Job::default()
+        };
+        assert_eq!(
+            observe_rustfs_init_job(&complete),
+            RustFsInitJobObservation::Complete
+        );
+    }
+
+    #[test]
+    fn superseded_jobs_require_matching_owner_and_generation() {
+        let owner = OwnerReference {
+            api_version: "storage.brewfs.io/v1alpha1".to_string(),
+            kind: "BrewFSCluster".to_string(),
+            name: "demo".to_string(),
+            uid: "cluster-uid".to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        let old = Job {
+            metadata: ObjectMeta {
+                name: Some("demo-rustfs-init-old".to_string()),
+                annotations: Some(BTreeMap::from([(
+                    RUSTFS_INIT_GENERATION_ANNOTATION.to_string(),
+                    "3".to_string(),
+                )])),
+                owner_references: Some(vec![owner.clone()]),
+                ..ObjectMeta::default()
+            },
+            ..Job::default()
+        };
+        assert!(should_delete_superseded_rustfs_init_job(
+            &old,
+            "demo-rustfs-init-current",
+            &owner,
+            3
+        ));
+
+        let newer = Job {
+            metadata: ObjectMeta {
+                annotations: Some(BTreeMap::from([(
+                    RUSTFS_INIT_GENERATION_ANNOTATION.to_string(),
+                    "4".to_string(),
+                )])),
+                ..old.metadata.clone()
+            },
+            ..old.clone()
+        };
+        assert!(!should_delete_superseded_rustfs_init_job(
+            &newer,
+            "demo-rustfs-init-current",
+            &owner,
+            3
+        ));
+
+        let unrelated = Job {
+            metadata: ObjectMeta {
+                owner_references: None,
+                ..old.metadata.clone()
+            },
+            ..old
+        };
+        assert!(!should_delete_superseded_rustfs_init_job(
+            &unrelated,
+            "demo-rustfs-init-current",
+            &owner,
+            3
+        ));
+    }
+
+    #[test]
+    fn rustfs_init_job_name_is_bounded_for_long_cluster_names() {
+        let cluster = BrewFSCluster {
+            metadata: ObjectMeta {
+                name: Some("a".repeat(63)),
+                ..ObjectMeta::default()
+            },
+            spec: BrewFSClusterSpec {
+                redis: RedisSpec::default(),
+                rustfs: RustFsSpec::default(),
+                mount_config: MountConfigSpec::default(),
+                #[cfg(feature = "workspace-operator")]
+                workspace: None,
+            },
+            status: None,
+        };
+
+        let name = rustfs_job_name(&cluster);
+        assert!(name.len() <= 63);
+        assert!(name.ends_with(&rustfs_job_template_hash(&cluster)[..12]));
     }
 
     #[test]
@@ -2272,5 +2894,91 @@ mod tests {
 
         desired.ready_replicas = Some(0);
         assert!(!mount_status_semantically_equal(&current, &desired));
+    }
+
+    #[test]
+    fn conflicting_consumer_label_keys_only_include_reserved_overrides() {
+        let mut consumer: MountConsumerSpec =
+            serde_json::from_value(json!({})).expect("default consumer spec");
+        consumer.pod_labels = BTreeMap::from([
+            (
+                "app.kubernetes.io/component".to_string(),
+                "wrong".to_string(),
+            ),
+            ("app.kubernetes.io/name".to_string(), "brewfs".to_string()),
+            ("example.com/custom".to_string(), "kept".to_string()),
+        ]);
+        consumer.workload_labels = BTreeMap::from([
+            (
+                "app.kubernetes.io/component".to_string(),
+                "also-wrong".to_string(),
+            ),
+            (
+                "app.kubernetes.io/instance".to_string(),
+                "wrong".to_string(),
+            ),
+        ]);
+
+        assert_eq!(
+            conflicting_consumer_label_keys(&consumer, &labels("demo-mount", "consumer")),
+            vec![
+                "app.kubernetes.io/component".to_string(),
+                "app.kubernetes.io/instance".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn consumer_pod_labels_cannot_override_selectors() {
+        let mut consumer: MountConsumerSpec =
+            serde_json::from_value(json!({})).expect("default consumer spec");
+        consumer.pod_labels = BTreeMap::from([
+            (
+                "app.kubernetes.io/component".to_string(),
+                "overridden".to_string(),
+            ),
+            ("example.com/custom".to_string(), "kept".to_string()),
+        ]);
+        consumer.workload_labels = BTreeMap::from([
+            (
+                "app.kubernetes.io/component".to_string(),
+                "overridden".to_string(),
+            ),
+            ("example.com/workload".to_string(), "kept".to_string()),
+        ]);
+        let selector_labels = labels("demo-mount", "consumer");
+
+        let template = build_consumer_pod_template(&consumer, "/mnt/demo", selector_labels.clone());
+        let template_labels = template
+            .metadata
+            .and_then(|metadata| metadata.labels)
+            .expect("consumer pod template labels");
+
+        assert_eq!(
+            template_labels
+                .get("app.kubernetes.io/component")
+                .map(String::as_str),
+            Some("consumer")
+        );
+        assert_eq!(
+            template_labels
+                .get("example.com/custom")
+                .map(String::as_str),
+            Some("kept")
+        );
+
+        let workload_labels = build_consumer_workload_labels(&consumer, selector_labels);
+        assert_eq!(
+            workload_labels
+                .get("app.kubernetes.io/component")
+                .map(String::as_str),
+            Some("consumer")
+        );
+        assert_eq!(
+            workload_labels
+                .get("example.com/workload")
+                .map(String::as_str),
+            Some("kept")
+        );
     }
 }

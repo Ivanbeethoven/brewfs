@@ -1793,17 +1793,11 @@ async fn test_rename_exchange_lua_old_not_found() {
         .rename_exchange(root, "nonexistent.txt", root, "file2.txt")
         .await;
 
-    assert!(result.is_err());
-    if let Err(MetaError::Internal(msg)) = result {
-        assert!(
-            msg.contains("Entry 'nonexistent.txt' not found in parent")
-                && msg.contains("for exchange"),
-            "error message should match format: got '{}'",
-            msg
-        );
-    } else {
-        panic!("expected Internal error");
-    }
+    assert!(matches!(
+        result,
+        Err(MetaError::EntryNotFound { parent, name })
+            if parent == root && name == "nonexistent.txt"
+    ));
 }
 
 #[serial]
@@ -1822,17 +1816,11 @@ async fn test_rename_exchange_lua_new_not_found() {
         .rename_exchange(root, "file1.txt", root, "nonexistent.txt")
         .await;
 
-    assert!(result.is_err());
-    if let Err(MetaError::Internal(msg)) = result {
-        assert!(
-            msg.contains("Entry 'nonexistent.txt' not found in parent")
-                && msg.contains("for exchange"),
-            "error message should match format: got '{}'",
-            msg
-        );
-    } else {
-        panic!("expected Internal error");
-    }
+    assert!(matches!(
+        result,
+        Err(MetaError::EntryNotFound { parent, name })
+            if parent == root && name == "nonexistent.txt"
+    ));
 }
 
 #[serial]
@@ -1919,6 +1907,77 @@ async fn test_rename_exchange_lua_hardlinks() {
     assert_eq!(node2_after.attr.nlink, 2);
     assert_eq!(node2_after.parent, 0);
     assert_eq!(node2_after.name, "");
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_rename_scripts_prevent_concurrent_parent_cycle() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let a = store.mkdir(root, "a".into()).await.unwrap();
+    let q = store.mkdir(root, "q".into()).await.unwrap();
+    let x = store.mkdir(q, "x".into()).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+    let exchange = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.rename_exchange(root, "a", q, "x").await
+        })
+    };
+    let rename = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.rename(root, "q", a, "q".into()).await
+        })
+    };
+    barrier.wait().await;
+
+    let exchange = exchange.await.unwrap();
+    let rename = rename.await.unwrap();
+    assert!(exchange.is_ok() ^ rename.is_ok());
+    assert!(matches!(
+        exchange.err().or_else(|| rename.err()).unwrap(),
+        MetaError::InvalidPath(_)
+    ));
+
+    for start in [a, q, x] {
+        let mut current = start;
+        let mut visited = std::collections::HashSet::new();
+        while current != root {
+            assert!(visited.insert(current));
+            current = store.get_dir_parent(current).await.unwrap().unwrap();
+        }
+    }
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_rename_exchange_rejects_corrupt_ancestry_without_writes() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let source = store.mkdir(root, "source".into()).await.unwrap();
+    let parent = store.mkdir(root, "parent".into()).await.unwrap();
+    let child = store.mkdir(parent, "child".into()).await.unwrap();
+    let file = store.create_file(parent, "file".into()).await.unwrap();
+
+    let mut parent_node = store.get_node(parent).await.unwrap().unwrap();
+    parent_node.parent = child;
+    store.save_node(&parent_node).await.unwrap();
+
+    let error = store
+        .rename_exchange(root, "source", parent, "file")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaError::InvalidPath(_)));
+    assert_eq!(store.lookup(root, "source").await.unwrap(), Some(source));
+    assert_eq!(store.lookup(parent, "file").await.unwrap(), Some(file));
 }
 
 #[test]

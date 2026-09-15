@@ -1284,11 +1284,15 @@ where
         }))
     };
     let mount_result = async {
-        let meta_layer = Arc::new(WorkspaceMetaLayer::with_chunk_size(
+        let mut meta_layer = WorkspaceMetaLayer::with_chunk_size(
             workspace_store,
             session.view.clone(),
             layout.chunk_size,
-        ));
+        );
+        if let Some(max_weight) = args.meta_read_plan_cache_max_weight {
+            meta_layer = meta_layer.with_read_plan_cache_max_weight(max_weight);
+        }
+        let meta_layer = Arc::new(meta_layer);
         meta_layer.initialize().await?;
         let writeback_root = crate::workspace_overlay::cache_scope::writeback_root(
             &args.cache.cache_root,

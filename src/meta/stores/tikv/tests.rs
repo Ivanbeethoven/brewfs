@@ -4,8 +4,8 @@ use crate::meta::config::{
     CacheConfig, ClientOptions, CompactConfig, DatabaseConfig, DatabaseType,
 };
 use crate::meta::factory::MetaStoreFactory;
-use crate::meta::store::{FileType, MetaStore};
-use crate::vfs::chunk_id_for;
+use crate::meta::store::{FileType, MetaError, MetaStore};
+use crate::vfs::{chunk_id_for, extract_ino_and_chunk_index};
 
 #[test]
 fn special_node_round_trip_preserves_kind_mode_and_rdev() {
@@ -126,7 +126,7 @@ fn key_schema_uses_namespace_prefixes() {
 }
 
 #[test]
-fn truncate_discovers_stale_mappings_and_stages_removed_ranges() {
+fn truncate_discovers_stale_mappings_and_only_stages_whole_slices() {
     let ino = 42;
     let chunk0 = chunk_id_for(ino, 0).unwrap();
     let chunk1 = chunk_id_for(ino, 1).unwrap();
@@ -149,14 +149,33 @@ fn truncate_discovers_stale_mappings_and_stages_removed_ranges() {
             offset: 80,
             length: 40,
         },
+        SliceDesc {
+            slice_id: 3,
+            chunk_id: chunk0,
+            offset: 120,
+            length: 20,
+        },
     ];
     assert_eq!(
         delayed_slices_for_truncate(&slices, Some(100)),
-        vec![(2, 100, 20)]
+        vec![(3, 120, 20)],
+        "only slices wholly beyond EOF may be scheduled for whole-slice GC"
     );
     assert_eq!(
         delayed_slices_for_truncate(&slices, None),
-        vec![(1, 0, 80), (2, 80, 40)]
+        vec![(1, 0, 80), (2, 80, 40), (3, 120, 20)]
+    );
+}
+
+#[test]
+fn chunk_index_keys_are_addressable_by_inode() {
+    let chunk_id = chunk_id_for(42, 7).unwrap();
+    let (ino, chunk_index) = extract_ino_and_chunk_index(chunk_id);
+    assert_eq!(ino, 42);
+    assert_eq!(chunk_index, 7);
+    assert_eq!(
+        TiKvMetaStore::scoped_key("tenant-a", "chunk_index/42/7"),
+        b"tenant-a/chunk_index/42/7".to_vec()
     );
 }
 
@@ -739,6 +758,72 @@ async fn tikv_rename_exchange_swaps_entries() {
     assert_eq!(store.lookup(root, "b").await.unwrap(), Some(a));
     assert_eq!(store.get_paths(a).await.unwrap(), vec!["/b".to_string()]);
     assert_eq!(store.get_paths(b).await.unwrap(), vec!["/a".to_string()]);
+
+    let left = store.mkdir(root, "left".into()).await.unwrap();
+    let right = store.mkdir(root, "right".into()).await.unwrap();
+    let directory = store.mkdir(left, "directory".into()).await.unwrap();
+    let file = store.create_file(right, "file".into()).await.unwrap();
+    store
+        .rename_exchange(left, "directory", right, "file")
+        .await
+        .unwrap();
+    assert_eq!(store.lookup(left, "directory").await.unwrap(), Some(file));
+    assert_eq!(store.lookup(right, "file").await.unwrap(), Some(directory));
+    assert_eq!(store.get_dir_parent(directory).await.unwrap(), Some(right));
+    assert_eq!(
+        store.get_names(file).await.unwrap(),
+        vec![(Some(left), "directory".into())]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a running TiKV/PD cluster; set BREWFS_TIKV_PD_ENDPOINTS"]
+async fn tikv_rename_transactions_prevent_concurrent_parent_cycle() {
+    let store = Arc::new(
+        TiKvMetaStore::from_config(integration_config("rename-cycle-race"))
+            .await
+            .unwrap(),
+    );
+    store.initialize().await.unwrap();
+    let root = store.root_ino();
+    let a = store.mkdir(root, "a".into()).await.unwrap();
+    let q = store.mkdir(root, "q".into()).await.unwrap();
+    let x = store.mkdir(q, "x".into()).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+    let exchange = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.rename_exchange(root, "a", q, "x").await
+        })
+    };
+    let rename = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.rename(root, "q", a, "q".into()).await
+        })
+    };
+    barrier.wait().await;
+
+    let exchange = exchange.await.unwrap();
+    let rename = rename.await.unwrap();
+    assert!(exchange.is_ok() ^ rename.is_ok());
+    assert!(matches!(
+        exchange.err().or_else(|| rename.err()).unwrap(),
+        MetaError::InvalidPath(_)
+    ));
+    for start in [a, q, x] {
+        let mut current = start;
+        let mut visited = std::collections::HashSet::new();
+        while current != root {
+            assert!(visited.insert(current));
+            current = store.get_dir_parent(current).await.unwrap().unwrap();
+        }
+    }
 }
 
 #[tokio::test]
@@ -807,8 +892,41 @@ async fn tikv_truncate_prunes_slices_before_extension_and_restart() {
     assert!(store.get_slices(chunk1).await.unwrap().is_empty());
     assert_eq!(store.stat(ino).await.unwrap().unwrap().size, 600);
 
-    store.truncate(ino, 1200, chunk_size).await.unwrap();
+    // The retained prefix must survive delayed-GC processing.  The removed
+    // tail is staged as a complete slice, so its block range cannot overlap
+    // the prefix that remains under slice ID 1.
+    let delayed = store.process_delayed_slices(10, -1).await.unwrap();
+    assert!(
+        delayed.iter().any(|(slice_id, offset, size, _)| {
+            *slice_id == 2 && *offset == 800 && *size == 224
+        })
+    );
     assert_eq!(store.get_slices(chunk0).await.unwrap()[0].length, 600);
+    let delayed_ids = delayed.iter().map(|(_, _, _, id)| *id).collect::<Vec<_>>();
+    store.confirm_delayed_deleted(&delayed_ids).await.unwrap();
+
+    // Simulate legacy metadata whose inode size was already reduced while a
+    // stale mapping remained.  Cleanup must use the per-inode index, not the
+    // old logical size as an upper bound.
+    store
+        .append_slice(
+            chunk1,
+            SliceDesc {
+                slice_id: 4,
+                chunk_id: chunk1,
+                offset: 0,
+                length: 128,
+            },
+        )
+        .await
+        .unwrap();
+    store.set_file_size(ino, 600).await.unwrap();
+    store.truncate(ino, 500, chunk_size).await.unwrap();
+    assert_eq!(store.get_slices(chunk0).await.unwrap()[0].length, 500);
+    assert!(store.get_slices(chunk1).await.unwrap().is_empty());
+
+    store.truncate(ino, 1200, chunk_size).await.unwrap();
+    assert_eq!(store.get_slices(chunk0).await.unwrap()[0].length, 500);
     assert!(store.get_slices(chunk1).await.unwrap().is_empty());
     assert_eq!(store.stat(ino).await.unwrap().unwrap().size, 1200);
 

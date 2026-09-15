@@ -2166,6 +2166,64 @@ struct Inner {
     sparse_fallocate_ranges: BTreeMap<u64, Vec<(u64, u64)>>,
 }
 
+struct FlushGateGuard<B, M>
+where
+    B: BlockStore + Send + Sync + 'static,
+    M: MetaLayer + Send + Sync + 'static,
+{
+    shared: Arc<Shared<B, M>>,
+    armed: bool,
+}
+
+impl<B, M> FlushGateGuard<B, M>
+where
+    B: BlockStore + Send + Sync + 'static,
+    M: MetaLayer + Send + Sync + 'static,
+{
+    fn new(shared: Arc<Shared<B, M>>) -> Self {
+        Self {
+            shared,
+            armed: true,
+        }
+    }
+
+    async fn release(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut guard = self.shared.inner.lock().await;
+        if guard.flush_waiting > 0 {
+            guard.flush_waiting -= 1;
+        }
+        if guard.flush_waiting == 0 && guard.write_waiting > 0 {
+            self.shared.write_notify.notify_waiters();
+        }
+        self.armed = false;
+    }
+}
+
+impl<B, M> Drop for FlushGateGuard<B, M>
+where
+    B: BlockStore + Send + Sync + 'static,
+    M: MetaLayer + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            let mut guard = shared.inner.lock().await;
+            if guard.flush_waiting > 0 {
+                guard.flush_waiting -= 1;
+            }
+            if guard.flush_waiting == 0 && guard.write_waiting > 0 {
+                shared.write_notify.notify_waiters();
+            }
+        });
+    }
+}
+
 impl Inner {
     fn chunk_handle<'a, B, M>(
         &'a mut self,
@@ -3552,11 +3610,12 @@ where
 
             guard.flush_waiting += 1;
         }
+        let mut flush_gate = FlushGateGuard::new(self.shared.clone());
 
         let start = Instant::now();
         let mut captured_slices = 0u64;
         let mut completed_gen_for_cache = None;
-        let result = {
+        let result = async {
             let mut flushed_gen = self.shared.write_gen.load(Ordering::Acquire);
             loop {
                 self.coalesce_cached_slices_before_explicit_flush().await?;
@@ -3698,19 +3757,14 @@ where
                 }
                 flushed_gen = current_gen;
             }
-        };
+        }
+        .await;
         self.shared
             .recent_pending_upload
             .record_flush_wait(start.elapsed(), captured_slices);
 
         // Notify all write events.
-        let mut guard = self.shared.inner.lock().await;
-        if guard.flush_waiting > 0 {
-            guard.flush_waiting -= 1;
-        }
-        if guard.flush_waiting == 0 && guard.write_waiting > 0 {
-            self.shared.write_notify.notify_waiters();
-        }
+        flush_gate.release().await;
 
         // Let has_pending() short-circuit when no new writes arrived since we finished.
         if result.is_ok()
@@ -9454,6 +9508,11 @@ mod tests {
             err.to_string().contains("writeback failed"),
             "unexpected flush error: {err:?}"
         );
+        assert_eq!(
+            writer.shared.inner.lock().await.flush_waiting,
+            0,
+            "flush error must release the flush gate"
+        );
         assert!(
             writer.has_pending().await,
             "writeback error should remain observable by later flush/fsync/close calls"
@@ -9624,6 +9683,11 @@ mod tests {
             err.to_string()
                 .contains("metadata commit failed with non-retryable error"),
             "unexpected flush error: {err:?}"
+        );
+        assert_eq!(
+            writer.shared.inner.lock().await.flush_waiting,
+            0,
+            "metadata commit error must release the flush gate"
         );
     }
 
