@@ -237,6 +237,51 @@ fn link_parent_exchange_rejects_missing_source_binding() {
     assert_eq!(link_parents[0].entry_name, "existing");
 }
 
+#[test]
+fn link_parent_exchange_accepts_noncanonical_aliases() {
+    let link_parents = vec![
+        crate::meta::entities::etcd::EtcdLinkParent {
+            parent_inode: 1,
+            entry_name: "canonical".to_string(),
+        },
+        crate::meta::entities::etcd::EtcdLinkParent {
+            parent_inode: 2,
+            entry_name: "source-alias".to_string(),
+        },
+        crate::meta::entities::etcd::EtcdLinkParent {
+            parent_inode: 3,
+            entry_name: "destination-alias".to_string(),
+        },
+    ];
+
+    super::validate_link_parent_exchange(&link_parents, 2, "source-alias", 3, "destination-alias")
+        .unwrap();
+}
+
+#[test]
+fn link_parent_exchange_rejects_duplicate_bindings() {
+    let link_parents = vec![
+        crate::meta::entities::etcd::EtcdLinkParent {
+            parent_inode: 2,
+            entry_name: "source".to_string(),
+        },
+        crate::meta::entities::etcd::EtcdLinkParent {
+            parent_inode: 2,
+            entry_name: "source".to_string(),
+        },
+        crate::meta::entities::etcd::EtcdLinkParent {
+            parent_inode: 3,
+            entry_name: "destination".to_string(),
+        },
+    ];
+
+    let result = super::validate_link_parent_exchange(&link_parents, 2, "source", 3, "destination");
+
+    assert!(
+        matches!(result, Err(MetaError::Internal(message)) if message.contains("source binding count"))
+    );
+}
+
 #[serial]
 #[tokio::test]
 #[ignore]
@@ -285,6 +330,14 @@ async fn test_rename_exchange_updates_reverse_and_link_parent_indexes() {
         .await
         .unwrap();
     store.link(linked, right, "linked-peer").await.unwrap();
+
+    // The reverse record has no canonical path once the inode is hard-linked;
+    // exchanging through either alias must use the LinkParent bindings.
+    store
+        .rename_exchange(right, "linked-peer", left, "linked-old")
+        .await
+        .unwrap();
+
     let plain = store.create_file(left, "plain".to_string()).await.unwrap();
     store
         .rename_exchange(left, "linked-old", left, "plain")

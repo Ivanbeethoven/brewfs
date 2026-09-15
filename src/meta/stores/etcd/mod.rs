@@ -1528,6 +1528,36 @@ fn update_link_parent_for_exchange(
     Ok(())
 }
 
+fn validate_link_parent_exchange(
+    link_parents: &[EtcdLinkParent],
+    old_parent: i64,
+    old_name: &str,
+    new_parent: i64,
+    new_name: &str,
+) -> Result<(), MetaError> {
+    let source_count = link_parents
+        .iter()
+        .filter(|link| link.parent_inode == old_parent && link.entry_name == old_name)
+        .count();
+    if source_count != 1 {
+        return Err(MetaError::Internal(format!(
+            "LinkParent source binding count is {source_count} (not found or duplicate) for parent {old_parent} name {old_name}"
+        )));
+    }
+
+    let destination_count = link_parents
+        .iter()
+        .filter(|link| link.parent_inode == new_parent && link.entry_name == new_name)
+        .count();
+    if destination_count != 1 {
+        return Err(MetaError::Internal(format!(
+            "LinkParent destination binding count is {destination_count} (not found or duplicate) for parent {new_parent} name {new_name}"
+        )));
+    }
+
+    Ok(())
+}
+
 fn resolved_info_entry_type(info: &EtcdEntryInfo) -> EntryType {
     info.entry_type.clone().unwrap_or({
         if info.is_file {
@@ -2514,6 +2544,12 @@ impl MetaStore for EtcdMetaStore {
                             ))
                         })?;
 
+                    // Resolve both entries before treating an exchange of a path with itself as
+                    // a no-op, so missing entries still produce an error.
+                    if old_parent == new_parent && old_name == new_name {
+                        return Ok(());
+                    }
+
                     let old_ino = old_forward_entry.inode;
                     let new_ino = new_forward_entry.inode;
                     let old_reverse_key = Self::etcd_reverse_key(old_ino);
@@ -2566,19 +2602,13 @@ impl MetaStore for EtcdMetaStore {
                         Some(info)
                     };
 
-                    if old_ino == new_ino {
-                        if resolved_info_entry_type(&old_info)
+                    if old_ino == new_ino
+                        && resolved_info_entry_type(&old_info)
                             != new_forward_entry.resolved_entry_type()
-                        {
-                            return Err(MetaError::Internal(format!(
-                                "destination forward entry type disagrees with inode {old_ino}"
-                            )));
-                        }
-                        if old_info.parent_inode != old_parent || old_info.entry_name != old_name {
-                            return Err(MetaError::Internal(format!(
-                                "inode {old_ino} reverse binding does not match source dentry"
-                            )));
-                        }
+                    {
+                        return Err(MetaError::Internal(format!(
+                            "destination forward entry type disagrees with inode {old_ino}"
+                        )));
                     }
 
                     // An exchange must never make a directory its own ancestor.
@@ -2634,17 +2664,13 @@ impl MetaStore for EtcdMetaStore {
                                     "LinkParent key {link_parent_key} not found for inode {old_ino}"
                                 ))
                             })?;
-                        let has_old = link_parents.iter().any(|link| {
-                            link.parent_inode == old_parent && link.entry_name == old_name
-                        });
-                        let has_new = link_parents.iter().any(|link| {
-                            link.parent_inode == new_parent && link.entry_name == new_name
-                        });
-                        if !has_old || !has_new {
-                            return Err(MetaError::Internal(format!(
-                                "LinkParent bindings do not contain both exchange entries for inode {old_ino}"
-                            )));
-                        }
+                        validate_link_parent_exchange(
+                            &link_parents,
+                            old_parent,
+                            &old_name,
+                            new_parent,
+                            &new_name,
+                        )?;
                     } else {
                         if old_info.nlink <= 1
                             && (old_info.parent_inode != old_parent
