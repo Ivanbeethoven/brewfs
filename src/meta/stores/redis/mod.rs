@@ -1075,6 +1075,38 @@ const RENAME_LUA: &str = r#"
     local xattr_prefix = ARGV[8]
     local noreplace = ARGV[9] == "1"
 
+    local function validate_ancestry(parent_ino, ancestor_ino)
+        local seen = {}
+        local depth = 0
+        while true do
+            if parent_ino == ancestor_ino then
+                return "circular_rename"
+            end
+            if parent_ino == 1 then
+                return nil
+            end
+            if seen[parent_ino] or depth >= 4096 then
+                return "corrupt_ancestry"
+            end
+            seen[parent_ino] = true
+            depth = depth + 1
+
+            local node_json = redis.call('GET', node_prefix .. parent_ino)
+            if not node_json then
+                return "corrupt_ancestry"
+            end
+            local ok_node, node = pcall(cjson.decode, node_json)
+            if not ok_node or not node or not node.attr or node.kind ~= "Dir"
+                or not node.parent or node.parent == parent_ino then
+                return "corrupt_ancestry"
+            end
+            parent_ino = tonumber(node.parent)
+            if not parent_ino then
+                return "corrupt_ancestry"
+            end
+        end
+    end
+
     -- Check source dentry exists.
     local dentry_ino = redis.call('HGET', old_parent_dir_key, old_name)
     if not dentry_ino then
@@ -1105,6 +1137,12 @@ const RENAME_LUA: &str = r#"
     local ok_child, child_node = pcall(cjson.decode, child_json)
     if not ok_child or not child_node or not child_node.attr then
         return cjson.encode({ok=false, error="corrupt_node"})
+    end
+    if child_node.kind == "Dir" then
+        local ancestry_error = validate_ancestry(new_parent_ino, child_ino)
+        if ancestry_error then
+            return cjson.encode({ok=false, error=ancestry_error})
+        end
     end
 
     -- Atomically handle existing destination (POSIX rename semantics: destination is
@@ -1264,36 +1302,67 @@ const RENAME_EXCHANGE_LUA: &str = r#"
 
     local old_parent_dir_key = KEYS[1]
     local new_parent_dir_key = KEYS[2]
-    local old_node_key = KEYS[3]
-    local new_node_key = KEYS[4]
-    local old_parent_node_key = KEYS[5]
-    local new_parent_node_key = KEYS[6]
-    local old_link_parents_key = KEYS[7]
-    local new_link_parents_key = KEYS[8]
+    local old_parent_node_key = KEYS[3]
+    local new_parent_node_key = KEYS[4]
     local old_name = ARGV[1]
     local new_name = ARGV[2]
     local old_parent_ino = tonumber(ARGV[3])
     local new_parent_ino = tonumber(ARGV[4])
     local timestamp = tonumber(ARGV[5])
-    local expected_old_ino = tonumber(ARGV[6])
-    local expected_new_ino = tonumber(ARGV[7])
+    local node_prefix = ARGV[6]
+    local link_parent_prefix = ARGV[7]
 
-    -- Check both entries exist and match expected inodes
+    local function validate_ancestry(parent_ino, ancestor_ino)
+        local seen = {}
+        local depth = 0
+        while true do
+            if parent_ino == ancestor_ino then
+                return "circular_rename"
+            end
+            if parent_ino == 1 then
+                return nil
+            end
+            if seen[parent_ino] or depth >= 4096 then
+                return "corrupt_ancestry"
+            end
+            seen[parent_ino] = true
+            depth = depth + 1
+
+            local node_json = redis.call('GET', node_prefix .. parent_ino)
+            if not node_json then
+                return "corrupt_ancestry"
+            end
+            local ok_node, node = pcall(cjson.decode, node_json)
+            if not ok_node or not node or not node.attr or node.kind ~= "Dir"
+                or not node.parent or node.parent == parent_ino then
+                return "corrupt_ancestry"
+            end
+            parent_ino = tonumber(node.parent)
+            if not parent_ino then
+                return "corrupt_ancestry"
+            end
+        end
+    end
+
+    -- Read both entries and derive their current inode keys atomically.
     local old_dentry_ino = redis.call('HGET', old_parent_dir_key, old_name)
     if not old_dentry_ino then
-        return cjson.encode({ok=false, error="not_found", ino=old_parent_ino})
+        return cjson.encode({ok=false, error="not_found", ino=old_parent_ino, msg="old"})
     end
-    if tonumber(old_dentry_ino) ~= expected_old_ino then
-        return cjson.encode({ok=false, error="stale_conflict"})
-    end
+    local old_ino = tonumber(old_dentry_ino)
+    local old_node_key = node_prefix .. old_dentry_ino
+    local old_link_parents_key = link_parent_prefix .. old_dentry_ino
 
     local new_dentry_ino = redis.call('HGET', new_parent_dir_key, new_name)
     if not new_dentry_ino then
-        return cjson.encode({ok=false, error="not_found", ino=new_parent_ino})
+        return cjson.encode({ok=false, error="not_found", ino=new_parent_ino, msg="new"})
     end
-    if tonumber(new_dentry_ino) ~= expected_new_ino then
-        return cjson.encode({ok=false, error="stale_conflict"})
+    local new_ino = tonumber(new_dentry_ino)
+    if old_ino == new_ino then
+        return cjson.encode({ok=true, ino=old_ino, replaced_ino=new_ino})
     end
+    local new_node_key = node_prefix .. new_dentry_ino
+    local new_link_parents_key = link_parent_prefix .. new_dentry_ino
 
     -- GET both nodes
     local old_node_json = redis.call('GET', old_node_key)
@@ -1312,6 +1381,36 @@ const RENAME_EXCHANGE_LUA: &str = r#"
     local ok_new, new_node = pcall(cjson.decode, new_node_json)
     if not ok_new or not new_node or not new_node.attr then
         return cjson.encode({ok=false, error="corrupt_node"})
+    end
+
+    if old_node.kind == "Dir" then
+        local ancestry_error = validate_ancestry(new_parent_ino, old_ino)
+        if ancestry_error then
+            return cjson.encode({ok=false, error=ancestry_error})
+        end
+    end
+    if new_node.kind == "Dir" then
+        local ancestry_error = validate_ancestry(old_parent_ino, new_ino)
+        if ancestry_error then
+            return cjson.encode({ok=false, error=ancestry_error})
+        end
+    end
+
+    local old_parent_json = redis.call('GET', old_parent_node_key)
+    local ok_op, old_parent_node = pcall(cjson.decode, old_parent_json or "")
+    if not ok_op or not old_parent_node or not old_parent_node.attr
+        or old_parent_node.kind ~= "Dir" then
+        return cjson.encode({ok=false, error="corrupt_ancestry"})
+    end
+    local new_parent_node = old_parent_node
+    if old_parent_ino ~= new_parent_ino then
+        local new_parent_json = redis.call('GET', new_parent_node_key)
+        local ok_np
+        ok_np, new_parent_node = pcall(cjson.decode, new_parent_json or "")
+        if not ok_np or not new_parent_node or not new_parent_node.attr
+            or new_parent_node.kind ~= "Dir" then
+            return cjson.encode({ok=false, error="corrupt_ancestry"})
+        end
     end
 
     -- Pre-check link_parents for hardlinked nodes before swapping dentries
@@ -1422,28 +1521,21 @@ const RENAME_EXCHANGE_LUA: &str = r#"
     redis.call('SET', old_node_key, cjson.encode(old_node))
     redis.call('SET', new_node_key, cjson.encode(new_node))
 
-    -- Update parent directory timestamps
-    local old_parent_json = redis.call('GET', old_parent_node_key)
-    if old_parent_json then
-        local ok_op, old_parent_node = pcall(cjson.decode, old_parent_json)
-        if ok_op and old_parent_node and old_parent_node.attr then
-            old_parent_node.attr.mtime = timestamp
-            old_parent_node.attr.ctime = timestamp
-            redis.call('SET', old_parent_node_key, cjson.encode(old_parent_node))
-        end
+    old_parent_node.attr.mtime = timestamp
+    old_parent_node.attr.ctime = timestamp
+    if old_parent_ino ~= new_parent_ino then
+        local old_delta = (new_node.kind == "Dir" and 1 or 0)
+            - (old_node.kind == "Dir" and 1 or 0)
+        local new_delta = -old_delta
+        old_parent_node.attr.nlink = old_parent_node.attr.nlink + old_delta
+        new_parent_node.attr.nlink = new_parent_node.attr.nlink + new_delta
+        new_parent_node.attr.mtime = timestamp
+        new_parent_node.attr.ctime = timestamp
+        redis.call('SET', new_parent_node_key, cjson.encode(new_parent_node))
     end
+    redis.call('SET', old_parent_node_key, cjson.encode(old_parent_node))
 
-    local new_parent_json = redis.call('GET', new_parent_node_key)
-    if new_parent_json then
-        local ok_np, new_parent_node = pcall(cjson.decode, new_parent_json)
-        if ok_np and new_parent_node and new_parent_node.attr then
-            new_parent_node.attr.mtime = timestamp
-            new_parent_node.attr.ctime = timestamp
-            redis.call('SET', new_parent_node_key, cjson.encode(new_parent_node))
-        end
-    end
-
-    return cjson.encode({ok=true})
+    return cjson.encode({ok=true, ino=old_ino, replaced_ino=new_ino})
 "#;
 
 // Atomically set one xattr and update the inode ctime. Redis hash values
@@ -3100,6 +3192,9 @@ impl MetaStore for RedisMetaStore {
             Some("parent_not_directory") => Err(MetaError::NotDirectory(new_parent)),
             Some("node_not_found") => Err(MetaError::NotFound(response.ino.unwrap_or(old_parent))),
             Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
+            Some("circular_rename") | Some("corrupt_ancestry") => Err(MetaError::InvalidPath(
+                "directory ancestry contains a cycle or invalid parent".into(),
+            )),
             Some("link_parent_not_found") => Err(MetaError::Internal(format!(
                 "expected link parent binding {old_parent}/{old_name} for inode {}",
                 response.ino.unwrap_or(old_parent)
@@ -3189,6 +3284,9 @@ impl MetaStore for RedisMetaStore {
             ))),
             Some("node_not_found") => Err(MetaError::NotFound(response.ino.unwrap_or(old_parent))),
             Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
+            Some("circular_rename") | Some("corrupt_ancestry") => Err(MetaError::InvalidPath(
+                "directory ancestry contains a cycle or invalid parent".into(),
+            )),
             Some("link_parent_not_found") => Err(MetaError::Internal(format!(
                 "expected link parent binding {old_parent}/{old_name} for inode {}",
                 response.ino.unwrap_or(old_parent)
@@ -3227,47 +3325,25 @@ impl MetaStore for RedisMetaStore {
             return Ok(());
         }
 
-        let Some(old_ino) = self.lookup(old_parent, old_name).await? else {
-            return Err(MetaError::Internal(format!(
-                "Entry '{}' not found in parent {} for exchange",
-                old_name, old_parent
-            )));
-        };
-
-        let Some(new_ino) = self.lookup(new_parent, new_name).await? else {
-            return Err(MetaError::Internal(format!(
-                "Entry '{}' not found in parent {} for exchange",
-                new_name, new_parent
-            )));
-        };
-
         let old_parent_dir_key = self.dir_key(old_parent);
         let new_parent_dir_key = self.dir_key(new_parent);
-        let old_node_key = self.node_key(old_ino);
-        let new_node_key = self.node_key(new_ino);
         let old_parent_node_key = self.node_key(old_parent);
         let new_parent_node_key = self.node_key(new_parent);
-        let old_link_parents_key = Self::link_parent_key(old_ino);
-        let new_link_parents_key = Self::link_parent_key(new_ino);
         let now = current_time();
 
         let script = redis::Script::new(RENAME_EXCHANGE_LUA);
         let result: String = script
             .key(&old_parent_dir_key)
             .key(&new_parent_dir_key)
-            .key(&old_node_key)
-            .key(&new_node_key)
             .key(&old_parent_node_key)
             .key(&new_parent_node_key)
-            .key(&old_link_parents_key)
-            .key(&new_link_parents_key)
             .arg(old_name)
             .arg(new_name)
             .arg(old_parent)
             .arg(new_parent)
             .arg(now)
-            .arg(old_ino)
-            .arg(new_ino)
+            .arg(NODE_KEY_PREFIX)
+            .arg(LINK_PARENT_KEY_PREFIX)
             .invoke_async(&mut self.conn.clone())
             .await
             .map_err(redis_err)?;
@@ -3275,18 +3351,35 @@ impl MetaStore for RedisMetaStore {
         let response: LuaResponse = serde_json::from_str(&result)
             .map_err(|e| MetaError::Internal(format!("Failed to parse Lua response: {e}")))?;
         match response.error.as_deref() {
-            Some("stale_conflict") => Err(MetaError::ContinueRetry(RetryReason::VersionConflict)),
-            Some("not_found") => Err(MetaError::NotFound(response.ino.unwrap_or(old_parent))),
+            Some("not_found") if response.msg.as_deref() == Some("new") => {
+                Err(MetaError::EntryNotFound {
+                    parent: new_parent,
+                    name: new_name.to_owned(),
+                })
+            }
+            Some("not_found") => Err(MetaError::EntryNotFound {
+                parent: old_parent,
+                name: old_name.to_owned(),
+            }),
             Some("internal") => {
                 let msg = response.msg.unwrap_or_else(|| "unknown error".to_string());
                 Err(MetaError::Internal(msg))
             }
             Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
+            Some("circular_rename") | Some("corrupt_ancestry") => Err(MetaError::InvalidPath(
+                "directory ancestry contains a cycle or invalid parent".into(),
+            )),
             Some("link_parent_not_found") => Err(MetaError::Internal(
                 "expected link parent binding not found during exchange".into(),
             )),
             Some(other) => Err(MetaError::Internal(format!("Lua error: {other}"))),
             None if response.ok => {
+                let old_ino = response.ino.ok_or_else(|| {
+                    MetaError::Internal("missing old inode in exchange response".into())
+                })?;
+                let new_ino = response.replaced_ino.ok_or_else(|| {
+                    MetaError::Internal("missing new inode in exchange response".into())
+                })?;
                 self.invalidate_nodes(&[old_parent, new_parent, old_ino, new_ino])
                     .await;
                 Ok(())

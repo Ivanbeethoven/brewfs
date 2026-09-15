@@ -181,7 +181,9 @@ impl VfsError {
     pub fn from_meta(path: impl Into<PathHint>, err: MetaError) -> Self {
         let path = path.into();
         match err {
-            MetaError::NotFound(_) | MetaError::ParentNotFound(_) => VfsError::NotFound { path },
+            MetaError::NotFound(_)
+            | MetaError::EntryNotFound { .. }
+            | MetaError::ParentNotFound(_) => VfsError::NotFound { path },
             MetaError::AlreadyExists { .. } => VfsError::AlreadyExists { path },
             MetaError::NotDirectory(_) => VfsError::NotADirectory { path },
             MetaError::DirectoryNotEmpty(_) => VfsError::DirectoryNotEmpty { path },
