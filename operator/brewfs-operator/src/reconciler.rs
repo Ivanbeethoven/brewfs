@@ -14,9 +14,9 @@ use k8s_openapi::api::core::v1::{
     Capabilities, ConfigMap, ConfigMapEnvSource, Container, ContainerPort, EmptyDirVolumeSource,
     EnvFromSource, EnvVar, EnvVarSource, ExecAction, HTTPGetAction, HTTPHeader, Lifecycle,
     LifecycleHandler, LocalObjectReference, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ResourceRequirements, Secret,
-    SecretEnvSource, SecretKeySelector, SecurityContext, Service, ServicePort, ServiceSpec,
-    TCPSocketAction, Toleration, Volume, VolumeMount,
+    PodAffinity, PodAffinityTerm, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
+    ResourceRequirements, Secret, SecretEnvSource, SecretKeySelector, SecurityContext, Service,
+    ServicePort, ServiceSpec, TCPSocketAction, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
@@ -94,7 +94,7 @@ pub async fn reconcile_cluster(
     match apply_redis_pvc(&client, &namespace, &cluster, &owner).await? {
         RedisPvcApplyOutcome::Applied => {}
         RedisPvcApplyOutcome::UnsupportedExpansion(reason) => {
-            patch_cluster_status_phase(
+            patch_cluster_status(
                 &client,
                 &namespace,
                 &cluster,
@@ -1317,7 +1317,12 @@ async fn apply_consumer_workload(
     let match_labels = labels(&mount_name, "consumer");
     let workload_labels = build_consumer_workload_labels(consumer, match_labels.clone());
     let workload_annotations = consumer.workload_annotations.clone();
-    let template = build_consumer_pod_template(consumer, host_mount_path, match_labels.clone());
+    let template = build_consumer_pod_template(
+        consumer,
+        host_mount_path,
+        match_labels.clone(),
+        labels(&mount_name, "mount"),
+    );
     let headless_service_name = consumer_headless_service_name(&mount_name);
 
     match consumer.workload_kind {
@@ -1631,6 +1636,7 @@ fn build_consumer_pod_template(
     consumer: &MountConsumerSpec,
     host_mount_path: &str,
     match_labels: BTreeMap<String, String>,
+    mount_labels: BTreeMap<String, String>,
 ) -> PodTemplateSpec {
     let labels = merge_operator_labels(&consumer.pod_labels, match_labels);
 
@@ -1670,6 +1676,22 @@ fn build_consumer_pod_template(
             } else {
                 Some(consumer.node_selector.clone())
             },
+            affinity: Some(k8s_openapi::api::core::v1::Affinity {
+                pod_affinity: Some(PodAffinity {
+                    required_during_scheduling_ignored_during_execution: Some(vec![
+                        PodAffinityTerm {
+                            label_selector: Some(LabelSelector {
+                                match_labels: Some(mount_labels),
+                                ..LabelSelector::default()
+                            }),
+                            topology_key: "kubernetes.io/hostname".to_string(),
+                            ..PodAffinityTerm::default()
+                        },
+                    ]),
+                    ..PodAffinity::default()
+                }),
+                ..k8s_openapi::api::core::v1::Affinity::default()
+            }),
             priority_class_name: consumer.priority_class_name.clone(),
             host_network: Some(consumer.host_network),
             dns_policy: consumer.dns_policy.clone(),
@@ -3280,6 +3302,56 @@ mod tests {
     }
 
     #[test]
+    fn consumer_requires_its_mount_on_the_same_node() {
+        let consumer: MountConsumerSpec =
+            serde_json::from_value(json!({"nodeSelector": {"pool": "apps"}})).unwrap();
+        let template = build_consumer_pod_template(
+            &consumer,
+            "/mnt/demo",
+            labels("demo-mount", "consumer"),
+            labels("demo-mount", "mount"),
+        );
+        let spec = template.spec.unwrap();
+        assert_eq!(spec.node_selector, Some(consumer.node_selector.clone()));
+        let terms = spec
+            .affinity
+            .expect("consumers require mount-node affinity")
+            .pod_affinity
+            .unwrap()
+            .required_during_scheduling_ignored_during_execution
+            .unwrap();
+        assert_eq!(terms.len(), 1);
+        let term = &terms[0];
+        assert_eq!(term.topology_key, "kubernetes.io/hostname");
+        // No namespace override: Kubernetes matches only this consumer's namespace.
+        assert!(term.namespaces.is_none());
+        assert!(term.namespace_selector.is_none());
+        let selector = term.label_selector.as_ref().unwrap();
+        let required_labels = selector.match_labels.as_ref().unwrap();
+        assert_eq!(required_labels, &labels("demo-mount", "mount"));
+
+        // Both nodes satisfy the consumer's nodeSelector, but only node A hosts
+        // this mount. A different mount or a consumer on B must not qualify B.
+        let pods = [
+            ("node-a", labels("demo-mount", "mount")),
+            ("node-b", labels("other-mount", "mount")),
+            ("node-b", labels("demo-mount", "consumer")),
+        ];
+        let eligible: Vec<_> = ["node-a", "node-b"]
+            .into_iter()
+            .filter(|node| {
+                pods.iter().any(|(pod_node, pod_labels)| {
+                    pod_node == node
+                        && required_labels
+                            .iter()
+                            .all(|(key, value)| pod_labels.get(key) == Some(value))
+                })
+            })
+            .collect();
+        assert_eq!(eligible, vec!["node-a"]);
+    }
+
+    #[test]
     fn consumer_pod_labels_cannot_override_selectors() {
         let mut consumer: MountConsumerSpec =
             serde_json::from_value(json!({})).expect("default consumer spec");
@@ -3299,7 +3371,12 @@ mod tests {
         ]);
         let selector_labels = labels("demo-mount", "consumer");
 
-        let template = build_consumer_pod_template(&consumer, "/mnt/demo", selector_labels.clone());
+        let template = build_consumer_pod_template(
+            &consumer,
+            "/mnt/demo",
+            selector_labels.clone(),
+            labels("demo-mount", "mount"),
+        );
         let template_labels = template
             .metadata
             .and_then(|metadata| metadata.labels)
