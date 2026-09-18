@@ -94,7 +94,7 @@ pub async fn reconcile_cluster(
     match apply_redis_pvc(&client, &namespace, &cluster, &owner).await? {
         RedisPvcApplyOutcome::Applied => {}
         RedisPvcApplyOutcome::UnsupportedExpansion(reason) => {
-            patch_cluster_status_phase(
+            patch_cluster_status(
                 &client,
                 &namespace,
                 &cluster,
@@ -1080,10 +1080,9 @@ fn observe_rustfs_init_job(job: &Job) -> RustFsInitJobObservation {
             .any(|condition| condition.type_ == "Complete" && condition.status == "True")
     {
         RustFsInitJobObservation::Complete
-    } else if status.failed.unwrap_or_default() > 0
-        || conditions
-            .iter()
-            .any(|condition| condition.type_ == "Failed" && condition.status == "True")
+    } else if conditions
+        .iter()
+        .any(|condition| condition.type_ == "Failed" && condition.status == "True")
     {
         RustFsInitJobObservation::Failed
     } else {
@@ -2554,11 +2553,11 @@ fn pvc_is_bound(pvc: &PersistentVolumeClaim) -> bool {
 }
 
 fn job_is_succeeded(job: &Job) -> bool {
-    job.status
-        .as_ref()
-        .and_then(|status| status.succeeded)
-        .unwrap_or_default()
-        > 0
+    observe_rustfs_init_job(job) == RustFsInitJobObservation::Complete
+}
+
+fn job_is_terminally_failed(job: &Job) -> bool {
+    observe_rustfs_init_job(job) == RustFsInitJobObservation::Failed
 }
 
 async fn observe_cluster_readiness(
@@ -2637,12 +2636,7 @@ async fn observe_cluster_readiness(
         ));
     };
     if !job_is_succeeded(&job) {
-        let failed = job
-            .status
-            .as_ref()
-            .and_then(|status| status.failed)
-            .unwrap_or_default();
-        let message = if failed > 0 {
+        let message = if job_is_terminally_failed(&job) {
             job_api
                 .delete(&job_name, &DeleteParams::default())
                 .await
@@ -2950,6 +2944,11 @@ mod tests {
         let failed = Job {
             status: Some(k8s_openapi::api::batch::v1::JobStatus {
                 failed: Some(3),
+                conditions: Some(vec![k8s_openapi::api::batch::v1::JobCondition {
+                    type_: "Failed".to_string(),
+                    status: "True".to_string(),
+                    ..Default::default()
+                }]),
                 ..Default::default()
             }),
             ..Job::default()
@@ -2969,6 +2968,34 @@ mod tests {
             observe_rustfs_init_job(&complete),
             RustFsInitJobObservation::Complete
         );
+    }
+
+    #[test]
+    fn rustfs_init_job_preserves_nonterminal_retries() {
+        for active in [Some(1), None] {
+            for condition_status in [None, Some("False"), Some("Unknown")] {
+                let job = Job {
+                    status: Some(k8s_openapi::api::batch::v1::JobStatus {
+                        failed: Some(1),
+                        active,
+                        conditions: condition_status.map(|status| {
+                            vec![k8s_openapi::api::batch::v1::JobCondition {
+                                type_: "Failed".to_string(),
+                                status: status.to_string(),
+                                ..Default::default()
+                            }]
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Job::default()
+                };
+                assert_eq!(
+                    observe_rustfs_init_job(&job),
+                    RustFsInitJobObservation::Pending,
+                    "a failed Pod must not reset the Job controller's retry/backoff state"
+                );
+            }
+        }
     }
 
     #[test]
