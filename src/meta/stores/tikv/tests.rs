@@ -1,5 +1,5 @@
 use super::*;
-use crate::chunk::SliceDesc;
+use crate::chunk::{BlockStore, InMemoryBlockStore, SliceDesc};
 use crate::meta::config::{
     CacheConfig, ClientOptions, CompactConfig, DatabaseConfig, DatabaseType,
 };
@@ -177,6 +177,68 @@ fn chunk_index_keys_are_addressable_by_inode() {
         TiKvMetaStore::scoped_key("tenant-a", "chunk_index/42/7"),
         b"tenant-a/chunk_index/42/7".to_vec()
     );
+}
+
+#[tokio::test]
+async fn truncate_partial_tail_gc_preserves_block_data() {
+    // The reported corruption case: an 8 MiB slice, 4 MiB blocks, 6 MiB EOF.
+    let mib = 1024 * 1024;
+    let block_size = 4 * mib;
+    let chunk_id = chunk_id_for(42, 0).unwrap();
+    let mut slices = vec![
+        SliceDesc {
+            slice_id: 1,
+            chunk_id,
+            offset: 0,
+            length: 8 * mib,
+        },
+        SliceDesc {
+            slice_id: 2,
+            chunk_id,
+            offset: 8 * mib,
+            length: mib,
+        },
+    ];
+    let blocks = InMemoryBlockStore::new();
+    blocks
+        .write_fresh_range((1, 0), 0, &vec![0x31; block_size as usize])
+        .await
+        .unwrap();
+    blocks
+        .write_fresh_range((1, 1), 0, &vec![0x32; block_size as usize])
+        .await
+        .unwrap();
+    blocks
+        .write_fresh_range((2, 0), 0, &vec![0x33; mib as usize])
+        .await
+        .unwrap();
+
+    let delayed = delayed_slices_for_truncate(&slices, Some(6 * mib));
+    trim_slices_safely(&mut slices, 6 * mib);
+    // Match both production GC workers: offset is not used, block numbering
+    // starts at zero within each slice. Actually delete the emitted ranges.
+    for (slice_id, _offset, size) in &delayed {
+        blocks
+            .delete_range((*slice_id, 0), u64::from(*size).div_ceil(block_size))
+            .await
+            .unwrap();
+    }
+    assert_eq!(slices.len(), 1);
+    assert_eq!(slices[0].length, 6 * mib);
+    let mut first = vec![0; block_size as usize];
+    let mut second = vec![0; (2 * mib) as usize];
+    blocks
+        .read_range((slices[0].slice_id, 0), 0, &mut first)
+        .await
+        .unwrap();
+    blocks
+        .read_range((slices[0].slice_id, 1), 0, &mut second)
+        .await
+        .unwrap();
+    assert!(first.iter().all(|byte| *byte == 0x31));
+    assert!(second.iter().all(|byte| *byte == 0x32));
+    assert!(blocks.read_range((2, 0), 0, &mut [0]).await.is_err());
+    assert_eq!(delayed, vec![(2, 8 * mib, mib as u32)]);
 }
 
 #[test]
@@ -897,6 +959,10 @@ async fn tikv_truncate_prunes_slices_before_extension_and_restart() {
     // the prefix that remains under slice ID 1.
     let delayed = store.process_delayed_slices(10, -1).await.unwrap();
     assert!(
+        delayed.iter().all(|(slice_id, _, _, _)| *slice_id != 1),
+        "a partial tail must not schedule its still-referenced slice ID for GC"
+    );
+    assert!(
         delayed.iter().any(|(slice_id, offset, size, _)| {
             *slice_id == 2 && *offset == 800 && *size == 224
         })
@@ -933,7 +999,7 @@ async fn tikv_truncate_prunes_slices_before_extension_and_restart() {
     let restarted = TiKvMetaStore::from_config(config)
         .await
         .expect("recreated tikv store should connect");
-    assert_eq!(restarted.get_slices(chunk0).await.unwrap()[0].length, 600);
+    assert_eq!(restarted.get_slices(chunk0).await.unwrap()[0].length, 500);
     assert!(restarted.get_slices(chunk1).await.unwrap().is_empty());
 }
 
