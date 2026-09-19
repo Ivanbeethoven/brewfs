@@ -661,6 +661,103 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         }
     }
 
+    async fn get_full_object(
+        &self,
+        object_key: &str,
+        count_as_payload: bool,
+    ) -> anyhow::Result<Option<Bytes>> {
+        self.bandwidth
+            .acquire_download(self.config.block_size)
+            .await;
+        let started = Instant::now();
+        let raw = self
+            .client
+            .get_object(object_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("object store get failed: {object_key}, {e:?}"))?;
+        if count_as_payload {
+            self.object_metrics.record_read_full_get();
+        }
+        match raw {
+            Some(data) => {
+                self.object_metrics
+                    .record_get(data.len() as u64, started.elapsed());
+                Ok(Some(Bytes::from(data)))
+            }
+            None => {
+                self.object_metrics.record_get(0, started.elapsed());
+                Ok(None)
+            }
+        }
+    }
+
+    async fn read_full_block(&self, key: BlockKey) -> anyhow::Result<Bytes> {
+        // Compression::None has a large legacy population whose raw payloads
+        // must keep the established probe + single GET path. Compressed
+        // mounts can use the v2 full-GET fast path without that probe.
+        if matches!(self.config.compression, Compression::None) {
+            let layout = self.resolve_object_layout(key).await?;
+            let object_key = Self::object_key_for(key, layout);
+            let Some(raw_bytes) = self.get_full_object(&object_key, true).await? else {
+                // A metadata-referenced block that is absent is corruption, not a
+                // successful empty read. Hand an empty block back so the caller's
+                // completeness check reports the typed IncompleteBlockRead error.
+                return Ok(Bytes::new());
+            };
+            return Self::decode_object(layout, self.config.compression, raw_bytes)
+                .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"));
+        }
+
+        let versioned_key = Self::versioned_key_for(key);
+        let versioned = self.get_full_object(&versioned_key, false).await?;
+
+        match versioned {
+            Some(raw_bytes) if !raw_bytes.is_empty() => {
+                let compression = match parse_persisted_header(&raw_bytes) {
+                    PersistedHeader::Framed(compression) => compression,
+                    PersistedHeader::Incomplete => {
+                        anyhow::bail!("truncated versioned block header for {versioned_key}")
+                    }
+                    PersistedHeader::NotFramed => {
+                        anyhow::bail!("missing versioned block header for {versioned_key}")
+                    }
+                    PersistedHeader::Invalid => {
+                        anyhow::bail!("unsupported versioned block header for {versioned_key}")
+                    }
+                };
+                let layout = ObjectLayout::Versioned(compression);
+                self.format_cache.insert(key, layout).await;
+                self.object_metrics.record_read_full_get();
+                Self::decode_object(layout, self.config.compression, raw_bytes)
+                    .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))
+            }
+            Some(_) => {
+                // Keep the established empty-object policy: resolve through the
+                // legacy probe before deciding whether a legacy object exists.
+                let layout = self.resolve_object_layout(key).await?;
+                let legacy_key = Self::object_key_for(key, layout);
+                let legacy = self.get_full_object(&legacy_key, true).await?;
+                match legacy {
+                    Some(raw_bytes) => {
+                        Self::decode_object(layout, self.config.compression, raw_bytes)
+                            .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))
+                    }
+                    None => Ok(Bytes::new()),
+                }
+            }
+            None => {
+                let layout = ObjectLayout::Legacy;
+                self.format_cache.insert(key, layout).await;
+                let legacy_key = Self::key_for(key);
+                let Some(raw_bytes) = self.get_full_object(&legacy_key, true).await? else {
+                    return Ok(Bytes::new());
+                };
+                Self::decode_object(layout, self.config.compression, raw_bytes)
+                    .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))
+            }
+        }
+    }
+
     fn range_base_offset(layout: ObjectLayout, current_compression: Compression) -> Option<u64> {
         match layout {
             ObjectLayout::Versioned(Compression::None) => Some(PERSISTED_HEADER_LEN as u64),
@@ -1167,42 +1264,25 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
 
         // Large read — fetch full block via SingleFlight, then cache it.
         tracing::Span::current().record("strategy", "coalesced_full");
-        let client = &self.client;
-        let object_metrics = self.object_metrics.clone();
         let compression = self.config.compression;
 
-        let block_data =
-            self.read_flight
-                .execute(key, || async move {
-                    let layout = match layout {
-                        Some(layout) => layout,
-                        None => self.resolve_object_layout(key).await?,
-                    };
-                    let object_key = Self::object_key_for(key, layout);
-                    self.bandwidth
-                        .acquire_download(self.config.block_size)
-                        .await;
-                    let started = Instant::now();
-                    let raw = client.get_object(&object_key).await.map_err(|e| {
-                        anyhow::anyhow!("object store get failed: {object_key}, {e:?}")
-                    })?;
-                    object_metrics.record_read_full_get();
-                    let raw_bytes = match raw {
-                        Some(data) => {
-                            object_metrics.record_get(data.len() as u64, started.elapsed());
-                            Bytes::from(data)
-                        }
-                        None => {
-                            object_metrics.record_get(0, started.elapsed());
-                            return Ok(Bytes::new());
-                        }
-                    };
-                    let decompressed = Self::decode_object(layout, compression, raw_bytes)
-                        .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))?;
-                    Ok::<_, anyhow::Error>(decompressed)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("SingleFlight read failed: {e}"))?;
+        let block_data = self
+            .read_flight
+            .execute(key, || async move {
+                if layout.is_none() {
+                    return self.read_full_block(key).await;
+                }
+
+                let layout = layout.expect("known layout must be present");
+                let object_key = Self::object_key_for(key, layout);
+                let Some(raw_bytes) = self.get_full_object(&object_key, true).await? else {
+                    return Ok(Bytes::new());
+                };
+                Self::decode_object(layout, compression, raw_bytes)
+                    .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("SingleFlight read failed: {e}"))?;
 
         // Copy data to caller's buffer first — minimize read latency.
         let offset_usize = offset as usize;
@@ -1730,7 +1810,7 @@ mod tests {
         );
         assert_eq!(
             stats.get_object_range_calls, 1,
-            "A cold legacy block first probes the versioned namespace before its full read"
+            "A cold legacy block at offset zero should probe the versioned namespace"
         );
 
         // Same read again should hit the full block cache.
@@ -1842,7 +1922,7 @@ mod tests {
         assert_eq!(stats.get_object_calls, 1, "Large read should use full read");
         assert_eq!(
             stats.get_object_range_calls, 1,
-            "Large read should probe the versioned layout before its full read"
+            "Large read should reuse the full GET response instead of probing the versioned layout"
         );
 
         // Concurrent large reads for a DIFFERENT (uncached) block should
@@ -1867,7 +1947,7 @@ mod tests {
         );
         assert_eq!(
             stats.get_object_range_calls, 1,
-            "Concurrent full reads should share one versioned-layout probe",
+            "Concurrent legacy full reads should share one versioned-layout probe",
         );
 
         Ok(())
@@ -1889,6 +1969,7 @@ mod tests {
             data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
             get_object_calls: Arc<Mutex<usize>>,
             get_object_range_calls: Arc<Mutex<usize>>,
+            full_get_error: Arc<Mutex<Option<String>>>,
         }
 
         #[async_trait]
@@ -1903,6 +1984,9 @@ mod tests {
 
             async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
                 *self.get_object_calls.lock().unwrap() += 1;
+                if let Some(error) = self.full_get_error.lock().unwrap().clone() {
+                    anyhow::bail!("mock full GET failed for {key}: {error}");
+                }
                 Ok(self.data.lock().unwrap().get(key).cloned())
             }
 
@@ -1944,6 +2028,10 @@ mod tests {
             .lock()
             .unwrap()
             .insert("chunks/7/0".to_string(), stored);
+        backend.data.lock().unwrap().insert(
+            "chunks-v2/8/0".to_string(),
+            compress(&raw, Compression::Lz4).into_owned(),
+        );
 
         let config = BlockStoreConfig {
             block_size: 4 * 1024 * 1024,
@@ -1963,6 +2051,112 @@ mod tests {
         )
         .await?;
 
+        let mut versioned_out = vec![1u8; 2 * 1024 * 1024];
+        store.read_range((8, 0), 0, &mut versioned_out).await?;
+        assert_eq!(versioned_out, vec![0u8; 2 * 1024 * 1024]);
+        assert_eq!(*backend.get_object_calls.lock().unwrap(), 1);
+        assert_eq!(
+            *backend.get_object_range_calls.lock().unwrap(),
+            0,
+            "a valid v2 full read should parse the payload GET without a header probe"
+        );
+
+        backend.data.lock().unwrap().insert(
+            "chunks-v2/12/0".to_string(),
+            compress(&raw, Compression::Zstd(3)).into_owned(),
+        );
+        *backend.get_object_calls.lock().unwrap() = 0;
+        let mut zstd_out = vec![1u8; 2 * 1024 * 1024];
+        store.read_range((12, 0), 0, &mut zstd_out).await?;
+        assert_eq!(zstd_out, vec![0u8; 2 * 1024 * 1024]);
+        assert_eq!(*backend.get_object_calls.lock().unwrap(), 1);
+        assert_eq!(*backend.get_object_range_calls.lock().unwrap(), 0);
+
+        backend
+            .data
+            .lock()
+            .unwrap()
+            .insert("chunks-v2/13/0".to_string(), Vec::new());
+        backend
+            .data
+            .lock()
+            .unwrap()
+            .insert("chunks/13/0".to_string(), vec![3u8; raw.len()]);
+        *backend.get_object_calls.lock().unwrap() = 0;
+        let mut zero_v2_out = vec![1u8; 2 * 1024 * 1024];
+        store.read_range((13, 0), 0, &mut zero_v2_out).await?;
+        assert_eq!(zero_v2_out, vec![3u8; 2 * 1024 * 1024]);
+        assert_eq!(*backend.get_object_calls.lock().unwrap(), 2);
+        assert_eq!(
+            *backend.get_object_range_calls.lock().unwrap(),
+            1,
+            "zero-byte v2 objects retain the established compatibility probe"
+        );
+
+        backend.get_object_calls.lock().unwrap().clone_from(&0);
+        backend
+            .get_object_range_calls
+            .lock()
+            .unwrap()
+            .clone_from(&0);
+        backend.data.lock().unwrap().insert(
+            "chunks-v2/9/0".to_string(),
+            b"not a persisted frame".to_vec(),
+        );
+        let mut bad_frame_out = vec![0u8; 2 * 1024 * 1024];
+        let bad_frame_error = store
+            .read_range((9, 0), 0, &mut bad_frame_out)
+            .await
+            .expect_err("non-empty bad v2 headers must not fall back to legacy");
+        assert!(
+            bad_frame_error
+                .to_string()
+                .contains("missing versioned block header")
+        );
+        assert_eq!(*backend.get_object_range_calls.lock().unwrap(), 0);
+
+        backend
+            .data
+            .lock()
+            .unwrap()
+            .insert("chunks-v2/14/0".to_string(), vec![0x53, 0x46, 1]);
+        backend.get_object_calls.lock().unwrap().clone_from(&0);
+        let mut short_header_out = vec![0u8; 2 * 1024 * 1024];
+        let short_header_error = store
+            .read_range((14, 0), 0, &mut short_header_out)
+            .await
+            .expect_err("a short non-empty v2 header must be an error, not a panic");
+        assert!(
+            short_header_error
+                .to_string()
+                .contains("truncated versioned block header")
+        );
+
+        backend.get_object_calls.lock().unwrap().clone_from(&0);
+        let mut missing_out = vec![0u8; 2 * 1024 * 1024];
+        let missing_error = store
+            .read_range((10, 0), 0, &mut missing_out)
+            .await
+            .expect_err("a missing referenced block must remain an error");
+        assert!(
+            missing_error
+                .downcast_ref::<IncompleteBlockRead>()
+                .is_some(),
+            "a missing referenced block must surface the typed incomplete-block error, got: {missing_error}"
+        );
+        assert_eq!(*backend.get_object_calls.lock().unwrap(), 2);
+
+        *backend.full_get_error.lock().unwrap() = Some("authorization denied".to_string());
+        let mut backend_error_out = vec![0u8; 2 * 1024 * 1024];
+        let backend_error = store
+            .read_range((11, 0), 0, &mut backend_error_out)
+            .await
+            .expect_err("backend errors must not be treated as missing objects");
+        assert!(backend_error.to_string().contains("authorization denied"));
+        *backend.full_get_error.lock().unwrap() = None;
+        *backend.get_object_calls.lock().unwrap() = 0;
+        *backend.get_object_range_calls.lock().unwrap() = 0;
+
         let mut out = vec![1u8; 512 * 1024];
         store.read_range((7, 0), 2 * 1024 * 1024, &mut out).await?;
 
@@ -1971,7 +2165,7 @@ mod tests {
         assert_eq!(
             *backend.get_object_range_calls.lock().unwrap(),
             1,
-            "a versioned-namespace probe precedes the legacy full-object read"
+            "a compressed legacy read still uses the established layout probe"
         );
         assert!(
             store.page_cache.get(&(7, 0, 32)).await.is_none(),
@@ -2806,7 +3000,7 @@ mod tests {
         });
 
         sleep(Duration::from_millis(20)).await;
-        backend.release_full_read.notify_waiters();
+        backend.release_full_read.notify_one();
 
         let large_buf = large_read.await??;
         let small_buf = small_read.await??;
