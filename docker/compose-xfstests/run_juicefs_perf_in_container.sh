@@ -9,6 +9,7 @@ err()  { log "ERROR $*" >&2; }
 
 mount_dir="${JFS_MOUNT_POINT:-/mnt/juicefs}"
 meta_url="${JFS_META_URL:-redis://redis:6379/0}"
+meta_url_display="$(printf '%s' "$meta_url" | sed -E 's#(redis(s)?://)[^@[:space:]]+@#\1***@#')"
 s3_bucket="${JFS_S3_BUCKET:-brewfs-data}"
 s3_endpoint="${JFS_S3_ENDPOINT:-http://rustfs:9000}"
 s3_region="${JFS_S3_REGION:-us-east-1}"
@@ -138,6 +139,10 @@ JFS_OPEN_CACHE_LIMIT=${jfs_open_cache_limit}
 JFS_BACKUP_META=${jfs_backup_meta}
 JFS_NO_USAGE_REPORT=${jfs_no_usage_report}
 JFS_CACHE_DIR=${jfs_cache_dir}
+JUICEFS_META_BACKEND=${JUICEFS_META_BACKEND:-redis}
+JFS_META_URL=${meta_url_display}
+JFS_S3_ENDPOINT=${s3_endpoint}
+JFS_S3_BUCKET=${s3_bucket}
 EOF
 }
 
@@ -264,7 +269,7 @@ run_logged_tool() {
 }
 
 format_juicefs() {
-    info "检查 JuiceFS 是否已格式化: $meta_url"
+    info "检查 JuiceFS 是否已格式化: $meta_url_display"
     if /usr/local/bin/juicefs status "$meta_url" >/dev/null 2>&1; then
         info "JuiceFS 已格式化，跳过 format"
         return 0
@@ -272,11 +277,23 @@ format_juicefs() {
 
     # JuiceFS uses bucket URL to specify custom S3 endpoint:
     #   http://<endpoint>/<bucket>
-    local bucket_url="${s3_endpoint}/${s3_bucket}"
+    # JuiceFS takes a bucket URL; Aliyun OSS requires virtual-hosted style, so
+    # prefer the explicit URL when the caller derived one.
+    local bucket_url="${JFS_S3_BUCKET_URL:-${s3_endpoint}/${s3_bucket}}"
 
-    info "格式化 JuiceFS: $meta_url (bucket=$bucket_url)"
+    # Aliyun OSS rejects path-style object requests (SecondLevelDomainForbidden).
+    # JuiceFS only switches to virtual-hosted addressing through its dedicated
+    # "oss" storage type; with "-storage s3" the generic S3 client keeps
+    # path-style addressing for *.aliyuncs.com endpoints. Verified locally
+    # against the same release: s3 => 403, oss => format succeeds.
+    local storage="s3"
+    if [[ "$bucket_url" == *aliyuncs.com* ]]; then
+        storage="oss"
+    fi
+
+    info "格式化 JuiceFS: $meta_url_display (bucket=$bucket_url)"
     /usr/local/bin/juicefs format \
-        --storage s3 \
+        --storage "$storage" \
         --bucket "$bucket_url" \
         --access-key "$access_key" \
         --secret-key "$secret_key" \
@@ -1463,7 +1480,9 @@ main() {
     if [[ -z "$artifact_dir" ]]; then
         local ts
         ts="$(date +%s)-$RANDOM"
-        artifact_dir="${artifact_root%/}/perf-run-${ts}"
+        # Keep the "perf-run-" prefix (host wrappers glob for it) and append the
+        # workload so the Result Vault run list shows BrewFS vs JuiceFS directly.
+        artifact_dir="${artifact_root%/}/perf-run-${ts}-juicefs"
     fi
 
     mkdir -p "$artifact_dir"
@@ -1496,11 +1515,20 @@ main() {
     local status=$?
     set -e
     generate_perf_report || true
+    touch "$artifact_dir/perf.complete"
 
     if [[ "$status" -eq 0 ]]; then
         ok "性能测试全部完成"
     else
         err "性能测试存在失败项 (exit=$status)"
+    fi
+
+    # Keep the pod alive briefly so Kubernetes clients can copy artifacts before
+    # the completed container becomes non-executable.
+    local hold_seconds="${BREWFS_ARTIFACT_HOLD_SECONDS:-0}"
+    if [[ "$hold_seconds" =~ ^[0-9]+$ ]] && (( hold_seconds > 0 )); then
+        info "保留产物窗口: ${hold_seconds}s"
+        sleep "$hold_seconds"
     fi
 
     return "$status"

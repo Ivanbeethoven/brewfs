@@ -522,6 +522,9 @@ copy_artifacts() {
     fi
     if [[ -f "$config_path" ]]; then
         cp -f "$config_path" "$artifact_dir/backend.yml" || true
+        if [[ -f "$artifact_dir/backend.yml" ]]; then
+            sed -E -i 's#(redis(s)?://)[^@[:space:]]+@#\1***@#g' "$artifact_dir/backend.yml"
+        fi
     fi
     chmod -R a+rwX "$artifact_dir" >/dev/null 2>&1 || true
 }
@@ -2617,7 +2620,9 @@ main() {
     if [[ -z "$artifact_dir" ]]; then
         local ts
         ts="$(date +%s)-$RANDOM"
-        artifact_dir="${artifact_root%/}/perf-run-${ts}"
+        # Keep the "perf-run-" prefix (host wrappers glob for it) and append the
+        # workload so the Result Vault run list shows BrewFS vs JuiceFS directly.
+        artifact_dir="${artifact_root%/}/perf-run-${ts}-brewfs"
     fi
 
     mkdir -p "$artifact_dir"
