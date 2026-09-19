@@ -192,6 +192,8 @@ while [[ $# -gt 0 ]]; do
                 export BREWFS_PERSIST_WRITE_CACHE_AFTER_UPLOAD="${BREWFS_PERSIST_WRITE_CACHE_AFTER_UPLOAD:-true}"
                 export BREWFS_COMPRESSION="${BREWFS_COMPRESSION:-none}"
                 export BREWFS_VERIFY_CACHE_CHECKSUM="${BREWFS_VERIFY_CACHE_CHECKSUM:-full}"
+                # Match the JuiceFS comparison leg's 1 GiB max readahead.
+                export BREWFS_PREFETCH_MAX_BYTES="${BREWFS_PREFETCH_MAX_BYTES:-1073741824}"
                 export BREWFS_FUSE_WORKERS="${BREWFS_FUSE_WORKERS:-16}"
                 export BREWFS_FUSE_MAX_BACKGROUND="${BREWFS_FUSE_MAX_BACKGROUND:-512}"
                 export PERF_FIO_PREFILL_DRAIN="${PERF_FIO_PREFILL_DRAIN:-true}"
