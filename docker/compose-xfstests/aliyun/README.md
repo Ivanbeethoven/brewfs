@@ -208,6 +208,71 @@ BrewFS 这条归档是由一次 salvage 规范化而来：native invocation 的�
 - 两侧都按 drained 口径比，写侧仍是 BrewFS 领先：`fio-seqwrite` 307.4 对 186.1、`fio-randwrite` 333.0 对 185.0、`fio-randrw` 读 465.2 对 130.5 / 写 207.1 对 58.5 MiB/s；JuiceFS 这三项 drain 要 176–185 s，BrewFS 是 62 s。
 - 顺带发现 JuiceFS 1.4.1 上 `max-downloads` 没生效：归档 `juicefs-profile.env` 里同时写着 `JFS_MAX_DOWNLOADS=8` 和 `JFS_MAX_DOWNLOADS_EFFECTIVE=unsupported`，读侧下载并发并没有真拉到 8。下一轮要对齐读侧并发时先解决这个开关。
 
+### 5.3 修好遥测链路后用当前 main 重测（2026-09-19）
+
+第 5.2 节的归档是在 `3e71f64` 上跑的。这轮的目标是：修掉 PR #115 上暴出的问题，再在**当前 main**
+（`4c0bae9`）上重跑一次 BrewFS 单腿，数字进同一个 Result Vault。
+
+CI 侧只有一个错误，来自 PR 基线自带的 `reconciler.rs`（`E0425: cannot find function
+patch_cluster_status_phase`），该函数在后续 main 提交里已改名 `patch_cluster_status`；把分支 rebase 到
+`4c0bae9` 后 CI 全绿。
+
+真正花钱的是遥测链路：native 腿在开机后几十秒内就以 `ExitCode 1` 结束，两轮各烧掉一台 ECS + 一个 Tair +
+一个 bucket 的时间。两次都是"镜像里烘焙的 runner 和每轮覆盖上传的 runner 对不上"：
+
+| 轮次 | 云端报错 | 根因 |
+| --- | --- | --- |
+| run10 | `python3: can't open file '/usr/local/bin/perf_manifest.py'` | `run_perf_in_container.sh` 已经会写 `run-manifest.json`，但 helper 只存在于引入它的那个 checkout 里；镜像烘焙和每轮 harness refresh 都只带了 runner |
+| run11 | `/opt/brewfs-perf/native/run_native_perf.sh: line 2: $'\r': command not found` | 所有 payload 都是从 Windows checkout 读的原字节；`core.autocrlf=true` 让新 worktree 里的脚本变成 CRLF，上传 19648 B 的 runner，bash 在第一行就拒绝 |
+
+修复：
+
+- 新增 `tools/perf/perf_manifest.py`，并接进四条供给路径：镜像烘焙（`prepare_native_perf_vm.sh`）、镜像维护
+（`maintain_aliyun_perf_image.ps1`）、每轮上传 + refresh（`run_aliyun_perf.ps1`）、compose 镜像
+（`Dockerfile`）。
+- 三个 payload 构造器统一把 CRLF 归一成 LF 再装箱（`run_aliyun_perf.ps1`、`invoke_native_vm_prepare.ps1`、
+`maintain_aliyun_perf_image.ps1`）。run9 之所以没踩到，只是那个 checkout 里脚本碰巧是 LF；同一 commit 的新
+worktree 就会失败。
+- 新增 `bash docker/compose-xfstests/test_native_perf_harness_payload.sh`：从两个 runner 里抽出所有
+`/usr/local/bin/*.py` 引用，断言每个 helper 都有仓库源文件、都随二进制上传、都被两条镜像路径安装、都进 compose
+镜像，并要求三个构造器仍然做 CRLF 归一。上面两种失败形态都验证过会被它拦下。顺带把两个一直没进 CI 的 native
+测试（`test_native_perf_budget_parity.sh`、`test_native_perf_memory_guard.sh`）接进 `Check perf scripts`。
+
+本轮归档：`perf-run-1789786937-918-brewfs-brewfs-main-4c0bae9-lfharness`（Result Vault run
+`run-20260919-111203-cc2b8fc7`），二进制是 `4c0bae9` 的干净构建
+（`sha256 52519bf3…ec09`），规格、预算、11 项工具与第 5.2 节完全一致（`config-parity.txt` 可自证：read 2 GiB
++ write 2 GiB 内存、read 4 GiB + write 4 GiB SSD、budget 8 GiB），11 项全部 `pass`，跑完 ECS/Tair/bucket
+已删除（复查：账号里只剩用户自己的 ECS，Tair 0 个，bucket 0 个）。
+
+与第 5.2 节（`3e71f64`，同预算同规格）逐项对比：
+
+| 场景 | run9（3e71f64） | run12（4c0bae9） | 变化 |
+| --- | ---: | ---: | ---: |
+| fio-bigread | 1812.4 MiB/s（p99 25.8 ms） | 2137.8 MiB/s（p99 21.4 ms） | +18.0% |
+| fio-seqread | 786.7 MiB/s（p99 5.7 ms） | 906.3 MiB/s（p99 5.0 ms） | +15.2% |
+| fio-randread | 794.0 MiB/s（p99 103.3 ms） | 896.4 MiB/s（p99 98.0 ms） | +12.9% |
+| fio-bigwrite | 1135.3 MiB/s（p99 42.2 ms） | 1267.3 MiB/s（p99 36.4 ms） | +11.6% |
+| fio-seqwrite 前台 / drained | 317.7 / 307.4 MiB/s | 320.2 / 320.2 MiB/s | +0.8% / +4.2% |
+| fio-randwrite 前台 / drained | 344.1 / 333.0 MiB/s（p99 489 ms） | 324.7 / 314.2 MiB/s（p99 541 ms） | -5.6% / -5.7% |
+| fio-randrw 读/写 drained | 465.2 / 207.1 MiB/s | 491.0 / 217.4 MiB/s | +5.5% / +5.0% |
+
+口径提醒：`3e71f64 → 4c0bae9` 之间只有 operator 调度、TiKV 尾部 GC、trusted xattr 这几个提交，没有碰读路径，
+所以读侧 +13% ~ +18% **不能算成代码收益**，更可能是宿主机抖动——本轮宿主机其实更紧（`free` 最低点 149 MiB
+对 185 MiB，`wa` 平均 34.5% 对 31.1%，两侧 swap 都是 0）。写侧 `fio-randwrite` 退 5.6% 同理。要结论就得加重复
+样本，单轮不够。
+
+与 JuiceFS 的 drained 口径（第 5.2 节的 JuiceFS 腿，`perf-run-1789648512-6450-juicefs-juicefs-16g`）：
+
+| 场景 | BrewFS（4c0bae9） | JuiceFS 1.4.1 | 差距 |
+| --- | ---: | ---: | ---: |
+| fio-bigwrite drained | 213.0 MiB/s | 190.9 MiB/s | +11.6% |
+| fio-seqwrite drained | 320.2 MiB/s | 186.1 MiB/s | +72.1% |
+| fio-randwrite drained | 314.2 MiB/s | 185.0 MiB/s | +69.8% |
+| fio-randrw drained 总吞吐 | 708.4 MiB/s | 189.0 MiB/s | +274.8% |
+
+读侧差距仍在，且这轮没有针对它做任何改动：`fio-bigread` 2137.8 对 2343.2、`fio-seqread` 906.3 对 1186.8、
+`fio-randread` 896.4 对 1332.4 MiB/s。下一轮优化应该从这里入手，不要再拿内存预算解释。
+
 ### 6. 成本控制
 
 默认策略是「用完即删」。2026-09-17 一轮结束后，账号里只应剩用户自己的 ECS、它的系统盘，以及一块长期 VM 镜像和它的快照。
