@@ -137,6 +137,7 @@ function New-PreparePayload {
         Copy-Item -LiteralPath (Join-Path $composeDir $name) -Destination (Join-Path $harness $name)
     }
     Copy-Item -LiteralPath (Join-Path $aliyunDir 'run_native_perf.sh') -Destination (Join-Path $harness 'run_native_perf.sh')
+    Copy-Item -LiteralPath (Join-Path $RepositoryRoot 'tools/perf/perf_manifest.py') -Destination (Join-Path $harness 'perf_manifest.py')
     if ($PrepareEnv) {
         # Sourced by bash: the file must not contain CR characters, otherwise
         # the value keeps a trailing CR and curl rejects the URL.

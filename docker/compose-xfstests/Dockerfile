@@ -45,9 +45,10 @@ COPY tests/scripts/xfstests_slayer.exclude /opt/xfstests_slayer.exclude
 COPY docker/xfstests_report.sh /usr/local/bin/xfstests_report.sh
 COPY docker/compose-xfstests/run_xfstests_in_container.sh /usr/local/bin/run_xfstests_in_container.sh
 COPY docker/compose-xfstests/perf_metadata_fallback.py /usr/local/bin/perf_metadata_fallback.py
+COPY tools/perf/perf_manifest.py /usr/local/bin/perf_manifest.py
 
 RUN set -e; \
-    chmod +x /usr/local/bin/brewfs /usr/local/bin/xfstests_report.sh /usr/local/bin/run_xfstests_in_container.sh /usr/local/bin/perf_metadata_fallback.py; \
+    chmod +x /usr/local/bin/brewfs /usr/local/bin/xfstests_report.sh /usr/local/bin/run_xfstests_in_container.sh /usr/local/bin/perf_metadata_fallback.py /usr/local/bin/perf_manifest.py; \
     mkdir -p /opt/xfstests-dev /mnt/brewfs /run/brewfs /var/lib/brewfs/data /artifacts; \
     if gzip -t /opt/xfstests-prebuilt.tar.gz >/dev/null 2>&1; then \
         tar -xzf /opt/xfstests-prebuilt.tar.gz -C /opt --transform 's|^xfstests|xfstests-dev|'; \

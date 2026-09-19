@@ -85,6 +85,9 @@ jobs:
           bash docker/compose-xfstests/test_perf_report_delta.sh
           bash docker/compose-xfstests/test_juicefs_direct_matrix.sh
           bash docker/compose-xfstests/test_juicefs_perf_report.sh
+          bash docker/compose-xfstests/test_native_perf_budget_parity.sh
+          bash docker/compose-xfstests/test_native_perf_memory_guard.sh
+          bash docker/compose-xfstests/test_native_perf_harness_payload.sh
 
       - name: Build workspace
         run: cargo build --workspace

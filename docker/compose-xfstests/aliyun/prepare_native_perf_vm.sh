@@ -14,6 +14,7 @@
 #   harness/run_perf_in_container.sh
 #   harness/run_juicefs_perf_in_container.sh
 #   harness/perf_metadata_fallback.py
+#   harness/perf_manifest.py
 #   harness/run_native_perf.sh
 #
 # The script is idempotent and is expected to run detached from the cloud
@@ -192,10 +193,15 @@ install -m 0755 "$PAYLOAD_DIR/harness/run_juicefs_perf_in_container.sh" \
     "$SOURCE/docker/compose-xfstests/run_juicefs_perf_in_container.sh"
 install -m 0755 "$PAYLOAD_DIR/harness/perf_metadata_fallback.py" \
     "$SOURCE/docker/compose-xfstests/perf_metadata_fallback.py"
+mkdir -p "$SOURCE/tools/perf"
+install -m 0755 "$PAYLOAD_DIR/harness/perf_manifest.py" \
+    "$SOURCE/tools/perf/perf_manifest.py"
 mkdir -p "$NATIVE_DIR"
 install -m 0755 "$PAYLOAD_DIR/harness/run_native_perf.sh" "$NATIVE_DIR/run_native_perf.sh"
 install -m 0755 "$PAYLOAD_DIR/harness/perf_metadata_fallback.py" \
     /usr/local/bin/perf_metadata_fallback.py
+install -m 0755 "$PAYLOAD_DIR/harness/perf_manifest.py" \
+    /usr/local/bin/perf_manifest.py
 
 git -C "$SOURCE" add -A
 if ! git -C "$SOURCE" diff --cached --quiet; then
@@ -220,6 +226,7 @@ cat >"$ROOT/image-manifest.json" <<EOF
     "run_perf_in_container.sh": "$(harness_sha "$SOURCE/docker/compose-xfstests/run_perf_in_container.sh")",
     "run_juicefs_perf_in_container.sh": "$(harness_sha "$SOURCE/docker/compose-xfstests/run_juicefs_perf_in_container.sh")",
     "perf_metadata_fallback.py": "$(harness_sha "$SOURCE/docker/compose-xfstests/perf_metadata_fallback.py")",
+    "perf_manifest.py": "$(harness_sha "$SOURCE/tools/perf/perf_manifest.py")",
     "run_native_perf.sh": "$(harness_sha "$NATIVE_DIR/run_native_perf.sh")"
   }
 }

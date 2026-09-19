@@ -187,6 +187,7 @@ fi
 install -m 0755 "`$SOURCE/docker/compose-xfstests/run_perf_in_container.sh" /usr/local/bin/run_perf_in_container.sh
 install -m 0755 "`$SOURCE/docker/compose-xfstests/run_juicefs_perf_in_container.sh" /usr/local/bin/run_juicefs_perf_in_container.sh
 install -m 0755 "`$SOURCE/docker/compose-xfstests/perf_metadata_fallback.py" /usr/local/bin/perf_metadata_fallback.py
+install -m 0755 "`$SOURCE/tools/perf/perf_manifest.py" /usr/local/bin/perf_manifest.py
 mkdir -p "`$ROOT/native"
 printf '%s' '__NATIVE_RUNNER_B64__' | base64 -d | gzip -d > "`$ROOT/native/run_native_perf.sh"
 chmod 0755 "`$ROOT/native/run_native_perf.sh"

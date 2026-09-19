@@ -169,7 +169,8 @@ function New-BinaryUpload {
             @{ Entry = 'run_native_perf.sh'; Path = (Join-Path $PSScriptRoot 'run_native_perf.sh') },
             @{ Entry = 'run_perf_in_container.sh'; Path = (Join-Path $parent 'run_perf_in_container.sh') },
             @{ Entry = 'run_juicefs_perf_in_container.sh'; Path = (Join-Path $parent 'run_juicefs_perf_in_container.sh') },
-            @{ Entry = 'perf_metadata_fallback.py'; Path = (Join-Path $parent 'perf_metadata_fallback.py') }
+            @{ Entry = 'perf_metadata_fallback.py'; Path = (Join-Path $parent 'perf_metadata_fallback.py') },
+            @{ Entry = 'perf_manifest.py'; Path = (Join-Path $parent '..\..\tools\perf\perf_manifest.py') }
         )) {
             if (-not (Test-Path -LiteralPath $item.Path -PathType Leaf)) {
                 Write-Warning "harness 文件缺失，未随二进制上传: $($item.Path)"
@@ -438,6 +439,10 @@ pull_docker_image() {
     refresh_harness run_juicefs_perf_in_container.sh "$WORK/docker/compose-xfstests/run_juicefs_perf_in_container.sh" || true
     if refresh_harness perf_metadata_fallback.py "$WORK/docker/compose-xfstests/perf_metadata_fallback.py"; then
       install -m 0755 "$WORK/docker/compose-xfstests/perf_metadata_fallback.py" /usr/local/bin/perf_metadata_fallback.py
+    fi
+    mkdir -p "$WORK/tools/perf"
+    if refresh_harness perf_manifest.py "$WORK/tools/perf/perf_manifest.py"; then
+      install -m 0755 "$WORK/tools/perf/perf_manifest.py" /usr/local/bin/perf_manifest.py
     fi
   fi
  elif [[ -n "$SOURCE_ARCHIVE_URL" ]]; then
