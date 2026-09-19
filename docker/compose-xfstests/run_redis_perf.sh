@@ -35,7 +35,7 @@ usage() {
   --bigwrite-throughput-profile
                              启用 fio-bigwrite/大 buffered write 吞吐 profile；这是 --writeback-throughput-profile 的明确别名，会启用 commit-before-upload 写回语义
   --writeback-throughput-profile
-                             启用 S3 writeback 全场景吞吐 profile（cache root=/var/lib/brewfs/cache, 4GiB memory + 8GiB read-SSD/4GiB write-SSD cache, 上传后持久块缓存并在 prefill remount 后保留, 12GiB memory budget, S3 max concurrency=16, writeback upload concurrency=6, pending soft/hard=2GiB/3GiB, writeback persist fsync=false, compression=none, full cache checksum, fuse workers=16, fuse max_background=512, read-throughput profile, fio prefill/post-write drain+remount）
+                             启用 S3 writeback 全场景吞吐 profile（cache root=/var/lib/brewfs/cache, 4GiB memory + 8GiB read-SSD/4GiB write-SSD cache, 上传后持久块缓存并在 prefill remount 后保留, 12GiB memory budget, S3 max concurrency=16, writeback upload concurrency=6, pending soft/hard=2GiB/3GiB, writeback persist fsync=false, compression=none, full cache checksum, fuse workers=16, fuse max_background=512, 1GiB readahead, read-throughput profile, fio prefill/post-write drain+remount）
   --tools "<tool...>"        指定压力工具列表，默认: "fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
   --brewfs-bench           额外运行一次宿主机 cargo bench --bench brewfs_bench
   --bench-args "<args...>"   透传给 cargo bench 之后的 Criterion 参数
@@ -211,6 +211,9 @@ enable_writeback_throughput_profile() {
     export BREWFS_PERSIST_WRITE_CACHE_AFTER_UPLOAD="${BREWFS_PERSIST_WRITE_CACHE_AFTER_UPLOAD:-true}"
     export BREWFS_COMPRESSION="${BREWFS_COMPRESSION:-none}"
     export BREWFS_VERIFY_CACHE_CHECKSUM="${BREWFS_VERIFY_CACHE_CHECKSUM:-full}"
+    # Align the compose profile's readahead cap with the JuiceFS comparison
+    # leg. Three-read evidence showed bigread gain without randread loss.
+    export BREWFS_PREFETCH_MAX_BYTES="${BREWFS_PREFETCH_MAX_BYTES:-1073741824}"
     # Eight fio jobs need enough request consumers to overlap object GET latency.
     # The 16-worker setting passed the complete data and metadata regression gate.
     export BREWFS_FUSE_WORKERS="${BREWFS_FUSE_WORKERS:-16}"
