@@ -106,7 +106,10 @@ function Get-ImageBuildCommand {
     if (-not (Test-Path -LiteralPath $nativeRunnerPath -PathType Leaf)) {
         throw "native runner is missing: $nativeRunnerPath"
     }
-    $nativeRunnerBytes = [Text.Encoding]::UTF8.GetBytes((Get-Content -LiteralPath $nativeRunnerPath -Raw))
+    # Ship the runner as LF: this script runs on Windows, where core.autocrlf
+    # hands back CRLF text, and bash on the VM rejects the first line otherwise.
+    $nativeRunnerText = (Get-Content -LiteralPath $nativeRunnerPath -Raw) -replace "`r`n", "`n"
+    $nativeRunnerBytes = [Text.Encoding]::UTF8.GetBytes(($nativeRunnerText -replace "`r", "`n"))
 $nativeRunnerStream = [IO.MemoryStream]::new()
 $nativeRunnerGzip = [IO.Compression.GZipStream]::new($nativeRunnerStream, [IO.Compression.CompressionMode]::Compress)
 $nativeRunnerGzip.Write($nativeRunnerBytes, 0, $nativeRunnerBytes.Length)

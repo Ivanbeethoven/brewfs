@@ -69,4 +69,18 @@ while IFS= read -r ref; do
     echo "OK container   : $name is copied into the compose image"
 done <<<"$helpers"
 
+# Line-ending guard. Every payload builder runs on Windows, where a checkout
+# with core.autocrlf=true hands back CRLF text. The 2026-09-19 run11 attempt
+# shipped run_native_perf.sh that way and the VM answered with
+#   /opt/brewfs-perf/native/run_native_perf.sh: line 2: $'\r': command not found
+# so each builder must normalize to LF before the bytes leave the machine.
+for builder in \
+    "$ALIYUN/run_aliyun_perf.ps1" \
+    "$ALIYUN/invoke_native_vm_prepare.ps1" \
+    "$ALIYUN/maintain_aliyun_perf_image.ps1"; do
+    grep -qF '`r`n' "$builder" \
+        || fail "$(basename "$builder") does not normalize CRLF before shipping harness files"
+done
+echo "OK line-endings: every payload builder normalizes CRLF to LF"
+
 echo "PASS: every perf-runner helper is available in every provisioning path"

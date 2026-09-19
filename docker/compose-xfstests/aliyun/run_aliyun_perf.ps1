@@ -177,9 +177,15 @@ function New-BinaryUpload {
                 continue
             }
             $harnessEntry = $zip.CreateEntry($item.Entry, [IO.Compression.CompressionLevel]::Optimal)
-            $harnessSource = [IO.File]::OpenRead($item.Path)
+            # Windows checkouts with core.autocrlf=true hand us CRLF text. Every
+            # harness file is a bash script or a Python helper, so shipping the
+            # bytes verbatim makes the VM die on `$'\r': command not found`.
+            # Normalize to LF so the payload does not depend on the line endings
+            # this checkout happens to have.
+            $harnessText = ([IO.File]::ReadAllText($item.Path) -replace "`r`n", "`n") -replace "`r", "`n"
+            $harnessBytes = [Text.Encoding]::UTF8.GetBytes($harnessText)
             $harnessDestination = $harnessEntry.Open()
-            try { $harnessSource.CopyTo($harnessDestination) } finally { $harnessDestination.Dispose(); $harnessSource.Dispose() }
+            try { $harnessDestination.Write($harnessBytes, 0, $harnessBytes.Length) } finally { $harnessDestination.Dispose() }
         }
     } finally {
         $zip.Dispose()

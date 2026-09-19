@@ -121,6 +121,19 @@ function Invoke-RemoteScript([string]$Script, [int]$TimeoutSeconds = 300, [int]$
     throw '远程脚本重试次数耗尽。'
 }
 
+# Windows checkouts with core.autocrlf=true hand these files CRLF text. The
+# payload is consumed by bash on the Linux VM, where a stray CR turns the first
+# line into `$'\r': command not found`. Stage every harness file as LF so the
+# image build does not depend on the line endings this checkout happens to have.
+function Copy-LfFile {
+    param([string]$Source, [string]$Destination)
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+        throw "payload source is missing: $Source"
+    }
+    $text = ([IO.File]::ReadAllText($Source) -replace "`r`n", "`n") -replace "`r", "`n"
+    [IO.File]::WriteAllText($Destination, $text, (New-Object Text.UTF8Encoding($false)))
+}
+
 function New-PreparePayload {
     param([string]$PrepareEnv)
 
@@ -132,12 +145,12 @@ function New-PreparePayload {
 
     $composeDir = Join-Path $RepositoryRoot 'docker/compose-xfstests'
     $aliyunDir = Join-Path $composeDir 'aliyun'
-    Copy-Item -LiteralPath (Join-Path $aliyunDir 'prepare_native_perf_vm.sh') -Destination (Join-Path $setup 'prepare_native_perf_vm.sh')
+    Copy-LfFile -Source (Join-Path $aliyunDir 'prepare_native_perf_vm.sh') -Destination (Join-Path $setup 'prepare_native_perf_vm.sh')
     foreach ($name in @('run_perf_in_container.sh', 'run_juicefs_perf_in_container.sh', 'perf_metadata_fallback.py')) {
-        Copy-Item -LiteralPath (Join-Path $composeDir $name) -Destination (Join-Path $harness $name)
+        Copy-LfFile -Source (Join-Path $composeDir $name) -Destination (Join-Path $harness $name)
     }
-    Copy-Item -LiteralPath (Join-Path $aliyunDir 'run_native_perf.sh') -Destination (Join-Path $harness 'run_native_perf.sh')
-    Copy-Item -LiteralPath (Join-Path $RepositoryRoot 'tools/perf/perf_manifest.py') -Destination (Join-Path $harness 'perf_manifest.py')
+    Copy-LfFile -Source (Join-Path $aliyunDir 'run_native_perf.sh') -Destination (Join-Path $harness 'run_native_perf.sh')
+    Copy-LfFile -Source (Join-Path $RepositoryRoot 'tools/perf/perf_manifest.py') -Destination (Join-Path $harness 'perf_manifest.py')
     if ($PrepareEnv) {
         # Sourced by bash: the file must not contain CR characters, otherwise
         # the value keeps a trailing CR and curl rejects the URL.
