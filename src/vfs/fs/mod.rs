@@ -1634,15 +1634,55 @@ where
         Ok(Some((ino, attr)))
     }
 
-    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
-    pub(crate) async fn stat_ino(&self, ino: i64) -> Option<FileAttr> {
-        let mut attr = self.meta_stat(ino).await.ok().flatten()?;
-
-        // close-to-open semantics: if there is a local state, it should be considered as the newest state.
+    fn apply_local_attr_state(&self, ino: i64, mut attr: FileAttr) -> FileAttr {
+        // Metadata is authoritative for every field except the local size
+        // already promised by close-to-open VFS semantics.
         if let Some(size) = self.inode_size_cached(ino) {
             attr.size = size;
         }
+        attr
+    }
 
+    pub(crate) async fn stat_ino_result(&self, ino: i64) -> Result<Option<FileAttr>, VfsError> {
+        Ok(self
+            .meta_stat(ino)
+            .await?
+            .map(|attr| self.apply_local_attr_state(ino, attr)))
+    }
+
+    /// Fetch and locally merge one directory window without changing its
+    /// input positions. Missing inodes remain `None` for the FUSE layer to
+    /// skip while retaining their original cookies.
+    pub(crate) async fn batch_stat_ino(
+        &self,
+        inodes: &[i64],
+    ) -> Result<Vec<Option<FileAttr>>, VfsError> {
+        let attrs = self
+            .meta_layer()
+            .batch_stat(inodes)
+            .await
+            .map_err(|err| VfsError::from_meta(PathHint::none(), err))?;
+        if attrs.len() != inodes.len() {
+            return Err(VfsError::from_meta(
+                PathHint::none(),
+                MetaError::Internal(format!(
+                    "metadata batch returned {} attributes for {} requested inodes",
+                    attrs.len(),
+                    inodes.len()
+                )),
+            ));
+        }
+        Ok(inodes
+            .iter()
+            .copied()
+            .zip(attrs)
+            .map(|(ino, attr)| attr.map(|attr| self.apply_local_attr_state(ino, attr)))
+            .collect())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
+    pub(crate) async fn stat_ino(&self, ino: i64) -> Option<FileAttr> {
+        let attr = self.stat_ino_result(ino).await.ok().flatten()?;
         tracing::debug!(ino, nlink = attr.nlink, kind = ?attr.kind, "stat_ino");
         Some(attr)
     }

@@ -547,6 +547,17 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
             .transpose()
     }
 
+    async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
+        // Workspace inode IDs are resolved against the selected view. Never
+        // send them through a flat backend batch API, which could expose a
+        // different workspace's attributes.
+        let mut results = Vec::with_capacity(inodes.len());
+        for &ino in inodes {
+            results.push(self.stat(ino).await?);
+        }
+        Ok(results)
+    }
+
     async fn stat_fresh(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
         self.stat(ino).await
     }

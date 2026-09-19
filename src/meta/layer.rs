@@ -119,6 +119,20 @@ pub trait MetaLayer: Send + Sync {
 
     async fn readdir(&self, ino: i64) -> Result<Vec<DirEntry>, MetaError>;
 
+    /// Fetch attributes for a directory window in input order.
+    ///
+    /// `None` is a missing inode, not a malformed reply. Implementations must
+    /// return exactly one result for every input inode and preserve duplicate
+    /// input positions. The default keeps the bridge correct for layers that
+    /// do not have a native batch source.
+    async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
+        let mut results = Vec::with_capacity(inodes.len());
+        for &ino in inodes {
+            results.push(self.stat(ino).await?);
+        }
+        Ok(results)
+    }
+
     async fn opendir(&self, ino: i64) -> Result<DirHandle, MetaError>;
 
     async fn mkdir(&self, parent: i64, name: String) -> Result<i64, MetaError>;

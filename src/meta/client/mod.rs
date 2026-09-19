@@ -1974,6 +1974,18 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
                         let batch_start = std::time::Instant::now();
                         match store.batch_stat(&chunk).await {
                             Ok(attrs) => {
+                                if attrs.len() != chunk.len()
+                                    || attrs.iter().zip(&chunk).any(|(attr, ino)| {
+                                        attr.as_ref().is_some_and(|attr| attr.ino != *ino)
+                                    })
+                                {
+                                    warn!(
+                                        "Batch {}/{} returned a malformed attribute reply; ignoring the batch",
+                                        batch_idx + 1,
+                                        total_batches
+                                    );
+                                    return;
+                                }
                                 let mut cached_count = 0;
                                 // Insert results into cache
                                 for (child_ino, attr_opt) in chunk.iter().zip(attrs.iter()) {
@@ -2130,6 +2142,59 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
         self.cached_stat(ino).await
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, inodes), fields(inode_count = inodes.len()))]
+    async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
+        if inodes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Resolve the client root alias before touching either cache or store.
+        // The result vector is indexed by the caller's original positions so
+        // hard links and repeated inodes remain visible to FUSE separately.
+        let checked: Vec<i64> = inodes.iter().map(|&ino| self.check_root(ino)).collect();
+        let mut results = vec![None; checked.len()];
+        let mut misses = Vec::new();
+        let mut miss_positions = Vec::new();
+
+        for (position, &ino) in checked.iter().enumerate() {
+            if let Some(attr) = self.inode_cache.get_attr(ino).await {
+                self.metrics.record_stat_cache_hit();
+                results[position] = Some(attr);
+            } else {
+                self.metrics.record_stat_cache_miss();
+                misses.push(ino);
+                miss_positions.push(position);
+            }
+        }
+
+        if misses.is_empty() {
+            return Ok(results);
+        }
+
+        let attrs = self.store.batch_stat(&misses).await?;
+        if attrs.len() != misses.len() {
+            return Err(MetaError::Internal(format!(
+                "batch_stat returned {} attributes for {} requested inodes",
+                attrs.len(),
+                misses.len()
+            )));
+        }
+
+        for ((&requested, &position), attr) in misses.iter().zip(miss_positions.iter()).zip(attrs) {
+            if let Some(ref attr) = attr
+                && attr.ino != requested
+            {
+                return Err(MetaError::Internal(format!(
+                    "batch_stat returned inode {} for requested inode {}",
+                    attr.ino, requested
+                )));
+            }
+            results[position] = attr;
+        }
+
+        Ok(results)
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]

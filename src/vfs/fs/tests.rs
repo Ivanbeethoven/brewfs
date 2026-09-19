@@ -481,6 +481,7 @@ mod rename_tests {
 #[cfg(test)]
 mod basic_tests {
     use super::*;
+    use crate::vfs::Inode;
 
     async fn new_basic_fs() -> VFS<InMemoryBlockStore, impl MetaLayer> {
         let layout = ChunkLayout::default();
@@ -568,6 +569,63 @@ mod basic_tests {
             fs.mkdir_at(file_ino, "child").await,
             Err(crate::vfs::error::VfsError::NotADirectory { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn batch_attrs_match_scalar_with_local_dirty_file() {
+        let fs = new_basic_fs().await;
+        let root = fs.root_ino();
+        let ino = fs
+            .create_file_at(root, "batch-dirty.txt", false)
+            .await
+            .unwrap();
+        fs.state.inodes.insert(ino, Inode::new(ino, 4096));
+
+        let batch = fs.batch_stat_ino(&[ino]).await.unwrap();
+        let scalar = fs.stat_ino_result(ino).await.unwrap();
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].as_ref().map(|attr| attr.size), Some(4096));
+        assert_eq!(
+            batch[0].as_ref().map(|attr| attr.size),
+            scalar.map(|attr| attr.size)
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_attrs_respect_local_truncate_without_max_merge() {
+        let fs = new_basic_fs().await;
+        let root = fs.root_ino();
+        let ino = fs
+            .create_file_at(root, "batch-truncate.txt", false)
+            .await
+            .unwrap();
+        fs.state.inodes.insert(ino, Inode::new(ino, 4096));
+        fs.state.inodes.get(&ino).unwrap().set_size(7);
+
+        let batch = fs.batch_stat_ino(&[ino]).await.unwrap();
+
+        assert_eq!(batch[0].as_ref().map(|attr| attr.size), Some(7));
+    }
+
+    #[tokio::test]
+    async fn batch_attrs_preserve_duplicate_and_missing_positions() {
+        let fs = new_basic_fs().await;
+        let root = fs.root_ino();
+        let ino = fs
+            .create_file_at(root, "batch-duplicate.txt", false)
+            .await
+            .unwrap();
+
+        let batch = fs.batch_stat_ino(&[ino, 9_999_999, ino]).await.unwrap();
+
+        assert_eq!(batch.len(), 3);
+        assert!(batch[0].is_some());
+        assert!(batch[1].is_none());
+        assert_eq!(
+            batch[0].as_ref().map(|attr| attr.ino),
+            batch[2].as_ref().map(|attr| attr.ino)
+        );
     }
 
     #[tokio::test]
