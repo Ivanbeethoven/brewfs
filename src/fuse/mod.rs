@@ -107,6 +107,31 @@ fn fuse_keep_cache_enabled() -> bool {
     }
 }
 
+fn readdirplus_child_records<'a>(
+    entries: &'a [crate::vfs::fs::DirEntry],
+    attrs: &'a [Option<VfsFileAttr>],
+    entries_offset: u64,
+) -> FuseResult<Vec<(usize, &'a crate::vfs::fs::DirEntry, &'a VfsFileAttr, i64)>> {
+    if attrs.len() != entries.len() {
+        return Err(libc::EIO.into());
+    }
+
+    Ok(entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            attrs[index].as_ref().map(|attr| {
+                (
+                    index,
+                    entry,
+                    attr,
+                    (entries_offset + index as u64 + 3) as i64,
+                )
+            })
+        })
+        .collect())
+}
+
 fn fuse_open_reply_flags(read: bool, write: bool) -> u32 {
     let mut flags = if fuse_keep_cache_enabled() {
         FOPEN_KEEP_CACHE
@@ -1264,7 +1289,11 @@ where
             };
 
         if fh != 0 && include_dot_entries {
-            if let Some(attr) = self.stat_ino(ino as i64).await {
+            if let Some(attr) = self
+                .stat_ino_result(ino as i64)
+                .await
+                .map_err(Into::<Errno>::into)?
+            {
                 let fattr = vfs_to_fuse_attr(&attr, &req, self.blocks_for_attr(&attr));
                 all.push(DirectoryEntryPlus {
                     inode: ino,
@@ -1283,7 +1312,11 @@ where
                 .parent_of(ino as i64)
                 .await
                 .unwrap_or_else(|| self.root_ino()) as u64;
-            if let Some(pattr) = self.stat_ino(parent_ino as i64).await {
+            if let Some(pattr) = self
+                .stat_ino_result(parent_ino as i64)
+                .await
+                .map_err(Into::<Errno>::into)?
+            {
                 let f = vfs_to_fuse_attr(&pattr, &req, self.blocks_for_attr(&pattr));
                 all.push(DirectoryEntryPlus {
                     inode: parent_ino,
@@ -1301,7 +1334,11 @@ where
                 .parent_of(ino as i64)
                 .await
                 .unwrap_or_else(|| self.root_ino()) as u64;
-            if let Some(pattr) = self.stat_ino(parent_ino as i64).await {
+            if let Some(pattr) = self
+                .stat_ino_result(parent_ino as i64)
+                .await
+                .map_err(Into::<Errno>::into)?
+            {
                 let f = vfs_to_fuse_attr(&pattr, &req, self.blocks_for_attr(&pattr));
                 all.push(DirectoryEntryPlus {
                     inode: parent_ino,
@@ -1334,17 +1371,21 @@ where
             }
         };
 
-        for (i, e) in entries.iter().enumerate() {
-            let Some(cattr) = self.stat_ino(e.ino).await else {
-                continue;
-            };
-            let fattr = vfs_to_fuse_attr(&cattr, &req, self.blocks_for_attr(&cattr));
+        let inodes: Vec<i64> = entries.iter().map(|entry| entry.ino).collect();
+        let attrs = self
+            .batch_stat_ino(&inodes)
+            .await
+            .map_err(Into::<Errno>::into)?;
+        for (_index, e, cattr, offset) in
+            readdirplus_child_records(&entries, &attrs, entries_offset)?
+        {
+            let fattr = vfs_to_fuse_attr(cattr, &req, self.blocks_for_attr(cattr));
             all.push(DirectoryEntryPlus {
                 inode: e.ino as u64,
                 generation: 0,
                 kind: vfs_kind_to_fuse(e.kind),
                 name: OsString::from(e.name.clone()),
-                offset: (entries_offset + i as u64 + 3) as i64,
+                offset,
                 attr: fattr,
                 entry_ttl: ttl,
                 attr_ttl: ttl,
@@ -3172,9 +3213,11 @@ mod mode_sanitization_tests {
         FUSE_OPEN_EXEC, access_mode_from_bits, acl_entries_access_mode, apply_creation_umask,
         mode_setattr_only_clears_suid_sgid, namespace_mutation_access_mask, open_flags_access_mask,
         opendir_access_mask, parent_namespace_mutation_access_mask, parse_proc_status_groups,
-        sanitize_special_mode_bits, validate_fuse_name, vfs_kind_to_fuse, vfs_to_fuse_attr,
+        readdirplus_child_records, sanitize_special_mode_bits, validate_fuse_name,
+        vfs_kind_to_fuse, vfs_to_fuse_attr,
     };
     use crate::control::protocol::ControlAclEntry;
+    use crate::vfs::error::{PathHint, VfsError};
     use crate::vfs::fs::{FileAttr as VfsFileAttr, FileType as VfsFileType};
     use asyncfuse::raw::Request;
     use asyncfuse::{Errno, FileType as FuseFileType};
@@ -3241,6 +3284,64 @@ mod mode_sanitization_tests {
         assert_eq!(seen.len(), TOTAL_CHILDREN);
         assert_eq!(seen.first().copied(), Some(0));
         assert_eq!(seen.last().copied(), Some(TOTAL_CHILDREN - 1));
+    }
+
+    #[test]
+    fn batch_reply_preserves_duplicate_missing_positions_and_cookies() {
+        let entries = vec![
+            crate::vfs::fs::DirEntry {
+                name: "first".into(),
+                ino: 7,
+                kind: VfsFileType::File,
+            },
+            crate::vfs::fs::DirEntry {
+                name: "missing".into(),
+                ino: 99,
+                kind: VfsFileType::File,
+            },
+            crate::vfs::fs::DirEntry {
+                name: "hard-link".into(),
+                ino: 7,
+                kind: VfsFileType::File,
+            },
+        ];
+        let attrs = vec![
+            Some(test_attr(0o644, 1, 1)),
+            None,
+            Some(test_attr(0o600, 2, 2)),
+        ];
+        let records = readdirplus_child_records(&entries, &attrs, 10).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].1.name, "first");
+        assert_eq!(records[0].3, 13);
+        assert_eq!(records[1].1.name, "hard-link");
+        assert_eq!(records[1].1.ino, 7);
+        assert_eq!(records[1].3, 15);
+    }
+
+    #[test]
+    fn short_batch_reply_is_an_io_error_instead_of_partial_directory() {
+        let entries = vec![crate::vfs::fs::DirEntry {
+            name: "one".into(),
+            ino: 7,
+            kind: VfsFileType::File,
+        }];
+
+        assert_eq!(
+            readdirplus_child_records(&entries, &[], 0).unwrap_err(),
+            Errno::from(libc::EIO)
+        );
+    }
+
+    #[test]
+    fn backend_batch_failure_is_not_silently_an_empty_directory() {
+        let error = VfsError::from_meta(
+            PathHint::none(),
+            crate::meta::store::MetaError::Internal("batch failed".into()),
+        );
+
+        assert_eq!(Errno::from(error), Errno::from(libc::EIO));
     }
 
     #[test]

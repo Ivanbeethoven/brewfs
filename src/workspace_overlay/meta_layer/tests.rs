@@ -676,6 +676,36 @@ async fn concurrent_directory_creates_do_not_lose_parent_updates() {
 }
 
 #[tokio::test]
+async fn batch_stat_preserves_workspace_view_identity_and_positions() {
+    let meta = test_meta().await;
+    let root = meta.root_ino();
+    let file = meta.create_file(root, "batch".into()).await.unwrap();
+    meta.set_attr(
+        file,
+        &SetAttrRequest {
+            uid: Some(2001),
+            ..SetAttrRequest::default()
+        },
+        SetAttrFlags::empty(),
+    )
+    .await
+    .unwrap();
+
+    let batch = meta.batch_stat(&[file, 9_999_999, file]).await.unwrap();
+
+    assert_eq!(batch.len(), 3);
+    assert_eq!(
+        batch[0].as_ref().map(|attr| (attr.ino, attr.uid)),
+        Some((file, 2001))
+    );
+    assert!(batch[1].is_none());
+    assert_eq!(
+        batch[2].as_ref().map(|attr| (attr.ino, attr.uid)),
+        Some((file, 2001))
+    );
+}
+
+#[tokio::test]
 async fn sibling_workspaces_share_the_base_but_isolate_namespace_and_data_changes() {
     let base = test_meta().await;
     let store = base.store().clone();
