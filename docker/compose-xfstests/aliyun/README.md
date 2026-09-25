@@ -1,6 +1,6 @@
 # Aliyun 云端性能测试
 
-这个目录把现有 Redis/TiKV Docker Compose 性能测试迁移到 Aliyun。百万级 packed 小文件测试使用 ECS/Cloud Assistant runner：默认 32 GiB 内存、100 GiB ESSD、100 万个 100 KiB 文件和三级目录树。ACK runner 仍用于已有集群上的通用矩阵。
+这个目录提供 Aliyun ECS 上的原生 packed-metadata 验证入口。脚本在本机 WSL 编译 Linux BrewFS 和 fixture 二进制，把二进制上传到 Aliyun OSS，再由 ECS Cloud Assistant 直接运行。ECS 不安装 Docker、不启动 Compose、不启动 Redis/RustFS；packed metadata 和数据对象都来自指定的 Aliyun OSS/S3 bucket。
 
 ## 百万级 packed 小文件测试
 
@@ -23,19 +23,28 @@ root/
   -VSwitchId vsw-xxxxxxxx `
   -SecurityGroupId sg-xxxxxxxx
 
-# 创建 ECS，构建指定 ref，发布 packed fixture，冷读扫描后自动释放 ECS。
+# 创建 ECS，构建当前本地工作树，发布 packed fixture，冷读扫描后自动释放 ECS。
 .\docker\compose-xfstests\aliyun\run_aliyun_packed_million.ps1 `
   -VSwitchId vsw-xxxxxxxx `
   -SecurityGroupId sg-xxxxxxxx `
+  -S3Bucket my-brewfs-test-bucket `
   -RegionId cn-hangzhou `
   -ZoneId cn-hangzhou-h `
   -ImageId ubuntu_24_04_x64_20G_alibase_20260916.vhd `
-  -Ref codex/packed-million
+  -Ref main
 ```
 
 默认使用 `ReadMode=full`，会读取每个 100 KiB 文件；若只想先验证元数据路径，可使用 `-ReadMode prefix`。测试固定关闭 BrewFS 数据缓存和预取，并要求 `drop_caches` 成功；结果不会把缓存命中当成冷读性能。`-KeepInstance` 可保留现场，`-NoCleanup` 禁止自动释放，完成后使用原 ECS runner 的 `-Action destroy` 清理。
 
-当前工作树的代码尚未提交到远端时，`-Ref` 必须指向已推送的分支或 commit；ECS runner 会在远端重新 clone 该 ref，不会自动上传未提交修改。
+默认会用当前工作树的 WSL2 `Ubuntu-24.04` 环境本地编译；也可以用 `-SkipBuild -BinaryPath ... -FixtureBinaryPath ...` 传入已经编好的 Linux ELF。OSS bucket 必须事先存在，上传的对象使用唯一前缀，测试结束后不会删除用户 bucket。
+
+默认运行的对象和缓存约束：
+
+- 目录布局为 `10 x 10 x 10 x 1,000 = 1,000,000` 个 100 KiB 文件。
+- fixture 的 namespace、data rows 和 payload block 均发布到 OSS；挂载时没有元数据数据库，`packed-metadata-v1` 直接从 OSS manifest/index 对象读取。
+- 每个工具开始前卸载并重挂载 BrewFS，删除本地 cache root，执行 `sync; echo 3 >/proc/sys/vm/drop_caches`，失败就拒绝产出性能结果。
+- `read_memory_bytes=0`、`read_ssd_bytes=0`、prefetch 关闭、FUSE read direct-io 开启；结果明确是无缓存冷读。
+- `packed-tree` 只遍历并校验百万文件的目录树；`packed-smallfiles` 做百万文件完整扫描，`packed-posix` 做只读语义检查，`fio-seqread`/`fio-randread` 只读 `bench/read.bin`。目录扫描必须报告 `walk_errors`，不能让 `os.walk` 静默跳过目录。
 
 ## ACK/Kubernetes 主流程
 
@@ -81,25 +90,23 @@ ACK 集群本身可使用 `operator/brewfs-operator/scripts/ack-e2e.ps1` 创建/
 - ECS 镜像内置 Cloud Assistant Agent，且能访问软件源和 GitHub/GHCR。
 - 目标镜像在该地域可用。百万级入口默认使用 `ubuntu_24_04_x64_20G_alibase_20260916.vhd`，可用 `ecs DescribeImages` 查询并通过 `-ImageId` 覆盖；通用 runner 仍可单独传入 `-ImageId`。
 
-## 使用方式
+## 原生 ECS 使用方式
 
 ```powershell
-# 创建临时 ECS，跑 Redis + RustFS/S3 性能测试，然后自动释放 ECS
+# 本地编译二进制，上传 OSS，ECS 直接连接 Aliyun OSS/S3，结束后自动释放 ECS
 .\docker\compose-xfstests\aliyun\run_aliyun_perf.ps1 `
   -Action run `
   -VSwitchId vsw-xxxxxxxx `
   -SecurityGroupId sg-xxxxxxxx `
-  -RegionId ap-northeast-2 `
-  -ZoneId ap-northeast-2a `
-  -Backend redis `
-  -DataBackend s3 `
-  -Ref main
+  -S3Bucket my-brewfs-test-bucket `
+  -S3Region cn-hangzhou `
+  -S3Endpoint https://oss-cn-hangzhou.aliyuncs.com
 
-# TiKV 场景，并保留 ECS 方便检查日志
+# 先创建 ECS，手动检查后再运行；不需要 Docker
 .\docker\compose-xfstests\aliyun\run_aliyun_perf.ps1 `
-  -Action run -InstanceId i-xxxxxxxx `
-  -RegionId ap-northeast-2 -Backend tikv `
-  -DataBackend local-fs -KeepInstance
+  -Action create -VSwitchId vsw-xxxxxxxx -SecurityGroupId sg-xxxxxxxx
+.\docker\compose-xfstests\aliyun\run_aliyun_perf.ps1 `
+  -Action run -InstanceId i-xxxxxxxx -S3Bucket my-brewfs-test-bucket -KeepInstance
 
 # 单独创建、查看和销毁
 .\docker\compose-xfstests\aliyun\run_aliyun_perf.ps1 -Action create `
@@ -110,15 +117,16 @@ ACK 集群本身可使用 `operator/brewfs-operator/scripts/ack-e2e.ps1` 创建/
   -InstanceId i-xxxxxxxx -RegionId ap-northeast-2
 ```
 
-## 参数映射
+## 参数
 
 | ECS 脚本参数 | Compose 等价行为 |
 | --- | --- |
-| `-Backend redis` | 调用 `run_redis_perf.sh`，启动 Redis、RustFS/MinIO 和 perf 容器 |
-| `-Backend tikv` | 调用 `run_tikv_perf.sh`，启动 PD、TiKV、RustFS 和 perf 容器 |
-| `-DataBackend s3` | 传递 `--s3`，使用 Compose 内的 RustFS |
-| `-DataBackend local-fs` | 传递 `--local-fs` |
-| `-PerfTools` | 传递给现有 runner 的 `--tools`，保持本地与云端测试矩阵一致 |
-| `-RunBench` | 传递 `--brewfs-bench` |
+| `-S3Bucket` | Aliyun OSS bucket，必须预先创建 |
+| `-S3Endpoint` | 默认为 `https://oss-$S3Region.aliyuncs.com` |
+| `-S3AccessKey/-S3SecretKey` | 默认读取本机 Aliyun CLI 当前 AK profile；也可显式覆盖 |
+| `-SkipBuild -BinaryPath -FixtureBinaryPath` | 跳过 WSL 编译，使用已有 Linux ELF |
+| `-PerfTools` | `packed-tree`、`packed-smallfiles`、`packed-posix`、`fio-seqread`、`fio-randread` 的子集 |
+| `-PackedSkipFixture -PackedExistingManifestKey` | 诊断时复用已有 packed manifest，跳过百万 fixture 发布；仅用于已确认 manifest 的复核 |
+| `-KeepInstance` | 测试后保留 ECS，便于检查远端日志 |
 
-默认 ECS 为按量付费，并设置八小时自动释放时间；`run` 结束后还会主动释放实例，除非指定 `-KeepInstance` 或 `-NoCleanup`。脚本不会删除快照、VPC、vSwitch、安全组或其他账号资源。创建前会在实例内校验内存至少 30,000,000 KiB、工作盘至少 90,000,000,000 字节，并把实际值写入 `aliyun-resource-proof.env`。
+默认 ECS 为按量付费，并设置八小时自动释放时间；`run` 结束后还会主动释放实例，除非指定 `-KeepInstance` 或 `-NoCleanup`。脚本不会删除快照、VPC、vSwitch、安全组或 OSS bucket。创建后会在实例内校验内存至少 30,000,000 KiB、工作盘至少 90,000,000,000 字节，并把实际值写入 `aliyun-resource-proof.env`。远端结果摘要保存在 `-ArtifactDirectory` 指定目录的 `remote-output.log`。

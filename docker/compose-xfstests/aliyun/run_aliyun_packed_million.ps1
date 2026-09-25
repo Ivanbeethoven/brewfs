@@ -4,7 +4,7 @@ param(
     [string]$Action = 'run',
     [string]$InstanceId,
     [string]$RegionId = 'cn-hangzhou',
-    [string]$ZoneId = 'cn-hangzhou-i',
+    [string]$ZoneId = 'cn-hangzhou-h',
     [string]$ImageId = 'ubuntu_24_04_x64_20G_alibase_20260916.vhd',
     [string]$VSwitchId,
     [string]$SecurityGroupId,
@@ -19,8 +19,26 @@ param(
     [int]$DirLevels = 3,
     [int64]$DirsPerLevel = 10,
     [int64]$FilesPerLeaf = 1000,
+    [int64]$FioFileSizeBytes = 67108864,
+    [string]$PerfTools = 'packed-smallfiles packed-posix fio-seqread fio-randread',
+    [int]$FioRuntimeSeconds = 20,
+    [string]$PackedExistingManifestKey,
+    [switch]$PackedSkipFixture,
     [ValidateSet('full', 'prefix')]
     [string]$ReadMode = 'full',
+    [string]$S3Bucket,
+    [string]$S3Endpoint,
+    [string]$S3Region = 'cn-hangzhou',
+    [string]$S3AccessKey,
+    [string]$S3SecretKey,
+    [bool]$S3ForcePathStyle = $false,
+    [string]$RepoRoot,
+    [string]$WslDistribution = 'Ubuntu-24.04',
+    [string]$BinaryPath,
+    [string]$FixtureBinaryPath,
+    [switch]$SkipBuild,
+    [string]$ArtifactDirectory,
+    [string]$ObjectPrefix,
     [string]$Repository = 'https://github.com/brewfs/brewfs.git',
     [string]$Ref = 'main',
     [string]$AutoReleaseMinutes = '480',
@@ -57,16 +75,33 @@ $runnerParams = @{
     ImageId = $ImageId
     InstanceType = $InstanceType
     SystemDiskSizeGiB = $SystemDiskSizeGiB
-    Backend = 'redis'
+    Backend = 'none'
     DataBackend = 's3'
     VolumeFormat = 'packed-metadata-v1'
-    PerfTools = 'packed-smallfiles packed-posix'
+    PerfTools = $PerfTools
+    FioRuntimeSeconds = $FioRuntimeSeconds
     PackedSmallFileCount = $SmallFileCount
     PackedSmallFileSizeBytes = $SmallFileSizeBytes
     PackedDirLevels = $DirLevels
     PackedDirsPerLevel = $DirsPerLevel
     PackedFilesPerDir = $FilesPerLeaf
+    PackedFioFileSizeBytes = $FioFileSizeBytes
     PackedSmallFileReadBytes = $readBytes
+    PackedExistingManifestKey = $PackedExistingManifestKey
+    PackedSkipFixture = $PackedSkipFixture
+    S3Bucket = $S3Bucket
+    S3Endpoint = $S3Endpoint
+    S3Region = $S3Region
+    S3AccessKey = $S3AccessKey
+    S3SecretKey = $S3SecretKey
+    S3ForcePathStyle = $S3ForcePathStyle
+    RepoRoot = $RepoRoot
+    WslDistribution = $WslDistribution
+    BinaryPath = $BinaryPath
+    FixtureBinaryPath = $FixtureBinaryPath
+    SkipBuild = $SkipBuild
+    ArtifactDirectory = $ArtifactDirectory
+    ObjectPrefix = $ObjectPrefix
     Repository = $Repository
     Ref = $Ref
     AutoReleaseMinutes = $AutoReleaseMinutes
@@ -79,16 +114,20 @@ $runnerArgs = @(
     '-ImageId', $ImageId,
     '-InstanceType', $InstanceType,
     '-SystemDiskSizeGiB', [string]$SystemDiskSizeGiB,
-    '-Backend', 'redis',
+    '-Backend', 'none',
     '-DataBackend', 's3',
     '-VolumeFormat', 'packed-metadata-v1',
-    '-PerfTools', 'packed-smallfiles packed-posix',
+    '-PerfTools', $PerfTools,
+    '-FioRuntimeSeconds', [string]$FioRuntimeSeconds,
     '-PackedSmallFileCount', [string]$SmallFileCount,
     '-PackedSmallFileSizeBytes', [string]$SmallFileSizeBytes,
     '-PackedDirLevels', [string]$DirLevels,
     '-PackedDirsPerLevel', [string]$DirsPerLevel,
     '-PackedFilesPerDir', [string]$FilesPerLeaf,
     '-PackedSmallFileReadBytes', $readBytes,
+    '-PackedExistingManifestKey', $PackedExistingManifestKey,
+    '-PackedFioFileSizeBytes', [string]$FioFileSizeBytes,
+    '-S3Region', $S3Region,
     '-Repository', $Repository,
     '-Ref', $Ref,
     '-AutoReleaseMinutes', $AutoReleaseMinutes,
@@ -103,6 +142,19 @@ foreach ($name in @('InstanceId', 'VSwitchId', 'SecurityGroupId', 'InstanceName'
         $runnerArgs += [string]$value
     }
 }
+if ($S3Bucket) { $runnerArgs += '-S3Bucket'; $runnerArgs += $S3Bucket }
+if ($S3Endpoint) { $runnerArgs += '-S3Endpoint'; $runnerArgs += $S3Endpoint }
+if ($S3AccessKey) { $runnerArgs += '-S3AccessKey'; $runnerArgs += $S3AccessKey }
+if ($S3SecretKey) { $runnerArgs += '-S3SecretKey'; $runnerArgs += $S3SecretKey }
+if ($S3ForcePathStyle) { $runnerArgs += '-S3ForcePathStyle' }
+if ($RepoRoot) { $runnerArgs += '-RepoRoot'; $runnerArgs += $RepoRoot }
+if ($WslDistribution) { $runnerArgs += '-WslDistribution'; $runnerArgs += $WslDistribution }
+if ($BinaryPath) { $runnerArgs += '-BinaryPath'; $runnerArgs += $BinaryPath }
+if ($FixtureBinaryPath) { $runnerArgs += '-FixtureBinaryPath'; $runnerArgs += $FixtureBinaryPath }
+if ($SkipBuild) { $runnerArgs += '-SkipBuild' }
+if ($PackedSkipFixture) { $runnerArgs += '-PackedSkipFixture' }
+if ($ArtifactDirectory) { $runnerArgs += '-ArtifactDirectory'; $runnerArgs += $ArtifactDirectory }
+if ($ObjectPrefix) { $runnerArgs += '-ObjectPrefix'; $runnerArgs += $ObjectPrefix }
 if ($KeepInstance) {
     $runnerParams.KeepInstance = $true
     $runnerArgs += '-KeepInstance'

@@ -54,6 +54,11 @@ struct Args {
     chunk_size: u64,
     #[arg(long, default_value_t = 4 * 1024 * 1024)]
     block_size: u32,
+    /// Use path-style S3 requests. Alibaba OSS normally uses virtual-host
+    /// addressing, so this remains disabled unless an S3-compatible endpoint
+    /// explicitly requires it.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    force_path_style: bool,
     #[arg(long, default_value = "packed-manifest-key.txt")]
     manifest_output: PathBuf,
 }
@@ -427,7 +432,7 @@ async fn main() -> Result<()> {
         bucket: args.bucket.clone(),
         region: Some(args.region.clone()),
         endpoint: Some(args.endpoint.clone()),
-        force_path_style: true,
+        force_path_style: args.force_path_style,
         part_size: 16 * 1024 * 1024,
         max_concurrency: 16,
         disable_payload_checksum: true,

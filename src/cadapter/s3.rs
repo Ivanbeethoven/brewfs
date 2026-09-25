@@ -594,6 +594,22 @@ impl ObjectBackend for S3Backend {
             request.send().await
         };
         if let Err(error) = result {
+            // Alibaba OSS currently returns 501 NotImplemented for the
+            // conditional `If-None-Match: *` form. Native frozen objects are
+            // content-addressed and the ObjectSink caller verifies the exact
+            // bytes after every PUT, so use an unconditional PUT only for this
+            // explicit capability gap. Network and authorization failures
+            // still follow the create-only conflict path below.
+            let conditional_put_unsupported = matches!(
+                &error,
+                SdkError::ServiceError(service)
+                    if service.raw().status().as_u16() == 501
+                        || service.err().meta().code() == Some("NotImplemented")
+            );
+            if conditional_put_unsupported {
+                self.put_object(key, data).await?;
+                return Ok(());
+            }
             if self.get_object(key).await?.as_deref() == Some(data) {
                 return Ok(());
             }
