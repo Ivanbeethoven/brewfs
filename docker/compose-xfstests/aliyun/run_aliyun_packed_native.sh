@@ -28,6 +28,12 @@ READ_BYTES="${PERF_PACKED_SMALLFILE_READ_BYTES:-0}"
 TOOLS="${PERF_TOOLS:-packed-smallfiles packed-posix fio-seqread fio-randread}"
 FIO_RUNTIME="${PERF_FIO_RUNTIME:-20}"
 FORCE_PATH_STYLE="${BREWFS_S3_FORCE_PATH_STYLE:-false}"
+READ_MEMORY_BYTES="${BREWFS_READ_MEMORY_BYTES:-0}"
+READ_SSD_BYTES="${BREWFS_READ_SSD_BYTES:-0}"
+PREFETCH_ENABLED="${BREWFS_PREFETCH_ENABLED:-false}"
+PREFETCH_MAX_BYTES="${BREWFS_PREFETCH_MAX_BYTES:-8388608}"
+PREFETCH_CONCURRENCY="${BREWFS_PREFETCH_CONCURRENCY:-7}"
+RANGE_BACKGROUND_PREFETCH="${BREWFS_RANGE_BACKGROUND_PREFETCH:-false}"
 
 mkdir -p "$WORK" "$ARTIFACT_DIR/tools" "$MOUNT_DIR"
 chmod 0755 "$BREWFS_BIN" "$PACKED_FIXTURE_BIN"
@@ -88,10 +94,12 @@ fuse:
 
 cache:
   root: $CACHE_ROOT
-  read_memory_bytes: 0
-  read_ssd_bytes: 0
-  prefetch_enabled: false
-  range_background_prefetch: false
+  read_memory_bytes: $READ_MEMORY_BYTES
+  read_ssd_bytes: $READ_SSD_BYTES
+  prefetch_enabled: $PREFETCH_ENABLED
+  prefetch_max_bytes: $PREFETCH_MAX_BYTES
+  prefetch_concurrency: $PREFETCH_CONCURRENCY
+  range_background_prefetch: $RANGE_BACKGROUND_PREFETCH
   compression: none
 EOF
 }
@@ -130,6 +138,11 @@ run_tool() {
     "$@" >"$log_path" 2>&1 || status=$?
     end_ns="$(date +%s%N)"
     elapsed_ns=$((end_ns - start_ns))
+    for stats_name in .stats .brewfs.stats; do
+        if [[ -f "$MOUNT_DIR/$stats_name" ]]; then
+            tr -d '\0' <"$MOUNT_DIR/$stats_name" >"$ARTIFACT_DIR/tools/${name}-${stats_name#.}.stats" || true
+        fi
+    done
     stop_mount
     printf '%s\t%s\t%.6f\t%s\n' "$name" "$([[ "$status" -eq 0 ]] && echo pass || echo "fail($status)")" \
         "$(awk -v ns="$elapsed_ns" 'BEGIN { print ns / 1000000000 }')" "$log_path" \

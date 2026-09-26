@@ -29,6 +29,12 @@ param(
     [string]$PackedExistingManifestKey,
     [switch]$PackedSkipFixture,
     [int]$FioRuntimeSeconds = 20,
+    [UInt64]$ReadMemoryBytes = 0,
+    [UInt64]$ReadSsdBytes = 0,
+    [bool]$PrefetchEnabled = $false,
+    [UInt64]$PrefetchMaxBytes = 8388608,
+    [int]$PrefetchConcurrency = 7,
+    [bool]$RangeBackgroundPrefetch = $false,
     [string]$S3Bucket,
     [string]$S3Endpoint,
     [string]$S3Region = 'cn-hangzhou',
@@ -279,10 +285,12 @@ export PERF_PACKED_FIO_FILE_SIZE=__FIO_FILE_SIZE__
 export PERF_PACKED_SMALLFILE_READ_BYTES=__READ_BYTES__
 export PERF_FIO_RUNTIME=__FIO_RUNTIME__
 export PERF_TOOLS=__TOOLS__
-export BREWFS_READ_MEMORY_BYTES=0
-export BREWFS_READ_SSD_BYTES=0
-export BREWFS_PREFETCH_ENABLED=false
-export BREWFS_RANGE_BACKGROUND_PREFETCH=false
+export BREWFS_READ_MEMORY_BYTES=__READ_MEMORY_BYTES__
+export BREWFS_READ_SSD_BYTES=__READ_SSD_BYTES__
+export BREWFS_PREFETCH_ENABLED=__PREFETCH_ENABLED__
+export BREWFS_PREFETCH_MAX_BYTES=__PREFETCH_MAX_BYTES__
+export BREWFS_PREFETCH_CONCURRENCY=__PREFETCH_CONCURRENCY__
+export BREWFS_RANGE_BACKGROUND_PREFETCH=__RANGE_BACKGROUND_PREFETCH__
 export BREWFS_FUSE_READ_DIRECT_IO=1
 export BREWFS_FUSE_KEEP_CACHE=0
 export BREWFS_NOFILE_LIMIT=1048576
@@ -325,6 +333,12 @@ for log in "$ARTIFACT_DIR"/tools/*.log; do
   echo "### $log"
   tail -n 12 "$log" || true
 done
+echo '--- packed native stats ---'
+for stats in "$ARTIFACT_DIR"/tools/*.stats; do
+  [[ -f "$stats" ]] || continue
+  echo "### $stats"
+  cat "$stats" || true
+done
 '@
     $values = @{
         '__BINARY_URL__' = Quote-Bash $BinaryUrl
@@ -346,6 +360,12 @@ done
         '__FIO_FILE_SIZE__' = Quote-Bash ([string]$PackedFioFileSizeBytes)
         '__READ_BYTES__' = Quote-Bash ([string]$PackedSmallFileReadBytes)
         '__FIO_RUNTIME__' = Quote-Bash ([string]$FioRuntimeSeconds)
+        '__READ_MEMORY_BYTES__' = Quote-Bash ([string]$ReadMemoryBytes)
+        '__READ_SSD_BYTES__' = Quote-Bash ([string]$ReadSsdBytes)
+        '__PREFETCH_ENABLED__' = Quote-Bash ($PrefetchEnabled.ToString().ToLowerInvariant())
+        '__PREFETCH_MAX_BYTES__' = Quote-Bash ([string]$PrefetchMaxBytes)
+        '__PREFETCH_CONCURRENCY__' = Quote-Bash ([string]$PrefetchConcurrency)
+        '__RANGE_BACKGROUND_PREFETCH__' = Quote-Bash ($RangeBackgroundPrefetch.ToString().ToLowerInvariant())
         '__TOOLS__' = Quote-Bash $PerfTools
         '__INSTANCE_TYPE__' = Quote-Bash $InstanceType
         '__SYSTEM_DISK_GIB__' = [string]$SystemDiskSizeGiB
