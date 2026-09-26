@@ -47,6 +47,11 @@ pub struct DirectoryEntry {
     pub name: NameBytes,
     pub inode: u64,
     pub kind: u8,
+    /// Physical namespace contributor that authenticated this entry.  The
+    /// planner's logical entries do not have a remote contributor, so this
+    /// stays optional at the planning boundary and is populated by the v2
+    /// remote route reader.
+    pub contributor: Option<NodeRef>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -348,6 +353,7 @@ mod tests {
                 name: name(b"x"),
                 inode: 9,
                 kind: 1,
+                contributor: None,
             }],
             end: false,
         };

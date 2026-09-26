@@ -39,6 +39,18 @@ pub(crate) const SLICE_PAGE_REF_LEN: usize = 64;
 pub(crate) const SLICE_PAGE_RECORD_LIMIT: usize = 256;
 const SLICE_PAGE_TARGET_BYTES: usize = 64 * 1024;
 
+// Frame and object descriptors are also independently pageable.  A large
+// cluster may contain millions of frames, so a cold read must not download
+// the whole descriptor section before it can resolve one SliceId span.
+pub(crate) const FRAME_INDEX_MAGIC: &[u8; 8] = b"BRFDIX02";
+pub(crate) const OBJECT_INDEX_MAGIC: &[u8; 8] = b"BRDOIX02";
+pub(crate) const TABLE_INDEX_VERSION: u16 = 1;
+pub(crate) const TABLE_INDEX_HEADER_LEN: usize = 64;
+pub(crate) const TABLE_PAGE_REF_LEN: usize = 64;
+pub(crate) const FRAME_PAGE_RECORD_LIMIT: usize = 1024;
+pub(crate) const OBJECT_PAGE_RECORD_LIMIT: usize = 256;
+const TABLE_PAGE_TARGET_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SliceIndexHeader {
     pub(crate) page_count: u32,
@@ -53,6 +65,26 @@ pub(crate) struct SlicePageRef {
     pub(crate) first_slice_id: u64,
     pub(crate) last_slice_id: u64,
     /// Offset relative to the beginning of the slice section payload.
+    pub(crate) offset: u64,
+    pub(crate) len: u32,
+    pub(crate) count: u32,
+    pub(crate) digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TableIndexHeader {
+    pub(crate) page_count: u32,
+    pub(crate) record_count: u64,
+    pub(crate) directory_len: u32,
+    pub(crate) page_record_limit: u32,
+    pub(crate) directory_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TablePageRef {
+    pub(crate) first_ordinal: u32,
+    pub(crate) last_ordinal: u32,
+    /// Offset relative to the beginning of the frame/object section payload.
     pub(crate) offset: u64,
     pub(crate) len: u32,
     pub(crate) count: u32,
@@ -726,23 +758,153 @@ fn encode_slices(slices: &BTreeMap<u64, SliceDescriptor>) -> WireResult<Vec<u8>>
 }
 
 fn encode_frames(frames: &BTreeMap<u32, FrameDescriptor>) -> WireResult<Vec<u8>> {
-    let mut writer = Writer::new();
-    for frame in frames.values() {
+    let records = frames.values().map(|frame| {
+        let mut writer = Writer::new();
         frame.encode_into(&mut writer);
-    }
-    bounded_table(writer.into_bytes())
+        (frame.frame_ordinal, writer.into_bytes())
+    });
+    encode_paged_table(FRAME_INDEX_MAGIC, records, FRAME_PAGE_RECORD_LIMIT)
 }
 
 fn encode_objects(objects: &BTreeMap<u32, DataObjectDescriptor>) -> WireResult<Vec<u8>> {
+    let records = objects
+        .values()
+        .map(|object| (object.object_ordinal, encode_object_record(object)));
+    encode_paged_table(OBJECT_INDEX_MAGIC, records, OBJECT_PAGE_RECORD_LIMIT)
+}
+
+fn encode_object_record(object: &DataObjectDescriptor) -> Vec<u8> {
     let mut writer = Writer::new();
-    for object in objects.values() {
-        writer.u32(object.object_ordinal);
-        writer.u64(object.object_len);
-        writer.put(&object.object_checksum);
-        writer.bytes(&object.object_key);
-        writer.bytes(&object.etag);
+    writer.u32(object.object_ordinal);
+    writer.u64(object.object_len);
+    writer.put(&object.object_checksum);
+    writer.bytes(&object.object_key);
+    writer.bytes(&object.etag);
+    writer.into_bytes()
+}
+
+fn encode_paged_table(
+    magic: &[u8; 8],
+    records: impl IntoIterator<Item = (u32, Vec<u8>)>,
+    page_record_limit: usize,
+) -> WireResult<Vec<u8>> {
+    if page_record_limit == 0 || page_record_limit > 4096 {
+        return Err(WireError::invalid(
+            "data seal table index",
+            "page record limit is outside bounds",
+        ));
     }
-    bounded_table(writer.into_bytes())
+    let mut pages = Vec::<Vec<u8>>::new();
+    let mut first_ordinals = Vec::<u32>::new();
+    let mut last_ordinals = Vec::<u32>::new();
+    let mut page_counts = Vec::<u32>::new();
+    let mut current = Vec::new();
+    let mut current_first = 0u32;
+    let mut current_last = 0u32;
+    let mut current_count = 0usize;
+
+    for (ordinal, record) in records {
+        if record.is_empty() || record.len() > MAX_TABLE_BYTES {
+            return Err(WireError::LimitExceeded(
+                "data seal table record is empty or exceeds table limit".into(),
+            ));
+        }
+        let should_flush = !current.is_empty()
+            && (current_count >= page_record_limit
+                || current
+                    .len()
+                    .checked_add(record.len())
+                    .is_none_or(|length| length > TABLE_PAGE_TARGET_BYTES));
+        if should_flush {
+            pages.push(std::mem::take(&mut current));
+            first_ordinals.push(current_first);
+            last_ordinals.push(current_last);
+            page_counts.push(u32::try_from(current_count).map_err(|_| {
+                WireError::LimitExceeded("data seal table page count exceeds u32".into())
+            })?);
+            current_count = 0;
+        }
+        if current.is_empty() {
+            current_first = ordinal;
+        }
+        current_last = ordinal;
+        current_count += 1;
+        current.extend_from_slice(&record);
+    }
+    if !current.is_empty() {
+        pages.push(current);
+        first_ordinals.push(current_first);
+        last_ordinals.push(current_last);
+        page_counts.push(u32::try_from(current_count).map_err(|_| {
+            WireError::LimitExceeded("data seal table page count exceeds u32".into())
+        })?);
+    }
+
+    // Keep small tables in the original compact continuous representation.
+    // `pages` has one entry only when neither the record nor byte limit was
+    // crossed, so no index header is needed for this common case.
+    if pages.len() == 1 && page_counts[0] as usize <= page_record_limit {
+        return bounded_table(pages.pop().expect("one compact table page"));
+    }
+
+    let page_count = u32::try_from(pages.len())
+        .map_err(|_| WireError::LimitExceeded("data seal table page count exceeds u32".into()))?;
+    let directory_len = pages
+        .len()
+        .checked_mul(TABLE_PAGE_REF_LEN)
+        .ok_or_else(|| WireError::LimitExceeded("data seal table directory overflows".into()))?;
+    let pages_offset = TABLE_INDEX_HEADER_LEN
+        .checked_add(directory_len)
+        .ok_or_else(|| WireError::LimitExceeded("data seal table index overflows".into()))?;
+    let mut directory = Vec::with_capacity(directory_len);
+    let mut page_offset = u64::try_from(pages_offset)
+        .map_err(|_| WireError::LimitExceeded("data seal table page offset overflows".into()))?;
+    for (index, page) in pages.iter().enumerate() {
+        let page_len = u32::try_from(page.len())
+            .map_err(|_| WireError::LimitExceeded("data seal table page exceeds u32".into()))?;
+        directory.extend_from_slice(&u64::from(first_ordinals[index]).to_le_bytes());
+        directory.extend_from_slice(&u64::from(last_ordinals[index]).to_le_bytes());
+        directory.extend_from_slice(&page_offset.to_le_bytes());
+        directory.extend_from_slice(&page_len.to_le_bytes());
+        directory.extend_from_slice(&page_counts[index].to_le_bytes());
+        directory.extend_from_slice(blake3::hash(page).as_bytes());
+        page_offset = page_offset
+            .checked_add(u64::from(page_len))
+            .ok_or_else(|| {
+                WireError::LimitExceeded("data seal table page offset overflows".into())
+            })?;
+    }
+
+    let directory_digest = blake3::hash(&directory);
+    let mut header = [0u8; TABLE_INDEX_HEADER_LEN];
+    header[..8].copy_from_slice(magic);
+    header[8..10].copy_from_slice(&TABLE_INDEX_VERSION.to_le_bytes());
+    header[12..16].copy_from_slice(&page_count.to_le_bytes());
+    header[16..24].copy_from_slice(
+        &(page_counts
+            .iter()
+            .map(|count| u64::from(*count))
+            .sum::<u64>())
+        .to_le_bytes(),
+    );
+    header[24..28].copy_from_slice(
+        &u32::try_from(directory_len)
+            .map_err(|_| WireError::LimitExceeded("data seal table directory exceeds u32".into()))?
+            .to_le_bytes(),
+    );
+    header[28..32].copy_from_slice(&(page_record_limit as u32).to_le_bytes());
+    header[32..64].copy_from_slice(directory_digest.as_bytes());
+
+    let payload_len = pages_offset
+        .checked_add(pages.iter().map(Vec::len).sum::<usize>())
+        .ok_or_else(|| WireError::LimitExceeded("data seal table overflows".into()))?;
+    let mut payload = Vec::with_capacity(payload_len);
+    payload.extend_from_slice(&header);
+    payload.extend_from_slice(&directory);
+    for page in pages {
+        payload.extend_from_slice(&page);
+    }
+    bounded_table(payload)
 }
 
 pub(crate) fn decode_slices(bytes: &[u8], count: u64) -> WireResult<Vec<SliceDescriptor>> {
@@ -1055,6 +1217,13 @@ pub(crate) fn decode_slice_page(
 }
 
 pub(crate) fn decode_frames(bytes: &[u8], count: u64) -> WireResult<Vec<FrameDescriptor>> {
+    if bytes.len() >= FRAME_INDEX_MAGIC.len() && &bytes[..8] == FRAME_INDEX_MAGIC {
+        return decode_paged_frames(bytes, count);
+    }
+    decode_frame_records(bytes, count)
+}
+
+pub(crate) fn decode_frame_records(bytes: &[u8], count: u64) -> WireResult<Vec<FrameDescriptor>> {
     let count = usize::try_from(count)
         .map_err(|_| WireError::LimitExceeded("data seal frame count exceeds usize".into()))?;
     if bytes.len() != count.saturating_mul(FrameDescriptor::ENCODED_LEN) {
@@ -1081,6 +1250,16 @@ pub(crate) fn decode_frames(bytes: &[u8], count: u64) -> WireResult<Vec<FrameDes
 }
 
 pub(crate) fn decode_objects(bytes: &[u8], count: u64) -> WireResult<Vec<DataObjectDescriptor>> {
+    if bytes.len() >= OBJECT_INDEX_MAGIC.len() && &bytes[..8] == OBJECT_INDEX_MAGIC {
+        return decode_paged_objects(bytes, count);
+    }
+    decode_object_records(bytes, count)
+}
+
+pub(crate) fn decode_object_records(
+    bytes: &[u8],
+    count: u64,
+) -> WireResult<Vec<DataObjectDescriptor>> {
     let count = usize::try_from(count)
         .map_err(|_| WireError::LimitExceeded("data seal object count exceeds usize".into()))?;
     let mut reader = Reader::new(bytes);
@@ -1113,6 +1292,236 @@ pub(crate) fn decode_objects(bytes: &[u8], count: u64) -> WireResult<Vec<DataObj
         return Err(WireError::invalid("data seal objects", "trailing bytes"));
     }
     Ok(objects)
+}
+
+fn decode_paged_frames(bytes: &[u8], count: u64) -> WireResult<Vec<FrameDescriptor>> {
+    let (_, pages) = decode_table_index(bytes, FRAME_INDEX_MAGIC, count)?;
+    let mut frames = Vec::with_capacity(
+        usize::try_from(count)
+            .map_err(|_| WireError::LimitExceeded("data seal frame count exceeds usize".into()))?,
+    );
+    for page in pages {
+        let page_bytes = table_page_bytes(bytes, &page)?;
+        verify_digest("data seal frame page", page_bytes, &page.digest)?;
+        let page_frames = decode_frame_records(page_bytes, u64::from(page.count))?;
+        if page_frames.first().map(|frame| frame.frame_ordinal) != Some(page.first_ordinal)
+            || page_frames.last().map(|frame| frame.frame_ordinal) != Some(page.last_ordinal)
+        {
+            return Err(WireError::invalid(
+                "data seal frame index",
+                "page ordinal coverage is not canonical",
+            ));
+        }
+        frames.extend(page_frames);
+    }
+    if frames.len() as u64 != count {
+        return Err(WireError::invalid(
+            "data seal frame index",
+            "page record counts do not match section count",
+        ));
+    }
+    Ok(frames)
+}
+
+fn decode_paged_objects(bytes: &[u8], count: u64) -> WireResult<Vec<DataObjectDescriptor>> {
+    let (_, pages) = decode_table_index(bytes, OBJECT_INDEX_MAGIC, count)?;
+    let mut objects =
+        Vec::with_capacity(usize::try_from(count).map_err(|_| {
+            WireError::LimitExceeded("data seal object count exceeds usize".into())
+        })?);
+    for page in pages {
+        let page_bytes = table_page_bytes(bytes, &page)?;
+        verify_digest("data seal object page", page_bytes, &page.digest)?;
+        let page_objects = decode_object_records(page_bytes, u64::from(page.count))?;
+        if page_objects.first().map(|object| object.object_ordinal) != Some(page.first_ordinal)
+            || page_objects.last().map(|object| object.object_ordinal) != Some(page.last_ordinal)
+        {
+            return Err(WireError::invalid(
+                "data seal object index",
+                "page ordinal coverage is not canonical",
+            ));
+        }
+        objects.extend(page_objects);
+    }
+    if objects.len() as u64 != count {
+        return Err(WireError::invalid(
+            "data seal object index",
+            "page record counts do not match section count",
+        ));
+    }
+    Ok(objects)
+}
+
+pub(crate) fn decode_table_index(
+    bytes: &[u8],
+    magic: &[u8; 8],
+    expected_count: u64,
+) -> WireResult<(TableIndexHeader, Vec<TablePageRef>)> {
+    let (header, pages) =
+        decode_table_index_prefix(bytes, magic, expected_count, bytes.len() as u64)?;
+    for page in &pages {
+        table_page_bytes(bytes, page)?;
+    }
+    Ok((header, pages))
+}
+
+/// Decode a table index header and directory when the caller has fetched only
+/// the prefix. `section_len` is the complete section length from the sealed
+/// Data Seal header; page payloads are validated later when selected.
+pub(crate) fn decode_table_index_prefix(
+    bytes: &[u8],
+    magic: &[u8; 8],
+    expected_count: u64,
+    section_len: u64,
+) -> WireResult<(TableIndexHeader, Vec<TablePageRef>)> {
+    if bytes.len() < TABLE_INDEX_HEADER_LEN || &bytes[..8] != magic {
+        return Err(WireError::UnsupportedFormat(
+            "not a paged BRFDS002 table index".into(),
+        ));
+    }
+    if u16::from_le_bytes(bytes[8..10].try_into().unwrap()) != TABLE_INDEX_VERSION
+        || bytes[10..12].iter().any(|byte| *byte != 0)
+    {
+        return Err(WireError::UnsupportedFormat(
+            "unsupported BRFDS002 table index version".into(),
+        ));
+    }
+    let page_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    let record_count = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    if record_count != expected_count {
+        return Err(WireError::invalid(
+            "data seal table index",
+            "record count does not match section count",
+        ));
+    }
+    let directory_len = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+    let expected_directory_len = usize::try_from(page_count)
+        .ok()
+        .and_then(|pages| pages.checked_mul(TABLE_PAGE_REF_LEN))
+        .ok_or_else(|| WireError::LimitExceeded("data seal table directory overflows".into()))?;
+    if directory_len as usize != expected_directory_len || expected_directory_len > MAX_TABLE_BYTES
+    {
+        return Err(WireError::invalid(
+            "data seal table index",
+            "directory length is not canonical",
+        ));
+    }
+    let page_record_limit = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
+    if page_record_limit == 0 || page_record_limit as usize > 4096 {
+        return Err(WireError::invalid(
+            "data seal table index",
+            "page record limit is outside bounds",
+        ));
+    }
+    if (record_count == 0) != (page_count == 0) {
+        return Err(WireError::invalid(
+            "data seal table index",
+            "empty record/page counts are inconsistent",
+        ));
+    }
+    let header = TableIndexHeader {
+        page_count,
+        record_count,
+        directory_len,
+        page_record_limit,
+        directory_digest: bytes[32..64].try_into().unwrap(),
+    };
+    let directory_start = TABLE_INDEX_HEADER_LEN;
+    let directory_end = directory_start
+        .checked_add(expected_directory_len)
+        .ok_or_else(|| WireError::LimitExceeded("data seal table directory overflows".into()))?;
+    if directory_end > bytes.len() {
+        return Err(WireError::Truncated {
+            what: "data seal table directory",
+            need: directory_end,
+            have: bytes.len(),
+        });
+    }
+    let directory = &bytes[directory_start..directory_end];
+    verify_digest(
+        "data seal table directory",
+        directory,
+        &header.directory_digest,
+    )?;
+    let mut pages = Vec::with_capacity(page_count as usize);
+    let mut expected_offset = u64::try_from(directory_end)
+        .map_err(|_| WireError::LimitExceeded("data seal table page offset overflows".into()))?;
+    let mut previous_last = None;
+    let mut total_count = 0u64;
+    for index in 0..page_count as usize {
+        let start = index.checked_mul(TABLE_PAGE_REF_LEN).ok_or_else(|| {
+            WireError::LimitExceeded("data seal table directory overflows".into())
+        })?;
+        let entry = &directory[start..start + TABLE_PAGE_REF_LEN];
+        let first_raw = u64::from_le_bytes(entry[..8].try_into().unwrap());
+        let last_raw = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+        let first_ordinal = u32::try_from(first_raw).map_err(|_| {
+            WireError::LimitExceeded("data seal table page ordinal exceeds u32".into())
+        })?;
+        let last_ordinal = u32::try_from(last_raw).map_err(|_| {
+            WireError::LimitExceeded("data seal table page ordinal exceeds u32".into())
+        })?;
+        let offset = u64::from_le_bytes(entry[16..24].try_into().unwrap());
+        let len = u32::from_le_bytes(entry[24..28].try_into().unwrap());
+        let page_count = u32::from_le_bytes(entry[28..32].try_into().unwrap());
+        let digest = entry[32..64].try_into().unwrap();
+        if first_ordinal > last_ordinal
+            || previous_last.is_some_and(|previous| first_ordinal <= previous)
+            || offset != expected_offset
+            || len == 0
+            || page_count == 0
+            || page_count > header.page_record_limit
+        {
+            return Err(WireError::invalid(
+                "data seal table directory",
+                "page ordering, bounds, or count is invalid",
+            ));
+        }
+        let end = offset
+            .checked_add(u64::from(len))
+            .ok_or_else(|| WireError::LimitExceeded("data seal table page end overflows".into()))?;
+        if end > section_len {
+            return Err(WireError::Truncated {
+                what: "data seal table page",
+                need: len as usize,
+                have: section_len.saturating_sub(offset) as usize,
+            });
+        }
+        total_count = total_count
+            .checked_add(u64::from(page_count))
+            .ok_or_else(|| WireError::LimitExceeded("data seal table count overflows".into()))?;
+        previous_last = Some(last_ordinal);
+        expected_offset = end;
+        pages.push(TablePageRef {
+            first_ordinal,
+            last_ordinal,
+            offset,
+            len,
+            count: page_count,
+            digest,
+        });
+    }
+    if total_count != header.record_count || expected_offset != section_len {
+        return Err(WireError::invalid(
+            "data seal table directory",
+            "page counts or section coverage are not canonical",
+        ));
+    }
+    Ok((header, pages))
+}
+
+fn table_page_bytes<'a>(bytes: &'a [u8], page: &TablePageRef) -> WireResult<&'a [u8]> {
+    let start = usize::try_from(page.offset).map_err(|_| {
+        WireError::LimitExceeded("data seal table page offset exceeds usize".into())
+    })?;
+    let end = start
+        .checked_add(page.len as usize)
+        .ok_or_else(|| WireError::LimitExceeded("data seal table page end overflows".into()))?;
+    bytes.get(start..end).ok_or(WireError::Truncated {
+        what: "data seal table page",
+        need: page.len as usize,
+        have: bytes.len().saturating_sub(start),
+    })
 }
 
 fn bounded_table(bytes: Vec<u8>) -> WireResult<Vec<u8>> {

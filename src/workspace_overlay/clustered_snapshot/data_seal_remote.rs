@@ -2,12 +2,12 @@
 //!
 //! The current v2 seal stores authenticated slice, frame, and object tables
 //! as independent sections.  This reader keeps the fixed header resident and
-//! fetches a table only when requested.  Slice lookup is still section-sized;
-//! a future format revision will add a pageable SliceId index without
-//! changing the publication/authentication contract.
+//! fetches only the authenticated index directory and selected table pages on
+//! demand. Legacy continuous sections remain readable for compatibility.
 
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use tokio::sync::OnceCell;
 
 use crate::cadapter::client::{ObjectBackend, ObjectClient};
@@ -15,10 +15,12 @@ use crate::native_base::wire::error::{WireError, WireResult};
 
 use super::data_seal::{
     DATA_SEAL_FOOTER_LEN, DATA_SEAL_HEADER_LEN, DATA_SEAL_MAGIC, DataObjectDescriptor,
-    DataSealSnapshot, FrameDescriptor, MAX_TABLE_BYTES, SECTION_COUNT, SLICE_INDEX_HEADER_LEN,
-    SLICE_INDEX_MAGIC, SectionRef, SliceDescriptor, SliceIndexHeader, SlicePageRef, decode_frames,
-    decode_header, decode_objects, decode_slice_index_directory, decode_slice_index_header,
-    decode_slice_page, decode_slices, verify_digest,
+    DataSealSnapshot, FRAME_INDEX_MAGIC, FrameDescriptor, MAX_TABLE_BYTES, OBJECT_INDEX_MAGIC,
+    SECTION_COUNT, SLICE_INDEX_HEADER_LEN, SLICE_INDEX_MAGIC, SectionRef, SliceDescriptor,
+    SliceIndexHeader, SlicePageRef, TABLE_INDEX_HEADER_LEN, TablePageRef, decode_frame_records,
+    decode_frames, decode_header, decode_object_records, decode_objects,
+    decode_slice_index_directory, decode_slice_index_header, decode_slice_page, decode_slices,
+    decode_table_index_prefix, verify_digest,
 };
 use super::snapshot_manifest::ManifestObjectRef;
 
@@ -61,6 +63,18 @@ impl RemoteSliceIndex {
     }
 }
 
+#[derive(Clone, Debug)]
+enum RemoteFrameIndex {
+    Paged { pages: Arc<[TablePageRef]> },
+    Legacy(Arc<[FrameDescriptor]>),
+}
+
+#[derive(Clone, Debug)]
+enum RemoteObjectIndex {
+    Paged { pages: Arc<[TablePageRef]> },
+    Legacy(Arc<[DataObjectDescriptor]>),
+}
+
 pub struct RemoteDataSeal<B: ObjectBackend + Clone> {
     client: ObjectClient<B>,
     object_key: String,
@@ -73,8 +87,12 @@ pub struct RemoteDataSeal<B: ObjectBackend + Clone> {
     sections: [SectionRef; SECTION_COUNT],
     slice_index: OnceCell<Arc<RemoteSliceIndex>>,
     slices: OnceCell<Arc<[SliceDescriptor]>>,
+    frame_index: OnceCell<Arc<RemoteFrameIndex>>,
     frames: OnceCell<Arc<[FrameDescriptor]>>,
+    frame_pages: DashMap<u64, Arc<[FrameDescriptor]>>,
+    object_index: OnceCell<Arc<RemoteObjectIndex>>,
     objects: OnceCell<Arc<[DataObjectDescriptor]>>,
+    object_pages: DashMap<u64, Arc<[DataObjectDescriptor]>>,
 }
 
 impl<B: ObjectBackend + Clone> RemoteDataSeal<B> {
@@ -116,8 +134,12 @@ impl<B: ObjectBackend + Clone> RemoteDataSeal<B> {
             sections: empty_sections(),
             slice_index: OnceCell::new(),
             slices: OnceCell::new(),
+            frame_index: OnceCell::new(),
             frames: OnceCell::new(),
+            frame_pages: DashMap::new(),
+            object_index: OnceCell::new(),
             objects: OnceCell::new(),
+            object_pages: DashMap::new(),
         };
         let header = reader.fetch_range(0, DATA_SEAL_HEADER_LEN as u32).await?;
         if &header[..8] != DATA_SEAL_MAGIC {
@@ -234,26 +256,294 @@ impl<B: ObjectBackend + Clone> RemoteDataSeal<B> {
         self.read_slice(slice_id).await
     }
 
-    /// Fetch, authenticate, and decode the complete fixed-width frame table.
+    /// Fetch, authenticate, and decode the complete frame descriptor table.
     pub async fn read_frames(&self) -> WireResult<Arc<[FrameDescriptor]>> {
         self.frames
             .get_or_try_init(|| async {
-                let payload = self.read_section(1).await?;
-                Ok(Arc::from(decode_frames(&payload, self.sections[1].count)?))
+                let index = self.load_frame_index().await?;
+                match index.as_ref() {
+                    RemoteFrameIndex::Legacy(frames) => Ok(frames.clone()),
+                    RemoteFrameIndex::Paged { pages } => {
+                        let mut frames = Vec::with_capacity(self.sections[1].count as usize);
+                        for page in pages.iter() {
+                            frames.extend(self.read_frame_page(page).await?.iter().cloned());
+                        }
+                        Ok(Arc::from(frames))
+                    }
+                }
             })
             .await
             .cloned()
     }
 
-    /// Fetch, authenticate, and decode the object descriptor table.
+    /// Look up one frame descriptor without downloading unrelated pages.
+    pub async fn read_frame(&self, frame_ordinal: u32) -> WireResult<Option<FrameDescriptor>> {
+        let index = self.load_frame_index().await?;
+        match index.as_ref() {
+            RemoteFrameIndex::Legacy(frames) => Ok(frames
+                .binary_search_by_key(&frame_ordinal, |frame| frame.frame_ordinal)
+                .ok()
+                .map(|position| frames[position].clone())),
+            RemoteFrameIndex::Paged { pages } => {
+                let Some(page) = pages.iter().find(|page| {
+                    page.first_ordinal <= frame_ordinal && frame_ordinal <= page.last_ordinal
+                }) else {
+                    return Ok(None);
+                };
+                let frames = self.read_frame_page(page).await?;
+                Ok(frames
+                    .binary_search_by_key(&frame_ordinal, |frame| frame.frame_ordinal)
+                    .ok()
+                    .map(|position| frames[position].clone()))
+            }
+        }
+    }
+
+    /// Fetch, authenticate, and decode the complete object descriptor table.
     pub async fn read_objects(&self) -> WireResult<Arc<[DataObjectDescriptor]>> {
         self.objects
             .get_or_try_init(|| async {
-                let payload = self.read_section(2).await?;
-                Ok(Arc::from(decode_objects(&payload, self.sections[2].count)?))
+                let index = self.load_object_index().await?;
+                match index.as_ref() {
+                    RemoteObjectIndex::Legacy(objects) => Ok(objects.clone()),
+                    RemoteObjectIndex::Paged { pages } => {
+                        let mut objects = Vec::with_capacity(self.sections[2].count as usize);
+                        for page in pages.iter() {
+                            objects.extend(self.read_object_page(page).await?.iter().cloned());
+                        }
+                        Ok(Arc::from(objects))
+                    }
+                }
             })
             .await
             .cloned()
+    }
+
+    /// Look up one object descriptor without downloading unrelated pages.
+    pub async fn read_object(
+        &self,
+        object_ordinal: u32,
+    ) -> WireResult<Option<DataObjectDescriptor>> {
+        let index = self.load_object_index().await?;
+        match index.as_ref() {
+            RemoteObjectIndex::Legacy(objects) => Ok(objects
+                .binary_search_by_key(&object_ordinal, |object| object.object_ordinal)
+                .ok()
+                .map(|position| objects[position].clone())),
+            RemoteObjectIndex::Paged { pages } => {
+                let Some(page) = pages.iter().find(|page| {
+                    page.first_ordinal <= object_ordinal && object_ordinal <= page.last_ordinal
+                }) else {
+                    return Ok(None);
+                };
+                let objects = self.read_object_page(page).await?;
+                Ok(objects
+                    .binary_search_by_key(&object_ordinal, |object| object.object_ordinal)
+                    .ok()
+                    .map(|position| objects[position].clone()))
+            }
+        }
+    }
+
+    async fn load_frame_index(&self) -> WireResult<Arc<RemoteFrameIndex>> {
+        self.frame_index
+            .get_or_try_init(|| async {
+                let section = &self.sections[1];
+                if section.len <= 64 * 1024
+                    && section.count <= super::data_seal::FRAME_PAGE_RECORD_LIMIT as u64
+                {
+                    let payload = self.read_section(1).await?;
+                    return Ok(Arc::new(RemoteFrameIndex::Legacy(Arc::from(
+                        decode_frames(&payload, section.count)?,
+                    ))));
+                }
+                let prefix_len = usize::try_from(section.len)
+                    .unwrap_or(MAX_TABLE_BYTES)
+                    .min(TABLE_INDEX_HEADER_LEN);
+                let mut prefix = self
+                    .fetch_range(
+                        section.offset,
+                        u32::try_from(prefix_len).map_err(|_| {
+                            WireError::LimitExceeded("data seal frame index exceeds u32".into())
+                        })?,
+                    )
+                    .await?;
+                if prefix.len() < FRAME_INDEX_MAGIC.len()
+                    || &prefix[..FRAME_INDEX_MAGIC.len()] != FRAME_INDEX_MAGIC
+                {
+                    let payload = self.read_section(1).await?;
+                    return Ok(Arc::new(RemoteFrameIndex::Legacy(Arc::from(
+                        decode_frames(&payload, section.count)?,
+                    ))));
+                }
+                if prefix.len() < TABLE_INDEX_HEADER_LEN {
+                    return Err(WireError::Truncated {
+                        what: "remote data seal frame index",
+                        need: TABLE_INDEX_HEADER_LEN,
+                        have: prefix.len(),
+                    });
+                }
+                let directory_len = u32::from_le_bytes(prefix[24..28].try_into().unwrap()) as usize;
+                let prefix_len = TABLE_INDEX_HEADER_LEN
+                    .checked_add(directory_len)
+                    .ok_or_else(|| {
+                        WireError::LimitExceeded("data seal frame directory overflows".into())
+                    })?;
+                if prefix_len > MAX_DATA_SEAL_RANGE_BYTES {
+                    return Err(WireError::LimitExceeded(
+                        "data seal frame directory exceeds configured bound".into(),
+                    ));
+                }
+                if prefix.len() < prefix_len {
+                    prefix = self
+                        .fetch_range(
+                            section.offset,
+                            u32::try_from(prefix_len).map_err(|_| {
+                                WireError::LimitExceeded(
+                                    "data seal frame directory exceeds u32".into(),
+                                )
+                            })?,
+                        )
+                        .await?;
+                }
+                let (_, pages) = decode_table_index_prefix(
+                    &prefix[..prefix_len],
+                    FRAME_INDEX_MAGIC,
+                    section.count,
+                    section.len,
+                )?;
+                Ok(Arc::new(RemoteFrameIndex::Paged {
+                    pages: Arc::from(pages),
+                }))
+            })
+            .await
+            .cloned()
+    }
+
+    async fn load_object_index(&self) -> WireResult<Arc<RemoteObjectIndex>> {
+        self.object_index
+            .get_or_try_init(|| async {
+                let section = &self.sections[2];
+                if section.len <= 64 * 1024
+                    && section.count <= super::data_seal::OBJECT_PAGE_RECORD_LIMIT as u64
+                {
+                    let payload = self.read_section(2).await?;
+                    return Ok(Arc::new(RemoteObjectIndex::Legacy(Arc::from(
+                        decode_objects(&payload, section.count)?,
+                    ))));
+                }
+                let prefix_len = usize::try_from(section.len)
+                    .unwrap_or(MAX_TABLE_BYTES)
+                    .min(TABLE_INDEX_HEADER_LEN);
+                let mut prefix = self
+                    .fetch_range(
+                        section.offset,
+                        u32::try_from(prefix_len).map_err(|_| {
+                            WireError::LimitExceeded("data seal object index exceeds u32".into())
+                        })?,
+                    )
+                    .await?;
+                if prefix.len() < OBJECT_INDEX_MAGIC.len()
+                    || &prefix[..OBJECT_INDEX_MAGIC.len()] != OBJECT_INDEX_MAGIC
+                {
+                    let payload = self.read_section(2).await?;
+                    return Ok(Arc::new(RemoteObjectIndex::Legacy(Arc::from(
+                        decode_objects(&payload, section.count)?,
+                    ))));
+                }
+                if prefix.len() < TABLE_INDEX_HEADER_LEN {
+                    return Err(WireError::Truncated {
+                        what: "remote data seal object index",
+                        need: TABLE_INDEX_HEADER_LEN,
+                        have: prefix.len(),
+                    });
+                }
+                let directory_len = u32::from_le_bytes(prefix[24..28].try_into().unwrap()) as usize;
+                let prefix_len = TABLE_INDEX_HEADER_LEN
+                    .checked_add(directory_len)
+                    .ok_or_else(|| {
+                        WireError::LimitExceeded("data seal object directory overflows".into())
+                    })?;
+                if prefix_len > MAX_DATA_SEAL_RANGE_BYTES {
+                    return Err(WireError::LimitExceeded(
+                        "data seal object directory exceeds configured bound".into(),
+                    ));
+                }
+                if prefix.len() < prefix_len {
+                    prefix = self
+                        .fetch_range(
+                            section.offset,
+                            u32::try_from(prefix_len).map_err(|_| {
+                                WireError::LimitExceeded(
+                                    "data seal object directory exceeds u32".into(),
+                                )
+                            })?,
+                        )
+                        .await?;
+                }
+                let (_, pages) = decode_table_index_prefix(
+                    &prefix[..prefix_len],
+                    OBJECT_INDEX_MAGIC,
+                    section.count,
+                    section.len,
+                )?;
+                Ok(Arc::new(RemoteObjectIndex::Paged {
+                    pages: Arc::from(pages),
+                }))
+            })
+            .await
+            .cloned()
+    }
+
+    async fn read_frame_page(&self, page: &TablePageRef) -> WireResult<Arc<[FrameDescriptor]>> {
+        if let Some(cached) = self.frame_pages.get(&page.offset) {
+            return Ok(cached.clone());
+        }
+        let section = &self.sections[1];
+        let offset = section.offset.checked_add(page.offset).ok_or_else(|| {
+            WireError::LimitExceeded("data seal frame page offset overflows".into())
+        })?;
+        let bytes = self.fetch_range(offset, page.len).await?;
+        verify_digest("remote data seal frame page", &bytes, &page.digest)?;
+        let frames = decode_frame_records(&bytes, u64::from(page.count))?;
+        if frames.first().map(|frame| frame.frame_ordinal) != Some(page.first_ordinal)
+            || frames.last().map(|frame| frame.frame_ordinal) != Some(page.last_ordinal)
+        {
+            return Err(WireError::invalid(
+                "remote data seal frame page",
+                "page ordinal coverage is not canonical",
+            ));
+        }
+        let frames: Arc<[FrameDescriptor]> = Arc::from(frames);
+        self.frame_pages.insert(page.offset, frames.clone());
+        Ok(frames)
+    }
+
+    async fn read_object_page(
+        &self,
+        page: &TablePageRef,
+    ) -> WireResult<Arc<[DataObjectDescriptor]>> {
+        if let Some(cached) = self.object_pages.get(&page.offset) {
+            return Ok(cached.clone());
+        }
+        let section = &self.sections[2];
+        let offset = section.offset.checked_add(page.offset).ok_or_else(|| {
+            WireError::LimitExceeded("data seal object page offset overflows".into())
+        })?;
+        let bytes = self.fetch_range(offset, page.len).await?;
+        verify_digest("remote data seal object page", &bytes, &page.digest)?;
+        let objects = decode_object_records(&bytes, u64::from(page.count))?;
+        if objects.first().map(|object| object.object_ordinal) != Some(page.first_ordinal)
+            || objects.last().map(|object| object.object_ordinal) != Some(page.last_ordinal)
+        {
+            return Err(WireError::invalid(
+                "remote data seal object page",
+                "page ordinal coverage is not canonical",
+            ));
+        }
+        let objects: Arc<[DataObjectDescriptor]> = Arc::from(objects);
+        self.object_pages.insert(page.offset, objects.clone());
+        Ok(objects)
     }
 
     /// Load all three tables and run the same closed-graph validation used by
@@ -609,6 +899,8 @@ mod tests {
             .unwrap();
         assert_eq!(backend.ranges().len(), 1);
         assert_eq!(remote.read_objects().await.unwrap().len(), 1);
+        // A one-record object table stays in the compact legacy layout; the
+        // remote reader keeps that representation compatible as well.
         assert_eq!(backend.ranges().len(), 2);
         remote.read_objects().await.unwrap();
         assert_eq!(backend.ranges().len(), 2);
@@ -674,6 +966,85 @@ mod tests {
                 .iter()
                 .any(|(offset, len)| *offset == sections[0].offset
                     && *len == sections[0].len as usize)
+        );
+    }
+
+    fn descriptor_paged_seal() -> Vec<u8> {
+        let mut builder = DataSealBuilder::new([21; 16], [22; 16]);
+        for ordinal in 0..300u32 {
+            builder
+                .add_object(DataObjectDescriptor {
+                    object_ordinal: ordinal,
+                    object_key: format!("packs/descriptor-pages-{ordinal}.brfdp").into_bytes(),
+                    object_len: 1 << 20,
+                    object_checksum: [23; 32],
+                    etag: Vec::new(),
+                })
+                .unwrap();
+        }
+        for ordinal in 0..2048u32 {
+            builder
+                .add_frame(FrameDescriptor {
+                    frame_ordinal: ordinal,
+                    object_ordinal: 0,
+                    object_offset: 64 + u64::from(ordinal) * 64,
+                    stored_len: 1,
+                    raw_len: 1,
+                    payload_format: PayloadFormat::PlainBytes.as_u8(),
+                    codec: Codec::None.as_u8(),
+                    frame_checksum: [24; 16],
+                })
+                .unwrap();
+        }
+        builder
+            .add_slice(SliceDescriptor {
+                slice_id: 1,
+                logical_len: 1,
+                spans: vec![DataSpan {
+                    frame_ordinal: 1500,
+                    raw_offset_in_frame: 0,
+                    raw_len: 1,
+                }],
+            })
+            .unwrap();
+        builder.build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn descriptor_lookup_reads_only_selected_frame_and_object_pages() {
+        let bytes = descriptor_paged_seal();
+        let backend = CountingBackend::default();
+        backend.insert("seals/test.brfds", bytes.clone());
+        let client = ObjectClient::new(backend.clone());
+        let remote = RemoteDataSeal::open(&client, object_ref(bytes.len()))
+            .await
+            .unwrap();
+        assert_eq!(backend.ranges().len(), 1);
+
+        let frame = remote.read_frame(1500).await.unwrap().unwrap();
+        assert_eq!(frame.frame_ordinal, 1500);
+        let after_frame = backend.ranges().len();
+        assert!(after_frame >= 3);
+        assert!(after_frame <= 4);
+
+        let object = remote.read_object(257).await.unwrap().unwrap();
+        assert_eq!(object.object_ordinal, 257);
+        let after_object = backend.ranges().len();
+        assert!(after_object >= after_frame + 2);
+
+        // Repeated lookups use the bounded page caches.
+        remote.read_frame(1500).await.unwrap();
+        remote.read_object(257).await.unwrap();
+        assert_eq!(backend.ranges().len(), after_object);
+
+        let (_, _, _, _, _, sections) = decode_header(&bytes[..DATA_SEAL_HEADER_LEN]).unwrap();
+        assert!(
+            !backend
+                .ranges()
+                .iter()
+                .any(|(offset, len)| (*offset == sections[1].offset
+                    && *len == sections[1].len as usize)
+                    || (*offset == sections[2].offset && *len == sections[2].len as usize))
         );
     }
 }

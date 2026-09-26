@@ -8,18 +8,24 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use futures::future::try_join_all;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::OnceCell;
 
 use crate::cadapter::client::{ObjectBackend, ObjectClient};
 use crate::meta::store::{FileType, MetaError};
+use crate::native_base::wire::container::ObjectKind;
 use crate::native_base::wire::error::{WireError, WireResult};
 use crate::vfs::handles::{DirectoryPageSource, RawDirEntry};
 
 use super::attribute::AttributeGroup;
 use super::batch::NamespaceEntry;
+use super::data_pack::RemoteDataPack;
+use super::data_seal_remote::RemoteDataSeal;
 use super::directory::{
     DirectoryEntry, DirectoryIdentity, DirectoryPage, MAX_RANGE_SOURCES, MAX_WINDOW_ENTRIES,
-    NodeRef, ReadDirLimit, WindowSourceKind,
+    NodeRef, ReadDirLimit,
 };
 use super::extent::ExtentSpan;
 use super::merge_route::MergeRouteRecord;
@@ -213,6 +219,21 @@ impl<B: ObjectBackend + Clone> RemoteClusterUnion<B> {
         route: &MergeRouteRecord,
         name: &[u8],
     ) -> WireResult<Option<super::batch::NamespaceEntry>> {
+        Ok(self
+            .lookup_route_with_contributor(route, name)
+            .await?
+            .map(|(_, entry)| entry))
+    }
+
+    /// Route lookup that retains the authenticated physical contributor. The
+    /// contributor is needed by a read-only catalog to resolve stable inode
+    /// attributes and extents without inferring a cluster from a planner
+    /// source id.
+    pub async fn lookup_route_with_contributor(
+        &self,
+        route: &MergeRouteRecord,
+        name: &[u8],
+    ) -> WireResult<Option<(NodeRef, super::batch::NamespaceEntry)>> {
         let Some(window) = route.windows.iter().find(|window| {
             window
                 .lower
@@ -225,18 +246,33 @@ impl<B: ObjectBackend + Clone> RemoteClusterUnion<B> {
         }) else {
             return Ok(None);
         };
-        let mut contributors = Vec::with_capacity(window.sources.len());
+        let mut found = None;
         for source in &window.sources {
-            match source.kind {
-                WindowSourceKind::CanonicalDirectoryEntries => {
-                    contributors.push(source.contributor);
+            let entry = self
+                .cluster(source.contributor.cluster_slot)?
+                .lookup_namespace(source.contributor.local_node_id, name)
+                .await?;
+            let Some(entry) = entry else {
+                continue;
+            };
+            if let Some((previous, previous_entry)) = &found {
+                if previous_entry != &entry {
+                    return Err(WireError::invalid(
+                        "cluster union",
+                        "contributors disagree on one routed raw name",
+                    ));
                 }
-                WindowSourceKind::FileEntries => {
-                    contributors.push(source.contributor);
+                // Keep the lowest physical contributor for deterministic
+                // hardlink/directory identity when duplicate directory
+                // skeletons are present.
+                if source.contributor < *previous {
+                    found = Some((source.contributor, entry));
                 }
+            } else {
+                found = Some((source.contributor, entry));
             }
         }
-        self.lookup_namespace(&contributors, name).await
+        Ok(found)
     }
 
     /// Read one bounded page from a persisted merged-directory route.
@@ -458,6 +494,7 @@ fn namespace_to_directory_entry(contributor: NodeRef, entry: NamespaceEntry) -> 
             name,
             inode: stable_inode(contributor, node.local_node_id),
             kind: node.kind,
+            contributor: Some(contributor),
         },
         // ExistingNode currently represents a hardlink to a regular inode in
         // the namespace codec. Keep the identity stable; cold attributes can
@@ -469,6 +506,7 @@ fn namespace_to_directory_entry(contributor: NodeRef, entry: NamespaceEntry) -> 
             name,
             inode: stable_inode(contributor, local_node_id),
             kind: 1,
+            contributor: Some(contributor),
         },
     }
 }
@@ -481,11 +519,55 @@ fn stable_inode(contributor: NodeRef, local_node_id: u32) -> u64 {
 /// runtime boundary used by callers that need to mount a complete snapshot;
 /// mutable agent overlays remain outside this type.
 pub struct RemoteSnapshot<B: ObjectBackend + Clone> {
+    client: ObjectClient<B>,
     manifest: super::manifest_remote::RemoteSnapshotManifest<B>,
     clusters: RemoteClusterUnion<B>,
+    data_seals: Arc<[OnceCell<Arc<RemoteDataSeal<B>>>]>,
+    data_packs: DashMap<(u32, u32), Arc<RemoteDataPack<B>>>,
+    slice_locators: DashMap<(NodeRef, u64), u64>,
+    slice_targets: DashMap<u64, (NodeRef, u64)>,
+    next_slice_locator: AtomicU64,
 }
 
 impl<B: ObjectBackend + Clone> RemoteSnapshot<B> {
+    /// Open a v2 manifest by object-store key using a metadata-only size
+    /// request.  The manifest reader still fetches only its fixed header and
+    /// cluster table during open; mount/route sections remain range-loaded.
+    pub async fn open_by_key(
+        client: &ObjectClient<B>,
+        key: &str,
+        options: RemoteClusterOptions,
+    ) -> WireResult<Self> {
+        if key.is_empty() || key.len() > 1024 || key.as_bytes().contains(&0) {
+            return Err(WireError::invalid(
+                "snapshot manifest",
+                "manifest object key is invalid",
+            ));
+        }
+        let object_len = client
+            .get_object_size(key)
+            .await
+            .map_err(|error| WireError::invalid("snapshot manifest", error.to_string()))?
+            .ok_or_else(|| WireError::invalid("snapshot manifest", "manifest object is missing"))?;
+        // The full content hash is carried by published manifest references.
+        // A key-only mount has no reference record, so use a stable key/length
+        // identity for cursor scoping; all bytes are still authenticated by
+        // the manifest and every referenced object during range reads.
+        let mut identity = blake3::Hasher::new();
+        identity.update(b"BrewFS.v2.key-manifest");
+        identity.update(key.as_bytes());
+        identity.update(&object_len.to_le_bytes());
+        let full_hash = *identity.finalize().as_bytes();
+        let manifest_ref = ManifestObjectRef {
+            object_id: full_hash[..16].try_into().expect("blake3 prefix length"),
+            kind: ObjectKind::SnapshotManifest.as_u8(),
+            object_len,
+            full_hash,
+            key: key.as_bytes().to_vec(),
+        };
+        Self::open(client, manifest_ref, options).await
+    }
+
     pub async fn open(
         client: &ObjectClient<B>,
         manifest_ref: ManifestObjectRef,
@@ -494,7 +576,19 @@ impl<B: ObjectBackend + Clone> RemoteSnapshot<B> {
         let manifest =
             super::manifest_remote::RemoteSnapshotManifest::open(client, manifest_ref).await?;
         let clusters = RemoteClusterUnion::open(client, manifest.clusters(), options).await?;
-        Ok(Self { manifest, clusters })
+        let data_seals = (0..manifest.clusters().len())
+            .map(|_| OnceCell::new())
+            .collect::<Vec<_>>();
+        Ok(Self {
+            client: client.clone(),
+            manifest,
+            clusters,
+            data_seals: Arc::from(data_seals),
+            data_packs: DashMap::new(),
+            slice_locators: DashMap::new(),
+            slice_targets: DashMap::new(),
+            next_slice_locator: AtomicU64::new(1),
+        })
     }
 
     pub fn manifest(&self) -> &super::manifest_remote::RemoteSnapshotManifest<B> {
@@ -503,6 +597,21 @@ impl<B: ObjectBackend + Clone> RemoteSnapshot<B> {
 
     pub fn clusters(&self) -> &RemoteClusterUnion<B> {
         &self.clusters
+    }
+
+    /// Resolve a route while retaining the physical contributor carried by
+    /// the authenticated route window.
+    pub async fn lookup_route_with_contributor(
+        &self,
+        dir_key: super::identity::DirKey,
+        name: &[u8],
+    ) -> WireResult<Option<(NodeRef, super::batch::NamespaceEntry)>> {
+        let Some(route) = self.manifest.lookup_merge_route(dir_key).await? else {
+            return Ok(None);
+        };
+        self.clusters
+            .lookup_route_with_contributor(&route, name)
+            .await
     }
 
     /// Route lookup uses the physical contributor identities authenticated in
@@ -558,6 +667,186 @@ impl<B: ObjectBackend + Clone> RemoteSnapshot<B> {
         self.clusters
             .read_extent_range(contributor, file_offset, length)
             .await
+    }
+
+    /// Read one logical SliceId directly from its authenticated DataPack
+    /// frame(s). The caller supplies the physical contributor from the
+    /// namespace route, so SliceIds remain cluster-local and do not need a
+    /// process-global metadata service.
+    pub async fn read_data_slice(
+        &self,
+        contributor: NodeRef,
+        slice_id: u64,
+        offset: u64,
+        output: &mut [u8],
+    ) -> WireResult<()> {
+        if output.is_empty() {
+            return Ok(());
+        }
+        let seal = self.data_seal(contributor.cluster_slot).await?;
+        let slice = seal.lookup_slice(slice_id).await?.ok_or_else(|| {
+            WireError::invalid("data slice", format!("slice {slice_id} is not sealed"))
+        })?;
+        let end = offset
+            .checked_add(output.len() as u64)
+            .ok_or_else(|| WireError::LimitExceeded("data slice read overflows u64".into()))?;
+        if end > slice.logical_len {
+            return Err(WireError::Truncated {
+                what: "data slice",
+                need: end as usize,
+                have: slice.logical_len as usize,
+            });
+        }
+        let mut logical_cursor = 0u64;
+        let mut copied = 0usize;
+        for span in &slice.spans {
+            let span_end = logical_cursor
+                .checked_add(u64::from(span.raw_len))
+                .ok_or_else(|| WireError::LimitExceeded("data span overflows u64".into()))?;
+            let copy_start = offset.max(logical_cursor);
+            let copy_end = end.min(span_end);
+            if copy_start < copy_end {
+                let frame = seal.read_frame(span.frame_ordinal).await?.ok_or_else(|| {
+                    WireError::invalid("data slice", "slice references a missing frame")
+                })?;
+                let object = seal
+                    .read_object(frame.object_ordinal)
+                    .await?
+                    .ok_or_else(|| {
+                        WireError::invalid("data slice", "frame references a missing object")
+                    })?;
+                let pack = self.data_pack(contributor.cluster_slot, &object).await?;
+                let decoded = pack.read_frame(&frame).await?;
+                let frame_start = u64::from(span.raw_offset_in_frame)
+                    .checked_add(copy_start - logical_cursor)
+                    .ok_or_else(|| {
+                        WireError::LimitExceeded("data frame offset overflows u64".into())
+                    })?;
+                let frame_end =
+                    frame_start
+                        .checked_add(copy_end - copy_start)
+                        .ok_or_else(|| {
+                            WireError::LimitExceeded("data frame end overflows u64".into())
+                        })?;
+                let frame_end_usize = usize::try_from(frame_end).map_err(|_| {
+                    WireError::LimitExceeded("data frame offset exceeds usize".into())
+                })?;
+                let frame_start_usize = usize::try_from(frame_start).map_err(|_| {
+                    WireError::LimitExceeded("data frame offset exceeds usize".into())
+                })?;
+                if frame_end_usize > decoded.raw.len() {
+                    return Err(WireError::Truncated {
+                        what: "data frame payload",
+                        need: frame_end_usize,
+                        have: decoded.raw.len(),
+                    });
+                }
+                let output_start = copied;
+                let copy_len = frame_end_usize - frame_start_usize;
+                output[output_start..output_start + copy_len]
+                    .copy_from_slice(&decoded.raw[frame_start_usize..frame_end_usize]);
+                copied = copied.saturating_add(copy_len);
+            }
+            logical_cursor = span_end;
+            if logical_cursor >= end {
+                break;
+            }
+        }
+        if copied != output.len() {
+            return Err(WireError::Truncated {
+                what: "data slice spans",
+                need: output.len(),
+                have: copied,
+            });
+        }
+        Ok(())
+    }
+
+    /// Assign a process-local, snapshot-scoped id to a physical Data Seal
+    /// slice.  Slice ids are only unique within one cluster, while the VFS
+    /// BlockStore key is process-global; keep the on-disk id unchanged and
+    /// carry the cluster identity in this bounded runtime locator instead.
+    pub fn register_data_slice(&self, contributor: NodeRef, slice_id: u64) -> WireResult<u64> {
+        if slice_id == 0 {
+            return Err(WireError::invalid("data slice", "slice id is zero"));
+        }
+        if let Some(existing) = self.slice_locators.get(&(contributor, slice_id)) {
+            return Ok(*existing);
+        }
+        let locator = self.next_slice_locator.fetch_add(1, Ordering::Relaxed);
+        if locator == 0 {
+            return Err(WireError::LimitExceeded(
+                "runtime data slice locator exhausted".into(),
+            ));
+        }
+        self.slice_locators
+            .entry((contributor, slice_id))
+            .or_insert_with(|| {
+                self.slice_targets.insert(locator, (contributor, slice_id));
+                locator
+            });
+        Ok(*self
+            .slice_locators
+            .get(&(contributor, slice_id))
+            .expect("inserted slice locator"))
+    }
+
+    /// Resolve a process-local slice locator and read its physical DataPack
+    /// bytes.  Callers cannot select a different cluster without a locator
+    /// that was issued by this immutable snapshot.
+    pub async fn read_registered_data_slice(
+        &self,
+        locator: u64,
+        offset: u64,
+        output: &mut [u8],
+    ) -> WireResult<()> {
+        let (contributor, slice_id) = self
+            .slice_targets
+            .get(&locator)
+            .map(|target| *target)
+            .ok_or_else(|| WireError::invalid("data slice", "unknown runtime locator"))?;
+        self.read_data_slice(contributor, slice_id, offset, output)
+            .await
+    }
+
+    async fn data_seal(&self, cluster_slot: u32) -> WireResult<Arc<RemoteDataSeal<B>>> {
+        let cell = self.data_seals.get(cluster_slot as usize).ok_or_else(|| {
+            WireError::invalid("data seal", "cluster slot is outside the snapshot")
+        })?;
+        let descriptor = self
+            .manifest
+            .clusters()
+            .get(cluster_slot as usize)
+            .ok_or_else(|| WireError::invalid("data seal", "cluster descriptor is missing"))?;
+        cell.get_or_try_init(|| async {
+            Ok(Arc::new(
+                RemoteDataSeal::open(&self.client, descriptor.data_seal_ref.clone()).await?,
+            ))
+        })
+        .await
+        .cloned()
+    }
+
+    async fn data_pack(
+        &self,
+        cluster_slot: u32,
+        object: &super::data_seal::DataObjectDescriptor,
+    ) -> WireResult<Arc<RemoteDataPack<B>>> {
+        let key = (cluster_slot, object.object_ordinal);
+        if let Some(pack) = self.data_packs.get(&key) {
+            return Ok(pack.clone());
+        }
+        let pack = Arc::new(
+            RemoteDataPack::open(
+                &self.client,
+                std::str::from_utf8(&object.object_key)
+                    .map_err(|_| WireError::invalid("data object", "object key is not UTF-8"))?,
+                object.object_len,
+            )
+            .await?,
+        );
+        self.data_packs.insert(key, pack.clone());
+        Ok(pack)
     }
 }
 
@@ -717,6 +1006,13 @@ mod tests {
         assert_eq!(page.next_ordinal, 1);
         assert_eq!(page.entries[0].name.as_bytes(), b"target");
         assert_eq!(page.entries[0].kind, 1);
+        assert_eq!(
+            page.entries[0].contributor,
+            Some(NodeRef {
+                cluster_slot: 0,
+                local_node_id: 1,
+            })
+        );
     }
 
     #[tokio::test]

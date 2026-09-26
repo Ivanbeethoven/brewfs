@@ -560,6 +560,83 @@ impl<B: ObjectBackend + Clone> RemoteCluster<B> {
         Ok(None)
     }
 
+    /// Resolve a node record by LocalNodeId without requiring the caller to
+    /// know its parent directory.  Namespace index leaves retain the node-id
+    /// range introduced by each batch, so the cold fallback scans only fixed
+    /// 4 KiB index pages and decodes the one candidate batch.  Normal path
+    /// lookup remains targeted and never takes this fallback.
+    pub async fn lookup_node(
+        &self,
+        local_node_id: u32,
+    ) -> WireResult<Option<super::batch::NodeRecord>> {
+        if local_node_id == 0 || local_node_id > self.superblock.node_count {
+            return Ok(None);
+        }
+        let root = self.read_index_root(BatchKind::Namespace).await?;
+        let mut pending = vec![root];
+        let mut seen = HashSet::new();
+        while let Some(node) = pending.pop() {
+            if node.level == 0 {
+                for entry in &node.entries {
+                    let IndexEntry::Leaf { locator, .. } = entry else {
+                        return Err(WireError::invalid(
+                            "namespace index",
+                            "leaf node contains an internal entry",
+                        ));
+                    };
+                    let Some(end) = locator
+                        .first_new_node_id
+                        .checked_add(locator.new_node_count)
+                    else {
+                        return Err(WireError::invalid(
+                            "namespace index",
+                            "new-node range overflows u32",
+                        ));
+                    };
+                    if local_node_id < locator.first_new_node_id || local_node_id >= end {
+                        continue;
+                    }
+                    let key = (
+                        locator.object_offset,
+                        locator.total_stored_len,
+                        locator.digest,
+                    );
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    let batch = self.read_namespace_batch(locator).await?;
+                    let namespace = NamespaceBatch::decode(&batch)?;
+                    for segment in namespace.segments {
+                        for entry in segment.entries {
+                            if let NamespaceEntry::NewNode { node, .. } = entry
+                                && node.local_node_id == local_node_id
+                            {
+                                return Ok(Some(node));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let mut children = Vec::new();
+            for entry in &node.entries {
+                let IndexEntry::Internal(child) = entry else {
+                    return Err(WireError::invalid(
+                        "namespace index",
+                        "internal node contains a leaf entry",
+                    ));
+                };
+                children.push(
+                    self.read_index_child(child, BatchKind::Namespace, node.level - 1)
+                        .await?,
+                );
+            }
+            pending.extend(children.into_iter().rev());
+        }
+        Ok(None)
+    }
+
     /// Read one bounded physical source range for a merged-directory window.
     ///
     /// The route carries the first and last raw names owned by a source. The

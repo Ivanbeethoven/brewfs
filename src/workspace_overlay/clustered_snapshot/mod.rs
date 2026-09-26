@@ -1,9 +1,10 @@
 //! Contracts shared by the clustered frozen-metadata v2 reader and producer.
 //!
-//! This module deliberately contains no object-store or FUSE integration.  It
-//! defines the bounded pieces that both sides must agree on: raw POSIX names,
-//! range windows, stable snapshot cursors, and allocation admission.  The
-//! legacy packed-metadata-v1 reader does not use these types.
+//! This module contains the clustered v2 wire contracts, range readers, and
+//! the read-only remote adapters used by the v2 FUSE dispatch. It defines the
+//! bounded pieces that both sides must agree on: raw POSIX names, range
+//! windows, stable snapshot cursors, and allocation admission. The legacy
+//! packed-metadata-v1 reader does not use these types.
 
 mod attribute;
 mod batch;
@@ -28,6 +29,8 @@ mod name;
 mod publication;
 mod range_reader;
 mod remote;
+mod remote_catalog;
+mod remote_store;
 mod remote_union;
 mod snapshot_manifest;
 
@@ -98,6 +101,8 @@ pub use remote::{
     DEFAULT_BATCH_CACHE_BYTES, DEFAULT_BATCH_CACHE_ENTRIES, DEFAULT_INDEX_CACHE_BYTES,
     DEFAULT_INDEX_CACHE_ENTRIES, RemoteCluster, RemoteClusterOptions,
 };
+pub use remote_catalog::RemoteFrozenCatalog;
+pub use remote_store::RemoteDataBlockStore;
 pub use remote_union::{
     REMOTE_PAGE_MAX_OWNED_BYTES, RemoteClusterUnion, RemoteDirectoryPageSource, RemoteSnapshot,
 };

@@ -56,6 +56,17 @@ pub struct BuiltSourceCluster {
     pub data: Option<BuiltSourceData>,
 }
 
+impl BuiltSourceCluster {
+    /// Parent-first namespace streams retained for the publication planner.
+    ///
+    /// The producer keeps these streams private from remote readers, but the
+    /// single-cluster manifest builder needs the same sorted boundaries to
+    /// materialize its authenticated merge-route index.
+    pub(crate) fn namespace_segments(&self) -> &[NamespaceSegmentInput] {
+        &self.namespace_segments
+    }
+}
+
 /// The producer-side pair of objects referenced by a complete source
 /// cluster.  Upload coordinators can put `data_pack` under `object_key`,
 /// verify its checksum, and then upload `data_seal` before publication.
@@ -410,6 +421,7 @@ struct PlannedExtent {
     logical_length: u64,
     slice_id: u64,
     frame_ordinal: u32,
+    slice_offset: u64,
 }
 
 fn build_source_payload<S: IngestSource>(
@@ -430,6 +442,7 @@ fn build_source_payload<S: IngestSource>(
     let mut pack = DataPackBuilder::new();
     let mut next_slice_id = 1u64;
     let mut placements = BTreeMap::<u32, Vec<PlannedExtent>>::new();
+    let mut current_frame = Vec::with_capacity(DATA_FRAME_RAW_BYTES);
     let mut files_by_node = BTreeMap::<u32, &SourceEntry>::new();
     for entry in &sorted {
         if matches!(entry.kind, EntryKind::File { .. }) {
@@ -440,6 +453,15 @@ fn build_source_payload<S: IngestSource>(
             files_by_node.entry(local_node_id).or_insert(entry);
         }
     }
+
+    let flush_frame = |pack: &mut DataPackBuilder, frame: &mut Vec<u8>| -> WireResult<()> {
+        if frame.is_empty() {
+            return Ok(());
+        }
+        pack.push(PackFrame::plain_bytes_zstd(frame, 3)?);
+        frame.clear();
+        Ok(())
+    };
 
     for (local_node_id, entry) in files_by_node {
         let EntryKind::File { size } = entry.kind else {
@@ -455,27 +477,47 @@ fn build_source_payload<S: IngestSource>(
             while offset < range_end {
                 let remaining = range_end - offset;
                 let chunk_len = remaining.min(DATA_FRAME_RAW_BYTES as u64);
-                let chunk_len_usize = usize::try_from(chunk_len).map_err(|_| {
-                    WireError::LimitExceeded("source chunk length exceeds usize".into())
-                })?;
-                let mut raw = vec![0u8; chunk_len_usize];
-                source
-                    .read_range(&entry.token, offset, &mut raw)
-                    .map_err(|error| WireError::invalid("source read", error.to_string()))?;
-                let frame = PackFrame::plain_bytes_zstd(&raw, 3)?;
-                let frame_ordinal = u32::try_from(pack.frame_count()).map_err(|_| {
-                    WireError::LimitExceeded("data pack frame count exceeds u32".into())
-                })?;
-                pack.push(frame);
-                file_extents.push(PlannedExtent {
-                    file_offset: offset,
-                    logical_length: chunk_len,
-                    slice_id: next_slice_id,
-                    frame_ordinal,
-                });
-                next_slice_id = next_slice_id
-                    .checked_add(1)
-                    .ok_or_else(|| WireError::LimitExceeded("slice id overflows u64".into()))?;
+                let mut chunk_offset = 0u64;
+                while chunk_offset < chunk_len {
+                    if current_frame.len() == DATA_FRAME_RAW_BYTES {
+                        flush_frame(&mut pack, &mut current_frame)?;
+                    }
+                    let available = DATA_FRAME_RAW_BYTES - current_frame.len();
+                    let take = (chunk_len - chunk_offset).min(available as u64);
+                    let take_usize = usize::try_from(take).map_err(|_| {
+                        WireError::LimitExceeded("source chunk length exceeds usize".into())
+                    })?;
+                    let read_offset = offset.checked_add(chunk_offset).ok_or_else(|| {
+                        WireError::LimitExceeded("source offset overflows u64".into())
+                    })?;
+                    let mut raw = vec![0u8; take_usize];
+                    source
+                        .read_range(&entry.token, read_offset, &mut raw)
+                        .map_err(|error| WireError::invalid("source read", error.to_string()))?;
+                    let frame_ordinal = u32::try_from(pack.frame_count()).map_err(|_| {
+                        WireError::LimitExceeded("data pack frame count exceeds u32".into())
+                    })?;
+                    let slice_offset = u64::try_from(current_frame.len()).map_err(|_| {
+                        WireError::LimitExceeded("data pack frame offset exceeds u64".into())
+                    })?;
+                    current_frame.extend_from_slice(&raw);
+                    file_extents.push(PlannedExtent {
+                        file_offset: read_offset,
+                        logical_length: take,
+                        slice_id: next_slice_id,
+                        frame_ordinal,
+                        slice_offset,
+                    });
+                    next_slice_id = next_slice_id
+                        .checked_add(1)
+                        .ok_or_else(|| WireError::LimitExceeded("slice id overflows u64".into()))?;
+                    chunk_offset = chunk_offset.checked_add(take).ok_or_else(|| {
+                        WireError::LimitExceeded("source chunk offset overflows u64".into())
+                    })?;
+                    if current_frame.len() == DATA_FRAME_RAW_BYTES {
+                        flush_frame(&mut pack, &mut current_frame)?;
+                    }
+                }
                 offset = offset.checked_add(chunk_len).ok_or_else(|| {
                     WireError::LimitExceeded("source offset overflows u64".into())
                 })?;
@@ -485,6 +527,7 @@ fn build_source_payload<S: IngestSource>(
             placements.insert(local_node_id, file_extents);
         }
     }
+    flush_frame(&mut pack, &mut current_frame)?;
 
     let extent_batches = build_extent_batches(cluster_id, &placements)?;
     let data_pack = pack.build()?;
@@ -508,7 +551,9 @@ fn build_source_payload<S: IngestSource>(
                 logical_len: extent.logical_length,
                 spans: vec![DataSpan {
                     frame_ordinal: extent.frame_ordinal,
-                    raw_offset_in_frame: 0,
+                    raw_offset_in_frame: u32::try_from(extent.slice_offset).map_err(|_| {
+                        WireError::LimitExceeded("data pack frame offset exceeds u32".into())
+                    })?,
                     raw_len: u32::try_from(extent.logical_length)
                         .map_err(|_| WireError::LimitExceeded("slice length exceeds u32".into()))?,
                 }],
@@ -597,7 +642,7 @@ fn build_extent_batches(
                     gap_from_previous_end: gap,
                     logical_length: extent.logical_length,
                     slice_id: extent.slice_id,
-                    slice_offset: 0,
+                    slice_offset: extent.slice_offset,
                 });
                 previous_end = extent
                     .file_offset
@@ -882,6 +927,44 @@ mod tests {
         assert_eq!(seal.objects().len(), 1);
         assert_eq!(seal.lookup_slice(1).unwrap().logical_len, 1 << 20);
         assert_eq!(seal.lookup_slice(2).unwrap().logical_len, 33);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_builder_packs_adjacent_small_files_into_shared_frames() {
+        use crate::workspace_overlay::clustered_snapshot::{DataPackSnapshot, DataSealSnapshot};
+
+        let root = tempfile::tempdir().unwrap();
+        let file_size = 128 * 1024;
+        for index in 0..16u8 {
+            let payload = vec![index; file_size];
+            std::fs::write(root.path().join(format!("file-{index:02}")), payload).unwrap();
+        }
+
+        let built = build_local_directory_cluster(
+            root.path(),
+            ConsistencyPolicy::SnapshotBacked,
+            [14; 16],
+            [15; 16],
+        )
+        .unwrap();
+        let data = built.data.as_ref().expect("regular file data artifact");
+        let pack = DataPackSnapshot::open(data.data_pack.clone()).unwrap();
+        let seal = DataSealSnapshot::open(data.data_seal.clone()).unwrap();
+
+        assert_eq!(pack.frames().len(), 2);
+        assert_eq!(pack.frames()[0].header.raw_len, 1 << 20);
+        assert_eq!(pack.frames()[1].header.raw_len, 1 << 20);
+        assert_eq!(seal.slices().len(), 16);
+        for (index, slice) in seal.slices().iter().enumerate() {
+            assert_eq!(slice.spans.len(), 1);
+            assert_eq!(slice.spans[0].frame_ordinal, (index / 8) as u32);
+            assert_eq!(
+                slice.spans[0].raw_offset_in_frame,
+                ((index % 8) * file_size) as u32
+            );
+            assert_eq!(slice.logical_len, file_size as u64);
+        }
     }
 
     #[cfg(unix)]

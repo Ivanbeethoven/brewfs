@@ -21,16 +21,21 @@ use crate::native_base::wire::frame::{
 };
 
 use super::attribute::AttributeBatch;
+use super::batch::NamespaceEntry;
 use super::batch::{BatchKind, EncodedBatch, NamespaceBatch};
 use super::cluster_format::SnapshotSuperblock;
 use super::cluster_format::{ClusterSuperblock, IndexRootRef, SUPERBLOCK_LEN};
 use super::data_pack::RemoteDataPack;
 use super::data_seal::{DataObjectDescriptor, DataSealSnapshot, FrameDescriptor, SliceDescriptor};
+use super::directory::{NodeRef, WindowSourceKind};
 use super::extent::ExtentBatch;
 use super::ingest::BuiltSourceCluster;
-use super::merge_route::MergeRouteIndex;
+use super::merge_route::{
+    DirectoryViewRecord, MergeRouteIndex, MergeRouteRecord, MergeRouteSource, MergeRouteWindow,
+};
 use super::merkle_index::IndexEntry;
 use super::mount_trie::{MountTrie, MountTrieNode};
+use super::name::NameBytes;
 use super::range_reader::{MemoryRangeReader, read_batch, read_index_child, read_index_root};
 use super::snapshot_manifest::{
     ClusterDescriptor, ManifestIndexPayload, ManifestObjectRef, SnapshotManifest,
@@ -219,7 +224,8 @@ pub fn build_single_cluster_manifest(
         }],
     }
     .encode()?;
-    let route_bytes = MergeRouteIndex::encode(&[])?;
+    let routes = build_single_cluster_routes(built)?;
+    let route_bytes = MergeRouteIndex::encode(&routes)?;
     let mut snapshot_semantic = blake3::Hasher::new();
     snapshot_semantic.update(b"BrewFS.Snapshot.v2");
     snapshot_semantic.update(&volume_id);
@@ -233,7 +239,7 @@ pub fn build_single_cluster_manifest(
             route_seed,
             cluster_count: 1,
             mount_count: 1,
-            merged_directory_count: 0,
+            merged_directory_count: routes.len() as u64,
             root_dir_key: built.root_dir_key,
             index_roots: [
                 empty_manifest_root(),
@@ -247,7 +253,7 @@ pub fn build_single_cluster_manifest(
             bytes: mount_bytes,
         },
         route_index: ManifestIndexPayload {
-            entry_count: 0,
+            entry_count: routes.len() as u64,
             bytes: route_bytes,
         },
     };
@@ -265,6 +271,92 @@ pub fn build_single_cluster_manifest(
         bytes,
         manifest_ref,
     })
+}
+
+/// Build the route index for a one-cluster source without re-inventing the
+/// namespace ordering rules. The retained producer segments are already
+/// sorted and use the same local node ids that the BRFCL object authenticates.
+/// Large directories are split into the bounded v2 route windows so a remote
+/// readdir request never has to materialize more than one window.
+fn build_single_cluster_routes(built: &BuiltSourceCluster) -> WireResult<Vec<MergeRouteRecord>> {
+    let mut segment_by_parent = std::collections::BTreeMap::new();
+    for segment in built.namespace_segments() {
+        segment_by_parent.insert(segment.parent_local_node_id, segment);
+    }
+
+    let mut routes = Vec::with_capacity(built.directory_keys.len());
+    for (path, dir_key) in &built.directory_keys {
+        let local_node_id = if path.is_empty() {
+            1
+        } else {
+            built.local_node_ids.get(path).copied().ok_or_else(|| {
+                WireError::invalid("snapshot route", "directory local node id is missing")
+            })?
+        };
+        let entries = segment_by_parent
+            .get(&local_node_id)
+            .map(|segment| segment.entries.as_slice())
+            .unwrap_or(&[]);
+        let mut windows = Vec::new();
+        for (window_index, chunk) in entries
+            .chunks(super::directory::MAX_WINDOW_ENTRIES)
+            .enumerate()
+        {
+            let first = namespace_entry_name(
+                chunk
+                    .first()
+                    .ok_or_else(|| WireError::invalid("snapshot route", "empty route chunk"))?,
+            )
+            .clone();
+            let last = namespace_entry_name(
+                chunk
+                    .last()
+                    .ok_or_else(|| WireError::invalid("snapshot route", "empty route chunk"))?,
+            )
+            .clone();
+            let lower = (window_index != 0).then(|| first.clone());
+            let upper = entries
+                .get((window_index + 1) * super::directory::MAX_WINDOW_ENTRIES)
+                .map(namespace_entry_name)
+                .cloned();
+            windows.push(MergeRouteWindow {
+                lower,
+                upper,
+                visible_entry_count: chunk.len() as u32,
+                sources: vec![MergeRouteSource {
+                    source_id: 1,
+                    kind: WindowSourceKind::CanonicalDirectoryEntries,
+                    contributor: NodeRef {
+                        cluster_slot: 0,
+                        local_node_id,
+                    },
+                    first_name: first,
+                    last_name: last,
+                    entry_count: chunk.len() as u32,
+                }],
+            });
+        }
+        routes.push(MergeRouteRecord {
+            view: DirectoryViewRecord {
+                dir_key: *dir_key,
+                canonical_node: NodeRef {
+                    cluster_slot: 0,
+                    local_node_id,
+                },
+                visible_entry_count: entries.len() as u64,
+                entry_index_root: [0; 32],
+            },
+            windows,
+        });
+    }
+    routes.sort_by_key(|route| route.view.dir_key);
+    Ok(routes)
+}
+
+fn namespace_entry_name(entry: &NamespaceEntry) -> &NameBytes {
+    match entry {
+        NamespaceEntry::NewNode { name, .. } | NamespaceEntry::ExistingNode { name, .. } => name,
+    }
 }
 
 fn derive_object_id(kind: u8, bytes: &[u8]) -> [u8; 16] {
