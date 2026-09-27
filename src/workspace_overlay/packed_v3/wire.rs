@@ -20,6 +20,7 @@ pub(crate) const MAX_OBJECT_BODY: u64 = 64 * 1024 * 1024;
 const MAX_MANIFEST_GROUPS: u32 = 16 * 1024 * 1024;
 const MAX_MANIFEST_CONTAINERS: u32 = 1 * 1024 * 1024;
 const MAX_NAME_RANGE_BYTES: u32 = 1 * 1024 * 1024;
+const MAX_INDEX_FENCE_NAME_BYTES: u32 = 1024;
 const MAX_OBJECT_KEY_BYTES: u32 = 4 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -358,6 +359,56 @@ pub struct PackedContainerRef {
     pub object_digest: [u8; 32],
 }
 
+/// Authenticated routing fence for one pageable group-index object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackedGroupIndexPageRef {
+    pub object: PackedContainerRef,
+    pub first_parent_dir_key: [u8; 32],
+    pub first_name: Vec<u8>,
+    pub last_parent_dir_key: [u8; 32],
+    pub last_name: Vec<u8>,
+}
+
+impl PackedGroupIndexPageRef {
+    fn validate(&self) -> PackedResult<()> {
+        validate_object_ref(&self.object, "group index page")?;
+        validate_fence_name(&self.first_name)?;
+        validate_fence_name(&self.last_name)?;
+        if compare_group_key(
+            self.first_parent_dir_key,
+            &self.first_name,
+            self.last_parent_dir_key,
+            &self.last_name,
+        ) == std::cmp::Ordering::Greater
+        {
+            return Err(PackedWireError::Invalid(
+                "group index page fence is inverted".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Authenticated inclusive inode range for one pageable inode-index object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackedInodeIndexPageRef {
+    pub object: PackedContainerRef,
+    pub first_inode: u64,
+    pub last_inode: u64,
+}
+
+impl PackedInodeIndexPageRef {
+    fn validate(&self) -> PackedResult<()> {
+        validate_object_ref(&self.object, "inode index page")?;
+        if self.first_inode > self.last_inode {
+            return Err(PackedWireError::Invalid(
+                "inode index page range is inverted".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackedSnapshotManifest {
     pub snapshot_id: [u8; 32],
@@ -373,15 +424,15 @@ pub struct PackedSnapshotManifest {
     pub containers: Vec<PackedContainerRef>,
     /// CAS references to pageable group and inode indexes.  Small snapshots
     /// may leave these empty and keep the group refs inline.
-    pub group_index_pages: Vec<PackedContainerRef>,
-    pub inode_index_pages: Vec<PackedContainerRef>,
+    pub group_index_pages: Vec<PackedGroupIndexPageRef>,
+    pub inode_index_pages: Vec<PackedInodeIndexPageRef>,
 }
 
 impl PackedSnapshotManifest {
     pub fn encode(&self) -> PackedResult<Vec<u8>> {
         self.validate()?;
         let mut writer = Writer::default();
-        writer.bytes(b"PM05");
+        writer.bytes(b"PM06");
         writer.bytes(&self.snapshot_id);
         writer.bytes(&self.root_dir_key);
         writer.u64(self.root_inode);
@@ -418,8 +469,8 @@ impl PackedSnapshotManifest {
             writer.bytes(&container.object_digest);
             writer.bytes(&container.object_key);
         }
-        encode_page_refs(&mut writer, &self.group_index_pages)?;
-        encode_page_refs(&mut writer, &self.inode_index_pages)?;
+        encode_group_page_refs(&mut writer, &self.group_index_pages)?;
+        encode_inode_page_refs(&mut writer, &self.inode_index_pages)?;
         PackedEnvelope::build(PackedObjectKind::Manifest, writer.finish())
     }
 
@@ -431,7 +482,7 @@ impl PackedSnapshotManifest {
             ));
         }
         let mut reader = Reader::new(envelope.body());
-        if reader.take(4)? != b"PM05" {
+        if reader.take(4)? != b"PM06" {
             return Err(PackedWireError::UnsupportedFormat(
                 "packed manifest payload version mismatch".into(),
             ));
@@ -538,8 +589,8 @@ impl PackedSnapshotManifest {
                 object_digest,
             });
         }
-        let group_index_pages = decode_page_refs(&mut reader)?;
-        let inode_index_pages = decode_page_refs(&mut reader)?;
+        let group_index_pages = decode_group_page_refs(&mut reader)?;
+        let inode_index_pages = decode_inode_page_refs(&mut reader)?;
         if !reader.is_empty() {
             return Err(PackedWireError::Invalid(
                 "packed manifest has trailing bytes".into(),
@@ -614,15 +665,57 @@ impl PackedSnapshotManifest {
                 ));
             }
         }
-        validate_page_refs(&self.group_index_pages)?;
-        validate_page_refs(&self.inode_index_pages)?;
+        validate_group_page_refs(&self.group_index_pages)?;
+        validate_inode_page_refs(&self.inode_index_pages)?;
         Ok(())
+    }
+
+    /// Return the page whose authenticated fence can contain a dentry.
+    pub fn group_index_page_for_name(
+        &self,
+        parent_dir_key: [u8; 32],
+        name: &[u8],
+    ) -> Option<usize> {
+        let ordinal = self.group_index_pages.partition_point(|page| {
+            compare_group_key(
+                page.last_parent_dir_key,
+                &page.last_name,
+                parent_dir_key,
+                name,
+            ) == std::cmp::Ordering::Less
+        });
+        let page = self.group_index_pages.get(ordinal)?;
+        (compare_group_key(
+            page.first_parent_dir_key,
+            &page.first_name,
+            parent_dir_key,
+            name,
+        ) != std::cmp::Ordering::Greater
+            && compare_group_key(
+                page.last_parent_dir_key,
+                &page.last_name,
+                parent_dir_key,
+                name,
+            ) != std::cmp::Ordering::Less)
+            .then_some(ordinal)
+    }
+
+    /// Return the page whose inclusive range can contain an inode.
+    pub fn inode_index_page_for_inode(&self, inode: u64) -> Option<usize> {
+        let page = self
+            .inode_index_pages
+            .partition_point(|page| page.last_inode < inode);
+        let reference = self.inode_index_pages.get(page)?;
+        (reference.first_inode <= inode && inode <= reference.last_inode).then_some(page)
     }
 }
 
 const MAX_INDEX_PAGES: u32 = 4 * 1024 * 1024;
 
-fn encode_page_refs(writer: &mut Writer, refs: &[PackedContainerRef]) -> PackedResult<()> {
+fn encode_group_page_refs(
+    writer: &mut Writer,
+    refs: &[PackedGroupIndexPageRef],
+) -> PackedResult<()> {
     if refs.len() as u64 > u64::from(MAX_INDEX_PAGES) {
         return Err(PackedWireError::LimitExceeded(
             "packed index page count exceeds limit".into(),
@@ -630,23 +723,19 @@ fn encode_page_refs(writer: &mut Writer, refs: &[PackedContainerRef]) -> PackedR
     }
     writer.u32(refs.len() as u32);
     for reference in refs {
-        if reference.object_key.is_empty()
-            || reference.object_key.len() as u32 > MAX_OBJECT_KEY_BYTES
-            || reference.object_key.contains(&0)
-        {
-            return Err(PackedWireError::Invalid(
-                "packed index page object key is invalid".into(),
-            ));
-        }
-        writer.u32(reference.object_key.len() as u32);
-        writer.u64(reference.object_len);
-        writer.bytes(&reference.object_digest);
-        writer.bytes(&reference.object_key);
+        reference.validate()?;
+        encode_object_ref(writer, &reference.object)?;
+        writer.bytes(&reference.first_parent_dir_key);
+        writer.u32(reference.first_name.len() as u32);
+        writer.bytes(&reference.first_name);
+        writer.bytes(&reference.last_parent_dir_key);
+        writer.u32(reference.last_name.len() as u32);
+        writer.bytes(&reference.last_name);
     }
     Ok(())
 }
 
-fn decode_page_refs(reader: &mut Reader<'_>) -> PackedResult<Vec<PackedContainerRef>> {
+fn decode_group_page_refs(reader: &mut Reader<'_>) -> PackedResult<Vec<PackedGroupIndexPageRef>> {
     let count = reader.u32()?;
     if count > MAX_INDEX_PAGES {
         return Err(PackedWireError::LimitExceeded(
@@ -655,44 +744,176 @@ fn decode_page_refs(reader: &mut Reader<'_>) -> PackedResult<Vec<PackedContainer
     }
     let mut refs = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        let key_len = reader.u32()?;
-        if key_len == 0 || key_len > MAX_OBJECT_KEY_BYTES {
-            return Err(PackedWireError::LimitExceeded(
-                "packed index page object key is empty or too long".into(),
-            ));
-        }
-        let object_len = reader.u64()?;
-        let object_digest = reader.array::<32>()?;
-        let object_key = reader.bytes(key_len as usize)?.to_vec();
-        if object_key.contains(&0) {
-            return Err(PackedWireError::Invalid(
-                "packed index page object key contains NUL".into(),
-            ));
-        }
-        refs.push(PackedContainerRef {
-            object_key,
-            object_len,
-            object_digest,
+        let object = decode_object_ref(reader, "group index page")?;
+        let first_parent_dir_key = reader.array::<32>()?;
+        let first_name = decode_fence_name(reader)?;
+        let last_parent_dir_key = reader.array::<32>()?;
+        let last_name = decode_fence_name(reader)?;
+        refs.push(PackedGroupIndexPageRef {
+            object,
+            first_parent_dir_key,
+            first_name,
+            last_parent_dir_key,
+            last_name,
         });
     }
+    validate_group_page_refs(&refs)?;
     Ok(refs)
 }
 
-fn validate_page_refs(refs: &[PackedContainerRef]) -> PackedResult<()> {
+fn encode_inode_page_refs(
+    writer: &mut Writer,
+    refs: &[PackedInodeIndexPageRef],
+) -> PackedResult<()> {
+    if refs.len() as u64 > u64::from(MAX_INDEX_PAGES) {
+        return Err(PackedWireError::LimitExceeded(
+            "packed index page count exceeds limit".into(),
+        ));
+    }
+    writer.u32(refs.len() as u32);
+    for reference in refs {
+        reference.validate()?;
+        encode_object_ref(writer, &reference.object)?;
+        writer.u64(reference.first_inode);
+        writer.u64(reference.last_inode);
+    }
+    Ok(())
+}
+
+fn decode_inode_page_refs(reader: &mut Reader<'_>) -> PackedResult<Vec<PackedInodeIndexPageRef>> {
+    let count = reader.u32()?;
+    if count > MAX_INDEX_PAGES {
+        return Err(PackedWireError::LimitExceeded(
+            "packed index page count exceeds limit".into(),
+        ));
+    }
+    let mut refs = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let object = decode_object_ref(reader, "inode index page")?;
+        refs.push(PackedInodeIndexPageRef {
+            object,
+            first_inode: reader.u64()?,
+            last_inode: reader.u64()?,
+        });
+    }
+    validate_inode_page_refs(&refs)?;
+    Ok(refs)
+}
+
+fn encode_object_ref(writer: &mut Writer, reference: &PackedContainerRef) -> PackedResult<()> {
+    validate_object_ref(reference, "index page")?;
+    writer.u32(reference.object_key.len() as u32);
+    writer.u64(reference.object_len);
+    writer.bytes(&reference.object_digest);
+    writer.bytes(&reference.object_key);
+    Ok(())
+}
+
+fn decode_object_ref(
+    reader: &mut Reader<'_>,
+    what: &'static str,
+) -> PackedResult<PackedContainerRef> {
+    let key_len = reader.u32()?;
+    if key_len == 0 || key_len > MAX_OBJECT_KEY_BYTES {
+        return Err(PackedWireError::LimitExceeded(format!(
+            "packed {what} object key is empty or too long"
+        )));
+    }
+    let object_len = reader.u64()?;
+    let object_digest = reader.array::<32>()?;
+    let object_key = reader.bytes(key_len as usize)?.to_vec();
+    if object_key.contains(&0) {
+        return Err(PackedWireError::Invalid(format!(
+            "packed {what} object key contains NUL"
+        )));
+    }
+    Ok(PackedContainerRef {
+        object_key,
+        object_len,
+        object_digest,
+    })
+}
+
+fn validate_object_ref(reference: &PackedContainerRef, what: &str) -> PackedResult<()> {
+    if reference.object_key.is_empty()
+        || reference.object_key.len() as u32 > MAX_OBJECT_KEY_BYTES
+        || reference.object_key.contains(&0)
+        || reference.object_len < (PACKED_HEADER_LEN + PACKED_FOOTER_LEN) as u64
+    {
+        return Err(PackedWireError::Invalid(format!(
+            "{what} object reference is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_group_page_refs(refs: &[PackedGroupIndexPageRef]) -> PackedResult<()> {
     if refs.len() as u64 > u64::from(MAX_INDEX_PAGES) {
         return Err(PackedWireError::LimitExceeded(
             "packed index page count exceeds limit".into(),
         ));
     }
     for reference in refs {
-        if reference.object_key.is_empty()
-            || reference.object_key.len() as u32 > MAX_OBJECT_KEY_BYTES
-            || reference.object_key.contains(&0)
+        reference.validate()?;
+    }
+    for pair in refs.windows(2) {
+        if compare_group_key(
+            pair[0].last_parent_dir_key,
+            &pair[0].last_name,
+            pair[1].first_parent_dir_key,
+            &pair[1].first_name,
+        ) != std::cmp::Ordering::Less
         {
             return Err(PackedWireError::Invalid(
-                "packed index page object key is invalid".into(),
+                "packed group index page fences are unsorted or overlapping".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_inode_page_refs(refs: &[PackedInodeIndexPageRef]) -> PackedResult<()> {
+    if refs.len() as u64 > u64::from(MAX_INDEX_PAGES) {
+        return Err(PackedWireError::LimitExceeded(
+            "packed index page count exceeds limit".into(),
+        ));
+    }
+    for reference in refs {
+        reference.validate()?;
+    }
+    for pair in refs.windows(2) {
+        if pair[0].last_inode >= pair[1].first_inode {
+            return Err(PackedWireError::Invalid(
+                "packed inode index page ranges are unsorted or overlapping".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn decode_fence_name(reader: &mut Reader<'_>) -> PackedResult<Vec<u8>> {
+    let length = reader.u32()?;
+    if length == 0 || length > MAX_INDEX_FENCE_NAME_BYTES {
+        return Err(PackedWireError::LimitExceeded(
+            "packed index fence name is empty or exceeds 1 KiB".into(),
+        ));
+    }
+    let name = reader.bytes(length as usize)?.to_vec();
+    validate_fence_name(&name)?;
+    Ok(name)
+}
+
+fn validate_fence_name(name: &[u8]) -> PackedResult<()> {
+    if name.is_empty()
+        || name.len() as u32 > MAX_INDEX_FENCE_NAME_BYTES
+        || name.contains(&0)
+        || name.contains(&b'/')
+        || name == b"."
+        || name == b".."
+    {
+        return Err(PackedWireError::Invalid(
+            "packed index fence name is invalid".into(),
+        ));
     }
     Ok(())
 }
@@ -717,6 +938,17 @@ fn validate_name_bytes(bytes: &[u8]) -> PackedResult<()> {
         ));
     }
     Ok(())
+}
+
+pub(crate) fn compare_group_key(
+    left_parent: [u8; 32],
+    left_name: &[u8],
+    right_parent: [u8; 32],
+    right_name: &[u8],
+) -> std::cmp::Ordering {
+    left_parent
+        .cmp(&right_parent)
+        .then_with(|| left_name.cmp(right_name))
 }
 
 fn layout_error(error: LayoutError) -> PackedWireError {
@@ -907,10 +1139,16 @@ mod tests {
     #[test]
     fn manifest_rejects_inline_groups_with_page_roots() {
         let mut invalid = manifest();
-        invalid.group_index_pages.push(PackedContainerRef {
-            object_key: b"packed/group-index-0".to_vec(),
-            object_len: 4096,
-            object_digest: [5; 32],
+        invalid.group_index_pages.push(PackedGroupIndexPageRef {
+            object: PackedContainerRef {
+                object_key: b"packed/group-index-0".to_vec(),
+                object_len: 4096,
+                object_digest: [5; 32],
+            },
+            first_parent_dir_key: [1; 32],
+            first_name: b"a".to_vec(),
+            last_parent_dir_key: [1; 32],
+            last_name: b"z".to_vec(),
         });
         assert!(invalid.encode().is_err());
     }
@@ -920,6 +1158,46 @@ mod tests {
         let mut invalid = manifest();
         invalid.root_inode = 0;
         assert!(invalid.encode().is_err());
+    }
+
+    #[test]
+    fn manifest_pages_round_trip_and_route_by_fence() {
+        let page_ref = |first_name: &[u8], last_name: &[u8]| PackedGroupIndexPageRef {
+            object: PackedContainerRef {
+                object_key: format!("packed/group-index-{}-{}", first_name[0], last_name[0])
+                    .into_bytes(),
+                object_len: 4096,
+                object_digest: [5; 32],
+            },
+            first_parent_dir_key: [1; 32],
+            first_name: first_name.to_vec(),
+            last_parent_dir_key: [1; 32],
+            last_name: last_name.to_vec(),
+        };
+        let inode_ref = |first_inode, last_inode| PackedInodeIndexPageRef {
+            object: PackedContainerRef {
+                object_key: format!("packed/inode-index-{first_inode}").into_bytes(),
+                object_len: 4096,
+                object_digest: [6; 32],
+            },
+            first_inode,
+            last_inode,
+        };
+        let mut value = manifest();
+        value.groups.clear();
+        value.containers.clear();
+        value.group_index_pages = vec![page_ref(b"a", b"m"), page_ref(b"n", b"z")];
+        value.inode_index_pages = vec![inode_ref(1, 10), inode_ref(11, 20)];
+
+        let decoded = PackedSnapshotManifest::decode(value.encode().unwrap()).unwrap();
+        assert_eq!(decoded, value);
+        assert_eq!(decoded.group_index_page_for_name([1; 32], b"a"), Some(0));
+        assert_eq!(decoded.group_index_page_for_name([1; 32], b"m"), Some(0));
+        assert_eq!(decoded.group_index_page_for_name([1; 32], b"n"), Some(1));
+        assert_eq!(decoded.group_index_page_for_name([1; 32], b"0"), None);
+        assert_eq!(decoded.inode_index_page_for_inode(1), Some(0));
+        assert_eq!(decoded.inode_index_page_for_inode(20), Some(1));
+        assert_eq!(decoded.inode_index_page_for_inode(21), None);
     }
 
     #[test]

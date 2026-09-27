@@ -6,7 +6,7 @@ Scope: mutable workspaces, immutable snapshots, and adaptive physical layout on 
 
 当前代码已经落地 wire/container、GM05 GroupMeta、动态 frame packer、分页 index、
 bounded remote frame descriptor 读取、group catalog lookup 和统一 `UnifiedReadPlan`
-生成。PM05 manifest 已固化 root identity，II05 inode index 和 GM05 GroupMeta 已包含
+生成。PM06 manifest 已固化 root identity，并为 group/inode index page 携带有序路由 fence；II05 inode index 和 GM05 GroupMeta 已包含
 parent/POSIX 热属性；只读 FUSE mount 仍需接入实际 dispatch 和 generation-aware VFS
 resolver。未接入前不把 packed-v3 的局部 probe 数字写入性能对比表。
 
@@ -338,7 +338,7 @@ cold_attr_ref   : optional u32
 非规范编码。name suffix 是原始字节，跨 restart 的前缀长度只引用同一个 metadata
 block，不跨 group。
 
-当前 wire 实现使用固定宽度的 `GM05` 热属性字段；manifest 使用 `PM05` payload，
+当前 wire 实现使用固定宽度的 `GM05` 热属性字段；manifest 使用 `PM06` payload，
 inode index 使用 `II05` payload。manifest 固化 `root_dir_key`/`root_inode`，每个
 inode index value 固化 `parent_inode`、`parent_dir_key`、uid/gid/rdev/nlink 和
 atime/mtime/ctime_ns，因此只读 getattr 和根目录初始化不依赖额外 KV 查询。

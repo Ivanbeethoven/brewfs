@@ -34,6 +34,6 @@ pub use remote::{
 pub use wire::{
     COLD_ATTRIBUTE_MAGIC, GROUP_CONTAINER_MAGIC, GROUP_INDEX_MAGIC, INODE_INDEX_MAGIC,
     MANIFEST_MAGIC, PACKED_FOOTER_LEN, PACKED_FOOTER_MAGIC, PACKED_HEADER_LEN, PackedContainerRef,
-    PackedEnvelope, PackedGroupRef, PackedHeader, PackedObjectKind, PackedResult,
-    PackedSnapshotManifest, PackedWireError,
+    PackedEnvelope, PackedGroupIndexPageRef, PackedGroupRef, PackedHeader, PackedInodeIndexPageRef,
+    PackedObjectKind, PackedResult, PackedSnapshotManifest, PackedWireError,
 };

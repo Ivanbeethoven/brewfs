@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use dashmap::DashMap;
+use moka::future::Cache;
 use sha2::{Digest, Sha256};
 
 use crate::cadapter::client::{ObjectBackend, ObjectClient};
@@ -19,6 +19,7 @@ use super::wire::{
 };
 
 const MAX_GROUPS_PER_PAGE: usize = 4096;
+const MAX_OPEN_CONTAINERS: u64 = 1024;
 
 /// A catalog intentionally keeps only the immutable manifest and no decoded
 /// group metadata.  Callers may layer a byte-budgeted cache above it; strict
@@ -32,10 +33,10 @@ pub struct RemoteGroupCatalog<B: ObjectBackend + Clone> {
     /// Immutable container headers are safe to share across requests. Keeping
     /// the opened object here avoids a header range GET for each GroupMeta or
     /// frame-descriptor lookup without retaining decoded metadata or payload.
-    containers: Arc<DashMap<u32, Arc<RemotePackedObject<B>>>>,
+    containers: Cache<u32, Arc<RemotePackedObject<B>>>,
 }
 
-impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
+impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
     pub fn new(client: ObjectClient<B>, manifest: PackedSnapshotManifest) -> Self {
         let mut group_indexes = HashMap::with_capacity(manifest.groups.len());
         let mut parent_indexes: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
@@ -60,7 +61,7 @@ impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
             manifest: Arc::new(manifest),
             group_indexes: Arc::new(group_indexes),
             parent_indexes: Arc::new(parent_indexes),
-            containers: Arc::new(DashMap::new()),
+            containers: Cache::new(MAX_OPEN_CONTAINERS),
         }
     }
 
@@ -161,6 +162,27 @@ impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
             }))
     }
 
+    /// Resolve a dentry by the manifest's authenticated page fence. Large
+    /// snapshots therefore need one binary search in the manifest and one
+    /// bounded group-index page read; callers do not guess a page ordinal.
+    pub async fn group_for_name_paged(
+        &self,
+        parent_dir_key: [u8; 32],
+        name: &[u8],
+    ) -> PackedResult<Option<PackedGroupRef>> {
+        if self.manifest.group_index_pages.is_empty() {
+            return Ok(self.group_for_name(parent_dir_key, name).cloned());
+        }
+        let Some(page_ordinal) = self
+            .manifest
+            .group_index_page_for_name(parent_dir_key, name)
+        else {
+            return Ok(None);
+        };
+        self.group_for_name_from_index_page(page_ordinal, parent_dir_key, name)
+            .await
+    }
+
     /// Perform a dentry lookup using one pageable group-index page.  This is
     /// the page-backed counterpart to [`Self::lookup_entry`]; it is useful for
     /// million-file snapshots where keeping all group descriptors in RAM
@@ -175,6 +197,21 @@ impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
             .group_for_name_from_index_page(page_ordinal, parent_dir_key, name)
             .await?
         else {
+            return Ok(None);
+        };
+        Ok(self
+            .load_group_meta_for_ref(&group)
+            .await?
+            .lookup(name)
+            .cloned())
+    }
+
+    pub async fn lookup_entry_paged(
+        &self,
+        parent_dir_key: [u8; 32],
+        name: &[u8],
+    ) -> PackedResult<Option<GroupMetaEntry>> {
+        let Some(group) = self.group_for_name_paged(parent_dir_key, name).await? else {
             return Ok(None);
         };
         Ok(self
@@ -205,12 +242,12 @@ impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
     }
 
     async fn load_group_meta_for_ref(&self, group: &PackedGroupRef) -> PackedResult<GroupMeta> {
-        let remote = self.open_container(group.container_ordinal).await?;
         if usize::try_from(group.meta_len).is_ok_and(|len| len > MAX_GROUP_META_BYTES) {
             return Err(PackedWireError::LimitExceeded(
                 "packed group metadata exceeds 256 KiB".into(),
             ));
         }
+        let remote = self.open_container(group.container_ordinal).await?;
         let bytes = remote
             .read_range(u64::from(group.meta_offset), u64::from(group.meta_len))
             .await?;
@@ -273,6 +310,34 @@ impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
                 "packed group id is missing from the index page".into(),
             ));
         };
+        self.read_unified_plan_for_ref(&group, name, offset, length)
+            .await
+    }
+
+    pub async fn read_unified_plan_paged(
+        &self,
+        parent_dir_key: [u8; 32],
+        name: &[u8],
+        offset: u64,
+        length: u64,
+    ) -> PackedResult<UnifiedReadPlan> {
+        if self.manifest.group_index_pages.is_empty() {
+            let group = self
+                .group_for_name(parent_dir_key, name)
+                .cloned()
+                .ok_or_else(|| PackedWireError::Invalid("packed dentry is missing".into()))?;
+            return self
+                .read_unified_plan_for_ref(&group, name, offset, length)
+                .await;
+        }
+        let page_ordinal = self
+            .manifest
+            .group_index_page_for_name(parent_dir_key, name)
+            .ok_or_else(|| PackedWireError::Invalid("packed dentry is missing".into()))?;
+        let group = self
+            .group_for_name_from_index_page(page_ordinal, parent_dir_key, name)
+            .await?
+            .ok_or_else(|| PackedWireError::Invalid("packed dentry is missing".into()))?;
         self.read_unified_plan_for_ref(&group, name, offset, length)
             .await
     }
@@ -387,7 +452,7 @@ impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
             .get(page_ordinal)
             .ok_or_else(|| PackedWireError::Invalid("packed group index page is missing".into()))?;
         let object = self
-            .read_index_object(reference, PackedObjectKind::GroupIndex)
+            .read_index_object(&reference.object, PackedObjectKind::GroupIndex)
             .await?;
         let page = PackedGroupIndexPage::decode(object)?;
         if page.snapshot_id != self.manifest.snapshot_id
@@ -398,6 +463,7 @@ impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
                 "packed group index page does not match the manifest".into(),
             ));
         }
+        page.validate_reference(reference)?;
         Ok(page)
     }
 
@@ -411,7 +477,7 @@ impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
             .get(page_ordinal)
             .ok_or_else(|| PackedWireError::Invalid("packed inode index page is missing".into()))?;
         let object = self
-            .read_index_object(reference, PackedObjectKind::InodeIndex)
+            .read_index_object(&reference.object, PackedObjectKind::InodeIndex)
             .await?;
         let page = PackedInodeIndexPage::decode(object)?;
         if page.snapshot_id != self.manifest.snapshot_id
@@ -422,6 +488,7 @@ impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
                 "packed inode index page does not match the manifest".into(),
             ));
         }
+        page.validate_reference(reference)?;
         Ok(page)
     }
 
@@ -442,6 +509,19 @@ impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
             .entries
             .into_iter()
             .find(|entry| entry.inode == inode))
+    }
+
+    pub async fn inode_paged(
+        &self,
+        inode: u64,
+    ) -> PackedResult<Option<super::index::PackedInodeIndexEntry>> {
+        if self.manifest.inode_index_pages.is_empty() {
+            return Ok(None);
+        }
+        let Some(page_ordinal) = self.manifest.inode_index_page_for_inode(inode) else {
+            return Ok(None);
+        };
+        self.inode_from_index_page(page_ordinal, inode).await
     }
 
     async fn read_index_object(
@@ -494,31 +574,34 @@ impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
         &self,
         container_ordinal: u32,
     ) -> PackedResult<Arc<RemotePackedObject<B>>> {
-        if let Some(remote) = self.containers.get(&container_ordinal) {
-            return Ok(Arc::clone(remote.value()));
-        }
+        // Validate before cache admission. Failed opens are never cached, and
+        // concurrent requests for the same ordinal share one initialization.
         let container = self
             .manifest
             .containers
             .get(container_ordinal as usize)
             .ok_or_else(|| PackedWireError::Invalid("packed group container is missing".into()))?;
-        let key = std::str::from_utf8(&container.object_key).map_err(|_| {
-            PackedWireError::Invalid("packed container object key is not UTF-8".into())
-        })?;
-        let remote = Arc::new(
-            RemotePackedObject::open(
-                &self.client,
-                key,
-                container.object_len,
-                PackedObjectKind::GroupContainer,
-            )
-            .await?,
-        );
-        let existing = self
-            .containers
-            .entry(container_ordinal)
-            .or_insert_with(|| Arc::clone(&remote));
-        Ok(Arc::clone(existing.value()))
+        let object_key = std::str::from_utf8(&container.object_key)
+            .map_err(|_| {
+                PackedWireError::Invalid("packed container object key is not UTF-8".into())
+            })?
+            .to_owned();
+        let object_len = container.object_len;
+        let client = self.client.clone();
+        self.containers
+            .try_get_with(container_ordinal, async {
+                Ok::<_, PackedWireError>(Arc::new(
+                    RemotePackedObject::open(
+                        &client,
+                        &object_key,
+                        object_len,
+                        PackedObjectKind::GroupContainer,
+                    )
+                    .await?,
+                ))
+            })
+            .await
+            .map_err(|error| (*error).clone())
     }
 }
 
@@ -732,10 +815,16 @@ mod tests {
                 object_len: opened.object_len(),
                 object_digest: opened.object_digest(),
             }],
-            group_index_pages: vec![PackedContainerRef {
-                object_key: b"group-index".to_vec(),
-                object_len: page.len() as u64,
-                object_digest: Sha256::digest(&page).into(),
+            group_index_pages: vec![super::super::wire::PackedGroupIndexPageRef {
+                object: PackedContainerRef {
+                    object_key: b"group-index".to_vec(),
+                    object_len: page.len() as u64,
+                    object_digest: Sha256::digest(&page).into(),
+                },
+                first_parent_dir_key: [8; 32],
+                first_name: b"sample.bin".to_vec(),
+                last_parent_dir_key: [8; 32],
+                last_name: b"sample.bin".to_vec(),
             }],
             inode_index_pages: Vec::new(),
         };
@@ -746,16 +835,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(group.group_id, 9);
+        assert_eq!(
+            catalog
+                .group_for_name_paged([8; 32], b"sample.bin")
+                .await
+                .unwrap()
+                .unwrap()
+                .group_id,
+            9
+        );
         let entry = catalog
             .lookup_entry_from_index_page(0, [8; 32], b"sample.bin")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(entry.inode, 7);
+        assert_eq!(
+            catalog
+                .lookup_entry_paged([8; 32], b"sample.bin")
+                .await
+                .unwrap()
+                .unwrap()
+                .inode,
+            7
+        );
         let plan = catalog
             .read_unified_plan_from_index_page(0, 9, b"sample.bin", 1, 4)
             .await
             .unwrap();
+        let paged_plan = catalog
+            .read_unified_plan_paged([8; 32], b"sample.bin", 1, 4)
+            .await
+            .unwrap();
+        assert_eq!(paged_plan, plan);
         let remote = super::super::remote::RemotePackedObject::open(
             catalog.client(),
             "container",

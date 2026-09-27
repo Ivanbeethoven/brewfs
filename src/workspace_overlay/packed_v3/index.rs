@@ -2,7 +2,8 @@
 
 use super::layout::AccessProfile;
 use super::wire::{
-    PackedEnvelope, PackedGroupRef, PackedObjectKind, PackedResult, PackedWireError, Reader, Writer,
+    PackedEnvelope, PackedGroupIndexPageRef, PackedGroupRef, PackedInodeIndexPageRef,
+    PackedObjectKind, PackedResult, PackedWireError, Reader, Writer, compare_group_key,
 };
 
 const MAX_PAGE_ENTRIES: u32 = 4096;
@@ -19,6 +20,7 @@ pub struct PackedGroupIndexPage {
 impl PackedGroupIndexPage {
     pub fn encode(&self) -> PackedResult<Vec<u8>> {
         validate_page_header(self.page_ordinal, self.total_pages, self.groups.len())?;
+        validate_group_order(&self.groups)?;
         let mut writer = Writer::default();
         writer.bytes(b"GI04");
         writer.bytes(&self.snapshot_id);
@@ -53,6 +55,7 @@ impl PackedGroupIndexPage {
         for _ in 0..count {
             groups.push(decode_group_ref(&mut reader)?);
         }
+        validate_group_order(&groups)?;
         if !reader.is_empty() {
             return Err(PackedWireError::Invalid(
                 "packed group index page has trailing bytes".into(),
@@ -63,6 +66,37 @@ impl PackedGroupIndexPage {
             page_ordinal,
             total_pages,
             groups,
+        })
+    }
+
+    /// Check that this page's first and last groups exactly match the
+    /// authenticated manifest routing fence.
+    pub fn validate_reference(&self, reference: &PackedGroupIndexPageRef) -> PackedResult<()> {
+        let first = self
+            .groups
+            .first()
+            .ok_or_else(|| PackedWireError::Invalid("packed group index page is empty".into()))?;
+        let last = self
+            .groups
+            .last()
+            .ok_or_else(|| PackedWireError::Invalid("packed group index page is empty".into()))?;
+        if first.parent_dir_key != reference.first_parent_dir_key
+            || first.first_name != reference.first_name
+            || last.parent_dir_key != reference.last_parent_dir_key
+            || last.last_name != reference.last_name
+        {
+            return Err(PackedWireError::Invalid(
+                "packed group index page fence does not match manifest".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn contains(&self, parent_dir_key: [u8; 32], name: &[u8]) -> bool {
+        self.groups.iter().any(|group| {
+            group.parent_dir_key == parent_dir_key
+                && group.first_name.as_slice() <= name
+                && group.last_name.as_slice() >= name
         })
     }
 }
@@ -100,6 +134,7 @@ pub struct PackedInodeIndexPage {
 impl PackedInodeIndexPage {
     pub fn encode(&self) -> PackedResult<Vec<u8>> {
         validate_page_header(self.page_ordinal, self.total_pages, self.entries.len())?;
+        validate_inode_order(&self.entries)?;
         let mut writer = Writer::default();
         writer.bytes(b"II05");
         writer.bytes(&self.snapshot_id);
@@ -193,6 +228,7 @@ impl PackedInodeIndexPage {
                 size,
             });
         }
+        validate_inode_order(&entries)?;
         if !reader.is_empty() {
             return Err(PackedWireError::Invalid(
                 "packed inode index page has trailing bytes".into(),
@@ -205,6 +241,64 @@ impl PackedInodeIndexPage {
             entries,
         })
     }
+
+    /// Check that the page's first and last inode exactly match its manifest
+    /// routing range.
+    pub fn validate_reference(&self, reference: &PackedInodeIndexPageRef) -> PackedResult<()> {
+        let first = self
+            .entries
+            .first()
+            .ok_or_else(|| PackedWireError::Invalid("packed inode index page is empty".into()))?;
+        let last = self
+            .entries
+            .last()
+            .ok_or_else(|| PackedWireError::Invalid("packed inode index page is empty".into()))?;
+        if first.inode != reference.first_inode || last.inode != reference.last_inode {
+            return Err(PackedWireError::Invalid(
+                "packed inode index page range does not match manifest".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn contains(&self, inode: u64) -> bool {
+        self.entries
+            .binary_search_by_key(&inode, |entry| entry.inode)
+            .is_ok()
+    }
+}
+
+fn validate_group_order(groups: &[PackedGroupRef]) -> PackedResult<()> {
+    for pair in groups.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        if compare_group_key(
+            previous.parent_dir_key,
+            &previous.first_name,
+            current.parent_dir_key,
+            &current.first_name,
+        ) != std::cmp::Ordering::Less
+            || (previous.parent_dir_key == current.parent_dir_key
+                && previous.last_name >= current.first_name)
+        {
+            return Err(PackedWireError::Invalid(
+                "packed group index page groups are unsorted or overlapping".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_inode_order(entries: &[PackedInodeIndexEntry]) -> PackedResult<()> {
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].inode >= pair[1].inode)
+    {
+        return Err(PackedWireError::Invalid(
+            "packed inode index page entries are not strictly ordered".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_page_header(page_ordinal: u32, total_pages: u32, count: usize) -> PackedResult<()> {
@@ -354,6 +448,22 @@ mod tests {
     }
 
     #[test]
+    fn group_index_page_rejects_overlapping_name_ranges() {
+        let mut first = group();
+        first.last_name = b"m".to_vec();
+        let mut second = group();
+        second.group_id = 2;
+        second.first_name = b"l".to_vec();
+        let page = PackedGroupIndexPage {
+            snapshot_id: [4; 32],
+            page_ordinal: 0,
+            total_pages: 1,
+            groups: vec![first, second],
+        };
+        assert!(page.encode().is_err());
+    }
+
+    #[test]
     fn inode_index_page_rejects_invalid_name() {
         let page = PackedInodeIndexPage {
             snapshot_id: [4; 32],
@@ -410,5 +520,34 @@ mod tests {
             PackedInodeIndexPage::decode(page.encode().unwrap()).unwrap(),
             page
         );
+    }
+
+    #[test]
+    fn inode_index_page_rejects_unsorted_entries() {
+        let entry = |inode| PackedInodeIndexEntry {
+            inode,
+            parent_inode: 2,
+            parent_dir_key: [7; 32],
+            group_id: 3,
+            entry_ordinal: 4,
+            name: format!("sample-{}", inode).into_bytes(),
+            kind: 1,
+            mode: 0o100640,
+            uid: 1001,
+            gid: 1002,
+            rdev: 0,
+            nlink: 1,
+            atime_ns: 1,
+            mtime_ns: 2,
+            ctime_ns: 3,
+            size: 4096,
+        };
+        let page = PackedInodeIndexPage {
+            snapshot_id: [4; 32],
+            page_ordinal: 0,
+            total_pages: 1,
+            entries: vec![entry(2), entry(1)],
+        };
+        assert!(page.encode().is_err());
     }
 }
