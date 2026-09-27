@@ -198,6 +198,14 @@ where
         state
     }
 
+    fn mark_write_dirty_for_inode(&self, ino: i64) {
+        for fh in self.handles_for(ino) {
+            if let Some(handle) = self.handles.get(&fh) {
+                handle.mark_write_dirty();
+            }
+        }
+    }
+
     fn take_write_dirty(&self, fh: u64) -> WriteDirtyState {
         self.handles
             .get(&fh)
@@ -4451,6 +4459,44 @@ where
             return;
         }
         let _ = self.state.writer.flush_if_exists(ino).await;
+    }
+
+    /// Flush pending inode writeback for a stateless FUSE request and retain
+    /// the error.  `flush_inode` is intentionally best-effort for metadata
+    /// operations such as rename; FUSE flush/release must report a failed
+    /// upload instead of silently acknowledging it.
+    pub(crate) async fn flush_inode_required(&self, ino: u64) -> Result<(), VfsError> {
+        #[cfg(feature = "native-packed-base")]
+        if let Some(runtime) = self.native_runtime() {
+            let report = runtime
+                .fsync(ino)
+                .await
+                .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?;
+            if !report.committed.is_empty() {
+                self.update_mtime_ctime(ino as i64).await?;
+            }
+            return Ok(());
+        }
+
+        let dirty_state = self.state.handles.take_write_dirty_for_inode(ino as i64);
+        let flushed_pending = match self.state.writer.flush_required_snapshot(ino).await {
+            Ok(flushed_pending) => flushed_pending,
+            Err(error) => {
+                if dirty_state.dirty {
+                    self.state.handles.mark_write_dirty_for_inode(ino as i64);
+                }
+                return Err(VfsError::from(error));
+            }
+        };
+        if Self::flush_needs_mtime_ctime_update(dirty_state, flushed_pending)
+            && let Err(error) = self.update_mtime_ctime(ino as i64).await
+        {
+            if dirty_state.dirty {
+                self.state.handles.mark_write_dirty_for_inode(ino as i64);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Sync file content (fsync): flush pending writes.

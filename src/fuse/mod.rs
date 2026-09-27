@@ -1959,12 +1959,12 @@ where
     // Close file handle
     async fn release(
         &self,
-        _req: Request,
+        req: Request,
         inode: u64,
         fh: u64,
         _flags: u32,
         lock_owner: u64,
-        _flush: bool,
+        flush: bool,
     ) -> FuseResult<()> {
         // Virtual .stats file: no real handle to close.
         if inode == STATS_INODE {
@@ -1973,6 +1973,19 @@ where
         debug!(fh, "fuse.release");
         self.unlock_owner_locks(inode, lock_owner).await;
         self.unlock_handle_locks(inode, fh).await;
+        if fh == 0 {
+            // A stateless FUSE open has no VFS handle to release.  The
+            // kernel may request the final flush here instead of sending a
+            // separate FLUSH operation.
+            if flush {
+                self.wait_for_prior_fuse_writes(inode as i64, req.unique)
+                    .await;
+                self.flush_inode_required(inode)
+                    .await
+                    .map_err(Errno::from)?;
+            }
+            return Ok(());
+        }
         self.close(fh).await.map_err(Errno::from)?;
         Ok(())
     }
@@ -1988,6 +2001,16 @@ where
         self.wait_for_prior_fuse_writes(inode as i64, req.unique)
             .await;
         self.unlock_owner_locks(inode, lock_owner).await;
+        if fh == 0 {
+            // asyncfuse can issue a stateless flush for a read-only open. There
+            // is no per-handle dirty state to snapshot in that case, so flush
+            // any inode-level writeback and avoid treating the absent handle
+            // as ESTALE when the caller closes the file.
+            self.flush_inode_required(inode)
+                .await
+                .map_err(Errno::from)?;
+            return Ok(());
+        }
         self.flush_dirty_handle_snapshot(fh)
             .await
             .map_err(Errno::from)?;
@@ -4312,6 +4335,53 @@ mod fuse_init_tests {
 
         assert_eq!(err, Errno::from(libc::EACCES));
         assert_eq!(fs.stat("/file.txt").await.unwrap().size, 0);
+    }
+
+    #[tokio::test]
+    async fn stateless_read_flush_without_handle_succeeds() {
+        let fs = new_fuse_test_vfs().await;
+        fs.create_file("/file.txt").await.unwrap();
+        let attr = fs.stat("/file.txt").await.unwrap();
+
+        Filesystem::flush(&fs, Request::default(), attr.ino as u64, 0, 0)
+            .await
+            .unwrap();
+        Filesystem::release(&fs, Request::default(), attr.ino as u64, 0, 0, 0, true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stateless_write_flush_and_release_without_handle_persists() {
+        let fs = new_fuse_test_vfs().await;
+        fs.create_file("/file.txt").await.unwrap();
+        let attr = fs.stat("/file.txt").await.unwrap();
+
+        let reply = Filesystem::write(
+            &fs,
+            request_with_ids(0, 0),
+            attr.ino as u64,
+            0,
+            0,
+            b"x",
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.written, 1);
+
+        Filesystem::flush(&fs, Request::default(), attr.ino as u64, 0, 0)
+            .await
+            .unwrap();
+        Filesystem::release(&fs, Request::default(), attr.ino as u64, 0, 0, 0, true)
+            .await
+            .unwrap();
+
+        let attr = fs.stat("/file.txt").await.unwrap();
+        let fh = fs.open(attr.ino, attr, true, false, false).await.unwrap();
+        assert_eq!(fs.read(fh, 0, 1).await.unwrap(), b"x");
+        fs.close(fh).await.unwrap();
     }
 
     #[tokio::test]

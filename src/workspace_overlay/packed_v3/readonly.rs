@@ -424,6 +424,10 @@ mod tests {
         let meta = PackedV3ReadonlyMeta::new(Arc::clone(&catalog), 4096);
         assert_eq!(meta.lookup(1, "file").await.unwrap(), Some(2));
         assert_eq!(meta.stat(2).await.unwrap().unwrap().size, 5);
+        assert_eq!(
+            meta.get_paths(2).await.unwrap(),
+            vec![String::from("/file")]
+        );
         let store = PackedV3BlockStore::new(catalog, 4096, 4096).unwrap();
         let key = (chunk_id_for(2, 0).unwrap(), 0);
         let mut output = [0; 5];
@@ -705,10 +709,51 @@ where
             .map_err(map_error)?
             .map(|entry| entry.parent_inode as i64))
     }
-    async fn get_paths(&self, _ino: i64) -> Result<Vec<String>, MetaError> {
-        Err(MetaError::NotSupported(
-            "packed v3 path enumeration requires an inode index reverse map".into(),
-        ))
+    async fn get_paths(&self, ino: i64) -> Result<Vec<String>, MetaError> {
+        let inode = Self::inode(ino)?;
+        if inode == self.manifest.root_inode {
+            return Ok(vec![String::from("/")]);
+        }
+
+        // The inode index already carries the parent and raw dentry name.
+        // Walk only this inode's ancestor chain; do not scan directory groups
+        // or materialize a reverse path table for the whole snapshot.
+        let mut components = Vec::new();
+        let mut current = inode;
+        let mut depth = 0usize;
+        while current != self.manifest.root_inode {
+            depth = depth.saturating_add(1);
+            if depth > 1024 {
+                return Err(MetaError::Internal(
+                    "packed v3 inode path exceeds maximum depth".into(),
+                ));
+            }
+            let Some(entry) = self.catalog.inode_paged(current).await.map_err(map_error)? else {
+                return Ok(Vec::new());
+            };
+            if entry.name.is_empty()
+                || entry.name == b"."
+                || entry.name == b".."
+                || entry.name.contains(&b'/')
+            {
+                return Err(MetaError::InvalidFilename);
+            }
+            components.push(entry.name);
+            current = entry.parent_inode;
+        }
+
+        components.reverse();
+        let mut path = String::new();
+        for component in components {
+            let component = String::from_utf8(component).map_err(|_| MetaError::InvalidFilename)?;
+            path.push('/');
+            path.push_str(&component);
+        }
+        Ok(vec![if path.is_empty() {
+            String::from("/")
+        } else {
+            path
+        }])
     }
     async fn read_symlink(&self, _ino: i64) -> Result<String, MetaError> {
         Err(MetaError::NotSupported(
