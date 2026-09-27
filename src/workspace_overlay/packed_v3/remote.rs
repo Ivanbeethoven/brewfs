@@ -427,6 +427,13 @@ mod tests {
                     inode: 1,
                     kind: 1,
                     mode: 0o100644,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    nlink: 1,
+                    atime_ns: 0,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
                     size: 7,
                     flags: 0,
                     extents: vec![GroupMetaExtent {

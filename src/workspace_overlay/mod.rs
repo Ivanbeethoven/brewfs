@@ -17,6 +17,7 @@ pub mod lifecycle;
 pub mod meta_layer;
 pub mod metrics;
 pub mod model;
+pub mod packed_v3;
 pub mod publish;
 pub mod resolver;
 pub mod stores;

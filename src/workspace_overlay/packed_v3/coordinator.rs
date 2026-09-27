@@ -1,0 +1,432 @@
+//! Bounded frame range planning and cold-read coordination.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use bytes::Bytes;
+use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
+
+use super::layout::AccessProfile;
+use super::remote::RemotePackedObject;
+use super::{PackedFrameDescriptor, PackedResult, PackedWireError, SizeClass};
+
+/// Limits applied before any remote range request is started.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoordinatorLimits {
+    pub max_merge_gap: u64,
+    pub max_coalesced_range: u64,
+    pub pipeline_bytes_budget: u64,
+    pub max_inflight_ranges: usize,
+}
+
+impl Default for CoordinatorLimits {
+    fn default() -> Self {
+        Self {
+            max_merge_gap: 64 * 1024,
+            max_coalesced_range: 8 * 1024 * 1024,
+            pipeline_bytes_budget: 32 * 1024 * 1024,
+            max_inflight_ranges: 16,
+        }
+    }
+}
+
+impl CoordinatorLimits {
+    fn validate(self) -> PackedResult<Self> {
+        if self.max_coalesced_range == 0
+            || self.pipeline_bytes_budget == 0
+            || self.max_inflight_ranges == 0
+            || self.max_coalesced_range > super::remote::MAX_PACKED_STREAM_RANGE_BYTES
+        {
+            return Err(PackedWireError::LimitExceeded(
+                "invalid packed group coordinator limits".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
+/// A requested frame and its logical contribution to the caller's read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrameReadRequest {
+    pub descriptor: PackedFrameDescriptor,
+    pub logical_len: u64,
+}
+
+/// One physical range request and the frames contained in it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoalescedRange {
+    pub offset: u64,
+    pub length: u64,
+    pub size_class: SizeClass,
+    pub frames: Vec<FrameReadRequest>,
+    pub logical_bytes: u64,
+}
+
+/// Per-mount coordinator configuration. It is intentionally stateless between
+/// calls: decoded frames are returned to the caller and are not retained as a
+/// hidden data cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupReadCoordinator {
+    profile: AccessProfile,
+    limits: CoordinatorLimits,
+}
+
+impl GroupReadCoordinator {
+    pub fn new(profile: AccessProfile, limits: CoordinatorLimits) -> PackedResult<Self> {
+        Ok(Self {
+            profile,
+            limits: limits.validate()?,
+        })
+    }
+
+    pub fn profile(&self) -> AccessProfile {
+        self.profile
+    }
+
+    pub fn limits(&self) -> CoordinatorLimits {
+        self.limits
+    }
+
+    pub fn plan(
+        &self,
+        requests: impl IntoIterator<Item = FrameReadRequest>,
+    ) -> PackedResult<Vec<CoalescedRange>> {
+        coalesce_frame_ranges(self.profile, requests, self.limits)
+    }
+
+    pub async fn read_frames<B: crate::cadapter::client::ObjectBackend + Clone>(
+        &self,
+        object: &RemotePackedObject<B>,
+        requests: impl IntoIterator<Item = FrameReadRequest>,
+    ) -> PackedResult<std::collections::BTreeMap<u32, Bytes>> {
+        read_coalesced_frames(object, self.profile, requests, self.limits).await
+    }
+}
+
+impl CoalescedRange {
+    pub fn overscan_bytes(&self) -> u64 {
+        self.length.saturating_sub(self.logical_bytes)
+    }
+}
+
+/// Build deterministic, class-aware physical ranges. Duplicate frame
+/// requests are collapsed here, which is the synchronous singleflight layer
+/// used by strict-cold reads.
+pub fn coalesce_frame_ranges(
+    profile: AccessProfile,
+    requests: impl IntoIterator<Item = FrameReadRequest>,
+    limits: CoordinatorLimits,
+) -> PackedResult<Vec<CoalescedRange>> {
+    let limits = limits.validate()?;
+    // A range can never consume more than the bytes available to the
+    // pipeline.  Keep this bound in the merge decision itself so a valid
+    // configuration with `pipeline_bytes_budget < max_coalesced_range`
+    // produces several bounded requests instead of building an oversized
+    // range and failing only after planning.
+    let max_range = limits.max_coalesced_range.min(limits.pipeline_bytes_budget);
+    let mut unique = HashMap::<u32, FrameReadRequest>::new();
+    for request in requests {
+        let descriptor = &request.descriptor;
+        if descriptor.stored_len == 0
+            || descriptor.raw_len == 0
+            || descriptor.stored_len != descriptor.raw_len
+            || request.logical_len == 0
+            || request.logical_len > u64::from(descriptor.raw_len)
+        {
+            return Err(PackedWireError::Invalid(
+                "frame range request has invalid descriptor or logical lengths".into(),
+            ));
+        }
+        let end = descriptor
+            .object_offset
+            .checked_add(u64::from(descriptor.stored_len))
+            .ok_or_else(|| PackedWireError::LimitExceeded("frame range overflows".into()))?;
+        if end < descriptor.object_offset {
+            return Err(PackedWireError::Invalid("frame range is inverted".into()));
+        }
+        match unique.entry(descriptor.frame_ordinal) {
+            std::collections::hash_map::Entry::Occupied(mut existing) => {
+                if existing.get().descriptor != request.descriptor {
+                    return Err(PackedWireError::Invalid(
+                        "same frame ordinal has conflicting descriptors".into(),
+                    ));
+                }
+                let logical_len = existing.get().logical_len.max(request.logical_len);
+                existing.get_mut().logical_len = logical_len;
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(request);
+            }
+        }
+    }
+
+    let mut by_class = BTreeMap::<u8, Vec<FrameReadRequest>>::new();
+    for request in unique.into_values() {
+        by_class
+            .entry(request.descriptor.size_class as u8)
+            .or_default()
+            .push(request);
+    }
+    let mut result = Vec::new();
+    for (_, mut requests) in by_class {
+        requests.sort_by_key(|request| request.descriptor.object_offset);
+        let mut current: Option<CoalescedRange> = None;
+        for request in requests {
+            let descriptor = &request.descriptor;
+            let start = descriptor.object_offset;
+            let end = start + u64::from(descriptor.stored_len);
+            let should_merge = current.as_ref().is_some_and(|range| {
+                let current_end = range.offset + range.length;
+                let gap = start.saturating_sub(current_end);
+                let merged_len = end.saturating_sub(range.offset);
+                let logical = range.logical_bytes.saturating_add(request.logical_len);
+                let multiplier = match profile {
+                    AccessProfile::SequentialSmallFile => 16,
+                    AccessProfile::RandomSmallFile | AccessProfile::Mixed => 4,
+                };
+                gap <= limits.max_merge_gap
+                    && merged_len <= max_range
+                    && merged_len <= logical.saturating_mul(multiplier).max(1)
+            });
+            if should_merge {
+                let range = current.as_mut().expect("checked above");
+                let range_end = end.max(range.offset + range.length);
+                range.length = range_end - range.offset;
+                range.logical_bytes = range.logical_bytes.saturating_add(request.logical_len);
+                range.frames.push(request);
+            } else {
+                if let Some(range) = current.take() {
+                    result.push(range);
+                }
+                current = Some(CoalescedRange {
+                    offset: start,
+                    length: u64::from(descriptor.stored_len),
+                    size_class: descriptor.size_class,
+                    logical_bytes: request.logical_len,
+                    frames: vec![request],
+                });
+            }
+        }
+        if let Some(range) = current {
+            result.push(range);
+        }
+    }
+    result.sort_by_key(|range| range.offset);
+    // A single frame larger than the pipeline budget cannot be split by this
+    // planner.  Keep the explicit error for that case while merged ranges
+    // are already bounded by `max_range` above.
+    if result
+        .iter()
+        .any(|range| range.length > limits.pipeline_bytes_budget)
+    {
+        return Err(PackedWireError::LimitExceeded(
+            "coalesced range exceeds pipeline byte budget".into(),
+        ));
+    }
+    Ok(result)
+}
+
+/// Fetch the planned ranges with bounded in-flight bytes. Returned frame
+/// payloads are detached from the range buffer, so callers can release the
+/// coalesced response immediately after delivery.
+pub async fn read_coalesced_frames<B: crate::cadapter::client::ObjectBackend + Clone>(
+    object: &RemotePackedObject<B>,
+    profile: AccessProfile,
+    requests: impl IntoIterator<Item = FrameReadRequest>,
+    limits: CoordinatorLimits,
+) -> PackedResult<BTreeMap<u32, Bytes>> {
+    let limits = limits.validate()?;
+    let ranges = coalesce_frame_ranges(profile, requests, limits)?;
+    let semaphore = Arc::new(Semaphore::new(
+        usize::try_from(limits.pipeline_bytes_budget).map_err(|_| {
+            PackedWireError::LimitExceeded("pipeline byte budget exceeds usize".into())
+        })?,
+    ));
+    let max_inflight = limits.max_inflight_ranges;
+    let mut stream = futures_util::stream::iter(ranges.into_iter().map(|range| {
+        let semaphore = Arc::clone(&semaphore);
+        async move {
+            let permits = u32::try_from(range.length).map_err(|_| {
+                PackedWireError::LimitExceeded("coalesced range exceeds semaphore permits".into())
+            })?;
+            let permit = semaphore
+                .acquire_many_owned(permits)
+                .await
+                .map_err(|_| PackedWireError::Backend("pipeline semaphore closed".into()))?;
+            let bytes = object.read_range(range.offset, range.length).await?;
+            Ok::<_, PackedWireError>((range, bytes, permit))
+        }
+    }))
+    .buffer_unordered(max_inflight);
+
+    let mut output = BTreeMap::new();
+    while let Some(result) = stream.next().await {
+        let (range, bytes, permit) = result?;
+        if bytes.len() as u64 != range.length {
+            return Err(PackedWireError::Truncated {
+                what: "coalesced packed frame range",
+                need: range.length as usize,
+                have: bytes.len(),
+            });
+        }
+        for request in range.frames {
+            let relative = request
+                .descriptor
+                .object_offset
+                .checked_sub(range.offset)
+                .ok_or_else(|| {
+                    PackedWireError::Invalid("frame is outside coalesced range".into())
+                })?;
+            let start = usize::try_from(relative).map_err(|_| {
+                PackedWireError::LimitExceeded("frame range offset exceeds usize".into())
+            })?;
+            let end = start
+                .checked_add(request.descriptor.stored_len as usize)
+                .ok_or_else(|| PackedWireError::LimitExceeded("frame slice overflows".into()))?;
+            if end > bytes.len() {
+                return Err(PackedWireError::Truncated {
+                    what: "frame in coalesced range",
+                    need: end,
+                    have: bytes.len(),
+                });
+            }
+            let payload = &bytes[start..end];
+            let digest: [u8; 16] = Sha256::digest(payload)[..16]
+                .try_into()
+                .expect("sha256 prefix has 16 bytes");
+            if digest != request.descriptor.frame_digest {
+                return Err(PackedWireError::Invalid(
+                    "packed frame digest mismatch".into(),
+                ));
+            }
+            output.insert(
+                request.descriptor.frame_ordinal,
+                Bytes::copy_from_slice(payload),
+            );
+        }
+        drop(permit);
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(ordinal: u32, offset: u64, size_class: SizeClass) -> FrameReadRequest {
+        let raw = [ordinal as u8; 1024];
+        let digest: [u8; 16] = Sha256::digest(raw)[..16].try_into().unwrap();
+        FrameReadRequest {
+            descriptor: PackedFrameDescriptor {
+                frame_ordinal: ordinal,
+                object_offset: offset,
+                stored_len: raw.len() as u32,
+                raw_len: raw.len() as u32,
+                first_file_slot: ordinal,
+                last_file_slot: ordinal,
+                size_class,
+                codec: 0,
+                frame_digest: digest,
+            },
+            logical_len: 1024,
+        }
+    }
+
+    #[test]
+    fn planner_deduplicates_and_merges_same_class() {
+        let ranges = coalesce_frame_ranges(
+            AccessProfile::RandomSmallFile,
+            vec![
+                request(1, 1000, SizeClass::Tiny),
+                request(0, 0, SizeClass::Tiny),
+                request(1, 1000, SizeClass::Tiny),
+            ],
+            CoordinatorLimits {
+                max_merge_gap: 0,
+                max_coalesced_range: 4096,
+                pipeline_bytes_budget: 4096,
+                max_inflight_ranges: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].frames.len(), 2);
+        assert_eq!(ranges[0].length, 2024);
+    }
+
+    #[test]
+    fn planner_keeps_size_classes_separate() {
+        let ranges = coalesce_frame_ranges(
+            AccessProfile::SequentialSmallFile,
+            vec![
+                request(0, 0, SizeClass::Tiny),
+                request(1, 1024, SizeClass::Small),
+            ],
+            CoordinatorLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(ranges.len(), 2);
+    }
+
+    #[test]
+    fn planner_enforces_random_overscan() {
+        let error = coalesce_frame_ranges(
+            AccessProfile::RandomSmallFile,
+            vec![
+                request(0, 0, SizeClass::Tiny),
+                request(1, 8000, SizeClass::Tiny),
+            ],
+            CoordinatorLimits {
+                max_merge_gap: 8192,
+                max_coalesced_range: 16 * 1024,
+                pipeline_bytes_budget: 16 * 1024,
+                max_inflight_ranges: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(error.len(), 2);
+    }
+
+    #[test]
+    fn planner_splits_when_pipeline_budget_is_below_merge_limit() {
+        let ranges = coalesce_frame_ranges(
+            AccessProfile::RandomSmallFile,
+            vec![
+                request(0, 0, SizeClass::Tiny),
+                request(1, 1024, SizeClass::Tiny),
+                request(2, 2048, SizeClass::Tiny),
+            ],
+            CoordinatorLimits {
+                max_merge_gap: 0,
+                max_coalesced_range: 4096,
+                pipeline_bytes_budget: 2048,
+                max_inflight_ranges: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].length, 2048);
+        assert_eq!(ranges[1].length, 1024);
+        assert!(ranges.iter().all(|range| range.length <= 2048));
+    }
+
+    #[test]
+    fn planner_rejects_a_single_frame_over_pipeline_budget() {
+        let error = coalesce_frame_ranges(
+            AccessProfile::RandomSmallFile,
+            [request(0, 0, SizeClass::Tiny)],
+            CoordinatorLimits {
+                max_merge_gap: 0,
+                max_coalesced_range: 4096,
+                pipeline_bytes_budget: 512,
+                max_inflight_ranges: 1,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PackedWireError::LimitExceeded(_)));
+    }
+}
