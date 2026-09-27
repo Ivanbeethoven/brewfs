@@ -7,10 +7,14 @@ use moka::future::Cache;
 use sha2::{Digest, Sha256};
 
 use crate::cadapter::client::{ObjectBackend, ObjectClient};
-use crate::chunk::read_plan::{LogicalSegment, ReadGeneration, ReadSource, UnifiedReadPlan};
+use crate::chunk::read_plan::{
+    LogicalSegment, ReadGeneration, ReadSource, UnifiedReadPlan, execute_unified_into,
+};
 
+use super::coordinator::{CoordinatorLimits, FrameReadRequest, GroupReadCoordinator};
 use super::group::PackedFrameDescriptor;
 use super::index::{PackedGroupIndexPage, PackedInodeIndexPage};
+use super::layout::SizeClass;
 use super::meta::{GroupMeta, GroupMetaEntry, MAX_GROUP_META_BYTES};
 use super::remote::{RemotePackedObject, read_exact_range};
 use super::wire::{
@@ -20,6 +24,18 @@ use super::wire::{
 
 const MAX_GROUPS_PER_PAGE: usize = 4096;
 const MAX_OPEN_CONTAINERS: u64 = 1024;
+
+/// Derive the stable namespace key used by a child directory group.  The
+/// root key is stored explicitly in the manifest; every other directory key
+/// is derived from the immutable snapshot and inode, so a dentry lookup never
+/// needs a second mutable namespace table.
+pub fn directory_key(snapshot_id: [u8; 32], inode: u64) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"BrewFS-packed-v3-directory\0");
+    hasher.update(snapshot_id);
+    hasher.update(inode.to_le_bytes());
+    hasher.finalize().into()
+}
 
 /// A catalog intentionally keeps only the immutable manifest and no decoded
 /// group metadata.  Callers may layer a byte-budgeted cache above it; strict
@@ -221,6 +237,222 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
             .cloned())
     }
 
+    /// Resolve an inode to its group and canonical directory entry.  The
+    /// pageable inode index keeps the lookup bounded to one inode page and
+    /// one group page; small inline manifests fall back to scanning their
+    /// bounded group table.
+    pub async fn lookup_inode_entry(
+        &self,
+        inode: u64,
+    ) -> PackedResult<Option<(PackedGroupRef, GroupMetaEntry)>> {
+        if let Some(index) = self.inode_paged(inode).await? {
+            let page = self
+                .manifest
+                .group_index_page_for_name(index.parent_dir_key, &index.name);
+            let group = match page {
+                Some(page) => {
+                    self.group_for_name_from_index_page(page, index.parent_dir_key, &index.name)
+                        .await?
+                }
+                None if self.manifest.group_index_pages.is_empty() => self
+                    .group_for_name(index.parent_dir_key, &index.name)
+                    .cloned(),
+                None => None,
+            };
+            let Some(group) = group else {
+                return Ok(None);
+            };
+            let entry = self
+                .load_group_meta_for_ref(&group)
+                .await?
+                .lookup(&index.name)
+                .cloned()
+                .ok_or_else(|| {
+                    PackedWireError::Invalid(
+                        "packed inode index entry is missing from group".into(),
+                    )
+                })?;
+            if entry.inode != inode {
+                return Err(PackedWireError::Invalid(
+                    "packed inode index and group metadata disagree".into(),
+                ));
+            }
+            return Ok(Some((group, entry)));
+        }
+
+        for group in &self.manifest.groups {
+            let meta = self.load_group_meta_for_ref(group).await?;
+            if let Some(entry) = meta.entries().iter().find(|entry| entry.inode == inode) {
+                return Ok(Some((group.clone(), entry.clone())));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve and execute a packed read for an inode.  The caller supplies a
+    /// file range; only the containing group's metadata, selected frame
+    /// descriptors, and requested frame payloads are fetched.
+    pub async fn read_inode_range(
+        &self,
+        inode: u64,
+        offset: u64,
+        output: &mut [u8],
+    ) -> PackedResult<()> {
+        let Some((group, entry)) = self.lookup_inode_entry(inode).await? else {
+            return Err(PackedWireError::Invalid("packed inode is missing".into()));
+        };
+        let length = u64::try_from(output.len())
+            .map_err(|_| PackedWireError::LimitExceeded("packed read length exceeds u64".into()))?;
+        let plan = self
+            .read_unified_plan_for_entry(&group, &entry, offset, length)
+            .await?;
+        let container_ordinal = plan.segments.iter().find_map(|segment| {
+            if let ReadSource::PackedFrame {
+                container_ordinal, ..
+            } = segment.source
+            {
+                Some(container_ordinal)
+            } else {
+                None
+            }
+        });
+        let Some(container_ordinal) = container_ordinal else {
+            output.fill(0);
+            return Ok(());
+        };
+        let requests = plan
+            .segments
+            .iter()
+            .filter_map(|segment| match &segment.source {
+                ReadSource::PackedFrame {
+                    container_ordinal: source_container,
+                    frame_ordinal,
+                    object_offset,
+                    stored_len,
+                    raw_len,
+                    size_class,
+                    codec,
+                    frame_digest,
+                    ..
+                } => {
+                    if *source_container != container_ordinal {
+                        return Some(Err(PackedWireError::Invalid(
+                            "packed read plan spans multiple containers".into(),
+                        )));
+                    }
+                    let size_class = match SizeClass::from_u8(*size_class) {
+                        Ok(size_class) => size_class,
+                        Err(error) => {
+                            return Some(Err(PackedWireError::Invalid(error.to_string())));
+                        }
+                    };
+                    Some(Ok(FrameReadRequest {
+                        descriptor: PackedFrameDescriptor {
+                            frame_ordinal: *frame_ordinal,
+                            object_offset: *object_offset,
+                            stored_len: *stored_len,
+                            raw_len: *raw_len,
+                            first_file_slot: 0,
+                            last_file_slot: 0,
+                            size_class,
+                            codec: *codec,
+                            frame_digest: *frame_digest,
+                        },
+                        logical_len: segment.length,
+                    }))
+                }
+                ReadSource::Hole => None,
+                _ => Some(Err(PackedWireError::Invalid(
+                    "packed read plan contains a non-packed source".into(),
+                ))),
+            })
+            .collect::<PackedResult<Vec<_>>>()?;
+        let object = self.open_container(container_ordinal).await?;
+        let coordinator =
+            GroupReadCoordinator::new(group.layout_profile, CoordinatorLimits::default())?;
+        let frames = coordinator.read_frames(&object, requests).await?;
+        let fetcher = super::remote::PackedFrameSourceFetcher::with_prefetched_frames(
+            (*object).clone(),
+            container_ordinal,
+            frames,
+        );
+        execute_unified_into(&fetcher, offset, &plan, output)
+            .await
+            .map_err(|error| PackedWireError::Backend(error.to_string()))
+    }
+
+    /// Return a bounded directory page. Group metadata remains the unit of
+    /// remote IO; the method only retains the groups needed to fill this
+    /// page, so a million-entry directory never becomes one allocation.
+    pub async fn readdir_page(
+        &self,
+        parent_dir_key: [u8; 32],
+        child_offset: usize,
+        limit: usize,
+    ) -> PackedResult<Vec<GroupMetaEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut skip = child_offset;
+        let mut output = Vec::with_capacity(limit);
+        if self.manifest.group_index_pages.is_empty() {
+            let groups = self.groups_for_parent(parent_dir_key, 0, usize::MAX);
+            for group in groups {
+                let meta = self.load_group_meta_for_ref(&group).await?;
+                if skip >= meta.len() {
+                    skip -= meta.len();
+                    continue;
+                }
+                let page = meta.page(skip, limit - output.len());
+                output.extend_from_slice(page);
+                if output.len() == limit {
+                    break;
+                }
+                skip = 0;
+            }
+            return Ok(output);
+        }
+
+        // Page fences are sorted by (parent key, first name). Start at the
+        // first page that can contain this parent, then continue until the
+        // fence moves past it. This bounds cold reads for a nested directory
+        // while preserving a stable ordinal cursor.
+        let start_page = self
+            .manifest
+            .group_index_pages
+            .iter()
+            .position(|page| page.last_parent_dir_key >= parent_dir_key)
+            .unwrap_or(0);
+        for page_ordinal in start_page..self.manifest.group_index_pages.len() {
+            let page = self.load_group_index_page(page_ordinal).await?;
+            if page
+                .groups
+                .first()
+                .is_some_and(|group| group.parent_dir_key > parent_dir_key)
+            {
+                break;
+            }
+            for group in page
+                .groups
+                .into_iter()
+                .filter(|group| group.parent_dir_key == parent_dir_key)
+            {
+                let meta = self.load_group_meta_for_ref(&group).await?;
+                if skip >= meta.len() {
+                    skip -= meta.len();
+                    continue;
+                }
+                let entries = meta.page(skip, limit - output.len());
+                output.extend_from_slice(entries);
+                if output.len() == limit {
+                    return Ok(output);
+                }
+                skip = 0;
+            }
+        }
+        Ok(output)
+    }
+
     /// Resolve one directory entry without a per-entry namespace lookup.
     pub async fn lookup_entry(
         &self,
@@ -355,6 +587,17 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
             .lookup(name)
             .cloned()
             .ok_or_else(|| PackedWireError::Invalid("packed group entry is missing".into()))?;
+        self.read_unified_plan_for_entry(group, &entry, offset, length)
+            .await
+    }
+
+    async fn read_unified_plan_for_entry(
+        &self,
+        group: &PackedGroupRef,
+        entry: &GroupMetaEntry,
+        offset: u64,
+        length: u64,
+    ) -> PackedResult<UnifiedReadPlan> {
         let end = offset
             .checked_add(length)
             .ok_or_else(|| PackedWireError::LimitExceeded("packed read range overflows".into()))?;
@@ -380,7 +623,7 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
             .map(|frame| (frame.frame_ordinal, frame))
             .collect::<HashMap<_, _>>();
         let mut segments = Vec::new();
-        for extent in entry.extents {
+        for extent in &entry.extents {
             let extent_end = extent
                 .file_offset
                 .checked_add(u64::from(extent.logical_len))

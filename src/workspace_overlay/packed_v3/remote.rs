@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::cadapter::client::{ObjectBackend, ObjectClient};
@@ -321,12 +321,14 @@ fn validate_descriptor_order(frames: &[PackedFrameDescriptor]) -> PackedResult<(
 #[derive(Clone)]
 pub struct PackedFrameSourceFetcher<B: ObjectBackend + Clone> {
     objects: Arc<HashMap<u32, RemotePackedObject<B>>>,
+    prefetched: Arc<HashMap<(u32, u32), Bytes>>,
 }
 
 impl<B: ObjectBackend + Clone> PackedFrameSourceFetcher<B> {
     pub fn new(objects: HashMap<u32, RemotePackedObject<B>>) -> Self {
         Self {
             objects: Arc::new(objects),
+            prefetched: Arc::new(HashMap::new()),
         }
     }
 
@@ -334,6 +336,23 @@ impl<B: ObjectBackend + Clone> PackedFrameSourceFetcher<B> {
         let mut objects = HashMap::new();
         objects.insert(container_ordinal, object);
         Self::new(objects)
+    }
+
+    /// Build a fetcher from a bounded coordinator result.  The map contains
+    /// complete raw frame payloads for one read operation; it is intentionally
+    /// short lived and is not a hidden cache.
+    pub fn with_prefetched_frames(
+        object: RemotePackedObject<B>,
+        container_ordinal: u32,
+        frames: BTreeMap<u32, Bytes>,
+    ) -> Self {
+        let mut fetcher = Self::from_object(object, container_ordinal);
+        let prefetched = frames
+            .into_iter()
+            .map(|(frame_ordinal, bytes)| ((container_ordinal, frame_ordinal), bytes))
+            .collect();
+        fetcher.prefetched = Arc::new(prefetched);
+        fetcher
     }
 }
 
@@ -375,10 +394,16 @@ impl<B: ObjectBackend + Clone + 'static> UnifiedReadSourceFetcher for PackedFram
                     codec: *codec,
                     frame_digest: *frame_digest,
                 };
-                let frame = object
-                    .read_frame(&descriptor)
-                    .await
-                    .map_err(|error| anyhow::anyhow!("packed frame read failed: {error}"))?;
+                let frame = if let Some(frame) =
+                    self.prefetched.get(&(*container_ordinal, *frame_ordinal))
+                {
+                    frame.clone()
+                } else {
+                    object
+                        .read_frame(&descriptor)
+                        .await
+                        .map_err(|error| anyhow::anyhow!("packed frame read failed: {error}"))?
+                };
                 let start = usize::try_from(*raw_offset)
                     .map_err(|_| anyhow::anyhow!("packed raw offset exceeds usize"))?;
                 let end = start

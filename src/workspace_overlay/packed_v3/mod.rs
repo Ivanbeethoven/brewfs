@@ -10,10 +10,11 @@ mod group;
 mod index;
 mod layout;
 mod meta;
+mod readonly;
 mod remote;
 mod wire;
 
-pub use catalog::RemoteGroupCatalog;
+pub use catalog::{RemoteGroupCatalog, directory_key};
 pub use coordinator::{
     CoalescedRange, CoordinatorLimits, FrameReadRequest, GroupReadCoordinator,
     coalesce_frame_ranges, read_coalesced_frames,
@@ -28,6 +29,7 @@ pub use layout::{
     AccessProfile, FrameLayoutDecision, LayoutError, SizeClass, SizeClassTable, choose_frame_layout,
 };
 pub use meta::{GroupMeta, GroupMetaEntry, GroupMetaExtent};
+pub use readonly::{PackedV3BlockStore, PackedV3ReadonlyMeta};
 pub use remote::{
     MAX_PACKED_STREAM_RANGE_BYTES, PackedFrameSourceFetcher, RemotePackedObject, read_exact_range,
 };
