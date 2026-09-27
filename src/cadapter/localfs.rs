@@ -7,16 +7,18 @@ use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 
-use crate::cadapter::client::ObjectBackend;
+use crate::cadapter::client::{ObjectBackend, ObjectByteStream};
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashSet;
+use futures_util::StreamExt;
 use std::io::{IoSlice, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{fs, io::AsyncReadExt, io::AsyncSeekExt, io::AsyncWriteExt};
+use tokio_util::io::ReaderStream;
 use tracing::field;
 
 fn can_block_in_place() -> bool {
@@ -274,6 +276,38 @@ impl ObjectBackend for LocalFsBackend {
             }
             Ok(read)
         })
+    }
+
+    async fn get_object_range_stream(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<ObjectByteStream> {
+        if length == 0 {
+            return Ok(Box::pin(futures_util::stream::empty()));
+        }
+        let path = self.path_for(key);
+        let mut file = match fs::File::open(path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Box::pin(futures_util::stream::empty()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let stream = ReaderStream::new(file.take(length))
+            .map(|item| item.map(Bytes::from).map_err(anyhow::Error::from));
+        Ok(Box::pin(stream))
+    }
+
+    async fn get_object_size(&self, key: &str) -> Result<Option<u64>> {
+        let path = self.path_for(key);
+        match fs::metadata(path).await {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn get_etag(&self, key: &str) -> Result<String> {

@@ -1,6 +1,6 @@
 //! S3 adapter: simplified aws-sdk-s3 implementation with multipart upload, retries, and validation.
 
-use crate::cadapter::client::ObjectBackend;
+use crate::cadapter::client::{ObjectBackend, ObjectByteStream};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -12,10 +12,12 @@ use aws_sdk_s3::{Client, config::Region};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use hyper::Body;
 use md5;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
+use tokio_util::io::ReaderStream;
 
 /// S3 backend configuration options
 #[derive(Debug, Clone)]
@@ -683,6 +685,61 @@ impl ObjectBackend for S3Backend {
             }
             Err(SdkError::ServiceError(err)) if err.err().is_no_such_key() => Ok(0),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn get_object_range_stream(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<ObjectByteStream> {
+        if length == 0 {
+            return Ok(Box::pin(futures_util::stream::empty()));
+        }
+        let end = offset
+            .checked_add(length - 1)
+            .ok_or_else(|| anyhow!("S3 range end overflows u64"))?;
+        let range_header = format!("bytes={offset}-{end}");
+        let resp = self
+            .client
+            .get_object()
+            .bucket(&self.config.bucket)
+            .key(key)
+            .range(range_header)
+            .send()
+            .await;
+
+        match resp {
+            Ok(object) => {
+                let stream = ReaderStream::new(object.body.into_async_read())
+                    .map(|item| item.map(Bytes::from).map_err(anyhow::Error::from));
+                Ok(Box::pin(stream))
+            }
+            Err(SdkError::ServiceError(error)) if error.err().is_no_such_key() => {
+                Ok(Box::pin(futures_util::stream::empty()))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn get_object_size(&self, key: &str) -> Result<Option<u64>> {
+        let resp = self
+            .client
+            .head_object()
+            .bucket(&self.config.bucket)
+            .key(key)
+            .send()
+            .await;
+        match resp {
+            Ok(response) => Ok(response.content_length().map(|length| length as u64)),
+            Err(SdkError::ServiceError(error))
+                if error.raw().status().as_u16() == 404
+                    || error.err().meta().code() == Some("NoSuchKey") =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
         }
     }
 

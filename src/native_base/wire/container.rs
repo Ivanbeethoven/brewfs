@@ -81,10 +81,17 @@ pub mod features {
     pub const ZSTD_FRAME_OR_PAGE: u64 = 1 << 1;
     pub const EXTERNAL_INDEX_CHILDREN: u64 = 1 << 2;
     pub const NATIVE_BLOCK_V1_INNER: u64 = 1 << 3;
+    /// Packed read-only data blocks are framed and uncompressed.  This bit
+    /// permits the block reader to issue payload-only range requests without
+    /// probing each object's four-byte frame header first.
+    pub const PACKED_DATA_UNCOMPRESSED_BLOCKS: u64 = 1 << 4;
 
     /// Bits this build understands.
-    pub const KNOWN: u64 =
-        PLAIN_BYTES_FRAMES | ZSTD_FRAME_OR_PAGE | EXTERNAL_INDEX_CHILDREN | NATIVE_BLOCK_V1_INNER;
+    pub const KNOWN: u64 = PLAIN_BYTES_FRAMES
+        | ZSTD_FRAME_OR_PAGE
+        | EXTERNAL_INDEX_CHILDREN
+        | NATIVE_BLOCK_V1_INNER
+        | PACKED_DATA_UNCOMPRESSED_BLOCKS;
 }
 
 /// The capability closure of a container's `required_features`

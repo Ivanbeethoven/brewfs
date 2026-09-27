@@ -415,6 +415,17 @@ pub struct BlockStoreConfig {
     /// Require atomic create-only object writes. Workspace volumes enable this
     /// so a key collision can never overwrite a block reachable from a lower.
     pub create_only_writes: bool,
+    /// Treat every referenced block as a framed object in the `chunks-v2`
+    /// namespace. Read-only packed snapshots carry immutable references and
+    /// therefore do not need the legacy namespace probe on every cold block.
+    /// Keep this disabled for ordinary mounts, where legacy `chunks/` objects
+    /// remain a supported compatibility path.
+    pub versioned_objects_only: bool,
+    /// When set with `versioned_objects_only`, the packed snapshot has
+    /// declared that its framed data blocks use the `None` encoding.  Without
+    /// this declaration the reader keeps the versioned namespace selection but
+    /// uses a full GET so the frame header can select the actual decoder.
+    pub versioned_objects_uncompressed: bool,
 }
 
 impl Default for BlockStoreConfig {
@@ -430,6 +441,8 @@ impl Default for BlockStoreConfig {
             persist_write_cache_after_upload: false,
             persistent_slice_cache_dir: None,
             create_only_writes: false,
+            versioned_objects_only: false,
+            versioned_objects_uncompressed: false,
         }
     }
 }
@@ -571,6 +584,23 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         self
     }
 
+    /// Restrict reads to the framed `chunks-v2` object namespace.
+    ///
+    /// This is intended for immutable packed snapshots whose manifest already
+    /// authenticates the data namespace. Ordinary mutable/legacy mounts must
+    /// leave the option disabled so the legacy fallback remains available.
+    pub fn with_versioned_objects_only(mut self, enabled: bool) -> Self {
+        self.config.versioned_objects_only = enabled;
+        self
+    }
+
+    /// Allow payload-only range reads for a packed snapshot whose manifest
+    /// explicitly declares uncompressed framed data blocks.
+    pub fn with_versioned_objects_uncompressed(mut self, enabled: bool) -> Self {
+        self.config.versioned_objects_uncompressed = enabled;
+        self
+    }
+
     /// Bind this store to a volume format. Native-v2 rejects all legacy
     /// block-range deletion; its domain cleaner is the only deletion owner.
     #[allow(dead_code)]
@@ -604,6 +634,25 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
     /// malformed frames as raw data.
     async fn resolve_object_layout(&self, key: BlockKey) -> anyhow::Result<ObjectLayout> {
         if let Some(layout) = self.format_cache.get(&key).await {
+            return Ok(layout);
+        }
+
+        // Packed read-only snapshots reference only immutable framed blocks in
+        // `chunks-v2`. Their manifest is the namespace contract, so probing
+        // `chunks-v2` and then falling back to `chunks` would add one object
+        // request per cold block without providing any compatibility value.
+        if self.config.versioned_objects_only {
+            // Compression is a property of the persisted frame, not of the
+            // mount's write configuration.  Only the explicit packed-format
+            // declaration permits the range path to assume `None`; otherwise
+            // use a non-range variant and let the full GET parse the header.
+            let compression = if self.config.versioned_objects_uncompressed {
+                Compression::None
+            } else {
+                Compression::Lz4
+            };
+            let layout = ObjectLayout::Versioned(compression);
+            self.format_cache.insert(key, layout).await;
             return Ok(layout);
         }
 
@@ -2042,6 +2091,86 @@ mod tests {
         assert_eq!(
             stats.get_object_range_calls, 1,
             "Concurrent full reads should share one versioned-layout probe",
+        );
+
+        // A packed snapshot already commits its data references to the
+        // framed namespace.  That contract should remove the legacy probe and
+        // leave one range request for a cold uncompressed block.
+        let versioned_block = vec![0x3c_u8; 4 * 1024 * 1024];
+        backend.data.lock().unwrap().insert(
+            "chunks-v2/100/0".to_string(),
+            encode_persisted_block(&versioned_block, Compression::None).to_vec(),
+        );
+        let versioned_cache_dir = tempfile::tempdir()?;
+        let versioned_store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(backend.clone()),
+            ChunksCacheConfig::with_budgets(0, 0, versioned_cache_dir.path().to_path_buf()),
+            BlockStoreConfig {
+                block_size: 4 * 1024 * 1024,
+                range_read_threshold: 0.25,
+                compression: Compression::None,
+                page_cache_capacity: 0,
+                range_background_prefetch: false,
+                versioned_objects_only: true,
+                versioned_objects_uncompressed: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        backend.reset_stats();
+        let mut versioned_out = vec![0u8; 512 * 1024];
+        versioned_store
+            .read_range((100, 0), 0, &mut versioned_out)
+            .await?;
+        assert_eq!(versioned_out, vec![0x3c_u8; 512 * 1024]);
+        let versioned_stats = backend.get_stats();
+        assert_eq!(
+            versioned_stats.get_object_range_calls, 1,
+            "packed framed reads should not issue a separate namespace probe"
+        );
+        assert_eq!(
+            versioned_stats.get_object_calls, 0,
+            "an uncompressed packed range should not fall back to a full GET"
+        );
+
+        // Without the manifest capability bit, a framed compressed object
+        // must use a full GET so its actual header selects the decoder.  The
+        // packed namespace optimization must never turn this into a range
+        // read of compressed bytes.
+        backend.data.lock().unwrap().insert(
+            "chunks-v2/101/0".to_string(),
+            encode_persisted_block(&versioned_block, Compression::Lz4).to_vec(),
+        );
+        let conservative_cache_dir = tempfile::tempdir()?;
+        let conservative_store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(backend.clone()),
+            ChunksCacheConfig::with_budgets(0, 0, conservative_cache_dir.path().to_path_buf()),
+            BlockStoreConfig {
+                block_size: 4 * 1024 * 1024,
+                range_read_threshold: 0.25,
+                compression: Compression::None,
+                page_cache_capacity: 0,
+                range_background_prefetch: false,
+                versioned_objects_only: true,
+                versioned_objects_uncompressed: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+        backend.reset_stats();
+        let mut conservative_out = vec![0u8; 512 * 1024];
+        conservative_store
+            .read_range((101, 0), 0, &mut conservative_out)
+            .await?;
+        assert_eq!(conservative_out, vec![0x3c_u8; 512 * 1024]);
+        let conservative_stats = backend.get_stats();
+        assert_eq!(
+            conservative_stats.get_object_range_calls, 0,
+            "compressed packed blocks without a capability bit must avoid range reads"
+        );
+        assert_eq!(
+            conservative_stats.get_object_calls, 1,
+            "compressed packed blocks should be decoded from one full GET"
         );
 
         Ok(())

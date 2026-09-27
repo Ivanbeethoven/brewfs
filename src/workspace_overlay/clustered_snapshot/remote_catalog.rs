@@ -417,8 +417,17 @@ impl<B: ObjectBackend + Clone + 'static> FrozenCatalog for RemoteFrozenCatalog<B
         let global_start = base
             .checked_add(start)
             .ok_or_else(|| WireError::LimitExceeded("extent query overflows u64".into()))?;
+        // `FrozenReadonlyMeta::get_slices` uses `u64::MAX` as an open-ended
+        // query within the selected chunk. Keep that sentinel local to the
+        // chunk; treating it as a global end would either overflow for a
+        // non-zero chunk or return extents belonging to later chunks.
+        let relative_end = if end == u64::MAX {
+            self.chunk_size
+        } else {
+            end
+        };
         let global_end = base
-            .checked_add(end)
+            .checked_add(relative_end)
             .ok_or_else(|| WireError::LimitExceeded("extent query overflows u64".into()))?;
         let spans = self
             .snapshot
@@ -499,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn v2_remote_catalog_resolves_root_lookup_and_extent() {
         let root = tempfile::tempdir().unwrap();
-        let payload = vec![0x5a; 128 * 1024];
+        let payload = vec![0x5a; 2 * 1024 * 1024];
         std::fs::write(root.path().join("sample"), &payload).unwrap();
         let built = super::super::ingest::build_local_directory_cluster(
             root.path(),
@@ -557,23 +566,42 @@ mod tests {
         let cold_attr = catalog.lookup_inode(found.0).await.unwrap().unwrap();
         assert_eq!(cold_attr.size, payload.len() as u64);
         let extents = catalog
-            .query_extents(found.0 as u64, 0, 0, payload.len() as u64)
+            .query_extents(found.0 as u64, 0, 0, u64::MAX)
             .await
             .unwrap();
         assert_eq!(extents.len(), 1);
-        assert_eq!(extents[0].length, payload.len() as u64);
+        assert_eq!(
+            extents.iter().map(|extent| extent.length).sum::<u64>(),
+            catalog.chunk_size
+        );
+
+        let second_extents = catalog
+            .query_extents(found.0 as u64, 1, 0, u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(second_extents.len(), 1);
+        assert_eq!(
+            second_extents
+                .iter()
+                .map(|extent| extent.length)
+                .sum::<u64>(),
+            payload.len() as u64 - catalog.chunk_size
+        );
 
         let readonly = catalog.readonly_meta();
         let chunk_id = chunk_id_for(found.0 as i64, 0).unwrap();
         let slices = readonly.get_slices(chunk_id).await.unwrap();
         assert_eq!(slices.len(), 1);
+        let second_chunk_id = chunk_id_for(found.0 as i64, 1).unwrap();
+        let second_chunk_slices = readonly.get_slices(second_chunk_id).await.unwrap();
+        assert_eq!(second_chunk_slices.len(), 1);
         let store = RemoteDataBlockStore::new(Arc::clone(&catalog.snapshot), DEFAULT_BLOCK_SIZE);
-        let mut read_back = vec![0u8; payload.len()];
+        let mut read_back = vec![0u8; slices[0].length as usize];
         store
             .read_range((slices[0].slice_id, 0), 0, &mut read_back)
             .await
             .unwrap();
-        assert_eq!(read_back, payload);
+        assert_eq!(read_back, payload[..read_back.len()]);
 
         let layout = ChunkLayout {
             chunk_size: catalog.manifest().chunk_size,

@@ -15,6 +15,16 @@ name = "packed_snapshot_fixture"
 path = "src/bin/packed_snapshot_fixture.rs"
 required-features = ["native-packed-base", "frozen-base-metadata"]
 
+[[bin]]
+name = "packed_v2_snapshot_fixture"
+path = "src/bin/packed_v2_snapshot_fixture.rs"
+required-features = ["native-packed-base"]
+
+[[bin]]
+name = "packed_v3_snapshot_fixture"
+path = "src/bin/packed_v3_snapshot_fixture.rs"
+required-features = ["workspace-overlay"]
+
 [workspace]
 members = [
     "tools/stats"

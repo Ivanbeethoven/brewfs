@@ -1,8 +1,9 @@
 //! Build and publish a deterministic packed-metadata read-only fixture.
 //!
-//! The fixture deliberately uses one shared immutable block for the small
-//! files and a separately named set of blocks for the fio file.  This keeps
-//! object PUT count small while exercising the real `chunks-v2` read path.
+//! Small files use independent immutable slices. Each file has deterministic,
+//! file-specific bytes so the benchmark cannot gain from duplicate-content or
+//! shared-offset cache reuse. Cross-file physical packing belongs to the v2
+//! extent/placement format; v1's extent offset is the file logical offset.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ use brewfs::native_base::frozen::{
     FrozenInodeRecord, FrozenRow, dentry_key, encode_extent_slice_value, extent_key, inode_key,
 };
 use brewfs::native_base::runtime::BackendObjectRepository;
+use brewfs::native_base::wire::container::features;
 use brewfs::native_base::wire::refs::ObjectId;
 use brewfs::vfs::chunk_id_for;
 
@@ -170,6 +172,13 @@ async fn put_block<B: brewfs::ObjectBackend>(
     Ok(())
 }
 
+fn fill_small_file_pattern(block: &mut [u8], offset: usize, len: usize, file_index: u64) {
+    let pattern = file_index.wrapping_add(1).to_le_bytes();
+    for (index, byte) in block[offset..offset + len].iter_mut().enumerate() {
+        *byte = pattern[index % pattern.len()];
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -207,9 +216,6 @@ async fn main() -> Result<()> {
         .context("system clock before unix epoch")?
         .as_secs()
         .saturating_mul(100_000);
-    let small_slice_id = slice_base + 1;
-    let seed = vec![0x5a_u8; 4 * 1024 * 1024];
-
     let mut namespace = BTreeMap::new();
     row(&mut namespace, inode_key(1), attr(2, 0o040755, 0, None, 2))?;
     let mut next_inode = 2_u64;
@@ -259,6 +265,17 @@ async fn main() -> Result<()> {
     if small_chunk != 1 {
         bail!("small-file-size must fit in one chunk for this fixture")
     }
+    let small_file_count = u64::try_from(leaf_dirs.len())
+        .ok()
+        .and_then(|count| count.checked_mul(args.files_per_dir))
+        .ok_or_else(|| anyhow::anyhow!("small-file count overflow"))?;
+    let small_slice_base = slice_base
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("small slice ID overflow"))?;
+    let bench_slice_base = small_slice_base
+        .checked_add(small_file_count)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| anyhow::anyhow!("benchmark slice ID overflow"))?;
     let mut file_count = 1_u64; // the fio file below
     let mut total_logical_bytes = args.fio_file_size;
     let first_small_inode = next_inode;
@@ -279,11 +296,18 @@ async fn main() -> Result<()> {
                 dentry_key(dir_inode, name.as_bytes()),
                 inode_key(inode),
             )?;
+            let global_file_index = (dir_index as u64)
+                .checked_mul(args.files_per_dir)
+                .and_then(|base| base.checked_add(file_index))
+                .ok_or_else(|| anyhow::anyhow!("small-file index overflow"))?;
+            let slice_id = small_slice_base
+                .checked_add(global_file_index)
+                .ok_or_else(|| anyhow::anyhow!("small slice ID overflow"))?;
             let chunk_id = chunk_id_for(inode as i64, 0)?;
             row(
                 &mut data,
                 extent_key(inode, 0, 0),
-                encode_extent_slice_value(args.small_file_size, small_slice_id, chunk_id, 0),
+                encode_extent_slice_value(args.small_file_size, slice_id, chunk_id, 0),
             )?;
             file_count += 1;
             total_logical_bytes += args.small_file_size;
@@ -385,7 +409,9 @@ async fn main() -> Result<()> {
         let chunk_index = offset / args.chunk_size;
         let chunk_offset = offset % args.chunk_size;
         let chunk_id = chunk_id_for(bench_inode as i64, chunk_index)?;
-        let slice_id = slice_base + 100 + block_index;
+        let slice_id = bench_slice_base
+            .checked_add(block_index)
+            .ok_or_else(|| anyhow::anyhow!("benchmark slice ID overflow"))?;
         row(
             &mut data,
             extent_key(bench_inode, chunk_index, chunk_offset),
@@ -412,7 +438,7 @@ async fn main() -> Result<()> {
         storage_namespace_id,
         chunk_size: args.chunk_size,
         block_size: args.block_size,
-        required_features: 0,
+        required_features: features::PACKED_DATA_UNCOMPRESSED_BLOCKS,
         logical_revision: revision_id(args.prefix.as_bytes(), "revision"),
         namespace_rows,
         data_rows,
@@ -440,19 +466,28 @@ async fn main() -> Result<()> {
     };
     let backend = S3Backend::with_config(config).await?;
     let client = ObjectClient::new(backend.clone());
-    put_block(
-        &client,
-        small_slice_id,
-        0,
-        &seed[..args.small_file_size as usize],
-    )
-    .await?;
+    for global_file_index in 0..small_file_count {
+        let mut block = vec![0_u8; args.small_file_size as usize];
+        fill_small_file_pattern(
+            &mut block,
+            0,
+            args.small_file_size as usize,
+            global_file_index,
+        );
+        let slice_id = small_slice_base
+            .checked_add(global_file_index)
+            .ok_or_else(|| anyhow::anyhow!("small slice ID overflow"))?;
+        put_block(&client, slice_id, 0, &block).await?;
+    }
     for block_index in 0..block_count {
         let mut block = vec![0_u8; args.block_size as usize];
         for (index, byte) in block.iter_mut().enumerate() {
             *byte = (index as u64 + block_index) as u8;
         }
-        put_block(&client, slice_base + 100 + block_index, 0, &block).await?;
+        let slice_id = bench_slice_base
+            .checked_add(block_index)
+            .ok_or_else(|| anyhow::anyhow!("benchmark slice ID overflow"))?;
+        put_block(&client, slice_id, 0, &block).await?;
     }
     let repository = BackendObjectRepository::new(client);
     let manifest = upload_snapshot(&repository, &snapshot).await?;
@@ -467,6 +502,8 @@ async fn main() -> Result<()> {
         dirs_per_level
     );
     println!("first_leaf_path={}/", first_leaf.join("/"));
-    println!("small_slice_id={small_slice_id} fio_blocks={block_count}");
+    println!(
+        "small_data_objects={small_file_count} files_per_data_object=1 first_small_slice_id={small_slice_base} fio_blocks={block_count}"
+    );
     Ok(())
 }

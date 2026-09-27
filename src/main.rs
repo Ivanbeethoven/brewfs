@@ -73,6 +73,8 @@ use crate::native_base::runtime::{
     BackendObjectRepository, FROZEN_METADATA_FEATURE, NativeDataRuntime, NativeRuntimeCapabilities,
     NativeVolumeHeader, WorkspaceBaseDataSource, initialize_volume, load_volume_header,
 };
+#[cfg(all(feature = "native-packed-base", feature = "frozen-base-metadata"))]
+use crate::native_base::wire::container::features;
 #[cfg(feature = "native-packed-base")]
 #[cfg(feature = "native-packed-base")]
 use crate::native_base::write::keys::Keys;
@@ -92,6 +94,10 @@ use crate::vfs::fs::VFS;
 #[cfg(feature = "workspace-overlay")]
 use crate::workspace_overlay::catalog::{CreateVolumeRoot, WorkspaceStore};
 #[cfg(feature = "workspace-overlay")]
+use crate::workspace_overlay::clustered_snapshot::{
+    RemoteClusterOptions, RemoteDataBlockStore, RemoteFrozenCatalog, RemoteSnapshot,
+};
+#[cfg(feature = "workspace-overlay")]
 use crate::workspace_overlay::control::WorkspaceControl;
 #[cfg(feature = "workspace-overlay")]
 use crate::workspace_overlay::gc::WorkspaceGc;
@@ -106,6 +112,10 @@ use crate::workspace_overlay::lifecycle::{
 use crate::workspace_overlay::meta_layer::WorkspaceMetaLayer;
 #[cfg(feature = "workspace-overlay")]
 use crate::workspace_overlay::model::WORKSPACE_SCHEMA_VERSION;
+#[cfg(feature = "workspace-overlay")]
+use crate::workspace_overlay::packed_v3::{
+    PackedSnapshotManifest, PackedV3BlockStore, PackedV3ReadonlyMeta, RemoteGroupCatalog,
+};
 #[cfg(feature = "workspace-overlay")]
 use crate::workspace_overlay::publish::diff::WorkspaceDiff;
 #[cfg(feature = "workspace-overlay")]
@@ -425,6 +435,14 @@ async fn mount_cmd(mut args: MountConfig) -> anyhow::Result<()> {
             if args.volume_format == VolumeFormat::WorkspaceNativeV2 {
                 return mount_native_with_client(client, layout, &args).await;
             }
+            #[cfg(feature = "workspace-overlay")]
+            if args.volume_format == VolumeFormat::PackedMetadataV2 {
+                return mount_packed_v2_readonly_with_client(client, layout, &args).await;
+            }
+            #[cfg(feature = "workspace-overlay")]
+            if args.volume_format == VolumeFormat::PackedMetadataV3 {
+                return mount_packed_v3_readonly_with_client(client, layout, &args).await;
+            }
             let store = create_object_store(
                 client,
                 layout,
@@ -448,6 +466,14 @@ async fn mount_cmd(mut args: MountConfig) -> anyhow::Result<()> {
             #[cfg(feature = "native-packed-base")]
             if args.volume_format == VolumeFormat::WorkspaceNativeV2 {
                 return mount_native_with_client(client, layout, &args).await;
+            }
+            #[cfg(feature = "workspace-overlay")]
+            if args.volume_format == VolumeFormat::PackedMetadataV2 {
+                return mount_packed_v2_readonly_with_client(client, layout, &args).await;
+            }
+            #[cfg(feature = "workspace-overlay")]
+            if args.volume_format == VolumeFormat::PackedMetadataV3 {
+                return mount_packed_v3_readonly_with_client(client, layout, &args).await;
             }
             let store = create_object_store(
                 client,
@@ -863,6 +889,10 @@ fn validate_volume_format_support(format: VolumeFormat) -> anyhow::Result<()> {
         VolumeFormat::PackedMetadataV1 => Err(anyhow::anyhow!(
             "feature not compiled: frozen-base-metadata"
         )),
+        #[cfg(feature = "workspace-overlay")]
+        VolumeFormat::PackedMetadataV2 => Ok(()),
+        #[cfg(feature = "workspace-overlay")]
+        VolumeFormat::PackedMetadataV3 => Ok(()),
     }
 }
 
@@ -898,6 +928,14 @@ where
         VolumeFormat::PackedMetadataV1 => {
             anyhow::bail!("feature not compiled: frozen-base-metadata")
         }
+        #[cfg(feature = "workspace-overlay")]
+        VolumeFormat::PackedMetadataV2 => {
+            anyhow::bail!("packed-metadata-v2 must be dispatched with its object client")
+        }
+        #[cfg(feature = "workspace-overlay")]
+        VolumeFormat::PackedMetadataV3 => {
+            anyhow::bail!("packed-metadata-v3 must be dispatched with its object client")
+        }
     }
 }
 
@@ -931,7 +969,14 @@ where
         );
     }
     let logical_revision = manifest.logical_revision;
-    let store = Arc::new(create_object_store(client, layout, &args.cache, false).await?);
+    let packed_data_uncompressed =
+        manifest.required_features & features::PACKED_DATA_UNCOMPRESSED_BLOCKS != 0;
+    let store = Arc::new(
+        create_object_store(client, layout, &args.cache, false)
+            .await?
+            .with_versioned_objects_only(true)
+            .with_versioned_objects_uncompressed(packed_data_uncompressed),
+    );
     let meta_layer = Arc::new(FrozenReadonlyMeta::new(catalog, 1));
     meta_layer.initialize().await?;
     let vfs_config =
@@ -953,6 +998,150 @@ where
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>(),
+            args.mount_point.display()
+        );
+        let mut handle = handle;
+        tokio::select! {
+            signal = shutdown_signal() => {
+                signal?;
+                println!("unmounting...");
+                handle.unmount().await?;
+            }
+            result = &mut handle => {
+                result?;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    mount_result
+}
+
+#[cfg(feature = "workspace-overlay")]
+async fn mount_packed_v2_readonly_with_client<B>(
+    client: ObjectClient<B>,
+    layout: ChunkLayout,
+    args: &MountConfig,
+) -> anyhow::Result<()>
+where
+    B: ObjectBackend + Clone + Send + Sync + 'static,
+{
+    let manifest_key = args
+        .packed_manifest_key
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("packed-metadata-v2 manifest key is missing"))?;
+    let snapshot = Arc::new(
+        RemoteSnapshot::open_by_key(&client, manifest_key, RemoteClusterOptions::default())
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?,
+    );
+    let expected_chunk_size = snapshot
+        .clusters()
+        .clusters()
+        .first()
+        .map(|cluster| cluster.superblock().chunk_size)
+        .ok_or_else(|| anyhow::anyhow!("packed-metadata-v2 manifest has no clusters"))?;
+    if expected_chunk_size != layout.chunk_size {
+        anyhow::bail!(
+            "packed v2 chunk size {} does not match mount layout {}",
+            expected_chunk_size,
+            layout.chunk_size
+        );
+    }
+    let catalog = Arc::new(RemoteFrozenCatalog::new(Arc::clone(&snapshot)));
+    let meta_layer = Arc::new(catalog.readonly_meta());
+    meta_layer.initialize().await?;
+    let store = Arc::new(RemoteDataBlockStore::new(
+        Arc::clone(&snapshot),
+        layout.block_size,
+    ));
+    let vfs_config =
+        crate::vfs::config::VFSConfig::new_with_cache_config(layout, args.cache.clone());
+    let fs = VFS::from_readonly_components(vfs_config, store, meta_layer)?;
+    let concurrency = FuseConcurrencyConfig {
+        worker_count: args.fuse_workers,
+        max_background: args.fuse_max_background,
+    };
+    let mount_result = async {
+        let handle = if args.privileged {
+            mount_vfs_privileged(fs, &args.mount_point, concurrency).await?
+        } else {
+            mount_vfs_unprivileged(fs, &args.mount_point, concurrency).await?
+        };
+        println!(
+            "mounted packed metadata v2 {} at {}",
+            snapshot
+                .manifest()
+                .superblock()
+                .semantic_hash
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            args.mount_point.display()
+        );
+        let mut handle = handle;
+        tokio::select! {
+            signal = shutdown_signal() => {
+                signal?;
+                println!("unmounting...");
+                handle.unmount().await?;
+            }
+            result = &mut handle => {
+                result?;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    mount_result
+}
+
+#[cfg(feature = "workspace-overlay")]
+async fn mount_packed_v3_readonly_with_client<B>(
+    client: ObjectClient<B>,
+    layout: ChunkLayout,
+    args: &MountConfig,
+) -> anyhow::Result<()>
+where
+    B: ObjectBackend + Clone + Send + Sync + 'static,
+{
+    let manifest_key = args
+        .packed_manifest_key
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("packed-metadata-v3 manifest key is missing"))?;
+    let bytes = client
+        .get_object(manifest_key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("packed-metadata-v3 manifest object is missing"))?;
+    let manifest = PackedSnapshotManifest::decode(bytes)
+        .map_err(|error| anyhow::anyhow!("packed-metadata-v3 manifest: {error}"))?;
+    let catalog = Arc::new(RemoteGroupCatalog::new(client, manifest));
+    let meta_layer = Arc::new(PackedV3ReadonlyMeta::new(
+        Arc::clone(&catalog),
+        layout.chunk_size,
+    ));
+    let store = Arc::new(PackedV3BlockStore::new(
+        Arc::clone(&catalog),
+        layout.chunk_size,
+        layout.block_size,
+    )?);
+    meta_layer.initialize().await?;
+    let vfs_config =
+        crate::vfs::config::VFSConfig::new_with_cache_config(layout, args.cache.clone());
+    let fs = VFS::from_readonly_components(vfs_config, store, meta_layer)?;
+    let concurrency = FuseConcurrencyConfig {
+        worker_count: args.fuse_workers,
+        max_background: args.fuse_max_background,
+    };
+    let mount_result = async {
+        let handle = if args.privileged {
+            mount_vfs_privileged(fs, &args.mount_point, concurrency).await?
+        } else {
+            mount_vfs_unprivileged(fs, &args.mount_point, concurrency).await?
+        };
+        println!(
+            "mounted packed metadata v3 {} at {}",
+            hex::encode(catalog.manifest().snapshot_id),
             args.mount_point.display()
         );
         let mut handle = handle;

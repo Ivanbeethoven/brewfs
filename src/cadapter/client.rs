@@ -3,6 +3,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::Stream;
+use std::pin::Pin;
+
+pub type ObjectByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 
 #[async_trait]
 pub trait ObjectBackend: Send + Sync {
@@ -33,6 +37,33 @@ pub trait ObjectBackend: Send + Sync {
     /// missing or `offset` is beyond the end. Partial reads are allowed.
     /// Used for small range reads in intelligent read strategy.
     async fn get_object_range(&self, key: &str, offset: u64, buf: &mut [u8]) -> Result<usize>;
+
+    /// Stream a bounded object range without requiring the backend to
+    /// materialize the complete response first.  The compatibility default
+    /// keeps older test backends correct; S3 and LocalFS override it with
+    /// genuine response/file streams.
+    async fn get_object_range_stream(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<ObjectByteStream> {
+        let length = usize::try_from(length)
+            .map_err(|_| anyhow::anyhow!("object range length exceeds usize"))?;
+        let mut bytes = vec![0u8; length];
+        let actual = self.get_object_range(key, offset, &mut bytes).await?;
+        bytes.truncate(actual);
+        Ok(Box::pin(futures_util::stream::once(async move {
+            Ok(Bytes::from(bytes))
+        })))
+    }
+
+    /// Return an object's length without downloading its payload when the
+    /// backend supports a metadata request.  The compatibility default keeps
+    /// existing test backends correct by falling back to one complete read.
+    async fn get_object_size(&self, key: &str) -> Result<Option<u64>> {
+        Ok(self.get_object(key).await?.map(|bytes| bytes.len() as u64))
+    }
 
     #[allow(dead_code)]
     async fn get_etag(&self, key: &str) -> Result<String>;
@@ -76,6 +107,21 @@ impl<B: ObjectBackend> ObjectClient<B> {
     /// Used for small range reads in intelligent read strategy.
     pub async fn get_object_range(&self, key: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
         self.backend.get_object_range(key, offset, buf).await
+    }
+
+    pub async fn get_object_range_stream(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<ObjectByteStream> {
+        self.backend
+            .get_object_range_stream(key, offset, length)
+            .await
+    }
+
+    pub async fn get_object_size(&self, key: &str) -> Result<Option<u64>> {
+        self.backend.get_object_size(key).await
     }
 
     #[allow(dead_code)]

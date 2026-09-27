@@ -291,6 +291,10 @@ pub enum VolumeFormat {
     WorkspaceNativeV2,
     #[cfg(feature = "native-packed-base")]
     PackedMetadataV1,
+    #[cfg(feature = "workspace-overlay")]
+    PackedMetadataV2,
+    #[cfg(feature = "workspace-overlay")]
+    PackedMetadataV3,
 }
 
 #[cfg(feature = "workspace-overlay")]
@@ -1017,6 +1021,40 @@ impl MountConfig {
                 || volume_cfg.native_control_version.is_some()
             {
                 anyhow::bail!("native workspace controls cannot be used with packed-metadata-v1");
+            }
+        }
+        #[cfg(feature = "workspace-overlay")]
+        if volume_format == VolumeFormat::PackedMetadataV2 {
+            if workspace.is_some() {
+                anyhow::bail!("packed-metadata-v2 is a standalone read-only volume");
+            }
+            if packed_manifest_key.is_none() {
+                anyhow::bail!(
+                    "packed-metadata-v2 requires --packed-manifest-key or packed_manifest_key"
+                );
+            }
+            if native_base.is_some()
+                || volume_cfg.schema_version.is_some()
+                || volume_cfg.native_control_version.is_some()
+            {
+                anyhow::bail!("native workspace controls cannot be used with packed-metadata-v2");
+            }
+        }
+        #[cfg(feature = "workspace-overlay")]
+        if volume_format == VolumeFormat::PackedMetadataV3 {
+            if workspace.is_some() {
+                anyhow::bail!("packed-metadata-v3 is a standalone read-only volume");
+            }
+            if packed_manifest_key.is_none() {
+                anyhow::bail!(
+                    "packed-metadata-v3 requires --packed-manifest-key or packed_manifest_key"
+                );
+            }
+            if native_base.is_some()
+                || volume_cfg.schema_version.is_some()
+                || volume_cfg.native_control_version.is_some()
+            {
+                anyhow::bail!("native workspace controls cannot be used with packed-metadata-v3");
             }
         }
         if volume_format == VolumeFormat::WorkspaceNativeV2 {
@@ -1785,6 +1823,34 @@ mod tests {
 
         let mut missing = empty_mount_args(None, Some(PathBuf::from("/mnt/packed")));
         missing.volume_format = Some(VolumeFormat::PackedMetadataV1);
+        assert!(MountConfig::from_sources(missing).is_err());
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[test]
+    fn packed_metadata_v2_format_requires_manifest_key_and_is_standalone() {
+        let cli = Cli::parse_from([
+            "brewfs",
+            "mount",
+            "/mnt/packed-v2",
+            "--volume-format",
+            "packed-metadata-v2",
+            "--packed-manifest-key",
+            "snapshots/v2.brfsm",
+        ]);
+        let Command::Mount(args) = cli.cmd else {
+            panic!("expected mount command");
+        };
+        let config = MountConfig::from_sources(*args).unwrap();
+        assert_eq!(config.volume_format, VolumeFormat::PackedMetadataV2);
+        assert_eq!(
+            config.packed_manifest_key.as_deref(),
+            Some("snapshots/v2.brfsm")
+        );
+        assert!(config.workspace.is_none());
+
+        let mut missing = empty_mount_args(None, Some(PathBuf::from("/mnt/packed-v2")));
+        missing.volume_format = Some(VolumeFormat::PackedMetadataV2);
         assert!(MountConfig::from_sources(missing).is_err());
     }
 
