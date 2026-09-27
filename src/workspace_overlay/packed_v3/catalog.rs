@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use sha2::{Digest, Sha256};
 
 use crate::cadapter::client::{ObjectBackend, ObjectClient};
@@ -28,6 +29,10 @@ pub struct RemoteGroupCatalog<B: ObjectBackend + Clone> {
     manifest: Arc<PackedSnapshotManifest>,
     group_indexes: Arc<HashMap<u64, usize>>,
     parent_indexes: Arc<HashMap<[u8; 32], Vec<usize>>>,
+    /// Immutable container headers are safe to share across requests. Keeping
+    /// the opened object here avoids a header range GET for each GroupMeta or
+    /// frame-descriptor lookup without retaining decoded metadata or payload.
+    containers: Arc<DashMap<u32, Arc<RemotePackedObject<B>>>>,
 }
 
 impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
@@ -55,6 +60,7 @@ impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
             manifest: Arc::new(manifest),
             group_indexes: Arc::new(group_indexes),
             parent_indexes: Arc::new(parent_indexes),
+            containers: Arc::new(DashMap::new()),
         }
     }
 
@@ -199,25 +205,12 @@ impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
     }
 
     async fn load_group_meta_for_ref(&self, group: &PackedGroupRef) -> PackedResult<GroupMeta> {
-        let container = self
-            .manifest
-            .containers
-            .get(group.container_ordinal as usize)
-            .ok_or_else(|| PackedWireError::Invalid("packed group container is missing".into()))?;
+        let remote = self.open_container(group.container_ordinal).await?;
         if usize::try_from(group.meta_len).is_ok_and(|len| len > MAX_GROUP_META_BYTES) {
             return Err(PackedWireError::LimitExceeded(
                 "packed group metadata exceeds 256 KiB".into(),
             ));
         }
-        let remote = RemotePackedObject::open(
-            &self.client,
-            std::str::from_utf8(&container.object_key).map_err(|_| {
-                PackedWireError::Invalid("packed container object key is not UTF-8".into())
-            })?,
-            container.object_len,
-            PackedObjectKind::GroupContainer,
-        )
-        .await?;
         let bytes = remote
             .read_range(u64::from(group.meta_offset), u64::from(group.meta_len))
             .await?;
@@ -493,22 +486,39 @@ impl<B: ObjectBackend + Clone> RemoteGroupCatalog<B> {
         container_ordinal: u32,
         ordinals: impl IntoIterator<Item = u32>,
     ) -> PackedResult<Vec<PackedFrameDescriptor>> {
+        let remote = self.open_container(container_ordinal).await?;
+        remote.read_frame_descriptors(ordinals).await
+    }
+
+    async fn open_container(
+        &self,
+        container_ordinal: u32,
+    ) -> PackedResult<Arc<RemotePackedObject<B>>> {
+        if let Some(remote) = self.containers.get(&container_ordinal) {
+            return Ok(Arc::clone(remote.value()));
+        }
         let container = self
             .manifest
             .containers
             .get(container_ordinal as usize)
-            .ok_or_else(|| PackedWireError::Invalid("packed container is missing".into()))?;
+            .ok_or_else(|| PackedWireError::Invalid("packed group container is missing".into()))?;
         let key = std::str::from_utf8(&container.object_key).map_err(|_| {
             PackedWireError::Invalid("packed container object key is not UTF-8".into())
         })?;
-        let remote = RemotePackedObject::open(
-            &self.client,
-            key,
-            container.object_len,
-            PackedObjectKind::GroupContainer,
-        )
-        .await?;
-        remote.read_frame_descriptors(ordinals).await
+        let remote = Arc::new(
+            RemotePackedObject::open(
+                &self.client,
+                key,
+                container.object_len,
+                PackedObjectKind::GroupContainer,
+            )
+            .await?,
+        );
+        let existing = self
+            .containers
+            .entry(container_ordinal)
+            .or_insert_with(|| Arc::clone(&remote));
+        Ok(Arc::clone(existing.value()))
     }
 }
 

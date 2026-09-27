@@ -574,6 +574,17 @@ impl PackedSnapshotManifest {
                 "manifest group/container count exceeds limit".into(),
             ));
         }
+        // A large snapshot must use the authenticated pageable group index
+        // instead of carrying the same table inline.  Keeping both copies
+        // would make the catalog retain the complete group table even when a
+        // caller intends to use one-page lookups, defeating the v3 memory
+        // bound.  Small snapshots may keep inline groups, but then they must
+        // leave the group index roots empty.
+        if !self.groups.is_empty() && !self.group_index_pages.is_empty() {
+            return Err(PackedWireError::Invalid(
+                "manifest cannot contain inline groups and group index pages together".into(),
+            ));
+        }
         let mut group_ids = std::collections::HashSet::with_capacity(self.groups.len());
         for group in &self.groups {
             if !group_ids.insert(group.group_id) {
@@ -891,6 +902,17 @@ mod tests {
         body.push(0);
         let object = PackedEnvelope::build(PackedObjectKind::Manifest, body).unwrap();
         assert!(PackedSnapshotManifest::decode(object).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_inline_groups_with_page_roots() {
+        let mut invalid = manifest();
+        invalid.group_index_pages.push(PackedContainerRef {
+            object_key: b"packed/group-index-0".to_vec(),
+            object_len: 4096,
+            object_digest: [5; 32],
+        });
+        assert!(invalid.encode().is_err());
     }
 
     #[test]
