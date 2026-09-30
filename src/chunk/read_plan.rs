@@ -1,5 +1,7 @@
 //! Workspace-neutral resolved read plans and their block-store executor.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -130,6 +132,13 @@ pub enum ReadSource {
         size_class: u8,
         codec: u8,
         frame_digest: [u8; 16],
+    },
+    /// Immutable file bytes embedded in a packed GroupMeta page.  This source
+    /// is already resident in the bounded metadata range and must not trigger
+    /// a second object-store request.
+    PackedInline {
+        data: Arc<[u8]>,
+        raw_offset: u32,
     },
 }
 
@@ -363,6 +372,22 @@ fn shift_source(source: &ReadSource, delta: u64) -> Result<ReadSource, ReadPlanE
                 frame_digest: *frame_digest,
             })
         }
+        ReadSource::PackedInline { data, raw_offset } => {
+            let shifted = u64::from(*raw_offset)
+                .checked_add(delta)
+                .ok_or_else(|| ReadPlanError::Invalid("packed inline offset overflows".into()))?;
+            if shifted > data.len() as u64 {
+                return Err(ReadPlanError::Invalid(
+                    "packed inline offset exceeds payload length".into(),
+                ));
+            }
+            Ok(ReadSource::PackedInline {
+                data: data.clone(),
+                raw_offset: u32::try_from(shifted).map_err(|_| {
+                    ReadPlanError::Invalid("packed inline offset exceeds u32".into())
+                })?,
+            })
+        }
     }
 }
 
@@ -400,6 +425,17 @@ fn validate_source(source: &ReadSource, logical_len: u64) -> Result<(), ReadPlan
             object_offset
                 .checked_add(u64::from(*stored_len))
                 .ok_or_else(|| ReadPlanError::Invalid("packed object range overflows".into()))?;
+            Ok(())
+        }
+        ReadSource::PackedInline { data, raw_offset } => {
+            let end = u64::from(*raw_offset)
+                .checked_add(logical_len)
+                .ok_or_else(|| ReadPlanError::Invalid("packed inline range overflows".into()))?;
+            if end > data.len() as u64 {
+                return Err(ReadPlanError::Invalid(
+                    "packed inline range exceeds payload length".into(),
+                ));
+            }
             Ok(())
         }
     }
@@ -975,6 +1011,25 @@ mod tests {
 
     struct UnifiedTestFetcher;
 
+    #[test]
+    fn shifting_packed_inline_sources_shares_payload_storage() {
+        let data: Arc<[u8]> = Arc::from(b"payload".as_slice());
+        let source = ReadSource::PackedInline {
+            data: data.clone(),
+            raw_offset: 0,
+        };
+        let shifted = shift_source(&source, 2).unwrap();
+        let ReadSource::PackedInline {
+            data: shifted_data,
+            raw_offset,
+        } = shifted
+        else {
+            panic!("expected packed inline source");
+        };
+        assert_eq!(raw_offset, 2);
+        assert!(Arc::ptr_eq(&data, &shifted_data));
+    }
+
     #[async_trait]
     impl UnifiedReadSourceFetcher for UnifiedTestFetcher {
         async fn read_source(&self, source: &ReadSource, output: &mut [u8]) -> anyhow::Result<()> {
@@ -982,6 +1037,10 @@ mod tests {
                 ReadSource::UpperBlock { .. } => output.fill(b'U'),
                 ReadSource::LegacySlice { .. } => output.fill(b'L'),
                 ReadSource::PackedFrame { .. } => output.fill(b'P'),
+                ReadSource::PackedInline { data, raw_offset } => {
+                    let start = *raw_offset as usize;
+                    output.copy_from_slice(&data[start..start + output.len()]);
+                }
                 ReadSource::Hole => anyhow::bail!("holes are handled by the executor"),
             }
             Ok(())

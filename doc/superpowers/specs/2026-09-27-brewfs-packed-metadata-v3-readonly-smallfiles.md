@@ -1,14 +1,44 @@
 # BrewFS v3：增量工作区与自适应只读快照的统一设计
 
 Status: **implementation in progress**
+
+### Implementation checkpoint (2026-09-29)
+
+本 SPEC 仍然是 v3 的目标契约；“目标契约”不等于当前代码已经全部实现。当前
+workspace 的实现审查结论如下，后续性能结果必须按这个边界命名：
+
+| 能力 | 当前状态 | 代码事实/限制 |
+| --- | --- | --- |
+| PM/GC/GM/II wire、digest、边界校验 | 已实现 | `BRFPM004`/`BRFGC004`、`PM06`/`GC04`/`GM06`/`II05` 使用独立 magic；外层 envelope 当前是 64-byte header + 64-byte footer。 |
+| pageable group/inode index、bounded GroupMeta | 已实现 | 大快照使用 page refs；GroupMeta hard limit 为 256 KiB，目录/索引页仍按当前实现的记录上限分页；catalog 以 byte budget 保留 index page、GroupMeta、inode entry 和 hot inode locator，并在热路径共享 Arc。metadata warm-up 会先选稳定预算前缀，再按 container 合并相邻 GroupMeta range（最多 8 MiB、空洞最多 64 KiB）；warm GroupMeta 时按独立 locator 子预算 admission 热 inode locator，II05 的 `entry_ordinal` 直接定位 entry 并保留 name/inode 校验；readdir 深分页用认证的 `entry_count` 跳过前置 group，strict-cold demand read 仍只取引用的 group。 |
+| dynamic frame 和 `<256 KiB` inline payload | 已实现 | inline 受每 group 224 KiB 预算限制；frame codec 当前只接受 codec `0`。 |
+| bounded streaming range | 部分实现 | `ObjectBackend::get_object_range_stream` 和 `read_exact_range` 只消费声明的 range；严格模式不做隐藏 4 MiB overscan，但当前仍将单个 range 累积到完整 `Vec`，尚未实现 SPEC 7.6 的边读边解码/零拷贝分发。 |
+| GroupMeta/GroupContainer 压缩、restart table | **未实现** | 当前 GroupMeta 是前缀压缩 + 固定宽度字段，body 和 frame 都是 uncompressed；没有每 32 条 restart table。zstd/restart 是后续 wire 版本或兼容扩展，不能写成当前性能事实。 |
+| 跨 FUSE 请求的 coalesce delay/group window | 已实现（demand coalescing） | `SharedGroupReadCoordinator` 在 mount 级维护 pending queue，并以 1 ms 收集窗口按 container/profile 合并已提交 frame；共享 4 MiB window cache 和可选 next-window read-ahead 仍是独立的 cold-pipelined 能力。 |
+| cold attributes (`BRFCA004`) | **未实现** | 当前只读适配器提供热属性；xattr/ACL/symlink target 的独立 cold-attribute 对象尚未发布或读取。 |
+| packed 专用 metrics | **部分实现** | window hit/miss/fetch 只有对象级 API，尚未接入 mount metrics；metadata GET、overscan、pipeline peak 等 SPEC 11 字段仍需补齐。 |
+| overlay-workspace lower binding | **部分实现** | `ReadGeneration`、`ReadSource` 和 `compose_overlay_plan` 已存在；v3 readonly mount 已接入，但 workspace lifecycle 尚未把 packed lower 完整接入 P5 的 upper/lower resolver。 |
+| 共享窗口 byte budget | 已实现 | window cache 在 catalog/mount 级创建并由所有 container 复用；预算不是每个 container 一份。coordinator 的 data/range permits 也按 batch 共享；双 container 回归测试锁定这一点。 |
+
+因此本文件第 4--12 节描述的是最终 v3 目标和验收口径；当前代码可以宣称已实现的
+范围以本检查表为准。`strict-cold` 结果可以包含只针对已提交请求的 demand coalescing，
+但不能隐含 GroupMeta 压缩或 BRFCA 读取；`cold-pipelined` 结果必须明确标注当前的
+mount window/read-ahead 实现。
 Owner: BrewFS workspace / packed read path
 Scope: mutable workspaces, immutable snapshots, and adaptive physical layout on S3/OSS
 
-当前代码已经落地 wire/container、GM05 GroupMeta、动态 frame packer、分页 index、
-bounded remote frame descriptor 读取、group catalog lookup 和统一 `UnifiedReadPlan`
-生成。PM06 manifest 已固化 root identity，并为 group/inode index page 携带有序路由 fence；II05 inode index 和 GM05 GroupMeta 已包含
-parent/POSIX 热属性；只读 FUSE mount 仍需接入实际 dispatch 和 generation-aware VFS
-resolver。未接入前不把 packed-v3 的局部 probe 数字写入性能对比表。
+当前代码已经落地 wire/container、GM06 GroupMeta、动态 frame packer、分页 index、
+bounded remote frame descriptor 读取、group catalog lookup 和统一 `UnifiedReadPlan`。
+PM06 manifest 已固化 root identity，并为 group/inode index page 携带有序路由 fence；
+II05 inode index 和 GM06 GroupMeta 已包含 parent/POSIX 热属性。只读 FUSE mount 现在
+通过 `PackedV3ReadonlyMeta` 和 `PackedV3BlockStore` 接入：目录页只取有限 group，数据
+读取由 inode/chunk 转为 packed frame plan，写入操作明确拒绝。性能对比仍需在真实挂载
+和同等冷读条件下进行，不能用 wire 层 probe 数字替代端到端结果。
+
+非根目录的稳定 `DirKey` 使用
+`SHA256("BrewFS-packed-v3-directory\\0" || snapshot_id || inode_le)` 派生；根目录 key
+仍由 manifest 显式保存。`packed_v3_snapshot_fixture` 会按目录生成独立 GroupContainer，
+并发布 group/inode pageable indexes，可用于本地和 OSS 冷读测试。
 
 本文是 v3 的设计提案。它不修改已经发布的 `packed-metadata-v1` 或
 `packed-metadata-v2` 对象；v1/v2 继续按各自的 magic 和校验规则读取。v3 必须使用
@@ -117,7 +147,8 @@ BRFPM004 manifest
 普通路径的远程请求目标变为：
 
 * 路径 lookup/readdir：一个 group index page 加一个 bounded GroupMeta range；
-* 单文件随机读：GroupMeta 已给出 frame placement，再发一个精确的 frame range；
+* 单文件随机读：inline 小文件只读一个 GroupMeta range；普通文件由 GroupMeta 给出
+  frame placement，再发一个精确的 frame range；
 * 顺序小文件读：由有界 `GroupReadCoordinator` 把相邻 frame range 合并成一个窗口，
   通过短生命周期的 in-flight buffer 分发给多个等待者；
 * 任何模式都不需要为每个文件重新读取 slice、frame、object 三张 v2 表。
@@ -254,6 +285,11 @@ manifest 只固定保存很小的根和表引用。group index、inode index、c
 
 ### 4.2 GroupContainer 的物理布局
 
+本节描述 v3 最终目标布局，不是当前 writer 已发布的完整承诺。截至上方
+implementation checkpoint，当前实现仍使用 64-byte packed envelope header/footer，
+GroupMeta 和 data frame 均为未压缩 body，也没有 restart table；这些字段只有在新的
+兼容 wire 版本落地并通过迁移/回读测试后，才能从“目标”升级为“当前格式”。
+
 一个 `BRFGC004` 对象按如下顺序组织：
 
 ```text
@@ -304,7 +340,7 @@ readdir 只加载当前 ordinal 所覆盖的 group。
 
 ## 5. GroupMeta 的紧凑编码
 
-v3 使用独立的 `GM05` payload magic（旧开发版 `GM04` 严格拒绝），因为一个文件可以
+v3 使用独立的 `GM06` payload magic（旧开发版 `GM04` 严格拒绝，兼容读取 `GM05`），因为一个文件可以
 拥有多个 extent。GroupMeta 使用 canonical little-endian 编码和显式长度检查。所有 raw name 都按 POSIX
 规则禁止 NUL、slash、`.` 和 `..`，不做 UTF-8 转换、大小写折叠或 Unicode normalization。
 
@@ -338,7 +374,7 @@ cold_attr_ref   : optional u32
 非规范编码。name suffix 是原始字节，跨 restart 的前缀长度只引用同一个 metadata
 block，不跨 group。
 
-当前 wire 实现使用固定宽度的 `GM05` 热属性字段；manifest 使用 `PM06` payload，
+当前 wire 实现使用固定宽度的 `GM06` 热属性字段；manifest 使用 `PM06` payload，
 inode index 使用 `II05` payload。manifest 固化 `root_dir_key`/`root_inode`，每个
 inode index value 固化 `parent_inode`、`parent_dir_key`、uid/gid/rdev/nlink 和
 atime/mtime/ctime_ns，因此只读 getattr 和根目录初始化不依赖额外 KV 查询。
@@ -366,8 +402,14 @@ frame_digest      : 16 B
 ```
 
 跨 frame 的大文件由多个 extent 组成；稀疏 hole 不写 data frame，读计划按 POSIX 规则
-填零。超过 `inline_file_max`（默认 8 MiB）的文件使用独立 large-data object，GroupMeta
-仍保存它的 extents 和 object descriptor，从而不把一个巨型文件绑进小文件窗口。
+填零。小于 `inline_file_max`（默认 256 KiB）的 immutable regular file 可以把 payload
+直接放在同一条 GroupMeta range 之后。记录设置 `INLINE_DATA_FLAG`，保存
+`inline_data_len + inline_data`，不再生成 extent；读取时 metadata range 已经包含文件
+内容，因此不会再发 frame/data GET。每个 group 的 inline payload 还受 224 KiB 上限和
+剩余固定记录空间共同限制，避免大量小文件把 GroupMeta 推过 256 KiB hard limit；预算
+耗尽后同一 group 的后续文件继续走动态 frame。达到或超过 256 KiB 的文件始终使用
+普通 extent/frame placement。普通文件的 extents 仍由动态 frame directory 校验，稀疏
+hole 不写 data frame，读计划按 POSIX 规则填零。
 
 ### 5.4 frame directory
 
@@ -657,6 +699,11 @@ v3 必须把三种概念分开，所有报告都标明 profile：
 * 允许同一时刻多个 FUSE read 的 demand coalescing，但不允许读取尚未请求的文件；
 * decoded data 在当前 request 完成后立即释放。
 
+当两个数据缓存预算都为零时，mount 不能把空的 `ChunksCache` 传给 packed
+payload reader；否则 reader 会选择 whole-container materialization，而空预算又
+无法保留对象，导致每个 frame miss 重复下载整个 container。strict-cold 必须走
+严格的 frame range。
+
 每个 tool 从新进程/新 mount 开始，不能复用前一个 tool 的 metadata 或 data state；
 同一个 tool 内同一 GroupMeta 被当前目录页和随后的 lookup 复用时，必须分别记录
 `metadata_cache_hit`，不能把它写成 `data_cache_hit`。需要测量绝对零 metadata retention
@@ -681,6 +728,16 @@ v3 必须把三种概念分开，所有报告都标明 profile：
 
 所有模式都输出 `data_cache_hit=0/1`、`inflight_singleflight` 和 `coalesced_range`，
 使临时流水线复用与持久缓存命中可以区分。
+
+只读 mount 可以显式启用 metadata warm-up。warm-up 并行读取有界的 inode/group
+index，并按 metadata byte budget 预热 GroupMeta；`auto` 模式先估算 pageable
+index 的驻留成本，再按稳定 group 顺序以保守 decoded-footprint 估算填充 GroupMeta
+子预算，超出的尾部 group 留给按需 LRU，避免下载后立即淘汰。目录页返回前还可以
+把已解码 entry 的 inode/group locator 有界 admission 到同一缓存，使随后 getattr、
+get_slices 和 read 复用同一条 locator。它不读取 data frame，也不计为
+`data_cache_hit`。warm-up 的耗时必须单独
+记录，不能从 strict-cold 的请求延迟中静默扣除；index、GroupMeta、inode-entry
+和 locator 的命中/未命中要分别记录。
 
 ## 9. 内存和错误边界
 
@@ -733,6 +790,10 @@ brewfs_packed_v3_metadata_cache_hit_total
 brewfs_packed_v3_data_cache_hit_total
 brewfs_packed_v3_group_evictions_total
 ```
+
+实现至少要在 mount 结束日志中同时输出 group-index、inode-index 和 GroupMeta
+的实际 remote GET 次数及字节数。metadata cache hit 不能替代这些请求图字段，
+否则无法判断二进制解析收益是否被 OSS RTT 抵消。
 
 每次性能 artifact 还要记录：snapshot id、layout profile、group/frame targets、
 `strict-cold|cold-pipelined|warm-frame-cache`、文件大小分布、目录 fanout、并发度、

@@ -16,14 +16,18 @@ param(
     [string]$Backend = 'none',
     [ValidateSet('s3')]
     [string]$DataBackend = 's3',
-    [ValidateSet('packed-metadata-v1')]
+    [ValidateSet('packed-metadata-v1', 'packed-metadata-v2', 'packed-metadata-v3')]
     [string]$VolumeFormat = 'packed-metadata-v1',
-    [string]$PerfTools = 'packed-smallfiles packed-posix fio-seqread fio-randread',
+    [string]$PerfTools = 'packed-tree packed-smallfiles fio-seqread fio-randread',
     [int64]$PackedSmallFileCount = 1000000,
     [int64]$PackedSmallFileSizeBytes = 102400,
+    [int64]$PackedSmallFileMinSizeBytes = 0,
+    [int64]$PackedSmallFileMaxSizeBytes = 0,
     [int]$PackedDirLevels = 3,
     [int64]$PackedDirsPerLevel = 10,
     [int64]$PackedFilesPerDir = 1000,
+    [ValidateSet('random-small-file', 'sequential-small-file', 'mixed')]
+    [string]$PackedAccessProfile = 'random-small-file',
     [int64]$PackedFioFileSizeBytes = 67108864,
     [string]$PackedSmallFileReadBytes = '0',
     [string]$PackedExistingManifestKey,
@@ -31,10 +35,16 @@ param(
     [int]$FioRuntimeSeconds = 20,
     [UInt64]$ReadMemoryBytes = 0,
     [UInt64]$ReadSsdBytes = 0,
+    [UInt64]$PackedFrameWindowCacheBytes = 0,
+    [bool]$PackedFrameWindowPrefetch = $false,
     [bool]$PrefetchEnabled = $false,
     [UInt64]$PrefetchMaxBytes = 8388608,
     [int]$PrefetchConcurrency = 7,
     [bool]$RangeBackgroundPrefetch = $false,
+    [ValidateSet('0', '1')]
+    [string]$ReadDirectIo = '1',
+    [ValidateRange(30, 7200)]
+    [int]$ToolTimeoutSeconds = 900,
     [string]$S3Bucket,
     [string]$S3Endpoint,
     [string]$S3Region = 'cn-hangzhou',
@@ -87,7 +97,13 @@ function Invoke-Checked([string]$File, [string[]]$Arguments) {
 
 function Invoke-AliyunJson([string[]]$Arguments) {
     $output = Invoke-Checked $Aliyun $Arguments
-    return ($output -join [Environment]::NewLine | ConvertFrom-Json)
+    $text = $output -join [Environment]::NewLine
+    $start = $text.IndexOf('{')
+    $end = $text.LastIndexOf('}')
+    if ($start -lt 0 -or $end -le $start) {
+        throw "Aliyun CLI returned no JSON object: $text"
+    }
+    return ($text.Substring($start, $end - $start + 1) | ConvertFrom-Json)
 }
 
 function Format-InstanceIds([string]$Value) {
@@ -96,10 +112,21 @@ function Format-InstanceIds([string]$Value) {
 
 function Wait-Until([scriptblock]$Condition, [string]$Description, [int]$TimeoutSeconds = 900) {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lastError = $null
     do {
-        try { if (& $Condition) { return } } catch { }
+        try {
+            if (& $Condition) { return }
+            $lastError = $null
+        }
+        catch {
+            $lastError = $_
+            Write-Host "  wait condition error: $($_.Exception.Message)"
+        }
         Start-Sleep -Seconds 5
     } while ((Get-Date) -lt $deadline)
+    if ($lastError) {
+        throw "等待超时: $Description; last error: $($lastError.Exception.Message)"
+    }
     throw "等待超时: $Description"
 }
 
@@ -142,7 +169,12 @@ function Get-ConfiguredCredentials {
 function Build-LocalBinaries {
     $root = Get-LocalRepoRoot
     if (-not $BinaryPath) { $script:BinaryPath = Join-Path $root 'target\release\brewfs' }
-    if (-not $FixtureBinaryPath) { $script:FixtureBinaryPath = Join-Path $root 'target\release\packed_snapshot_fixture' }
+    $fixtureName = switch ($VolumeFormat) {
+        'packed-metadata-v2' { 'packed_v2_snapshot_fixture'; break }
+        'packed-metadata-v3' { 'packed_v3_snapshot_fixture'; break }
+        default { 'packed_snapshot_fixture' }
+    }
+    if (-not $FixtureBinaryPath) { $script:FixtureBinaryPath = Join-Path $root "target\release\$fixtureName" }
     if ($SkipBuild) {
         if (-not (Test-Path -LiteralPath $BinaryPath) -or -not (Test-Path -LiteralPath $FixtureBinaryPath)) {
             throw '-SkipBuild 要求 -BinaryPath 和 -FixtureBinaryPath 都存在。'
@@ -155,9 +187,9 @@ set -Eeuo pipefail
 cd $(Quote-Bash $wslRoot)
 export CARGO_INCREMENTAL=0
 export CARGO_PROFILE_RELEASE_DEBUG=0
-cargo build --release --features native-packed-base,frozen-base-metadata --bin brewfs --bin packed_snapshot_fixture
-strip target/release/brewfs target/release/packed_snapshot_fixture
-file target/release/brewfs target/release/packed_snapshot_fixture
+cargo build --release --features native-packed-base,frozen-base-metadata --bin brewfs --bin $fixtureName
+strip target/release/brewfs target/release/$fixtureName
+file target/release/brewfs target/release/$fixtureName
 "@
     $output = & wsl.exe -d $WslDistribution -- bash -lc $command 2>&1
     if ($LASTEXITCODE -ne 0) {
@@ -237,6 +269,11 @@ function New-EcsInstance {
 }
 
 function Get-RemoteCommand([string]$BinaryUrl, [string]$FixtureUrl, [string]$RunnerUrl, [string]$CredentialUrl) {
+    $fixtureName = switch ($VolumeFormat) {
+        'packed-metadata-v2' { 'packed_v2_snapshot_fixture'; break }
+        'packed-metadata-v3' { 'packed_v3_snapshot_fixture'; break }
+        default { 'packed_snapshot_fixture' }
+    }
     $remote = @'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -256,9 +293,9 @@ apt-get install -y -qq ca-certificates curl fio fuse3 python3 util-linux procps
 modprobe fuse 2>/dev/null || true
 
 curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/brewfs" __BINARY_URL__
-curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/packed_snapshot_fixture" __FIXTURE_URL__
+curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/__FIXTURE_FILE_NAME__" __FIXTURE_URL__
 curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/run_packed_native.sh" __RUNNER_URL__
-chmod 0755 "$WORK/brewfs" "$WORK/packed_snapshot_fixture" "$WORK/run_packed_native.sh"
+chmod 0755 "$WORK/brewfs" "$WORK/__FIXTURE_FILE_NAME__" "$WORK/run_packed_native.sh"
 
 curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/s3-credentials.env" __CREDENTIAL_URL__
 chmod 0600 "$WORK/s3-credentials.env"
@@ -270,7 +307,8 @@ export BREWFS_S3_ENDPOINT=__S3_ENDPOINT__
 export BREWFS_S3_REGION=__S3_REGION__
 export BREWFS_S3_FORCE_PATH_STYLE=__S3_FORCE_PATH_STYLE__
 export BREWFS_BIN="$WORK/brewfs"
-export PACKED_FIXTURE_BIN="$WORK/packed_snapshot_fixture"
+export PACKED_FIXTURE_BIN="$WORK/__FIXTURE_FILE_NAME__"
+export PACKED_VOLUME_FORMAT=__VOLUME_FORMAT__
 export BREWFS_NATIVE_WORK="$WORK"
 export BREWFS_NATIVE_ARTIFACT_DIR="$ARTIFACT_DIR"
 export PACKED_FIXTURE_PREFIX=__FIXTURE_PREFIX__
@@ -278,20 +316,27 @@ export PACKED_SKIP_FIXTURE=__PACKED_SKIP_FIXTURE__
 export PACKED_EXISTING_MANIFEST_KEY=__PACKED_EXISTING_MANIFEST_KEY__
 export PACKED_SMALLFILE_COUNT=__SMALLFILE_COUNT__
 export PACKED_SMALLFILE_SIZE=__SMALLFILE_SIZE__
+export PACKED_SMALLFILE_MIN_SIZE=__SMALLFILE_MIN_SIZE__
+export PACKED_SMALLFILE_MAX_SIZE=__SMALLFILE_MAX_SIZE__
+export PACKED_ACCESS_PROFILE=__PACKED_ACCESS_PROFILE__
 export PACKED_DIR_LEVELS=__DIR_LEVELS__
 export PACKED_DIRS_PER_LEVEL=__DIRS_PER_LEVEL__
 export PACKED_FILES_PER_DIR=__FILES_PER_DIR__
 export PERF_PACKED_FIO_FILE_SIZE=__FIO_FILE_SIZE__
 export PERF_PACKED_SMALLFILE_READ_BYTES=__READ_BYTES__
+export PERF_PACKED_SMALLFILE_WORKERS=16
 export PERF_FIO_RUNTIME=__FIO_RUNTIME__
 export PERF_TOOLS=__TOOLS__
 export BREWFS_READ_MEMORY_BYTES=__READ_MEMORY_BYTES__
 export BREWFS_READ_SSD_BYTES=__READ_SSD_BYTES__
+export BREWFS_PACKED_FRAME_WINDOW_CACHE_BYTES=__PACKED_FRAME_WINDOW_CACHE_BYTES__
+export BREWFS_PACKED_FRAME_WINDOW_PREFETCH=__PACKED_FRAME_WINDOW_PREFETCH__
 export BREWFS_PREFETCH_ENABLED=__PREFETCH_ENABLED__
 export BREWFS_PREFETCH_MAX_BYTES=__PREFETCH_MAX_BYTES__
 export BREWFS_PREFETCH_CONCURRENCY=__PREFETCH_CONCURRENCY__
 export BREWFS_RANGE_BACKGROUND_PREFETCH=__RANGE_BACKGROUND_PREFETCH__
-export BREWFS_FUSE_READ_DIRECT_IO=1
+export BREWFS_FUSE_READ_DIRECT_IO=__READ_DIRECT_IO__
+export PERF_TOOL_TIMEOUT_SECONDS=__TOOL_TIMEOUT_SECONDS__
 export BREWFS_FUSE_KEEP_CACHE=0
 export BREWFS_NOFILE_LIMIT=1048576
 export RUST_LOG=warn
@@ -345,6 +390,8 @@ done
         '__FIXTURE_URL__' = Quote-Bash $FixtureUrl
         '__RUNNER_URL__' = Quote-Bash $RunnerUrl
         '__CREDENTIAL_URL__' = Quote-Bash $CredentialUrl
+        '__FIXTURE_FILE_NAME__' = $fixtureName
+        '__VOLUME_FORMAT__' = Quote-Bash $VolumeFormat
         '__S3_REGION__' = Quote-Bash $S3Region
         '__S3_BUCKET__' = Quote-Bash $S3Bucket
         '__S3_ENDPOINT__' = Quote-Bash $S3Endpoint
@@ -354,6 +401,9 @@ done
         '__PACKED_EXISTING_MANIFEST_KEY__' = Quote-Bash ([string]$PackedExistingManifestKey)
         '__SMALLFILE_COUNT__' = Quote-Bash ([string]$PackedSmallFileCount)
         '__SMALLFILE_SIZE__' = Quote-Bash ([string]$PackedSmallFileSizeBytes)
+        '__SMALLFILE_MIN_SIZE__' = Quote-Bash ([string]$PackedSmallFileMinSizeBytes)
+        '__SMALLFILE_MAX_SIZE__' = Quote-Bash ([string]$PackedSmallFileMaxSizeBytes)
+        '__PACKED_ACCESS_PROFILE__' = Quote-Bash $PackedAccessProfile
         '__DIR_LEVELS__' = Quote-Bash ([string]$PackedDirLevels)
         '__DIRS_PER_LEVEL__' = Quote-Bash ([string]$PackedDirsPerLevel)
         '__FILES_PER_DIR__' = Quote-Bash ([string]$PackedFilesPerDir)
@@ -362,10 +412,14 @@ done
         '__FIO_RUNTIME__' = Quote-Bash ([string]$FioRuntimeSeconds)
         '__READ_MEMORY_BYTES__' = Quote-Bash ([string]$ReadMemoryBytes)
         '__READ_SSD_BYTES__' = Quote-Bash ([string]$ReadSsdBytes)
+        '__PACKED_FRAME_WINDOW_CACHE_BYTES__' = Quote-Bash ([string]$PackedFrameWindowCacheBytes)
+        '__PACKED_FRAME_WINDOW_PREFETCH__' = Quote-Bash ($PackedFrameWindowPrefetch.ToString().ToLowerInvariant())
         '__PREFETCH_ENABLED__' = Quote-Bash ($PrefetchEnabled.ToString().ToLowerInvariant())
         '__PREFETCH_MAX_BYTES__' = Quote-Bash ([string]$PrefetchMaxBytes)
         '__PREFETCH_CONCURRENCY__' = Quote-Bash ([string]$PrefetchConcurrency)
         '__RANGE_BACKGROUND_PREFETCH__' = Quote-Bash ($RangeBackgroundPrefetch.ToString().ToLowerInvariant())
+        '__READ_DIRECT_IO__' = Quote-Bash $ReadDirectIo
+        '__TOOL_TIMEOUT_SECONDS__' = Quote-Bash ([string]$ToolTimeoutSeconds)
         '__TOOLS__' = Quote-Bash $PerfTools
         '__INSTANCE_TYPE__' = Quote-Bash $InstanceType
         '__SYSTEM_DISK_GIB__' = [string]$SystemDiskSizeGiB
@@ -396,7 +450,7 @@ function Invoke-PerfOnEcs {
         $item = @($result.Invocation.InvocationResults.InvocationResult)[0]
         if ($item) {
             Write-Host "  invocation status=$($item.InvocationStatus)"
-            if ($item.InvocationStatus -in @('Success', 'Failed', 'Stopped', 'Error', 'Terminated')) {
+            if ($item.InvocationStatus -in @('Success', 'Failed', 'Stopped', 'Error', 'Terminated', 'Aborted', 'Timeout')) {
                 $decoded = ''
                 if ($item.Output) { $decoded = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($item.Output)) }
                 Set-Content -LiteralPath (Join-Path $script:RunArtifactDirectory 'remote-output.log') -Value $decoded -Encoding UTF8
@@ -443,8 +497,8 @@ try {
     }
     if ($Action -eq 'create') { New-EcsInstance; return }
 
-    if ($VolumeFormat -ne 'packed-metadata-v1' -or $DataBackend -ne 's3') {
-        throw '原生 ECS runner 只接受 packed-metadata-v1 + Aliyun S3/OSS。'
+    if ($VolumeFormat -notin @('packed-metadata-v1', 'packed-metadata-v2', 'packed-metadata-v3') -or $DataBackend -ne 's3') {
+        throw '原生 ECS runner 只接受 packed-metadata-v1/v2/v3 + Aliyun S3/OSS。'
     }
     if (-not $S3Bucket) { throw 'run 必须指定 -S3Bucket（Aliyun OSS bucket）。' }
     $expected = [int64]1
@@ -452,6 +506,11 @@ try {
     $expected *= $PackedFilesPerDir
     if ($expected -ne $PackedSmallFileCount) { throw "packed 文件数量不一致: expected=$expected actual=$PackedSmallFileCount" }
     if ($PackedSmallFileSizeBytes -le 0 -or $PackedSmallFileSizeBytes -gt 4MB) { throw 'PackedSmallFileSizeBytes 必须在 1 到 4 MiB 之间。' }
+    if ($PackedSmallFileMinSizeBytes -le 0) { $PackedSmallFileMinSizeBytes = $PackedSmallFileSizeBytes }
+    if ($PackedSmallFileMaxSizeBytes -le 0) { $PackedSmallFileMaxSizeBytes = $PackedSmallFileSizeBytes }
+    if ($PackedSmallFileMinSizeBytes -gt $PackedSmallFileMaxSizeBytes -or $PackedSmallFileMaxSizeBytes -gt 4MB) {
+        throw 'PackedSmallFileMinSizeBytes/MaxSizeBytes 必须满足 0 < min <= max <= 4 MiB。'
+    }
     if ($PackedSkipFixture -and -not $PackedExistingManifestKey) { throw '-PackedSkipFixture 必须同时指定 -PackedExistingManifestKey。' }
     if (-not $S3Endpoint) { $S3Endpoint = "https://oss-$S3Region.aliyuncs.com" }
     if (-not $S3AccessKey -or -not $S3SecretKey) {
@@ -464,13 +523,18 @@ try {
 
     Build-LocalBinaries
     Publish-OssObject $BinaryPath "$ObjectPrefix/bin/brewfs"
-    Publish-OssObject $FixtureBinaryPath "$ObjectPrefix/bin/packed_snapshot_fixture"
+    $fixtureName = switch ($VolumeFormat) {
+        'packed-metadata-v2' { 'packed_v2_snapshot_fixture'; break }
+        'packed-metadata-v3' { 'packed_v3_snapshot_fixture'; break }
+        default { 'packed_snapshot_fixture' }
+    }
+    Publish-OssObject $FixtureBinaryPath "$ObjectPrefix/bin/$fixtureName"
     $nativeScriptPath = Join-Path $PSScriptRoot 'run_aliyun_packed_native.sh'
     Publish-OssObject $nativeScriptPath "$ObjectPrefix/bin/run_aliyun_packed_native.sh"
     $credentialKey = "$ObjectPrefix/bootstrap/s3-credentials.env"
     Publish-CredentialBundle $credentialKey
     $script:BinaryUrl = Get-OssSignedUrl "$ObjectPrefix/bin/brewfs"
-    $script:FixtureUrl = Get-OssSignedUrl "$ObjectPrefix/bin/packed_snapshot_fixture"
+    $script:FixtureUrl = Get-OssSignedUrl "$ObjectPrefix/bin/$fixtureName"
     $script:RunnerUrl = Get-OssSignedUrl "$ObjectPrefix/bin/run_aliyun_packed_native.sh"
     $script:CredentialUrl = Get-OssSignedUrl $credentialKey 28800
 

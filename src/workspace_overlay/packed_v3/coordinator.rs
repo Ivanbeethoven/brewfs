@@ -2,11 +2,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Notify, Semaphore, oneshot};
 
 use super::layout::AccessProfile;
 use super::remote::RemotePackedObject;
@@ -71,6 +73,230 @@ pub struct CoalescedRange {
 pub struct GroupReadCoordinator {
     profile: AccessProfile,
     limits: CoordinatorLimits,
+}
+
+/// Mount-scoped demand coordinator.  FUSE normally delivers adjacent file
+/// reads as separate tasks, so a stateless per-call planner cannot amortize
+/// the object-store RTT.  This coordinator collects requests for one tick,
+/// groups them by immutable container and access profile, and then reuses the
+/// same bounded range planner.  It retains no frame bytes after replies are
+/// delivered; the only state between calls is the short pending queue.
+#[derive(Clone)]
+pub(crate) struct SharedGroupReadCoordinator<B: crate::cadapter::client::ObjectBackend + Clone> {
+    state: Arc<SharedCoordinatorState<B>>,
+    limits: CoordinatorLimits,
+}
+
+struct SharedCoordinatorState<B: crate::cadapter::client::ObjectBackend + Clone> {
+    pending: Mutex<Vec<PendingRead<B>>>,
+    notify: Notify,
+    worker_started: AtomicBool,
+}
+
+struct PendingRead<B: crate::cadapter::client::ObjectBackend + Clone> {
+    object: Arc<RemotePackedObject<B>>,
+    profile: AccessProfile,
+    requests: Vec<FrameReadRequest>,
+    reply: oneshot::Sender<PackedResult<BTreeMap<u32, Bytes>>>,
+}
+
+struct PendingBatchGroup<B: crate::cadapter::client::ObjectBackend + Clone> {
+    object: Arc<RemotePackedObject<B>>,
+    profile: AccessProfile,
+    requests: Vec<FrameReadRequest>,
+    waiters: Vec<PendingRead<B>>,
+}
+
+/// Batch-scoped permits shared by every container group dispatched in one
+/// coordinator tick.  Keeping the byte and range budgets here prevents group
+/// parallelism from multiplying the configured mount-level limits.
+struct SharedReadBudget {
+    bytes: Arc<Semaphore>,
+    ranges: Arc<Semaphore>,
+}
+
+impl SharedReadBudget {
+    fn new(limits: CoordinatorLimits) -> PackedResult<Arc<Self>> {
+        let bytes = usize::try_from(limits.pipeline_bytes_budget).map_err(|_| {
+            PackedWireError::LimitExceeded("pipeline byte budget exceeds usize".into())
+        })?;
+        Ok(Arc::new(Self {
+            bytes: Arc::new(Semaphore::new(bytes)),
+            ranges: Arc::new(Semaphore::new(limits.max_inflight_ranges)),
+        }))
+    }
+}
+
+impl<B> SharedGroupReadCoordinator<B>
+where
+    B: crate::cadapter::client::ObjectBackend + Clone + 'static,
+{
+    pub(crate) fn new(limits: CoordinatorLimits) -> PackedResult<Self> {
+        Ok(Self {
+            state: Arc::new(SharedCoordinatorState {
+                pending: Mutex::new(Vec::new()),
+                notify: Notify::new(),
+                worker_started: AtomicBool::new(false),
+            }),
+            limits: limits.validate()?,
+        })
+    }
+
+    pub(crate) async fn submit(
+        &self,
+        object: Arc<RemotePackedObject<B>>,
+        profile: AccessProfile,
+        requests: Vec<FrameReadRequest>,
+    ) -> PackedResult<BTreeMap<u32, Bytes>> {
+        if requests.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let (reply, result) = oneshot::channel();
+        {
+            let mut pending = self.state.pending.lock().await;
+            pending.push(PendingRead {
+                object,
+                profile,
+                requests,
+                reply,
+            });
+        }
+        self.start_worker();
+        self.state.notify.notify_one();
+        result.await.map_err(|_| {
+            PackedWireError::Backend("packed read coordinator worker stopped".into())
+        })?
+    }
+
+    fn start_worker(&self) {
+        if self
+            .state
+            .worker_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let state = Arc::clone(&self.state);
+            let limits = self.limits;
+            tokio::spawn(async move { shared_coordinator_worker(state, limits).await });
+        }
+    }
+}
+
+async fn shared_coordinator_worker<B>(
+    state: Arc<SharedCoordinatorState<B>>,
+    limits: CoordinatorLimits,
+) where
+    B: crate::cadapter::client::ObjectBackend + Clone + 'static,
+{
+    loop {
+        // Construct the notification future before checking the queue so a
+        // producer racing with the check cannot lose its wake-up.
+        let notified = state.notify.notified();
+        if state.pending.lock().await.is_empty() {
+            notified.await;
+            continue;
+        }
+        drop(notified);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let batch = {
+            let mut pending = state.pending.lock().await;
+            std::mem::take(&mut *pending)
+        };
+        if batch.is_empty() {
+            continue;
+        }
+        dispatch_shared_batch(batch, limits).await;
+    }
+}
+
+async fn dispatch_shared_batch<B>(batch: Vec<PendingRead<B>>, limits: CoordinatorLimits)
+where
+    B: crate::cadapter::client::ObjectBackend + Clone + 'static,
+{
+    let mut groups = Vec::<PendingBatchGroup<B>>::new();
+    let mut indexes = HashMap::<(String, AccessProfile), usize>::new();
+    for waiter in batch {
+        let key = (waiter.object.object_key().to_owned(), waiter.profile);
+        let group_index = if let Some(index) = indexes.get(&key).copied() {
+            index
+        } else {
+            let index = groups.len();
+            indexes.insert(key, index);
+            groups.push(PendingBatchGroup {
+                object: Arc::clone(&waiter.object),
+                profile: waiter.profile,
+                requests: Vec::new(),
+                waiters: Vec::new(),
+            });
+            index
+        };
+        groups[group_index]
+            .requests
+            .extend(waiter.requests.iter().cloned());
+        groups[group_index].waiters.push(waiter);
+    }
+
+    let budget = match SharedReadBudget::new(limits) {
+        Ok(budget) => budget,
+        Err(error) => {
+            for group in groups {
+                for waiter in group.waiters {
+                    let _ = waiter.reply.send(Err(error.clone()));
+                }
+            }
+            return;
+        }
+    };
+    // Groups can now overlap their object-store RTT, while the shared range
+    // and byte permits below keep the total in-flight work within the mount
+    // budget.  Use the range limit as the group fan-out cap so a large batch
+    // cannot create an unbounded number of active group futures.
+    let group_concurrency = limits.max_inflight_ranges.max(1);
+    let mut groups = futures_util::stream::iter(groups.into_iter().map(|group| {
+        let budget = Arc::clone(&budget);
+        async move {
+            let PendingBatchGroup {
+                object,
+                profile,
+                requests,
+                waiters,
+            } = group;
+            let result =
+                read_coalesced_frames_with_budget(&object, profile, requests, limits, budget).await;
+            (waiters, result)
+        }
+    }))
+    .buffer_unordered(group_concurrency);
+
+    while let Some((waiters, result)) = groups.next().await {
+        match result {
+            Ok(frames) => {
+                for waiter in waiters {
+                    let mut output = BTreeMap::new();
+                    let mut error = None;
+                    for request in waiter.requests {
+                        let ordinal = request.descriptor.frame_ordinal;
+                        let Some(payload) = frames.get(&ordinal) else {
+                            error = Some(PackedWireError::Invalid(
+                                "coordinator response is missing a requested frame".into(),
+                            ));
+                            break;
+                        };
+                        output.insert(ordinal, payload.clone());
+                    }
+                    let _ = waiter.reply.send(match error {
+                        Some(error) => Err(error),
+                        None => Ok(output),
+                    });
+                }
+            }
+            Err(error) => {
+                for waiter in waiters {
+                    let _ = waiter.reply.send(Err(error.clone()));
+                }
+            }
+        }
+    }
 }
 
 impl GroupReadCoordinator {
@@ -238,32 +464,49 @@ pub async fn read_coalesced_frames<B: crate::cadapter::client::ObjectBackend + C
     limits: CoordinatorLimits,
 ) -> PackedResult<BTreeMap<u32, Bytes>> {
     let limits = limits.validate()?;
+    let budget = SharedReadBudget::new(limits)?;
+    read_coalesced_frames_with_budget(object, profile, requests, limits, budget).await
+}
+
+async fn read_coalesced_frames_with_budget<B: crate::cadapter::client::ObjectBackend + Clone>(
+    object: &RemotePackedObject<B>,
+    profile: AccessProfile,
+    requests: impl IntoIterator<Item = FrameReadRequest>,
+    limits: CoordinatorLimits,
+    budget: Arc<SharedReadBudget>,
+) -> PackedResult<BTreeMap<u32, Bytes>> {
     let ranges = coalesce_frame_ranges(profile, requests, limits)?;
-    let semaphore = Arc::new(Semaphore::new(
-        usize::try_from(limits.pipeline_bytes_budget).map_err(|_| {
-            PackedWireError::LimitExceeded("pipeline byte budget exceeds usize".into())
-        })?,
-    ));
-    let max_inflight = limits.max_inflight_ranges;
     let mut stream = futures_util::stream::iter(ranges.into_iter().map(|range| {
-        let semaphore = Arc::clone(&semaphore);
+        let budget = Arc::clone(&budget);
         async move {
             let permits = u32::try_from(range.length).map_err(|_| {
                 PackedWireError::LimitExceeded("coalesced range exceeds semaphore permits".into())
             })?;
-            let permit = semaphore
+            let range_permit = budget
+                .ranges
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| PackedWireError::Backend("range semaphore closed".into()))?;
+            let byte_permit = budget
+                .bytes
+                .clone()
                 .acquire_many_owned(permits)
                 .await
                 .map_err(|_| PackedWireError::Backend("pipeline semaphore closed".into()))?;
-            let bytes = object.read_range(range.offset, range.length).await?;
-            Ok::<_, PackedWireError>((range, bytes, permit))
+            let bytes = object
+                .read_windowed_payload_range(range.offset, range.length)
+                .await?;
+            Ok::<_, PackedWireError>((range, bytes, range_permit, byte_permit))
         }
     }))
-    .buffer_unordered(max_inflight);
+    // All range futures are cheap descriptors waiting on the shared permits;
+    // the permits, rather than this buffer size, define actual concurrency.
+    .buffer_unordered(limits.max_inflight_ranges.max(1));
 
     let mut output = BTreeMap::new();
     while let Some(result) = stream.next().await {
-        let (range, bytes, permit) = result?;
+        let (range, bytes, range_permit, byte_permit) = result?;
         if bytes.len() as u64 != range.length {
             return Err(PackedWireError::Truncated {
                 what: "coalesced packed frame range",
@@ -306,7 +549,8 @@ pub async fn read_coalesced_frames<B: crate::cadapter::client::ObjectBackend + C
                 Bytes::copy_from_slice(payload),
             );
         }
-        drop(permit);
+        drop(byte_permit);
+        drop(range_permit);
     }
     Ok(output)
 }
@@ -428,5 +672,37 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, PackedWireError::LimitExceeded(_)));
+    }
+
+    #[tokio::test]
+    async fn shared_read_budget_caps_bytes_across_groups() {
+        let limits = CoordinatorLimits {
+            pipeline_bytes_budget: 2 * 1024,
+            max_inflight_ranges: 4,
+            ..CoordinatorLimits::default()
+        };
+        let budget = SharedReadBudget::new(limits).unwrap();
+        let active_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tasks = (0..4).map(|_| {
+            let budget = Arc::clone(&budget);
+            let active_bytes = Arc::clone(&active_bytes);
+            let peak_bytes = Arc::clone(&peak_bytes);
+            tokio::spawn(async move {
+                let range_permit = budget.ranges.clone().acquire_owned().await.unwrap();
+                let byte_permit = budget.bytes.clone().acquire_many_owned(1024).await.unwrap();
+                let active = active_bytes.fetch_add(1024, Ordering::AcqRel) + 1024;
+                peak_bytes.fetch_max(active, Ordering::AcqRel);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                active_bytes.fetch_sub(1024, Ordering::AcqRel);
+                drop(byte_permit);
+                drop(range_permit);
+            })
+        });
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert!(peak_bytes.load(Ordering::Acquire) <= limits.pipeline_bytes_budget as usize);
+        assert_eq!(active_bytes.load(Ordering::Acquire), 0);
     }
 }

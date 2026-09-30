@@ -45,7 +45,7 @@ usage() {
   -h, --help                 显示帮助
 
 支持的 PERF_TOOLS:
-  fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw fio dirstress dirperf metaperf looptest stress-ng
+  fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw fio dirstress dirperf smallfiles-read metaperf looptest stress-ng
 
 可通过环境变量覆盖各工具参数:
   PERF_DIRSTRESS_ARGS PERF_DIRPERF_ARGS PERF_METAPERF_ARGS PERF_LOOPTEST_ARGS
@@ -60,6 +60,7 @@ usage() {
   JFS_COMPRESS JFS_WRITEBACK JFS_BUFFER_SIZE_MIB JFS_CACHE_SIZE_MIB JFS_CACHE_LARGE_WRITE
   JFS_MAX_UPLOADS JFS_MAX_STAGE_WRITE JFS_MAX_DOWNLOADS JFS_MAX_READAHEAD_MIB JFS_PREFETCH
   JFS_OPEN_CACHE JFS_OPEN_CACHE_LIMIT JFS_BACKUP_META JFS_NO_USAGE_REPORT JFS_CACHE_DIR
+  PERF_SMALLFILE_DIRS PERF_SMALLFILE_FILES_PER_DIR PERF_SMALLFILE_SIZE PERF_SMALLFILE_COLD_READ
   REDIS_PERF_DATA_MOUNT 可把 Redis AOF/RDB 数据挂到大容量目录或命名卷（例如 /data/slayer/juicefs-perf-redis）
   PERF_LOG_TO_CONSOLE=true 可恢复压测工具日志输出到终端（默认关闭）
 EOF
@@ -259,6 +260,10 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e PERF_TOOLS="$PERF_TOOLS_VALUE" \
     -e PERF_DIRSTRESS_ARGS \
     -e PERF_DIRPERF_ARGS \
+    -e PERF_SMALLFILE_DIRS \
+    -e PERF_SMALLFILE_FILES_PER_DIR \
+    -e PERF_SMALLFILE_SIZE \
+    -e PERF_SMALLFILE_COLD_READ \
     -e PERF_METAPERF_ARGS \
     -e PERF_LOOPTEST_ARGS \
     -e PERF_DIRSTRESS_PROCS \

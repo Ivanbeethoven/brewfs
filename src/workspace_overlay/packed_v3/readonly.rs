@@ -25,6 +25,7 @@ use crate::vfs::handles::{DirHandle, DirectoryPageSource, RawDirEntry};
 use crate::vfs::{chunk_id_for, extract_ino_and_chunk_index};
 
 use super::catalog::{RemoteGroupCatalog, directory_key};
+use super::index::PackedInodeIndexEntry;
 use super::meta::GroupMetaEntry;
 use super::wire::{PackedSnapshotManifest, PackedWireError};
 
@@ -61,6 +62,23 @@ fn attr(inode: u64, entry: &GroupMetaEntry) -> FileAttr {
         mtime: entry.mtime_ns,
         ctime: entry.ctime_ns,
         nlink: entry.nlink,
+    }
+}
+
+fn attr_from_inode_index(index: &PackedInodeIndexEntry) -> FileAttr {
+    FileAttr {
+        ino: index.inode as i64,
+        size: index.size,
+        blocks: index.size.div_ceil(512),
+        kind: file_type(index.kind, index.mode),
+        mode: index.mode,
+        rdev: index.rdev.min(u64::from(u32::MAX)) as u32,
+        uid: index.uid,
+        gid: index.gid,
+        atime: index.atime_ns,
+        mtime: index.mtime_ns,
+        ctime: index.ctime_ns,
+        nlink: index.nlink,
     }
 }
 
@@ -249,6 +267,26 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
             .checked_mul(self.chunk_size)
             .ok_or_else(|| MetaError::Internal("packed chunk offset overflows".into()))?;
         let chunk_end = chunk_start.saturating_add(self.chunk_size);
+
+        // Inline bytes live in GroupMeta rather than in a frame extent.  The
+        // legacy DataFetcher still asks MetaLayer for visible slices, so expose
+        // the inline range as a logical slice.  PackedV3BlockStore resolves
+        // the resulting block read back to the inode and serves it from the
+        // already-decoded GroupMeta payload without issuing a frame request.
+        if !entry.inline_data.is_empty() {
+            let start = chunk_start.min(entry.size);
+            let end = chunk_end.min(entry.size);
+            if start < end {
+                return Ok(vec![SliceDesc {
+                    slice_id: chunk_id,
+                    chunk_id,
+                    offset: start - chunk_start,
+                    length: end - start,
+                }]);
+            }
+            return Ok(Vec::new());
+        }
+
         let mut slices = Vec::new();
         for extent in &entry.extents {
             let extent_end = extent
@@ -278,7 +316,7 @@ mod tests {
         AccessProfile, GroupMeta, GroupMetaExtent, PackedContainerRef, PackedFrameInput,
         PackedGroupContainer, PackedGroupIndexPage, PackedGroupIndexPageRef, PackedGroupInput,
         PackedGroupRef, PackedInodeIndexEntry, PackedInodeIndexPage, PackedInodeIndexPageRef,
-        SizeClass, SizeClassTable,
+        PackedSnapshotManifest, SizeClass, SizeClassTable,
     };
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
@@ -302,6 +340,7 @@ mod tests {
             ctime_ns: 0,
             size: 5,
             flags: 0,
+            inline_data: Arc::from([]),
             extents: vec![GroupMetaExtent {
                 file_offset: 0,
                 logical_len: 5,
@@ -434,6 +473,55 @@ mod tests {
         store.read_range(key, 0, &mut output).await.unwrap();
         assert_eq!(&output, b"hello");
     }
+
+    #[test]
+    fn inline_meta_exposes_a_logical_slice_to_the_legacy_reader() {
+        let temp = tempdir().unwrap();
+        let client = ObjectClient::new(LocalFsBackend::new(temp.path()));
+        let catalog = Arc::new(RemoteGroupCatalog::new(
+            client,
+            PackedSnapshotManifest {
+                snapshot_id: [1; 32],
+                root_dir_key: [2; 32],
+                root_inode: 1,
+                layout_profile: AccessProfile::RandomSmallFile,
+                size_classes: SizeClassTable::default(),
+                groups: Vec::new(),
+                containers: Vec::new(),
+                group_index_pages: Vec::new(),
+                inode_index_pages: Vec::new(),
+            },
+        ));
+        let meta = PackedV3ReadonlyMeta::new(catalog, 4096);
+        let entry = GroupMetaEntry {
+            name: b"inline.bin".to_vec(),
+            inode: 8,
+            kind: 1,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            nlink: 1,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            size: 7,
+            flags: super::super::meta::INLINE_DATA_FLAG,
+            inline_data: Arc::from(b"payload".as_slice()),
+            extents: Vec::new(),
+        };
+        let chunk_id = chunk_id_for(8, 0).unwrap();
+        assert_eq!(
+            meta.chunk_slices(chunk_id, &entry, 0).unwrap(),
+            vec![SliceDesc {
+                slice_id: chunk_id,
+                chunk_id,
+                offset: 0,
+                length: 7,
+            }]
+        );
+        assert!(meta.chunk_slices(chunk_id, &entry, 1).unwrap().is_empty());
+    }
 }
 
 #[async_trait]
@@ -484,6 +572,12 @@ where
                 ctime: 0,
                 nlink: 2,
             }));
+        }
+        // II05 carries the complete hot attribute set.  Use it directly for
+        // getattr/open so a metadata-only operation does not fetch or clone a
+        // GroupMeta page merely to reconstruct FileAttr.
+        if let Some(index) = self.catalog.inode_paged(inode).await.map_err(map_error)? {
+            return Ok(Some(attr_from_inode_index(&index)));
         }
         Ok(self
             .entry(inode)
@@ -757,7 +851,7 @@ where
     }
     async fn read_symlink(&self, _ino: i64) -> Result<String, MetaError> {
         Err(MetaError::NotSupported(
-            "packed v3 symlink targets are not present in GM05".into(),
+            "packed v3 symlink targets are not present in GM06; BRFCA004 is not published".into(),
         ))
     }
     async fn set_attr(
@@ -807,10 +901,15 @@ where
         {
             return Err(MetaError::Internal("invalid packed v3 chunk id".into()));
         }
-        let Some((_, entry)) = self.entry(ino as u64).await? else {
+        let Some(locator) = self
+            .catalog
+            .lookup_inode_locator(ino as u64)
+            .await
+            .map_err(map_error)?
+        else {
             return Err(MetaError::NotFound(ino));
         };
-        self.chunk_slices(chunk_id, &entry, chunk_index)
+        self.chunk_slices(chunk_id, &locator.entry, chunk_index)
     }
     async fn append_slice(&self, _chunk_id: u64, _slice: SliceDesc) -> Result<(), MetaError> {
         Self::readonly().await

@@ -7,23 +7,36 @@
 //! fields are fixed width so a decoder never has to allocate based on an
 //! untrusted varint.
 
+use std::sync::Arc;
+
 use super::wire::{PackedResult, PackedWireError, Reader, Writer};
 
-// GM05 is the first packed-v3 metadata format. GM04 was used by the
+// GM06 is the current packed-v3 metadata format. GM04 was used by the
 // development codec when each entry carried one extent; accepting it here
 // would make the decoder interpret the old trailing fields as an extent
 // count and could silently produce a wrong read plan. Keep the version
-// marker strict until an explicit migration decoder exists.
-const GROUP_META_MAGIC: &[u8; 4] = b"GM05";
-const GROUP_META_HEADER_LEN: usize = 12;
+// marker strict until an explicit migration decoder exists. GM05 remains a
+// read-only compatibility format because it has no inline-payload field.
+const GROUP_META_MAGIC: &[u8; 4] = b"GM06";
+const LEGACY_GROUP_META_MAGIC: &[u8; 4] = b"GM05";
+pub(crate) const GROUP_META_HEADER_LEN: usize = 12;
 // Prefix/suffix lengths, kind/flags, mode, inode, size, POSIX hot
 // attributes, and extent count.  Keeping this lower bound explicit lets the
 // decoder reject a forged entry count before allocating its vector.
-const GROUP_META_MIN_ENTRY_BYTES: usize = 72;
+const GROUP_META_MIN_ENTRY_BYTES: usize = 76;
 const MAX_GROUP_META_ENTRIES: u32 = 1_048_576;
 const MAX_ENTRY_EXTENTS: usize = 1024;
 const MAX_NAME_LEN: usize = 1024;
 pub(crate) const MAX_GROUP_META_BYTES: usize = 256 * 1024;
+/// Files below this threshold may be stored directly in the authenticated
+/// GroupMeta range.  The strict inequality leaves the envelope and record
+/// headers outside the payload budget.
+pub const INLINE_FILE_MAX_BYTES: usize = 256 * 1024;
+/// Keep enough room for names and POSIX hot attributes when a group contains
+/// more than one inline file.  A group that exceeds this budget continues to
+/// use ordinary dynamic frames for the remaining files.
+pub(crate) const INLINE_GROUP_DATA_BUDGET_BYTES: usize = 224 * 1024;
+pub const INLINE_DATA_FLAG: u8 = 0x01;
 
 /// One physical extent belonging to a file in a group.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,6 +66,11 @@ pub struct GroupMetaEntry {
     pub ctime_ns: i64,
     pub size: u64,
     pub flags: u8,
+    /// Contents embedded in the GroupMeta page for one small immutable file.
+    /// An empty vector means the file is represented by `extents` (or is a
+    /// zero-length file).  The flag is persisted separately so a malformed
+    /// record cannot silently reinterpret an empty payload.
+    pub inline_data: Arc<[u8]>,
     pub extents: Vec<GroupMetaExtent>,
 }
 
@@ -62,6 +80,36 @@ impl GroupMetaEntry {
         if self.extents.len() > MAX_ENTRY_EXTENTS {
             return Err(PackedWireError::LimitExceeded(
                 "group entry extent count exceeds limit".into(),
+            ));
+        }
+        if !self.inline_data.is_empty() {
+            if self.kind != 1 {
+                return Err(PackedWireError::Invalid(
+                    "inline group metadata payload requires a regular file".into(),
+                ));
+            }
+            if self.inline_data.len() >= INLINE_FILE_MAX_BYTES {
+                return Err(PackedWireError::LimitExceeded(
+                    "inline group metadata file exceeds 256 KiB".into(),
+                ));
+            }
+            if self.size != self.inline_data.len() as u64 || !self.extents.is_empty() {
+                return Err(PackedWireError::Invalid(
+                    "inline group metadata file must have an exact size and no extents".into(),
+                ));
+            }
+            if self.flags & INLINE_DATA_FLAG == 0 {
+                return Err(PackedWireError::Invalid(
+                    "inline group metadata file is missing its inline flag".into(),
+                ));
+            }
+        } else if self.flags & INLINE_DATA_FLAG != 0 && self.kind != 1 {
+            return Err(PackedWireError::Invalid(
+                "inline group metadata flag requires a regular file".into(),
+            ));
+        } else if self.flags & INLINE_DATA_FLAG != 0 && self.size != 0 {
+            return Err(PackedWireError::Invalid(
+                "non-empty group metadata file has an inline flag without payload".into(),
             ));
         }
         let mut previous_end = 0u64;
@@ -116,12 +164,30 @@ impl GroupMeta {
         &self.entries
     }
 
+    pub(crate) fn entries_mut(&mut self) -> &mut [GroupMetaEntry] {
+        &mut self.entries
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Approximate the retained decoded footprint for byte-budgeted caches.
+    /// The estimate intentionally includes owned names, inline payloads and
+    /// extent vectors, which are the parts that dominate a large snapshot.
+    pub(crate) fn decoded_weight(&self) -> u32 {
+        let bytes = self.entries.iter().fold(0usize, |total, entry| {
+            total
+                .saturating_add(96)
+                .saturating_add(entry.name.len())
+                .saturating_add(entry.inline_data.len())
+                .saturating_add(entry.extents.len().saturating_mul(28))
+        });
+        u32::try_from(bytes.min(u32::MAX as usize)).unwrap_or(u32::MAX)
     }
 
     /// Return a bounded page without copying the complete group.
@@ -181,6 +247,10 @@ impl GroupMeta {
                 writer.u32(extent.raw_offset);
                 writer.u32(extent.raw_len);
             }
+            writer.u32(u32::try_from(entry.inline_data.len()).map_err(|_| {
+                PackedWireError::LimitExceeded("inline group metadata payload exceeds u32".into())
+            })?);
+            writer.bytes(entry.inline_data.as_ref());
             previous.clear();
             previous.extend_from_slice(&entry.name);
         }
@@ -207,11 +277,16 @@ impl GroupMeta {
             ));
         }
         let mut reader = Reader::new(bytes);
-        if reader.take(4)? != GROUP_META_MAGIC {
+        let magic = reader.take(4)?;
+        let has_inline_payload = if magic == GROUP_META_MAGIC {
+            true
+        } else if magic == LEGACY_GROUP_META_MAGIC {
+            false
+        } else {
             return Err(PackedWireError::UnsupportedFormat(
                 "group metadata payload version mismatch".into(),
             ));
-        }
+        };
         let count = reader.u32()?;
         if count > MAX_GROUP_META_ENTRIES {
             return Err(PackedWireError::LimitExceeded(
@@ -219,7 +294,13 @@ impl GroupMeta {
             ));
         }
         let available = bytes.len().saturating_sub(GROUP_META_HEADER_LEN);
-        if count as usize > available / GROUP_META_MIN_ENTRY_BYTES {
+        let min_entry_bytes = if has_inline_payload {
+            GROUP_META_MIN_ENTRY_BYTES
+        } else {
+            // GM05 did not carry the inline-length field.
+            GROUP_META_MIN_ENTRY_BYTES - 4
+        };
+        if count as usize > available / min_entry_bytes {
             return Err(PackedWireError::Invalid(
                 "group metadata entry count exceeds the payload budget".into(),
             ));
@@ -244,39 +325,65 @@ impl GroupMeta {
                     "group metadata name prefix is not canonical".into(),
                 ));
             }
+            let kind = reader.u8()?;
+            let flags = reader.u8()?;
+            let mode = reader.u32()?;
+            let uid = reader.u32()?;
+            let gid = reader.u32()?;
+            let rdev = reader.u64()?;
+            let nlink = reader.u32()?;
+            let atime_ns = reader.i64()?;
+            let mtime_ns = reader.i64()?;
+            let ctime_ns = reader.i64()?;
+            let inode = reader.u64()?;
+            let size = reader.u64()?;
+            let extent_count = usize::from(reader.u16()?);
+            if extent_count > MAX_ENTRY_EXTENTS {
+                return Err(PackedWireError::LimitExceeded(
+                    "group entry extent count exceeds limit".into(),
+                ));
+            }
+            let mut extents = Vec::with_capacity(extent_count);
+            for _ in 0..extent_count {
+                extents.push(GroupMetaExtent {
+                    file_offset: reader.u64()?,
+                    logical_len: reader.u32()?,
+                    frame_ordinal: reader.u32()?,
+                    raw_offset: reader.u32()?,
+                    raw_len: reader.u32()?,
+                });
+            }
+            let inline_data = if has_inline_payload {
+                let length = usize::try_from(reader.u32()?).map_err(|_| {
+                    PackedWireError::LimitExceeded(
+                        "inline group metadata length exceeds usize".into(),
+                    )
+                })?;
+                if length >= INLINE_FILE_MAX_BYTES {
+                    return Err(PackedWireError::LimitExceeded(
+                        "inline group metadata file exceeds 256 KiB".into(),
+                    ));
+                }
+                Arc::from(reader.bytes(length)?)
+            } else {
+                Arc::from([])
+            };
             let entry = GroupMetaEntry {
                 name,
-                kind: reader.u8()?,
-                flags: reader.u8()?,
-                mode: reader.u32()?,
-                uid: reader.u32()?,
-                gid: reader.u32()?,
-                rdev: reader.u64()?,
-                nlink: reader.u32()?,
-                atime_ns: reader.i64()?,
-                mtime_ns: reader.i64()?,
-                ctime_ns: reader.i64()?,
-                inode: reader.u64()?,
-                size: reader.u64()?,
-                extents: {
-                    let count = usize::from(reader.u16()?);
-                    if count > MAX_ENTRY_EXTENTS {
-                        return Err(PackedWireError::LimitExceeded(
-                            "group entry extent count exceeds limit".into(),
-                        ));
-                    }
-                    let mut extents = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        extents.push(GroupMetaExtent {
-                            file_offset: reader.u64()?,
-                            logical_len: reader.u32()?,
-                            frame_ordinal: reader.u32()?,
-                            raw_offset: reader.u32()?,
-                            raw_len: reader.u32()?,
-                        });
-                    }
-                    extents
-                },
+                kind,
+                flags,
+                mode,
+                uid,
+                gid,
+                rdev,
+                nlink,
+                atime_ns,
+                mtime_ns,
+                ctime_ns,
+                inode,
+                size,
+                inline_data,
+                extents,
             };
             entry.validate()?;
             if !previous.is_empty() && previous.as_slice() >= entry.name.as_slice() {
@@ -357,6 +464,7 @@ mod tests {
             ctime_ns: 13,
             size: 7,
             flags: 0,
+            inline_data: Arc::from([]),
             extents: vec![GroupMetaExtent {
                 file_offset: 0,
                 logical_len: 7,
@@ -376,6 +484,69 @@ mod tests {
         assert_eq!(decoded, meta);
         assert_eq!(decoded.lookup(b"alphabet").unwrap().inode, 2);
         assert_eq!(decoded.page(1, 1)[0].name, b"alphabet");
+    }
+
+    #[test]
+    fn inline_payload_round_trips_without_an_extent() {
+        let payload = b"inline-small-file".to_vec();
+        let meta = GroupMeta::new(vec![GroupMetaEntry {
+            name: b"tiny.bin".to_vec(),
+            inode: 3,
+            kind: 1,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            nlink: 1,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            size: payload.len() as u64,
+            flags: INLINE_DATA_FLAG,
+            inline_data: Arc::from(payload.clone()),
+            extents: Vec::new(),
+        }])
+        .unwrap();
+        let decoded = GroupMeta::decode(&meta.encode().unwrap()).unwrap();
+        assert_eq!(
+            decoded.entries()[0].inline_data.as_ref(),
+            payload.as_slice()
+        );
+        assert!(decoded.entries()[0].extents.is_empty());
+    }
+
+    #[test]
+    fn legacy_gm05_payload_remains_readable() {
+        let mut writer = Writer::default();
+        writer.bytes(LEGACY_GROUP_META_MAGIC);
+        writer.u32(1);
+        writer.u32(0);
+        writer.u16(0);
+        writer.u16(1);
+        writer.bytes(b"a");
+        writer.u8(1);
+        writer.u8(0);
+        writer.u32(0o100644);
+        writer.u32(1000);
+        writer.u32(1000);
+        writer.u64(0);
+        writer.u32(1);
+        writer.i64(11);
+        writer.i64(12);
+        writer.i64(13);
+        writer.u64(7);
+        writer.u64(7);
+        writer.u16(1);
+        writer.u64(0);
+        writer.u32(7);
+        writer.u32(0);
+        writer.u32(0);
+        writer.u32(7);
+
+        let decoded = GroupMeta::decode(&writer.finish()).unwrap();
+        assert_eq!(decoded.entries()[0].name, b"a");
+        assert!(decoded.entries()[0].inline_data.is_empty());
+        assert_eq!(decoded.entries()[0].extents[0].logical_len, 7);
     }
 
     #[test]
@@ -429,6 +600,7 @@ mod tests {
             ctime_ns: 13,
             size: 12,
             flags: 0,
+            inline_data: Arc::from([]),
             extents: vec![
                 GroupMetaExtent {
                     file_offset: 0,

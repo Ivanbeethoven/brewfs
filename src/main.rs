@@ -48,6 +48,8 @@ use crate::cadapter::client::{ObjectBackend, ObjectClient};
 use crate::cadapter::localfs::LocalFsBackend;
 use crate::cadapter::s3::{S3Backend, S3Config};
 use crate::chunk::bandwidth::BandwidthLimiter;
+#[cfg(feature = "workspace-overlay")]
+use crate::chunk::cache::ChunksCache;
 use crate::chunk::cache::ChunksCacheConfig;
 use crate::chunk::layout::ChunkLayout;
 use crate::chunk::store::{BlockStore, BlockStoreConfig, ObjectBlockStore};
@@ -1115,7 +1117,123 @@ where
         .ok_or_else(|| anyhow::anyhow!("packed-metadata-v3 manifest object is missing"))?;
     let manifest = PackedSnapshotManifest::decode(bytes)
         .map_err(|error| anyhow::anyhow!("packed-metadata-v3 manifest: {error}"))?;
-    let catalog = Arc::new(RemoteGroupCatalog::new(client, manifest));
+    // A zero-budget read profile is the strict cold-read baseline.  Do not
+    // construct a payload-cache facade in that mode: RemotePackedObject uses
+    // the presence of this facade to select whole-container materialization,
+    // which would turn every miss into a full object GET even though no cache
+    // entry can be retained.
+    let payload_cache_enabled = args.cache.read_memory_bytes > 0 || args.cache.read_ssd_bytes > 0;
+    let packed_cache = if payload_cache_enabled {
+        Some(Arc::new(
+            ChunksCache::new_with_config(
+                ChunksCacheConfig::with_budgets(
+                    args.cache.read_memory_bytes,
+                    args.cache.read_ssd_bytes,
+                    args.cache.cache_root.join("packed-containers"),
+                )
+                .with_integrity_mode(args.cache.verify_cache_checksum),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("packed payload cache: {error}"))?,
+        ))
+    } else {
+        None
+    };
+    let frame_window_cache_bytes = std::env::var("BREWFS_PACKED_FRAME_WINDOW_CACHE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let frame_window_prefetch = std::env::var("BREWFS_PACKED_FRAME_WINDOW_PREFETCH")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false);
+    let metadata_cache_bytes = std::env::var("BREWFS_PACKED_METADATA_CACHE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(256 * 1024 * 1024);
+    let metadata_prefetch_mode = std::env::var("BREWFS_PACKED_METADATA_PREFETCH")
+        .ok()
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "eager" => "eager",
+            "auto" => "auto",
+            _ => "off",
+        })
+        // Read-only packed mounts are immutable, so warming a bounded
+        // metadata prefix is the useful default. Set `off` explicitly for a
+        // strict metadata-cold request-graph measurement.
+        .unwrap_or("auto");
+    let metadata_prefetch_concurrency =
+        std::env::var("BREWFS_PACKED_METADATA_PREFETCH_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(1, 64);
+    let metadata_prefetch_max_groups = std::env::var("BREWFS_PACKED_METADATA_PREFETCH_MAX_GROUPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    tracing::info!(
+        frame_window_cache_bytes,
+        frame_window_prefetch,
+        metadata_cache_bytes,
+        metadata_prefetch_mode,
+        metadata_prefetch_concurrency,
+        ?metadata_prefetch_max_groups,
+        "packed v3 read caches configured"
+    );
+    let catalog = match packed_cache {
+        Some(packed_cache) => {
+            RemoteGroupCatalog::with_payload_cache(client, manifest, packed_cache)
+        }
+        None => RemoteGroupCatalog::new(client, manifest),
+    };
+    let catalog = Arc::new(
+        catalog
+            .with_metadata_cache_bytes(metadata_cache_bytes)
+            .with_frame_window_cache_bytes(frame_window_cache_bytes)
+            .with_frame_window_prefetch(frame_window_prefetch),
+    );
+    if metadata_prefetch_mode != "off" {
+        let started = Instant::now();
+        let warmup = if metadata_prefetch_mode == "auto" {
+            catalog
+                .prefetch_metadata_adaptive(metadata_prefetch_concurrency)
+                .await
+        } else {
+            catalog
+                .prefetch_metadata(metadata_prefetch_concurrency, metadata_prefetch_max_groups)
+                .await
+        }
+        .map_err(|error| anyhow::anyhow!("packed metadata prefetch: {error}"))?;
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            inode_index_pages = warmup.inode_index_pages,
+            inode_entries = warmup.inode_entries,
+            inode_entry_bytes = warmup.inode_entry_bytes,
+            inode_entries_skipped = warmup.inode_entries_skipped,
+            group_index_pages = warmup.group_index_pages,
+            group_meta_pages = warmup.group_meta_pages,
+            metadata_index_budget_bytes = warmup.index_budget_bytes,
+            metadata_group_meta_budget_bytes = warmup.group_meta_budget_bytes,
+            metadata_frame_directory_budget_bytes = warmup.frame_directory_budget_bytes,
+            index_bytes_estimated = warmup.index_bytes_estimated,
+            inode_index_pages_skipped = warmup.inode_index_pages_skipped,
+            group_index_pages_skipped = warmup.group_index_pages_skipped,
+            group_meta_bytes_estimated = warmup.group_meta_bytes_estimated,
+            group_meta_pages_skipped = warmup.group_meta_pages_skipped,
+            frame_directory_pages = warmup.frame_directory_pages,
+            frame_directory_pages_skipped = warmup.frame_directory_pages_skipped,
+            frame_directory_bytes_estimated = warmup.frame_directory_bytes_estimated,
+            locator_entries = warmup.locator_entries,
+            locator_bytes = warmup.locator_bytes,
+            locator_entries_skipped = warmup.locator_entries_skipped,
+            "packed v3 metadata prefetch complete"
+        );
+    }
     let meta_layer = Arc::new(PackedV3ReadonlyMeta::new(
         Arc::clone(&catalog),
         layout.chunk_size,
@@ -1158,6 +1276,44 @@ where
         Ok::<(), anyhow::Error>(())
     }
     .await;
+    let metadata_stats = catalog.metadata_cache_stats();
+    tracing::info!(
+        metadata_cache_hits = metadata_stats.hits,
+        metadata_cache_misses = metadata_stats.misses,
+        metadata_index_hits = metadata_stats.index_hits,
+        metadata_index_misses = metadata_stats.index_misses,
+        metadata_inode_entry_hits = metadata_stats.inode_entry_hits,
+        metadata_inode_entry_misses = metadata_stats.inode_entry_misses,
+        metadata_group_meta_hits = metadata_stats.group_meta_hits,
+        metadata_group_meta_misses = metadata_stats.group_meta_misses,
+        metadata_locator_hits = metadata_stats.locator_hits,
+        metadata_locator_misses = metadata_stats.locator_misses,
+        packed_group_index_remote_gets = metadata_stats.group_index_remote_gets,
+        packed_group_index_remote_bytes = metadata_stats.group_index_remote_bytes,
+        packed_inode_index_remote_gets = metadata_stats.inode_index_remote_gets,
+        packed_inode_index_remote_bytes = metadata_stats.inode_index_remote_bytes,
+        packed_group_meta_remote_gets = metadata_stats.group_meta_remote_gets,
+        packed_group_meta_remote_bytes = metadata_stats.group_meta_remote_bytes,
+        packed_frame_directory_remote_gets = metadata_stats.frame_directory_remote_gets,
+        packed_frame_directory_remote_bytes = metadata_stats.frame_directory_remote_bytes,
+        packed_frame_descriptor_remote_gets = metadata_stats.frame_descriptor_remote_gets,
+        packed_frame_descriptor_remote_bytes = metadata_stats.frame_descriptor_remote_bytes,
+        group_index_entries = metadata_stats.group_index_entries,
+        group_index_bytes = metadata_stats.group_index_bytes,
+        inode_index_entries = metadata_stats.inode_index_entries,
+        inode_index_bytes = metadata_stats.inode_index_bytes,
+        inode_entry_entries = metadata_stats.inode_entry_entries,
+        inode_entry_bytes = metadata_stats.inode_entry_bytes,
+        group_meta_entries = metadata_stats.group_meta_entries,
+        group_meta_bytes = metadata_stats.group_meta_bytes,
+        frame_directory_entries = metadata_stats.frame_directory_entries,
+        frame_directory_bytes = metadata_stats.frame_directory_bytes,
+        frame_descriptor_entries = metadata_stats.frame_descriptor_entries,
+        frame_descriptor_bytes = metadata_stats.frame_descriptor_bytes,
+        file_locator_entries = metadata_stats.file_locator_entries,
+        file_locator_bytes = metadata_stats.file_locator_bytes,
+        "packed v3 metadata cache stats"
+    );
     mount_result
 }
 

@@ -14,24 +14,31 @@ mod readonly;
 mod remote;
 mod wire;
 
-pub use catalog::{RemoteGroupCatalog, directory_key};
+pub use catalog::{
+    PackedMetadataCacheStats, PackedMetadataWarmupStats, RemoteGroupCatalog, directory_key,
+};
 pub use coordinator::{
     CoalescedRange, CoordinatorLimits, FrameReadRequest, GroupReadCoordinator,
     coalesce_frame_ranges, read_coalesced_frames,
 };
 pub use group::{
-    PackedFileInput, PackedFrameDescriptor, PackedFrameInput, PackedGroupContainer,
-    PackedGroupDescriptor, PackedGroupInput, frame_directory_body_len, frame_table_body_offset,
-    group_container_counts, pack_group_files, parse_frame_descriptor_range, parse_frame_directory,
+    ContainerPackingLimits, GroupPackingLimits, PackedContainerInput, PackedFileInput,
+    PackedFrameDescriptor, PackedFrameInput, PackedGroupContainer, PackedGroupDescriptor,
+    PackedGroupInput, frame_directory_body_len, frame_table_body_offset, group_container_counts,
+    pack_group_file_shards, pack_group_files, pack_group_shard_containers,
+    parse_frame_descriptor_range, parse_frame_directory,
 };
 pub use index::{PackedGroupIndexPage, PackedInodeIndexEntry, PackedInodeIndexPage};
 pub use layout::{
     AccessProfile, FrameLayoutDecision, LayoutError, SizeClass, SizeClassTable, choose_frame_layout,
 };
-pub use meta::{GroupMeta, GroupMetaEntry, GroupMetaExtent};
+pub use meta::{
+    GroupMeta, GroupMetaEntry, GroupMetaExtent, INLINE_DATA_FLAG, INLINE_FILE_MAX_BYTES,
+};
 pub use readonly::{PackedV3BlockStore, PackedV3ReadonlyMeta};
 pub use remote::{
-    MAX_PACKED_STREAM_RANGE_BYTES, PackedFrameSourceFetcher, RemotePackedObject, read_exact_range,
+    MAX_PACKED_STREAM_RANGE_BYTES, PackedFrameSourceFetcher, PackedWindowCacheStats,
+    RemotePackedObject, read_exact_range,
 };
 pub use wire::{
     COLD_ATTRIBUTE_MAGIC, GROUP_CONTAINER_MAGIC, GROUP_INDEX_MAGIC, INODE_INDEX_MAGIC,

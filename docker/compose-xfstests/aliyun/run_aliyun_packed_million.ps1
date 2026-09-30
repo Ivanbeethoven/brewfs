@@ -15,13 +15,23 @@ param(
     [int]$SystemDiskSizeGiB = 100,
     [int64]$SmallFileCount = 1000000,
     [int64]$SmallFileSizeBytes = 102400,
+    [int64]$SmallFileMinSizeBytes = 0,
+    [int64]$SmallFileMaxSizeBytes = 0,
     [ValidateRange(1, 32)]
     [int]$DirLevels = 3,
     [int64]$DirsPerLevel = 10,
     [int64]$FilesPerLeaf = 1000,
+    [ValidateSet('random-small-file', 'sequential-small-file', 'mixed')]
+    [string]$PackedAccessProfile = 'random-small-file',
     [int64]$FioFileSizeBytes = 67108864,
-    [string]$PerfTools = 'packed-smallfiles packed-posix fio-seqread fio-randread',
+    [string]$PerfTools = 'packed-tree packed-smallfiles fio-seqread fio-randread',
+    [ValidateSet('packed-metadata-v1', 'packed-metadata-v2', 'packed-metadata-v3')]
+    [string]$VolumeFormat = 'packed-metadata-v3',
     [int]$FioRuntimeSeconds = 20,
+    [UInt64]$PackedFrameWindowCacheBytes = 0,
+    [bool]$PackedFrameWindowPrefetch = $false,
+    [ValidateRange(30, 7200)]
+    [int]$ToolTimeoutSeconds = 900,
     [string]$PackedExistingManifestKey,
     [switch]$PackedSkipFixture,
     [ValidateSet('full', 'prefix')]
@@ -61,6 +71,11 @@ if ($expected -ne $SmallFileCount) {
 if ($SmallFileSizeBytes -le 0 -or $SmallFileSizeBytes -gt 4MB) {
     throw 'SmallFileSizeBytes must be between 1 and 4 MiB.'
 }
+if ($SmallFileMinSizeBytes -le 0) { $SmallFileMinSizeBytes = $SmallFileSizeBytes }
+if ($SmallFileMaxSizeBytes -le 0) { $SmallFileMaxSizeBytes = $SmallFileSizeBytes }
+if ($SmallFileMinSizeBytes -gt $SmallFileMaxSizeBytes -or $SmallFileMaxSizeBytes -gt 4MB) {
+    throw 'SmallFileMinSizeBytes/MaxSizeBytes must satisfy 0 < min <= max <= 4 MiB.'
+}
 
 $scriptPath = Join-Path $PSScriptRoot 'run_aliyun_perf.ps1'
 if (-not (Test-Path -LiteralPath $scriptPath)) {
@@ -77,14 +92,20 @@ $runnerParams = @{
     SystemDiskSizeGiB = $SystemDiskSizeGiB
     Backend = 'none'
     DataBackend = 's3'
-    VolumeFormat = 'packed-metadata-v1'
+    VolumeFormat = $VolumeFormat
     PerfTools = $PerfTools
     FioRuntimeSeconds = $FioRuntimeSeconds
+    PackedFrameWindowCacheBytes = $PackedFrameWindowCacheBytes
+    PackedFrameWindowPrefetch = $PackedFrameWindowPrefetch
+    ToolTimeoutSeconds = $ToolTimeoutSeconds
     PackedSmallFileCount = $SmallFileCount
     PackedSmallFileSizeBytes = $SmallFileSizeBytes
+    PackedSmallFileMinSizeBytes = $SmallFileMinSizeBytes
+    PackedSmallFileMaxSizeBytes = $SmallFileMaxSizeBytes
     PackedDirLevels = $DirLevels
     PackedDirsPerLevel = $DirsPerLevel
     PackedFilesPerDir = $FilesPerLeaf
+    PackedAccessProfile = $PackedAccessProfile
     PackedFioFileSizeBytes = $FioFileSizeBytes
     PackedSmallFileReadBytes = $readBytes
     PackedExistingManifestKey = $PackedExistingManifestKey
@@ -116,14 +137,19 @@ $runnerArgs = @(
     '-SystemDiskSizeGiB', [string]$SystemDiskSizeGiB,
     '-Backend', 'none',
     '-DataBackend', 's3',
-    '-VolumeFormat', 'packed-metadata-v1',
+    '-VolumeFormat', $VolumeFormat,
     '-PerfTools', $PerfTools,
     '-FioRuntimeSeconds', [string]$FioRuntimeSeconds,
+    '-PackedFrameWindowCacheBytes', [string]$PackedFrameWindowCacheBytes,
+    '-ToolTimeoutSeconds', [string]$ToolTimeoutSeconds,
     '-PackedSmallFileCount', [string]$SmallFileCount,
     '-PackedSmallFileSizeBytes', [string]$SmallFileSizeBytes,
+    '-PackedSmallFileMinSizeBytes', [string]$SmallFileMinSizeBytes,
+    '-PackedSmallFileMaxSizeBytes', [string]$SmallFileMaxSizeBytes,
     '-PackedDirLevels', [string]$DirLevels,
     '-PackedDirsPerLevel', [string]$DirsPerLevel,
     '-PackedFilesPerDir', [string]$FilesPerLeaf,
+    '-PackedAccessProfile', $PackedAccessProfile,
     '-PackedSmallFileReadBytes', $readBytes,
     '-PackedExistingManifestKey', $PackedExistingManifestKey,
     '-PackedFioFileSizeBytes', [string]$FioFileSizeBytes,
@@ -168,7 +194,7 @@ Write-Host 'Aliyun packed million-small-file profile'
 Write-Host "  instance_type=$InstanceType"
 Write-Host "  system_disk=${SystemDiskSizeGiB}GiB ESSD"
 Write-Host "  image=$ImageId"
-Write-Host "  files=$SmallFileCount file_size=$SmallFileSizeBytes bytes read_mode=$ReadMode"
+Write-Host "  files=$SmallFileCount file_size=${SmallFileMinSizeBytes}-${SmallFileMaxSizeBytes} bytes read_mode=$ReadMode"
 Write-Host "  hierarchy=${DirLevels} levels x ${DirsPerLevel} dirs/level x ${FilesPerLeaf} files/leaf"
 Write-Host '  data cache: disabled; cold-read/drop-caches checks: enabled'
 

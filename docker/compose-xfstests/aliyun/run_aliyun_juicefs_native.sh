@@ -8,8 +8,11 @@ die() { log "ERROR: $*" >&2; exit 1; }
 : "${JUICEFS_BIN:?JUICEFS_BIN is required}"
 : "${JFS_S3_BUCKET:?JFS_S3_BUCKET is required}"
 : "${JFS_S3_REGION:?JFS_S3_REGION is required}"
+: "${JFS_S3_ENDPOINT:?JFS_S3_ENDPOINT is required}"
 : "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is required}"
 : "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is required}"
+: "${JFS_RAW_FIXTURE_BIN:?JFS_RAW_FIXTURE_BIN is required}"
+: "${JFS_RAW_OBJECT_PREFIX:?JFS_RAW_OBJECT_PREFIX is required}"
 : "${JFS_SMALLFILE_COUNT:?JFS_SMALLFILE_COUNT is required}"
 : "${JFS_SMALLFILE_SIZE:?JFS_SMALLFILE_SIZE is required}"
 : "${JFS_DIR_LEVELS:?JFS_DIR_LEVELS is required}"
@@ -20,11 +23,39 @@ WORK="${JFS_NATIVE_WORK:-/opt/juicefs-native}"
 ARTIFACT_DIR="${JFS_NATIVE_ARTIFACT_DIR:-$WORK/artifacts}"
 MOUNT_DIR="${JFS_MOUNT_POINT:-/mnt/juicefs-compare}"
 CACHE_DIR="${JFS_CACHE_DIR:-$WORK/jfs-cache}"
-META_URL="${JFS_META_URL:-redis://127.0.0.1:6379/0}"
 VOLUME_NAME="${JFS_VOLUME_NAME:-brewfs-jfs-compare}"
-S3_BUCKET_URL="${JFS_BUCKET_URL:-https://${JFS_S3_BUCKET}.oss-${JFS_S3_REGION}.aliyuncs.com}"
+META_BACKEND="${JFS_META_BACKEND:-redis}"
+TIKV_VERSION="${JFS_TIKV_VERSION:-v6.5.3}"
+TIKV_TAG="${JFS_TIKV_TAG:-brewfs-juicefs-tikv}"
+TIKV_HOME="${JFS_TIKV_HOME:-$WORK/tiup-home}"
+TIKV_PID_FILE="$WORK/tiup-playground.pid"
+META_URL="${JFS_META_URL:-}"
+S3_ENDPOINT_HOST="${JFS_S3_ENDPOINT#https://}"
+S3_ENDPOINT_HOST="${S3_ENDPOINT_HOST#http://}"
+S3_BUCKET_URL="${JFS_BUCKET_URL:-https://${JFS_S3_BUCKET}.${S3_ENDPOINT_HOST}}"
+RAW_SOURCE_URL="oss://${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}@${JFS_S3_BUCKET}.${S3_ENDPOINT_HOST}/${JFS_RAW_OBJECT_PREFIX#/}/"
 PREFETCH_CACHE_SIZE_MIB="${JFS_PREFETCH_CACHE_SIZE_MIB:-4096}"
 PREFETCH_BLOCKS="${JFS_PREFETCH_BLOCKS:-16}"
+PERF_TOOLS="${JFS_PERF_TOOLS:-juicefs-smallfiles}"
+METADATA_LATENCY_MS="${JFS_METADATA_LATENCY_MS:-0}"
+SMALLFILE_MIN_SIZE="${JFS_SMALLFILE_MIN_SIZE:-$JFS_SMALLFILE_SIZE}"
+SMALLFILE_MAX_SIZE="${JFS_SMALLFILE_MAX_SIZE:-$JFS_SMALLFILE_SIZE}"
+SMALLFILE_WORKERS="${JFS_SMALLFILE_WORKERS:-16}"
+# Match BrewFS' FUSE request and kernel readahead contract for A/B tests.
+JFS_MAX_FUSE_IO="${JFS_MAX_FUSE_IO:-4M}"
+JFS_MAX_READAHEAD="${JFS_MAX_READAHEAD:-16M}"
+
+case "$META_BACKEND" in
+    redis)
+        META_URL="${META_URL:-redis://127.0.0.1:6379/0}"
+        ;;
+    tikv)
+        META_URL="${META_URL:-tikv://127.0.0.1:2379}"
+        ;;
+    *)
+        die "unsupported JFS_META_BACKEND: $META_BACKEND (expected redis or tikv)"
+        ;;
+esac
 
 mkdir -p "$WORK" "$ARTIFACT_DIR" "$MOUNT_DIR"
 chmod 0755 "$JUICEFS_BIN"
@@ -40,9 +71,27 @@ stop_mount() {
 
 cleanup() {
     stop_mount
-    redis-cli -h 127.0.0.1 shutdown nosave >/dev/null 2>&1 || true
+    if [[ "$METADATA_LATENCY_MS" -gt 0 ]]; then
+        tc qdisc del dev lo root >/dev/null 2>&1 || true
+    fi
+    if [[ "$META_BACKEND" == redis ]]; then
+        redis-cli -h 127.0.0.1 shutdown nosave >/dev/null 2>&1 || true
+    elif [[ "$META_BACKEND" == tikv ]]; then
+        if [[ -f "$TIKV_PID_FILE" ]]; then
+            kill "$(cat "$TIKV_PID_FILE")" >/dev/null 2>&1 || true
+            rm -f "$TIKV_PID_FILE"
+        fi
+        pkill -TERM -f "$TIKV_HOME" >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT INT TERM
+
+apply_metadata_latency() {
+    if [[ "$METADATA_LATENCY_MS" -gt 0 ]]; then
+        tc qdisc replace dev lo root netem delay "${METADATA_LATENCY_MS}ms"
+        printf 'metadata_latency_ms=%s\n' "$METADATA_LATENCY_MS" >>"$ARTIFACT_DIR/resource-proof.env"
+    fi
+}
 
 drop_caches() {
     sync
@@ -59,6 +108,71 @@ start_redis() {
         sleep 1
     done
     die 'Redis did not become ready'
+}
+
+start_tikv() {
+    mkdir -p "$TIKV_HOME"
+    export TIUP_HOME="$TIKV_HOME"
+    local tiup_bin="$TIKV_HOME/bin/tiup"
+    if [[ ! -x "$tiup_bin" ]]; then
+        curl --fail --location --retry 5 --connect-timeout 20 \
+            --output "$WORK/tiup-install.sh" \
+            https://tiup-mirrors.pingcap.com/install.sh
+        sh "$WORK/tiup-install.sh" >/"$WORK/tiup-install.log" 2>&1
+    fi
+    [[ -x "$tiup_bin" ]] || die "TiUP was not installed at $tiup_bin"
+    if [[ -f "$TIKV_PID_FILE" ]]; then
+        kill "$(cat "$TIKV_PID_FILE")" >/dev/null 2>&1 || true
+        rm -f "$TIKV_PID_FILE"
+    fi
+    "$tiup_bin" playground "$TIKV_VERSION" --mode tikv-slim --tag "$TIKV_TAG" \
+        --host 127.0.0.1 --without-monitor \
+        >"$WORK/tiup-playground.log" 2>&1 &
+    echo $! >"$TIKV_PID_FILE"
+    for _ in $(seq 1 240); do
+        if curl -fsS --max-time 2 http://127.0.0.1:2379/pd/api/v1/cluster/status \
+            >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    curl -fsS --max-time 5 http://127.0.0.1:2379/pd/api/v1/cluster/status \
+        >/dev/null 2>&1 || {
+        tail -n 120 "$WORK/tiup-playground.log" >&2 || true
+        die 'TiKV PD did not become ready'
+    }
+    for _ in $(seq 1 60); do
+        if python3 - <<'PY'
+import json
+import urllib.request
+
+try:
+    with urllib.request.urlopen('http://127.0.0.1:2379/pd/api/v1/stores', timeout=2) as response:
+        payload = json.load(response)
+    stores = payload.get('stores', [])
+    if any(str(store.get('store', {}).get('state_name', '')).lower() in {'up', 'serving'} for store in stores):
+        raise SystemExit(0)
+except Exception:
+    pass
+raise SystemExit(1)
+PY
+        then
+            return 0
+        fi
+        sleep 1
+    done
+    tail -n 120 "$WORK/tiup-playground.log" >&2 || true
+    die 'TiKV store did not become ready'
+}
+
+start_metadata() {
+    case "$META_BACKEND" in
+        redis) start_redis ;;
+        tikv) start_tikv ;;
+    esac
+    printf 'metadata_backend=%s\nmetadata_url=%s\ntikv_version=%s\n' \
+        "$META_BACKEND" "$META_URL" "$TIKV_VERSION" \
+        >"$ARTIFACT_DIR/metadata-proof.env"
 }
 
 format_volume() {
@@ -78,58 +192,33 @@ format_volume() {
 }
 
 prepare_dataset() {
-    local marker="$WORK/dataset-ready"
+    local marker_suffix="${VOLUME_NAME//[^A-Za-z0-9_.-]/_}"
+    local marker="$WORK/dataset-ready-$marker_suffix"
     [[ -f "$marker" ]] && return 0
     stop_mount
-    rm -rf -- "$CACHE_DIR"
-    local mount_log="$WORK/juicefs-prepare.log"
-    set +e
-    "$JUICEFS_BIN" mount "$META_URL" "$MOUNT_DIR" \
-        --storage oss --bucket "$S3_BUCKET_URL" \
-        --buffer-size 1024 --cache-size 0 --prefetch 0 \
-        --no-usage-report -d --log "$mount_log" \
-        >"$mount_log.command" 2>&1
-    local mount_status=$?
-    set -e
-    if [[ "$mount_status" -ne 0 ]]; then
-        cat "$mount_log.command" >&2 || true
-        cat "$mount_log" >&2 || true
-        die 'JuiceFS prepare mount command failed'
-    fi
-    for _ in $(seq 1 60); do mountpoint -q "$MOUNT_DIR" && break; sleep 1; done
-    mountpoint -q "$MOUNT_DIR" || die 'JuiceFS prepare mount failed'
-    python3 - "$MOUNT_DIR" "$JFS_SMALLFILE_COUNT" "$JFS_SMALLFILE_SIZE" \
-        "$JFS_DIR_LEVELS" "$JFS_DIRS_PER_LEVEL" "$JFS_FILES_PER_DIR" \
-        >"$ARTIFACT_DIR/prepare.log" 2>&1 <<'PY'
-import pathlib
-import sys
-import time
-
-root = pathlib.Path(sys.argv[1])
-expected = int(sys.argv[2])
-size = int(sys.argv[3])
-levels = int(sys.argv[4])
-fanout = int(sys.argv[5])
-per_leaf = int(sys.argv[6])
-if fanout ** levels * per_leaf != expected:
-    raise SystemExit('fixture shape mismatch')
-data = bytes([0x5A]) * size
-started = time.monotonic()
-for leaf_index in range(fanout ** levels):
-    components = []
-    value = leaf_index
-    for _ in range(levels):
-        components.append(f'd{value % fanout:03d}')
-        value //= fanout
-    directory = root.joinpath(*reversed(components))
-    directory.mkdir(parents=True, exist_ok=True)
-    for file_index in range(per_leaf):
-        (directory / f'f{file_index:05d}').write_bytes(data)
-elapsed = time.monotonic() - started
-print(f'juicefs_prepare_summary files={expected} bytes={expected * size} seconds={elapsed:.6f}')
-PY
-    sync
-    stop_mount
+    rm -rf -- "$CACHE_DIR" "$WORK/raw-manifest-key.txt"
+    log "uploading deterministic raw files with SDK"
+    "$JFS_RAW_FIXTURE_BIN" \
+        --bucket "$JFS_S3_BUCKET" \
+        --endpoint "$JFS_S3_ENDPOINT" \
+        --region "$JFS_S3_REGION" \
+        --prefix "$JFS_RAW_OBJECT_PREFIX" \
+        --dir-levels "$JFS_DIR_LEVELS" \
+        --dirs-per-level "$JFS_DIRS_PER_LEVEL" \
+        --files-per-dir "$JFS_FILES_PER_DIR" \
+        --small-file-size "$JFS_SMALLFILE_SIZE" \
+        --small-file-min-size "$SMALLFILE_MIN_SIZE" \
+        --small-file-max-size "$SMALLFILE_MAX_SIZE" \
+        --raw-only true \
+        --manifest-output "$WORK/raw-manifest-key.txt" \
+        >"$ARTIFACT_DIR/raw-upload.log" 2>&1
+    [[ -s "$WORK/raw-manifest-key.txt" ]] || die 'raw SDK uploader did not produce a manifest key'
+    log "importing raw OSS objects through JuiceFS sync without FUSE"
+    myfs="$META_URL" "$JUICEFS_BIN" sync \
+        --threads 32 --list-threads 4 \
+        --check-new --exclude='raw-manifest.tsv' \
+        "$RAW_SOURCE_URL" "jfs://myfs/" \
+        >"$ARTIFACT_DIR/juicefs-sync.log" 2>&1
     touch "$marker"
 }
 
@@ -155,10 +244,13 @@ mount_profile() {
     fi
     rm -rf -- "$CACHE_DIR"
     mkdir -p "$CACHE_DIR"
+    printf 'cache_size_mib=%s\nprefetch_blocks=%s\nmax_fuse_io=%s\nmax_readahead=%s\n' \
+        "$cache_size" "$prefetch" "$JFS_MAX_FUSE_IO" "$JFS_MAX_READAHEAD" \
+        >"$ARTIFACT_DIR/mount-${profile}.env"
     "$JUICEFS_BIN" mount "$META_URL" "$MOUNT_DIR" \
         --storage oss --bucket "$S3_BUCKET_URL" \
         --buffer-size "$buffer_size" --cache-size "$cache_size" --prefetch "$prefetch" \
-        --cache-dir "$CACHE_DIR" --max-fuse-io 128K --max-readahead 128M \
+        --cache-dir "$CACHE_DIR" --max-fuse-io "$JFS_MAX_FUSE_IO" --max-readahead "$JFS_MAX_READAHEAD" \
         --attr-cache 0s --entry-cache 0s --dir-entry-cache 0s --open-cache 0s \
         --no-usage-report --read-only -d --metrics 127.0.0.1:9567 \
         --log "$WORK/juicefs-${profile}.log" >/dev/null 2>&1
@@ -168,24 +260,30 @@ mount_profile() {
 
 scan_smallfiles() {
     local profile="$1"
-    python3 - "$MOUNT_DIR" "$JFS_SMALLFILE_COUNT" "$JFS_SMALLFILE_SIZE" \
-        "$JFS_DIR_LEVELS" "$JFS_DIRS_PER_LEVEL" "$JFS_FILES_PER_DIR" \
-        >"$ARTIFACT_DIR/scan-${profile}.log" 2>&1 <<'PY'
+    local log_suffix="${2:-smallfiles}"
+    python3 - "$MOUNT_DIR" "$JFS_SMALLFILE_COUNT" "$SMALLFILE_MIN_SIZE" "$SMALLFILE_MAX_SIZE" \
+        "$JFS_DIR_LEVELS" "$JFS_DIRS_PER_LEVEL" "$JFS_FILES_PER_DIR" "$SMALLFILE_WORKERS" \
+        >"$ARTIFACT_DIR/scan-${profile}-${log_suffix}.log" 2>&1 <<'PY'
 import os
 import pathlib
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 root = pathlib.Path(sys.argv[1])
 expected = int(sys.argv[2])
-size = int(sys.argv[3])
-levels = int(sys.argv[4])
-fanout = int(sys.argv[5])
-per_leaf = int(sys.argv[6])
+min_size = int(sys.argv[3])
+max_size = int(sys.argv[4])
+levels = int(sys.argv[5])
+fanout = int(sys.argv[6])
+per_leaf = int(sys.argv[7])
+workers = max(1, int(sys.argv[8]))
 started = time.monotonic()
 files = directories = errors = logical = payload = checksum = 0
+file_specs = []
 for directory, dirs, names in os.walk(root):
     dirs[:] = sorted(name for name in dirs if name.startswith('d'))
+    names = sorted(name for name in names if not name.startswith('.') and name != 'lost+found')
     relative = pathlib.Path(directory).relative_to(root)
     depth = len(relative.parts)
     if depth == 0:
@@ -199,56 +297,161 @@ for directory, dirs, names in os.walk(root):
         raise SystemExit(f'leaf shape mismatch path={directory}')
     for name in sorted(names):
         path = pathlib.Path(directory) / name
-        try:
-            with path.open('rb') as handle:
-                data = handle.read()
-            if len(data) != size:
-                raise OSError(f'size={len(data)} expected={size}')
+        leaf_index = 0
+        for component in pathlib.Path(directory).relative_to(root).parts:
+            leaf_index = leaf_index * fanout + int(component[1:])
+        file_index = int(name[1:])
+        global_file_index = leaf_index * per_leaf + file_index
+        span = max_size - min_size + 1
+        mixed = (global_file_index * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
+        file_specs.append((path, global_file_index, min_size + (mixed % span if span else 0)))
+
+def read_one(spec):
+    path, global_file_index, expected_size = spec
+    try:
+        with path.open('rb') as handle:
+            data = handle.read()
+        if len(data) != expected_size:
+            raise OSError(f'size={len(data)} expected={expected_size}')
+        seed = (global_file_index + 1).to_bytes(8, 'little')
+        expected_header = bytes(
+            seed[offset % len(seed)] ^ (((offset << 7) | (offset >> 57)) & 0xff)
+            for offset in range(min(8, expected_size))
+        )
+        if data[:len(expected_header)] != expected_header:
+            raise OSError('file content pattern mismatch')
+        return ('ok', expected_size, len(data), (data[0] if data else 0))
+    except OSError as error:
+        return ('error', str(error))
+
+with ThreadPoolExecutor(max_workers=workers) as executor:
+    for spec, result in zip(file_specs, executor.map(read_one, file_specs)):
+        if result[0] == 'ok':
+            _, expected_size, data_len, first_byte = result
             files += 1
-            logical += size
-            payload += len(data)
-            checksum = (checksum + (data[0] if data else 0)) & 0xffffffff
-        except OSError as error:
+            logical += expected_size
+            payload += data_len
+            checksum = (checksum + first_byte) & 0xffffffff
+        else:
             errors += 1
-            print(f'read error path={path} error={error}')
+            print(f'read error path={spec[0]} error={result[1]}')
 elapsed = time.monotonic() - started
-print(f'juicefs_smallfiles_summary files={files} expected={expected} directories={directories} file_size={size} read_mode=full logical_bytes={logical} payload_bytes={payload} errors={errors} checksum={checksum} seconds={elapsed:.6f} files_per_sec={files / elapsed if elapsed else 0:.2f}')
+print(f'juicefs_smallfiles_summary files={files} expected={expected} directories={directories} min_file_size={min_size} max_file_size={max_size} read_mode=full workers={workers} logical_bytes={logical} payload_bytes={payload} errors={errors} checksum={checksum} seconds={elapsed:.6f} files_per_sec={files / elapsed if elapsed else 0:.2f}')
 if files != expected or errors:
     raise SystemExit(1)
 PY
 }
 
-run_profile() {
+scan_tree() {
     local profile="$1"
+    local log_suffix="${2:-tree}"
+    python3 - "$MOUNT_DIR" "$JFS_SMALLFILE_COUNT" \
+        "$JFS_DIR_LEVELS" "$JFS_DIRS_PER_LEVEL" "$JFS_FILES_PER_DIR" \
+        >"$ARTIFACT_DIR/scan-${profile}-${log_suffix}.log" 2>&1 <<'PY'
+import os
+import pathlib
+import sys
+import time
+
+root = pathlib.Path(sys.argv[1])
+expected_files = int(sys.argv[2])
+levels = int(sys.argv[3])
+fanout = int(sys.argv[4])
+per_leaf = int(sys.argv[5])
+expected_leaf_dirs = fanout ** levels
+expected_tree_dirs = sum(fanout ** level for level in range(1, levels + 1))
+started = time.monotonic()
+files = directories = leaf_dirs = 0
+for directory, dirs, names in os.walk(root):
+    raw_dirs = list(dirs)
+    raw_names = list(names)
+    dirs[:] = sorted(name for name in dirs if name.startswith('d'))
+    names = sorted(name for name in names if not name.startswith('.') and name != 'lost+found')
+    relative = pathlib.Path(directory).relative_to(root)
+    depth = len(relative.parts)
+    if depth == 0:
+        if len(dirs) != fanout or names:
+            raise SystemExit(f'root shape mismatch path={directory} raw_dirs={raw_dirs!r} raw_names={raw_names!r} filtered_dirs={dirs!r} filtered_names={names!r}')
+        continue
+    directories += 1
+    if depth < levels:
+        if len(dirs) != fanout or names:
+            raise SystemExit(f'internal shape mismatch path={directory}')
+        continue
+    if depth != levels or len(dirs) != 0 or len(names) != per_leaf:
+        raise SystemExit(f'leaf shape mismatch path={directory}')
+    leaf_dirs += 1
+    files += len(names)
+elapsed = time.monotonic() - started
+print(f'juicefs_tree_summary files={files} expected={expected_files} directories={directories} expected_directories={expected_tree_dirs} leaf_directories={leaf_dirs} expected_leaf_directories={expected_leaf_dirs} seconds={elapsed:.6f} files_per_sec={files / elapsed if elapsed else 0:.2f}')
+if files != expected_files or directories != expected_tree_dirs or leaf_dirs != expected_leaf_dirs:
+    raise SystemExit(1)
+PY
+}
+
+run_tool_profile() {
+    local profile="$1"
+    local tool="$2"
     stop_mount
     rm -rf -- "$CACHE_DIR"
     drop_caches || die "drop_caches failed before JuiceFS $profile"
     mount_profile "$profile"
-    scrape_metrics "${profile}-before"
+    local cache_bytes_before
+    cache_bytes_before="$(du -sb "$CACHE_DIR" 2>/dev/null | awk '{print $1}')"
+    cache_bytes_before="${cache_bytes_before:-0}"
+    local cache_files_before
+    cache_files_before="$(find "$CACHE_DIR" -type f -printf '%p\n' 2>/dev/null | wc -l)"
+    cache_files_before="${cache_files_before:-0}"
+    scrape_metrics "${profile}-${tool}-before"
     local start_ns end_ns status=0
     start_ns="$(date +%s%N)"
-    scan_smallfiles "$profile" || status=$?
+    case "$tool" in
+        juicefs-tree) scan_tree "$profile" tree || status=$? ;;
+        juicefs-smallfiles) scan_smallfiles "$profile" smallfiles || status=$? ;;
+        *) die "unsupported JuiceFS tool: $tool" ;;
+    esac
     end_ns="$(date +%s%N)"
-    scrape_metrics "${profile}-after"
+    scrape_metrics "${profile}-${tool}-after"
+    local cache_bytes_after
+    cache_bytes_after="$(du -sb "$CACHE_DIR" 2>/dev/null | awk '{print $1}')"
+    cache_bytes_after="${cache_bytes_after:-0}"
+    local cache_files_after
+    cache_files_after="$(find "$CACHE_DIR" -type f -printf '%p\n' 2>/dev/null | wc -l)"
+    cache_files_after="${cache_files_after:-0}"
+    printf 'profile=%s tool=%s cache_dir=%s cache_bytes_before=%s cache_bytes_after=%s cache_files_before=%s cache_files_after=%s\n' \
+        "$profile" "$tool" "$CACHE_DIR" "$cache_bytes_before" "$cache_bytes_after" \
+        "$cache_files_before" "$cache_files_after" \
+        >>"$ARTIFACT_DIR/cache-proof.env"
     local elapsed_ns=$((end_ns - start_ns))
-    printf '%s\t%s\t%.6f\t%s\n' "$profile" \
+    printf '%s\t%s\t%.6f\t%s\n' "${profile}-${tool}" \
         "$([[ "$status" -eq 0 ]] && echo pass || echo "fail($status)")" \
         "$(awk -v ns="$elapsed_ns" 'BEGIN { print ns / 1000000000 }')" \
-        "$ARTIFACT_DIR/scan-${profile}.log" >>"$ARTIFACT_DIR/perf-summary.tsv"
+        "$ARTIFACT_DIR/scan-${profile}-${tool#juicefs-}.log" >>"$ARTIFACT_DIR/perf-summary.tsv"
     stop_mount
     [[ "$status" -eq 0 ]] || return "$status"
 }
 
-start_redis
+run_profile() {
+    local profile="$1"
+    local tool status=0
+    for tool in $PERF_TOOLS; do
+        run_tool_profile "$profile" "$tool" || status=1
+    done
+    return "$status"
+}
+
+start_metadata
 format_volume
 prepare_dataset
+apply_metadata_latency
 printf 'profile\tstatus\tseconds\tlog\n' >"$ARTIFACT_DIR/perf-summary.tsv"
 status=0
 run_profile strict || status=1
-run_profile prefetch || status=1
-printf 'files=%s file_size=%s levels=%s fanout=%s files_per_leaf=%s\n' \
-    "$JFS_SMALLFILE_COUNT" "$JFS_SMALLFILE_SIZE" "$JFS_DIR_LEVELS" \
+printf 'files=%s file_size=%s-%s levels=%s fanout=%s files_per_leaf=%s cache=0 prefetch=0\n' \
+    "$JFS_SMALLFILE_COUNT" "$SMALLFILE_MIN_SIZE" "$SMALLFILE_MAX_SIZE" "$JFS_DIR_LEVELS" \
     "$JFS_DIRS_PER_LEVEL" "$JFS_FILES_PER_DIR"
+printf '%s\n' '--- JuiceFS mount proof ---'
+cat "$ARTIFACT_DIR/mount-strict.env" "$ARTIFACT_DIR/cache-proof.env" 2>/dev/null || true
 cat "$ARTIFACT_DIR/perf-summary.tsv"
 for log_path in "$ARTIFACT_DIR"/scan-*.log; do
     echo "### $log_path"

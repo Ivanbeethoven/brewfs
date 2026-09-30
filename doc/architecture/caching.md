@@ -194,16 +194,19 @@ pub enum Compression {
 
 | 参数路径 | 默认值 | 说明 |
 |---|---|---|
-| `cache.read_memory_bytes` | 4 GiB | 读缓存内存上限 |
-| `cache.read_ssd_bytes` | 0 | 读缓存 SSD 冷层大小 |
-| `cache.write_memory_bytes` | 1 GiB | 写缓存内存上限 |
-| `cache.write_ssd_bytes` | 0 | 写缓存 SSD 层大小 |
-| `cache.dirty_slice_target_size` | 64 MiB | 触发 flush 的大小阈值 |
-| `cache.dirty_slice_max_age_ms` | 500 | 触发 flush 的时间阈值 |
+| `cache.read_memory_bytes` | 8 GiB | 读缓存内存上限 |
+| `cache.read_ssd_bytes` | 64 GiB | 读缓存 SSD 冷层大小 |
+| `cache.write_memory_bytes` | 768 MiB | 写缓存内存上限 |
+| `cache.write_ssd_bytes` | 64 GiB | 写缓存 SSD 层大小 |
+| `BlockStoreConfig.page_cache_capacity` | 32768 pages / 2 GiB | 小范围读的 64 KiB page cache；`read_memory_bytes=0` 时由冷读 profile 禁用 |
+| `cache.dirty_slice_target_size` | 32 MiB | 触发 flush 的大小阈值 |
+| `cache.dirty_slice_max_age_ms` | 2000 | 触发 flush 的时间阈值 |
 | `cache.prefetch_enabled` | true | 是否启用预读 |
-| `cache.prefetch_max_bytes` | 256 MiB | 预读窗口上限 |
-| `cache.prefetch_concurrency` | 2 | 预读并发数 |
-| `cache.memory_budget_bytes` | 8 GiB | 全局内存预算 |
+| `cache.prefetch_max_bytes` | 128 MiB | 预读窗口上限 |
+| `cache.prefetch_concurrency` | 64 | 预读并发数 |
+| `StreamingFrozenMetadataCatalog` metadata budget | 512 MiB | packed v1 解码页、inode 和 extent 共享的硬预算 |
+| clustered v2 index/batch cache | 64/256 MiB | 每个 cluster handle 的 decoded index/batch 上限 |
+| `cache.memory_budget_bytes` | 2 GiB | 全局内存预算 |
 | `cache.compression` | none | 传输压缩（none/lz4/zstd） |
 | `cache.bandwidth.upload_limit_mibps` | none | 上传带宽限制 |
 | `cache.bandwidth.download_limit_mibps` | none | 下载带宽限制 |

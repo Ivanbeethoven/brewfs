@@ -107,6 +107,10 @@ JFS_OPEN_CACHE_LIMIT=${jfs_open_cache_limit}
 JFS_BACKUP_META=${jfs_backup_meta}
 JFS_NO_USAGE_REPORT=${jfs_no_usage_report}
 JFS_CACHE_DIR=${jfs_cache_dir}
+PERF_SMALLFILE_DIRS=${PERF_SMALLFILE_DIRS:-8}
+PERF_SMALLFILE_FILES_PER_DIR=${PERF_SMALLFILE_FILES_PER_DIR:-4500}
+PERF_SMALLFILE_SIZE=${PERF_SMALLFILE_SIZE:-4096}
+PERF_SMALLFILE_COLD_READ=${PERF_SMALLFILE_COLD_READ:-true}
 EOF
 
     {
@@ -580,6 +584,89 @@ run_dirperf() {
         args=(-d "$work_dir" -a "${PERF_DIRPERF_ADDSTEP:-100}" -f "${PERF_DIRPERF_FIRST:-100}" -l "${PERF_DIRPERF_LAST:-1000}" -c "${PERF_DIRPERF_NAME_LEN:-16}" -n "${PERF_DIRPERF_DIRS:-2}" -s "${PERF_DIRPERF_STATS:-5}")
     fi
     run_logged_tool dirperf "$bin" "${args[@]}"
+}
+
+run_smallfiles_read() {
+    local root="$mount_dir"
+    local dirs="${PERF_SMALLFILE_DIRS:-8}"
+    local files_per_dir="${PERF_SMALLFILE_FILES_PER_DIR:-4500}"
+    local file_size="${PERF_SMALLFILE_SIZE:-4096}"
+    local prep_log="$artifact_dir/tools/smallfiles-read-prepare.log"
+    local expected=$((dirs * files_per_dir))
+
+    info "准备 JuiceFS 小文件只读扫描: dirs=$dirs files_per_dir=$files_per_dir size=$file_size"
+    python3 - "$root" "$dirs" "$files_per_dir" "$file_size" >"$prep_log" 2>&1 <<'PY'
+import pathlib
+import sys
+import time
+
+root = pathlib.Path(sys.argv[1])
+dirs = int(sys.argv[2])
+files_per_dir = int(sys.argv[3])
+file_size = int(sys.argv[4])
+data = bytes([0x5A]) * file_size
+started = time.monotonic()
+for directory_index in range(dirs):
+    directory = root / f"d{directory_index:03d}"
+    directory.mkdir()
+    for file_index in range(files_per_dir):
+        (directory / f"f{file_index:05d}").write_bytes(data)
+elapsed = time.monotonic() - started
+print(f"smallfiles_prepare_summary files={dirs * files_per_dir} bytes={dirs * files_per_dir * file_size} seconds={elapsed:.6f}")
+PY
+    cat "$prep_log"
+    sync || true
+
+    if truthy "${PERF_SMALLFILE_COLD_READ:-true}"; then
+        info "为 JuiceFS 小文件扫描重挂载并清理数据缓存"
+        cleanup
+        PERF_FIO_COLD_READ=true PERF_FIO_COLD_READ_CLEAR_CACHE=true clear_juicefs_cache_if_requested
+        PERF_FIO_COLD_READ_DROP_CACHES=true drop_kernel_page_cache_if_requested
+        mount_juicefs
+    fi
+
+    smallfiles_scan() {
+        python3 - "$root" "$expected" "$file_size" <<'PY'
+import os
+import pathlib
+import sys
+import time
+
+root = pathlib.Path(sys.argv[1])
+expected = int(sys.argv[2])
+file_size = int(sys.argv[3])
+started = time.monotonic()
+files = 0
+bytes_read = 0
+checksum = 0
+errors = 0
+for directory, dirs, names in os.walk(root):
+    dirs[:] = sorted(name for name in dirs if name.startswith("d"))
+    # JuiceFS keeps implementation files (for example .stats and .config)
+    # at the mount root. The benchmark corpus lives only below d* dirs.
+    if pathlib.Path(directory) == root:
+        continue
+    for name in sorted(names):
+        path = pathlib.Path(directory) / name
+        try:
+            st = path.stat()
+            with path.open("rb") as handle:
+                first = handle.read(1)
+            if st.st_size != file_size:
+                raise OSError(f"unexpected size {st.st_size}")
+            files += 1
+            bytes_read += st.st_size
+            checksum = (checksum + (first[0] if first else 0)) & 0xffffffff
+        except OSError as error:
+            errors += 1
+            print(f"error path={path} error={error}")
+elapsed = time.monotonic() - started
+print(f"smallfiles_read_summary files={files} expected={expected} bytes={bytes_read} errors={errors} checksum={checksum} seconds={elapsed:.6f} files_per_sec={files / elapsed if elapsed else 0:.2f}")
+if files != expected or errors:
+    raise SystemExit(1)
+PY
+    }
+    run_logged_tool smallfiles-read smallfiles_scan
 }
 
 run_metaperf() {
@@ -1128,7 +1215,12 @@ run_fio_profile() {
         )
 
         if [[ "${use_time_based:-true}" == true ]]; then
-            args+=(--runtime="$runtime" --time_based)
+            # A zero runtime means a size-bounded fio job. Passing --time_based
+            # with runtime=0 only emits a fio warning and can break report parsing.
+            args+=(--runtime="$runtime")
+            if [[ "$runtime" =~ ^[1-9][0-9]*$ ]]; then
+                args+=(--time_based)
+            fi
         fi
         if [[ "${use_end_fsync:-false}" == true ]]; then
             args+=(--end_fsync=1)
@@ -1425,6 +1517,7 @@ run_perf_suite() {
         case "$tool" in
             dirstress)    run_dirstress || status=1 ;;
             dirperf)      run_dirperf || status=1 ;;
+            smallfiles-read) run_smallfiles_read || status=1 ;;
             metaperf)     run_metaperf || status=1 ;;
             looptest)     run_looptest || status=1 ;;
             stress-ng)    run_stress_ng || status=1 ;;

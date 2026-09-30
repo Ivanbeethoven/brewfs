@@ -2589,6 +2589,21 @@ impl ChunksCache {
         self.policy.system_metrics.get_hit_rate()
     }
 
+    /// Whether this cache can retain read payloads.  A zero-budget cache is
+    /// still constructible for callers that share configuration plumbing, but
+    /// it must not be used as a signal to switch range reads into whole-object
+    /// materialization.
+    pub fn has_read_capacity(&self) -> bool {
+        self.config.max_hot_bytes > 0 || self.config.max_disk_bytes > 0
+    }
+
+    /// Whether one immutable object can fit in at least one read tier. Packed
+    /// containers use this to avoid repeatedly downloading an object that the
+    /// configured cache can never retain.
+    pub fn can_retain_read_bytes(&self, bytes: u64) -> bool {
+        bytes <= self.config.max_hot_bytes || bytes <= self.config.max_disk_bytes
+    }
+
     pub async fn insert(&self, key: &str, data: &Vec<u8>) -> anyhow::Result<()> {
         let generation = self.disk_storage.store_generation(key);
         self.insert_hot_at_generation(key, bytes::Bytes::from(data.clone()), generation)

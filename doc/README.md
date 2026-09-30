@@ -11,8 +11,7 @@ plans under `doc/` unless a tool explicitly requires another location.
 | Architecture overview | [architecture/arch.md](architecture/arch.md) |
 | Configuration | [operations/configuration.md](operations/configuration.md) |
 | Binary deployment | [operations/binary-deployment.md](operations/binary-deployment.md) |
-| Current performance roadmap | [performance/perf-optimization-roadmap.md](performance/perf-optimization-roadmap.md) |
-| BrewFS vs JuiceFS comparison | [performance/brewfs-vs-juicefs-analysis.md](performance/brewfs-vs-juicefs-analysis.md) |
+| Current packed performance evidence | [performance/native-packed-base-large-scale-validation-2026-09-24.md](performance/native-packed-base-large-scale-validation-2026-09-24.md) |
 | Docker and CI test guide | [testing/docker-compose-test-guide.md](testing/docker-compose-test-guide.md) |
 | VFS internals | [vfs/README.md](vfs/README.md) |
 
@@ -23,7 +22,7 @@ plans under `doc/` unless a tool explicitly requires another location.
 | [architecture/](architecture/) | Core layout, metadata, data path, cache, consistency, POSIX behavior, and compaction/GC design. |
 | [operations/](operations/) | Runtime configuration, control plane, observability, profiling, SDK, and stats tooling. |
 | [testing/](testing/) | Benchmark, compose, fuzz, lock, xfstests, and CI-oriented test guidance. |
-| [performance/](performance/) | Performance roadmap, JuiceFS comparisons, and focused review notes from previous tuning passes. |
+| [performance/](performance/) | Current packed metadata performance evidence and reproducible cold-read rules. |
 | [meta-api/](meta-api/) | Meta client API audit, mapping, extension plan, and read/write follow-up work. |
 | [juicefs/](juicefs/) | JuiceFS internals notes used for cross-project comparison. |
 | [gap/](gap/) | BrewFS/JuiceFS module gap analysis and iteration roadmap. |
@@ -76,13 +75,7 @@ plans under `doc/` unless a tool explicitly requires another location.
 
 | Topic | Document |
 |---|---|
-| Current performance roadmap | [performance/perf-optimization-roadmap.md](performance/perf-optimization-roadmap.md) |
-| Broader performance backlog | [performance/performance-roadmap.md](performance/performance-roadmap.md) |
-| Metadata cache analysis | [performance/perf-agent-metadata-cache.md](performance/perf-agent-metadata-cache.md), [performance/review-metadata-cache.md](performance/review-metadata-cache.md) |
-| Read/object/writeback reviews | [performance/review-read-cache.md](performance/review-read-cache.md), [performance/review-object-store-cache.md](performance/review-object-store-cache.md), [performance/review-writeback-writer.md](performance/review-writeback-writer.md) |
-| Perf harness review | [performance/review-perf-harness-config.md](performance/review-perf-harness-config.md) |
-| Small-file optimization notes | [performance/small-file-read-write-performance-optimization.md](performance/small-file-read-write-performance-optimization.md) |
-| BrewFS vs JuiceFS overview | [performance/brewfs-vs-juicefs-analysis.md](performance/brewfs-vs-juicefs-analysis.md) |
+| Current packed validation | [performance/native-packed-base-large-scale-validation-2026-09-24.md](performance/native-packed-base-large-scale-validation-2026-09-24.md) |
 | JuiceFS internals | [juicefs/README.md](juicefs/README.md) |
 | Gap analysis | [gap/README.md](gap/README.md) |
 

@@ -1,5 +1,14 @@
 # Native Packed Metadata Large-Scale Validation (2026-09-24)
 
+> **Status (2026-09-26): superseded for small-file comparisons.** The fixture
+> used by this document gives every small file the same immutable slice and
+> repeated bytes. Its small-file scan and any packed-vs-flat advantage derived
+> from that layout are cache-contaminated and must not be used as a cold-read
+> comparison. The independent `fio` file results remain useful only as a
+> separate large-file read-path observation. Use
+> `aliyun-packed-vs-juicefs-smallfiles-2026-09-26.md` for the fair small-file
+> result.
+
 ## Scope
 
 This is the current post-optimization validation for the read-only
@@ -114,9 +123,9 @@ The packed benchmark profile now has a fixed million-small-file shape:
   verification directory.
 
 The fixture publisher generated and uploaded this exact corpus to local RustFS
-without materializing 100 GiB of duplicate payload. All small files reference
-one immutable data block, while the scan still reads the full logical payload
-when `ReadMode=full` is selected. The local publication evidence is in
+without materializing 100 GiB of payload. **This historical fixture is not a
+valid small-file performance fixture:** all small files reference one immutable
+data block and use duplicate bytes. The local publication evidence is in
 `docker/compose-xfstests/artifacts/local-million-fixture/fixture.log` and its
 manifest key is in `manifest-key.txt`.
 
@@ -137,10 +146,10 @@ read can be accepted as a cloud result.
 
 ## Conclusion
 
-After the read-path fixes, packed is ahead in this strict no-data-cache A/B:
-2.08x sequential fio and 1.08x four-job random fio in the recorded run, while
-the 100k metadata-heavy scan is correct and bounded. The result is not a claim
-that packed always wins: data RTT and backend variance dominate these tests,
-and a matched flat 100k scan is still a separate experiment. Any future table
-update must retain the zero-hit evidence and report the effective wall-time
-bandwidth alongside fio active bandwidth.
+The recorded strict no-data-cache run shows 2.08x sequential fio and 1.08x
+four-job random fio for the independent large file. Those numbers are not a
+small-file comparison. The 100k scan is functionally correct and bounded, but
+its shared-slice fixture is invalid for performance conclusions. Any future
+small-file table must use independent file contents and legal per-file physical
+placement, retain zero-hit evidence, and report effective wall-time bandwidth
+alongside fio active bandwidth.

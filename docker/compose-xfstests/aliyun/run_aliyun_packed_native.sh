@@ -7,6 +7,7 @@ die() { log "ERROR: $*" >&2; exit 1; }
 
 : "${BREWFS_BIN:?BREWFS_BIN is required}"
 : "${PACKED_FIXTURE_BIN:?PACKED_FIXTURE_BIN is required}"
+: "${PACKED_VOLUME_FORMAT:?PACKED_VOLUME_FORMAT is required}"
 : "${BREWFS_S3_BUCKET:?BREWFS_S3_BUCKET is required}"
 : "${BREWFS_S3_ENDPOINT:?BREWFS_S3_ENDPOINT is required}"
 : "${BREWFS_S3_REGION:?BREWFS_S3_REGION is required}"
@@ -25,7 +26,11 @@ FIXTURE_PREFIX="${PACKED_FIXTURE_PREFIX:-brewfs-packed-native-$(date +%s)}"
 FIXTURE_MANIFEST="$WORK/manifest-key.txt"
 FIO_FILE_SIZE="${PERF_PACKED_FIO_FILE_SIZE:-67108864}"
 READ_BYTES="${PERF_PACKED_SMALLFILE_READ_BYTES:-0}"
-TOOLS="${PERF_TOOLS:-packed-smallfiles packed-posix fio-seqread fio-randread}"
+SMALLFILE_WORKERS="${PERF_PACKED_SMALLFILE_WORKERS:-16}"
+SMALLFILE_MIN_SIZE="${PACKED_SMALLFILE_MIN_SIZE:-$PACKED_SMALLFILE_SIZE}"
+SMALLFILE_MAX_SIZE="${PACKED_SMALLFILE_MAX_SIZE:-$PACKED_SMALLFILE_SIZE}"
+PACKED_ACCESS_PROFILE="${PACKED_ACCESS_PROFILE:-random-small-file}"
+TOOLS="${PERF_TOOLS:-packed-tree packed-smallfiles fio-seqread fio-randread}"
 FIO_RUNTIME="${PERF_FIO_RUNTIME:-20}"
 FORCE_PATH_STYLE="${BREWFS_S3_FORCE_PATH_STYLE:-false}"
 READ_MEMORY_BYTES="${BREWFS_READ_MEMORY_BYTES:-0}"
@@ -34,6 +39,26 @@ PREFETCH_ENABLED="${BREWFS_PREFETCH_ENABLED:-false}"
 PREFETCH_MAX_BYTES="${BREWFS_PREFETCH_MAX_BYTES:-8388608}"
 PREFETCH_CONCURRENCY="${BREWFS_PREFETCH_CONCURRENCY:-7}"
 RANGE_BACKGROUND_PREFETCH="${BREWFS_RANGE_BACKGROUND_PREFETCH:-false}"
+TOOL_TIMEOUT_SECONDS="${PERF_TOOL_TIMEOUT_SECONDS:-900}"
+
+case "$PACKED_VOLUME_FORMAT" in
+    packed-metadata-v1)
+        MOUNT_CHUNK_SIZE=67108864
+        MOUNT_BLOCK_SIZE=4194304
+        ;;
+    packed-metadata-v2)
+        # v2 cluster superblocks currently carry a fixed 1 MiB chunk size.
+        MOUNT_CHUNK_SIZE=1048576
+        MOUNT_BLOCK_SIZE=1048576
+        ;;
+    packed-metadata-v3)
+        MOUNT_CHUNK_SIZE=67108864
+        MOUNT_BLOCK_SIZE=4194304
+        ;;
+    *)
+        die "unsupported packed volume format: $PACKED_VOLUME_FORMAT"
+        ;;
+esac
 
 mkdir -p "$WORK" "$ARTIFACT_DIR/tools" "$MOUNT_DIR"
 chmod 0755 "$BREWFS_BIN" "$PACKED_FIXTURE_BIN"
@@ -69,7 +94,7 @@ drop_caches() {
 write_config() {
     cat >"$CONFIG_PATH" <<EOF
 mount_point: $MOUNT_DIR
-volume_format: packed-metadata-v1
+volume_format: $PACKED_VOLUME_FORMAT
 packed_manifest_key: $(cat "$FIXTURE_MANIFEST")
 
 data:
@@ -84,8 +109,8 @@ data:
     disable_payload_checksum: true
 
 layout:
-  chunk_size: 67108864
-  block_size: 4194304
+  chunk_size: $MOUNT_CHUNK_SIZE
+  block_size: $MOUNT_BLOCK_SIZE
 
 fuse:
   workers: 16
@@ -135,7 +160,24 @@ run_tool() {
     drop_caches || die "drop_caches failed before $name; refusing to report a cached read"
     start_mount || die "BrewFS mount failed before $name"
     start_ns="$(date +%s%N)"
-    "$@" >"$log_path" 2>&1 || status=$?
+    "$@" >"$log_path" 2>&1 &
+    local command_pid=$!
+    local deadline=$((SECONDS + TOOL_TIMEOUT_SECONDS))
+    while kill -0 "$command_pid" 2>/dev/null; do
+        if (( SECONDS >= deadline )); then
+            kill -TERM "$command_pid" 2>/dev/null || true
+            sleep 10
+            kill -KILL "$command_pid" 2>/dev/null || true
+            status=124
+            break
+        fi
+        sleep 1
+    done
+    if (( status == 0 )); then
+        wait "$command_pid" || status=$?
+    else
+        wait "$command_pid" 2>/dev/null || true
+    fi
     end_ns="$(date +%s%N)"
     elapsed_ns=$((end_ns - start_ns))
     for stats_name in .stats .brewfs.stats; do
@@ -155,7 +197,7 @@ run_tool() {
 
 publish_fixture() {
     log "publishing immutable packed metadata fixture to OSS"
-    "$PACKED_FIXTURE_BIN" \
+    local fixture_args=(
         --bucket "$BREWFS_S3_BUCKET" \
         --endpoint "$BREWFS_S3_ENDPOINT" \
         --region "$BREWFS_S3_REGION" \
@@ -164,40 +206,68 @@ publish_fixture() {
         --dirs-per-level "$PACKED_DIRS_PER_LEVEL" \
         --files-per-dir "$PACKED_FILES_PER_DIR" \
         --small-file-size "$PACKED_SMALLFILE_SIZE" \
-        --fio-file-size "$FIO_FILE_SIZE" \
+        --small-file-min-size "$SMALLFILE_MIN_SIZE" \
+        --small-file-max-size "$SMALLFILE_MAX_SIZE" \
+        --access-profile "$PACKED_ACCESS_PROFILE" \
         --force-path-style "$FORCE_PATH_STYLE" \
-        --manifest-output "$FIXTURE_MANIFEST" \
+        --manifest-output "$FIXTURE_MANIFEST"
+    )
+    "$PACKED_FIXTURE_BIN" "${fixture_args[@]}" \
         >"$ARTIFACT_DIR/packed-fixture.log" 2>&1
     [[ -s "$FIXTURE_MANIFEST" ]] || die "fixture did not produce a manifest key"
     log "packed manifest: $(cat "$FIXTURE_MANIFEST")"
 }
 
 packed_smallfiles_scan() {
-    python3 - "$MOUNT_DIR" "$PACKED_SMALLFILE_COUNT" "$PACKED_SMALLFILE_SIZE" "$READ_BYTES" "$PACKED_DIR_LEVELS" "$PACKED_DIRS_PER_LEVEL" "$PACKED_FILES_PER_DIR" <<'PY'
+    python3 - "$MOUNT_DIR" "$PACKED_SMALLFILE_COUNT" "$SMALLFILE_MIN_SIZE" "$SMALLFILE_MAX_SIZE" "$READ_BYTES" "$PACKED_DIR_LEVELS" "$PACKED_DIRS_PER_LEVEL" "$PACKED_FILES_PER_DIR" "$SMALLFILE_WORKERS" <<'PY'
 import pathlib
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 root = pathlib.Path(sys.argv[1])
 expected = int(sys.argv[2])
-file_size = int(sys.argv[3])
-read_bytes = int(sys.argv[4])
-levels = int(sys.argv[5])
-fanout = int(sys.argv[6])
-files_per_leaf = int(sys.argv[7])
+min_size = int(sys.argv[3])
+max_size = int(sys.argv[4])
+read_bytes = int(sys.argv[5])
+levels = int(sys.argv[6])
+fanout = int(sys.argv[7])
+files_per_leaf = int(sys.argv[8])
+workers = max(1, int(sys.argv[9]))
 expected_leaf_dirs = fanout ** levels
 expected_tree_dirs = sum(fanout ** level for level in range(1, levels + 1))
 started = time.monotonic()
 files = directories = leaf_dirs = logical = payload = errors = checksum = 0
 walk_errors = []
+file_specs = []
 
 def on_walk_error(error):
     walk_errors.append(error)
     print(f"walk error path={error.filename} error={error}")
 
+def leaf_index(relative):
+    value = 0
+    for component in relative.parts:
+        value = value * fanout + int(component[1:])
+    return value
+
+def expected_prefix(file_number, length):
+    seed = (file_number + 1).to_bytes(8, "little")
+    result = bytearray()
+    for index in range(length):
+        rotated = ((index << 7) | (index >> 57)) & ((1 << 64) - 1)
+        result.append(seed[index % len(seed)] ^ (rotated & 0xff))
+    return bytes(result)
+
+def expected_size(file_number):
+    span = max_size - min_size + 1
+    mixed = (file_number * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
+    return min_size + (mixed % span if span else 0)
+
 import os
 for directory, dirs, names in os.walk(root, onerror=on_walk_error):
     dirs[:] = sorted(name for name in dirs if name.startswith("d"))
+    names = sorted(name for name in names if not name.startswith("."))
     relative = pathlib.Path(directory).relative_to(root)
     depth = len(relative.parts)
     if depth:
@@ -214,23 +284,45 @@ for directory, dirs, names in os.walk(root, onerror=on_walk_error):
     for name in sorted(names):
         path = pathlib.Path(directory) / name
         try:
-            size = path.stat().st_size
-            if size != file_size:
-                raise OSError(f"size={size} expected={file_size}")
-            with path.open("rb") as stream:
-                data = stream.read() if read_bytes <= 0 else stream.read(read_bytes)
-            if read_bytes <= 0 and len(data) != file_size:
-                raise OSError(f"short read={len(data)} expected={file_size}")
-            files += 1
-            logical += size
-            payload += len(data)
-            checksum = (checksum + (data[0] if data else 0)) & 0xffffffff
+            file_index = int(name[1:])
+            global_file_index = leaf_index(relative) * files_per_leaf + file_index
+            file_specs.append((path, global_file_index, expected_size(global_file_index)))
         except OSError as error:
             errors += 1
             print(f"read error path={path} error={error}")
+
+def read_one(spec):
+    path, global_file_index, expected_size_value = spec
+    try:
+        size = path.stat().st_size
+        if size != expected_size_value:
+            raise OSError(f"size={size} expected={expected_size_value}")
+        with path.open("rb") as stream:
+            data = stream.read() if read_bytes <= 0 else stream.read(read_bytes)
+        if read_bytes <= 0 and len(data) != expected_size_value:
+            raise OSError(f"short read={len(data)} expected={expected_size_value}")
+        header_len = min(8, len(data))
+        expected_header = expected_prefix(global_file_index, header_len)
+        if data[:header_len] != expected_header:
+            raise OSError("file content pattern mismatch")
+        return ("ok", size, len(data), (data[0] if data else 0))
+    except OSError as error:
+        return ("error", str(error))
+
+with ThreadPoolExecutor(max_workers=workers) as executor:
+    for spec, result in zip(file_specs, executor.map(read_one, file_specs)):
+        if result[0] == "ok":
+            _, size, data_len, first_byte = result
+            files += 1
+            logical += size
+            payload += data_len
+            checksum = (checksum + first_byte) & 0xffffffff
+        else:
+            errors += 1
+            print(f"read error path={spec[0]} error={result[1]}")
 elapsed = time.monotonic() - started
 mode = "full" if read_bytes <= 0 else f"prefix:{read_bytes}"
-print(f"packed_smallfiles_summary files={files} expected={expected} directories={directories} expected_directories={expected_tree_dirs} leaf_directories={leaf_dirs} expected_leaf_directories={expected_leaf_dirs} file_size={file_size} read_mode={mode} logical_bytes={logical} payload_bytes={payload} errors={errors} walk_errors={len(walk_errors)} checksum={checksum} seconds={elapsed:.6f} files_per_sec={files / elapsed if elapsed else 0:.2f}")
+print(f"packed_smallfiles_summary files={files} expected={expected} directories={directories} expected_directories={expected_tree_dirs} leaf_directories={leaf_dirs} expected_leaf_directories={expected_leaf_dirs} min_file_size={min_size} max_file_size={max_size} read_mode={mode} workers={workers} logical_bytes={logical} payload_bytes={payload} errors={errors} walk_errors={len(walk_errors)} checksum={checksum} seconds={elapsed:.6f} files_per_sec={files / elapsed if elapsed else 0:.2f}")
 if files != expected or directories != expected_tree_dirs or leaf_dirs != expected_leaf_dirs or errors or walk_errors:
     raise SystemExit(1)
 PY
@@ -260,6 +352,7 @@ def on_walk_error(error):
 
 for directory, dirs, names in os.walk(root, onerror=on_walk_error):
     dirs[:] = sorted(name for name in dirs if name.startswith("d"))
+    names = sorted(name for name in names if not name.startswith("."))
     relative = pathlib.Path(directory).relative_to(root)
     depth = len(relative.parts)
     if depth:
@@ -282,23 +375,27 @@ PY
 }
 
 packed_posix_scan() {
-    python3 - "$MOUNT_DIR" "$PACKED_SMALLFILE_SIZE" "$FIO_FILE_SIZE" "$PACKED_FILES_PER_DIR" "$PACKED_DIR_LEVELS" <<'PY'
+    python3 - "$MOUNT_DIR" "$SMALLFILE_MIN_SIZE" "$SMALLFILE_MAX_SIZE" "$FIO_FILE_SIZE" "$PACKED_FILES_PER_DIR" "$PACKED_DIR_LEVELS" <<'PY'
 import os
 import pathlib
 import stat
 import sys
 
 root = pathlib.Path(sys.argv[1])
-small_size = int(sys.argv[2])
-fio_size = int(sys.argv[3])
-files_per_dir = int(sys.argv[4])
-levels = int(sys.argv[5])
+min_size = int(sys.argv[2])
+max_size = int(sys.argv[3])
+fio_size = int(sys.argv[4])
+files_per_dir = int(sys.argv[5])
+levels = int(sys.argv[6])
 leaf = root.joinpath(*(["d000"] * levels))
 read_path = leaf / "f00000"
 bench_path = root / "bench" / "read.bin"
 verify = root / "verify"
 data = read_path.read_bytes()
-if len(data) != small_size or bench_path.stat().st_size != fio_size:
+span = max_size - min_size + 1
+mixed = 1442695040888963407 & ((1 << 64) - 1)
+expected_small_size = min_size + (mixed % span if span else 0)
+if len(data) != expected_small_size or bench_path.stat().st_size != fio_size:
     raise SystemExit("fixture sizes do not match")
 if len(list(leaf.iterdir())) != files_per_dir:
     raise SystemExit("readdir count mismatch")
@@ -364,7 +461,7 @@ for tool in $TOOLS; do
 done
 
 printf 'files=%s file_size=%s levels=%s fanout=%s files_per_leaf=%s read_bytes=%s\n' \
-    "$PACKED_SMALLFILE_COUNT" "$PACKED_SMALLFILE_SIZE" "$PACKED_DIR_LEVELS" \
+    "$PACKED_SMALLFILE_COUNT" "${SMALLFILE_MIN_SIZE}-${SMALLFILE_MAX_SIZE}" "$PACKED_DIR_LEVELS" \
     "$PACKED_DIRS_PER_LEVEL" "$PACKED_FILES_PER_DIR" "$READ_BYTES"
 cat "$ARTIFACT_DIR/perf-summary.tsv"
 exit "$status"

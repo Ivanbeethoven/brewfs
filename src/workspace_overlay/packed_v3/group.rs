@@ -1,7 +1,12 @@
+use std::sync::Arc;
+
 use sha2::{Digest, Sha256};
 
 use super::layout::{AccessProfile, SizeClass, SizeClassTable, choose_frame_layout};
-use super::meta::{GroupMeta, GroupMetaEntry, GroupMetaExtent};
+use super::meta::{
+    GROUP_META_HEADER_LEN, GroupMeta, GroupMetaEntry, GroupMetaExtent, INLINE_DATA_FLAG,
+    INLINE_FILE_MAX_BYTES, INLINE_GROUP_DATA_BUDGET_BYTES, MAX_GROUP_META_BYTES,
+};
 use super::wire::{
     MAX_OBJECT_BODY, PackedEnvelope, PackedObjectKind, PackedResult, PackedWireError, Reader,
     Writer,
@@ -285,6 +290,130 @@ pub struct PackedFileInput {
     pub data: Vec<u8>,
 }
 
+/// Hard and soft limits used when a directory is split into immutable groups.
+///
+/// `target_logical_bytes` is a packing preference. `max_logical_bytes`,
+/// `max_entries` and `max_metadata_bytes` are hard limits for one group. The
+/// metadata limit is estimated conservatively before encoding, so a builder
+/// never has to discover an over-sized GroupMeta after consuming a directory
+/// shard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupPackingLimits {
+    pub target_logical_bytes: usize,
+    pub max_logical_bytes: usize,
+    pub max_entries: usize,
+    pub max_metadata_bytes: usize,
+}
+
+impl Default for GroupPackingLimits {
+    fn default() -> Self {
+        Self {
+            target_logical_bytes: 8 * 1024 * 1024,
+            max_logical_bytes: 16 * 1024 * 1024,
+            max_entries: 256,
+            max_metadata_bytes: MAX_GROUP_META_BYTES,
+        }
+    }
+}
+
+impl GroupPackingLimits {
+    /// Return a packing profile tuned for the expected access shape.
+    ///
+    /// The default remains conservative for callers that do not know the
+    /// workload.  Immutable training-style snapshots usually scan adjacent
+    /// files, so the random-small-file profile can use a larger logical
+    /// window while the encoded GroupMeta limit still bounds metadata reads.
+    pub fn for_profile(profile: AccessProfile) -> Self {
+        match profile {
+            AccessProfile::RandomSmallFile => Self {
+                target_logical_bytes: 16 * 1024 * 1024,
+                max_logical_bytes: 32 * 1024 * 1024,
+                max_entries: 512,
+                ..Self::default()
+            },
+            AccessProfile::SequentialSmallFile => Self {
+                target_logical_bytes: 32 * 1024 * 1024,
+                max_logical_bytes: 48 * 1024 * 1024,
+                max_entries: 1024,
+                ..Self::default()
+            },
+            AccessProfile::Mixed => Self::default(),
+        }
+    }
+
+    fn validate(self) -> PackedResult<Self> {
+        if self.target_logical_bytes == 0
+            || self.max_logical_bytes < self.target_logical_bytes
+            || self.max_entries == 0
+            || self.max_metadata_bytes < GROUP_META_HEADER_LEN
+            || self.max_metadata_bytes > MAX_GROUP_META_BYTES
+        {
+            return Err(PackedWireError::Invalid(
+                "invalid packed group packing limits".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
+/// Limits for immutable container bin-packing. The body limit excludes the
+/// fixed envelope header/footer and may not exceed the wire hard maximum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContainerPackingLimits {
+    pub target_body_bytes: usize,
+    pub max_body_bytes: usize,
+    pub max_groups: usize,
+}
+
+impl Default for ContainerPackingLimits {
+    fn default() -> Self {
+        Self {
+            target_body_bytes: 16 * 1024 * 1024,
+            max_body_bytes: MAX_OBJECT_BODY as usize,
+            max_groups: 65_536,
+        }
+    }
+}
+
+impl ContainerPackingLimits {
+    /// Match container windows to the same access profile as group packing.
+    /// The wire hard limit remains 64 MiB for every profile.
+    pub fn for_profile(profile: AccessProfile) -> Self {
+        match profile {
+            AccessProfile::RandomSmallFile => Self {
+                target_body_bytes: 32 * 1024 * 1024,
+                ..Self::default()
+            },
+            AccessProfile::SequentialSmallFile => Self {
+                target_body_bytes: 48 * 1024 * 1024,
+                ..Self::default()
+            },
+            AccessProfile::Mixed => Self::default(),
+        }
+    }
+
+    fn validate(self) -> PackedResult<Self> {
+        if self.target_body_bytes == 0
+            || self.target_body_bytes > self.max_body_bytes
+            || self.max_body_bytes > MAX_OBJECT_BODY as usize
+            || self.max_groups == 0
+        {
+            return Err(PackedWireError::Invalid(
+                "invalid packed container packing limits".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
+/// Input for one immutable group container after group-level sharding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackedContainerInput {
+    pub container_id: u64,
+    pub groups: Vec<PackedGroupInput>,
+    pub frames: Vec<PackedFrameInput>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackedFrameDescriptor {
     pub frame_ordinal: u32,
@@ -296,6 +425,272 @@ pub struct PackedFrameDescriptor {
     pub size_class: SizeClass,
     pub codec: u8,
     pub frame_digest: [u8; 16],
+}
+
+/// Split one directory into sorted, independently addressable groups and pack
+/// each group into dynamic frames. Group ids are assigned consecutively from
+/// `group_id_base`; callers can publish each returned group in a separate
+/// container or co-pack several groups after rebasing frame ordinals.
+pub fn pack_group_file_shards(
+    group_id_base: u64,
+    parent_dir_key: [u8; 32],
+    mut files: Vec<PackedFileInput>,
+    profile: AccessProfile,
+    size_classes: SizeClassTable,
+    p90_requested_range: Option<u64>,
+    limits: GroupPackingLimits,
+) -> PackedResult<Vec<(PackedGroupInput, Vec<PackedFrameInput>)>> {
+    let limits = limits.validate()?;
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut shards = Vec::new();
+    let mut current = Vec::new();
+    let mut current_logical_bytes = 0usize;
+    let mut shard_ordinal = 0u64;
+
+    for file in files {
+        let file_bytes = file.data.len();
+        let should_flush = !current.is_empty()
+            && (current.len() >= limits.max_entries
+                || current_logical_bytes >= limits.target_logical_bytes
+                || current_logical_bytes.saturating_add(file_bytes) > limits.max_logical_bytes
+                || !metadata_budget_allows(
+                    &current,
+                    &file,
+                    profile,
+                    size_classes,
+                    p90_requested_range,
+                    limits.max_metadata_bytes,
+                ));
+        if should_flush {
+            let group_id = group_id_base.checked_add(shard_ordinal).ok_or_else(|| {
+                PackedWireError::LimitExceeded("packed group id exceeds u64".into())
+            })?;
+            let packed = pack_group_files(
+                group_id,
+                parent_dir_key,
+                std::mem::take(&mut current),
+                profile,
+                size_classes,
+                p90_requested_range,
+            )?;
+            if packed.0.metadata.len() > limits.max_metadata_bytes {
+                return Err(PackedWireError::LimitExceeded(
+                    "packed group metadata exceeds configured limit".into(),
+                ));
+            }
+            shards.push(packed);
+            shard_ordinal = shard_ordinal.saturating_add(1);
+            current_logical_bytes = 0;
+        }
+
+        current_logical_bytes = current_logical_bytes.saturating_add(file_bytes);
+        current.push(file);
+    }
+
+    if !current.is_empty() {
+        let group_id = group_id_base
+            .checked_add(shard_ordinal)
+            .ok_or_else(|| PackedWireError::LimitExceeded("packed group id exceeds u64".into()))?;
+        let packed = pack_group_files(
+            group_id,
+            parent_dir_key,
+            current,
+            profile,
+            size_classes,
+            p90_requested_range,
+        )?;
+        if packed.0.metadata.len() > limits.max_metadata_bytes {
+            return Err(PackedWireError::LimitExceeded(
+                "packed group metadata exceeds configured limit".into(),
+            ));
+        }
+        shards.push(packed);
+    }
+    Ok(shards)
+}
+
+/// Bin-pack already-sharded groups into bounded containers. Group metadata
+/// carries frame ordinals, so ordinals are rebased while groups are appended
+/// to a container. No file data is copied during the size decision.
+pub fn pack_group_shard_containers(
+    container_id_base: u64,
+    shards: Vec<(PackedGroupInput, Vec<PackedFrameInput>)>,
+    limits: ContainerPackingLimits,
+) -> PackedResult<Vec<PackedContainerInput>> {
+    let limits = limits.validate()?;
+    let mut result = Vec::new();
+    let mut groups = Vec::new();
+    let mut frames = Vec::new();
+
+    for (group, shard_frames) in shards {
+        let candidate_body = container_body_len(&groups, &frames)?
+            .checked_add(container_group_delta(&group, &shard_frames)?)
+            .ok_or_else(|| {
+                PackedWireError::LimitExceeded("packed container size overflows".into())
+            })?;
+        let must_flush = !groups.is_empty()
+            && (groups.len() >= limits.max_groups || candidate_body > limits.target_body_bytes);
+        if must_flush {
+            push_container(&mut result, container_id_base, &mut groups, &mut frames)?;
+        }
+
+        let frame_offset = u32::try_from(frames.len()).map_err(|_| {
+            PackedWireError::LimitExceeded("packed container frame ordinal exceeds u32".into())
+        })?;
+        let rebased = rebase_group_frames(group, frame_offset)?;
+        let single_body = container_body_len(std::slice::from_ref(&rebased), &shard_frames)?;
+        if single_body > limits.max_body_bytes {
+            return Err(PackedWireError::LimitExceeded(
+                "one packed group cannot fit in a container".into(),
+            ));
+        }
+        groups.push(rebased);
+        frames.extend(shard_frames);
+    }
+
+    if !groups.is_empty() {
+        push_container(&mut result, container_id_base, &mut groups, &mut frames)?;
+    }
+    Ok(result)
+}
+
+fn rebase_group_frames(
+    mut group: PackedGroupInput,
+    frame_offset: u32,
+) -> PackedResult<PackedGroupInput> {
+    if frame_offset == 0 {
+        return Ok(group);
+    }
+    let mut metadata = GroupMeta::decode(&group.metadata)?;
+    for entry in metadata.entries_mut() {
+        for extent in &mut entry.extents {
+            extent.frame_ordinal =
+                extent
+                    .frame_ordinal
+                    .checked_add(frame_offset)
+                    .ok_or_else(|| {
+                        PackedWireError::LimitExceeded("packed frame ordinal exceeds u32".into())
+                    })?;
+        }
+    }
+    group.metadata = metadata.encode()?;
+    for ordinal in &mut group.frame_ordinals {
+        *ordinal = ordinal.checked_add(frame_offset).ok_or_else(|| {
+            PackedWireError::LimitExceeded("packed frame ordinal exceeds u32".into())
+        })?;
+    }
+    Ok(group)
+}
+
+fn container_body_len(
+    groups: &[PackedGroupInput],
+    frames: &[PackedFrameInput],
+) -> PackedResult<usize> {
+    let frame_lists_len = groups
+        .iter()
+        .map(|group| group.frame_ordinals.len().saturating_mul(4))
+        .sum::<usize>();
+    let metadata_len = groups
+        .iter()
+        .map(|group| group.metadata.len())
+        .fold(0usize, usize::saturating_add);
+    let payload_len = frames
+        .iter()
+        .map(|frame| frame.raw.len())
+        .fold(0usize, usize::saturating_add);
+    GROUP_PREFIX_LEN
+        .checked_add(groups.len().saturating_mul(GROUP_RECORD_LEN))
+        .and_then(|value| value.checked_add(frames.len().saturating_mul(FRAME_RECORD_LEN)))
+        .and_then(|value| value.checked_add(frame_lists_len))
+        .and_then(|value| value.checked_add(metadata_len))
+        .and_then(|value| value.checked_add(payload_len))
+        .ok_or_else(|| PackedWireError::LimitExceeded("packed container size overflows".into()))
+}
+
+fn container_group_delta(
+    group: &PackedGroupInput,
+    frames: &[PackedFrameInput],
+) -> PackedResult<usize> {
+    GROUP_RECORD_LEN
+        .checked_add(frames.len().saturating_mul(FRAME_RECORD_LEN))
+        .and_then(|value| value.checked_add(group.frame_ordinals.len().saturating_mul(4)))
+        .and_then(|value| value.checked_add(group.metadata.len()))
+        .and_then(|value| {
+            value.checked_add(
+                frames
+                    .iter()
+                    .map(|frame| frame.raw.len())
+                    .fold(0usize, usize::saturating_add),
+            )
+        })
+        .ok_or_else(|| PackedWireError::LimitExceeded("packed container size overflows".into()))
+}
+
+fn push_container(
+    result: &mut Vec<PackedContainerInput>,
+    container_id_base: u64,
+    groups: &mut Vec<PackedGroupInput>,
+    frames: &mut Vec<PackedFrameInput>,
+) -> PackedResult<()> {
+    let container_id = container_id_base
+        .checked_add(result.len() as u64)
+        .ok_or_else(|| PackedWireError::LimitExceeded("packed container id exceeds u64".into()))?;
+    result.push(PackedContainerInput {
+        container_id,
+        groups: std::mem::take(groups),
+        frames: std::mem::take(frames),
+    });
+    Ok(())
+}
+
+fn metadata_budget_allows(
+    current: &[PackedFileInput],
+    next: &PackedFileInput,
+    profile: AccessProfile,
+    size_classes: SizeClassTable,
+    p90_requested_range: Option<u64>,
+    max_metadata_bytes: usize,
+) -> bool {
+    let fixed_bytes = GROUP_META_HEADER_LEN.saturating_add(
+        current
+            .iter()
+            .chain(std::iter::once(next))
+            .map(|file| 96usize.saturating_add(file.name.len()))
+            .sum::<usize>(),
+    );
+    if fixed_bytes > max_metadata_bytes {
+        return false;
+    }
+
+    // Mirror the packer's deterministic inline admission rule. The fixed
+    // record estimate is intentionally larger than the actual GM06 record,
+    // so this check errs on the side of an earlier shard boundary.
+    let inline_budget =
+        INLINE_GROUP_DATA_BUDGET_BYTES.min(max_metadata_bytes.saturating_sub(fixed_bytes));
+    let mut inline_bytes = 0usize;
+    let mut extent_bytes = 0usize;
+    for file in current.iter().chain(std::iter::once(next)) {
+        let size = file.data.len();
+        let inline = size != 0
+            && file.kind == 1
+            && size < INLINE_FILE_MAX_BYTES
+            && inline_bytes.saturating_add(size) <= inline_budget;
+        if inline {
+            inline_bytes = inline_bytes.saturating_add(size);
+        } else if size != 0 {
+            let frame_bytes =
+                choose_frame_layout(size as u64, p90_requested_range, profile, size_classes)
+                    .map(|decision| decision.frame_raw_bytes.max(1) as usize)
+                    .unwrap_or(1);
+            extent_bytes =
+                extent_bytes.saturating_add(size.div_ceil(frame_bytes).saturating_mul(24));
+        }
+    }
+    fixed_bytes
+        .saturating_add(inline_bytes)
+        .saturating_add(extent_bytes)
+        <= max_metadata_bytes
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -349,17 +744,40 @@ pub fn pack_group_files(
     let mut frames = Vec::new();
     let mut frame_ordinals = Vec::new();
     let mut current: Option<FrameBuilder> = None;
+    let mut inline_bytes = 0usize;
+    // Reserve the fixed record and name bytes before admitting inline data;
+    // otherwise a directory with many 1 KiB files could exceed the 256 KiB
+    // GroupMeta bound even though its inline payload stayed under budget.
+    let fixed_metadata_bytes = 12usize.saturating_add(
+        files
+            .iter()
+            .map(|file| 96usize.saturating_add(file.name.len()))
+            .sum::<usize>(),
+    );
+    let inline_budget = INLINE_GROUP_DATA_BUDGET_BYTES
+        .min(MAX_GROUP_META_BYTES.saturating_sub(fixed_metadata_bytes));
+    let entry_count = files.len();
+    let file_count = files.iter().filter(|file| file.kind == 1).count();
 
-    for (file_slot, file) in files.iter().enumerate() {
+    // Consume the inputs after calculating the metadata budget. Inline data
+    // can then move directly into GroupMeta instead of being cloned.
+    for (file_slot, file) in files.into_iter().enumerate() {
         let file_slot = u32::try_from(file_slot)
             .map_err(|_| PackedWireError::LimitExceeded("file slot exceeds u32".into()))?;
-        let size = u64::try_from(file.data.len())
+        let data = file.data;
+        let size = u64::try_from(data.len())
             .map_err(|_| PackedWireError::LimitExceeded("file size exceeds u64".into()))?;
         let decision = choose_frame_layout(size, p90_requested_range, profile, size_classes)
             .map_err(|error| PackedWireError::Invalid(error.to_string()))?;
         let mut drafts = Vec::new();
 
-        if size != 0 {
+        let inline = size != 0
+            && file.kind == 1
+            && data.len() < INLINE_FILE_MAX_BYTES
+            && inline_bytes.saturating_add(data.len()) <= inline_budget;
+        if inline {
+            inline_bytes = inline_bytes.saturating_add(data.len());
+        } else if size != 0 {
             let target_len = usize::try_from(decision.frame_raw_bytes).map_err(|_| {
                 PackedWireError::LimitExceeded("dynamic frame size exceeds usize".into())
             })?;
@@ -367,7 +785,7 @@ pub fn pack_group_files(
                 let can_append = current.as_ref().is_some_and(|frame| {
                     frame.size_class == decision.size_class
                         && frame.target_len == target_len
-                        && frame.raw.len().saturating_add(file.data.len()) <= target_len
+                        && frame.raw.len().saturating_add(data.len()) <= target_len
                 });
                 if !can_append {
                     flush_frame(&mut current, &mut frames, &mut frame_ordinals)?;
@@ -383,11 +801,11 @@ pub fn pack_group_files(
                 let raw_offset = u32::try_from(frame.raw.len()).map_err(|_| {
                     PackedWireError::LimitExceeded("frame raw offset exceeds u32".into())
                 })?;
-                frame.raw.extend_from_slice(&file.data);
+                frame.raw.extend_from_slice(&data);
                 frame.last_file_slot = file_slot;
                 drafts.push(GroupMetaExtent {
                     file_offset: 0,
-                    logical_len: u32::try_from(file.data.len()).map_err(|_| {
+                    logical_len: u32::try_from(data.len()).map_err(|_| {
                         PackedWireError::LimitExceeded("file extent length exceeds u32".into())
                     })?,
                     frame_ordinal: u32::try_from(frames.len()).map_err(|_| {
@@ -399,7 +817,7 @@ pub fn pack_group_files(
             } else {
                 flush_frame(&mut current, &mut frames, &mut frame_ordinals)?;
                 let mut file_offset = 0u64;
-                for chunk in file.data.chunks(target_len) {
+                for chunk in data.chunks(target_len) {
                     let frame_ordinal = frames.len();
                     let logical_len = u32::try_from(chunk.len()).map_err(|_| {
                         PackedWireError::LimitExceeded("file extent length exceeds u32".into())
@@ -428,7 +846,7 @@ pub fn pack_group_files(
         }
 
         entries.push(GroupMetaEntry {
-            name: file.name.clone(),
+            name: file.name,
             inode: file.inode,
             kind: file.kind,
             mode: file.mode,
@@ -440,7 +858,12 @@ pub fn pack_group_files(
             mtime_ns: file.mtime_ns,
             ctime_ns: file.ctime_ns,
             size,
-            flags: file.flags,
+            flags: file.flags | if inline { INLINE_DATA_FLAG } else { 0 },
+            inline_data: if inline {
+                Arc::from(data)
+            } else {
+                Arc::from([])
+            },
             extents: drafts,
         });
     }
@@ -456,14 +879,13 @@ pub fn pack_group_files(
         }
     }
     let metadata = GroupMeta::new(entries)?.encode()?;
-    let file_count = files.iter().filter(|file| file.kind == 1).count();
     Ok((
         PackedGroupInput {
             group_id,
             parent_dir_key,
             metadata,
             frame_ordinals,
-            entry_count: u32::try_from(files.len()).map_err(|_| {
+            entry_count: u32::try_from(entry_count).map_err(|_| {
                 PackedWireError::LimitExceeded("group entry count exceeds u32".into())
             })?,
             file_count: u32::try_from(file_count).map_err(|_| {
@@ -1133,6 +1555,7 @@ mod tests {
                 ctime_ns: 0,
                 size: 5,
                 flags: 0,
+                inline_data: Arc::from([]),
                 extents: vec![GroupMetaExtent {
                     file_offset: 0,
                     logical_len: 5,
@@ -1155,6 +1578,7 @@ mod tests {
                 ctime_ns: 0,
                 size: 5,
                 flags: 0,
+                inline_data: Arc::from([]),
                 extents: vec![GroupMetaExtent {
                     file_offset: 0,
                     logical_len: 5,
@@ -1257,6 +1681,58 @@ mod tests {
     }
 
     #[test]
+    fn container_shards_rebase_frame_ordinals_and_obey_target() {
+        let (mut first_groups, first_frames) = inputs();
+        let first_group = first_groups.remove(0);
+        let (mut second_groups, second_frames) = inputs();
+        let mut second_group = second_groups.remove(0);
+        second_group.group_id = 10;
+        let containers = pack_group_shard_containers(
+            100,
+            vec![(first_group, first_frames), (second_group, second_frames)],
+            ContainerPackingLimits {
+                target_body_bytes: 256,
+                max_body_bytes: MAX_OBJECT_BODY as usize,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(containers.len(), 2);
+        assert_eq!(containers[0].container_id, 100);
+        assert_eq!(containers[1].container_id, 101);
+
+        let (mut first_groups, first_frames) = inputs();
+        let first_group = first_groups.remove(0);
+        let (mut second_groups, second_frames) = inputs();
+        let mut second_group = second_groups.remove(0);
+        second_group.group_id = 10;
+        let containers = pack_group_shard_containers(
+            200,
+            vec![(first_group, first_frames), (second_group, second_frames)],
+            ContainerPackingLimits {
+                target_body_bytes: 1 * 1024 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(containers.len(), 1);
+        let container = &containers[0];
+        let object = PackedGroupContainer::build(
+            container.container_id,
+            AccessProfile::RandomSmallFile,
+            container.groups.clone(),
+            container.frames.clone(),
+        )
+        .unwrap();
+        let opened = PackedGroupContainer::open(object).unwrap();
+        let second_meta = opened.group_meta(10).unwrap();
+        assert_eq!(second_meta.entries()[0].extents[0].frame_ordinal, 2);
+        assert_eq!(second_meta.entries()[1].extents[0].frame_ordinal, 3);
+        assert_eq!(opened.frame_payload(2).unwrap(), b"hello");
+        assert_eq!(opened.frame_payload(3).unwrap(), b"world");
+    }
+
+    #[test]
     fn dynamic_packer_copacks_tiny_files_and_splits_large_files() {
         let tiny_files = (0..3)
             .map(|index| PackedFileInput {
@@ -1284,11 +1760,12 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.len(), 1);
         let meta = GroupMeta::decode(&group.metadata).unwrap();
-        assert_eq!(meta.entries()[0].extents[0].frame_ordinal, 0);
-        assert_eq!(meta.entries()[1].extents[0].frame_ordinal, 0);
-        assert_eq!(meta.entries()[0].extents[0].raw_len, 200 * 1024);
+        assert_eq!(meta.entries()[0].inline_data.len(), 100 * 1024);
+        assert_eq!(meta.entries()[1].inline_data.len(), 100 * 1024);
+        assert!(meta.entries()[0].extents.is_empty());
+        assert_eq!(meta.entries()[2].extents[0].frame_ordinal, 0);
 
         let (large_group, large_frames) = pack_group_files(
             2,
@@ -1319,6 +1796,152 @@ mod tests {
                 .extents
                 .len(),
             3
+        );
+    }
+
+    #[test]
+    fn inline_boundary_uses_a_dynamic_frame() {
+        let (group, frames) = pack_group_files(
+            3,
+            [1; 32],
+            vec![PackedFileInput {
+                name: b"boundary.bin".to_vec(),
+                inode: 11,
+                kind: 1,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                nlink: 1,
+                atime_ns: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                flags: 0,
+                data: vec![3; INLINE_FILE_MAX_BYTES],
+            }],
+            AccessProfile::RandomSmallFile,
+            SizeClassTable::default(),
+            None,
+        )
+        .unwrap();
+        let decoded = GroupMeta::decode(&group.metadata).unwrap();
+        let entry = &decoded.entries()[0];
+        assert!(entry.inline_data.is_empty());
+        assert_eq!(entry.extents.len(), 1);
+        assert_eq!(frames.len(), 1);
+    }
+
+    #[test]
+    fn directory_shards_obey_entry_and_logical_limits() {
+        let files = (0..100)
+            .map(|index| PackedFileInput {
+                name: format!("f{index:04}").into_bytes(),
+                inode: index + 1,
+                kind: 1,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                nlink: 1,
+                atime_ns: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                flags: 0,
+                data: vec![index as u8; 100 * 1024],
+            })
+            .collect();
+        let limits = GroupPackingLimits {
+            target_logical_bytes: 2 * 1024 * 1024,
+            max_logical_bytes: 3 * 1024 * 1024,
+            max_entries: 32,
+            ..Default::default()
+        };
+        let shards = pack_group_file_shards(
+            100,
+            [7; 32],
+            files,
+            AccessProfile::RandomSmallFile,
+            SizeClassTable::default(),
+            None,
+            limits,
+        )
+        .unwrap();
+        assert!(shards.len() >= 5);
+        assert_eq!(shards[0].0.group_id, 100);
+        assert_eq!(
+            shards.last().unwrap().0.group_id,
+            100 + shards.len() as u64 - 1
+        );
+
+        let mut names = Vec::new();
+        for (group, _) in &shards {
+            assert!(group.entry_count as usize <= limits.max_entries);
+            assert!(group.metadata.len() <= limits.max_metadata_bytes);
+            let meta = GroupMeta::decode(&group.metadata).unwrap();
+            assert_eq!(meta.len(), group.entry_count as usize);
+            names.extend(meta.entries().iter().map(|entry| entry.name.clone()));
+        }
+        assert_eq!(names.len(), 100);
+        assert!(names.windows(2).all(|window| window[0] < window[1]));
+    }
+
+    #[test]
+    fn metadata_heavy_directory_shards_before_group_meta_overflow() {
+        let files = (0..4_000)
+            .map(|index| PackedFileInput {
+                name: format!("entry-{index:06}-with-a-long-name").into_bytes(),
+                inode: index + 1,
+                kind: 2,
+                mode: 0o040755,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                nlink: 2,
+                atime_ns: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                flags: 0,
+                data: Vec::new(),
+            })
+            .collect();
+        let shards = pack_group_file_shards(
+            900,
+            [8; 32],
+            files,
+            AccessProfile::RandomSmallFile,
+            SizeClassTable::default(),
+            None,
+            GroupPackingLimits {
+                target_logical_bytes: 64 * 1024 * 1024,
+                max_logical_bytes: 64 * 1024 * 1024,
+                max_entries: 10_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(shards.len() >= 2);
+        assert!(
+            shards
+                .iter()
+                .all(|(group, _)| group.metadata.len() <= MAX_GROUP_META_BYTES)
+        );
+    }
+
+    #[test]
+    fn access_profiles_use_bounded_but_different_pack_windows() {
+        let random = GroupPackingLimits::for_profile(AccessProfile::RandomSmallFile);
+        let sequential = GroupPackingLimits::for_profile(AccessProfile::SequentialSmallFile);
+        assert!(random.target_logical_bytes < sequential.target_logical_bytes);
+        assert!(random.max_logical_bytes < sequential.max_logical_bytes);
+        assert_eq!(random.max_metadata_bytes, MAX_GROUP_META_BYTES);
+        assert_eq!(
+            ContainerPackingLimits::for_profile(AccessProfile::RandomSmallFile).target_body_bytes,
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            ContainerPackingLimits::for_profile(AccessProfile::SequentialSmallFile)
+                .target_body_bytes,
+            48 * 1024 * 1024
         );
     }
 }

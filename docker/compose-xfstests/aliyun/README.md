@@ -1,132 +1,227 @@
-# Aliyun 云端性能测试
+<p align="center"><a href="https://github.com/juicedata/juicefs"><img alt="JuiceFS Logo" src="docs/en/images/juicefs-logo-new.svg" width="50%" /></a></p>
+<p align="center">
+    <a href="https://github.com/juicedata/juicefs/releases/latest"><img alt="Latest Stable Release" src="https://img.shields.io/github/v/release/juicedata/juicefs" /></a>
+    <a href="https://github.com/juicedata/juicefs/actions/workflows/unittests.yml"><img alt="GitHub Workflow Status" src="https://img.shields.io/github/actions/workflow/status/juicedata/juicefs/unittests.yml?branch=main&label=Unit%20Testing" /></a>
+    <a href="https://github.com/juicedata/juicefs/actions/workflows/integrationtests.yml"><img alt="GitHub Workflow Status" src="https://img.shields.io/github/actions/workflow/status/juicedata/juicefs/integrationtests.yml?branch=main&label=Integration%20Testing" /></a>
+    <a href="https://goreportcard.com/report/github.com/juicedata/juicefs"><img alt="Go Report" src="https://goreportcard.com/badge/github.com/juicedata/juicefs" /></a>
+    <a href="https://juicefs.com/docs/community/introduction"><img alt="English doc" src="https://img.shields.io/badge/docs-Doc%20Center-brightgreen" /></a>
+    <a href="https://go.juicefs.com/slack"><img alt="Join Slack" src="https://badgen.net/badge/Slack/Join%20JuiceFS/0abd59?icon=slack" /></a>
+</p>
 
-这个目录提供 Aliyun ECS 上的原生 packed-metadata 验证入口。脚本在本机 WSL 编译 Linux BrewFS 和 fixture 二进制，把二进制上传到 Aliyun OSS，再由 ECS Cloud Assistant 直接运行。ECS 不安装 Docker、不启动 Compose、不启动 Redis/RustFS；packed metadata 和数据对象都来自指定的 Aliyun OSS/S3 bucket。
+**JuiceFS** is a high-performance [POSIX](https://en.wikipedia.org/wiki/POSIX) file system released under Apache License 2.0, particularly designed for the cloud-native environment. The data, stored via JuiceFS, will be persisted in Object Storage _(e.g. Amazon S3)_, and the corresponding metadata can be persisted in various compatible database engines such as Redis, MySQL, and TiKV based on the scenarios and requirements.
 
-## 百万级 packed 小文件测试
+With JuiceFS, massive cloud storage can be directly connected to big data, machine learning, artificial intelligence, and various application platforms in production environments. Without modifying code, the massive cloud storage can be used as efficiently as local storage.
 
-`run_aliyun_packed_million.ps1` 是专用入口，目录布局默认是：
+📖 **Document**: [Quick Start Guide](https://juicefs.com/docs/community/quick_start_guide)
 
-```text
-root/
-  d000..d009/
-    d000..d009/
-      d000..d009/
-        f00000..f00999  (100 KiB each)
+## Highlighted Features
+
+1. **Fully POSIX-compatible**: Use as a local file system, seamlessly docking with existing applications without breaking business workflow.
+2. **Fully Hadoop-compatible**: JuiceFS' [Hadoop Java SDK](https://juicefs.com/docs/community/hadoop_java_sdk) is compatible with Hadoop 2.x and Hadoop 3.x as well as a variety of components in the Hadoop ecosystems.
+3. **S3-compatible**:  JuiceFS' [S3 Gateway](https://juicefs.com/docs/community/s3_gateway) provides an S3-compatible interface.
+4. **Cloud Native**: A [Kubernetes CSI Driver](https://juicefs.com/docs/community/how_to_use_on_kubernetes) is provided for easily using JuiceFS in Kubernetes.
+5. **Shareable**: JuiceFS is a shared file storage that can be read and written by thousands of clients.
+6. **Strong Consistency**: The confirmed modification will be immediately visible on all the servers mounted with the same file system.
+7. **Outstanding Performance**: The latency can be as low as a few milliseconds, and the throughput can be expanded nearly unlimitedly _(depending on the size of the Object Storage)_. [Test results](https://juicefs.com/docs/community/benchmark)
+8. **Data Encryption**: Supports data encryption in transit and at rest (please refer to [the guide](https://juicefs.com/docs/community/security/encrypt) for more information).
+9. **Global File Locks**: JuiceFS supports both BSD locks (flock) and POSIX record locks (fcntl).
+10. **Data Compression**: JuiceFS supports [LZ4](https://lz4.github.io/lz4) or [Zstandard](https://facebook.github.io/zstd) to compress all your data.
+
+---
+
+[Architecture](#architecture) | [Getting Started](#getting-started) | [Advanced Topics](#advanced-topics) | [POSIX Compatibility](#posix-compatibility) | [Performance Benchmark](#performance-benchmark) | [Supported Object Storage](#supported-object-storage) | [Who is using](#who-is-using) | [Roadmap](#roadmap) | [Reporting Issues](#reporting-issues) | [Contributing](#contributing) | [Community](#community) | [Usage Tracking](#usage-tracking) | [License](#license) | [Credits](#credits) | [FAQ](#faq)
+
+---
+
+## Architecture
+
+JuiceFS consists of three parts:
+
+1. **JuiceFS Client**: Coordinates Object Storage and metadata storage engine as well as implementation of file system interfaces such as POSIX, Hadoop, Kubernetes, and S3 gateway.
+2. **Data Storage**: Stores data, with supports of a variety of data storage media, e.g., local disk, public or private cloud Object Storage, and HDFS.
+3. **Metadata Engine**: Stores the corresponding metadata that contains information of file name, file size, permission group, creation and modification time and directory structure, etc., with supports of different metadata engines, e.g., Redis, MySQL, SQLite and TiKV.
+
+![JuiceFS Architecture](docs/en/images/juicefs-arch-new.png)
+
+JuiceFS can store the metadata of file system on different metadata engines, like Redis, which is a fast, open-source, in-memory key-value data storage, particularly suitable for storing metadata; meanwhile, all the data will be stored in Object Storage through JuiceFS client. [Learn more](https://juicefs.com/docs/community/architecture)
+
+![data-structure-diagram](docs/en/images/data-structure-diagram.svg)
+
+Each file stored in JuiceFS is split into **"Chunk"** s at a fixed size with the default upper limit of 64 MiB. Each Chunk is composed of one or more **"Slice"**(s), and the length of the slice varies depending on how the file is written. Each slice is composed of size-fixed **"Block"** s, which are 4 MiB by default. These blocks will be stored in Object Storage in the end; at the same time, the metadata information of the file and its Chunks, Slices, and Blocks will be stored in metadata engines via JuiceFS. [Learn more](https://juicefs.com/docs/community/architecture/#how-juicefs-store-files)
+
+![How JuiceFS stores your files](docs/en/images/how-juicefs-stores-files.svg)
+
+When using JuiceFS, files will eventually be split into Chunks, Slices and Blocks and stored in Object Storage. Therefore, the source files stored in JuiceFS cannot be found in the file browser of the Object Storage platform; instead, there are only a chunks directory and a bunch of digitally numbered directories and files in the bucket. Don't panic! This is just the secret of the high-performance operation of JuiceFS!
+
+## Getting Started
+
+Before you begin, make sure you have:
+
+1. One supported metadata engine, see [How to Set Up Metadata Engine](https://juicefs.com/docs/community/databases_for_metadata)
+2. One supported Object Storage for storing data blocks, see [Supported Object Storage](https://juicefs.com/docs/community/how_to_setup_object_storage)
+3. [JuiceFS Client](https://juicefs.com/docs/community/installation) downloaded and installed
+
+Please refer to [Quick Start Guide](https://juicefs.com/docs/community/quick_start_guide) to start using JuiceFS right away!
+
+### Command Reference
+
+Check out all the command line options in [command reference](https://juicefs.com/docs/community/command_reference).
+
+### Containers
+
+JuiceFS can be used as a persistent volume for Docker and Podman, please check [here](https://juicefs.com/docs/community/juicefs_on_docker) for details.
+
+### Kubernetes
+
+It is also very easy to use JuiceFS on Kubernetes. Please find more information [here](https://juicefs.com/docs/community/how_to_use_on_kubernetes).
+
+### Hadoop Java SDK
+
+If you wanna use JuiceFS in Hadoop, check [Hadoop Java SDK](https://juicefs.com/docs/community/hadoop_java_sdk).
+
+## Advanced Topics
+
+- [Redis Best Practices](https://juicefs.com/docs/community/redis_best_practices)
+- [How to Setup Object Storage](https://juicefs.com/docs/community/how_to_setup_object_storage)
+- [Cache](https://juicefs.com/docs/community/cache)
+- [Fault Diagnosis and Analysis](https://juicefs.com/docs/community/fault_diagnosis_and_analysis)
+- [FUSE Mount Options](https://juicefs.com/docs/community/fuse_mount_options)
+- [Using JuiceFS on Windows](https://juicefs.com/docs/community/installation#windows)
+- [S3 Gateway](https://juicefs.com/docs/community/s3_gateway)
+
+Please refer to [JuiceFS Document Center](https://juicefs.com/docs/community/introduction) for more information.
+
+## POSIX Compatibility
+
+JuiceFS has passed all of the compatibility tests (8813 in total) in the latest [pjdfstest](https://github.com/pjd/pjdfstest) .
+
+```
+All tests successful.
+
+Test Summary Report
+-------------------
+/root/soft/pjdfstest/tests/chown/00.t          (Wstat: 0 Tests: 1323 Failed: 0)
+  TODO passed:   693, 697, 708-709, 714-715, 729, 733
+Files=235, Tests=8813, 233 wallclock secs ( 2.77 usr  0.38 sys +  2.57 cusr  3.93 csys =  9.65 CPU)
+Result: PASS
 ```
 
-也就是 `10 x 10 x 10 x 1,000 = 1,000,000` 个文件。packed fixture 的小文件数据共享一个不可变 block，因此不会在 ECS 本地落下约 100 GiB 的重复 payload；全文件读模式仍会实际读取约 100 GiB 的逻辑数据并记录 payload bytes。
+Aside from the POSIX features covered by pjdfstest, JuiceFS also provides:
 
-```powershell
-# 先用 -DryRun 检查参数；需要已有 vSwitch 和安全组。
-.\docker\compose-xfstests\aliyun\run_aliyun_packed_million.ps1 `
-  -DryRun `
-  -VSwitchId vsw-xxxxxxxx `
-  -SecurityGroupId sg-xxxxxxxx
+- **Close-to-open consistency**. Once a file is written _and_ closed, it is guaranteed to view the written data in the following opens and reads from any client. Within the same mount point, all the written data can be read immediately.
+- Rename and all other metadata operations are atomic, which are guaranteed by supported metadata engine transaction.
+- Opened files remain accessible after unlink from same mount point.
+- Mmap (tested with FSx).
+- Fallocate with punch hole support.
+- Extended attributes (xattr).
+- BSD locks (flock).
+- POSIX record locks (fcntl).
 
-# 创建 ECS，构建当前本地工作树，发布 packed fixture，冷读扫描后自动释放 ECS。
-.\docker\compose-xfstests\aliyun\run_aliyun_packed_million.ps1 `
-  -VSwitchId vsw-xxxxxxxx `
-  -SecurityGroupId sg-xxxxxxxx `
-  -S3Bucket my-brewfs-test-bucket `
-  -RegionId cn-hangzhou `
-  -ZoneId cn-hangzhou-h `
-  -ImageId ubuntu_24_04_x64_20G_alibase_20260916.vhd `
-  -Ref main
+## Performance Benchmark
+
+### Basic benchmark
+
+JuiceFS provides a subcommand that can run a few basic benchmarks to help you understand how it works in your environment:
+
+![JuiceFS Bench](docs/en/images/juicefs-bench.png)
+
+### Throughput
+
+A sequential read/write benchmark has also been performed on JuiceFS, [EFS](https://aws.amazon.com/efs) and [S3FS](https://github.com/s3fs-fuse/s3fs-fuse) by [fio](https://github.com/axboe/fio).
+
+![Sequential Read Write Benchmark](docs/en/images/sequential-read-write-benchmark.svg)
+
+Above result figure shows that JuiceFS can provide 10X more throughput than the other two (see [more details](https://juicefs.com/docs/community/fio)).
+
+### Metadata IOPS
+
+A simple mdtest benchmark has been performed on JuiceFS, [EFS](https://aws.amazon.com/efs) and [S3FS](https://github.com/s3fs-fuse/s3fs-fuse) by [mdtest](https://github.com/hpc/ior).
+
+![Metadata Benchmark](docs/en/images/metadata-benchmark.svg)
+
+The result shows that JuiceFS can provide significantly more metadata IOPS than the other two (see [more details](https://juicefs.com/docs/community/mdtest)).
+
+### Analyze performance
+
+See [Real-Time Performance Monitoring](https://juicefs.com/docs/community/fault_diagnosis_and_analysis#performance-monitor) if you encountered performance issues.
+
+## Supported Object Storage
+
+- Amazon S3 _(and other S3 compatible Object Storage services)_
+- Google Cloud Storage
+- Azure Blob Storage
+- Alibaba Cloud Object Storage Service (OSS)
+- Tencent Cloud Object Storage (COS)
+- Qiniu Cloud Object Storage (Kodo)
+- QingStor Object Storage
+- Ceph RGW
+- MinIO
+- Local disk
+- Redis
+- ...
+
+JuiceFS supports numerous Object Storage services. [Learn more](https://juicefs.com/docs/community/how_to_setup_object_storage#supported-object-storage).
+
+## Who is using
+
+JuiceFS is production ready and used by thousands of machines in production. A list of users has been assembled and documented [here](https://juicefs.com/docs/community/adopters). In addition JuiceFS has several collaborative projects that integrate with other open source projects, which we have documented [here](https://juicefs.com/docs/community/integrations). If you are also using JuiceFS, please feel free to let us know, and you are welcome to share your specific experience with everyone.
+
+The storage format is stable, and will be supported by all future releases.
+
+## Roadmap
+
+- User and group quotas
+- Snapshots
+- Write once read many (WORM)
+
+## Reporting Issues
+
+We use [GitHub Issues](https://github.com/juicedata/juicefs/issues) to track community reported issues. You can also [contact](#community) the community for any questions.
+
+## Contributing
+
+Thank you for your contribution! Please refer to the [JuiceFS Contributing Guide](https://juicefs.com/docs/community/development/contributing_guide) for more information.
+
+## Community
+
+Welcome to join the [Discussions](https://github.com/juicedata/juicefs/discussions) and the [Slack channel](https://go.juicefs.com/slack) to connect with JuiceFS team members and other users.
+
+## Usage Tracking
+
+JuiceFS collects **anonymous** usage data by default to help us better understand how the community is using JuiceFS. Only core metrics (e.g. version number) will be reported, and user data and any other sensitive data will not be included. The related code can be viewed [here](pkg/usage/usage.go).
+
+You could also disable reporting easily by command line option `--no-usage-report`:
+
+```bash
+juicefs mount --no-usage-report
 ```
 
-默认使用 `ReadMode=full`，会读取每个 100 KiB 文件；若只想先验证元数据路径，可使用 `-ReadMode prefix`。测试固定关闭 BrewFS 数据缓存和预取，并要求 `drop_caches` 成功；结果不会把缓存命中当成冷读性能。`-KeepInstance` 可保留现场，`-NoCleanup` 禁止自动释放，完成后使用原 ECS runner 的 `-Action destroy` 清理。
+## License
 
-默认会用当前工作树的 WSL2 `Ubuntu-24.04` 环境本地编译；也可以用 `-SkipBuild -BinaryPath ... -FixtureBinaryPath ...` 传入已经编好的 Linux ELF。OSS bucket 必须事先存在，上传的对象使用唯一前缀，测试结束后不会删除用户 bucket。
+JuiceFS is open-sourced under Apache License 2.0, see [LICENSE](LICENSE).
 
-默认运行的对象和缓存约束：
+## Credits
 
-- 目录布局为 `10 x 10 x 10 x 1,000 = 1,000,000` 个 100 KiB 文件。
-- fixture 的 namespace、data rows 和 payload block 均发布到 OSS；挂载时没有元数据数据库，`packed-metadata-v1` 直接从 OSS manifest/index 对象读取。
-- 每个工具开始前卸载并重挂载 BrewFS，删除本地 cache root，执行 `sync; echo 3 >/proc/sys/vm/drop_caches`，失败就拒绝产出性能结果。
-- `read_memory_bytes=0`、`read_ssd_bytes=0`、prefetch 关闭、FUSE read direct-io 开启；结果明确是无缓存冷读。
-- `packed-tree` 只遍历并校验百万文件的目录树；`packed-smallfiles` 做百万文件完整扫描，`packed-posix` 做只读语义检查，`fio-seqread`/`fio-randread` 只读 `bench/read.bin`。目录扫描必须报告 `walk_errors`，不能让 `os.walk` 静默跳过目录。
+The design of JuiceFS was inspired by [Google File System](https://research.google/pubs/pub51), [HDFS](https://hadoop.apache.org) and [MooseFS](https://moosefs.com). Thanks for their great work!
 
-## ACK/Kubernetes 主流程
+## FAQ
 
-性能测试的推荐路径是本地构建镜像后交给 ACK 运行，避免在临时 ECS 上冷编译。`run_aliyun_perf_k8s.ps1` 使用 `Dockerfile.perf-local` 在本地 Docker builder 中构建 Linux BrewFS 镜像，推送到 GHCR（或其他可访问 registry），然后在已有 ACK 集群中创建 Redis/TiKV 依赖和特权 FUSE Job，并把 `/artifacts` 拷回本地。
+### Why doesn't JuiceFS support XXX Object Storage?
 
-```powershell
-$env:BREWFS_RESULTS_URL = 'https://results.example.com'
+JuiceFS supports many Object Storage services. Please check out [this list](https://juicefs.com/docs/community/how_to_setup_object_storage#supported-object-storage) first. If the Object Storage you want to use is compatible with S3, you could treat it as S3. Otherwise, try reporting any issue.
 
-.\docker\compose-xfstests\aliyun\run_aliyun_perf_k8s.ps1 `
-  -KubeconfigPath $env:KUBECONFIG `
-  -RegistryImage ghcr.io/ivanbeethoven/brewfs-perf `
-  -GhcrUsername Ivanbeethoven `
-  -GhcrToken $env:GHCR_TOKEN `
-  -Backend redis -DataBackend local-fs `
-  -ArtifactDirectory .\docker\compose-xfstests\artifacts\ack-redis
-```
+### Can I use Redis Cluster as metadata engine?
 
-测试完成后脚本会在本地输出两个结果：完整结果目录和同名 `.zip` 归档。设置 `BREWFS_RESULTS_URL` 后，脚本还会自动把同一个 ZIP POST 到网站；`-ResultVaultUrl` 可临时覆盖环境变量，未配置时只保存在本地。网站不可用时不会丢弃本地结果，只会发出警告。归档包含性能报告、原始日志、BrewFS 日志、后端诊断和性能统计，便于上传或脱离集群查看（xfstests/LTP runner 的 artifacts 也使用同样的目录结构）。脚本会在容器中先生成单个 `tar.gz` 再下载，避免逐文件复制时出现 `unexpected EOF`。
+Yes. Since [v1.0.0 Beta3](https://github.com/juicedata/juicefs/releases/tag/v1.0.0-beta3) JuiceFS supports the use of [Redis Cluster](https://redis.io/docs/manual/scaling) as the metadata engine, but it should be noted that Redis Cluster requires that the keys of all operations in a transaction must be in the same hash slot, so a JuiceFS file system can only use one hash slot.
 
-默认情况下，无论测试成功还是失败，runner 都会清理本轮带有 `app.kubernetes.io/managed-by=brewfs-perf-runner` 标签的 Job、Redis/TiKV、RustFS、ConfigMap 和镜像拉取 Secret，避免共享 ACK 集群上留下持续占用节点的资源。需要保留现场或手工导出时使用 `-KeepJob`；之后通过 `-Action destroy` 清理。
+See ["Redis Best Practices"](https://juicefs.com/docs/community/redis_best_practices) for more information.
 
-若希望在测试进行时从另一终端手动导出，保留 Job 并延长结果保留窗口：
+### What's the difference between JuiceFS and XXX?
 
-```powershell
-$tag = 'aliyun-20260904-redis'
-.\docker\compose-xfstests\aliyun\run_aliyun_perf_k8s.ps1 `
-  -KubeconfigPath $env:KUBECONFIG -ImageTag $tag -Backend redis `
-  -KeepJob -ArtifactHoldSeconds 1800
+See ["Comparison with Others"](https://juicefs.com/docs/community/comparison/juicefs_vs_alluxio) for more information.
 
-.\docker\compose-xfstests\aliyun\run_aliyun_perf_k8s.ps1 `
-  -Action export -JobName "brewfs-perf-$tag" `
-  -KubeconfigPath $env:KUBECONFIG -ArtifactDirectory .\artifacts\manual
-```
+For more FAQs, please see the [full list](https://juicefs.com/docs/community/faq).
 
-`-Action export` 只能在 Pod 仍处于 Running 且 `perf.complete` 已出现的 hold 窗口内执行；默认 `emptyDir` 随 Pod 结束而消失。因此正常使用应直接等待 `-Action test` 自动导出。若需要测试结束后仍可导出，应为 Job 改用持久化卷（后续可增加 `-ArtifactPvc` 参数）。不带 `-KeepJob` 时，自动导出完成后会立即清理测试资源，不再等待 hold 窗口。
+## Stargazers over time
 
-ACK 集群本身可使用 `operator/brewfs-operator/scripts/ack-e2e.ps1` 创建/销毁；K8s runner 不创建 VPC、节点或账号级网络资源。`run_aliyun_perf.ps1` 保留为 ECS/Cloud Assistant fallback，适合没有 ACK 集群的故障诊断，不是主性能测试路径。
-
-## 前置条件
-
-- Aliyun CLI 已配置，并具备 ECS、VPC 查询、RunCommand 权限。
-- 目标地域已有可用的 VPC vSwitch 和安全组；脚本不会自动创建或删除账号网络资源。
-- ECS 镜像内置 Cloud Assistant Agent，且能访问软件源和 GitHub/GHCR。
-- 目标镜像在该地域可用。百万级入口默认使用 `ubuntu_24_04_x64_20G_alibase_20260916.vhd`，可用 `ecs DescribeImages` 查询并通过 `-ImageId` 覆盖；通用 runner 仍可单独传入 `-ImageId`。
-
-## 原生 ECS 使用方式
-
-```powershell
-# 本地编译二进制，上传 OSS，ECS 直接连接 Aliyun OSS/S3，结束后自动释放 ECS
-.\docker\compose-xfstests\aliyun\run_aliyun_perf.ps1 `
-  -Action run `
-  -VSwitchId vsw-xxxxxxxx `
-  -SecurityGroupId sg-xxxxxxxx `
-  -S3Bucket my-brewfs-test-bucket `
-  -S3Region cn-hangzhou `
-  -S3Endpoint https://oss-cn-hangzhou.aliyuncs.com
-
-# 先创建 ECS，手动检查后再运行；不需要 Docker
-.\docker\compose-xfstests\aliyun\run_aliyun_perf.ps1 `
-  -Action create -VSwitchId vsw-xxxxxxxx -SecurityGroupId sg-xxxxxxxx
-.\docker\compose-xfstests\aliyun\run_aliyun_perf.ps1 `
-  -Action run -InstanceId i-xxxxxxxx -S3Bucket my-brewfs-test-bucket -KeepInstance
-
-# 单独创建、查看和销毁
-.\docker\compose-xfstests\aliyun\run_aliyun_perf.ps1 -Action create `
-  -VSwitchId vsw-xxxxxxxx -SecurityGroupId sg-xxxxxxxx
-.\docker\compose-xfstests\aliyun\run_aliyun_perf.ps1 -Action status `
-  -InstanceId i-xxxxxxxx -RegionId ap-northeast-2
-.\docker\compose-xfstests\aliyun\run_aliyun_perf.ps1 -Action destroy `
-  -InstanceId i-xxxxxxxx -RegionId ap-northeast-2
-```
-
-## 参数
-
-| ECS 脚本参数 | Compose 等价行为 |
-| --- | --- |
-| `-S3Bucket` | Aliyun OSS bucket，必须预先创建 |
-| `-S3Endpoint` | 默认为 `https://oss-$S3Region.aliyuncs.com` |
-| `-S3AccessKey/-S3SecretKey` | 默认读取本机 Aliyun CLI 当前 AK profile；也可显式覆盖 |
-| `-SkipBuild -BinaryPath -FixtureBinaryPath` | 跳过 WSL 编译，使用已有 Linux ELF |
-| `-PerfTools` | `packed-tree`、`packed-smallfiles`、`packed-posix`、`fio-seqread`、`fio-randread` 的子集 |
-| `-PackedSkipFixture -PackedExistingManifestKey` | 诊断时复用已有 packed manifest，跳过百万 fixture 发布；仅用于已确认 manifest 的复核 |
-| `-KeepInstance` | 测试后保留 ECS，便于检查远端日志 |
-
-默认 ECS 为按量付费，并设置八小时自动释放时间；`run` 结束后还会主动释放实例，除非指定 `-KeepInstance` 或 `-NoCleanup`。脚本不会删除快照、VPC、vSwitch、安全组或 OSS bucket。创建后会在实例内校验内存至少 30,000,000 KiB、工作盘至少 90,000,000,000 字节，并把实际值写入 `aliyun-resource-proof.env`。远端结果摘要保存在 `-ArtifactDirectory` 指定目录的 `remote-output.log`。
+[![Star History Chart](https://api.star-history.com/svg?repos=juicedata/juicefs&type=Date)](https://star-history.com/#juicedata/juicefs&Date)
