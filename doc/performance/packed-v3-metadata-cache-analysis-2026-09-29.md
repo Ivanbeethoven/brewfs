@@ -156,3 +156,33 @@ packed 即使把索引页常驻内存，冷读仍要承担 OSS range RTT 和每�
 2. 完整 payload 扫描必须另外报告 frame/window GET 数和 overscan；
 3. 只有远端 KV RTT 明显高、packed metadata 真正 warm、并且 group window/并发读取
    合并了相邻 payload 时，二进制格式的理论优势才会传导到端到端吞吐。
+
+## 本轮候选（coordinator batching delay，2026-09-30）
+
+### 假设
+
+`SharedGroupReadCoordinator` 原来在每次收到 pending read 后固定等待 1 ms，给相邻
+FUSE 请求留下合并机会。对单文件冷读或低并发随机扫描，如果没有第二个请求，这个等待
+不会产生任何 range 合并收益，却直接增加每个读请求的端到端延迟。将收集窗口缩短到
+250 us 应保留同一调度 tick 内的合并能力，同时减少无合并收益的固定等待。
+
+### 变更与边界
+
+变更仅在 `src/workspace_overlay/packed_v3/coordinator.rs`，不改变 range planner、
+digest/CRC/长度/边界校验、共享 byte/range budget 或窗口 cache。新增单元回归固定该
+收集窗口小于 1 ms；没有 benchmark-only 分支，也没有改变 strict-cold 的对象布局。
+
+### 验证记录
+
+本候选尚未获得端到端性能验收数字。目标实验应使用已有的 10k/100k OSS fixture，
+保持 `BREWFS_PACKED_FRAME_WINDOW_CACHE_BYTES=0`、payload memory/SSD cache 为 0、
+metadata cache/prefetch 设置与匹配基线一致，并在 `sync; echo 3 >/proc/sys/vm/drop_caches`
+后分别运行 packed 与 JuiceFS；报告 FUSE active bandwidth、request/GET 数、对象放大和
+`effective_active_plus_drain_bw_mib_s`。现有匹配参考证据为：
+
+* packed：`docker/compose-xfstests/artifacts/aliyun-packed-v3-vs-juicefs-100k-20260928-r3/`
+* JuiceFS：同一目录下的 `juicefs/` strict-cold 结果
+
+本地 focused test 因当前环境无法解析 `static.crates.io`、缺少 `asyncfuse 0.1.12`
+下载而未运行完成；因此本候选不能被写入 README 性能表或宣称已击败 JuiceFS，待网络
+恢复后必须先通过完整 CI gate，再进行 matched compose 对照。

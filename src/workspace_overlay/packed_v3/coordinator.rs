@@ -14,6 +14,8 @@ use super::layout::AccessProfile;
 use super::remote::RemotePackedObject;
 use super::{PackedFrameDescriptor, PackedResult, PackedWireError, SizeClass};
 
+const COALESCE_DELAY: Duration = Duration::from_micros(250);
+
 /// Limits applied before any remote range request is started.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CoordinatorLimits {
@@ -197,7 +199,7 @@ async fn shared_coordinator_worker<B>(
             continue;
         }
         drop(notified);
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::sleep(COALESCE_DELAY).await;
         let batch = {
             let mut pending = state.pending.lock().await;
             std::mem::take(&mut *pending)
@@ -558,6 +560,11 @@ async fn read_coalesced_frames_with_budget<B: crate::cadapter::client::ObjectBac
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coalescing_delay_stays_below_one_millisecond() {
+        assert!(COALESCE_DELAY < Duration::from_millis(1));
+    }
 
     fn request(ordinal: u32, offset: u64, size_class: SizeClass) -> FrameReadRequest {
         let raw = [ordinal as u8; 1024];
