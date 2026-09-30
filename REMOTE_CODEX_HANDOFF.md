@@ -196,14 +196,14 @@ previous matched 10k/100k references remain the only performance evidence.
 Review before staging:
 
 ```text
-ssh brewfs-frp-sea "wsl.exe -d Ubuntu-24.04 -- /usr/bin/git -C /home/hxy/brewfs diff -- src/workspace_overlay/packed_v3/coordinator.rs doc/performance/packed-v3-metadata-cache-analysis-2026-09-29.md REMOTE_CODEX_HANDOFF.md"
+ssh brewfs-frp-sea "wsl.exe -d Ubuntu-24.04 -- /usr/bin/git -C /home/hxy/brewfs diff -- src/main.rs src/workspace_overlay/packed_v3/metrics.rs src/workspace_overlay/packed_v3/remote.rs src/workspace_overlay/packed_v3/coordinator.rs src/workspace_overlay/packed_v3/catalog.rs docker/compose-xfstests/aliyun/run_aliyun_perf.ps1 doc/performance/packed-v3-metadata-cache-analysis-2026-09-29.md REMOTE_CODEX_HANDOFF.md"
 ssh brewfs-frp-sea "wsl.exe -d Ubuntu-24.04 -- /usr/bin/git -C /home/hxy/brewfs status --short --branch"
 ```
 
 After review and any matched benchmark:
 
 ```text
-ssh brewfs-frp-sea "wsl.exe -d Ubuntu-24.04 -- bash -lc 'cd /home/hxy/brewfs && git add src/workspace_overlay/packed_v3/coordinator.rs doc/performance/packed-v3-metadata-cache-analysis-2026-09-29.md REMOTE_CODEX_HANDOFF.md && git commit -m \"perf: shorten packed read coalescing window\" && git push origin codex/packed-metadata-aliyun-20260930'"
+ssh brewfs-frp-sea "wsl.exe -d Ubuntu-24.04 -- bash -lc 'cd /home/hxy/brewfs && git add src/main.rs src/workspace_overlay/packed_v3/metrics.rs src/workspace_overlay/packed_v3/remote.rs src/workspace_overlay/packed_v3/coordinator.rs src/workspace_overlay/packed_v3/catalog.rs docker/compose-xfstests/aliyun/run_aliyun_perf.ps1 doc/performance/packed-v3-metadata-cache-analysis-2026-09-29.md REMOTE_CODEX_HANDOFF.md && git commit -m \"perf: stream packed frame ranges and record runtime metrics\" && git push origin codex/packed-metadata-aliyun-20260930'"
 ```
 
 Do not use destructive reset/checkout commands. At closeout, leave a coherent
