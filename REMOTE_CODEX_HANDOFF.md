@@ -12,6 +12,7 @@ Codex bearer value. Credentials remain only in the target user profiles.
 - WSL user: `hxy`
 - Repository: `/home/hxy/brewfs`
 - Branch: `codex/packed-metadata-aliyun-20260930`
+- Latest implementation commit: `7d97082` (`perf: stream packed frame ranges and record runtime metrics`)
 - Current remote HEAD before the candidate: `2e10947` (`docs-remote-codex-handoff`)
 - Git remotes: `origin=https://github.com/Ivanbeethoven/brewfs.git`,
   `upstream=https://github.com/brewfs/brewfs.git`
