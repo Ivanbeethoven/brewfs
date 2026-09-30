@@ -389,6 +389,26 @@ if files != expected_files or directories != expected_tree_dirs or leaf_dirs != 
 PY
 }
 
+scan_stat() {
+    local profile="$1"
+    local log_suffix="${2:-stat}"
+    local scanner="${JFS_SMALLFILES_SCANNER:-}"
+    [[ -n "$scanner" && -x "$scanner" ]] || die "JFS_SMALLFILES_SCANNER must point to tools/perf/smallfiles_scan.py"
+    "$scanner" \
+        --root "$MOUNT_DIR" \
+        --label juicefs-stat \
+        --mode stat \
+        --expected-files "$JFS_SMALLFILE_COUNT" \
+        --min-size "$SMALLFILE_MIN_SIZE" \
+        --max-size "$SMALLFILE_MAX_SIZE" \
+        --dir-levels "$JFS_DIR_LEVELS" \
+        --dirs-per-level "$JFS_DIRS_PER_LEVEL" \
+        --files-per-leaf "$JFS_FILES_PER_DIR" \
+        --workers "$SMALLFILE_WORKERS" \
+        --json-output "$ARTIFACT_DIR/scan-${profile}-${log_suffix}.json" \
+        >"$ARTIFACT_DIR/scan-${profile}-${log_suffix}.log" 2>&1
+}
+
 run_tool_profile() {
     local profile="$1"
     local tool="$2"
@@ -407,6 +427,7 @@ run_tool_profile() {
     start_ns="$(date +%s%N)"
     case "$tool" in
         juicefs-tree) scan_tree "$profile" tree || status=$? ;;
+        juicefs-stat) scan_stat "$profile" stat || status=$? ;;
         juicefs-smallfiles) scan_smallfiles "$profile" smallfiles || status=$? ;;
         *) die "unsupported JuiceFS tool: $tool" ;;
     esac

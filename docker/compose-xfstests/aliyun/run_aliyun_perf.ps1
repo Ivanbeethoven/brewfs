@@ -37,6 +37,9 @@ param(
     [UInt64]$ReadSsdBytes = 0,
     [UInt64]$PackedFrameWindowCacheBytes = 0,
     [bool]$PackedFrameWindowPrefetch = $false,
+    [UInt64]$PackedMetadataCacheBytes = 268435456,
+    [ValidateSet('off', 'auto', 'eager')]
+    [string]$PackedMetadataPrefetch = 'auto',
     [bool]$PrefetchEnabled = $false,
     [UInt64]$PrefetchMaxBytes = 8388608,
     [int]$PrefetchConcurrency = 7,
@@ -55,6 +58,7 @@ param(
     [string]$WslDistribution = 'Ubuntu-24.04',
     [string]$BinaryPath,
     [string]$FixtureBinaryPath,
+    [string]$ScannerPath,
     [switch]$SkipBuild,
     [string]$ArtifactDirectory,
     [string]$ObjectPrefix,
@@ -268,7 +272,7 @@ function New-EcsInstance {
     } 'ECS 启动' 900
 }
 
-function Get-RemoteCommand([string]$BinaryUrl, [string]$FixtureUrl, [string]$RunnerUrl, [string]$CredentialUrl) {
+function Get-RemoteCommand([string]$BinaryUrl, [string]$FixtureUrl, [string]$RunnerUrl, [string]$ScannerUrl, [string]$CredentialUrl) {
     $fixtureName = switch ($VolumeFormat) {
         'packed-metadata-v2' { 'packed_v2_snapshot_fixture'; break }
         'packed-metadata-v3' { 'packed_v3_snapshot_fixture'; break }
@@ -295,7 +299,8 @@ modprobe fuse 2>/dev/null || true
 curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/brewfs" __BINARY_URL__
 curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/__FIXTURE_FILE_NAME__" __FIXTURE_URL__
 curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/run_packed_native.sh" __RUNNER_URL__
-chmod 0755 "$WORK/brewfs" "$WORK/__FIXTURE_FILE_NAME__" "$WORK/run_packed_native.sh"
+curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/smallfiles_scan.py" __SCANNER_URL__
+chmod 0755 "$WORK/brewfs" "$WORK/__FIXTURE_FILE_NAME__" "$WORK/run_packed_native.sh" "$WORK/smallfiles_scan.py"
 
 curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/s3-credentials.env" __CREDENTIAL_URL__
 chmod 0600 "$WORK/s3-credentials.env"
@@ -308,6 +313,7 @@ export BREWFS_S3_REGION=__S3_REGION__
 export BREWFS_S3_FORCE_PATH_STYLE=__S3_FORCE_PATH_STYLE__
 export BREWFS_BIN="$WORK/brewfs"
 export PACKED_FIXTURE_BIN="$WORK/__FIXTURE_FILE_NAME__"
+export PACKED_SMALLFILES_SCANNER="$WORK/smallfiles_scan.py"
 export PACKED_VOLUME_FORMAT=__VOLUME_FORMAT__
 export BREWFS_NATIVE_WORK="$WORK"
 export BREWFS_NATIVE_ARTIFACT_DIR="$ARTIFACT_DIR"
@@ -331,6 +337,8 @@ export BREWFS_READ_MEMORY_BYTES=__READ_MEMORY_BYTES__
 export BREWFS_READ_SSD_BYTES=__READ_SSD_BYTES__
 export BREWFS_PACKED_FRAME_WINDOW_CACHE_BYTES=__PACKED_FRAME_WINDOW_CACHE_BYTES__
 export BREWFS_PACKED_FRAME_WINDOW_PREFETCH=__PACKED_FRAME_WINDOW_PREFETCH__
+export BREWFS_PACKED_METADATA_CACHE_BYTES=__PACKED_METADATA_CACHE_BYTES__
+export BREWFS_PACKED_METADATA_PREFETCH=__PACKED_METADATA_PREFETCH__
 export BREWFS_PREFETCH_ENABLED=__PREFETCH_ENABLED__
 export BREWFS_PREFETCH_MAX_BYTES=__PREFETCH_MAX_BYTES__
 export BREWFS_PREFETCH_CONCURRENCY=__PREFETCH_CONCURRENCY__
@@ -389,6 +397,7 @@ done
         '__BINARY_URL__' = Quote-Bash $BinaryUrl
         '__FIXTURE_URL__' = Quote-Bash $FixtureUrl
         '__RUNNER_URL__' = Quote-Bash $RunnerUrl
+        '__SCANNER_URL__' = Quote-Bash $ScannerUrl
         '__CREDENTIAL_URL__' = Quote-Bash $CredentialUrl
         '__FIXTURE_FILE_NAME__' = $fixtureName
         '__VOLUME_FORMAT__' = Quote-Bash $VolumeFormat
@@ -414,6 +423,8 @@ done
         '__READ_SSD_BYTES__' = Quote-Bash ([string]$ReadSsdBytes)
         '__PACKED_FRAME_WINDOW_CACHE_BYTES__' = Quote-Bash ([string]$PackedFrameWindowCacheBytes)
         '__PACKED_FRAME_WINDOW_PREFETCH__' = Quote-Bash ($PackedFrameWindowPrefetch.ToString().ToLowerInvariant())
+        '__PACKED_METADATA_CACHE_BYTES__' = Quote-Bash ([string]$PackedMetadataCacheBytes)
+        '__PACKED_METADATA_PREFETCH__' = Quote-Bash $PackedMetadataPrefetch
         '__PREFETCH_ENABLED__' = Quote-Bash ($PrefetchEnabled.ToString().ToLowerInvariant())
         '__PREFETCH_MAX_BYTES__' = Quote-Bash ([string]$PrefetchMaxBytes)
         '__PREFETCH_CONCURRENCY__' = Quote-Bash ([string]$PrefetchConcurrency)
@@ -432,7 +443,7 @@ function Invoke-PerfOnEcs {
     $artifact = if ($ArtifactDirectory) { $ArtifactDirectory } else { Join-Path $PSScriptRoot '..\artifacts\aliyun-native' }
     New-Item -ItemType Directory -Force -Path $artifact | Out-Null
     $script:RunArtifactDirectory = (Resolve-Path -LiteralPath $artifact).Path
-    $commandText = Get-RemoteCommand $script:BinaryUrl $script:FixtureUrl $script:RunnerUrl $script:CredentialUrl
+    $commandText = Get-RemoteCommand $script:BinaryUrl $script:FixtureUrl $script:RunnerUrl $script:ScannerUrl $script:CredentialUrl
     $content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($commandText))
     $run = Invoke-AliyunJson @(
         'ecs', 'RunCommand', '--region', $RegionId, '--Type', 'RunShellScript',
@@ -522,6 +533,13 @@ try {
     $script:FixturePrefix = "$ObjectPrefix/fixture"
 
     Build-LocalBinaries
+    if (-not $ScannerPath) {
+        $ScannerPath = Join-Path (Get-LocalRepoRoot) 'tools\perf\smallfiles_scan.py'
+    }
+    if (-not (Test-Path -LiteralPath $ScannerPath)) {
+        throw "找不到共享 small-file scanner: $ScannerPath"
+    }
+    $ScannerPath = (Resolve-Path -LiteralPath $ScannerPath).Path
     Publish-OssObject $BinaryPath "$ObjectPrefix/bin/brewfs"
     $fixtureName = switch ($VolumeFormat) {
         'packed-metadata-v2' { 'packed_v2_snapshot_fixture'; break }
@@ -531,11 +549,13 @@ try {
     Publish-OssObject $FixtureBinaryPath "$ObjectPrefix/bin/$fixtureName"
     $nativeScriptPath = Join-Path $PSScriptRoot 'run_aliyun_packed_native.sh'
     Publish-OssObject $nativeScriptPath "$ObjectPrefix/bin/run_aliyun_packed_native.sh"
+    Publish-OssObject $ScannerPath "$ObjectPrefix/bin/smallfiles_scan.py"
     $credentialKey = "$ObjectPrefix/bootstrap/s3-credentials.env"
     Publish-CredentialBundle $credentialKey
     $script:BinaryUrl = Get-OssSignedUrl "$ObjectPrefix/bin/brewfs"
     $script:FixtureUrl = Get-OssSignedUrl "$ObjectPrefix/bin/$fixtureName"
     $script:RunnerUrl = Get-OssSignedUrl "$ObjectPrefix/bin/run_aliyun_packed_native.sh"
+    $script:ScannerUrl = Get-OssSignedUrl "$ObjectPrefix/bin/smallfiles_scan.py"
     $script:CredentialUrl = Get-OssSignedUrl $credentialKey 28800
 
     if (-not $InstanceId) { New-EcsInstance } else { $script:InstanceId = $InstanceId }

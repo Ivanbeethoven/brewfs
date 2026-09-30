@@ -30,6 +30,9 @@ param(
     [int]$FioRuntimeSeconds = 20,
     [UInt64]$PackedFrameWindowCacheBytes = 0,
     [bool]$PackedFrameWindowPrefetch = $false,
+    [UInt64]$PackedMetadataCacheBytes = 268435456,
+    [ValidateSet('off', 'auto', 'eager')]
+    [string]$PackedMetadataPrefetch = 'auto',
     [ValidateRange(30, 7200)]
     [int]$ToolTimeoutSeconds = 900,
     [string]$PackedExistingManifestKey,
@@ -97,6 +100,8 @@ $runnerParams = @{
     FioRuntimeSeconds = $FioRuntimeSeconds
     PackedFrameWindowCacheBytes = $PackedFrameWindowCacheBytes
     PackedFrameWindowPrefetch = $PackedFrameWindowPrefetch
+    PackedMetadataCacheBytes = $PackedMetadataCacheBytes
+    PackedMetadataPrefetch = $PackedMetadataPrefetch
     ToolTimeoutSeconds = $ToolTimeoutSeconds
     PackedSmallFileCount = $SmallFileCount
     PackedSmallFileSizeBytes = $SmallFileSizeBytes
@@ -141,6 +146,8 @@ $runnerArgs = @(
     '-PerfTools', $PerfTools,
     '-FioRuntimeSeconds', [string]$FioRuntimeSeconds,
     '-PackedFrameWindowCacheBytes', [string]$PackedFrameWindowCacheBytes,
+    '-PackedMetadataCacheBytes', [string]$PackedMetadataCacheBytes,
+    '-PackedMetadataPrefetch', $PackedMetadataPrefetch,
     '-ToolTimeoutSeconds', [string]$ToolTimeoutSeconds,
     '-PackedSmallFileCount', [string]$SmallFileCount,
     '-PackedSmallFileSizeBytes', [string]$SmallFileSizeBytes,

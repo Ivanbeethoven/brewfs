@@ -45,7 +45,7 @@ usage() {
   -h, --help                 显示帮助
 
 支持的 PERF_TOOLS:
-  fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw fio dirstress dirperf smallfiles-read metaperf looptest stress-ng
+  fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw fio dirstress dirperf smallfiles-read smallfiles-stat metaperf looptest stress-ng
 
 可通过环境变量覆盖各工具参数:
   PERF_DIRSTRESS_ARGS PERF_DIRPERF_ARGS PERF_METAPERF_ARGS PERF_LOOPTEST_ARGS
@@ -264,6 +264,8 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e PERF_SMALLFILE_FILES_PER_DIR \
     -e PERF_SMALLFILE_SIZE \
     -e PERF_SMALLFILE_COLD_READ \
+    -e PERF_SMALLFILE_STAT_ONLY \
+    -e PERF_SMALLFILE_WORKERS \
     -e PERF_METAPERF_ARGS \
     -e PERF_LOOPTEST_ARGS \
     -e PERF_DIRSTRESS_PROCS \
@@ -391,6 +393,9 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e JFS_PREFETCH \
     -e JFS_OPEN_CACHE \
     -e JFS_OPEN_CACHE_LIMIT \
+    -e JFS_ATTR_CACHE \
+    -e JFS_ENTRY_CACHE \
+    -e JFS_DIR_ENTRY_CACHE \
     -e JFS_BACKUP_META \
     -e JFS_NO_USAGE_REPORT \
     -e JFS_CACHE_DIR \

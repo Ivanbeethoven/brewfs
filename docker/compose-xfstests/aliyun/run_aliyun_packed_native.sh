@@ -16,6 +16,7 @@ die() { log "ERROR: $*" >&2; exit 1; }
 : "${PACKED_DIR_LEVELS:?PACKED_DIR_LEVELS is required}"
 : "${PACKED_DIRS_PER_LEVEL:?PACKED_DIRS_PER_LEVEL is required}"
 : "${PACKED_FILES_PER_DIR:?PACKED_FILES_PER_DIR is required}"
+: "${PACKED_SMALLFILES_SCANNER:?PACKED_SMALLFILES_SCANNER is required}"
 
 WORK="${BREWFS_NATIVE_WORK:-/opt/brewfs-native}"
 ARTIFACT_DIR="${BREWFS_NATIVE_ARTIFACT_DIR:-$WORK/artifacts}"
@@ -39,6 +40,8 @@ PREFETCH_ENABLED="${BREWFS_PREFETCH_ENABLED:-false}"
 PREFETCH_MAX_BYTES="${BREWFS_PREFETCH_MAX_BYTES:-8388608}"
 PREFETCH_CONCURRENCY="${BREWFS_PREFETCH_CONCURRENCY:-7}"
 RANGE_BACKGROUND_PREFETCH="${BREWFS_RANGE_BACKGROUND_PREFETCH:-false}"
+PACKED_METADATA_CACHE_BYTES="${BREWFS_PACKED_METADATA_CACHE_BYTES:-268435456}"
+PACKED_METADATA_PREFETCH="${BREWFS_PACKED_METADATA_PREFETCH:-auto}"
 TOOL_TIMEOUT_SECONDS="${PERF_TOOL_TIMEOUT_SECONDS:-900}"
 
 case "$PACKED_VOLUME_FORMAT" in
@@ -61,7 +64,7 @@ case "$PACKED_VOLUME_FORMAT" in
 esac
 
 mkdir -p "$WORK" "$ARTIFACT_DIR/tools" "$MOUNT_DIR"
-chmod 0755 "$BREWFS_BIN" "$PACKED_FIXTURE_BIN"
+chmod 0755 "$BREWFS_BIN" "$PACKED_FIXTURE_BIN" "$PACKED_SMALLFILES_SCANNER"
 
 BREWFS_PID=""
 stop_mount() {
@@ -158,6 +161,18 @@ run_tool() {
     stop_mount
     rm -rf -- "$CACHE_ROOT"
     drop_caches || die "drop_caches failed before $name; refusing to report a cached read"
+    cat >"$ARTIFACT_DIR/tools/${name}-profile.env" <<EOF
+profile=$name
+payload_memory_bytes=$READ_MEMORY_BYTES
+payload_ssd_bytes=$READ_SSD_BYTES
+metadata_cache_bytes=$PACKED_METADATA_CACHE_BYTES
+metadata_prefetch=$PACKED_METADATA_PREFETCH
+frame_window_cache_bytes=${BREWFS_PACKED_FRAME_WINDOW_CACHE_BYTES:-0}
+frame_window_prefetch=${BREWFS_PACKED_FRAME_WINDOW_PREFETCH:-false}
+range_background_prefetch=$RANGE_BACKGROUND_PREFETCH
+workers=$SMALLFILE_WORKERS
+page_cache=dropped
+EOF
     start_mount || die "BrewFS mount failed before $name"
     start_ns="$(date +%s%N)"
     "$@" >"$log_path" 2>&1 &
@@ -374,6 +389,23 @@ if files != expected_files or directories != expected_tree_dirs or leaf_dirs != 
 PY
 }
 
+run_shared_smallfiles_scan() {
+    local mode="$1"
+    local label="$2"
+    python3 "$PACKED_SMALLFILES_SCANNER" \
+        --root "$MOUNT_DIR" \
+        --label "$label" \
+        --mode "$mode" \
+        --expected-files "$PACKED_SMALLFILE_COUNT" \
+        --min-size "$SMALLFILE_MIN_SIZE" \
+        --max-size "$SMALLFILE_MAX_SIZE" \
+        --dir-levels "$PACKED_DIR_LEVELS" \
+        --dirs-per-level "$PACKED_DIRS_PER_LEVEL" \
+        --files-per-leaf "$PACKED_FILES_PER_DIR" \
+        --workers "$SMALLFILE_WORKERS" \
+        --json-output "$ARTIFACT_DIR/tools/${label}-summary.json"
+}
+
 packed_posix_scan() {
     python3 - "$MOUNT_DIR" "$SMALLFILE_MIN_SIZE" "$SMALLFILE_MAX_SIZE" "$FIO_FILE_SIZE" "$PACKED_FILES_PER_DIR" "$PACKED_DIR_LEVELS" <<'PY'
 import os
@@ -451,8 +483,9 @@ fi
 status=0
 for tool in $TOOLS; do
     case "$tool" in
-        packed-smallfiles) run_tool "$tool" packed_smallfiles_scan || status=1 ;;
-        packed-tree) run_tool "$tool" packed_tree_scan || status=1 ;;
+        packed-smallfiles) run_tool "$tool" run_shared_smallfiles_scan full packed-smallfiles || status=1 ;;
+        packed-stat) run_tool "$tool" run_shared_smallfiles_scan stat packed-stat || status=1 ;;
+        packed-tree) run_tool "$tool" run_shared_smallfiles_scan tree packed-tree || status=1 ;;
         packed-posix) run_tool "$tool" packed_posix_scan || status=1 ;;
         fio-seqread) run_tool "$tool" fio_read read || status=1 ;;
         fio-randread) run_tool "$tool" fio_read randread || status=1 ;;

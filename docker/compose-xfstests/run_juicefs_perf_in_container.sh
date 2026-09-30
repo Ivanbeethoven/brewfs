@@ -30,6 +30,9 @@ jfs_max_readahead_mib="${JFS_MAX_READAHEAD_MIB:-}"
 jfs_prefetch="${JFS_PREFETCH:-}"
 jfs_open_cache="${JFS_OPEN_CACHE:-}"
 jfs_open_cache_limit="${JFS_OPEN_CACHE_LIMIT:-}"
+jfs_attr_cache="${JFS_ATTR_CACHE:-}"
+jfs_entry_cache="${JFS_ENTRY_CACHE:-}"
+jfs_dir_entry_cache="${JFS_DIR_ENTRY_CACHE:-}"
 jfs_backup_meta="${JFS_BACKUP_META:-}"
 jfs_no_usage_report="${JFS_NO_USAGE_REPORT:-false}"
 jfs_cache_dir="${JFS_CACHE_DIR:-}"
@@ -104,6 +107,9 @@ JFS_MAX_READAHEAD_MIB=${jfs_max_readahead_mib}
 JFS_PREFETCH=${jfs_prefetch}
 JFS_OPEN_CACHE=${jfs_open_cache}
 JFS_OPEN_CACHE_LIMIT=${jfs_open_cache_limit}
+JFS_ATTR_CACHE=${jfs_attr_cache}
+JFS_ENTRY_CACHE=${jfs_entry_cache}
+JFS_DIR_ENTRY_CACHE=${jfs_dir_entry_cache}
 JFS_BACKUP_META=${jfs_backup_meta}
 JFS_NO_USAGE_REPORT=${jfs_no_usage_report}
 JFS_CACHE_DIR=${jfs_cache_dir}
@@ -139,6 +145,9 @@ JFS_MAX_READAHEAD_MIB=${jfs_max_readahead_mib}
 JFS_PREFETCH=${jfs_prefetch}
 JFS_OPEN_CACHE=${jfs_open_cache}
 JFS_OPEN_CACHE_LIMIT=${jfs_open_cache_limit}
+JFS_ATTR_CACHE=${jfs_attr_cache}
+JFS_ENTRY_CACHE=${jfs_entry_cache}
+JFS_DIR_ENTRY_CACHE=${jfs_dir_entry_cache}
 JFS_BACKUP_META=${jfs_backup_meta}
 JFS_NO_USAGE_REPORT=${jfs_no_usage_report}
 JFS_CACHE_DIR=${jfs_cache_dir}
@@ -323,6 +332,9 @@ mount_juicefs() {
     [[ -n "$jfs_prefetch" ]] && mount_args+=(--prefetch="$jfs_prefetch")
     [[ -n "$jfs_open_cache" ]] && mount_args+=(--open-cache="$jfs_open_cache")
     [[ -n "$jfs_open_cache_limit" ]] && mount_args+=(--open-cache-limit="$jfs_open_cache_limit")
+    [[ -n "$jfs_attr_cache" ]] && mount_args+=(--attr-cache="$jfs_attr_cache")
+    [[ -n "$jfs_entry_cache" ]] && mount_args+=(--entry-cache="$jfs_entry_cache")
+    [[ -n "$jfs_dir_entry_cache" ]] && mount_args+=(--dir-entry-cache="$jfs_dir_entry_cache")
     [[ -n "$jfs_backup_meta" ]] && mount_args+=(--backup-meta="$jfs_backup_meta")
     [[ -n "$jfs_cache_dir" ]] && mount_args+=(--cache-dir="$jfs_cache_dir")
     if truthy "$jfs_no_usage_report"; then
@@ -591,6 +603,7 @@ run_smallfiles_read() {
     local dirs="${PERF_SMALLFILE_DIRS:-8}"
     local files_per_dir="${PERF_SMALLFILE_FILES_PER_DIR:-4500}"
     local file_size="${PERF_SMALLFILE_SIZE:-4096}"
+    local stat_only="${PERF_SMALLFILE_STAT_ONLY:-false}"
     local prep_log="$artifact_dir/tools/smallfiles-read-prepare.log"
     local expected=$((dirs * files_per_dir))
 
@@ -623,6 +636,22 @@ PY
         PERF_FIO_COLD_READ=true PERF_FIO_COLD_READ_CLEAR_CACHE=true clear_juicefs_cache_if_requested
         PERF_FIO_COLD_READ_DROP_CACHES=true drop_kernel_page_cache_if_requested
         mount_juicefs
+    fi
+
+    if truthy "$stat_only" && [[ -x /usr/local/bin/smallfiles_scan.py ]]; then
+        run_logged_tool smallfiles-stat /usr/local/bin/smallfiles_scan.py \
+            --root "$root" \
+            --label "juicefs-${meta_url%%:*}-stat" \
+            --mode stat \
+            --expected-files "$expected" \
+            --min-size "$file_size" \
+            --max-size "$file_size" \
+            --dir-levels 1 \
+            --dirs-per-level "$dirs" \
+            --files-per-leaf "$files_per_dir" \
+            --workers "${PERF_SMALLFILE_WORKERS:-16}" \
+            --json-output "$artifact_dir/results/smallfiles-stat.json"
+        return
     fi
 
     smallfiles_scan() {
@@ -667,6 +696,10 @@ if files != expected or errors:
 PY
     }
     run_logged_tool smallfiles-read smallfiles_scan
+}
+
+run_smallfiles_stat() {
+    PERF_SMALLFILE_STAT_ONLY=true run_smallfiles_read
 }
 
 run_metaperf() {
@@ -1518,6 +1551,7 @@ run_perf_suite() {
             dirstress)    run_dirstress || status=1 ;;
             dirperf)      run_dirperf || status=1 ;;
             smallfiles-read) run_smallfiles_read || status=1 ;;
+            smallfiles-stat) run_smallfiles_stat || status=1 ;;
             metaperf)     run_metaperf || status=1 ;;
             looptest)     run_looptest || status=1 ;;
             stress-ng)    run_stress_ng || status=1 ;;

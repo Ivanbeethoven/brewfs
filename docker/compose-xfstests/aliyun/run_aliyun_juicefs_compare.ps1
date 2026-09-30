@@ -10,6 +10,7 @@ param(
     [string]$JuiceFsBinaryPath,
     [string]$RawFixtureBinaryPath,
     [string]$RunnerPath,
+    [string]$ScannerPath,
     [ValidateSet('redis', 'tikv')]
     [string]$MetadataBackend = 'redis',
     [string]$TikvVersion = 'v6.5.3',
@@ -32,6 +33,13 @@ Set-StrictMode -Version Latest
 if (-not $RunnerPath) {
     $RunnerPath = Join-Path $PSScriptRoot 'run_aliyun_juicefs_native.sh'
 }
+if (-not $ScannerPath) {
+    $ScannerPath = Join-Path $PSScriptRoot '..\..\..\tools\perf\smallfiles_scan.py'
+}
+if (-not (Test-Path -LiteralPath $ScannerPath)) {
+    throw "找不到共享 smallfiles scanner: $ScannerPath"
+}
+$ScannerPath = (Resolve-Path -LiteralPath $ScannerPath).Path
 
 function Resolve-Executable([string]$Name, [string[]]$Candidates = @()) {
     $command = Get-Command $Name -ErrorAction SilentlyContinue
@@ -140,12 +148,14 @@ try {
     $rawFixtureName = 'packed_v3_snapshot_fixture'
     Publish $RawFixtureBinaryPath "$prefix/bin/$rawFixtureName"
     Publish $RunnerPath "$prefix/bin/run_aliyun_juicefs_native.sh"
+    Publish $ScannerPath "$prefix/bin/smallfiles_scan.py"
     $script:CredentialKey = "$prefix/bootstrap/s3-credentials.env"
     Publish $credentialPath $script:CredentialKey
 
     $binaryUrl = Sign "$prefix/bin/juicefs"
     $rawFixtureUrl = Sign "$prefix/bin/$rawFixtureName"
     $runnerUrl = Sign "$prefix/bin/run_aliyun_juicefs_native.sh"
+    $scannerUrl = Sign "$prefix/bin/smallfiles_scan.py"
     $credentialUrl = Sign $script:CredentialKey
     $remote = @'
 #!/usr/bin/env bash
@@ -166,8 +176,9 @@ modprobe fuse 2>/dev/null || true
 curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/juicefs" __JUICEFS_URL__
 curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/packed_v3_snapshot_fixture" __RAW_FIXTURE_URL__
 curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/run_juicefs.sh" __RUNNER_URL__
+curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/smallfiles_scan.py" __SCANNER_URL__
 curl --fail --location --retry 5 --connect-timeout 20 --output "$WORK/s3-credentials.env" __CREDENTIAL_URL__
-chmod 0755 "$WORK/juicefs" "$WORK/packed_v3_snapshot_fixture" "$WORK/run_juicefs.sh"
+chmod 0755 "$WORK/juicefs" "$WORK/packed_v3_snapshot_fixture" "$WORK/run_juicefs.sh" "$WORK/smallfiles_scan.py"
 chmod 0600 "$WORK/s3-credentials.env"
 source "$WORK/s3-credentials.env"
 rm -f "$WORK/s3-credentials.env"
@@ -179,6 +190,7 @@ export JFS_S3_BUCKET=__S3_BUCKET__
 export JFS_S3_REGION=__S3_REGION__
 export JFS_S3_ENDPOINT=__S3_ENDPOINT__
 export JFS_RAW_FIXTURE_BIN="$WORK/packed_v3_snapshot_fixture"
+export JFS_SMALLFILES_SCANNER="$WORK/smallfiles_scan.py"
 export JFS_RAW_OBJECT_PREFIX=__RAW_OBJECT_PREFIX__
 export JFS_SMALLFILE_COUNT=__COUNT__
 export JFS_SMALLFILE_SIZE=__SIZE__
@@ -212,6 +224,7 @@ cat "$ARTIFACT_DIR/perf-summary.tsv"
         '__JUICEFS_URL__' = (Quote-Bash $binaryUrl)
         '__RAW_FIXTURE_URL__' = (Quote-Bash $rawFixtureUrl)
         '__RUNNER_URL__' = (Quote-Bash $runnerUrl)
+        '__SCANNER_URL__' = (Quote-Bash $scannerUrl)
         '__CREDENTIAL_URL__' = (Quote-Bash $credentialUrl)
         '__S3_BUCKET__' = (Quote-Bash $S3Bucket)
         '__S3_REGION__' = (Quote-Bash $S3Region)

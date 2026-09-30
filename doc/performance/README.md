@@ -19,6 +19,11 @@ cache-contaminated numbers cannot be mistaken for an acceptance baseline.
   records the matched packed-v3/JuiceFS 1,000-file full-payload comparison and
   the current high-metadata-latency boundary.
 
+- [packed-v3-vs-juicefs-tikv-metadata-stat-2026-09-30.md](packed-v3-vs-juicefs-tikv-metadata-stat-2026-09-30.md)
+  defines the matched metadata-only stat workload for packed v3 versus
+  JuiceFS+TiKV, records the local packed FUSE baseline, and preserves the TiKV
+  image-download blocker without claiming a win.
+
 Cold-read artifacts are valid only when the runner records zero data-cache
 hits. The runner now forces zero read-memory/SSD budgets, disables prefetch,
 requests kernel cache eviction, and fails a tool when any data-cache hit is
