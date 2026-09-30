@@ -1523,7 +1523,6 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
         let entry = &locator.entry;
         let length = u64::try_from(output.len())
             .map_err(|_| PackedWireError::LimitExceeded("packed read length exceeds u64".into()))?;
-        self.runtime_metrics.record_logical_bytes(length);
         let plan = self
             .read_unified_plan_for_entry(&group, &entry, offset, length)
             .await?;
@@ -1540,9 +1539,13 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
         let Some(container_ordinal) = container_ordinal else {
             let fetcher: super::remote::PackedFrameSourceFetcher<B> =
                 super::remote::PackedFrameSourceFetcher::new(HashMap::new());
-            return execute_unified_into(&fetcher, offset, &plan, output)
+            let result = execute_unified_into(&fetcher, offset, &plan, output)
                 .await
                 .map_err(|error| PackedWireError::Backend(error.to_string()));
+            if result.is_ok() {
+                self.runtime_metrics.record_logical_bytes(length);
+            }
+            return result;
         };
         let requests = plan
             .segments
@@ -1660,9 +1663,13 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
             container_ordinal,
             frames,
         );
-        execute_unified_into(&fetcher, offset, &plan, output)
+        let result = execute_unified_into(&fetcher, offset, &plan, output)
             .await
-            .map_err(|error| PackedWireError::Backend(error.to_string()))
+            .map_err(|error| PackedWireError::Backend(error.to_string()));
+        if result.is_ok() {
+            self.runtime_metrics.record_logical_bytes(length);
+        }
+        result
     }
 
     /// Return a bounded directory page. Group metadata remains the unit of
@@ -3117,6 +3124,15 @@ mod tests {
             RemoteGroupCatalog::new(client, manifest).with_decoded_frame_cache_bytes(1024);
         catalog.prefetch_metadata_adaptive(2).await.unwrap();
         ranges.lock().unwrap().clear();
+
+        let mut oversized = [0u8; 8];
+        assert!(
+            catalog
+                .read_inode_range(7, 0, &mut oversized)
+                .await
+                .is_err()
+        );
+        assert_eq!(catalog.packed_runtime_metrics().logical_bytes, 0);
 
         let mut first = [0u8; 7];
         catalog.read_inode_range(7, 0, &mut first).await.unwrap();
