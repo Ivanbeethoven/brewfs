@@ -16,7 +16,7 @@ workspace 的实现审查结论如下，后续性能结果必须按这个边界�
 | GroupMeta/GroupContainer 压缩、restart table | **未实现** | 当前 GroupMeta 是前缀压缩 + 固定宽度字段，body 和 frame 都是 uncompressed；没有每 32 条 restart table。zstd/restart 是后续 wire 版本或兼容扩展，不能写成当前性能事实。 |
 | 跨 FUSE 请求的 coalesce delay/group window | 已实现（demand coalescing） | `SharedGroupReadCoordinator` 在 mount 级维护 pending queue，并以 **250 µs** 收集窗口按 container/profile 合并已提交 frame；共享 4 MiB window cache 和可选 next-window read-ahead 仍是独立的 cold-pipelined 能力。 |
 | cold attributes (`BRFCA004`) | **未实现** | 当前只读适配器提供热属性；xattr/ACL/symlink target 的独立 cold-attribute 对象尚未发布或读取。 |
-| packed 专用 metrics | 部分实现 | mount-scoped `PackedRuntimeMetrics` 已记录 data range GET/bytes、logical/overscan、decoded frames/size class、coalesced/singleflight、pipeline peak、window hit/miss/fetch 和 data-cache hit，并在 packed mount 卸载日志输出；`.stats`/Prometheus sink、metadata/data 完整请求图和 eviction/prefetch 全字段仍需补齐。 |
+| packed 专用 metrics | 部分实现 | mount-scoped `PackedRuntimeMetrics` 已记录 data range GET/bytes、logical/overscan、decoded frames/size class、coalesced/singleflight、pipeline peak、window hit/miss/fetch、decoded-frame cache configured/resident/hit/miss/eviction 和 data-cache hit，并在 packed mount 卸载日志输出；`.stats`/Prometheus sink、metadata/data 完整请求图和 prefetch 全字段仍需补齐。 |
 | overlay-workspace lower binding | **部分实现** | `ReadGeneration`、`ReadSource` 和 `compose_overlay_plan` 已存在；v3 readonly mount 已接入，但 workspace lifecycle 尚未把 packed lower 完整接入 P5 的 upper/lower resolver。 |
 | 共享窗口 byte budget | 已实现 | window cache 在 catalog/mount 级创建并由所有 container 复用；预算不是每个 container 一份。coordinator 的 data/range permits 也按 batch 共享；双 container 回归测试锁定这一点。 |
 
@@ -734,7 +734,10 @@ payload reader；否则 reader 会选择 whole-container materialization，而�
 
 ### 8.3 warm-frame-cache
 
-允许 decoded frame/page cache，用于观察重复访问收益；与 cold 结果分开，不能混写。
+允许显式 byte-budgeted decoded frame cache，用于观察重复访问收益；当前实现通过
+`BREWFS_PACKED_DECODED_FRAME_CACHE_BYTES` 配置，默认 0。cache key 是已认证 container/frame
+identity，只有完成长度和 digest 校验的 frame 才能 admission；configured/resident bytes、
+hit/miss/eviction 必须独立报告。该 profile 与 cold 结果分开，不能混写。
 
 所有模式都输出 `data_cache_hit=0/1`、`inflight_singleflight` 和 `coalesced_range`，
 使临时流水线复用与持久缓存命中可以区分。

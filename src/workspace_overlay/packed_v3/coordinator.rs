@@ -510,7 +510,7 @@ async fn read_coalesced_frames_with_budget<B: crate::cadapter::client::ObjectBac
         metrics.record_singleflight(requests.len().saturating_sub(unique.len()) as u64);
         for range in &ranges {
             let class = range.size_class as usize;
-            metrics.record_logical_range(range.logical_bytes, range.overscan_bytes(), class);
+            metrics.record_overscan(range.overscan_bytes(), class);
         }
     }
     let mut stream = futures_util::stream::iter(ranges.into_iter().map(|range| {

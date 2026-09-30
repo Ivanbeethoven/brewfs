@@ -243,10 +243,6 @@ impl<B: ObjectBackend + Clone> RemotePackedObject<B> {
         self
     }
 
-    pub(crate) fn runtime_metrics(&self) -> Arc<PackedRuntimeMetrics> {
-        Arc::clone(&self.runtime_metrics)
-    }
-
     pub fn window_cache_stats(&self) -> PackedWindowCacheStats {
         PackedWindowCacheStats {
             cache_hits: self.window_cache_hits.load(Ordering::Relaxed),

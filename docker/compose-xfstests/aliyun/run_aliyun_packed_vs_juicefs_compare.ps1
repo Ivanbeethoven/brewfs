@@ -35,6 +35,7 @@ param(
     [string]$JuiceFsPerfTools = 'juicefs-tree juicefs-smallfiles',
     [UInt64]$PackedFrameWindowCacheBytes = 0,
     [bool]$PackedFrameWindowPrefetch = $false,
+    [UInt64]$PackedDecodedFrameCacheBytes = 0,
     [UInt64]$PackedMetadataCacheBytes = 268435456,
     [ValidateSet('off', 'auto', 'eager')]
     [string]$PackedMetadataPrefetch = 'auto',
@@ -200,6 +201,7 @@ try {
         PerfTools = $PerfTools
         PackedFrameWindowCacheBytes = $PackedFrameWindowCacheBytes
         PackedFrameWindowPrefetch = $PackedFrameWindowPrefetch
+        PackedDecodedFrameCacheBytes = $PackedDecodedFrameCacheBytes
         PackedMetadataCacheBytes = $PackedMetadataCacheBytes
         PackedMetadataPrefetch = $PackedMetadataPrefetch
         VolumeFormat = 'packed-metadata-v3'

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
@@ -298,6 +299,21 @@ fn frame_descriptor_cache(max_bytes: u64) -> Cache<(u32, u32), PackedFrameDescri
         .build()
 }
 
+fn decoded_frame_cache(
+    max_bytes: u64,
+    metrics: Arc<PackedRuntimeMetrics>,
+) -> Cache<(u32, u32), Bytes> {
+    Cache::builder()
+        .max_capacity(max_bytes.max(1))
+        .weigher(|_key: &(u32, u32), value: &Bytes| value.len().min(u32::MAX as usize) as u32)
+        .eviction_listener(move |_key, _value, cause| {
+            if cause.was_evicted() {
+                metrics.record_decoded_frame_cache_eviction();
+            }
+        })
+        .build()
+}
+
 /// Derive the stable namespace key used by a child directory group.  The
 /// root key is stored explicitly in the manifest; every other directory key
 /// is derived from the immutable snapshot and inode, so a dentry lookup never
@@ -336,6 +352,10 @@ pub struct RemoteGroupCatalog<B: ObjectBackend + Clone> {
     /// canonical page cache; this is a bounded hot-entry view over it.
     file_locators: Cache<u64, Arc<PackedFileLocator>>,
     frame_descriptors: Cache<(u32, u32), PackedFrameDescriptor>,
+    /// Optional exact decoded-frame cache for the explicitly named warm-frame
+    /// profile. A zero budget disables it and preserves strict-cold semantics.
+    decoded_frames: Option<Cache<(u32, u32), Bytes>>,
+    decoded_frame_cache_bytes: u64,
     /// A container's frame table is tiny compared with its payload. Cache it
     /// as one immutable directory so concurrent small-file reads do not each
     /// issue a prefix probe plus a one-record range request.
@@ -428,6 +448,8 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
                 MAX_FRAME_DESCRIPTORS
                     .saturating_mul(std::mem::size_of::<PackedFrameDescriptor>() as u64),
             ),
+            decoded_frames: None,
+            decoded_frame_cache_bytes: 0,
             frame_directories: frame_directory_cache(MAX_FRAME_DIRECTORY_CACHE_BYTES),
             payload_cache: None,
             frame_window_cache_bytes: 0,
@@ -542,6 +564,15 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
         self
     }
 
+    /// Set the exact decoded-frame budget used only by the explicit
+    /// warm-frame-cache profile. A zero budget preserves strict-cold behavior.
+    pub fn with_decoded_frame_cache_bytes(mut self, max_bytes: u64) -> Self {
+        self.decoded_frame_cache_bytes = max_bytes;
+        self.decoded_frames = (max_bytes > 0)
+            .then(|| decoded_frame_cache(max_bytes, Arc::clone(&self.runtime_metrics)));
+        self
+    }
+
     /// Set the bounded in-process group-window budget used by packed payload
     /// reads. A zero budget preserves strict per-range cold-read behavior.
     pub fn with_frame_window_cache_bytes(mut self, max_bytes: u64) -> Self {
@@ -601,7 +632,13 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
     }
 
     pub fn packed_runtime_metrics(&self) -> PackedRuntimeMetricsSnapshot {
-        self.runtime_metrics.snapshot()
+        let mut snapshot = self.runtime_metrics.snapshot();
+        snapshot.decoded_frame_cache_configured_bytes = self.decoded_frame_cache_bytes;
+        if let Some(cache) = &self.decoded_frames {
+            snapshot.decoded_frame_cache_entries = cache.entry_count();
+            snapshot.decoded_frame_cache_resident_bytes = cache.weighted_size();
+        }
+        snapshot
     }
 
     /// Warm immutable routing and group metadata before the FUSE mount starts
@@ -1486,6 +1523,7 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
         let entry = &locator.entry;
         let length = u64::try_from(output.len())
             .map_err(|_| PackedWireError::LimitExceeded("packed read length exceeds u64".into()))?;
+        self.runtime_metrics.record_logical_bytes(length);
         let plan = self
             .read_unified_plan_for_entry(&group, &entry, offset, length)
             .await?;
@@ -1553,8 +1591,25 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
                 ))),
             })
             .collect::<PackedResult<Vec<_>>>()?;
+        let mut frames = BTreeMap::new();
+        let mut pending_requests = Vec::with_capacity(requests.len());
+        if let Some(cache) = &self.decoded_frames {
+            for request in requests {
+                let key = (container_ordinal, request.descriptor.frame_ordinal);
+                if let Some(frame) = cache.get(&key).await {
+                    self.runtime_metrics.record_decoded_frame_cache_hit();
+                    self.runtime_metrics.record_data_cache_hit();
+                    frames.insert(request.descriptor.frame_ordinal, frame);
+                } else {
+                    self.runtime_metrics.record_decoded_frame_cache_miss();
+                    pending_requests.push(request);
+                }
+            }
+        } else {
+            pending_requests = requests;
+        }
         let object = self.open_container(container_ordinal).await?;
-        let prefetch_anchor = requests
+        let prefetch_anchor = pending_requests
             .iter()
             .map(|request| {
                 (
@@ -1586,10 +1641,20 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
                 }
             });
         }
-        let frames = self
-            .read_coordinator
-            .submit(Arc::clone(&object), group.layout_profile, requests)
-            .await?;
+        if !pending_requests.is_empty() {
+            let fetched = self
+                .read_coordinator
+                .submit(Arc::clone(&object), group.layout_profile, pending_requests)
+                .await?;
+            if let Some(cache) = &self.decoded_frames {
+                for (ordinal, frame) in &fetched {
+                    cache
+                        .insert((container_ordinal, *ordinal), frame.clone())
+                        .await;
+                }
+            }
+            frames.extend(fetched);
+        }
         let fetcher = super::remote::PackedFrameSourceFetcher::with_prefetched_frames(
             (*object).clone(),
             container_ordinal,
@@ -2930,6 +2995,158 @@ mod tests {
         assert_eq!(runtime.frames_decoded, 2);
         assert_eq!(runtime.coalesced_ranges, 1);
         assert!(runtime.pipeline_bytes_peak > 0);
+    }
+
+    #[tokio::test]
+    async fn decoded_frame_cache_reuses_a_shared_frame_for_adjacent_files() {
+        let temp = tempdir().unwrap();
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let client = ObjectClient::new(RecordingBackend {
+            inner: LocalFsBackend::new(temp.path()),
+            ranges: Arc::clone(&ranges),
+        });
+        let metadata = super::super::meta::GroupMeta::new(vec![
+            GroupMetaEntry {
+                name: b"a.bin".to_vec(),
+                inode: 7,
+                kind: 1,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                nlink: 1,
+                atime_ns: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                size: 7,
+                flags: 0,
+                inline_data: Arc::from([]),
+                extents: vec![GroupMetaExtent {
+                    file_offset: 0,
+                    logical_len: 7,
+                    frame_ordinal: 0,
+                    raw_offset: 0,
+                    raw_len: 14,
+                }],
+            },
+            GroupMetaEntry {
+                name: b"b.bin".to_vec(),
+                inode: 8,
+                kind: 1,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                nlink: 1,
+                atime_ns: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                size: 7,
+                flags: 0,
+                inline_data: Arc::from([]),
+                extents: vec![GroupMetaExtent {
+                    file_offset: 0,
+                    logical_len: 7,
+                    frame_ordinal: 0,
+                    raw_offset: 7,
+                    raw_len: 14,
+                }],
+            },
+        ])
+        .unwrap()
+        .encode()
+        .unwrap();
+        let object = PackedGroupContainer::build(
+            91,
+            AccessProfile::RandomSmallFile,
+            vec![PackedGroupInput {
+                group_id: 1,
+                parent_dir_key: [4; 32],
+                metadata: metadata.clone(),
+                frame_ordinals: vec![0],
+                entry_count: 2,
+                file_count: 2,
+                layout_profile: AccessProfile::RandomSmallFile,
+            }],
+            vec![PackedFrameInput {
+                raw: b"aaaaaaabbbbbbb".to_vec(),
+                size_class: SizeClass::Tiny,
+                codec: 0,
+                first_file_slot: 0,
+                last_file_slot: 1,
+            }],
+        )
+        .unwrap();
+        let opened = PackedGroupContainer::open(object.clone()).unwrap();
+        client
+            .put_object("shared-container", &object)
+            .await
+            .unwrap();
+        let manifest = PackedSnapshotManifest {
+            snapshot_id: [90; 32],
+            root_dir_key: [11; 32],
+            root_inode: 1,
+            layout_profile: AccessProfile::RandomSmallFile,
+            size_classes: Default::default(),
+            groups: vec![super::super::wire::PackedGroupRef {
+                group_id: 1,
+                container_ordinal: 0,
+                parent_dir_key: [4; 32],
+                first_name: b"a.bin".to_vec(),
+                last_name: b"b.bin".to_vec(),
+                meta_offset: opened.groups()[0].metadata_offset,
+                meta_len: opened.groups()[0].metadata_len,
+                data_offset: opened.groups()[0].data_offset,
+                data_len: opened.groups()[0].data_len,
+                entry_count: 2,
+                file_count: 2,
+                frame_count: 1,
+                layout_profile: AccessProfile::RandomSmallFile,
+                metadata_digest: Sha256::digest(&metadata).into(),
+                data_digest: opened.groups()[0].data_digest,
+            }],
+            containers: vec![PackedContainerRef {
+                object_key: b"shared-container".to_vec(),
+                object_len: opened.object_len(),
+                object_digest: opened.object_digest(),
+            }],
+            group_index_pages: Vec::new(),
+            inode_index_pages: Vec::new(),
+        };
+        let catalog =
+            RemoteGroupCatalog::new(client, manifest).with_decoded_frame_cache_bytes(1024);
+        catalog.prefetch_metadata_adaptive(2).await.unwrap();
+        ranges.lock().unwrap().clear();
+
+        let mut first = [0u8; 7];
+        catalog.read_inode_range(7, 0, &mut first).await.unwrap();
+        let mut second = [0u8; 7];
+        catalog.read_inode_range(8, 0, &mut second).await.unwrap();
+
+        assert_eq!(&first, b"aaaaaaa");
+        assert_eq!(&second, b"bbbbbbb");
+        let frame = &opened.frames()[0];
+        let payload_ranges = ranges
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(offset, _)| *offset == frame.object_offset)
+            .count();
+        assert_eq!(payload_ranges, 1);
+        catalog
+            .decoded_frames
+            .as_ref()
+            .unwrap()
+            .run_pending_tasks()
+            .await;
+        let runtime = catalog.packed_runtime_metrics();
+        assert_eq!(runtime.data_range_gets, 1);
+        assert_eq!(runtime.logical_bytes, 14);
+        assert_eq!(runtime.decoded_frame_cache_configured_bytes, 1024);
+        assert_eq!(runtime.decoded_frame_cache_entries, 1);
+        assert_eq!(runtime.decoded_frame_cache_resident_bytes, 14);
+        assert_eq!(runtime.decoded_frame_cache_hits, 1);
+        assert_eq!(runtime.decoded_frame_cache_misses, 1);
     }
 
     #[tokio::test]

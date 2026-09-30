@@ -24,6 +24,12 @@ cache-contaminated numbers cannot be mistaken for an acceptance baseline.
   JuiceFS+TiKV, records the local packed FUSE baseline, and preserves the TiKV
   image-download blocker without claiming a win.
 
+- [packed-v3-decoded-frame-cache-local-2026-10-01.md](packed-v3-decoded-frame-cache-local-2026-10-01.md)
+  records the repeated local full-read A/B for the explicit 32 MiB exact
+  decoded-frame cache, including request counts, latency, bounded residency,
+  and rejected window/coalescing candidates. It is a warm-frame-cache result,
+  not a strict-cold JuiceFS comparison.
+
 Cold-read artifacts are valid only when the runner records zero data-cache
 hits. The runner now forces zero read-memory/SSD budgets, disables prefetch,
 requests kernel cache eviction, and fails a tool when any data-cache hit is

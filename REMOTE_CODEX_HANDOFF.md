@@ -12,7 +12,8 @@ Codex bearer value. Credentials remain only in the target user profiles.
 - WSL user: `hxy`
 - Repository: `/home/hxy/brewfs`
 - Branch: `codex/packed-metadata-aliyun-20260930`
-- Latest implementation commit: `7d97082` (`perf: stream packed frame ranges and record runtime metrics`)
+- Latest published benchmark commit: `57cdfd1` (`docs: record cold packed metadata stat baseline`)
+- Streaming implementation commit: `7d97082` (`perf: stream packed frame ranges and record runtime metrics`)
 - Current remote HEAD before the candidate: `2e10947` (`docs-remote-codex-handoff`)
 - Git remotes: `origin=https://github.com/Ivanbeethoven/brewfs.git`,
   `upstream=https://github.com/brewfs/brewfs.git`
@@ -115,7 +116,7 @@ Passed:
   cargo test -p brewfs --features workspace-overlay packed_v3 --lib -- --nocapture
   ```
 
-  Result: 64 passed, 0 failed.
+  Result: 65 passed, 0 failed.
 
 The feature flag matters. `workspace_overlay` is gated by the
 `workspace-overlay` Cargo feature, so a filter run without
@@ -171,15 +172,39 @@ No ECS, mount, OSS object, or temporary credential was created by either attempt
 Therefore no new cloud artifact or accepted end-to-end number exists; the
 previous matched 10k/100k references remain the only performance evidence.
 
+## 2026-10-01 benchmark and warm-cache update
+
+A matched metadata-only scanner is now shared by packed and JuiceFS runners.
+The 10,000-file local RustFS/HTTP packed scan, with host page cache dropped,
+completed in 0.377112 s (26,517 files/s); the same 10 × 1,000 shape on
+JuiceFS+Redis strict metadata caches completed in 0.651548 s (15,348 files/s).
+This is a 1.73x scanner-phase diagnostic for the immutable metadata-only
+scenario, not the requested TiKV result. TiKV could not run because all
+configured Docker mirrors timed out while pulling the standard PD/TiKV images;
+no service or volume remained after cleanup. Evidence and exact limitations are
+in `doc/performance/packed-v3-vs-juicefs-tikv-metadata-stat-2026-09-30.md`.
+
+An explicit decoded-frame cache is now available through
+`BREWFS_PACKED_DECODED_FRAME_CACHE_BYTES`; the default is 0, so strict-cold is
+unchanged. The accepted repeated local A/B used 10,000 independent 100 KiB files
+and a 32 MiB decoded budget: mean throughput improved 19.91%, p95 fell 20.40%,
+and physical data ranges fell from roughly 3,000 to 1,900 with matching
+checksums and zero errors. A supplemental two-pass RustFS run with 1,000 files
+and 64 MiB showed second-pass 851 vs 360 files/s (2.36x) and two-pass total
+3.952 vs 5.188 s (1.31x). This is accepted only as a `warm-frame-cache`
+profile and reports configured/resident bytes, hits/misses/evictions. The packed
+focused suite is now 65 tests; the workspace hard gate remains 1097 passed,
+225 ignored, 0 failed.
+
 ## Remaining work
 
-1. Stage only the packed source, focused performance note, and this handoff;
-   leave `.claude/` and generated `target/` artifacts untracked.
-2. Commit the implementation as a measured-pending optimization, then push
-   `codex/packed-metadata-aliyun-20260930` to `origin`.
-3. The 10k strict-cold cloud run remains pending user-approved execution in an
-   environment whose policy permits the ECS/OSS bootstrap. Do not retry it by
-   bypassing the classifier. If it is later run, verify cleanup explicitly.
+1. Commit and push the decoded-frame warm-cache implementation and this updated
+   handoff; leave `.claude/` and generated `target/` artifacts untracked.
+2. Re-run the matched `smallfiles-stat` command with JuiceFS+TiKV when the
+   standard PD/TiKV images are available; do not substitute Redis in the TiKV
+   result row. Always run Compose cleanup and verify no services/volumes remain.
+3. Keep the decoded cache opt-in and label its measurements `warm-frame-cache`;
+   never use its hits in strict-cold claims.
 4. Implement `.stats`/Prometheus export for the runtime snapshot, then add the
    versioned BRFCA cold-attribute object and packed lower bridge.
 5. Keep compression/restart work behind a new wire version; never mutate PM06,
@@ -187,9 +212,9 @@ previous matched 10k/100k references remain the only performance evidence.
 6. If a future benchmark regresses request count, overscan, active-plus-drain
    bandwidth, or correctness, revert only that candidate patch and document the
    rejection in `doc/performance/`.
-7. After every permitted cloud run, remove temporary OSS objects, Redis/TiKV
-   keys, mounts, containers, and servers. Preserve accepted artifacts and record
-   their paths.
+7. After every permitted cloud or Compose run, remove temporary OSS objects,
+   Redis/TiKV keys, mounts, containers, volumes and servers. Preserve accepted
+   artifacts and record their paths.
 
 ## Commit and closeout commands
 
@@ -203,7 +228,7 @@ ssh brewfs-frp-sea "wsl.exe -d Ubuntu-24.04 -- /usr/bin/git -C /home/hxy/brewfs 
 After review and any matched benchmark:
 
 ```text
-ssh brewfs-frp-sea "wsl.exe -d Ubuntu-24.04 -- bash -lc 'cd /home/hxy/brewfs && git add src/main.rs src/workspace_overlay/packed_v3/metrics.rs src/workspace_overlay/packed_v3/remote.rs src/workspace_overlay/packed_v3/coordinator.rs src/workspace_overlay/packed_v3/catalog.rs docker/compose-xfstests/aliyun/run_aliyun_perf.ps1 doc/performance/packed-v3-metadata-cache-analysis-2026-09-29.md REMOTE_CODEX_HANDOFF.md && git commit -m \"perf: stream packed frame ranges and record runtime metrics\" && git push origin codex/packed-metadata-aliyun-20260930'"
+ssh brewfs-frp-sea "wsl.exe -d Ubuntu-24.04 -- bash -lc 'cd /home/hxy/brewfs && git add src/main.rs src/workspace_overlay/packed_v3/metrics.rs src/workspace_overlay/packed_v3/coordinator.rs src/workspace_overlay/packed_v3/catalog.rs docker/compose-xfstests/aliyun/run_aliyun_perf.ps1 docker/compose-xfstests/aliyun/run_aliyun_packed_million.ps1 docker/compose-xfstests/aliyun/run_aliyun_packed_vs_juicefs_compare.ps1 docker/compose-xfstests/aliyun/run_aliyun_packed_native.sh doc/performance/packed-v3-metadata-cache-analysis-2026-09-29.md doc/superpowers/specs/2026-09-27-brewfs-packed-metadata-v3-readonly-smallfiles.md REMOTE_CODEX_HANDOFF.md && git commit -m \"perf: add explicit packed decoded-frame cache\" && git push origin codex/packed-metadata-aliyun-20260930'"
 ```
 
 Do not use destructive reset/checkout commands. At closeout, leave a coherent

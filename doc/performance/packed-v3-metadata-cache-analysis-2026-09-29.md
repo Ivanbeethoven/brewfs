@@ -207,3 +207,25 @@ fuse-tokio/io-uring feature checks 均通过。
 本轮两次 10k Aliyun runner 尝试均在执行前被 Claude Code 安全策略以
 `Data Exfiltration` 拒绝，未创建 ECS、挂载、OSS 对象或临时凭据；因此没有新的云端
 吞吐结论，也没有更新 README 性能表。已有 matched JuiceFS reference 仍是性能基线。
+
+## 显式 decoded-frame warm cache（2026-10-01）
+
+为重复 epoch/训练集扫描增加了独立的、byte-budgeted decoded-frame cache。它只在
+`BREWFS_PACKED_DECODED_FRAME_CACHE_BYTES > 0` 时启用；默认值为 0，因此
+`strict-cold` 和 `cold-pipelined` 请求图不变。cache key 是
+`(container_ordinal, frame_ordinal)`，只 admission 已完成长度和 frame digest 校验的
+payload；Moka weigher 按实际 frame bytes 计费，日志单独报告 configured/resident bytes、
+hit/miss/eviction，命中同时计为明确的 data-cache hit。
+
+本机 RustFS/S3-compatible HTTP、1,000 个独立 100 KiB 文件、16 workers、direct I/O、
+persistent payload cache=0、window cache=0 的两遍完整读取 A/B：
+
+| profile | pass 1 | pass 2 | two-pass total | backend GET | fetched bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| decoded cache 0 | 2.412 s / 414.55 files/s | 2.776 s / 360.20 files/s | 5.188 s | 714 | 294,912,000 |
+| decoded cache 64 MiB | 2.778 s / 359.99 files/s | 1.175 s / 851.33 files/s | 3.952 s | 414 | 167,321,600 |
+
+两边 checksum 均为 `124948`、errors=0。候选第二遍 files/s 为 baseline 的 `2.36x`，
+两遍总耗时改善约 `1.31x`；代价是首遍约 15% admission 开销和 64 MiB 显式内存预算。
+因此该能力只接受为 `warm-frame-cache` profile，不作为 strict-cold 默认值，也不能替代
+metadata-only/TiKV 对照或已有 full-payload cold 结论。

@@ -30,6 +30,7 @@ param(
     [int]$FioRuntimeSeconds = 20,
     [UInt64]$PackedFrameWindowCacheBytes = 0,
     [bool]$PackedFrameWindowPrefetch = $false,
+    [UInt64]$PackedDecodedFrameCacheBytes = 0,
     [UInt64]$PackedMetadataCacheBytes = 268435456,
     [ValidateSet('off', 'auto', 'eager')]
     [string]$PackedMetadataPrefetch = 'auto',
@@ -100,6 +101,7 @@ $runnerParams = @{
     FioRuntimeSeconds = $FioRuntimeSeconds
     PackedFrameWindowCacheBytes = $PackedFrameWindowCacheBytes
     PackedFrameWindowPrefetch = $PackedFrameWindowPrefetch
+    PackedDecodedFrameCacheBytes = $PackedDecodedFrameCacheBytes
     PackedMetadataCacheBytes = $PackedMetadataCacheBytes
     PackedMetadataPrefetch = $PackedMetadataPrefetch
     ToolTimeoutSeconds = $ToolTimeoutSeconds
@@ -146,6 +148,7 @@ $runnerArgs = @(
     '-PerfTools', $PerfTools,
     '-FioRuntimeSeconds', [string]$FioRuntimeSeconds,
     '-PackedFrameWindowCacheBytes', [string]$PackedFrameWindowCacheBytes,
+    '-PackedDecodedFrameCacheBytes', [string]$PackedDecodedFrameCacheBytes,
     '-PackedMetadataCacheBytes', [string]$PackedMetadataCacheBytes,
     '-PackedMetadataPrefetch', $PackedMetadataPrefetch,
     '-ToolTimeoutSeconds', [string]$ToolTimeoutSeconds,

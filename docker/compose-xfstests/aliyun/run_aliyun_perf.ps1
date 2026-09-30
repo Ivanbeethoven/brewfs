@@ -37,6 +37,7 @@ param(
     [UInt64]$ReadSsdBytes = 0,
     [UInt64]$PackedFrameWindowCacheBytes = 0,
     [bool]$PackedFrameWindowPrefetch = $false,
+    [UInt64]$PackedDecodedFrameCacheBytes = 0,
     [UInt64]$PackedMetadataCacheBytes = 268435456,
     [ValidateSet('off', 'auto', 'eager')]
     [string]$PackedMetadataPrefetch = 'auto',
@@ -337,6 +338,7 @@ export BREWFS_READ_MEMORY_BYTES=__READ_MEMORY_BYTES__
 export BREWFS_READ_SSD_BYTES=__READ_SSD_BYTES__
 export BREWFS_PACKED_FRAME_WINDOW_CACHE_BYTES=__PACKED_FRAME_WINDOW_CACHE_BYTES__
 export BREWFS_PACKED_FRAME_WINDOW_PREFETCH=__PACKED_FRAME_WINDOW_PREFETCH__
+export BREWFS_PACKED_DECODED_FRAME_CACHE_BYTES=__PACKED_DECODED_FRAME_CACHE_BYTES__
 export BREWFS_PACKED_METADATA_CACHE_BYTES=__PACKED_METADATA_CACHE_BYTES__
 export BREWFS_PACKED_METADATA_PREFETCH=__PACKED_METADATA_PREFETCH__
 export BREWFS_PREFETCH_ENABLED=__PREFETCH_ENABLED__
@@ -423,6 +425,7 @@ done
         '__READ_SSD_BYTES__' = Quote-Bash ([string]$ReadSsdBytes)
         '__PACKED_FRAME_WINDOW_CACHE_BYTES__' = Quote-Bash ([string]$PackedFrameWindowCacheBytes)
         '__PACKED_FRAME_WINDOW_PREFETCH__' = Quote-Bash ($PackedFrameWindowPrefetch.ToString().ToLowerInvariant())
+        '__PACKED_DECODED_FRAME_CACHE_BYTES__' = Quote-Bash ([string]$PackedDecodedFrameCacheBytes)
         '__PACKED_METADATA_CACHE_BYTES__' = Quote-Bash ([string]$PackedMetadataCacheBytes)
         '__PACKED_METADATA_PREFETCH__' = Quote-Bash $PackedMetadataPrefetch
         '__PREFETCH_ENABLED__' = Quote-Bash ($PrefetchEnabled.ToString().ToLowerInvariant())

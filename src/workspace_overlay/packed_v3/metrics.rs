@@ -15,6 +15,9 @@ pub struct PackedRuntimeMetrics {
     pipeline_peak: AtomicU64,
     prefetched_logical_bytes: AtomicU64,
     data_cache_hits: AtomicU64,
+    decoded_frame_cache_hits: AtomicU64,
+    decoded_frame_cache_misses: AtomicU64,
+    decoded_frame_cache_evictions: AtomicU64,
     window_cache_hits: AtomicU64,
     window_cache_misses: AtomicU64,
     window_remote_fetches: AtomicU64,
@@ -36,6 +39,12 @@ pub struct PackedRuntimeMetricsSnapshot {
     pub pipeline_bytes_peak: u64,
     pub prefetched_logical_bytes: u64,
     pub data_cache_hits: u64,
+    pub decoded_frame_cache_configured_bytes: u64,
+    pub decoded_frame_cache_entries: u64,
+    pub decoded_frame_cache_resident_bytes: u64,
+    pub decoded_frame_cache_hits: u64,
+    pub decoded_frame_cache_misses: u64,
+    pub decoded_frame_cache_evictions: u64,
     pub window_cache_hits: u64,
     pub window_cache_misses: u64,
     pub window_remote_fetches: u64,
@@ -54,9 +63,12 @@ impl PackedRuntimeMetrics {
         self.data_cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_logical_range(&self, logical_bytes: u64, overscan_bytes: u64, class: usize) {
+    pub fn record_logical_bytes(&self, logical_bytes: u64) {
         self.logical_bytes
             .fetch_add(logical_bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_overscan(&self, overscan_bytes: u64, class: usize) {
         self.overscan_bytes
             .fetch_add(overscan_bytes, Ordering::Relaxed);
         let class = class.min(SIZE_CLASS_COUNT - 1);
@@ -97,6 +109,21 @@ impl PackedRuntimeMetrics {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub fn record_decoded_frame_cache_hit(&self) {
+        self.decoded_frame_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_decoded_frame_cache_miss(&self) {
+        self.decoded_frame_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_decoded_frame_cache_eviction(&self) {
+        self.decoded_frame_cache_evictions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_window_hit(&self) {
         self.window_cache_hits.fetch_add(1, Ordering::Relaxed);
     }
@@ -124,6 +151,12 @@ impl PackedRuntimeMetrics {
             pipeline_bytes_peak: load(&self.pipeline_peak),
             prefetched_logical_bytes: load(&self.prefetched_logical_bytes),
             data_cache_hits: load(&self.data_cache_hits),
+            decoded_frame_cache_configured_bytes: 0,
+            decoded_frame_cache_entries: 0,
+            decoded_frame_cache_resident_bytes: 0,
+            decoded_frame_cache_hits: load(&self.decoded_frame_cache_hits),
+            decoded_frame_cache_misses: load(&self.decoded_frame_cache_misses),
+            decoded_frame_cache_evictions: load(&self.decoded_frame_cache_evictions),
             window_cache_hits: load(&self.window_cache_hits),
             window_cache_misses: load(&self.window_cache_misses),
             window_remote_fetches: load(&self.window_remote_fetches),
@@ -146,7 +179,8 @@ mod tests {
     fn runtime_metrics_track_pipeline_and_size_classes() {
         let metrics = PackedRuntimeMetrics::default();
         metrics.record_data_range(128);
-        metrics.record_logical_range(100, 28, 2);
+        metrics.record_logical_bytes(100);
+        metrics.record_overscan(28, 2);
         metrics.record_frame(2, 100);
         metrics.record_coalesced_ranges(1);
         metrics.pipeline_acquire(128);

@@ -1143,6 +1143,10 @@ where
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
+    let decoded_frame_cache_bytes = std::env::var("BREWFS_PACKED_DECODED_FRAME_CACHE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
     let frame_window_prefetch = std::env::var("BREWFS_PACKED_FRAME_WINDOW_PREFETCH")
         .ok()
         .map(|value| {
@@ -1178,6 +1182,7 @@ where
         .and_then(|value| value.parse::<usize>().ok());
     tracing::info!(
         frame_window_cache_bytes,
+        decoded_frame_cache_bytes,
         frame_window_prefetch,
         metadata_cache_bytes,
         metadata_prefetch_mode,
@@ -1194,6 +1199,7 @@ where
     let catalog = Arc::new(
         catalog
             .with_metadata_cache_bytes(metadata_cache_bytes)
+            .with_decoded_frame_cache_bytes(decoded_frame_cache_bytes)
             .with_frame_window_cache_bytes(frame_window_cache_bytes)
             .with_frame_window_prefetch(frame_window_prefetch),
     );
@@ -1327,6 +1333,12 @@ where
         packed_pipeline_bytes_peak = packed_runtime_stats.pipeline_bytes_peak,
         packed_prefetched_logical_bytes = packed_runtime_stats.prefetched_logical_bytes,
         packed_data_cache_hits = packed_runtime_stats.data_cache_hits,
+        packed_decoded_frame_cache_configured_bytes = packed_runtime_stats.decoded_frame_cache_configured_bytes,
+        packed_decoded_frame_cache_entries = packed_runtime_stats.decoded_frame_cache_entries,
+        packed_decoded_frame_cache_resident_bytes = packed_runtime_stats.decoded_frame_cache_resident_bytes,
+        packed_decoded_frame_cache_hits = packed_runtime_stats.decoded_frame_cache_hits,
+        packed_decoded_frame_cache_misses = packed_runtime_stats.decoded_frame_cache_misses,
+        packed_decoded_frame_cache_evictions = packed_runtime_stats.decoded_frame_cache_evictions,
         packed_window_cache_hits = packed_runtime_stats.window_cache_hits,
         packed_window_cache_misses = packed_runtime_stats.window_cache_misses,
         packed_window_remote_fetches = packed_runtime_stats.window_remote_fetches,
