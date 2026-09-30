@@ -1611,7 +1611,11 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
         } else {
             pending_requests = requests;
         }
-        let object = self.open_container(container_ordinal).await?;
+        let object = if pending_requests.is_empty() {
+            None
+        } else {
+            Some(self.open_container(container_ordinal).await?)
+        };
         let prefetch_anchor = pending_requests
             .iter()
             .map(|request| {
@@ -1636,7 +1640,7 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
             && let Some((offset, length)) = prefetch_anchor
             && let Ok(permit) = self.frame_window_prefetch_limit.clone().try_acquire_owned()
         {
-            let object = Arc::clone(&object);
+            let object = Arc::clone(object.as_ref().expect("pending requests opened container"));
             tokio::spawn(async move {
                 let _permit = permit;
                 if let Err(error) = object.prefetch_next_payload_window(offset, length).await {
@@ -1647,22 +1651,35 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
         if !pending_requests.is_empty() {
             let fetched = self
                 .read_coordinator
-                .submit(Arc::clone(&object), group.layout_profile, pending_requests)
+                .submit(
+                    Arc::clone(object.as_ref().expect("pending requests opened container")),
+                    group.layout_profile,
+                    pending_requests,
+                )
                 .await?;
             if let Some(cache) = &self.decoded_frames {
                 for (ordinal, frame) in &fetched {
-                    cache
-                        .insert((container_ordinal, *ordinal), frame.clone())
-                        .await;
+                    if frame.len() as u64 <= self.decoded_frame_cache_bytes {
+                        cache
+                            .insert((container_ordinal, *ordinal), frame.clone())
+                            .await;
+                    }
                 }
             }
             frames.extend(fetched);
         }
-        let fetcher = super::remote::PackedFrameSourceFetcher::with_prefetched_frames(
-            (*object).clone(),
-            container_ordinal,
-            frames,
-        );
+        let fetcher = if let Some(object) = object {
+            super::remote::PackedFrameSourceFetcher::with_prefetched_frames(
+                (*object).clone(),
+                container_ordinal,
+                frames,
+            )
+        } else {
+            super::remote::PackedFrameSourceFetcher::with_prefetched_frame_map(
+                container_ordinal,
+                frames,
+            )
+        };
         let result = execute_unified_into(&fetcher, offset, &plan, output)
             .await
             .map_err(|error| PackedWireError::Backend(error.to_string()));
@@ -3136,25 +3153,35 @@ mod tests {
 
         let mut first = [0u8; 7];
         catalog.read_inode_range(7, 0, &mut first).await.unwrap();
-        let mut second = [0u8; 7];
-        catalog.read_inode_range(8, 0, &mut second).await.unwrap();
-
-        assert_eq!(&first, b"aaaaaaa");
-        assert_eq!(&second, b"bbbbbbb");
-        let frame = &opened.frames()[0];
-        let payload_ranges = ranges
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(offset, _)| *offset == frame.object_offset)
-            .count();
-        assert_eq!(payload_ranges, 1);
         catalog
             .decoded_frames
             .as_ref()
             .unwrap()
             .run_pending_tasks()
             .await;
+        let frame = &opened.frames()[0];
+        assert_eq!(
+            ranges
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(offset, _)| *offset == frame.object_offset)
+                .count(),
+            1
+        );
+        catalog.containers.invalidate_all();
+        catalog.containers.run_pending_tasks().await;
+        ranges.lock().unwrap().clear();
+
+        let mut second = [0u8; 7];
+        catalog.read_inode_range(8, 0, &mut second).await.unwrap();
+
+        assert_eq!(&first, b"aaaaaaa");
+        assert_eq!(&second, b"bbbbbbb");
+        assert!(
+            ranges.lock().unwrap().is_empty(),
+            "a decoded-frame hit must not reopen the container"
+        );
         let runtime = catalog.packed_runtime_metrics();
         assert_eq!(runtime.data_range_gets, 1);
         assert_eq!(runtime.logical_bytes, 14);

@@ -946,7 +946,20 @@ impl<B: ObjectBackend + Clone> PackedFrameSourceFetcher<B> {
         Self::new(objects)
     }
 
-    /// Build a fetcher from a bounded coordinator result.  The map contains
+    pub(crate) fn with_prefetched_frame_map(
+        container_ordinal: u32,
+        frames: BTreeMap<u32, Bytes>,
+    ) -> Self {
+        let prefetched = frames
+            .into_iter()
+            .map(|(frame_ordinal, bytes)| ((container_ordinal, frame_ordinal), bytes))
+            .collect();
+        Self {
+            objects: Arc::new(HashMap::new()),
+            prefetched: Arc::new(prefetched),
+        }
+    }
+
     /// complete raw frame payloads for one read operation; it is intentionally
     /// short lived and is not a hidden cache.
     pub fn with_prefetched_frames(
@@ -987,26 +1000,26 @@ impl<B: ObjectBackend + Clone + 'static> UnifiedReadSourceFetcher for PackedFram
                 if *codec != 0 || *stored_len != *raw_len {
                     anyhow::bail!("unsupported packed frame codec or lengths")
                 }
-                let object = self.objects.get(container_ordinal).ok_or_else(|| {
-                    anyhow::anyhow!("packed frame container {container_ordinal} is not pinned")
-                })?;
-                let descriptor = PackedFrameDescriptor {
-                    frame_ordinal: *frame_ordinal,
-                    object_offset: *object_offset,
-                    stored_len: *stored_len,
-                    raw_len: *raw_len,
-                    first_file_slot: 0,
-                    last_file_slot: 0,
-                    size_class: super::layout::SizeClass::from_u8(*size_class)
-                        .map_err(|error| anyhow::anyhow!(error.to_string()))?,
-                    codec: *codec,
-                    frame_digest: *frame_digest,
-                };
                 let frame = if let Some(frame) =
                     self.prefetched.get(&(*container_ordinal, *frame_ordinal))
                 {
                     frame.clone()
                 } else {
+                    let object = self.objects.get(container_ordinal).ok_or_else(|| {
+                        anyhow::anyhow!("packed frame container {container_ordinal} is not pinned")
+                    })?;
+                    let descriptor = PackedFrameDescriptor {
+                        frame_ordinal: *frame_ordinal,
+                        object_offset: *object_offset,
+                        stored_len: *stored_len,
+                        raw_len: *raw_len,
+                        first_file_slot: 0,
+                        last_file_slot: 0,
+                        size_class: super::layout::SizeClass::from_u8(*size_class)
+                            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+                        codec: *codec,
+                        frame_digest: *frame_digest,
+                    };
                     object
                         .read_frame(&descriptor)
                         .await
