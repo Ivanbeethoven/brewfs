@@ -10,6 +10,7 @@ mod group;
 mod index;
 mod layout;
 mod meta;
+mod metrics;
 mod readonly;
 mod remote;
 mod wire;
@@ -35,6 +36,7 @@ pub use layout::{
 pub use meta::{
     GroupMeta, GroupMetaEntry, GroupMetaExtent, INLINE_DATA_FLAG, INLINE_FILE_MAX_BYTES,
 };
+pub use metrics::{PackedRuntimeMetrics, PackedRuntimeMetricsSnapshot};
 pub use readonly::{PackedV3BlockStore, PackedV3ReadonlyMeta};
 pub use remote::{
     MAX_PACKED_STREAM_RANGE_BYTES, PackedFrameSourceFetcher, PackedWindowCacheStats,

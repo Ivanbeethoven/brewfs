@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -15,6 +15,7 @@ use super::group::{
     PackedFrameDescriptor, frame_directory_body_len, frame_table_body_offset,
     group_container_counts, parse_frame_descriptor_range,
 };
+use super::metrics::PackedRuntimeMetrics;
 use super::wire::{
     PACKED_FOOTER_LEN, PACKED_HEADER_LEN, PackedHeader, PackedObjectKind, PackedResult,
     PackedWireError,
@@ -73,11 +74,62 @@ pub struct PackedWindowCacheStats {
     pub remote_fetches: u64,
 }
 
+/// Consume exactly one bounded range from an object backend without retaining the
+/// complete range. The consumer receives the relative offset of each chunk and
+/// owns any bytes it needs to retain.
+async fn consume_exact_range<B, F>(
+    client: &ObjectClient<B>,
+    key: &str,
+    offset: u64,
+    length: u64,
+    mut consume: F,
+) -> PackedResult<()>
+where
+    B: ObjectBackend + Clone,
+    F: FnMut(u64, Bytes) -> PackedResult<()>,
+{
+    if length > MAX_PACKED_STREAM_RANGE_BYTES {
+        return Err(PackedWireError::LimitExceeded(
+            "packed stream range exceeds 8 MiB budget".into(),
+        ));
+    }
+    offset
+        .checked_add(length)
+        .ok_or_else(|| PackedWireError::LimitExceeded("packed stream range overflows".into()))?;
+    let mut stream = client
+        .get_object_range_stream(key, offset, length)
+        .await
+        .map_err(|error| PackedWireError::Backend(error.to_string()))?;
+    let mut consumed = 0u64;
+    while consumed < length {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let chunk = chunk.map_err(|error| PackedWireError::Backend(error.to_string()))?;
+        let chunk_len = u64::try_from(chunk.len()).map_err(|_| {
+            PackedWireError::LimitExceeded("packed stream chunk exceeds u64".into())
+        })?;
+        if chunk_len > length - consumed {
+            return Err(PackedWireError::Invalid(
+                "packed stream returned more bytes than requested".into(),
+            ));
+        }
+        consume(consumed, chunk)?;
+        consumed += chunk_len;
+    }
+    if consumed != length {
+        return Err(PackedWireError::Truncated {
+            what: "packed streamed range",
+            need: usize::try_from(length).unwrap_or(usize::MAX),
+            have: usize::try_from(consumed).unwrap_or(usize::MAX),
+        });
+    }
+    Ok(())
+}
+
 /// Consume exactly one bounded range from an object backend. The backend may
 /// yield any chunk sizes; a short response or a chunk that crosses the
-/// requested bound is rejected before callers can treat the bytes as a valid
-/// frame. Once the bound is satisfied we intentionally do not await an EOF
-/// marker, because some OSS gateways keep range bodies readable indefinitely.
+/// requested bound is rejected before callers can treat the bytes as valid.
 pub async fn read_exact_range<B: ObjectBackend + Clone>(
     client: &ObjectClient<B>,
     key: &str,
@@ -91,35 +143,12 @@ pub async fn read_exact_range<B: ObjectBackend + Clone>(
     }
     let expected = usize::try_from(length)
         .map_err(|_| PackedWireError::LimitExceeded("packed stream length exceeds usize".into()))?;
-    let mut stream = client
-        .get_object_range_stream(key, offset, length)
-        .await
-        .map_err(|error| PackedWireError::Backend(error.to_string()))?;
     let mut output = Vec::with_capacity(expected);
-    // S3 range responses have an explicit byte bound.  Some OSS-compatible
-    // gateways keep the HTTP body readable after delivering that bound, so
-    // waiting for an EOF marker can strand the FUSE request indefinitely.
-    // Stop as soon as the requested bytes are complete; a short response is
-    // still rejected below.
-    while output.len() < expected {
-        let Some(chunk) = stream.next().await else {
-            break;
-        };
-        let chunk = chunk.map_err(|error| PackedWireError::Backend(error.to_string()))?;
-        if chunk.len() > expected.saturating_sub(output.len()) {
-            return Err(PackedWireError::Invalid(
-                "packed stream returned more bytes than requested".into(),
-            ));
-        }
+    consume_exact_range(client, key, offset, length, |_, chunk| {
         output.extend_from_slice(&chunk);
-    }
-    if output.len() != expected {
-        return Err(PackedWireError::Truncated {
-            what: "packed streamed range",
-            need: expected,
-            have: output.len(),
-        });
-    }
+        Ok(())
+    })
+    .await?;
     Ok(output)
 }
 
@@ -145,6 +174,7 @@ pub struct RemotePackedObject<B: ObjectBackend + Clone> {
     window_cache_hits: Arc<AtomicU64>,
     window_cache_misses: Arc<AtomicU64>,
     window_remote_fetches: Arc<AtomicU64>,
+    runtime_metrics: Arc<PackedRuntimeMetrics>,
 }
 
 impl<B: ObjectBackend + Clone> RemotePackedObject<B> {
@@ -185,6 +215,7 @@ impl<B: ObjectBackend + Clone> RemotePackedObject<B> {
             window_cache_hits: Arc::new(AtomicU64::new(0)),
             window_cache_misses: Arc::new(AtomicU64::new(0)),
             window_remote_fetches: Arc::new(AtomicU64::new(0)),
+            runtime_metrics: Arc::new(PackedRuntimeMetrics::default()),
         })
     }
 
@@ -205,6 +236,15 @@ impl<B: ObjectBackend + Clone> RemotePackedObject<B> {
     ) -> Self {
         self.window_cache = cache;
         self
+    }
+
+    pub(crate) fn with_runtime_metrics(mut self, metrics: Arc<PackedRuntimeMetrics>) -> Self {
+        self.runtime_metrics = metrics;
+        self
+    }
+
+    pub(crate) fn runtime_metrics(&self) -> Arc<PackedRuntimeMetrics> {
+        Arc::clone(&self.runtime_metrics)
     }
 
     pub fn window_cache_stats(&self) -> PackedWindowCacheStats {
@@ -298,6 +338,7 @@ impl<B: ObjectBackend + Clone> RemotePackedObject<B> {
                     window_cache_hits: Arc::new(AtomicU64::new(0)),
                     window_cache_misses: Arc::new(AtomicU64::new(0)),
                     window_remote_fetches: Arc::new(AtomicU64::new(0)),
+                    runtime_metrics: Arc::new(PackedRuntimeMetrics::default()),
                 });
             }
             let _ = payload_cache.remove(&payload_cache_key).await;
@@ -355,14 +396,17 @@ impl<B: ObjectBackend + Clone> RemotePackedObject<B> {
     pub async fn read_payload_range(&self, offset: u64, length: u64) -> PackedResult<Vec<u8>> {
         let (end, _) = self.validate_body_range(offset, length)?;
         let (Some(cache), Some(cache_key)) = (&self.payload_cache, &self.payload_cache_key) else {
+            self.runtime_metrics.record_data_range(length);
             return read_exact_range(&self.client, &self.object_key, offset, length).await;
         };
         if !cache.has_read_capacity() || !cache.can_retain_read_bytes(self.object_len) {
+            self.runtime_metrics.record_data_range(length);
             return read_exact_range(&self.client, &self.object_key, offset, length).await;
         }
         if let Some(object) = cache.get(cache_key).await
             && object.len() as u64 == self.object_len
         {
+            self.runtime_metrics.record_data_cache_hit();
             return Ok(object[offset as usize..end as usize].to_vec());
         }
 
@@ -393,6 +437,7 @@ impl<B: ObjectBackend + Clone> RemotePackedObject<B> {
             .await;
         let object = result.map_err(|error| PackedWireError::Backend(error.to_string()))?;
         if is_leader {
+            self.runtime_metrics.record_data_range(object_len);
             if let Err(error) = cache.insert(cache_key, object.as_ref()).await {
                 tracing::warn!(error = ?error, "packed container local cache insert failed");
             }
@@ -412,12 +457,14 @@ impl<B: ObjectBackend + Clone> RemotePackedObject<B> {
     ) -> PackedResult<Vec<u8>> {
         let (end, footer_offset) = self.validate_body_range(offset, length)?;
         let Some(cache) = &self.window_cache else {
+            self.runtime_metrics.record_data_range(length);
             return read_exact_range(&self.client, &self.object_key, offset, length).await;
         };
         if length == 0 {
             return Ok(Vec::new());
         }
         if length > PACKED_FRAME_READ_WINDOW_BYTES {
+            self.runtime_metrics.record_data_range(length);
             return read_exact_range(&self.client, &self.object_key, offset, length).await;
         }
         let aligned = (offset / PACKED_FRAME_READ_WINDOW_BYTES)
@@ -430,6 +477,7 @@ impl<B: ObjectBackend + Clone> RemotePackedObject<B> {
             .unwrap_or(footer_offset)
             .min(footer_offset);
         if window_end <= window_offset || end > window_end {
+            self.runtime_metrics.record_data_range(length);
             return read_exact_range(&self.client, &self.object_key, offset, length).await;
         }
         let key = RangeFlightKey {
@@ -439,6 +487,7 @@ impl<B: ObjectBackend + Clone> RemotePackedObject<B> {
         let shared_key = (self.object_key.clone(), key.offset, key.length);
         if let Some(window) = cache.cache.get(&shared_key).await {
             self.window_cache_hits.fetch_add(1, Ordering::Relaxed);
+            self.runtime_metrics.record_window_hit();
             let start = usize::try_from(offset - window_offset).map_err(|_| {
                 PackedWireError::LimitExceeded("packed window offset exceeds usize".into())
             })?;
@@ -459,9 +508,11 @@ impl<B: ObjectBackend + Clone> RemotePackedObject<B> {
             return Ok(window[start..end].to_vec());
         }
         self.window_cache_misses.fetch_add(1, Ordering::Relaxed);
+        self.runtime_metrics.record_window_miss();
         let client = self.client.clone();
         let object_key = self.object_key.clone();
         let cache_key = key.clone();
+        let window_fetch_bytes = key.length;
         let (is_leader, result) = self
             .range_flight
             .execute_with_status(key, || async move {
@@ -474,6 +525,7 @@ impl<B: ObjectBackend + Clone> RemotePackedObject<B> {
         let window = result.map_err(|error| PackedWireError::Backend(error.to_string()))?;
         if is_leader {
             self.window_remote_fetches.fetch_add(1, Ordering::Relaxed);
+            self.runtime_metrics.record_window_fetch(window_fetch_bytes);
             cache.cache.insert(shared_key, (*window).clone()).await;
         }
         let start = usize::try_from(offset - window_offset).map_err(|_| {
@@ -553,7 +605,119 @@ impl<B: ObjectBackend + Clone> RemotePackedObject<B> {
         Ok(bytes)
     }
 
-    /// Read the complete frame directory using bounded ranges.  The first
+    /// Stream one bounded physical range and retain only the requested frame
+    /// payloads. Strict-cold callers use this path so coalesced gap bytes never
+    /// become a second full-range allocation.
+    pub(crate) async fn read_frames_in_range(
+        &self,
+        offset: u64,
+        length: u64,
+        frames: &[PackedFrameDescriptor],
+    ) -> PackedResult<BTreeMap<u32, Bytes>> {
+        let (end, _) = self.validate_body_range(offset, length)?;
+        if frames.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut descriptors = frames.to_vec();
+        descriptors.sort_by_key(|frame| frame.object_offset);
+        for pair in descriptors.windows(2) {
+            if pair[0].frame_ordinal == pair[1].frame_ordinal {
+                return Err(PackedWireError::Invalid(
+                    "duplicate frame ordinal in streamed range".into(),
+                ));
+            }
+        }
+        for frame in &descriptors {
+            let frame_end = frame
+                .object_offset
+                .checked_add(u64::from(frame.stored_len))
+                .ok_or_else(|| PackedWireError::LimitExceeded("frame range overflows".into()))?;
+            if frame.object_offset < offset || frame_end > end {
+                return Err(PackedWireError::Invalid(
+                    "requested frame lies outside streamed range".into(),
+                ));
+            }
+        }
+
+        if self.window_cache.is_some() && length <= PACKED_FRAME_READ_WINDOW_BYTES {
+            let bytes = self.read_windowed_payload_range(offset, length).await?;
+            return decode_frame_range(offset, &bytes, &descriptors);
+        }
+
+        let mut buffers: Vec<(PackedFrameDescriptor, BytesMut)> = descriptors
+            .iter()
+            .cloned()
+            .map(|frame| {
+                (
+                    frame.clone(),
+                    BytesMut::with_capacity(frame.stored_len as usize),
+                )
+            })
+            .collect();
+        self.runtime_metrics.record_data_range(length);
+        consume_exact_range(
+            &self.client,
+            &self.object_key,
+            offset,
+            length,
+            |relative, chunk| {
+                let chunk_start = offset.checked_add(relative).ok_or_else(|| {
+                    PackedWireError::LimitExceeded("stream offset overflows".into())
+                })?;
+                let chunk_end = chunk_start.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    PackedWireError::LimitExceeded("stream chunk overflows".into())
+                })?;
+                for (frame, output) in &mut buffers {
+                    let frame_end = frame
+                        .object_offset
+                        .checked_add(u64::from(frame.stored_len))
+                        .ok_or_else(|| {
+                            PackedWireError::LimitExceeded("frame range overflows".into())
+                        })?;
+                    let copy_start = chunk_start.max(frame.object_offset);
+                    let copy_end = chunk_end.min(frame_end);
+                    if copy_start < copy_end {
+                        let chunk_offset =
+                            usize::try_from(copy_start - chunk_start).map_err(|_| {
+                                PackedWireError::LimitExceeded(
+                                    "frame chunk offset exceeds usize".into(),
+                                )
+                            })?;
+                        let copy_len = usize::try_from(copy_end - copy_start).map_err(|_| {
+                            PackedWireError::LimitExceeded(
+                                "frame chunk length exceeds usize".into(),
+                            )
+                        })?;
+                        output.extend_from_slice(&chunk[chunk_offset..chunk_offset + copy_len]);
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await?;
+
+        let mut output = BTreeMap::new();
+        for (frame, bytes) in buffers {
+            if bytes.len() != frame.stored_len as usize {
+                return Err(PackedWireError::Truncated {
+                    what: "streamed packed frame",
+                    need: frame.stored_len as usize,
+                    have: bytes.len(),
+                });
+            }
+            let digest: [u8; 16] = Sha256::digest(&bytes)[..16]
+                .try_into()
+                .expect("sha256 prefix has 16 bytes");
+            if digest != frame.frame_digest {
+                return Err(PackedWireError::Invalid(
+                    "packed frame digest mismatch".into(),
+                ));
+            }
+            output.insert(frame.frame_ordinal, bytes.freeze());
+        }
+        Ok(output)
+    }
+
     /// request fetches only the 24-byte body prefix; descriptor records are
     /// then fetched in chunks no larger than the streaming range budget.  No
     /// metadata, frame-list or frame payload bytes are touched.
@@ -727,7 +891,43 @@ fn validate_descriptor_order(frames: &[PackedFrameDescriptor]) -> PackedResult<(
     Ok(())
 }
 
-/// Adapter that lets the common unified read executor consume packed frames.
+fn decode_frame_range(
+    offset: u64,
+    bytes: &[u8],
+    frames: &[PackedFrameDescriptor],
+) -> PackedResult<BTreeMap<u32, Bytes>> {
+    let mut output = BTreeMap::new();
+    for frame in frames {
+        let relative = frame
+            .object_offset
+            .checked_sub(offset)
+            .ok_or_else(|| PackedWireError::Invalid("frame is outside range".into()))?;
+        let start = usize::try_from(relative)
+            .map_err(|_| PackedWireError::LimitExceeded("frame offset exceeds usize".into()))?;
+        let end = start
+            .checked_add(frame.stored_len as usize)
+            .ok_or_else(|| PackedWireError::LimitExceeded("frame slice overflows".into()))?;
+        if end > bytes.len() {
+            return Err(PackedWireError::Truncated {
+                what: "frame in streamed range",
+                need: end,
+                have: bytes.len(),
+            });
+        }
+        let payload = &bytes[start..end];
+        let digest: [u8; 16] = Sha256::digest(payload)[..16]
+            .try_into()
+            .expect("sha256 prefix has 16 bytes");
+        if digest != frame.frame_digest {
+            return Err(PackedWireError::Invalid(
+                "packed frame digest mismatch".into(),
+            ));
+        }
+        output.insert(frame.frame_ordinal, Bytes::copy_from_slice(payload));
+    }
+    Ok(output)
+}
+
 /// The map is populated from the pinned manifest; no metadata service is
 /// consulted while a frame is being delivered.
 #[derive(Clone)]
@@ -853,7 +1053,7 @@ impl<B: ObjectBackend + Clone + 'static> UnifiedReadSourceFetcher for PackedFram
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cadapter::client::ObjectBackend;
+    use crate::cadapter::client::{ObjectBackend, ObjectByteStream};
     use crate::cadapter::localfs::LocalFsBackend;
     use crate::chunk::cache::{ChunksCache, ChunksCacheConfig};
     use crate::workspace_overlay::packed_v3::{
@@ -864,6 +1064,61 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
     use tempfile::tempdir;
+
+    #[derive(Clone)]
+    struct ScriptedStreamBackend {
+        chunks: Arc<Vec<Vec<u8>>>,
+        error_after_chunks: Option<usize>,
+    }
+
+    #[async_trait]
+    impl ObjectBackend for ScriptedStreamBackend {
+        async fn put_object(&self, _key: &str, _data: &[u8]) -> Result<()> {
+            anyhow::bail!("scripted stream backend is read-only")
+        }
+
+        async fn get_object(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(Some(self.chunks.iter().flatten().copied().collect()))
+        }
+
+        async fn get_object_range(&self, _key: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
+            let object: Vec<u8> = self.chunks.iter().flatten().copied().collect();
+            let start = usize::try_from(offset).unwrap_or(usize::MAX);
+            if start >= object.len() {
+                return Ok(0);
+            }
+            let length = buf.len().min(object.len() - start);
+            buf[..length].copy_from_slice(&object[start..start + length]);
+            Ok(length)
+        }
+
+        async fn get_object_range_stream(
+            &self,
+            _key: &str,
+            _offset: u64,
+            _length: u64,
+        ) -> Result<ObjectByteStream> {
+            let mut items: Vec<Result<Bytes>> = self
+                .chunks
+                .iter()
+                .cloned()
+                .map(|chunk| Ok(Bytes::from(chunk)))
+                .collect();
+            if let Some(index) = self.error_after_chunks {
+                items.truncate(index);
+                items.push(Err(anyhow::anyhow!("injected stream failure")));
+            }
+            Ok(Box::pin(futures_util::stream::iter(items)))
+        }
+
+        async fn get_etag(&self, _key: &str) -> Result<String> {
+            Ok(String::new())
+        }
+
+        async fn delete_object(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[derive(Clone)]
     struct RecordingBackend {
@@ -965,6 +1220,103 @@ mod tests {
         assert_eq!(directory, opened.frames());
         let selected = remote.read_frame_descriptors([0]).await.unwrap();
         assert_eq!(selected, opened.frames());
+    }
+
+    #[tokio::test]
+    async fn exact_range_consumes_multiple_chunks() {
+        let client = ObjectClient::new(ScriptedStreamBackend {
+            chunks: Arc::new(vec![b"ab".to_vec(), b"c".to_vec(), b"def".to_vec()]),
+            error_after_chunks: None,
+        });
+
+        assert_eq!(
+            read_exact_range(&client, "object", 0, 6).await.unwrap(),
+            b"abcdef"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_range_rejects_an_interrupted_stream() {
+        let client = ObjectClient::new(ScriptedStreamBackend {
+            chunks: Arc::new(vec![b"ab".to_vec(), b"cd".to_vec()]),
+            error_after_chunks: Some(1),
+        });
+
+        assert!(matches!(
+            read_exact_range(&client, "object", 0, 4).await,
+            Err(PackedWireError::Backend(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_range_rejects_a_chunk_crossing_the_declared_bound() {
+        let client = ObjectClient::new(ScriptedStreamBackend {
+            chunks: Arc::new(vec![b"abcdefg".to_vec()]),
+            error_after_chunks: None,
+        });
+
+        assert!(matches!(
+            read_exact_range(&client, "object", 0, 6).await,
+            Err(PackedWireError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn streamed_frame_range_delivers_each_frame_without_a_range_buffer() {
+        let temp = tempdir().unwrap();
+        let client = ObjectClient::new(LocalFsBackend::new(temp.path()));
+        let object = PackedGroupContainer::build(
+            71,
+            AccessProfile::SequentialSmallFile,
+            vec![PackedGroupInput {
+                group_id: 1,
+                parent_dir_key: [0; 32],
+                metadata: GroupMeta::new(Vec::new()).unwrap().encode().unwrap(),
+                frame_ordinals: vec![0, 1],
+                entry_count: 0,
+                file_count: 0,
+                layout_profile: AccessProfile::SequentialSmallFile,
+            }],
+            vec![
+                PackedFrameInput {
+                    raw: vec![1; 24 * 1024],
+                    size_class: SizeClass::Tiny,
+                    codec: 0,
+                    first_file_slot: 0,
+                    last_file_slot: 0,
+                },
+                PackedFrameInput {
+                    raw: vec![2; 24 * 1024],
+                    size_class: SizeClass::Tiny,
+                    codec: 0,
+                    first_file_slot: 1,
+                    last_file_slot: 1,
+                },
+            ],
+        )
+        .unwrap();
+        client.put_object("streamed-group", &object).await.unwrap();
+        let opened = PackedGroupContainer::open(object).unwrap();
+        let remote = RemotePackedObject::open(
+            &client,
+            "streamed-group",
+            opened.object_len(),
+            PackedObjectKind::GroupContainer,
+        )
+        .await
+        .unwrap();
+        let first = &opened.frames()[0];
+        let second = &opened.frames()[1];
+        let start = first.object_offset;
+        let end = second.object_offset + u64::from(second.stored_len);
+
+        let frames = remote
+            .read_frames_in_range(start, end - start, &[first.clone(), second.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(frames[&0].as_ref(), vec![1; 24 * 1024]);
+        assert_eq!(frames[&1].as_ref(), vec![2; 24 * 1024]);
     }
 
     #[tokio::test]

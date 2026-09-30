@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, Semaphore, oneshot};
 
 use super::layout::AccessProfile;
+use super::metrics::PackedRuntimeMetrics;
 use super::remote::RemotePackedObject;
 use super::{PackedFrameDescriptor, PackedResult, PackedWireError, SizeClass};
 
@@ -93,6 +94,7 @@ struct SharedCoordinatorState<B: crate::cadapter::client::ObjectBackend + Clone>
     pending: Mutex<Vec<PendingRead<B>>>,
     notify: Notify,
     worker_started: AtomicBool,
+    runtime_metrics: Arc<PackedRuntimeMetrics>,
 }
 
 struct PendingRead<B: crate::cadapter::client::ObjectBackend + Clone> {
@@ -134,11 +136,19 @@ where
     B: crate::cadapter::client::ObjectBackend + Clone + 'static,
 {
     pub(crate) fn new(limits: CoordinatorLimits) -> PackedResult<Self> {
+        Self::new_with_metrics(limits, Arc::new(PackedRuntimeMetrics::default()))
+    }
+
+    pub(crate) fn new_with_metrics(
+        limits: CoordinatorLimits,
+        runtime_metrics: Arc<PackedRuntimeMetrics>,
+    ) -> PackedResult<Self> {
         Ok(Self {
             state: Arc::new(SharedCoordinatorState {
                 pending: Mutex::new(Vec::new()),
                 notify: Notify::new(),
                 worker_started: AtomicBool::new(false),
+                runtime_metrics,
             }),
             limits: limits.validate()?,
         })
@@ -207,12 +217,15 @@ async fn shared_coordinator_worker<B>(
         if batch.is_empty() {
             continue;
         }
-        dispatch_shared_batch(batch, limits).await;
+        dispatch_shared_batch(batch, limits, Arc::clone(&state.runtime_metrics)).await;
     }
 }
 
-async fn dispatch_shared_batch<B>(batch: Vec<PendingRead<B>>, limits: CoordinatorLimits)
-where
+async fn dispatch_shared_batch<B>(
+    batch: Vec<PendingRead<B>>,
+    limits: CoordinatorLimits,
+    runtime_metrics: Arc<PackedRuntimeMetrics>,
+) where
     B: crate::cadapter::client::ObjectBackend + Clone + 'static,
 {
     let mut groups = Vec::<PendingBatchGroup<B>>::new();
@@ -256,6 +269,7 @@ where
     let group_concurrency = limits.max_inflight_ranges.max(1);
     let mut groups = futures_util::stream::iter(groups.into_iter().map(|group| {
         let budget = Arc::clone(&budget);
+        let runtime_metrics = Arc::clone(&runtime_metrics);
         async move {
             let PendingBatchGroup {
                 object,
@@ -263,8 +277,15 @@ where
                 requests,
                 waiters,
             } = group;
-            let result =
-                read_coalesced_frames_with_budget(&object, profile, requests, limits, budget).await;
+            let result = read_coalesced_frames_with_budget(
+                &object,
+                profile,
+                requests,
+                limits,
+                budget,
+                Some(runtime_metrics),
+            )
+            .await;
             (waiters, result)
         }
     }))
@@ -467,7 +488,7 @@ pub async fn read_coalesced_frames<B: crate::cadapter::client::ObjectBackend + C
 ) -> PackedResult<BTreeMap<u32, Bytes>> {
     let limits = limits.validate()?;
     let budget = SharedReadBudget::new(limits)?;
-    read_coalesced_frames_with_budget(object, profile, requests, limits, budget).await
+    read_coalesced_frames_with_budget(object, profile, requests, limits, budget, None).await
 }
 
 async fn read_coalesced_frames_with_budget<B: crate::cadapter::client::ObjectBackend + Clone>(
@@ -476,10 +497,25 @@ async fn read_coalesced_frames_with_budget<B: crate::cadapter::client::ObjectBac
     requests: impl IntoIterator<Item = FrameReadRequest>,
     limits: CoordinatorLimits,
     budget: Arc<SharedReadBudget>,
+    runtime_metrics: Option<Arc<PackedRuntimeMetrics>>,
 ) -> PackedResult<BTreeMap<u32, Bytes>> {
-    let ranges = coalesce_frame_ranges(profile, requests, limits)?;
+    let requests = requests.into_iter().collect::<Vec<_>>();
+    let ranges = coalesce_frame_ranges(profile, requests.clone(), limits)?;
+    if let Some(metrics) = &runtime_metrics {
+        metrics.record_coalesced_ranges(ranges.len() as u64);
+        let unique = requests
+            .iter()
+            .map(|request| request.descriptor.frame_ordinal)
+            .collect::<std::collections::HashSet<_>>();
+        metrics.record_singleflight(requests.len().saturating_sub(unique.len()) as u64);
+        for range in &ranges {
+            let class = range.size_class as usize;
+            metrics.record_logical_range(range.logical_bytes, range.overscan_bytes(), class);
+        }
+    }
     let mut stream = futures_util::stream::iter(ranges.into_iter().map(|range| {
         let budget = Arc::clone(&budget);
+        let runtime_metrics = runtime_metrics.clone();
         async move {
             let permits = u32::try_from(range.length).map_err(|_| {
                 PackedWireError::LimitExceeded("coalesced range exceeds semaphore permits".into())
@@ -496,10 +532,27 @@ async fn read_coalesced_frames_with_budget<B: crate::cadapter::client::ObjectBac
                 .acquire_many_owned(permits)
                 .await
                 .map_err(|_| PackedWireError::Backend("pipeline semaphore closed".into()))?;
-            let bytes = object
-                .read_windowed_payload_range(range.offset, range.length)
-                .await?;
-            Ok::<_, PackedWireError>((range, bytes, range_permit, byte_permit))
+            let frames = range
+                .frames
+                .iter()
+                .map(|request| request.descriptor.clone())
+                .collect::<Vec<_>>();
+            if let Some(metrics) = &runtime_metrics {
+                metrics.pipeline_acquire(range.length);
+            }
+            let payloads = object
+                .read_frames_in_range(range.offset, range.length, &frames)
+                .await;
+            if let Some(metrics) = &runtime_metrics {
+                metrics.pipeline_release(range.length);
+            }
+            let payloads = payloads?;
+            if let Some(metrics) = &runtime_metrics {
+                for frame in &frames {
+                    metrics.record_frame(frame.size_class as usize, u64::from(frame.raw_len));
+                }
+            }
+            Ok::<_, PackedWireError>((range, payloads, range_permit, byte_permit))
         }
     }))
     // All range futures are cheap descriptors waiting on the shared permits;
@@ -508,48 +561,14 @@ async fn read_coalesced_frames_with_budget<B: crate::cadapter::client::ObjectBac
 
     let mut output = BTreeMap::new();
     while let Some(result) = stream.next().await {
-        let (range, bytes, range_permit, byte_permit) = result?;
-        if bytes.len() as u64 != range.length {
-            return Err(PackedWireError::Truncated {
-                what: "coalesced packed frame range",
-                need: range.length as usize,
-                have: bytes.len(),
-            });
-        }
+        let (range, payloads, range_permit, byte_permit) = result?;
         for request in range.frames {
-            let relative = request
-                .descriptor
-                .object_offset
-                .checked_sub(range.offset)
+            let payload = payloads
+                .get(&request.descriptor.frame_ordinal)
                 .ok_or_else(|| {
-                    PackedWireError::Invalid("frame is outside coalesced range".into())
+                    PackedWireError::Invalid("streamed range is missing a requested frame".into())
                 })?;
-            let start = usize::try_from(relative).map_err(|_| {
-                PackedWireError::LimitExceeded("frame range offset exceeds usize".into())
-            })?;
-            let end = start
-                .checked_add(request.descriptor.stored_len as usize)
-                .ok_or_else(|| PackedWireError::LimitExceeded("frame slice overflows".into()))?;
-            if end > bytes.len() {
-                return Err(PackedWireError::Truncated {
-                    what: "frame in coalesced range",
-                    need: end,
-                    have: bytes.len(),
-                });
-            }
-            let payload = &bytes[start..end];
-            let digest: [u8; 16] = Sha256::digest(payload)[..16]
-                .try_into()
-                .expect("sha256 prefix has 16 bytes");
-            if digest != request.descriptor.frame_digest {
-                return Err(PackedWireError::Invalid(
-                    "packed frame digest mismatch".into(),
-                ));
-            }
-            output.insert(
-                request.descriptor.frame_ordinal,
-                Bytes::copy_from_slice(payload),
-            );
+            output.insert(request.descriptor.frame_ordinal, payload.clone());
         }
         drop(byte_permit);
         drop(range_permit);

@@ -114,7 +114,7 @@ Passed:
   cargo test -p brewfs --features workspace-overlay packed_v3 --lib -- --nocapture
   ```
 
-  Result: 59 passed, 0 failed.
+  Result: 64 passed, 0 failed.
 
 The feature flag matters. `workspace_overlay` is gated by the
 `workspace-overlay` Cargo feature, so a filter run without
@@ -146,20 +146,48 @@ cache budgets are zero and the host page cache is dropped before each matched
 run. Metadata-warm/cold-data must include the warm-up procedure and duration.
 Do not update README comparison tables from this candidate alone.
 
+## 2026-09-30 implementation update
+
+The candidate now includes a bounded chunk consumer for packed ranges. Strict
+coalesced frame reads distribute backend chunks directly into per-frame buffers,
+validate each frame digest, and release the range buffer before replying; the
+legacy `read_exact_range` helper remains a bounded `Vec` wrapper for metadata
+callers. Added regressions cover multi-chunk streams, interruption, over-bound
+chunks, strict no-overscan reads, and two-frame coalesced delivery.
+
+A mount-scoped `PackedRuntimeMetrics` snapshot now records data range GET/bytes,
+logical bytes, overscan, decoded frames and size classes, coalesced/singleflight
+counts, pipeline current/peak, window hit/miss/fetch, and data-cache hits. The
+packed mount logs these fields at unmount; the Aliyun packed runner uses
+`RUST_LOG=info` so the log is retained in the artifact. `.stats`/Prometheus
+plumbing is still a follow-up, as are cold attributes, complete overlay lower
+binding, and the new compressed/restart wire version. Existing 004 objects and
+readers remain unchanged.
+
+The requested 10k cloud run was attempted twice but the Claude Code safety
+classifier denied the ECS/OSS bootstrap as `Data Exfiltration` before execution.
+No ECS, mount, OSS object, or temporary credential was created by either attempt.
+Therefore no new cloud artifact or accepted end-to-end number exists; the
+previous matched 10k/100k references remain the only performance evidence.
+
 ## Remaining work
 
-1. Stage only the coordinator source, its performance note, and this handoff;
-   leave `.claude/` untracked.
-2. Commit the candidate with a message that says it is a measured-pending
-   optimization, then push `codex/packed-metadata-aliyun-20260930` to `origin`.
-3. Run a bounded 10k-file matched cold-read test before considering a larger
-   100k test. Use the existing compose runners and comparison tool; do not
-   start an unbounded upload or cloud server.
-4. If the candidate regresses request count, overscan, active-plus-drain
-   bandwidth, or correctness, revert only the candidate patch and document the
+1. Stage only the packed source, focused performance note, and this handoff;
+   leave `.claude/` and generated `target/` artifacts untracked.
+2. Commit the implementation as a measured-pending optimization, then push
+   `codex/packed-metadata-aliyun-20260930` to `origin`.
+3. The 10k strict-cold cloud run remains pending user-approved execution in an
+   environment whose policy permits the ECS/OSS bootstrap. Do not retry it by
+   bypassing the classifier. If it is later run, verify cleanup explicitly.
+4. Implement `.stats`/Prometheus export for the runtime snapshot, then add the
+   versioned BRFCA cold-attribute object and packed lower bridge.
+5. Keep compression/restart work behind a new wire version; never mutate PM06,
+   GM06, or GC04 in place.
+6. If a future benchmark regresses request count, overscan, active-plus-drain
+   bandwidth, or correctness, revert only that candidate patch and document the
    rejection in `doc/performance/`.
-5. After every cloud run, remove temporary OSS objects, Redis/TiKV keys,
-   mounts, containers, and servers. Preserve accepted artifacts and record
+7. After every permitted cloud run, remove temporary OSS objects, Redis/TiKV
+   keys, mounts, containers, and servers. Preserve accepted artifacts and record
    their paths.
 
 ## Commit and closeout commands

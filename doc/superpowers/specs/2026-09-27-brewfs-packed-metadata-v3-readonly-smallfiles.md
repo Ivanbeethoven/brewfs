@@ -12,15 +12,25 @@ workspace 的实现审查结论如下，后续性能结果必须按这个边界�
 | PM/GC/GM/II wire、digest、边界校验 | 已实现 | `BRFPM004`/`BRFGC004`、`PM06`/`GC04`/`GM06`/`II05` 使用独立 magic；外层 envelope 当前是 64-byte header + 64-byte footer。 |
 | pageable group/inode index、bounded GroupMeta | 已实现 | 大快照使用 page refs；GroupMeta hard limit 为 256 KiB，目录/索引页仍按当前实现的记录上限分页；catalog 以 byte budget 保留 index page、GroupMeta、inode entry 和 hot inode locator，并在热路径共享 Arc。metadata warm-up 会先选稳定预算前缀，再按 container 合并相邻 GroupMeta range（最多 8 MiB、空洞最多 64 KiB）；warm GroupMeta 时按独立 locator 子预算 admission 热 inode locator，II05 的 `entry_ordinal` 直接定位 entry 并保留 name/inode 校验；readdir 深分页用认证的 `entry_count` 跳过前置 group，strict-cold demand read 仍只取引用的 group。 |
 | dynamic frame 和 `<256 KiB` inline payload | 已实现 | inline 受每 group 224 KiB 预算限制；frame codec 当前只接受 codec `0`。 |
-| bounded streaming range | 部分实现 | `ObjectBackend::get_object_range_stream` 和 `read_exact_range` 只消费声明的 range；严格模式不做隐藏 4 MiB overscan，但当前仍将单个 range 累积到完整 `Vec`，尚未实现 SPEC 7.6 的边读边解码/零拷贝分发。 |
+| bounded streaming range | 部分实现（strict payload 已增强） | `ObjectBackend::get_object_range_stream` 和 `read_exact_range` 只消费声明的 range；strict/coalesced frame path 现在逐 chunk 分发到独立 frame buffer、逐 frame 校验 digest，避免把 coalesced overscan range 累积为完整 `Vec`；metadata helper 仍返回 bounded `Vec`，window-cache opt-in 仍保留完整对齐窗口，因此 SPEC 7.6 的全路径零拷贝/压缩解码尚未完成。 |
 | GroupMeta/GroupContainer 压缩、restart table | **未实现** | 当前 GroupMeta 是前缀压缩 + 固定宽度字段，body 和 frame 都是 uncompressed；没有每 32 条 restart table。zstd/restart 是后续 wire 版本或兼容扩展，不能写成当前性能事实。 |
-| 跨 FUSE 请求的 coalesce delay/group window | 已实现（demand coalescing） | `SharedGroupReadCoordinator` 在 mount 级维护 pending queue，并以 1 ms 收集窗口按 container/profile 合并已提交 frame；共享 4 MiB window cache 和可选 next-window read-ahead 仍是独立的 cold-pipelined 能力。 |
+| 跨 FUSE 请求的 coalesce delay/group window | 已实现（demand coalescing） | `SharedGroupReadCoordinator` 在 mount 级维护 pending queue，并以 **250 µs** 收集窗口按 container/profile 合并已提交 frame；共享 4 MiB window cache 和可选 next-window read-ahead 仍是独立的 cold-pipelined 能力。 |
 | cold attributes (`BRFCA004`) | **未实现** | 当前只读适配器提供热属性；xattr/ACL/symlink target 的独立 cold-attribute 对象尚未发布或读取。 |
-| packed 专用 metrics | **部分实现** | window hit/miss/fetch 只有对象级 API，尚未接入 mount metrics；metadata GET、overscan、pipeline peak 等 SPEC 11 字段仍需补齐。 |
+| packed 专用 metrics | 部分实现 | mount-scoped `PackedRuntimeMetrics` 已记录 data range GET/bytes、logical/overscan、decoded frames/size class、coalesced/singleflight、pipeline peak、window hit/miss/fetch 和 data-cache hit，并在 packed mount 卸载日志输出；`.stats`/Prometheus sink、metadata/data 完整请求图和 eviction/prefetch 全字段仍需补齐。 |
 | overlay-workspace lower binding | **部分实现** | `ReadGeneration`、`ReadSource` 和 `compose_overlay_plan` 已存在；v3 readonly mount 已接入，但 workspace lifecycle 尚未把 packed lower 完整接入 P5 的 upper/lower resolver。 |
 | 共享窗口 byte budget | 已实现 | window cache 在 catalog/mount 级创建并由所有 container 复用；预算不是每个 container 一份。coordinator 的 data/range permits 也按 batch 共享；双 container 回归测试锁定这一点。 |
 
-因此本文件第 4--12 节描述的是最终 v3 目标和验收口径；当前代码可以宣称已实现的
+
+### Implementation update (2026-09-30)
+
+The strict payload path now consumes bounded object streams chunk by chunk and
+routes coalesced chunks directly into requested frame buffers. It still keeps a
+bounded `Vec` compatibility wrapper for metadata reads and an explicit full
+window for the opt-in window cache. Runtime read metrics are mount-scoped and
+logged, but are not yet exported through `.stats`/Prometheus. The 004 wire
+formats remain unchanged: cold attributes, compression/restart and complete
+workspace lower binding require explicit follow-up versions/adapters.
+
 范围以本检查表为准。`strict-cold` 结果可以包含只针对已提交请求的 demand coalescing，
 但不能隐含 GroupMeta 压缩或 BRFCA 读取；`cold-pipelined` 结果必须明确标注当前的
 mount window/read-ahead 实现。

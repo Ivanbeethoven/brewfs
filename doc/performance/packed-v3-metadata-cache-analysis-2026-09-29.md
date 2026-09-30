@@ -183,6 +183,27 @@ metadata cache/prefetch 设置与匹配基线一致，并在 `sync; echo 3 >/pro
 * packed：`docker/compose-xfstests/artifacts/aliyun-packed-v3-vs-juicefs-100k-20260928-r3/`
 * JuiceFS：同一目录下的 `juicefs/` strict-cold 结果
 
-本地 focused test 因当前环境无法解析 `static.crates.io`、缺少 `asyncfuse 0.1.12`
-下载而未运行完成；因此本候选不能被写入 README 性能表或宣称已击败 JuiceFS，待网络
-恢复后必须先通过完整 CI gate，再进行 matched compose 对照。
+
+## 2026-09-30 strict streaming and runtime metrics update
+
+本轮在保持 `BRFPM004/BRFGC004`、PM06/GC04/GM06/II05 不变的前提下补齐了两项可
+独立验证的读路径能力：
+
+1. strict/coalesced payload range 现在通过 bounded chunk consumer 逐块消费，按 frame
+   descriptor 把 chunk 分发到独立 `BytesMut`，完成后逐 frame 校验 16-byte digest；coalesced
+   gap bytes 不再先 materialize 成完整 range `Vec`。window cache 仍是显式 opt-in 的完整
+   对齐窗口，metadata `read_exact_range` 仍保留 bounded `Vec` 兼容 wrapper。
+2. 新增 mount-scoped `PackedRuntimeMetrics`，在实际 coordinator/remote 边界统计 data
+   range GET/bytes、logical/overscan、decoded frames/size class、coalesced/singleflight、
+   pipeline current/peak、window hit/miss/fetch 和 data-cache hit；packed mount 卸载日志会
+   输出 snapshot，runner 改为 `RUST_LOG=info` 以保留这些字段。`.stats`/Prometheus sink、
+   cold attributes、完整 overlay lower binding 和压缩/restart 新 wire 仍未宣称完成。
+
+本地验证通过：packed-v3 focused suite `64 passed`；workspace hard gate
+`CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace --lib --bins`
+为 `1097 passed, 0 failed, 225 ignored`；workspace check/build/clippy、fmt、脚本门禁及
+fuse-tokio/io-uring feature checks 均通过。
+
+本轮两次 10k Aliyun runner 尝试均在执行前被 Claude Code 安全策略以
+`Data Exfiltration` 拒绝，未创建 ECS、挂载、OSS 对象或临时凭据；因此没有新的云端
+吞吐结论，也没有更新 README 性能表。已有 matched JuiceFS reference 仍是性能基线。

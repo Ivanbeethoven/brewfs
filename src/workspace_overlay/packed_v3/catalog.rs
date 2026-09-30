@@ -20,6 +20,7 @@ use super::group::{FRAME_RECORD_LEN, PackedFrameDescriptor};
 use super::index::{PackedGroupIndexPage, PackedInodeIndexPage};
 use super::layout::SizeClass;
 use super::meta::{GroupMeta, GroupMetaEntry, MAX_GROUP_META_BYTES};
+use super::metrics::{PackedRuntimeMetrics, PackedRuntimeMetricsSnapshot};
 use super::remote::{
     MAX_PACKED_STREAM_RANGE_BYTES, PackedWindowCache, RemotePackedObject, read_exact_range,
 };
@@ -384,6 +385,7 @@ pub struct RemoteGroupCatalog<B: ObjectBackend + Clone> {
     /// requests for its short collection tick; decoded payloads are returned
     /// directly to the waiting FUSE calls and are not cached here.
     read_coordinator: Arc<SharedGroupReadCoordinator<B>>,
+    runtime_metrics: Arc<PackedRuntimeMetrics>,
 }
 
 impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
@@ -406,6 +408,7 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
                     .then_with(|| left.group_id.cmp(&right.group_id))
             });
         }
+        let runtime_metrics = Arc::new(PackedRuntimeMetrics::default());
         let catalog = Self {
             client,
             manifest: Arc::new(manifest),
@@ -460,9 +463,13 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
             frame_descriptor_remote_gets: Arc::new(AtomicU64::new(0)),
             frame_descriptor_remote_bytes: Arc::new(AtomicU64::new(0)),
             read_coordinator: Arc::new(
-                SharedGroupReadCoordinator::new(CoordinatorLimits::default())
-                    .expect("default packed coordinator limits are valid"),
+                SharedGroupReadCoordinator::new_with_metrics(
+                    CoordinatorLimits::default(),
+                    Arc::clone(&runtime_metrics),
+                )
+                .expect("default packed coordinator limits are valid"),
             ),
+            runtime_metrics,
         };
         catalog.with_metadata_cache_bytes(DEFAULT_METADATA_CACHE_BYTES)
     }
@@ -591,6 +598,10 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
             file_locator_entries: self.file_locators.entry_count(),
             file_locator_bytes: self.file_locators.weighted_size(),
         }
+    }
+
+    pub fn packed_runtime_metrics(&self) -> PackedRuntimeMetricsSnapshot {
+        self.runtime_metrics.snapshot()
     }
 
     /// Warm immutable routing and group metadata before the FUSE mount starts
@@ -2321,6 +2332,7 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
         let client = self.client.clone();
         let payload_cache = self.payload_cache.clone();
         let frame_window_cache = self.frame_window_cache.clone();
+        let runtime_metrics = Arc::clone(&self.runtime_metrics);
         let snapshot_id = self.manifest.snapshot_id;
         let object_digest = container.object_digest;
         self.containers
@@ -2350,7 +2362,9 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
                     .await?
                 };
                 Ok::<_, PackedWireError>(Arc::new(
-                    object.with_shared_frame_window_cache(frame_window_cache),
+                    object
+                        .with_runtime_metrics(runtime_metrics)
+                        .with_shared_frame_window_cache(frame_window_cache),
                 ))
             })
             .await
@@ -2910,6 +2924,12 @@ mod tests {
         let stats = catalog.metadata_cache_stats();
         assert!(stats.hits >= 2, "metadata cache stats: {stats:?}");
         assert!(stats.file_locator_entries >= 2);
+        let runtime = catalog.packed_runtime_metrics();
+        assert_eq!(runtime.data_range_gets, 1);
+        assert_eq!(runtime.logical_bytes, 14);
+        assert_eq!(runtime.frames_decoded, 2);
+        assert_eq!(runtime.coalesced_ranges, 1);
+        assert!(runtime.pipeline_bytes_peak > 0);
     }
 
     #[tokio::test]

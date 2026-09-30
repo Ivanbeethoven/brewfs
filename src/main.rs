@@ -1314,6 +1314,27 @@ where
         file_locator_bytes = metadata_stats.file_locator_bytes,
         "packed v3 metadata cache stats"
     );
+    let packed_runtime_stats = catalog.packed_runtime_metrics();
+    tracing::info!(
+        packed_data_range_gets = packed_runtime_stats.data_range_gets,
+        packed_data_range_bytes = packed_runtime_stats.data_range_bytes,
+        packed_logical_bytes = packed_runtime_stats.logical_bytes,
+        packed_overscan_bytes = packed_runtime_stats.overscan_bytes,
+        packed_frames_decoded = packed_runtime_stats.frames_decoded,
+        packed_coalesced_ranges = packed_runtime_stats.coalesced_ranges,
+        packed_inflight_singleflight = packed_runtime_stats.inflight_singleflight,
+        packed_pipeline_bytes_current = packed_runtime_stats.pipeline_bytes_current,
+        packed_pipeline_bytes_peak = packed_runtime_stats.pipeline_bytes_peak,
+        packed_prefetched_logical_bytes = packed_runtime_stats.prefetched_logical_bytes,
+        packed_data_cache_hits = packed_runtime_stats.data_cache_hits,
+        packed_window_cache_hits = packed_runtime_stats.window_cache_hits,
+        packed_window_cache_misses = packed_runtime_stats.window_cache_misses,
+        packed_window_remote_fetches = packed_runtime_stats.window_remote_fetches,
+        packed_frames_by_size_class = ?packed_runtime_stats.frames_by_size_class,
+        packed_frame_raw_bytes_by_size_class = ?packed_runtime_stats.frame_raw_bytes_by_size_class,
+        packed_overscan_by_size_class = ?packed_runtime_stats.overscan_by_size_class,
+        "packed v3 runtime read stats"
+    );
     mount_result
 }
 

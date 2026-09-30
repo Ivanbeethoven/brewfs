@@ -339,7 +339,7 @@ export BREWFS_FUSE_READ_DIRECT_IO=__READ_DIRECT_IO__
 export PERF_TOOL_TIMEOUT_SECONDS=__TOOL_TIMEOUT_SECONDS__
 export BREWFS_FUSE_KEEP_CACHE=0
 export BREWFS_NOFILE_LIMIT=1048576
-export RUST_LOG=warn
+export RUST_LOG=info
 
 mem_kib="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
 disk_bytes="$(df -B1 --output=size "$WORK" | tail -n 1 | tr -d ' ')"
