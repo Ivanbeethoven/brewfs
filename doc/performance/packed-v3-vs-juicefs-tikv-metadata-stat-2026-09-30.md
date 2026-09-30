@@ -62,14 +62,14 @@ and mounted through BrewFS' S3-compatible HTTP backend. This keeps the scan
 metadata-only while exercising real HTTP Range GETs during mount warm-up:
 
 ```text
-mount_ready_ms=315.466
+mount_ready_ms=323.348
 metadata_warmup_ms=206
-scan_seconds=0.380335
-mount_plus_scan_seconds=0.734778
-files_per_sec=26292.58
-stat_latency_p50_ms=0.414927
-stat_latency_p95_ms=1.285356
-scanner_peak_rss_kib=38616
+scan_seconds=0.377112
+mount_plus_scan_seconds=0.768167
+files_per_sec=26517.33
+stat_latency_p50_ms=0.439063
+stat_latency_p95_ms=1.148058
+scanner_peak_rss_kib=38428
 files=10000
 errors=0
 data_range_gets=0
@@ -77,9 +77,8 @@ frames_decoded=0
 frame_directory_remote_gets=0
 ```
 
-The process lacked permission to drop the host page cache, so this is explicitly
-a metadata-warm local HTTP integration result, not a strict-cold artifact. The
-run still started a fresh mount and removed its temporary fixture, mount, cache,
+The host page cache was dropped successfully with non-interactive sudo immediately
+before the fresh mount. The run removed its temporary fixture, mount, cache,
 RustFS container and Compose volumes on exit.
 
 
@@ -92,15 +91,14 @@ metadata backend for JuiceFS than remote TiKV. Both sides used the same 10 ×
 
 | mounted-FUSE scan | seconds | files/s | payload bytes |
 | --- | ---: | ---: | ---: |
-| packed v3, RustFS HTTP metadata, eager warm | 0.380335 | 26,292.58 | 0 |
+| packed v3, RustFS HTTP metadata, eager warm | 0.377112 | 26,517.33 | 0 |
 | JuiceFS + Redis, attr/entry/dir/open caches disabled | 0.651548 | 15,348.05 | 0 |
 
-The packed HTTP scanner phase is `1.71x` the Redis strict scan rate. This is useful
+The packed HTTP scanner phase is `1.73x` the Redis strict scan rate. This is useful
 diagnostic evidence that metadata-only immutable scans are the right candidate
-scenario, but it is not the requested JuiceFS+TiKV result. The packed HTTP run
-could not drop host page cache, and the two filesystems use different metadata
-backends/layouts by design. Packed mount readiness was 315.466 ms and its
-metadata warm-up was 206 ms; mount plus scan was 0.734778 s. The JuiceFS artifact is:
+scenario, but it is not the requested JuiceFS+TiKV result. The two filesystems
+use different metadata backends/layouts by design. Packed mount readiness was
+323.348 ms; mount plus scan was 0.768167 s. The JuiceFS artifact is:
 
 ```text
 docker/compose-xfstests/artifacts/juicefs-perf-run-1790783857-8985/
