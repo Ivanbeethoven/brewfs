@@ -491,8 +491,13 @@ run_with_timeout() {
     local deadline=$((SECONDS + TOOL_TIMEOUT_SECONDS))
     while kill -0 "$command_pid" 2>/dev/null; do
         if (( SECONDS >= deadline )); then
+            # Kill the scanner's own children before the caller unmounts, so a
+            # timed-out epoch cannot report ENOENT for a filesystem that the
+            # runner is actively taking away.
+            pkill -TERM -P "$command_pid" 2>/dev/null || true
             kill -TERM "$command_pid" 2>/dev/null || true
             sleep 10
+            pkill -KILL -P "$command_pid" 2>/dev/null || true
             kill -KILL "$command_pid" 2>/dev/null || true
             wait "$command_pid" 2>/dev/null || true
             return 124

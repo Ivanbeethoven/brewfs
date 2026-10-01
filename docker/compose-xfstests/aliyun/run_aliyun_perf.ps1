@@ -49,7 +49,7 @@ param(
     [string]$ReadDirectIo = '1',
     [ValidateSet('0', '1')]
     [string]$FuseKeepCache = '0',
-    [ValidateRange(30, 7200)]
+    [ValidateRange(30, 14400)]
     [int]$ToolTimeoutSeconds = 900,
     [string]$S3Bucket,
     [string]$S3Endpoint,

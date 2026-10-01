@@ -36,7 +36,7 @@ param(
     [UInt64]$PackedMetadataCacheBytes = 268435456,
     [ValidateSet('off', 'auto', 'eager')]
     [string]$PackedMetadataPrefetch = 'auto',
-    [ValidateRange(30, 7200)]
+    [ValidateRange(30, 14400)]
     [int]$ToolTimeoutSeconds = 900,
     [string]$PackedExistingManifestKey,
     [switch]$PackedSkipFixture,

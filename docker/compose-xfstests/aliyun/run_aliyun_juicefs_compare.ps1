@@ -25,7 +25,7 @@ param(
     [int64]$DirsPerLevel = 10,
     [int64]$FilesPerDir = 100,
     [string]$PerfTools = 'juicefs-tree juicefs-smallfiles',
-    [ValidateRange(30, 7200)][int]$ToolTimeoutSeconds = 7200,
+    [ValidateRange(30, 14400)][int]$ToolTimeoutSeconds = 7200,
     [ValidateRange(0, 200)]
     [int]$MetadataLatencyMs = 0,
     [string]$ArtifactDirectory

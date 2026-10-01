@@ -184,8 +184,14 @@ EOF
     local deadline=$((SECONDS + TOOL_TIMEOUT_SECONDS))
     while kill -0 "$command_pid" 2>/dev/null; do
         if (( SECONDS >= deadline )); then
+            # Terminate the scanner's own process tree before unmounting.
+            # Killing only the wrapping subshell leaves the child reading a
+            # filesystem that is about to disappear, and every in-flight
+            # open then reports a spurious ENOENT.
+            pkill -TERM -P "$command_pid" 2>/dev/null || true
             kill -TERM "$command_pid" 2>/dev/null || true
             sleep 10
+            pkill -KILL -P "$command_pid" 2>/dev/null || true
             kill -KILL "$command_pid" 2>/dev/null || true
             status=124
             break
