@@ -43,6 +43,10 @@ RANGE_BACKGROUND_PREFETCH="${BREWFS_RANGE_BACKGROUND_PREFETCH:-false}"
 PACKED_METADATA_CACHE_BYTES="${BREWFS_PACKED_METADATA_CACHE_BYTES:-268435456}"
 PACKED_METADATA_PREFETCH="${BREWFS_PACKED_METADATA_PREFETCH:-auto}"
 PACKED_DECODED_FRAME_CACHE_BYTES="${BREWFS_PACKED_DECODED_FRAME_CACHE_BYTES:-0}"
+# FUSE kernel attribute/entry cache TTL for this mount. Packed keeps the
+# shared default of 1s; strict or cold profiles set 0 explicitly so both
+# filesystems are measured with the same metadata caching policy.
+METADATA_CACHE_TTL_MS="${BREWFS_METADATA_CACHE_TTL_MS:-1000}"
 TOOL_TIMEOUT_SECONDS="${PERF_TOOL_TIMEOUT_SECONDS:-900}"
 
 case "$PACKED_VOLUME_FORMAT" in
@@ -175,6 +179,7 @@ frame_window_cache_bytes=${BREWFS_PACKED_FRAME_WINDOW_CACHE_BYTES:-0}
 frame_window_prefetch=${BREWFS_PACKED_FRAME_WINDOW_PREFETCH:-false}
 range_background_prefetch=$RANGE_BACKGROUND_PREFETCH
 workers=$SMALLFILE_WORKERS
+metadata_cache_ttl_ms=$METADATA_CACHE_TTL_MS
 page_cache=dropped
 EOF
     start_mount || die "BrewFS mount failed before $name"

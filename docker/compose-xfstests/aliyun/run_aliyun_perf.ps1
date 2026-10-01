@@ -49,6 +49,8 @@ param(
     [string]$ReadDirectIo = '1',
     [ValidateSet('0', '1')]
     [string]$FuseKeepCache = '0',
+    [ValidateRange(0, 86400000)]
+    [int64]$MetadataCacheTtlMs = 0,
     [ValidateRange(30, 14400)]
     [int]$ToolTimeoutSeconds = 900,
     [string]$S3Bucket,
@@ -350,6 +352,7 @@ export BREWFS_RANGE_BACKGROUND_PREFETCH=__RANGE_BACKGROUND_PREFETCH__
 export BREWFS_FUSE_READ_DIRECT_IO=__READ_DIRECT_IO__
 export PERF_TOOL_TIMEOUT_SECONDS=__TOOL_TIMEOUT_SECONDS__
 export BREWFS_FUSE_KEEP_CACHE=__FUSE_KEEP_CACHE__
+export BREWFS_METADATA_CACHE_TTL_MS=__METADATA_CACHE_TTL_MS__
 export BREWFS_NOFILE_LIMIT=1048576
 export RUST_LOG=info
 
@@ -439,6 +442,7 @@ done
         '__RANGE_BACKGROUND_PREFETCH__' = Quote-Bash ($RangeBackgroundPrefetch.ToString().ToLowerInvariant())
         '__READ_DIRECT_IO__' = Quote-Bash $ReadDirectIo
         '__FUSE_KEEP_CACHE__' = Quote-Bash $FuseKeepCache
+        '__METADATA_CACHE_TTL_MS__' = Quote-Bash $MetadataCacheTtlMs
         '__TOOL_TIMEOUT_SECONDS__' = Quote-Bash ([string]$ToolTimeoutSeconds)
         '__TOOLS__' = Quote-Bash $PerfTools
         '__INSTANCE_TYPE__' = Quote-Bash $InstanceType

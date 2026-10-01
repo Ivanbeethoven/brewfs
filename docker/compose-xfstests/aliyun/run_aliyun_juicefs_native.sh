@@ -42,6 +42,10 @@ METADATA_LATENCY_MS="${JFS_METADATA_LATENCY_MS:-0}"
 SMALLFILE_MIN_SIZE="${JFS_SMALLFILE_MIN_SIZE:-$JFS_SMALLFILE_SIZE}"
 SMALLFILE_MAX_SIZE="${JFS_SMALLFILE_MAX_SIZE:-$JFS_SMALLFILE_SIZE}"
 SMALLFILE_WORKERS="${JFS_SMALLFILE_WORKERS:-16}"
+# Kernel/client metadata cache TTL. Strict profiles use 0 so both
+# filesystems are measured without metadata caching; the readonly
+# optimized profile passes a long TTL on both sides.
+METADATA_CACHE_TTL_SEC="${JFS_METADATA_CACHE_TTL_SEC:-0}"
 TOOL_TIMEOUT_SECONDS="${JFS_TOOL_TIMEOUT_SECONDS:-7200}"
 # Match BrewFS' FUSE request and kernel readahead contract for A/B tests.
 JFS_MAX_FUSE_IO="${JFS_MAX_FUSE_IO:-4M}"
@@ -256,14 +260,15 @@ mount_profile() {
     fi
     rm -rf -- "$CACHE_DIR"
     mkdir -p "$CACHE_DIR"
-    printf 'cache_size_mib=%s\nprefetch_blocks=%s\nmax_fuse_io=%s\nmax_readahead=%s\n' \
-        "$cache_size" "$prefetch" "$JFS_MAX_FUSE_IO" "$JFS_MAX_READAHEAD" \
+    printf 'cache_size_mib=%s\nprefetch_blocks=%s\nmax_fuse_io=%s\nmax_readahead=%s\nmetadata_cache_ttl_sec=%s\n' \
+        "$cache_size" "$prefetch" "$JFS_MAX_FUSE_IO" "$JFS_MAX_READAHEAD" "$METADATA_CACHE_TTL_SEC" \
         >"$ARTIFACT_DIR/mount-${profile}.env"
     "$JUICEFS_BIN" mount "$META_URL" "$MOUNT_DIR" \
         --storage oss --bucket "$S3_BUCKET_URL" \
         --buffer-size "$buffer_size" --cache-size "$cache_size" --prefetch "$prefetch" \
         --cache-dir "$CACHE_DIR" --max-fuse-io "$JFS_MAX_FUSE_IO" --max-readahead "$JFS_MAX_READAHEAD" \
-        --attr-cache 0s --entry-cache 0s --dir-entry-cache 0s --open-cache 0s \
+        --attr-cache "${METADATA_CACHE_TTL_SEC}s" --entry-cache "${METADATA_CACHE_TTL_SEC}s" \
+        --dir-entry-cache "${METADATA_CACHE_TTL_SEC}s" --open-cache "${METADATA_CACHE_TTL_SEC}s" \
         --no-usage-report --read-only -d --metrics 127.0.0.1:9567 \
         --log "$WORK/juicefs-${profile}.log" >/dev/null 2>&1
     for _ in $(seq 1 60); do mountpoint -q "$MOUNT_DIR" && break; sleep 1; done

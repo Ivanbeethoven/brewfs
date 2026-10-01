@@ -26,6 +26,8 @@ param(
     [int64]$FilesPerDir = 100,
     [string]$PerfTools = 'juicefs-tree juicefs-smallfiles',
     [ValidateRange(30, 14400)][int]$ToolTimeoutSeconds = 7200,
+    [ValidateRange(0, 86400)]
+    [int]$MetadataCacheTtlSec = 0,
     [ValidateRange(0, 200)]
     [int]$MetadataLatencyMs = 0,
     [string]$ArtifactDirectory
@@ -207,6 +209,7 @@ export JFS_DIR_LEVELS=__LEVELS__
 export JFS_DIRS_PER_LEVEL=__FANOUT__
 export JFS_FILES_PER_DIR=__FILES_PER_DIR__
 export JFS_PERF_TOOLS=__PERF_TOOLS__
+export JFS_METADATA_CACHE_TTL_SEC=__METADATA_CACHE_TTL_SEC__
 export JFS_TOOL_TIMEOUT_SECONDS=__TOOL_TIMEOUT_SECONDS__
 export JFS_VOLUME_NAME=__VOLUME_NAME__
 export JFS_DATA_PREFIX=__DATA_PREFIX__
@@ -253,6 +256,7 @@ for proof in "$ARTIFACT_DIR"/metadata-*.env; do [[ -f "$proof" ]] && { echo "###
         '__FANOUT__' = (Quote-Bash ([string]$DirsPerLevel))
         '__FILES_PER_DIR__' = (Quote-Bash ([string]$FilesPerDir))
         '__PERF_TOOLS__' = (Quote-Bash $PerfTools)
+        '__METADATA_CACHE_TTL_SEC__' = (Quote-Bash ([string]$MetadataCacheTtlSec))
         '__TOOL_TIMEOUT_SECONDS__' = (Quote-Bash ([string]$ToolTimeoutSeconds))
         '__META_BACKEND__' = (Quote-Bash $MetadataBackend)
         '__TIKV_VERSION__' = (Quote-Bash $TikvVersion)
