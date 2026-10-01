@@ -215,7 +215,7 @@ def emit_summary(summary: dict[str, object]) -> None:
         f"{key}={value:.6f}" if isinstance(value, float) else f"{key}={value}"
         for key, value in summary.items()
     )
-    print(f"smallfiles_scan_summary {rendered}")
+    print(f"smallfiles_scan_summary {rendered}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
