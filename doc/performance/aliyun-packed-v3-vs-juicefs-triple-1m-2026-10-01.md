@@ -2,9 +2,13 @@
 
 ## Status
 
-The matched 10k smoke passed for all three filesystems/backends. The 1M run is
-approved to start on a fresh disposable ECS after the runner changes pass local
-gates. No 1M result is recorded yet.
+The matched 10k smoke passed for all three filesystems/backends, and the
+lexicographic 1M baseline completed for all three rows. The GPU-like shuffled
+1M campaign is in progress; its packed cold epoch is recorded below and the
+remaining rows are still pending.
+
+No claim is made here for a GPU-shaped 1M win until packed, Redis and TiKV all
+complete the same two-epoch profile.
 
 ## Workload contract
 
@@ -153,6 +157,31 @@ performs stat/open/read-to-EOF and validates every payload byte. Epoch 1 is the
 cold/shuffled result; epoch 2 measures repeated-epoch behavior. Packed strict
 and explicit warm-frame-cache profiles remain separate. The lexicographic table
 above remains a namespace/sequential baseline only.
+
+### Packed 1M shuffled cold epoch
+
+Measured on the same 1M x 4 KiB fixture, buffered FUSE, decoded-frame cache 0,
+metadata budget 512 MiB and prefetch `auto`:
+
+```text
+files=1000000 expected_files=1000000 errors=0 checksum=127493920
+logical_bytes=4096000000 payload_bytes=4096000000
+seconds=5067.53 files_per_sec=197.33 mib_per_sec=0.77
+latency_p50_ms=77.19 latency_p95_ms=142.86 peak_rss_kib=706540
+```
+
+Full validation passed for the cold epoch: every one of the 1,000,000 files was
+read to EOF and byte-compared. The run then hit the two-hour tool limit during
+epoch 2; that attempt is invalid and its epoch-2 `ENOENT` entries were an
+artifact of the runner unmounting the filesystem while the scanner process was
+still alive, not a metadata loss. The runner now terminates the scanner's own
+process tree before unmounting and permits a four-hour tool timeout, so the
+rerun keeps a real epoch-2 measurement.
+
+Random 4 KiB shuffled access is close to the worst case for this packed layout:
+the run recorded 775,628 physical data ranges and 189.96 GB fetched for
+4.096 GB logical payload, with inode-index and GroupMeta re-reads dominating
+because a 512 MiB metadata budget covers only a prefix of a 1M-inode snapshot.
 
 ## 1M acceptance
 
