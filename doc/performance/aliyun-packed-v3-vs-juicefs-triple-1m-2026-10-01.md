@@ -187,6 +187,26 @@ entries reported `ENOENT`. That was a harness artifact, not a metadata loss. The
 runner now stops the scanner's own process tree before unmounting and accepts a
 four-hour tool timeout, so the rerun keeps a real epoch-2 measurement.
 
+### Packed warm-frame-cache row
+
+The same fixture, shuffle seed, batch and worker settings, with an explicit 4 GiB
+exact decoded-frame cache and zero persistent data cache:
+
+| epoch | files/s | MiB/s | p50 ms | p95 ms | errors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 (cold, shuffled) | 369.05 | 1.442 | 41.06 | 83.28 | 0 |
+| 2 (repeated epoch) | 411.12 | 1.606 | 38.94 | 75.41 | 0 |
+
+Both epochs passed with 5,145.98 s active and 5.39 s drain. The exact decoded
+cache lifts the cold shuffled epoch about 1.98x over the strict row, because a
+4 KiB random workload revisits shared frames immediately. It does not change
+epoch 2: both rows are then dominated by the kernel page cache, so the two rows
+converge at about 411 files/s.
+
+This is the important distinction for the GPU-shaped workload: packed v3's
+advantage is in the first, cold pass over an immutable snapshot, not in steady
+repeated epochs once the kernel already serves the payload.
+
 ## 1M acceptance
 
 The 1M result is valid only if all three tools pass for all three rows, every
