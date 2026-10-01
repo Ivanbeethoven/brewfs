@@ -215,4 +215,6 @@ if ($DryRun) {
 }
 
 & $scriptPath @runnerParams
-exit $LASTEXITCODE
+if ($LASTEXITCODE -ne 0) {
+    throw "shared Aliyun runner failed with exit code $LASTEXITCODE"
+}

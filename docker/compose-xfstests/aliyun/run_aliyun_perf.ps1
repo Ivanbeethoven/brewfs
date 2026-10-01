@@ -383,16 +383,19 @@ fi
 cat "$WORK/aliyun-resource-proof.env"
 echo '--- packed native perf summary ---'
 cat "$ARTIFACT_DIR/perf-summary.tsv"
-echo '--- packed native tool tails ---'
+echo '--- packed native concise diagnostics ---'
 for log in "$ARTIFACT_DIR"/tools/*.log; do
-  echo "### $log"
-  tail -n 12 "$log" || true
+  [[ -f "$log" ]] || continue
+  grep -a 'smallfiles_scan_summary' "$log" || tail -n 4 "$log" || true
 done
-echo '--- packed native stats ---'
+for mount_log in "$ARTIFACT_DIR"/tools/*-brewfs.log; do
+  [[ -f "$mount_log" ]] || continue
+  grep -a -E 'packed v3 (metadata prefetch complete|metadata cache stats|runtime read stats)' "$mount_log" || true
+done
 for stats in "$ARTIFACT_DIR"/tools/*.stats; do
   [[ -f "$stats" ]] || continue
   echo "### $stats"
-  cat "$stats" || true
+  grep -a -E '^(brewfs_uptime_seconds|brewfs_fuse_(read|lookup|readdir|getattr)_|brewfs_cache_|brewfs_read_(block_cache|page_cache|range_gets|full_gets))' "$stats" || true
 done
 '@
     $values = @{
@@ -542,7 +545,7 @@ try {
     if (-not (Test-Path -LiteralPath $ScannerPath)) {
         throw "找不到共享 small-file scanner: $ScannerPath"
     }
-    $ScannerPath = (Resolve-Path -LiteralPath $ScannerPath).Path
+    $ScannerPath = (Resolve-Path -LiteralPath $ScannerPath).ProviderPath
     Publish-OssObject $BinaryPath "$ObjectPrefix/bin/brewfs"
     $fixtureName = switch ($VolumeFormat) {
         'packed-metadata-v2' { 'packed_v2_snapshot_fixture'; break }

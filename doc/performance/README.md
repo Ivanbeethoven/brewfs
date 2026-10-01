@@ -30,6 +30,11 @@ cache-contaminated numbers cannot be mistaken for an acceptance baseline.
   and rejected window/coalescing candidates. It is a warm-frame-cache result,
   not a strict-cold JuiceFS comparison.
 
+- [aliyun-packed-v3-vs-juicefs-triple-1m-2026-10-01.md](aliyun-packed-v3-vs-juicefs-triple-1m-2026-10-01.md)
+  defines the million-file packed/Redis/TiKV cloud contract, records the matched
+  three-way 10k smoke and resource cleanup proof, and is the acceptance record
+  for the pending 1M run.
+
 Cold-read artifacts are valid only when the runner records zero data-cache
 hits. The runner now forces zero read-memory/SSD budgets, disables prefetch,
 requests kernel cache eviction, and fails a tool when any data-cache hit is

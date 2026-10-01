@@ -29,7 +29,8 @@ param(
     [string]$RepoRoot,
     [string]$ArtifactDirectory,
     [string]$WslDistribution = 'Ubuntu-24.04',
-    [ValidateSet('redis', 'tikv')][string]$MetadataBackend = 'redis',
+    [ValidateSet('', 'redis', 'tikv')][string]$MetadataBackend = '',
+    [ValidateSet('redis', 'tikv')][string[]]$MetadataBackends = @('redis', 'tikv'),
     [string]$TikvVersion = 'v6.5.3',
     [string]$PerfTools = 'packed-smallfiles packed-posix',
     [string]$JuiceFsPerfTools = 'juicefs-tree juicefs-smallfiles',
@@ -135,16 +136,17 @@ function Invoke-Runner([string]$Path, [hashtable]$Parameters, [string]$LogPath) 
 $script:Aliyun = Resolve-Aliyun
 $rootPrefix = $ObjectPrefix.TrimEnd('/')
 $packedPrefix = "$rootPrefix/packed"
-$juicePrefix = "$rootPrefix/juicefs"
+$rawPrefix = "$rootPrefix/juicefs/raw"
+$selectedBackends = if ($MetadataBackend) { @($MetadataBackend) } else { @($MetadataBackends) }
+if (-not $selectedBackends -or $selectedBackends.Count -eq 0) { throw 'At least one JuiceFS metadata backend is required.' }
 $artifactRoot = if ($ArtifactDirectory) { $ArtifactDirectory } else { Join-Path $scriptDir '..\artifacts\aliyun-packed-v3-vs-juicefs' }
 New-Item -ItemType Directory -Force -Path $artifactRoot | Out-Null
 $createLog = Join-Path $artifactRoot 'create.log'
 $packedLog = Join-Path $artifactRoot 'packed-run.log'
-$juiceLog = Join-Path $artifactRoot 'juicefs-run.log'
 $script:InstanceId = $null
 
 if ($DryRun) {
-    Write-Host "Dry run: one ECS, packed prefix=$packedPrefix, JuiceFS prefix=$juicePrefix"
+    Write-Host "Dry run: one ECS, packed prefix=$packedPrefix, raw prefix=$rawPrefix, backends=$($selectedBackends -join ',')"
     Write-Host "  files=$SmallFileCount size=${SmallFileMinSizeBytes}-${SmallFileMaxSizeBytes} levels=$DirLevels fanout=$DirsPerLevel files_per_leaf=$FilesPerLeaf"
     exit 0
 }
@@ -217,30 +219,40 @@ try {
     }
     Invoke-Runner $packedScript $packedParams $packedLog | Out-Null
 
-    $juiceParams = @{
-        InstanceId = $script:InstanceId
-        S3Bucket = $S3Bucket
-        S3Region = $S3Region
-        S3Endpoint = $S3Endpoint
-        S3AccessKey = $S3AccessKey
-        S3SecretKey = $S3SecretKey
-        ObjectPrefix = $juicePrefix
-        JuiceFsBinaryPath = $JuiceFsBinaryPath
-        RawFixtureBinaryPath = $RawFixtureBinaryPath
-        RunnerPath = (Join-Path $scriptDir 'run_aliyun_juicefs_native.sh')
-        MetadataBackend = $MetadataBackend
-        TikvVersion = $TikvVersion
-        SmallFileCount = $SmallFileCount
-        SmallFileSizeBytes = $SmallFileSizeBytes
-        SmallFileMinSizeBytes = $SmallFileMinSizeBytes
-        SmallFileMaxSizeBytes = $SmallFileMaxSizeBytes
-        DirLevels = $DirLevels
-        DirsPerLevel = $DirsPerLevel
-        FilesPerDir = $FilesPerLeaf
-        PerfTools = $JuiceFsPerfTools
-        ArtifactDirectory = (Join-Path $artifactRoot 'juicefs')
+    for ($backendIndex = 0; $backendIndex -lt $selectedBackends.Count; $backendIndex++) {
+        $backend = [string]$selectedBackends[$backendIndex]
+        $juicePrefix = "$rootPrefix/juicefs/$backend"
+        $juiceArtifact = Join-Path $artifactRoot "juicefs-$backend"
+        $juiceLog = Join-Path $artifactRoot "juicefs-$backend-run.log"
+        $juiceParams = @{
+            InstanceId = $script:InstanceId
+            S3Bucket = $S3Bucket
+            S3Region = $S3Region
+            S3Endpoint = $S3Endpoint
+            S3AccessKey = $S3AccessKey
+            S3SecretKey = $S3SecretKey
+            ObjectPrefix = $juicePrefix
+            RawObjectPrefix = $rawPrefix
+            SkipRawUpload = ($backendIndex -gt 0)
+            KeepRawObjects = ($backendIndex -lt $selectedBackends.Count - 1)
+            JuiceFsBinaryPath = $JuiceFsBinaryPath
+            RawFixtureBinaryPath = $RawFixtureBinaryPath
+            RunnerPath = (Join-Path $scriptDir 'run_aliyun_juicefs_native.sh')
+            MetadataBackend = $backend
+            TikvVersion = $TikvVersion
+            SmallFileCount = $SmallFileCount
+            SmallFileSizeBytes = $SmallFileSizeBytes
+            SmallFileMinSizeBytes = $SmallFileMinSizeBytes
+            SmallFileMaxSizeBytes = $SmallFileMaxSizeBytes
+            DirLevels = $DirLevels
+            DirsPerLevel = $DirsPerLevel
+            FilesPerDir = $FilesPerLeaf
+            PerfTools = $JuiceFsPerfTools
+            ToolTimeoutSeconds = $ToolTimeoutSeconds
+            ArtifactDirectory = $juiceArtifact
+        }
+        Invoke-Runner $juiceScript $juiceParams $juiceLog | Out-Null
     }
-    Invoke-Runner $juiceScript $juiceParams $juiceLog | Out-Null
     Write-Host "Comparison completed. Artifacts: $artifactRoot"
 }
 finally {

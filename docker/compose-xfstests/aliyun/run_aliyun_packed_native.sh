@@ -68,6 +68,7 @@ mkdir -p "$WORK" "$ARTIFACT_DIR/tools" "$MOUNT_DIR"
 chmod 0755 "$BREWFS_BIN" "$PACKED_FIXTURE_BIN" "$PACKED_SMALLFILES_SCANNER"
 
 BREWFS_PID=""
+CURRENT_TOOL="startup"
 stop_mount() {
     if [[ -n "$BREWFS_PID" ]] && kill -0 "$BREWFS_PID" 2>/dev/null; then
         kill "$BREWFS_PID" 2>/dev/null || true
@@ -137,7 +138,7 @@ start_mount() {
     write_config
     mkdir -p "$MOUNT_DIR"
     "$BREWFS_BIN" mount --privileged --config "$CONFIG_PATH" "$MOUNT_DIR" \
-        >"$ARTIFACT_DIR/brewfs.log" 2>&1 &
+        >"$ARTIFACT_DIR/tools/${CURRENT_TOOL}-brewfs.log" 2>&1 &
     BREWFS_PID=$!
     local deadline=$((SECONDS + 90))
     while (( SECONDS < deadline )); do
@@ -146,7 +147,7 @@ start_mount() {
         fi
         if ! kill -0 "$BREWFS_PID" 2>/dev/null; then
             wait "$BREWFS_PID" || true
-            tail -n 80 "$ARTIFACT_DIR/brewfs.log" >&2 || true
+            tail -n 80 "$ARTIFACT_DIR/tools/${CURRENT_TOOL}-brewfs.log" >&2 || true
             return 1
         fi
         sleep 1
@@ -158,7 +159,8 @@ run_tool() {
     local name="$1"
     shift
     local log_path="$ARTIFACT_DIR/tools/$name.log"
-    local start_ns end_ns elapsed_ns status=0
+    local start_ns end_ns elapsed_ns drain_start_ns drain_end_ns drain_ns status=0
+    CURRENT_TOOL="$name"
     stop_mount
     rm -rf -- "$CACHE_ROOT"
     drop_caches || die "drop_caches failed before $name; refusing to report a cached read"
@@ -202,9 +204,14 @@ EOF
             tr -d '\0' <"$MOUNT_DIR/$stats_name" >"$ARTIFACT_DIR/tools/${name}-${stats_name#.}.stats" || true
         fi
     done
+    drain_start_ns="$(date +%s%N)"
     stop_mount
-    printf '%s\t%s\t%.6f\t%s\n' "$name" "$([[ "$status" -eq 0 ]] && echo pass || echo "fail($status)")" \
-        "$(awk -v ns="$elapsed_ns" 'BEGIN { print ns / 1000000000 }')" "$log_path" \
+    drain_end_ns="$(date +%s%N)"
+    drain_ns=$((drain_end_ns - drain_start_ns))
+    printf '%s\t%s\t%.6f\t%.6f\t%.6f\t%s\n' "$name" "$([[ "$status" -eq 0 ]] && echo pass || echo "fail($status)")" \
+        "$(awk -v ns="$elapsed_ns" 'BEGIN { print ns / 1000000000 }')" \
+        "$(awk -v ns="$drain_ns" 'BEGIN { print ns / 1000000000 }')" \
+        "$(awk -v a="$elapsed_ns" -v d="$drain_ns" 'BEGIN { print (a + d) / 1000000000 }')" "$log_path" \
         >>"$ARTIFACT_DIR/perf-summary.tsv"
     if [[ "$status" -ne 0 ]]; then
         tail -n 30 "$log_path" >&2 || true
@@ -473,7 +480,7 @@ fio_read() {
         --group_reporting=1 --output-format=normal
 }
 
-printf 'tool\tstatus\tseconds\tlog\n' >"$ARTIFACT_DIR/perf-summary.tsv"
+printf 'tool\tstatus\tactive_seconds\tdrain_seconds\tactive_plus_drain_seconds\tlog\n' >"$ARTIFACT_DIR/perf-summary.tsv"
 if [[ "${PACKED_SKIP_FIXTURE:-false}" == "true" ]]; then
     : "${PACKED_EXISTING_MANIFEST_KEY:?PACKED_EXISTING_MANIFEST_KEY is required when PACKED_SKIP_FIXTURE=true}"
     printf '%s\n' "$PACKED_EXISTING_MANIFEST_KEY" >"$FIXTURE_MANIFEST"

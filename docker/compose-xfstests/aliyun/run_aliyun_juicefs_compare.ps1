@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$InstanceId,
     [Parameter(Mandatory = $true)][string]$S3Bucket,
@@ -7,6 +7,9 @@ param(
     [string]$S3AccessKey,
     [string]$S3SecretKey,
     [string]$ObjectPrefix = ('brewfs-jfs-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss')),
+    [string]$RawObjectPrefix,
+    [switch]$SkipRawUpload,
+    [switch]$KeepRawObjects,
     [string]$JuiceFsBinaryPath,
     [string]$RawFixtureBinaryPath,
     [string]$RunnerPath,
@@ -22,6 +25,7 @@ param(
     [int64]$DirsPerLevel = 10,
     [int64]$FilesPerDir = 100,
     [string]$PerfTools = 'juicefs-tree juicefs-smallfiles',
+    [ValidateRange(30, 7200)][int]$ToolTimeoutSeconds = 7200,
     [ValidateRange(0, 200)]
     [int]$MetadataLatencyMs = 0,
     [string]$ArtifactDirectory
@@ -39,7 +43,7 @@ if (-not $ScannerPath) {
 if (-not (Test-Path -LiteralPath $ScannerPath)) {
     throw "找不到共享 smallfiles scanner: $ScannerPath"
 }
-$ScannerPath = (Resolve-Path -LiteralPath $ScannerPath).Path
+$ScannerPath = (Resolve-Path -LiteralPath $ScannerPath).ProviderPath
 
 function Resolve-Executable([string]$Name, [string[]]$Candidates = @()) {
     $command = Get-Command $Name -ErrorAction SilentlyContinue
@@ -57,7 +61,7 @@ if ($JuiceFsBinaryPath) {
     if (-not (Test-Path -LiteralPath $JuiceFsBinaryPath)) {
         throw "找不到 JuiceFS 二进制: $JuiceFsBinaryPath"
     }
-    $JuiceFsBinaryPath = (Resolve-Path -LiteralPath $JuiceFsBinaryPath).Path
+    $JuiceFsBinaryPath = (Resolve-Path -LiteralPath $JuiceFsBinaryPath).ProviderPath
 } else {
     $juiceFsCandidates = @(
         (Join-Path $PSScriptRoot 'juicefs'),
@@ -75,7 +79,7 @@ if (-not $RawFixtureBinaryPath) {
 if (-not (Test-Path -LiteralPath $RawFixtureBinaryPath)) {
     throw "找不到 raw SDK fixture binary: $RawFixtureBinaryPath"
 }
-$RawFixtureBinaryPath = (Resolve-Path -LiteralPath $RawFixtureBinaryPath).Path
+$RawFixtureBinaryPath = (Resolve-Path -LiteralPath $RawFixtureBinaryPath).ProviderPath
 if ($SmallFileMinSizeBytes -le 0) { $SmallFileMinSizeBytes = $SmallFileSizeBytes }
 if ($SmallFileMaxSizeBytes -le 0) { $SmallFileMaxSizeBytes = $SmallFileSizeBytes }
 if ($SmallFileMinSizeBytes -gt $SmallFileMaxSizeBytes -or $SmallFileMaxSizeBytes -gt 4MB) {
@@ -133,8 +137,9 @@ $credentials = Get-Credentials
 $S3AccessKey = $credentials[0]
 $S3SecretKey = $credentials[1]
 $prefix = $ObjectPrefix.TrimEnd('/')
-$script:RawObjectPrefix = "$prefix/raw"
-$script:JuiceFsObjectPrefix = "jfs-" + $prefix.Replace('/', '-')
+$script:RawObjectPrefix = if ($RawObjectPrefix) { $RawObjectPrefix.Trim('/') } else { "$prefix/raw" }
+$script:JuiceFsObjectPrefix = "$prefix/data"
+$script:JuiceFsVolumeName = "jfs-" + $prefix.Replace('/', '-').Replace('_', '-').Replace('.', '-')
 $credentialPath = Join-Path ([IO.Path]::GetTempPath()) ("brewfs-jfs-{0}.env" -f [Guid]::NewGuid().ToString('N'))
 $credentialText = @(
     "export AWS_ACCESS_KEY_ID=$(Quote-Bash $S3AccessKey)"
@@ -192,6 +197,7 @@ export JFS_S3_ENDPOINT=__S3_ENDPOINT__
 export JFS_RAW_FIXTURE_BIN="$WORK/packed_v3_snapshot_fixture"
 export JFS_SMALLFILES_SCANNER="$WORK/smallfiles_scan.py"
 export JFS_RAW_OBJECT_PREFIX=__RAW_OBJECT_PREFIX__
+export JFS_SKIP_RAW_UPLOAD=__SKIP_RAW_UPLOAD__
 export JFS_SMALLFILE_COUNT=__COUNT__
 export JFS_SMALLFILE_SIZE=__SIZE__
 export JFS_SMALLFILE_MIN_SIZE=__MIN_SIZE__
@@ -201,7 +207,9 @@ export JFS_DIR_LEVELS=__LEVELS__
 export JFS_DIRS_PER_LEVEL=__FANOUT__
 export JFS_FILES_PER_DIR=__FILES_PER_DIR__
 export JFS_PERF_TOOLS=__PERF_TOOLS__
+export JFS_TOOL_TIMEOUT_SECONDS=__TOOL_TIMEOUT_SECONDS__
 export JFS_VOLUME_NAME=__VOLUME_NAME__
+export JFS_DATA_PREFIX=__DATA_PREFIX__
 export JFS_META_BACKEND=__META_BACKEND__
 export JFS_TIKV_VERSION=__TIKV_VERSION__
 export JFS_PREFETCH_CACHE_SIZE_MIB=4096
@@ -219,6 +227,12 @@ else
   exit "$status"
 fi
 cat "$ARTIFACT_DIR/perf-summary.tsv"
+printf '%s\n' '--- JuiceFS scanner summaries ---'
+for log in "$ARTIFACT_DIR"/scan-*.log; do [[ -f "$log" ]] && { echo "### $log"; tail -n 4 "$log"; }; done
+printf '%s\n' '--- JuiceFS cache proof ---'
+cat "$ARTIFACT_DIR/cache-proof.env" 2>/dev/null || true
+printf '%s\n' '--- JuiceFS metadata backend snapshots ---'
+for proof in "$ARTIFACT_DIR"/metadata-*.env; do [[ -f "$proof" ]] && { echo "### $proof"; cat "$proof"; }; done
 '@
     $values = @{
         '__JUICEFS_URL__' = (Quote-Bash $binaryUrl)
@@ -230,6 +244,7 @@ cat "$ARTIFACT_DIR/perf-summary.tsv"
         '__S3_REGION__' = (Quote-Bash $S3Region)
         '__S3_ENDPOINT__' = (Quote-Bash $S3Endpoint)
         '__RAW_OBJECT_PREFIX__' = (Quote-Bash $script:RawObjectPrefix)
+        '__SKIP_RAW_UPLOAD__' = (Quote-Bash ($SkipRawUpload.ToString().ToLowerInvariant()))
         '__COUNT__' = (Quote-Bash ([string]$SmallFileCount))
         '__SIZE__' = (Quote-Bash ([string]$SmallFileSizeBytes))
         '__MIN_SIZE__' = (Quote-Bash ([string]$SmallFileMinSizeBytes))
@@ -238,10 +253,12 @@ cat "$ARTIFACT_DIR/perf-summary.tsv"
         '__FANOUT__' = (Quote-Bash ([string]$DirsPerLevel))
         '__FILES_PER_DIR__' = (Quote-Bash ([string]$FilesPerDir))
         '__PERF_TOOLS__' = (Quote-Bash $PerfTools)
+        '__TOOL_TIMEOUT_SECONDS__' = (Quote-Bash ([string]$ToolTimeoutSeconds))
         '__META_BACKEND__' = (Quote-Bash $MetadataBackend)
         '__TIKV_VERSION__' = (Quote-Bash $TikvVersion)
         '__METADATA_LATENCY_MS__' = (Quote-Bash ([string]$MetadataLatencyMs))
-        '__VOLUME_NAME__' = (Quote-Bash $script:JuiceFsObjectPrefix)
+        '__VOLUME_NAME__' = (Quote-Bash $script:JuiceFsVolumeName)
+        '__DATA_PREFIX__' = (Quote-Bash $script:JuiceFsObjectPrefix)
     }
     foreach ($key in $values.Keys) { $remote = $remote.Replace($key, [string]$values[$key]) }
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remote))
@@ -267,13 +284,18 @@ cat "$ARTIFACT_DIR/perf-summary.tsv"
 }
 finally {
     Remove-Item -LiteralPath $credentialPath -Force -ErrorAction SilentlyContinue
-    if ($script:RawObjectPrefix) {
-        try { Invoke-Checked $Aliyun @('oss', 'rm', "oss://$S3Bucket/$prefix", '--region', $S3Region, '--recursive', '--force') | Out-Null } catch { Write-Warning $_ }
+    if ($script:RawObjectPrefix -and -not $KeepRawObjects) {
+        try { Invoke-Checked $Aliyun @('oss', 'rm', "oss://$S3Bucket/$($script:RawObjectPrefix)", '--region', $S3Region, '--recursive', '--force') | Out-Null } catch { Write-Warning $_ }
     }
     if ($script:JuiceFsObjectPrefix) {
         try {
             Invoke-Checked $Aliyun @('oss', 'rm', "oss://$S3Bucket/$($script:JuiceFsObjectPrefix)", '--region', $S3Region, '--recursive', '--force') | Out-Null
         } catch { Write-Warning "JuiceFS object prefix cleanup failed: $($_.Exception.Message)" }
+    }
+    if ($prefix) {
+        try {
+            Invoke-Checked $Aliyun @('oss', 'rm', "oss://$S3Bucket/$prefix", '--region', $S3Region, '--recursive', '--force') | Out-Null
+        } catch { Write-Warning "JuiceFS run prefix cleanup failed: $($_.Exception.Message)" }
     }
     if ($script:CredentialKey) {
         try { Invoke-Checked $Aliyun @('oss', 'rm', "oss://$S3Bucket/$script:CredentialKey", '--region', $S3Region, '--force') | Out-Null } catch { Write-Warning $_ }

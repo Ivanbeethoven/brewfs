@@ -32,7 +32,8 @@ TIKV_PID_FILE="$WORK/tiup-playground.pid"
 META_URL="${JFS_META_URL:-}"
 S3_ENDPOINT_HOST="${JFS_S3_ENDPOINT#https://}"
 S3_ENDPOINT_HOST="${S3_ENDPOINT_HOST#http://}"
-S3_BUCKET_URL="${JFS_BUCKET_URL:-https://${JFS_S3_BUCKET}.${S3_ENDPOINT_HOST}}"
+DATA_PREFIX="${JFS_DATA_PREFIX:-juicefs-data-${VOLUME_NAME}}"
+S3_BUCKET_URL="${JFS_BUCKET_URL:-https://${JFS_S3_BUCKET}.${S3_ENDPOINT_HOST}/${DATA_PREFIX#/}}"
 RAW_SOURCE_URL="oss://${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}@${JFS_S3_BUCKET}.${S3_ENDPOINT_HOST}/${JFS_RAW_OBJECT_PREFIX#/}/"
 PREFETCH_CACHE_SIZE_MIB="${JFS_PREFETCH_CACHE_SIZE_MIB:-4096}"
 PREFETCH_BLOCKS="${JFS_PREFETCH_BLOCKS:-16}"
@@ -41,6 +42,7 @@ METADATA_LATENCY_MS="${JFS_METADATA_LATENCY_MS:-0}"
 SMALLFILE_MIN_SIZE="${JFS_SMALLFILE_MIN_SIZE:-$JFS_SMALLFILE_SIZE}"
 SMALLFILE_MAX_SIZE="${JFS_SMALLFILE_MAX_SIZE:-$JFS_SMALLFILE_SIZE}"
 SMALLFILE_WORKERS="${JFS_SMALLFILE_WORKERS:-16}"
+TOOL_TIMEOUT_SECONDS="${JFS_TOOL_TIMEOUT_SECONDS:-7200}"
 # Match BrewFS' FUSE request and kernel readahead contract for A/B tests.
 JFS_MAX_FUSE_IO="${JFS_MAX_FUSE_IO:-4M}"
 JFS_MAX_READAHEAD="${JFS_MAX_READAHEAD:-16M}"
@@ -82,6 +84,12 @@ cleanup() {
             rm -f "$TIKV_PID_FILE"
         fi
         pkill -TERM -f "$TIKV_HOME" >/dev/null 2>&1 || true
+        for _ in $(seq 1 30); do
+            pgrep -f "$TIKV_HOME" >/dev/null 2>&1 || break
+            sleep 1
+        done
+        pkill -KILL -f "$TIKV_HOME" >/dev/null 2>&1 || true
+        rm -rf -- "$TIKV_HOME"
     fi
 }
 trap cleanup EXIT INT TERM
@@ -170,8 +178,8 @@ start_metadata() {
         redis) start_redis ;;
         tikv) start_tikv ;;
     esac
-    printf 'metadata_backend=%s\nmetadata_url=%s\ntikv_version=%s\n' \
-        "$META_BACKEND" "$META_URL" "$TIKV_VERSION" \
+    printf 'metadata_backend=%s\nmetadata_url=%s\ntikv_version=%s\ndata_prefix=%s\n' \
+        "$META_BACKEND" "$META_URL" "$TIKV_VERSION" "$DATA_PREFIX" \
         >"$ARTIFACT_DIR/metadata-proof.env"
 }
 
@@ -197,22 +205,26 @@ prepare_dataset() {
     [[ -f "$marker" ]] && return 0
     stop_mount
     rm -rf -- "$CACHE_DIR" "$WORK/raw-manifest-key.txt"
-    log "uploading deterministic raw files with SDK"
-    "$JFS_RAW_FIXTURE_BIN" \
-        --bucket "$JFS_S3_BUCKET" \
-        --endpoint "$JFS_S3_ENDPOINT" \
-        --region "$JFS_S3_REGION" \
-        --prefix "$JFS_RAW_OBJECT_PREFIX" \
-        --dir-levels "$JFS_DIR_LEVELS" \
-        --dirs-per-level "$JFS_DIRS_PER_LEVEL" \
-        --files-per-dir "$JFS_FILES_PER_DIR" \
-        --small-file-size "$JFS_SMALLFILE_SIZE" \
-        --small-file-min-size "$SMALLFILE_MIN_SIZE" \
-        --small-file-max-size "$SMALLFILE_MAX_SIZE" \
-        --raw-only true \
-        --manifest-output "$WORK/raw-manifest-key.txt" \
-        >"$ARTIFACT_DIR/raw-upload.log" 2>&1
-    [[ -s "$WORK/raw-manifest-key.txt" ]] || die 'raw SDK uploader did not produce a manifest key'
+    if [[ "${JFS_SKIP_RAW_UPLOAD:-false}" == true ]]; then
+        log "reusing deterministic raw fixture prefix: $JFS_RAW_OBJECT_PREFIX"
+    else
+        log "uploading deterministic raw files with SDK"
+        "$JFS_RAW_FIXTURE_BIN" \
+            --bucket "$JFS_S3_BUCKET" \
+            --endpoint "$JFS_S3_ENDPOINT" \
+            --region "$JFS_S3_REGION" \
+            --prefix "$JFS_RAW_OBJECT_PREFIX" \
+            --dir-levels "$JFS_DIR_LEVELS" \
+            --dirs-per-level "$JFS_DIRS_PER_LEVEL" \
+            --files-per-dir "$JFS_FILES_PER_DIR" \
+            --small-file-size "$JFS_SMALLFILE_SIZE" \
+            --small-file-min-size "$SMALLFILE_MIN_SIZE" \
+            --small-file-max-size "$SMALLFILE_MAX_SIZE" \
+            --raw-only true \
+            --manifest-output "$WORK/raw-manifest-key.txt" \
+            >"$ARTIFACT_DIR/raw-upload.log" 2>&1
+        [[ -s "$WORK/raw-manifest-key.txt" ]] || die 'raw SDK uploader did not produce a manifest key'
+    fi
     log "importing raw OSS objects through JuiceFS sync without FUSE"
     myfs="$META_URL" "$JUICEFS_BIN" sync \
         --threads 32 --list-threads 4 \
@@ -409,6 +421,75 @@ scan_stat() {
         >"$ARTIFACT_DIR/scan-${profile}-${log_suffix}.log" 2>&1
 }
 
+scan_shared() {
+    local profile="$1"
+    local log_suffix="$2"
+    local mode="$3"
+    local scanner="${JFS_SMALLFILES_SCANNER:-}"
+    [[ -n "$scanner" && -x "$scanner" ]] || die "JFS_SMALLFILES_SCANNER must point to tools/perf/smallfiles_scan.py"
+    "$scanner" \
+        --root "$MOUNT_DIR" \
+        --label "juicefs-${META_BACKEND}-${log_suffix}" \
+        --mode "$mode" \
+        --expected-files "$JFS_SMALLFILE_COUNT" \
+        --min-size "$SMALLFILE_MIN_SIZE" \
+        --max-size "$SMALLFILE_MAX_SIZE" \
+        --dir-levels "$JFS_DIR_LEVELS" \
+        --dirs-per-level "$JFS_DIRS_PER_LEVEL" \
+        --files-per-leaf "$JFS_FILES_PER_DIR" \
+        --workers "$SMALLFILE_WORKERS" \
+        --json-output "$ARTIFACT_DIR/scan-${profile}-${log_suffix}.json" \
+        >"$ARTIFACT_DIR/scan-${profile}-${log_suffix}.log" 2>&1
+}
+
+snapshot_metadata_backend() {
+    local label="$1"
+    local output="$ARTIFACT_DIR/metadata-${label}.env"
+    case "$META_BACKEND" in
+        redis)
+            {
+                printf 'backend=redis\n'
+                redis-cli -h 127.0.0.1 INFO commandstats | awk -F'[:,=]' '/^cmdstat_/ { calls += $3 } END { printf "command_calls_total=%d\n", calls }'
+                redis-cli -h 127.0.0.1 INFO memory | awk -F: '/^used_memory:/ { gsub("\\r", "", $2); print "used_memory_bytes=" $2 }'
+                redis-cli -h 127.0.0.1 DBSIZE | awk '{ print "keys=" $1 }'
+            } >"$output"
+            ;;
+        tikv)
+            {
+                printf 'backend=tikv\n'
+                curl -fsS --max-time 5 http://127.0.0.1:2379/pd/api/v1/cluster/status \
+                    | python3 -c 'import json,sys; d=json.load(sys.stdin); print("pd_status=" + json.dumps(d, sort_keys=True, separators=(",", ":")))' \
+                    || printf 'pd_status=unavailable\n'
+                curl -fsS --max-time 5 http://127.0.0.1:2379/pd/api/v1/stores \
+                    | python3 -c 'import json,sys; d=json.load(sys.stdin); print("store_count=" + str(len(d.get("stores", []))))' \
+                    || printf 'store_count=unavailable\n'
+                curl -fsS --max-time 5 http://127.0.0.1:20180/metrics \
+                    | awk '/^tikv_storage_command_total[{ ]/ {sum += $NF} END {printf "storage_command_total=%.0f\n", sum}' \
+                    || printf 'storage_command_total=unavailable\n'
+            } >"$output"
+            ;;
+    esac
+}
+
+run_with_timeout() {
+    local log_path="$1"
+    shift
+    "$@" >"$log_path" 2>&1 &
+    local command_pid=$!
+    local deadline=$((SECONDS + TOOL_TIMEOUT_SECONDS))
+    while kill -0 "$command_pid" 2>/dev/null; do
+        if (( SECONDS >= deadline )); then
+            kill -TERM "$command_pid" 2>/dev/null || true
+            sleep 10
+            kill -KILL "$command_pid" 2>/dev/null || true
+            wait "$command_pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+    done
+    wait "$command_pid"
+}
+
 run_tool_profile() {
     local profile="$1"
     local tool="$2"
@@ -423,15 +504,17 @@ run_tool_profile() {
     cache_files_before="$(find "$CACHE_DIR" -type f -printf '%p\n' 2>/dev/null | wc -l)"
     cache_files_before="${cache_files_before:-0}"
     scrape_metrics "${profile}-${tool}-before"
-    local start_ns end_ns status=0
+    snapshot_metadata_backend "${profile}-${tool}-before"
+    local start_ns end_ns drain_start_ns drain_end_ns drain_ns status=0
     start_ns="$(date +%s%N)"
     case "$tool" in
-        juicefs-tree) scan_tree "$profile" tree || status=$? ;;
-        juicefs-stat) scan_stat "$profile" stat || status=$? ;;
-        juicefs-smallfiles) scan_smallfiles "$profile" smallfiles || status=$? ;;
+        juicefs-tree) run_with_timeout "$ARTIFACT_DIR/scan-${profile}-tree.log" scan_shared "$profile" tree tree || status=$? ;;
+        juicefs-stat) run_with_timeout "$ARTIFACT_DIR/scan-${profile}-stat.log" scan_shared "$profile" stat stat || status=$? ;;
+        juicefs-smallfiles) run_with_timeout "$ARTIFACT_DIR/scan-${profile}-smallfiles.log" scan_shared "$profile" smallfiles full || status=$? ;;
         *) die "unsupported JuiceFS tool: $tool" ;;
     esac
     end_ns="$(date +%s%N)"
+    snapshot_metadata_backend "${profile}-${tool}-after"
     scrape_metrics "${profile}-${tool}-after"
     local cache_bytes_after
     cache_bytes_after="$(du -sb "$CACHE_DIR" 2>/dev/null | awk '{print $1}')"
@@ -444,11 +527,16 @@ run_tool_profile() {
         "$cache_files_before" "$cache_files_after" \
         >>"$ARTIFACT_DIR/cache-proof.env"
     local elapsed_ns=$((end_ns - start_ns))
-    printf '%s\t%s\t%.6f\t%s\n' "${profile}-${tool}" \
+    drain_start_ns="$(date +%s%N)"
+    stop_mount
+    drain_end_ns="$(date +%s%N)"
+    drain_ns=$((drain_end_ns - drain_start_ns))
+    printf '%s\t%s\t%.6f\t%.6f\t%.6f\t%s\n' "${profile}-${tool}" \
         "$([[ "$status" -eq 0 ]] && echo pass || echo "fail($status)")" \
         "$(awk -v ns="$elapsed_ns" 'BEGIN { print ns / 1000000000 }')" \
+        "$(awk -v ns="$drain_ns" 'BEGIN { print ns / 1000000000 }')" \
+        "$(awk -v a="$elapsed_ns" -v d="$drain_ns" 'BEGIN { print (a + d) / 1000000000 }')" \
         "$ARTIFACT_DIR/scan-${profile}-${tool#juicefs-}.log" >>"$ARTIFACT_DIR/perf-summary.tsv"
-    stop_mount
     [[ "$status" -eq 0 ]] || return "$status"
 }
 
@@ -465,7 +553,7 @@ start_metadata
 format_volume
 prepare_dataset
 apply_metadata_latency
-printf 'profile\tstatus\tseconds\tlog\n' >"$ARTIFACT_DIR/perf-summary.tsv"
+printf 'profile\tstatus\tactive_seconds\tdrain_seconds\tactive_plus_drain_seconds\tlog\n' >"$ARTIFACT_DIR/perf-summary.tsv"
 status=0
 run_profile strict || status=1
 printf 'files=%s file_size=%s-%s levels=%s fanout=%s files_per_leaf=%s cache=0 prefetch=0\n' \
