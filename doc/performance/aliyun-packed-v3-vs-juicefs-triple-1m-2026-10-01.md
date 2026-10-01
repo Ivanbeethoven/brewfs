@@ -158,30 +158,34 @@ cold/shuffled result; epoch 2 measures repeated-epoch behavior. Packed strict
 and explicit warm-frame-cache profiles remain separate. The lexicographic table
 above remains a namespace/sequential baseline only.
 
-### Packed 1M shuffled cold epoch
+### Packed 1M shuffled two-epoch result
 
 Measured on the same 1M x 4 KiB fixture, buffered FUSE, decoded-frame cache 0,
-metadata budget 512 MiB and prefetch `auto`:
+metadata budget 512 MiB, prefetch `auto`, 16 workers, batch 256, deterministic
+shuffle seed `20261001`:
 
-```text
-files=1000000 expected_files=1000000 errors=0 checksum=127493920
-logical_bytes=4096000000 payload_bytes=4096000000
-seconds=5067.53 files_per_sec=197.33 mib_per_sec=0.77
-latency_p50_ms=77.19 latency_p95_ms=142.86 peak_rss_kib=706540
-```
+| epoch | files/s | MiB/s | p50 ms | p95 ms | errors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 (cold, shuffled) | 186.54 | 0.729 | 80.79 | 153.28 | 0 |
+| 2 (repeated epoch) | 411.35 | 1.607 | 38.98 | 75.10 | 0 |
 
-Full validation passed for the cold epoch: every one of the 1,000,000 files was
-read to EOF and byte-compared. The run then hit the two-hour tool limit during
-epoch 2; that attempt is invalid and its epoch-2 `ENOENT` entries were an
-artifact of the runner unmounting the filesystem while the scanner process was
-still alive, not a metadata loss. The runner now terminates the scanner's own
-process tree before unmounting and permits a four-hour tool timeout, so the
-rerun keeps a real epoch-2 measurement.
+Both epochs validated 1,000,000 files, 4,096,000,000 payload bytes and checksum
+`127493920`; the runner reported `pass` with 7,795.58 s active and 5.09 s drain,
+and scanner peak RSS stayed at 690 MiB.
 
-Random 4 KiB shuffled access is close to the worst case for this packed layout:
-the run recorded 775,628 physical data ranges and 189.96 GB fetched for
-4.096 GB logical payload, with inode-index and GroupMeta re-reads dominating
-because a 512 MiB metadata budget covers only a prefix of a 1M-inode snapshot.
+Random 4 KiB shuffled access is close to the worst case for this packed layout.
+The cold epoch issued 775,628 physical data ranges and fetched 189.96 GB for
+4.096 GB of logical payload, and the metadata budget covered only a prefix of the
+1M-inode snapshot, so inode-index and GroupMeta pages were re-read repeatedly.
+The repeated epoch improves about 2.2x because payload bytes come from the kernel
+page cache, but it still returns to userspace for every lookup.
+
+An earlier attempt at this row is invalid and is not used for any number above:
+it hit the two-hour tool limit during epoch 2, and the runner then unmounted the
+filesystem while the scanner process was still running, so the surviving epoch-2
+entries reported `ENOENT`. That was a harness artifact, not a metadata loss. The
+runner now stops the scanner's own process tree before unmounting and accepts a
+four-hour tool timeout, so the rerun keeps a real epoch-2 measurement.
 
 ## 1M acceptance
 
