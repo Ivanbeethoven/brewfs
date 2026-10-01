@@ -2,13 +2,13 @@
 
 ## Status
 
-The matched 10k smoke passed for all three filesystems/backends, and the
-lexicographic 1M baseline completed for all three rows. The GPU-like shuffled
-1M campaign is in progress; its packed cold epoch is recorded below and the
-remaining rows are still pending.
+The matched 10k smoke passed for all three filesystems/backends, the
+lexicographic 1M baseline completed for all three rows, and the GPU-like
+shuffled 1M campaign completed for all four packed/Redis/TiKV rows with full
+byte validation and zero errors.
 
-No claim is made here for a GPU-shaped 1M win until packed, Redis and TiKV all
-complete the same two-epoch profile.
+**Conclusion: packed v3 does not win the shuffled GPU-shaped 1M profile.** It
+does win the ordered and metadata-dominant profiles recorded below.
 
 ## Workload contract
 
@@ -219,33 +219,54 @@ Same fixture, shuffle seed, batch and worker settings, `cache-size=0`,
 
 Both epochs passed with 2,441.75 s active and 2.71 s drain.
 
-### Shuffled 1M comparison so far
+### JuiceFS + TiKV row
 
-| profile | epoch 1 files/s | epoch 2 files/s |
-| --- | ---: | ---: |
-| packed strict (decoded cache 0) | 186.54 | 411.35 |
-| packed warm (decoded cache 4 GiB) | 369.05 | 411.12 |
-| JuiceFS + Redis strict | 826.84 | 814.01 |
+Same fixture and settings, with the TiKV v6.5.3 playground started by the
+runner and metadata caches disabled:
+
+| epoch | files/s | MiB/s | p50 ms | p95 ms | errors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 (cold, shuffled) | 590.73 | 2.308 | 24.46 | 43.80 | 0 |
+| 2 (repeated epoch) | 600.66 | 2.346 | 24.38 | 43.81 | 0 |
+
+Both epochs passed with 3,361.20 s active and 2.74 s drain. Importing 1M objects
+into TiKV took about 42 minutes versus about 18 minutes for Redis.
+
+### Complete shuffled 1M comparison
+
+| profile | epoch 1 files/s | epoch 2 files/s | epoch 1 MiB/s | epoch 1 p50/p95 ms | errors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| packed strict (decoded cache 0) | 186.54 | 411.35 | 0.729 | 80.79 / 153.28 | 0 |
+| packed warm (decoded cache 4 GiB) | 369.05 | 411.12 | 1.442 | 41.06 / 83.28 | 0 |
+| JuiceFS + Redis strict | 826.84 | 814.01 | 3.230 | 16.29 / 37.70 | 0 |
+| JuiceFS + TiKV strict | 590.73 | 600.66 | 2.308 | 24.46 / 43.80 | 0 |
+
+Every row validated 1,000,000 files, 4,096,000,000 payload bytes and checksum
+`127493920` on both epochs with zero errors, so the comparison is like-for-like.
+
+**Result: packed v3 does not win the shuffled GPU-shaped 1M profile.** Redis is
+2.24x ahead of the best packed row, and TiKV is 1.60x ahead.
 
 Random 4 KiB shuffled access is a hostile case for packed v3. Redis answers a
 shuffled stat/open on a warm keyspace in tens of microseconds, while packed must
 resolve the inode through an authenticated page and then fetch a physical frame;
-with 4 KiB files that ratio is roughly one frame per file, and the cold shuffled
-epoch fell to about 0.73 MiB/s with 775,628 physical ranges and 189.96 GB fetched
-for 4.096 GB of payload.
+with 4 KiB files that is roughly one frame per file, and the cold shuffled epoch
+fell to about 0.73 MiB/s with 775,628 physical ranges and 189.96 GB fetched for
+4.096 GB of payload.
 
-The decoded-frame cache recovers about half of that gap but does not close it.
-Its remaining cost is metadata, not payload: a 512 MiB budget cannot hold the
-inode index and GroupMeta of a 1M-inode snapshot, so repeated lookups re-read
-index pages from OSS. The strict row shows the same effect through
-`packed_inode_index_remote_gets` and `packed_group_meta_remote_gets` in the tens
-of thousands.
+The decoded-frame cache recovers about half the gap but does not close it. Its
+remaining cost is metadata, not payload: a 512 MiB budget cannot hold the inode
+index and GroupMeta of a 1M-inode snapshot, so repeated lookups re-read index
+pages from OSS, visible as `packed_inode_index_remote_gets` and
+`packed_group_meta_remote_gets` in the tens of thousands.
 
-By contrast, the lexicographic 1M baseline shows packed far ahead on tree and
-stat scans and roughly tied on full read against TiKV. The two profiles together
-bracket the honest claim: packed v3 wins when access is ordered or
-metadata-dominant, and loses when a tiny random-read workload is dominated by
-per-file physical payload and metadata misses.
+The packed rows still pay off where they did in the lexicographic campaign and in
+the 10k metadata-only smoke: ordered access and metadata-dominant scans. The
+honest summary across both 1M profiles is that packed v3 wins on ordered and
+metadata-heavy reads, and loses on a tiny random-read workload dominated by
+per-file payload and metadata misses. Making packed competitive in the shuffled
+profile needs a smaller hot working set per inode (or a metadata layout that
+avoids a remote page per random lookup), not more payload caching.
 
 ## 1M acceptance
 
