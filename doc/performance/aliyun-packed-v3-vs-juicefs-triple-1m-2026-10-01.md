@@ -207,6 +207,46 @@ This is the important distinction for the GPU-shaped workload: packed v3's
 advantage is in the first, cold pass over an immutable snapshot, not in steady
 repeated epochs once the kernel already serves the payload.
 
+### JuiceFS + Redis row
+
+Same fixture, shuffle seed, batch and worker settings, `cache-size=0`,
+`prefetch=0`, and metadata caches disabled on both sides for a fair strict row:
+
+| epoch | files/s | MiB/s | p50 ms | p95 ms | errors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 (cold, shuffled) | 826.84 | 3.230 | 16.29 | 37.70 | 0 |
+| 2 (repeated epoch) | 814.01 | 3.180 | 18.15 | 38.39 | 0 |
+
+Both epochs passed with 2,441.75 s active and 2.71 s drain.
+
+### Shuffled 1M comparison so far
+
+| profile | epoch 1 files/s | epoch 2 files/s |
+| --- | ---: | ---: |
+| packed strict (decoded cache 0) | 186.54 | 411.35 |
+| packed warm (decoded cache 4 GiB) | 369.05 | 411.12 |
+| JuiceFS + Redis strict | 826.84 | 814.01 |
+
+Random 4 KiB shuffled access is a hostile case for packed v3. Redis answers a
+shuffled stat/open on a warm keyspace in tens of microseconds, while packed must
+resolve the inode through an authenticated page and then fetch a physical frame;
+with 4 KiB files that ratio is roughly one frame per file, and the cold shuffled
+epoch fell to about 0.73 MiB/s with 775,628 physical ranges and 189.96 GB fetched
+for 4.096 GB of payload.
+
+The decoded-frame cache recovers about half of that gap but does not close it.
+Its remaining cost is metadata, not payload: a 512 MiB budget cannot hold the
+inode index and GroupMeta of a 1M-inode snapshot, so repeated lookups re-read
+index pages from OSS. The strict row shows the same effect through
+`packed_inode_index_remote_gets` and `packed_group_meta_remote_gets` in the tens
+of thousands.
+
+By contrast, the lexicographic 1M baseline shows packed far ahead on tree and
+stat scans and roughly tied on full read against TiKV. The two profiles together
+bracket the honest claim: packed v3 wins when access is ordered or
+metadata-dominant, and loses when a tiny random-read workload is dominated by
+per-file physical payload and metadata misses.
+
 ## 1M acceptance
 
 The 1M result is valid only if all three tools pass for all three rows, every
