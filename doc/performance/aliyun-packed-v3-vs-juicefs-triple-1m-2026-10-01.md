@@ -82,6 +82,55 @@ The 10k smoke ECS was stopped/deleted after completion. An independent
 `DescribeInstances` query returned zero instances for its id, and an OSS JSON
 listing returned zero objects under the smoke root prefix.
 
+## Completed lexicographic 1M baseline
+
+The first 1M campaign completed all three rows with the lexicographic scanner.
+Every full row validated 1,000,000 files, 4,096,000,000 payload bytes, checksum
+`127493920` and zero errors. Local data caches remained disabled/empty.
+
+| tool | packed v3 | JuiceFS+Redis | JuiceFS+TiKV |
+| --- | ---: | ---: | ---: |
+| tree files/s | 10,203.53 | 79,147.18 | 46,359.94 |
+| stat files/s | 4,595.13 | 6,089.22 | 2,186.64 |
+| full files/s | 681.04 | 1,144.90 | 674.13 |
+| full MiB/s | 2.66 | 4.47 | 2.63 |
+| full p50/p95 ms | 19.54 / 48.44 | 12.43 / 23.79 | 21.64 / 35.63 |
+
+Active+drain seconds were:
+
+- packed tree/stat/full: 99 / 219 / 1,471 seconds (approximately, from mount
+  uptime and scanner/runtime evidence; concise runner rows recorded drain
+  separately after the smoke fix);
+- Redis: 14.69 / 168.00 / 877.91 seconds;
+- TiKV: 23.72 / 460.85 / 1,488.53 seconds.
+
+Packed metadata behavior changed with scale. A 512 MiB metadata budget warmed
+only 31/245 inode-index pages and 913/4,111 GroupMeta pages. The full phase
+recorded 666 inode-index remote GETs and 8,262 GroupMeta GETs. Packed full read
+issued 136,883 data ranges and fetched 32.65 GiB for 4.096 GiB logical bytes;
+this random 4 KiB layout therefore has substantial frame overscan. Redis kept
+about 2,002,230 keys and used about 422 MiB.
+
+Interpretation:
+
+- packed beats TiKV stat by about 2.10x and is approximately tied on full read
+  (1.01x), but loses tree;
+- packed loses Redis at 1M even though it led the matched 10k stat smoke;
+- this access order is lexicographic and benefits the physical packed order, so
+  it is not a GPU DataLoader claim.
+
+The campaign root prefix and ECS were independently verified empty/deleted after
+completion.
+
+## Pending GPU-like shuffled validation
+
+A follow-up scanner profile uses deterministic per-epoch shuffle, batch size
+256, 16 worker batches, bounded in-flight batches and two epochs. It still
+performs stat/open/read-to-EOF and validates every payload byte. Epoch 1 is the
+cold/shuffled result; epoch 2 measures repeated-epoch behavior. Packed strict
+and explicit warm-frame-cache profiles remain separate. The lexicographic table
+above remains a namespace/sequential baseline only.
+
 ## 1M acceptance
 
 The 1M result is valid only if all three tools pass for all three rows, every

@@ -34,35 +34,40 @@ class SmallfilesScanTest(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def run_scanner(self, mode: str) -> subprocess.CompletedProcess[str]:
+    def run_scanner(
+        self, mode: str, extra_args: list[str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         scanner = pathlib.Path(__file__).with_name("smallfiles_scan.py")
+        command = [
+            sys.executable,
+            str(scanner),
+            "--root",
+            str(self.root),
+            "--label",
+            "test",
+            "--mode",
+            mode,
+            "--expected-files",
+            str(self.fanout * self.files_per_leaf),
+            "--min-size",
+            str(self.minimum),
+            "--max-size",
+            str(self.maximum),
+            "--dir-levels",
+            str(self.levels),
+            "--dirs-per-level",
+            str(self.fanout),
+            "--files-per-leaf",
+            str(self.files_per_leaf),
+            "--workers",
+            "2",
+            "--chunk-bytes",
+            "257",
+        ]
+        if extra_args:
+            command.extend(extra_args)
         return subprocess.run(
-            [
-                sys.executable,
-                str(scanner),
-                "--root",
-                str(self.root),
-                "--label",
-                "test",
-                "--mode",
-                mode,
-                "--expected-files",
-                str(self.fanout * self.files_per_leaf),
-                "--min-size",
-                str(self.minimum),
-                "--max-size",
-                str(self.maximum),
-                "--dir-levels",
-                str(self.levels),
-                "--dirs-per-level",
-                str(self.fanout),
-                "--files-per-leaf",
-                str(self.files_per_leaf),
-                "--workers",
-                "2",
-                "--chunk-bytes",
-                "257",
-            ],
+            command,
             text=True,
             capture_output=True,
             check=False,
@@ -79,6 +84,34 @@ class SmallfilesScanTest(unittest.TestCase):
         full = self.run_scanner("full")
         self.assertIn("payload_bytes=", full.stdout)
         self.assertIn("latency_p95_ms=", full.stdout)
+
+    def test_shuffle_epochs_are_deterministic_and_bounded(self):
+        result = self.run_scanner(
+            "full",
+            [
+                "--order",
+                "shuffle",
+                "--shuffle-seed",
+                "17",
+                "--epochs",
+                "2",
+                "--batch-size",
+                "2",
+                "--max-inflight-batches",
+                "1",
+            ],
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        summaries = [
+            line for line in result.stdout.splitlines() if line.startswith("smallfiles_scan_summary")
+        ]
+        self.assertEqual(len(summaries), 2)
+        self.assertIn("order=shuffle", summaries[0])
+        self.assertIn("epoch=1", summaries[0])
+        self.assertIn("epoch=2", summaries[1])
+        self.assertIn("checksum=21", summaries[0])
+        self.assertIn("checksum=21", summaries[1])
 
     def test_full_mode_rejects_payload_corruption(self):
         path = self.root / "d001" / "f00002"

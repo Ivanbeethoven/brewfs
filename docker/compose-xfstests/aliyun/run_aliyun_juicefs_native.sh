@@ -425,6 +425,7 @@ scan_shared() {
     local profile="$1"
     local log_suffix="$2"
     local mode="$3"
+    shift 3
     local scanner="${JFS_SMALLFILES_SCANNER:-}"
     [[ -n "$scanner" && -x "$scanner" ]] || die "JFS_SMALLFILES_SCANNER must point to tools/perf/smallfiles_scan.py"
     "$scanner" \
@@ -438,8 +439,19 @@ scan_shared() {
         --dirs-per-level "$JFS_DIRS_PER_LEVEL" \
         --files-per-leaf "$JFS_FILES_PER_DIR" \
         --workers "$SMALLFILE_WORKERS" \
+        "$@" \
         --json-output "$ARTIFACT_DIR/scan-${profile}-${log_suffix}.json" \
         >"$ARTIFACT_DIR/scan-${profile}-${log_suffix}.log" 2>&1
+}
+
+scan_gpu() {
+    local profile="$1"
+    scan_shared "$profile" gpu-smallfiles full \
+        --order shuffle \
+        --shuffle-seed "${PERF_GPU_SHUFFLE_SEED:-20261001}" \
+        --epochs "${PERF_GPU_EPOCHS:-2}" \
+        --batch-size "${PERF_GPU_BATCH_SIZE:-256}" \
+        --max-inflight-batches "${PERF_GPU_MAX_INFLIGHT_BATCHES:-2}"
 }
 
 snapshot_metadata_backend() {
@@ -511,6 +523,7 @@ run_tool_profile() {
         juicefs-tree) run_with_timeout "$ARTIFACT_DIR/scan-${profile}-tree.log" scan_shared "$profile" tree tree || status=$? ;;
         juicefs-stat) run_with_timeout "$ARTIFACT_DIR/scan-${profile}-stat.log" scan_shared "$profile" stat stat || status=$? ;;
         juicefs-smallfiles) run_with_timeout "$ARTIFACT_DIR/scan-${profile}-smallfiles.log" scan_shared "$profile" smallfiles full || status=$? ;;
+        juicefs-gpu-smallfiles) run_with_timeout "$ARTIFACT_DIR/scan-${profile}-gpu-smallfiles.log" scan_gpu "$profile" || status=$? ;;
         *) die "unsupported JuiceFS tool: $tool" ;;
     esac
     end_ns="$(date +%s%N)"

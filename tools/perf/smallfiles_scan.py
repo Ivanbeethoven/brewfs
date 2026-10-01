@@ -4,16 +4,18 @@
 from __future__ import annotations
 
 import argparse
+from array import array
 import json
 import math
 import os
 import pathlib
+import random
 import resource
 import stat
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -160,6 +162,62 @@ def scan_file(spec: FileSpec, mode: str, chunk_bytes: int) -> FileResult:
         )
 
 
+def scan_batch(batch: list[FileSpec], mode: str, chunk_bytes: int) -> list[FileResult]:
+    return [scan_file(spec, mode, chunk_bytes) for spec in batch]
+
+
+def scan_specs_bounded(
+    specs: list[FileSpec],
+    mode: str,
+    chunk_bytes: int,
+    workers: int,
+    batch_size: int,
+    max_inflight_batches: int,
+) -> tuple[int, int, int, int, list[str], array]:
+    successful = logical_bytes = payload_bytes = checksum = 0
+    errors: list[str] = []
+    latencies = array("Q")
+    batches = (
+        specs[offset : offset + batch_size]
+        for offset in range(0, len(specs), batch_size)
+    )
+    max_pending = workers * max_inflight_batches
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending = set()
+        for _ in range(max_pending):
+            try:
+                batch = next(batches)
+            except StopIteration:
+                break
+            pending.add(executor.submit(scan_batch, batch, mode, chunk_bytes))
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                for result in future.result():
+                    latencies.append(result.latency_ns)
+                    if result.ok:
+                        successful += 1
+                        logical_bytes += result.logical_bytes
+                        payload_bytes += result.payload_bytes
+                        checksum = (checksum + result.checksum) & 0xFFFFFFFF
+                    else:
+                        errors.append(result.error)
+                try:
+                    batch = next(batches)
+                except StopIteration:
+                    continue
+                pending.add(executor.submit(scan_batch, batch, mode, chunk_bytes))
+    return successful, logical_bytes, payload_bytes, checksum, errors, latencies
+
+
+def emit_summary(summary: dict[str, object]) -> None:
+    rendered = " ".join(
+        f"{key}={value:.6f}" if isinstance(value, float) else f"{key}={value}"
+        for key, value in summary.items()
+    )
+    print(f"smallfiles_scan_summary {rendered}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=pathlib.Path, required=True)
@@ -173,6 +231,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--files-per-leaf", type=int, required=True)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--chunk-bytes", type=int, default=1024 * 1024)
+    parser.add_argument("--order", choices=("lexicographic", "shuffle"), default="lexicographic")
+    parser.add_argument("--shuffle-seed", type=int, default=20261001)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--max-inflight-batches", type=int, default=2)
     parser.add_argument("--ignore-root-file", action="append", default=[])
     parser.add_argument("--json-output", type=pathlib.Path)
     return parser.parse_args()
@@ -189,6 +252,9 @@ def main() -> int:
         or args.files_per_leaf <= 0
         or args.workers <= 0
         or args.chunk_bytes <= 0
+        or args.epochs <= 0
+        or args.batch_size <= 0
+        or args.max_inflight_batches <= 0
     ):
         print("invalid scanner bounds", file=sys.stderr)
         return 2
@@ -212,63 +278,113 @@ def main() -> int:
         print(f"smallfiles discovery failed: {error}", file=sys.stderr)
         return 1
 
+    discovery_finished = time.monotonic()
     if args.mode == "tree":
-        results: list[FileResult] = []
+        summary = {
+            "label": args.label,
+            "mode": args.mode,
+            "order": args.order,
+            "epoch": 1,
+            "epochs": 1,
+            "files": len(specs),
+            "expected_files": args.expected_files,
+            "stat_calls": 0,
+            "directories": directories,
+            "expected_directories": expected_directories,
+            "leaf_directories": leaf_directories,
+            "expected_leaf_directories": expected_leaf_directories,
+            "workers": args.workers,
+            "batch_size": args.batch_size,
+            "logical_bytes": 0,
+            "payload_bytes": 0,
+            "errors": 0,
+            "checksum": 0,
+            "discovery_seconds": discovery_finished - started,
+            "seconds": discovery_finished - started,
+            "files_per_sec": len(specs) / (discovery_finished - started),
+            "mib_per_sec": 0.0,
+            "latency_p50_ms": 0.0,
+            "latency_p95_ms": 0.0,
+            "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        }
+        summaries = [summary]
+        emit_summary(summary)
     else:
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            results = list(
-                executor.map(
-                    lambda spec: scan_file(spec, args.mode, args.chunk_bytes), specs
-                )
+        summaries = []
+        base_specs = list(specs)
+        for epoch in range(args.epochs):
+            epoch_specs = list(base_specs)
+            if args.order == "shuffle":
+                random.Random(args.shuffle_seed + epoch).shuffle(epoch_specs)
+            epoch_started = started if epoch == 0 else time.monotonic()
+            (
+                successful,
+                logical_bytes,
+                payload_bytes,
+                checksum,
+                errors,
+                latencies,
+            ) = scan_specs_bounded(
+                epoch_specs,
+                args.mode,
+                args.chunk_bytes,
+                args.workers,
+                args.batch_size,
+                args.max_inflight_batches,
             )
+            elapsed = time.monotonic() - epoch_started
+            for error in errors:
+                print(error)
+            summary = {
+                "label": args.label,
+                "mode": args.mode,
+                "order": args.order,
+                "shuffle_seed": args.shuffle_seed if args.order == "shuffle" else 0,
+                "epoch": epoch + 1,
+                "epochs": args.epochs,
+                "files": successful,
+                "expected_files": args.expected_files,
+                "stat_calls": len(epoch_specs),
+                "directories": directories,
+                "expected_directories": expected_directories,
+                "leaf_directories": leaf_directories,
+                "expected_leaf_directories": expected_leaf_directories,
+                "workers": args.workers,
+                "batch_size": args.batch_size,
+                "max_inflight_batches": args.max_inflight_batches,
+                "logical_bytes": logical_bytes,
+                "payload_bytes": payload_bytes,
+                "errors": len(errors),
+                "checksum": checksum,
+                "discovery_seconds": discovery_finished - started,
+                "seconds": elapsed,
+                "files_per_sec": successful / elapsed if elapsed else 0.0,
+                "mib_per_sec": payload_bytes / elapsed / (1024 * 1024) if elapsed else 0.0,
+                "latency_p50_ms": percentile_ns(latencies, 0.50) / 1_000_000,
+                "latency_p95_ms": percentile_ns(latencies, 0.95) / 1_000_000,
+                "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            }
+            summaries.append(summary)
+            emit_summary(summary)
+            if (
+                successful != args.expected_files
+                or len(epoch_specs) != args.expected_files
+                or errors
+                or (args.mode == "full" and payload_bytes != logical_bytes)
+            ):
+                return 1
 
-    errors = [result.error for result in results if not result.ok]
-    for error in errors:
-        print(error)
-    successful = len(specs) if args.mode == "tree" else sum(result.ok for result in results)
-    logical_bytes = sum(result.logical_bytes for result in results if result.ok)
-    payload_bytes = sum(result.payload_bytes for result in results if result.ok)
-    checksum = sum(result.checksum for result in results if result.ok) & 0xFFFFFFFF
-    latencies = [result.latency_ns for result in results if result.ok]
-    elapsed = time.monotonic() - started
-    summary = {
-        "label": args.label,
-        "mode": args.mode,
-        "files": successful,
-        "expected_files": args.expected_files,
-        "stat_calls": 0 if args.mode == "tree" else len(specs),
-        "directories": directories,
-        "expected_directories": expected_directories,
-        "leaf_directories": leaf_directories,
-        "expected_leaf_directories": expected_leaf_directories,
-        "workers": args.workers,
-        "logical_bytes": logical_bytes,
-        "payload_bytes": payload_bytes,
-        "errors": len(errors),
-        "checksum": checksum,
-        "seconds": elapsed,
-        "files_per_sec": successful / elapsed if elapsed else 0.0,
-        "mib_per_sec": payload_bytes / elapsed / (1024 * 1024) if elapsed else 0.0,
-        "latency_p50_ms": percentile_ns(latencies, 0.50) / 1_000_000,
-        "latency_p95_ms": percentile_ns(latencies, 0.95) / 1_000_000,
-        "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
-    }
-    rendered = " ".join(
-        f"{key}={value:.6f}" if isinstance(value, float) else f"{key}={value}"
-        for key, value in summary.items()
-    )
-    print(f"smallfiles_scan_summary {rendered}")
     if args.json_output is not None:
         args.json_output.parent.mkdir(parents=True, exist_ok=True)
-        args.json_output.write_text(json.dumps(summary, sort_keys=True, indent=2) + "\n")
+        payload = summaries[0] if len(summaries) == 1 else {"epochs": summaries}
+        args.json_output.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
 
     valid = (
-        successful == args.expected_files
-        and len(specs) == args.expected_files
+        len(specs) == args.expected_files
         and directories == expected_directories
         and leaf_directories == expected_leaf_directories
-        and not errors
-        and (args.mode != "full" or payload_bytes == logical_bytes)
+        and all(summary["files"] == args.expected_files for summary in summaries)
+        and all(summary["errors"] == 0 for summary in summaries)
     )
     return 0 if valid else 1
 

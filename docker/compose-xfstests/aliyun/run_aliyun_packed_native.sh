@@ -415,6 +415,26 @@ run_shared_smallfiles_scan() {
         --json-output "$ARTIFACT_DIR/tools/${label}-summary.json"
 }
 
+run_gpu_smallfiles_scan() {
+    python3 "$PACKED_SMALLFILES_SCANNER" \
+        --root "$MOUNT_DIR" \
+        --label packed-gpu-smallfiles \
+        --mode full \
+        --order shuffle \
+        --shuffle-seed "${PERF_GPU_SHUFFLE_SEED:-20261001}" \
+        --epochs "${PERF_GPU_EPOCHS:-2}" \
+        --batch-size "${PERF_GPU_BATCH_SIZE:-256}" \
+        --max-inflight-batches "${PERF_GPU_MAX_INFLIGHT_BATCHES:-2}" \
+        --expected-files "$PACKED_SMALLFILE_COUNT" \
+        --min-size "$SMALLFILE_MIN_SIZE" \
+        --max-size "$SMALLFILE_MAX_SIZE" \
+        --dir-levels "$PACKED_DIR_LEVELS" \
+        --dirs-per-level "$PACKED_DIRS_PER_LEVEL" \
+        --files-per-leaf "$PACKED_FILES_PER_DIR" \
+        --workers "$SMALLFILE_WORKERS" \
+        --json-output "$ARTIFACT_DIR/tools/packed-gpu-smallfiles-summary.json"
+}
+
 packed_posix_scan() {
     python3 - "$MOUNT_DIR" "$SMALLFILE_MIN_SIZE" "$SMALLFILE_MAX_SIZE" "$FIO_FILE_SIZE" "$PACKED_FILES_PER_DIR" "$PACKED_DIR_LEVELS" <<'PY'
 import os
@@ -493,6 +513,7 @@ status=0
 for tool in $TOOLS; do
     case "$tool" in
         packed-smallfiles) run_tool "$tool" run_shared_smallfiles_scan full packed-smallfiles || status=1 ;;
+        packed-gpu-smallfiles) run_tool "$tool" run_gpu_smallfiles_scan || status=1 ;;
         packed-stat) run_tool "$tool" run_shared_smallfiles_scan stat packed-stat || status=1 ;;
         packed-tree) run_tool "$tool" run_shared_smallfiles_scan tree packed-tree || status=1 ;;
         packed-posix) run_tool "$tool" packed_posix_scan || status=1 ;;
