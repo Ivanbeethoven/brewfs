@@ -32,6 +32,7 @@ param(
     [bool]$PackedFrameWindowPrefetch = $false,
     [UInt64]$PackedDecodedFrameCacheBytes = 0,
     [ValidateSet('0', '1')][string]$ReadDirectIo = '1',
+    [ValidateSet('0', '1')][string]$FuseKeepCache = '0',
     [UInt64]$PackedMetadataCacheBytes = 268435456,
     [ValidateSet('off', 'auto', 'eager')]
     [string]$PackedMetadataPrefetch = 'auto',
@@ -104,6 +105,7 @@ $runnerParams = @{
     PackedFrameWindowPrefetch = $PackedFrameWindowPrefetch
     PackedDecodedFrameCacheBytes = $PackedDecodedFrameCacheBytes
     ReadDirectIo = $ReadDirectIo
+    FuseKeepCache = $FuseKeepCache
     PackedMetadataCacheBytes = $PackedMetadataCacheBytes
     PackedMetadataPrefetch = $PackedMetadataPrefetch
     ToolTimeoutSeconds = $ToolTimeoutSeconds
@@ -152,6 +154,7 @@ $runnerArgs = @(
     '-PackedFrameWindowCacheBytes', [string]$PackedFrameWindowCacheBytes,
     '-PackedDecodedFrameCacheBytes', [string]$PackedDecodedFrameCacheBytes,
     '-ReadDirectIo', $ReadDirectIo,
+    '-FuseKeepCache', $FuseKeepCache,
     '-PackedMetadataCacheBytes', [string]$PackedMetadataCacheBytes,
     '-PackedMetadataPrefetch', $PackedMetadataPrefetch,
     '-ToolTimeoutSeconds', [string]$ToolTimeoutSeconds,

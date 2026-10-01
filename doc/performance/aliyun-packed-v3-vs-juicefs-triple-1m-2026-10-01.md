@@ -122,6 +122,29 @@ Interpretation:
 The campaign root prefix and ECS were independently verified empty/deleted after
 completion.
 
+## GPU-like 10k smoke
+
+The shuffled scanner and runner wiring passed a matched 10k smoke with two
+epochs, 16 workers, batch size 256, deterministic seed `20261001`, bounded
+in-flight batches, full payload validation and zero errors.
+
+| profile | epoch 1 files/s | epoch 2 files/s | epoch 1 p50/p95 ms | epoch 2 p50/p95 ms |
+| --- | ---: | ---: | ---: | ---: |
+| packed buffered, decoded cache 0 | 559.47 | 11,906.76 | 21.15 / 62.45 | 1.26 / 1.70 |
+| packed decoded cache 64 MiB | 5,113.42 | 9,647.82 | 1.71 / 3.00 | 1.60 / 1.83 |
+| JuiceFS+Redis, local data cache 0 | 942.41 | 3,754.76 | 13.58 / 20.50 | 3.92 / 4.62 |
+| JuiceFS+TiKV, local data cache 0 | 666.50 | 1,300.45 | 18.30 / 26.10 | 10.92 / 13.92 |
+
+Packed buffered mode uses `direct_io=0` and `keep_cache=1`, matching the
+reference filesystems' kernel page-cache behavior. Epoch 1 is still cold at
+mount start; epoch 2 explicitly measures the repeated training epoch and is not
+a cold result. The decoded-cache row is a separate 64 MiB application-cache
+profile. It fetched only 101 exact packed frames across both 10k epochs, with
+8,696 decoded-frame hits and no eviction.
+
+The GPU smoke ECS and all GPU smoke OSS prefixes were independently verified
+deleted before the 1M GPU campaign.
+
 ## Pending GPU-like shuffled validation
 
 A follow-up scanner profile uses deterministic per-epoch shuffle, batch size
