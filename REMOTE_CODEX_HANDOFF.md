@@ -1,241 +1,192 @@
-# BrewFS Remote Codex Handoff
+# BrewFS packed-v3 handoff — 2026-10-02
 
-This is the operator handoff for the remote packed-v3 read-only optimization
-work. It contains no password, access token, Aliyun AK/SK, GitHub token, or
-Codex bearer value. Credentials remain only in the target user profiles.
+## Repository and safety
 
-## Target and repository
+- Working directory: `/home/hxy/brewfs`.
+- Branch: `codex/packed-metadata-aliyun-20260930`.
+- Baseline at takeover: `abcdda0ba975af50cf4147c37d271099e316f8f7`.
+- Retained validation/measurement fix: `dd418fa` (`test: validate packed dynamic frames and effective FUSE TTL`).
+- `origin` is the personal repository, `upstream` the public repository.
+- Keep `.claude/` untracked. Do not reset/checkout user work, remove credentials,
+  print tokens/passwords/AK/SK, or commit local generated artifacts.
+- Only this session owns the current working-tree edits. The other interactive
+  session is no longer running; do not resume concurrent writers in this tree.
 
-- SSH alias: `brewfs-frp-sea`
-- Windows target: `laptop-fjfpi4lk`
-- WSL distribution: `Ubuntu-24.04`
-- WSL user: `hxy`
-- Repository: `/home/hxy/brewfs`
-- Branch: `codex/packed-metadata-aliyun-20260930`
-- Latest implementation commit: `2b112b1` (`perf: add explicit packed decoded-frame cache`)
-- Metadata benchmark commit: `7f2f27d` (`perf: add matched packed and JuiceFS metadata scanner`)
-- Cold metadata evidence commit: `57cdfd1` (`docs: record cold packed metadata stat baseline`)
-- Streaming implementation commit: `7d97082` (`perf: stream packed frame ranges and record runtime metrics`)
-- Current remote HEAD before the candidate: `2e10947` (`docs-remote-codex-handoff`)
-- Git remotes: `origin=https://github.com/Ivanbeethoven/brewfs.git`,
-  `upstream=https://github.com/brewfs/brewfs.git`
+Historical remote transport is documented in
+`doc/operations/remote-codex-migration.md`. SSH alias `brewfs-frp-sea` reaches
+Windows; `ssh.exe` can forward commands to WSL `Ubuntu-24.04`, user `hxy`.
+Credential profiles remain operator-owned and must not be deleted.
 
-The branch was migrated from a local Git bundle because the target Windows
-host could not reach `github.com:443` during the first clone. Confirm the
-current state before doing more work:
+## What is already implemented
 
-```text
-ssh brewfs-frp-sea wsl.exe -d Ubuntu-24.04 -- /usr/bin/git -C /home/hxy/brewfs status --short --branch
-ssh brewfs-frp-sea wsl.exe -d Ubuntu-24.04 -- /usr/bin/git -C /home/hxy/brewfs rev-parse HEAD
-```
+- Independent PM06/GC04/GM06/II05 formats in the 004 envelope.
+- Fenced pageable group/inode indexes and byte-weighted metadata tiers.
+- Bounded strict/coalesced payload streams, digest checks, class-aware demand
+  coordinator and a 250 µs collection delay.
+- Explicit aligned window/read-ahead and decoded-frame cache, both off by
+  default for strict demand-only data reads.
+- Shared tree/stat/full scanner, deterministic shuffled epochs, native Aliyun
+  packed/Redis/TiKV harness and process-tree timeout cleanup.
+- `ReadGeneration`/`ReadSource`/`compose_overlay_plan` primitives. The standalone
+  packed readonly mount works through the legacy slice/BlockStore facade;
+  actual workspace packed-lower binding, lifecycle publication and retries are
+  **not complete**.
+- Runtime metrics are logged at unmount; complete `.stats`/Prometheus packed
+  export is still missing.
 
-The untracked `.claude/` directory is migration scratch state and must not be
-committed. `REMOTE_CODEX_GOAL.md` and this file are operator inputs, not source
-code or credential stores.
+Important commits already on the baseline:
 
-## Access and command transport
+- `7d97082`: streamed packed ranges and runtime metrics.
+- `7f2f27d`: matched shared scanner.
+- `2b112b1`: opt-in decoded-frame cache.
+- `535e3b8`: successful reads only in logical-byte counters.
+- `89e662e`: decoded cache hits avoid reopening the container.
+- `900075e` through `abcdda0`: cloud million-file harness and completed result
+  documentation. Do not rerun these campaigns merely because the old handoff
+  used to describe them as pending.
 
-Windows OpenSSH is configured with the `brewfs-frp-sea` alias. A direct
-Windows command is the most reliable form:
+## Existing performance observations
 
-```text
-ssh.exe brewfs-frp-sea "wsl.exe -d Ubuntu-24.04 -- /usr/bin/git -C /home/hxy/brewfs status --short --branch"
-```
+The final historical cloud summary is
+`doc/performance/aliyun-packed-v3-vs-juicefs-triple-1m-2026-10-01.md`.
 
-The generic `remote-ssh-dev` helper scripts assume that the local `ssh`
-binary has the same alias configuration. When invoked from local WSL, Linux
-`ssh` does not know the Windows alias and reports `Could not resolve hostname
-brewfs-frp-sea`. Use `ssh.exe` from Windows, or export a small shell function
-that forwards `ssh` to `ssh.exe` before running the helper scripts. This is a
-local transport issue, not a remote repository failure.
+- Ordered 1M stat: packed 4,595.13 files/s, Redis 6,089.22, TiKV 2,186.64.
+  Packed stat is about 2.10x TiKV, but tree is slower and full read is only
+  approximately tied with TiKV.
+- Shuffled 1M epoch 1: packed demand-cold 186.54 files/s, explicit decoded
+  4 GiB profile 369.05, Redis 826.84, TiKV 590.73. There is no general packed
+  victory and no actual GPU training-throughput measurement.
+- Local 32 MiB decoded-frame A/B: mean +19.91% throughput and -20.40% p95,
+  valid only as an explicit `warm-frame-cache` observation.
 
-## Installed tools
+### Newly discovered measurement limitations
 
-The target Windows user has Git for Windows 2.55.0.windows.5, authenticated
-GitHub CLI with `gh auth setup-git`, and an authenticated Alibaba Cloud CLI
-profile in `cn-hangzhou`. Git identity is `Xiaoyang Han <lux1an@qq.com>`.
+The cloud runner exported `BREWFS_METADATA_CACHE_TTL_MS`, but FUSE reads
+`BREWFS_CACHE_TTL_MS`. The current correction explicitly forwards the effective
+name to the mount command. Historical numeric results remain observations;
+claims of identical actual TTL/cache semantics require revalidation.
 
-The WSL helpers are:
+`data_range_gets=0` does not mean no file data was transferred: inline bytes are
+fetched and retained as part of GroupMeta. Moka weighted resident bytes are not
+process RSS; scanner RSS and filesystem-daemon RSS are different metrics.
 
-- `/home/hxy/.local/bin/gh.exe` -> Windows GitHub CLI
-- `/home/hxy/.local/bin/aliyun.exe` -> Windows Aliyun CLI
-- `/home/hxy/.local/bin/codex` -> the installed npm Codex package with Node.js
-  on `PATH`
+The valid archived shuffled warm row records 1,284,176 inode-index GETs and
+1,236,238 GroupMeta GETs across the two epochs, about 933.3 GiB of metadata-range
+bytes. The old phrase "tens of thousands" was incorrect. GroupMeta stored bytes
+include inline payload. The strict r2 epoch-2 artifact contains errors and must
+not replace the later successful strict row.
 
-The WSL Git credential helper delegates to `gh.exe auth git-credential`. Do
-not print `gh auth token`, Aliyun credential files, or Codex configuration
-secrets in logs or commits.
+## Current iteration closeout
 
-## Objective and design invariants
+### Index-budget candidate: withdrawn
 
-The active objective is a measurable read-only improvement for large
-namespaces of 100 KiB to 1 MiB files under strict cold-data and
-metadata-warm/cold-data profiles, with the same OSS endpoint and dataset as
-the JuiceFS reference. Keep these three ideas integrated:
+The manifest-aware split would reclaim the unused group-index half of the
+64 MiB pool for inode pages without increasing total metadata bytes. It passed
+budget edge and real authenticated-page residency tests, but actual local
+RustFS/FUSE constrained-budget runs had EIO/ENOENT in both the exact `abcdda0`
+baseline and candidate. No successful paired throughput result exists.
 
-1. Immutable authenticated packed metadata with pageable group/inode indexes.
-2. Dynamic size-class data frames with bounded descriptor and payload windows.
-3. Overlay workspace semantics with packed metadata as the lower layer.
+The production candidate and its temporary allocation tests were removed with a
+targeted patch. Original production budget allocation is restored. Full details:
+`doc/performance/packed-v3-index-budget-candidate-2026-10-02.md`.
 
-Correctness is more important than a benchmark-only shortcut. Preserve digest,
-CRC, length, ordering, and frame-boundary checks. Never share unrelated file
-payload merely to inflate a small-file benchmark. A large directory must be
-pageable and must not require materializing every entry in memory.
+Preserved local evidence:
 
-## Candidate currently in the remote worktree
+- `docker/compose-xfstests/artifacts/local-packed-index-budget-20261002/`
+- `docker/compose-xfstests/artifacts/local-packed-index-budget-20261002-ttl1/`
+- `docker/compose-xfstests/artifacts/local-packed-index-budget-20261002-tiny/`
 
-The only source candidate is in
-`src/workspace_overlay/packed_v3/coordinator.rs`:
+Each contains raw profiles/errors/build or cleanup logs. Baseline source was
+built from `git archive abcdda0`, not inferred from binary timestamps. Builds
+were unoptimized and matched; they are diagnostics, not release benchmarks.
 
-- the shared group-read batching delay changed from 1 ms to 250 us;
-- a unit assertion requires the delay to remain below 1 ms.
+### Retained work
 
-The corresponding hypothesis and limits are recorded in
-`doc/performance/packed-v3-metadata-cache-analysis-2026-09-29.md`. The change
-does not alter the range planner, size-class separation, byte/range budgets,
-window cache, or integrity validation. It is still a performance candidate:
-no new end-to-end cold-read number has been accepted, and it must not be
-described as faster than JuiceFS without a matched run.
+1. Catalog regression covers the builder→manifest→GroupMeta→remote-read chain
+   for 200 KiB/512 KiB/1 MiB/10 MiB/32 MiB, random/sequential profiles, inline
+   and non-inline Tiny files, EOF/frame boundaries and a p90 hint. It does not
+   prove full size-class FUSE/lifecycle support.
+2. Cloud runner now forwards the actual FUSE TTL environment variable.
+   `tools/perf/test_packed_runner_ttl.sh` verifies the actual `start_mount`
+   invocation with a test CLI at 0/1,000/60,000 ms and a conflicting parent env.
+3. Spec checkpoint and historical-result caveats corrected. Detailed staged
+   experimental plan written:
+   `doc/superpowers/plans/2026-10-02-brewfs-three-innovations-experiment-plan.md`.
 
-## Verification completed on 2026-09-30
+## Dynamic block / packed metadata audit
 
-All commands below ran in `/home/hxy/brewfs` on the target, with
-`CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0` for Cargo
-commands where shown.
+Dynamic frame selection, same-class co-pack, multi-frame extents and catalog
+execution are real, not merely proposed. Default caps are random 4 MiB and
+sequential 8 MiB; the default Tiny target is 256 KiB. Actual stored frame length
+is not always equal to the target. The fixture still caps files at 4 MiB and
+passes `p90=None`.
 
-Passed:
+Still incomplete:
 
-- `cargo fmt --all --check`
-- all required shell syntax/report checks from `AGENTS.md`
-- `git diff --check`
-- `cargo check --workspace`
-- `cargo build --workspace`
-- `cargo clippy --workspace` (existing warnings only; exit status 0)
-- `cargo test --workspace --lib --bins`: 1097 passed, 225 ignored, 0 failed
-- packed-v3 focused suite:
+- zstd independent frame codec and compressed/restart GroupMeta;
+- external large-object DataRef and sparse producer/inventory;
+- common manifest-profile/frame-consistency and target 256-frame/file bound;
+- cold attributes and hardlink placement semantics;
+- range descriptor authentication anchored in the manifest;
+- P5 workspace packed lower/VFS/publish/recovery integration.
 
-  ```text
-  cargo test -p brewfs --features workspace-overlay packed_v3 --lib -- --nocapture
-  ```
+Strict remote per-frame digest comes from an unauthenticated descriptor table;
+it is self-consistency, not full content authentication. Full-object local open
+has stronger checks. Never claim complete authenticated container reads without
+an independently authenticated directory/ref or an explicit full verification
+mode. Do not silently mutate 004/GM06/GC04 interpretation.
 
-  Result: 65 passed, 0 failed.
+## Verification and remaining gates
 
-The feature flag matters. `workspace_overlay` is gated by the
-`workspace-overlay` Cargo feature, so a filter run without
-`--features workspace-overlay` legitimately reports zero packed tests; that
-is not evidence that the suite passed.
+Current-iteration raw validation logs are under the first artifact directory:
+`final-check.log`, `final-build.log`, runtime feature checks,
+`final-packed-tests.log`, `final-workspace-tests.log`, `final-clippy.log`.
+Consult their completion/status rather than treating old 65-test/1097-test prose
+as proof for an arbitrary future tip. AGENTS.md's workspace lib/bins test is a
+hard gate. GitHub CI has stricter all-feature/-D warnings/operator steps; local
+minimum-gate completion is not a claim those independent jobs passed.
 
-The target has `asyncfuse 0.1.12` in its Cargo cache. The earlier failure to
-resolve `static.crates.io` is therefore no longer blocking these local gates.
+## Final local validation (this iteration)
 
-## Performance status
+- fmt/diff check, required shell syntax/report tests and shared scanner tests:
+  passed. The TTL regression reproduces the old failure and passes the correction.
+- `cargo check --workspace` and `cargo build --workspace`: passed.
+- tokio/io-uring runtime checks, with and without `workspace-overlay`: passed.
+- packed feature suite: 66 passed, 0 failed, including the mixed size/profile
+  corpus. Full workspace lib/bins gate: 1097 passed, 225 ignored, 0 failed.
+- `cargo clippy --workspace`: exit 0 with pre-existing warnings. No assertion is
+  made that all-feature/operator or `-D warnings` GitHub jobs passed.
+- The first chained gate command exceeded its background time limit during
+  workspace tests; independent completed logs supersede the incomplete log:
+  `final-workspace-tests-complete.log` and `final-clippy-complete.log`.
 
-No new remote OSS/FUSE benchmark was run for this 250-us candidate. The
-existing matched reference artifacts remain the source of truth until a new
-run is completed. The artifact directory is in the operator's local checkout;
-it was not copied into the remote WSL repository during migration:
+## Next work, in order
 
-```text
-docker/compose-xfstests/artifacts/aliyun-packed-v3-vs-juicefs-100k-20260928-r3/
-```
+1. Diagnose constrained-budget mounted-FUSE EIO with a small reproducer before
+   trying more cache tuning. Do not accept numbers from failing scans.
+2. Fix/request-graph measurement and manifest-bound descriptor authentication.
+3. Run the mixed size/partial-read corpus in actual FUSE and add offline builder
+   controls for static-frame, dynamic-frame, inline and size-table experiments.
+4. Follow the experiment plan: separate packed metadata effect from frame size,
+   inline/cache/prefetch and total setup/drain effects.
+5. Finish packed lower generation-fenced workspace binding and publication
+   before running the three-innovation lifecycle experiments.
+6. Only after small gates pass, run matched JuiceFS+TiKV smoke/scale-up, with
+   actual equal TTL and stated total client/server resources. No unbounded or
+   unnecessary repeat of existing million-object imports.
 
-Verify that path locally before using it as a comparison input. Do not infer
-that a missing path on the remote host means the reference run never existed.
+## Resource state
 
-Any follow-up benchmark must report, for both packed and JuiceFS, the exact
-metadata/payload memory and SSD cache budgets, page-cache state, active and
-active-plus-drain bandwidth, object GET/range counts, metadata bytes, frame
-overscan, and dataset/file-size distribution. Strict cold means both payload
-cache budgets are zero and the host page cache is dropped before each matched
-run. Metadata-warm/cold-data must include the warm-up procedure and duration.
-Do not update README comparison tables from this candidate alone.
+No cloud server or credential object was created in this iteration. All local
+RustFS/FUSE runs used traps to stop daemons/unmount, remove only freshly generated
+temporary fixture directories, and run Compose `down -v --remove-orphans`.
+Accepted/failed referenced artifact logs remain preserved. Verify process,
+mount and container/volume state again before starting the next experiment.
 
-## 2026-09-30 implementation update
+## Delivery
 
-The candidate now includes a bounded chunk consumer for packed ranges. Strict
-coalesced frame reads distribute backend chunks directly into per-frame buffers,
-validate each frame digest, and release the range buffer before replying; the
-legacy `read_exact_range` helper remains a bounded `Vec` wrapper for metadata
-callers. Added regressions cover multi-chunk streams, interruption, over-bound
-chunks, strict no-overscan reads, and two-frame coalesced delivery.
-
-A mount-scoped `PackedRuntimeMetrics` snapshot now records data range GET/bytes,
-logical bytes, overscan, decoded frames and size classes, coalesced/singleflight
-counts, pipeline current/peak, window hit/miss/fetch, and data-cache hits. The
-packed mount logs these fields at unmount; the Aliyun packed runner uses
-`RUST_LOG=info` so the log is retained in the artifact. `.stats`/Prometheus
-plumbing is still a follow-up, as are cold attributes, complete overlay lower
-binding, and the new compressed/restart wire version. Existing 004 objects and
-readers remain unchanged.
-
-The requested 10k cloud run was attempted twice but the Claude Code safety
-classifier denied the ECS/OSS bootstrap as `Data Exfiltration` before execution.
-No ECS, mount, OSS object, or temporary credential was created by either attempt.
-Therefore no new cloud artifact or accepted end-to-end number exists; the
-previous matched 10k/100k references remain the only performance evidence.
-
-## 2026-10-01 benchmark and warm-cache update
-
-A matched metadata-only scanner is now shared by packed and JuiceFS runners.
-The 10,000-file local RustFS/HTTP packed scan, with host page cache dropped,
-completed in 0.377112 s (26,517 files/s); the same 10 × 1,000 shape on
-JuiceFS+Redis strict metadata caches completed in 0.651548 s (15,348 files/s).
-This is a 1.73x scanner-phase diagnostic for the immutable metadata-only
-scenario, not the requested TiKV result. TiKV could not run because all
-configured Docker mirrors timed out while pulling the standard PD/TiKV images;
-no service or volume remained after cleanup. Evidence and exact limitations are
-in `doc/performance/packed-v3-vs-juicefs-tikv-metadata-stat-2026-09-30.md`.
-
-An explicit decoded-frame cache is now available through
-`BREWFS_PACKED_DECODED_FRAME_CACHE_BYTES`; the default is 0, so strict-cold is
-unchanged. The accepted repeated local A/B used 10,000 independent 100 KiB files
-and a 32 MiB decoded budget: mean throughput improved 19.91%, p95 fell 20.40%,
-and physical data ranges fell from roughly 3,000 to 1,900 with matching
-checksums and zero errors. A supplemental two-pass RustFS run with 1,000 files
-and 64 MiB showed second-pass 851 vs 360 files/s (2.36x) and two-pass total
-3.952 vs 5.188 s (1.31x). This is accepted only as a `warm-frame-cache`
-profile and reports configured/resident bytes, hits/misses/evictions. The packed
-focused suite is now 65 tests; the workspace hard gate remains 1097 passed,
-225 ignored, 0 failed.
-
-## Remaining work
-
-1. Commit and push the decoded-frame warm-cache implementation and this updated
-   handoff; leave `.claude/` and generated `target/` artifacts untracked.
-2. Re-run the matched `smallfiles-stat` command with JuiceFS+TiKV when the
-   standard PD/TiKV images are available; do not substitute Redis in the TiKV
-   result row. Always run Compose cleanup and verify no services/volumes remain.
-3. Keep the decoded cache opt-in and label its measurements `warm-frame-cache`;
-   never use its hits in strict-cold claims.
-4. Implement `.stats`/Prometheus export for the runtime snapshot, then add the
-   versioned BRFCA cold-attribute object and packed lower bridge.
-5. Keep compression/restart work behind a new wire version; never mutate PM06,
-   GM06, or GC04 in place.
-6. If a future benchmark regresses request count, overscan, active-plus-drain
-   bandwidth, or correctness, revert only that candidate patch and document the
-   rejection in `doc/performance/`.
-7. After every permitted cloud or Compose run, remove temporary OSS objects,
-   Redis/TiKV keys, mounts, containers, volumes and servers. Preserve accepted
-   artifacts and record their paths.
-
-## Commit and closeout commands
-
-Review before staging:
-
-```text
-ssh brewfs-frp-sea "wsl.exe -d Ubuntu-24.04 -- /usr/bin/git -C /home/hxy/brewfs diff -- src/main.rs src/workspace_overlay/packed_v3/metrics.rs src/workspace_overlay/packed_v3/remote.rs src/workspace_overlay/packed_v3/coordinator.rs src/workspace_overlay/packed_v3/catalog.rs docker/compose-xfstests/aliyun/run_aliyun_perf.ps1 doc/performance/packed-v3-metadata-cache-analysis-2026-09-29.md REMOTE_CODEX_HANDOFF.md"
-ssh brewfs-frp-sea "wsl.exe -d Ubuntu-24.04 -- /usr/bin/git -C /home/hxy/brewfs status --short --branch"
-```
-
-After review and any matched benchmark:
-
-```text
-ssh brewfs-frp-sea "wsl.exe -d Ubuntu-24.04 -- bash -lc 'cd /home/hxy/brewfs && git add src/main.rs src/workspace_overlay/packed_v3/metrics.rs src/workspace_overlay/packed_v3/coordinator.rs src/workspace_overlay/packed_v3/catalog.rs docker/compose-xfstests/aliyun/run_aliyun_perf.ps1 docker/compose-xfstests/aliyun/run_aliyun_packed_million.ps1 docker/compose-xfstests/aliyun/run_aliyun_packed_vs_juicefs_compare.ps1 docker/compose-xfstests/aliyun/run_aliyun_packed_native.sh doc/performance/packed-v3-metadata-cache-analysis-2026-09-29.md doc/superpowers/specs/2026-09-27-brewfs-packed-metadata-v3-readonly-smallfiles.md REMOTE_CODEX_HANDOFF.md && git commit -m \"perf: add explicit packed decoded-frame cache\" && git push origin codex/packed-metadata-aliyun-20260930'"
-```
-
-Do not use destructive reset/checkout commands. At closeout, leave a coherent
-commit on the personal branch, report the commit ID and all test/artifact
-paths, and keep the repository and credential profiles available for follow-up
-work. Remove only migration bundles and temporary staging files after the
-final verification; never remove the working repository or credentials as
-part of normal handoff.
+The retained tests and TTL forwarding are committed in `dd418fa`; this handoff,
+closeout and experiment plan form the documentation follow-up. Keep `.claude/`
+and artifacts out of commits. Verify the personal branch push before closeout.
+Report actual commits, test results, withdrawn candidate and pending
+correctness/feature gates without a new performance-win claim.

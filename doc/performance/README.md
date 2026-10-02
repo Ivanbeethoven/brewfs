@@ -31,9 +31,18 @@ cache-contaminated numbers cannot be mistaken for an acceptance baseline.
   not a strict-cold JuiceFS comparison.
 
 - [aliyun-packed-v3-vs-juicefs-triple-1m-2026-10-01.md](aliyun-packed-v3-vs-juicefs-triple-1m-2026-10-01.md)
-  defines the million-file packed/Redis/TiKV cloud contract, records the matched
-  three-way 10k smoke and resource cleanup proof, and is the acceptance record
-  for the pending 1M run.
+  records the completed 10k, ordered 1M and shuffled 1M packed/Redis/TiKV
+  observations. Packed does not win the shuffled profile; historical TTL
+  symmetry claims require revalidation after the runner forwarding correction.
+
+- [packed-v3-index-budget-candidate-2026-10-02.md](packed-v3-index-budget-candidate-2026-10-02.md)
+  closes out the withdrawn index-budget candidate: authenticated-page tests
+  improved, but constrained-budget mounted-FUSE runs had EIO and no throughput
+  claim is accepted. Includes the dynamic/packed corpus and TTL correction.
+
+- [Three-innovation experiment plan](../superpowers/plans/2026-10-02-brewfs-three-innovations-experiment-plan.md)
+  separates metadata/frame/inline/cache effects, names the incomplete packed
+  lower lifecycle and authentication gates, and defines matched TiKV validation.
 
 Cold-read artifacts are valid only when the runner records zero data-cache
 hits. The runner now forces zero read-memory/SSD budgets, disables prefetch,

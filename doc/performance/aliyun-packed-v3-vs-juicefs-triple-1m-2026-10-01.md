@@ -8,7 +8,25 @@ shuffled 1M campaign completed for all four packed/Redis/TiKV rows with full
 byte validation and zero errors.
 
 **Conclusion: packed v3 does not win the shuffled GPU-shaped 1M profile.** It
-does win the ordered and metadata-dominant profiles recorded below.
+shows a narrower ordered stat advantage over TiKV, not a general ordered/tree
+or full-read win. See the measurement caveat below.
+
+## Measurement caveat added on 2026-10-02
+
+The packed runner exported `BREWFS_METADATA_CACHE_TTL_MS`, whereas the FUSE
+adapter reads `BREWFS_CACHE_TTL_MS`. Before the forwarding correction, setting
+the former did not prove the actual packed kernel TTL. The numeric rows below
+are preserved as historical observations, but statements that both sides used
+the same metadata TTL/cache semantics are **not verified**. Re-run matched
+profiles with the effective variable and FUSE operation counters before making
+new fairness or general superiority claims. Likewise, `data_range_gets=0` does
+not count inline file bytes fetched through GroupMeta.
+
+The archived strict r2 epoch-2 log contains errors and remains invalid; it must
+not be silently substituted for the later successful row summarized here. Raw
+artifacts are local generated evidence, not part of the Git commit. The completed
+valid warm/Redis/TiKV rows are under
+`docker/compose-xfstests/artifacts/aliyun-gpu-1m-r3-20261001/`.
 
 ## Workload contract
 
@@ -110,8 +128,9 @@ Active+drain seconds were:
 
 Packed metadata behavior changed with scale. A 512 MiB metadata budget warmed
 only 31/245 inode-index pages and 913/4,111 GroupMeta pages. The full phase
-recorded 666 inode-index remote GETs and 8,262 GroupMeta GETs. Packed full read
-issued 136,883 data ranges and fetched 32.65 GiB for 4.096 GiB logical bytes;
+recorded 911 inode-index remote GETs and 8,260 GroupMeta GETs in the archived
+full-phase log (666/8,262 belong to the stat phase). Packed full read issued
+136,883 data ranges and fetched 32.65 GB (30.41 GiB) for 4.096 GB logical bytes;
 this random 4 KiB layout therefore has substantial frame overscan. Redis kept
 about 2,002,230 keys and used about 422 MiB.
 
@@ -149,7 +168,7 @@ profile. It fetched only 101 exact packed frames across both 10k epochs, with
 The GPU smoke ECS and all GPU smoke OSS prefixes were independently verified
 deleted before the 1M GPU campaign.
 
-## Pending GPU-like shuffled validation
+## Completed GPU-like shuffled validation
 
 A follow-up scanner profile uses deterministic per-epoch shuffle, batch size
 256, 16 worker batches, bounded in-flight batches and two epochs. It still
@@ -257,13 +276,15 @@ fell to about 0.73 MiB/s with 775,628 physical ranges and 189.96 GB fetched for
 The decoded-frame cache recovers about half the gap but does not close it. Its
 remaining cost is metadata, not payload: a 512 MiB budget cannot hold the inode
 index and GroupMeta of a 1M-inode snapshot, so repeated lookups re-read index
-pages from OSS, visible as `packed_inode_index_remote_gets` and
-`packed_group_meta_remote_gets` in the tens of thousands.
+pages from OSS. The valid archived warm row records 1,284,176 inode-index GETs
+and 1,236,238 GroupMeta GETs across both epochs (about 933.3 GiB metadata-range
+bytes); these are millions of requests, not tens of thousands.
 
 The packed rows still pay off where they did in the lexicographic campaign and in
 the 10k metadata-only smoke: ordered access and metadata-dominant scans. The
-honest summary across both 1M profiles is that packed v3 wins on ordered and
-metadata-heavy reads, and loses on a tiny random-read workload dominated by
+honest summary across both 1M profiles is that ordered stat is faster than TiKV,
+ordered tree is slower, full read is roughly tied with TiKV and slower than
+Redis, and packed loses on a tiny random-read workload dominated by
 per-file payload and metadata misses. Making packed competitive in the shuffled
 profile needs a smaller hot working set per inode (or a metadata layout that
 avoids a remote page per random lookup), not more payload caching.

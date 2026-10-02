@@ -2,16 +2,16 @@
 
 Status: **implementation in progress**
 
-### Implementation checkpoint (2026-09-29)
+### Implementation checkpoint（2026-10-02 复核）
 
 本 SPEC 仍然是 v3 的目标契约；“目标契约”不等于当前代码已经全部实现。当前
 workspace 的实现审查结论如下，后续性能结果必须按这个边界命名：
 
 | 能力 | 当前状态 | 代码事实/限制 |
 | --- | --- | --- |
-| PM/GC/GM/II wire、digest、边界校验 | 已实现 | `BRFPM004`/`BRFGC004`、`PM06`/`GC04`/`GM06`/`II05` 使用独立 magic；外层 envelope 当前是 64-byte header + 64-byte footer。 |
+| PM/GC/GM/II wire、digest、边界校验 | 部分认证链已实现 | `BRFPM004`/`BRFGC004`、`PM06`/`GC04`/`GM06`/`II05` 使用独立 magic；64-byte header/footer。完整本地 container open 校验 body/footer/group digest；strict range 校验 GroupMeta 和 frame bytes，但 frame descriptor table 未通过 manifest ref 独立认证，不能称完整 container 端到端认证。 |
 | pageable group/inode index、bounded GroupMeta | 已实现 | 大快照使用 page refs；GroupMeta hard limit 为 256 KiB，目录/索引页仍按当前实现的记录上限分页；catalog 以 byte budget 保留 index page、GroupMeta、inode entry 和 hot inode locator，并在热路径共享 Arc。metadata warm-up 会先选稳定预算前缀，再按 container 合并相邻 GroupMeta range（最多 8 MiB、空洞最多 64 KiB）；warm GroupMeta 时按独立 locator 子预算 admission 热 inode locator，II05 的 `entry_ordinal` 直接定位 entry 并保留 name/inode 校验；readdir 深分页用认证的 `entry_count` 跳过前置 group，strict-cold demand read 仍只取引用的 group。 |
-| dynamic frame 和 `<256 KiB` inline payload | 已实现 | inline 受每 group 224 KiB 预算限制；frame codec 当前只接受 codec `0`。 |
+| dynamic frame 和 `<256 KiB` inline payload | 核心构建/回读已实现，完整目标未完成 | 按 size/profile/p90 选择 frame，同类 co-pack、跨 frame extents、inline 每 group 224 KiB；raw codec `0`。联合回归覆盖 200 KiB/512 KiB/1 MiB/10 MiB/32 MiB、random/sequential 和跨 frame 读取；fixture 仍限 4 MiB 且 p90=None，external large DataRef、sparse producer、完整 FUSE size-class corpus 尚未完成。 |
 | bounded streaming range | 部分实现（strict payload 已增强） | `ObjectBackend::get_object_range_stream` 和 `read_exact_range` 只消费声明的 range；strict/coalesced frame path 现在逐 chunk 分发到独立 frame buffer、逐 frame 校验 digest，避免把 coalesced overscan range 累积为完整 `Vec`；metadata helper 仍返回 bounded `Vec`，window-cache opt-in 仍保留完整对齐窗口，因此 SPEC 7.6 的全路径零拷贝/压缩解码尚未完成。 |
 | GroupMeta/GroupContainer 压缩、restart table | **未实现** | 当前 GroupMeta 是前缀压缩 + 固定宽度字段，body 和 frame 都是 uncompressed；没有每 32 条 restart table。zstd/restart 是后续 wire 版本或兼容扩展，不能写成当前性能事实。 |
 | 跨 FUSE 请求的 coalesce delay/group window | 已实现（demand coalescing） | `SharedGroupReadCoordinator` 在 mount 级维护 pending queue，并以 **250 µs** 收集窗口按 container/profile 合并已提交 frame；共享 4 MiB window cache 和可选 next-window read-ahead 仍是独立的 cold-pipelined 能力。 |
@@ -34,6 +34,19 @@ workspace lower binding require explicit follow-up versions/adapters.
 范围以本检查表为准。`strict-cold` 结果可以包含只针对已提交请求的 demand coalescing，
 但不能隐含 GroupMeta 压缩或 BRFCA 读取；`cold-pipelined` 结果必须明确标注当前的
 mount window/read-ahead 实现。
+### 2026-10-02 联合审查与实验门禁
+
+- dynamic block 的 selector/packer 已接入实际只读 catalog/coordinator；不是所有文件固定 4 MiB，也不是三个创新点的完整生命周期已经落地。
+- 当前 random group target/max 为 16/32 MiB、512 entries，sequential 为 32/48 MiB、1024 entries；container target 分别 32/48 MiB。第 6 节的 8/16 MiB、256 entries、16 MiB container 是目标默认，不是所有已发布 profile 的当前参数。
+- GM06 允许最多 1024 extents，第 6 节目标是每文件最多 256 frames；当前 builder/reader 尚未把该目标做成统一 profile 校验。不能直接修改 GM06 限制而破坏旧对象回读。
+- standalone FUSE 的 legacy slice facade 最终进入 packed unified plan；P5 的 upper/lower fallback、generation retry 和 seal/repack/head-CAS 尚未接通到 workspace 生命周期。
+- inline payload 与 GroupMeta 共传输、共占预算。metadata-only 的 `data_range_gets=0` 不代表没有通过 GroupMeta 下载 inline 文件内容。
+- 本轮 index-budget 候选虽通过页驻留回归，但本地旧基线和候选的 constrained-budget FUSE stat 都有 EIO，候选生产代码已回退。不得据此更新吞吐表。
+- cloud runner 的 TTL 变量与 FUSE 变量不一致；已增加实际进程环境桥接和回归。旧实验“双方 TTL 对称”的结论需要重新验证，保留原始数字而不泛化缓存公平性。
+
+完整消融和生命周期规划见
+[`2026-10-02-brewfs-three-innovations-experiment-plan.md`](../plans/2026-10-02-brewfs-three-innovations-experiment-plan.md)。
+
 Owner: BrewFS workspace / packed read path
 Scope: mutable workspaces, immutable snapshots, and adaptive physical layout on S3/OSS
 
