@@ -3022,6 +3022,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dynamic_size_class_corpus_reads_inline_and_split_frames_through_catalog() {
+        use super::super::{
+            PackedFileInput, SizeClassTable, choose_frame_layout, pack_group_files,
+        };
+
+        for profile in [
+            AccessProfile::RandomSmallFile,
+            AccessProfile::SequentialSmallFile,
+        ] {
+            for (size, hint) in [
+                (200 * 1024, None),
+                (512 * 1024, None),
+                (1024 * 1024, None),
+                (10 * 1024 * 1024, None),
+                (32 * 1024 * 1024, None),
+                (10 * 1024 * 1024, Some(200 * 1024)),
+            ] {
+                let temp = tempdir().unwrap();
+                let ranges = Arc::new(Mutex::new(Vec::new()));
+                let client = ObjectClient::new(RecordingBackend {
+                    inner: LocalFsBackend::new(temp.path()),
+                    ranges: Arc::clone(&ranges),
+                });
+                let payload = |inode: u64| -> Vec<u8> {
+                    (0..size)
+                        .map(|offset| {
+                            let mixed = (offset as u64)
+                                .wrapping_mul(6_364_136_223_846_793_005)
+                                .wrapping_add(inode.wrapping_mul(1_442_695_040_888_963_407));
+                            (mixed ^ (mixed >> 32) ^ (mixed >> 56)) as u8
+                        })
+                        .collect()
+                };
+                let file = |name: &[u8], inode| PackedFileInput {
+                    name: name.to_vec(),
+                    inode,
+                    kind: 1,
+                    mode: 0o100644,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    nlink: 1,
+                    atime_ns: 0,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                    flags: 0,
+                    data: payload(inode),
+                };
+                let mut files = vec![file(b"a", 7)];
+                // The second tiny file exceeds the group inline budget and
+                // exercises the Tiny frame path on the same published layout.
+                if size == 200 * 1024 {
+                    files.push(file(b"b", 8));
+                }
+                let table = SizeClassTable::default();
+                let decision = choose_frame_layout(size as u64, hint, profile, table).unwrap();
+                let (input, frames) =
+                    pack_group_files(1, [4; 32], files, profile, table, hint).unwrap();
+                let meta = GroupMeta::decode(&input.metadata).unwrap();
+                let object = PackedGroupContainer::build(1, profile, vec![input], frames).unwrap();
+                let opened = PackedGroupContainer::open(object.clone()).unwrap();
+                for frame in opened.frames() {
+                    assert_eq!(frame.size_class, decision.size_class);
+                    assert_eq!(frame.codec, 0);
+                    assert_eq!(frame.raw_len, frame.stored_len);
+                    assert!(u64::from(frame.raw_len) <= decision.frame_raw_bytes);
+                }
+                if size >= 256 * 1024 {
+                    assert_eq!(opened.frames().len() as u64, decision.frame_count);
+                    assert_eq!(meta.entries()[0].extents.len() as u64, decision.frame_count);
+                } else {
+                    assert_eq!(meta.entries()[0].inline_data.len(), size);
+                    assert_eq!(meta.entries()[1].extents.len(), 1);
+                }
+                client
+                    .put_object("size-class-container", &object)
+                    .await
+                    .unwrap();
+                let descriptor = &opened.groups()[0];
+                let manifest = PackedSnapshotManifest {
+                    snapshot_id: [3; 32],
+                    root_dir_key: [4; 32],
+                    root_inode: 1,
+                    layout_profile: profile,
+                    size_classes: table,
+                    groups: vec![PackedGroupRef {
+                        group_id: 1,
+                        container_ordinal: 0,
+                        parent_dir_key: [4; 32],
+                        first_name: b"a".to_vec(),
+                        last_name: meta.entries().last().unwrap().name.clone(),
+                        meta_offset: descriptor.metadata_offset,
+                        meta_len: descriptor.metadata_len,
+                        data_offset: descriptor.data_offset,
+                        data_len: descriptor.data_len,
+                        entry_count: descriptor.entry_count,
+                        file_count: descriptor.file_count,
+                        frame_count: descriptor.frame_ordinals.len() as u32,
+                        layout_profile: profile,
+                        metadata_digest: descriptor.metadata_digest,
+                        data_digest: descriptor.data_digest,
+                    }],
+                    containers: vec![PackedContainerRef {
+                        object_key: b"size-class-container".to_vec(),
+                        object_len: opened.object_len(),
+                        object_digest: opened.object_digest(),
+                    }],
+                    group_index_pages: Vec::new(),
+                    inode_index_pages: Vec::new(),
+                };
+                let manifest = PackedSnapshotManifest::decode(manifest.encode().unwrap()).unwrap();
+                let catalog = RemoteGroupCatalog::new(client, manifest);
+                catalog.prefetch_metadata_adaptive(2).await.unwrap();
+                for entry in meta.entries() {
+                    let expected = payload(entry.inode);
+                    let mut offsets = vec![0, size - 257, size / 2];
+                    if decision.frame_count > 1 {
+                        offsets.push(decision.frame_raw_bytes as usize - 128);
+                    }
+                    for offset in offsets {
+                        let mut output = vec![0; 257];
+                        catalog
+                            .read_inode_range(entry.inode, offset as u64, &mut output)
+                            .await
+                            .unwrap();
+                        assert_eq!(output, expected[offset..offset + 257]);
+                    }
+                    if !entry.inline_data.is_empty() {
+                        assert_eq!(catalog.packed_runtime_metrics().data_range_gets, 0);
+                    }
+                }
+                assert!(!ranges.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn decoded_frame_cache_reuses_a_shared_frame_for_adjacent_files() {
         let temp = tempdir().unwrap();
         let ranges = Arc::new(Mutex::new(Vec::new()));

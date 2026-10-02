@@ -141,7 +141,8 @@ EOF
 start_mount() {
     write_config
     mkdir -p "$MOUNT_DIR"
-    "$BREWFS_BIN" mount --privileged --config "$CONFIG_PATH" "$MOUNT_DIR" \
+    BREWFS_CACHE_TTL_MS="$METADATA_CACHE_TTL_MS" \
+        "$BREWFS_BIN" mount --privileged --config "$CONFIG_PATH" "$MOUNT_DIR" \
         >"$ARTIFACT_DIR/tools/${CURRENT_TOOL}-brewfs.log" 2>&1 &
     BREWFS_PID=$!
     local deadline=$((SECONDS + 90))

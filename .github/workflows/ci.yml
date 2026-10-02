@@ -85,6 +85,8 @@ jobs:
           bash docker/compose-xfstests/test_perf_report_delta.sh
           bash docker/compose-xfstests/test_juicefs_direct_matrix.sh
           bash docker/compose-xfstests/test_juicefs_perf_report.sh
+          bash tools/perf/test_packed_runner_ttl.sh
+          python3 -m unittest discover -s tools/perf -p test_smallfiles_scan.py
 
       - name: Build workspace
         run: cargo build --workspace
