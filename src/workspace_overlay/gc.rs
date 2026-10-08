@@ -53,6 +53,11 @@ where
 
     pub async fn run_at(&self, now_ns: i64) -> Result<GcReport, WorkspaceError> {
         let lease_grace_ns = duration_ns(self.lease_grace)?;
+        self.store.reap_expired_leases().await?;
+        // 宽限期结束后清理终止状态的租约与 journal，再扫描 GC 根集合。
+        self.store
+            .prune_terminal_records(now_ns, lease_grace_ns)
+            .await?;
         let snapshot = self.store.gc_snapshot(now_ns, lease_grace_ns).await?;
         let parents = snapshot
             .layers
@@ -98,6 +103,7 @@ where
         }
 
         let deleted_layers = deletable.into_iter().collect::<Vec<_>>();
+        // 候选集合允许过期；存储后端在标记 Deleting 时复核根引用并执行 CAS。
         self.store
             .delete_layer_metadata(DeleteLayerMetadata {
                 layer_ids: deleted_layers.clone(),
@@ -281,6 +287,33 @@ mod tests {
         );
         let report = gc.run_at(i64::MAX / 2).await.unwrap();
         assert!(!report.deleted_slices.contains(&77));
+    }
+
+    #[tokio::test]
+    async fn gc_prunes_all_old_released_leases() {
+        let (store, first) = setup().await;
+        let workspace_id = first.view.workspace_id;
+        first.release().await.unwrap();
+        let second = WorkspaceMountSession::acquire(
+            store.clone(),
+            workspace_id,
+            2,
+            DEFAULT_LEASE_TTL,
+            DEFAULT_HEARTBEAT_INTERVAL,
+        )
+        .await
+        .unwrap();
+        second.release().await.unwrap();
+        assert_eq!(store.list_leases(workspace_id).await.unwrap().len(), 2);
+        let gc = WorkspaceGc::new(
+            store.clone(),
+            Arc::new(InMemoryBlockStore::new()),
+            ChunkLayout::default(),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        gc.run_at(i64::MAX / 2).await.unwrap();
+        assert!(store.list_leases(workspace_id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
