@@ -100,6 +100,16 @@ fn is_carrier_deletion_check(key: &[u8]) -> bool {
         || key.starts_with(b"packed/v3/registry/history-root/")
         || key.starts_with(b"packed/v3/history/")
 }
+// Binding history version 1 is the durable source installed by the initial
+// bootstrap. A carrier may retain that source exactly as it retains a later
+// publication version; only the zero version is invalid. Keep this check
+// explicit so borrowed forks do not accidentally reject an initial source.
+fn validate_retained_source_binding_version(version: u64) -> Result<(), WorkspaceError> {
+    if version == 0 {
+        return Err(WorkspaceError::Fenced);
+    }
+    Ok(())
+}
 
 fn merge(checks: &mut Vec<KvCheck>, added: Vec<KvCheck>) -> Result<(), WorkspaceError> {
     super::super::native_publication::append_exact_checks(checks, added)?;
@@ -472,10 +482,10 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                 .ok_or(WorkspaceError::Fenced)?;
         let descriptor_digest: [u8; 32] =
             Sha256::digest(values[0].as_ref().ok_or(WorkspaceError::Fenced)?).into();
+        validate_retained_source_binding_version(basis.source_binding.binding.binding_version)?;
         if descriptor_digest != alias.carrier_basis_digest
             || basis.registry_incarnation != alias.source_incarnation
             || basis.source_binding.workspace_id == binding.workspace_id
-            || basis.source_binding.binding.binding_version <= 1
             || basis.source_binding.binding.manifest != binding.binding.manifest
             || basis.source_binding.highest_inode != binding.highest_inode
         {
@@ -493,9 +503,7 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
         &self,
         basis: &PackedCarrierBasis,
     ) -> Result<Vec<KvCheck>, WorkspaceError> {
-        if basis.source_binding.binding.binding_version <= 1 {
-            return Err(WorkspaceError::Fenced);
-        }
+        validate_retained_source_binding_version(basis.source_binding.binding.binding_version)?;
         let source_keys = vec![
             packed_history_key(
                 basis.source_binding.workspace_id,
@@ -767,6 +775,18 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                 matched = matched.checked_add(1).ok_or(WorkspaceError::Busy)?;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_retained_source_binding_version;
+
+    #[test]
+    fn initial_binding_history_version_is_a_valid_retained_source() {
+        assert!(validate_retained_source_binding_version(1).is_ok());
+        assert!(validate_retained_source_binding_version(2).is_ok());
+        assert!(validate_retained_source_binding_version(0).is_err());
     }
 }
 

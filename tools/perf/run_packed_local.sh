@@ -149,6 +149,7 @@ metadata_bytes=%s
 workers=%s
 epochs=%s
 mode=%s
+order=shuffle
 payload_memory=0
 payload_ssd=0
 window=0
