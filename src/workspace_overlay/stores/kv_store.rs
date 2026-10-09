@@ -80,6 +80,16 @@ const VOLUME_FORMAT: &str = "workspace-v1";
 const PACKED_CLAIM: &[u8] = b"PWC3";
 const PACKED_ROOT_GENERATION_KEY: &[u8] = b"packed/v3/root-generation";
 const LAYER_INVENTORY_GENERATION_KEY: &[u8] = b"packed/v3/layer-inventory-generation";
+// PWB3 root enumeration is an admin/GC proof, so never materialize an
+// unbounded packed history/current namespace from Redis or TiKV. The row cap
+// matches the native GC census tier; the byte cap fails closed before retained
+// checks can exceed the canonical metadata budget.
+const PACKED_BINDING_SCAN_PAGE_RECORDS: usize = 32;
+const PACKED_BINDING_SCAN_MAX_ROWS: usize = 4096;
+const PACKED_BINDING_SCAN_MAX_PAGES: usize =
+    PACKED_BINDING_SCAN_MAX_ROWS / PACKED_BINDING_SCAN_PAGE_RECORDS + 1;
+const PACKED_BINDING_SCAN_MAX_BYTES: usize = 16 << 20;
+const PACKED_BINDING_SCAN_ADMISSION_BYTES: u64 = 16 << 20;
 const OPEN_V3_PREFIX: &[u8] = b"open/v3/";
 const OPEN_RECOVERY_PREFIX: &[u8] = b"open/v3/recovery/";
 const VOLUME_HEADER_KEY: &[u8] = b"volume/header";
@@ -1656,35 +1666,128 @@ where
         ),
         WorkspaceError,
     > {
-        // Capture before scanning. Every public install/publication advances
-        // this fence atomically with its roots, including a first binding
-        // whose new keys cannot be protected by checks of existing rows.
-        let generation = self.backend.get(PACKED_ROOT_GENERATION_KEY).await?;
+        let budget =
+            self.packed_reader_pin_budget
+                .get()
+                .ok_or(WorkspaceError::UnsupportedCapability(
+                    "packed binding GC memory budget",
+                ))?;
+        // Retain the owner through the final destructive CAS. This accounts
+        // for all decoded PWB3 rows and their exact checks, including rows
+        // returned by a later page after a short first page.
+        let binding_owner = budget
+            .admit(&[(
+                crate::workspace_overlay::packed_v3::wire005::V3BudgetPool::Metadata,
+                PACKED_BINDING_SCAN_ADMISSION_BYTES,
+            )])
+            .map_err(|error| WorkspaceError::InvalidReadPlan(error.to_string()))?;
+        let generation_key = PACKED_ROOT_GENERATION_KEY.to_vec();
+        let (generation_values, now) = self
+            .backend
+            .get_many_consistent_with_time_bounded(
+                std::slice::from_ref(&generation_key),
+                KvReadLimits {
+                    max_records: 1,
+                    max_key_bytes: 256,
+                    max_value_bytes: 512,
+                    max_total_bytes: 4096,
+                    max_response_bytes: 16 << 10,
+                    max_data_requests: 1,
+                },
+            )
+            .await?;
+        if generation_values.len() != 1 || now <= 0 {
+            return Err(WorkspaceError::Fenced);
+        }
+        let generation = generation_values.into_iter().next().flatten();
         next_packed_root_generation(&generation)?;
-        let mut roots = BTreeSet::new();
-        let mut checks = vec![KvCheck {
-            key: PACKED_ROOT_GENERATION_KEY.to_vec(),
+        let generation_check = KvCheck {
+            key: generation_key.clone(),
             expected: generation,
-        }];
+        };
+        let mut roots = BTreeSet::new();
+        let mut checks = vec![generation_check.clone()];
+        let page_limits = KvReadLimits {
+            max_records: PACKED_BINDING_SCAN_PAGE_RECORDS,
+            max_key_bytes: 256,
+            max_value_bytes: 12 << 10,
+            max_total_bytes: 512 << 10,
+            max_response_bytes: 512 << 10,
+            max_data_requests: 64,
+        };
+        let mut rows = 0usize;
+        let mut bytes = 0usize;
         for prefix in [b"packed/v3/history/".as_slice(), b"packed/v3/current/"] {
-            for entry in self.scan_entries(prefix.to_vec()).await? {
-                let record = PackedLowerBindingRecord::decode(&entry.value)?;
-                let expected_key = if prefix == b"packed/v3/history/" {
-                    packed_history_key(record.workspace_id, record.binding.binding_version)
-                } else {
-                    packed_current_key(record.workspace_id)
-                };
-                if entry.key != expected_key {
-                    return Err(WorkspaceError::CorruptMetadata(
-                        "PWB3 GC key/record disagree".into(),
-                    ));
+            let mut after = None;
+            let mut pages = 0usize;
+            loop {
+                pages = pages.checked_add(1).ok_or(WorkspaceError::Busy)?;
+                if pages > PACKED_BINDING_SCAN_MAX_PAGES {
+                    return Err(WorkspaceError::Busy);
                 }
-                roots.insert(record.base_revision.layer_id);
-                roots.insert(record.head_layer_id);
-                checks.push(KvCheck {
-                    key: entry.key,
-                    expected: Some(entry.value),
-                });
+                // Every page is fenced on the same root generation. A new
+                // binding can appear after a prior page and is then rejected
+                // by this CAS before its roots are used for deletion.
+                if !self
+                    .backend
+                    .compare_and_swap(std::slice::from_ref(&generation_check), &[])
+                    .await?
+                {
+                    return Err(WorkspaceError::Busy);
+                }
+                let page = self
+                    .backend
+                    .scan_prefix_page_with_byte_limits(prefix, after.as_deref(), page_limits)
+                    .await?;
+                if !self
+                    .backend
+                    .compare_and_swap(std::slice::from_ref(&generation_check), &[])
+                    .await?
+                {
+                    return Err(WorkspaceError::Busy);
+                }
+                if page.len() > PACKED_BINDING_SCAN_PAGE_RECORDS {
+                    return Err(WorkspaceError::Fenced);
+                }
+                if page.is_empty() {
+                    break;
+                }
+                for entry in page {
+                    if !entry.key.starts_with(prefix)
+                        || entry.key.len() > page_limits.max_key_bytes
+                        || entry.value.len() > page_limits.max_value_bytes
+                        || after.as_ref().is_some_and(|cursor| entry.key <= *cursor)
+                    {
+                        return Err(WorkspaceError::Fenced);
+                    }
+                    rows = rows.checked_add(1).ok_or(WorkspaceError::Busy)?;
+                    bytes = bytes
+                        .checked_add(entry.key.len())
+                        .and_then(|total| total.checked_add(entry.value.len()))
+                        .ok_or(WorkspaceError::Busy)?;
+                    if rows > PACKED_BINDING_SCAN_MAX_ROWS || bytes > PACKED_BINDING_SCAN_MAX_BYTES
+                    {
+                        return Err(WorkspaceError::Busy);
+                    }
+                    let record = PackedLowerBindingRecord::decode(&entry.value)?;
+                    let expected_key = if prefix == b"packed/v3/history/" {
+                        packed_history_key(record.workspace_id, record.binding.binding_version)
+                    } else {
+                        packed_current_key(record.workspace_id)
+                    };
+                    if entry.key != expected_key {
+                        return Err(WorkspaceError::CorruptMetadata(
+                            "PWB3 GC key/record disagree".into(),
+                        ));
+                    }
+                    roots.insert(record.base_revision.layer_id);
+                    roots.insert(record.head_layer_id);
+                    after = Some(entry.key.clone());
+                    checks.push(KvCheck {
+                        key: entry.key,
+                        expected: Some(entry.value),
+                    });
+                }
             }
         }
         let reader_pins = self.packed_reader_pin_roots().await?;
@@ -1694,9 +1797,8 @@ where
             self.scan_packed_journal_layer_roots().await?;
         roots.extend(journal_roots);
         checks.extend(journal_checks);
-        let admissions = reader_pins
-            ._permit
-            .into_iter()
+        let admissions = std::iter::once(binding_owner)
+            .chain(reader_pins._permit)
             .chain(journal_admission)
             .collect();
         Ok((roots, checks, admissions))
@@ -4229,23 +4331,13 @@ where
                 }
             }
         }
-        // PWB3 binding history is an independent catalog root. A workspace
-        // can enter Deleting before its binding records are retired; dropping
-        // the native base/head here would leave a durable binding dangling.
-        // Decode both history and current records so a partially retired
-        // history cannot make the current binding invisible to GC.
-        for prefix in [b"packed/v3/history/".as_slice(), b"packed/v3/current/"] {
-            for entry in self.scan_entries(prefix.to_vec()).await? {
-                let record = PackedLowerBindingRecord::decode(&entry.value)?;
-                roots.insert(record.base_revision.layer_id);
-                roots.insert(record.head_layer_id);
-            }
-        }
-        let reader_pins = self.packed_reader_pin_roots().await?;
-        roots.extend(reader_pins.native_roots.iter().copied());
-        let (journal_roots, _journal_checks, _journal_admission) =
-            self.scan_packed_journal_layer_roots().await?;
-        roots.extend(journal_roots);
+        // PWB3 bindings, reader pins, and packed journal records are all
+        // independent roots. Reuse the same bounded paginated census used by
+        // destructive metadata CAS preparation so an observational GC
+        // snapshot cannot materialize an unbounded Redis/TiKV namespace.
+        let (packed_roots, _packed_checks, _packed_admissions) =
+            self.scan_packed_binding_roots().await?;
+        roots.extend(packed_roots);
         let mut layers = state.layers.into_values().collect::<Vec<_>>();
         layers.sort_by_key(|layer| (layer.created_at_ns, layer.layer_id));
         let extents: Vec<DataExtentDelta> = self.scan(b"delta/extent/".to_vec()).await?;

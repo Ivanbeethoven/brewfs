@@ -431,6 +431,18 @@ pub async fn patch_mount_backend_status(
             .as_ref()
             .and_then(|status| status.pod_uid.clone());
     }
+    // Preserve the last authoritative lease identity after the backend moves
+    // it to Released/Expired. Deletion finalizers use this exact ID to prove
+    // durable clean release; clearing it when active becomes None would
+    // make a status update lose the only link to that proof.
+    let previous_lease_id = mount
+        .status
+        .as_ref()
+        .and_then(|status| status.lease_id.clone());
+    let previous_holder_generation = mount
+        .status
+        .as_ref()
+        .and_then(|status| status.holder_generation);
     let status = BrewFSWorkspaceMountStatus {
         observed_generation: mount.metadata.generation,
         phase: if replaced_active_pod {
@@ -450,8 +462,12 @@ pub async fn patch_mount_backend_status(
         pod_name: Some(format!("{}-workspace-0", mount.name_any())),
         pod_uid,
         workspace_id: Some(backend.record.workspace_id.to_string()),
-        lease_id: active.map(|lease| lease.lease_id.to_string()),
-        holder_generation: active.map(|lease| lease.holder_generation),
+        lease_id: active
+            .map(|lease| lease.lease_id.to_string())
+            .or(previous_lease_id),
+        holder_generation: active
+            .map(|lease| lease.holder_generation)
+            .or(previous_holder_generation),
         mounted_head_layer_id: Some(backend.record.head_layer_id.to_string()),
         mounted_head_epoch: Some(backend.record.head_epoch),
         mounted_base_revision: Some(revision_to_status(&backend.base_revision)),

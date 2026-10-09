@@ -1,16 +1,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context as _, anyhow, bail};
+use anyhow::{anyhow, bail, Context as _};
 use brewfs::workspace_overlay::error::WorkspaceError;
-use brewfs::workspace_overlay::ids::{LayerId, SnapshotId, WorkspaceId};
-use brewfs::workspace_overlay::model::LeaseState;
+use brewfs::workspace_overlay::ids::{LayerId, LeaseId, SnapshotId, WorkspaceId};
+use brewfs::workspace_overlay::model::{LeaseState, SnapshotLease};
 use chrono::Utc;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::runtime::controller::Action;
 use kube::{Client, Resource, ResourceExt};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
 use uuid::Uuid;
@@ -19,9 +19,9 @@ use crate::crd::BrewFSCluster;
 use crate::reconciler::OperatorContext;
 
 use super::admin::{
-    EnsureSnapshotRequest, EnsureWorkspaceRequest, VolumeIdentity, WorkspaceAdmin,
     catalog_namespace, connect_workspace_admin_for_cluster, deterministic_uuid,
-    revision_from_status, revision_to_status,
+    revision_from_status, revision_to_status, EnsureSnapshotRequest, EnsureWorkspaceRequest,
+    VolumeIdentity, WorkspaceAdmin,
 };
 use super::crd::{
     BrewFSWorkspace, BrewFSWorkspaceMount, BrewFSWorkspaceSnapshot, BrewFSWorkspaceSnapshotStatus,
@@ -377,10 +377,15 @@ pub async fn reconcile_workspace(
         return Err(anyhow!("workspace backend returned a non-canonical layer depth").into());
     }
 
+    // A Releasing lease still owns the writable mount slot until the backend
+    // records the durable Released transition. Treat it as busy for both
+    // clean-source admission and the workspace phase; checking only Active
+    // would let a suspended workspace advertise a clean view while a release
+    // transaction is still in flight.
     let active_lease = view
         .leases
         .iter()
-        .any(|lease| lease.state == LeaseState::Active);
+        .any(|lease| matches!(lease.state, LeaseState::Active | LeaseState::Releasing));
     let packed_binding = admin.packed_binding(workspace_id).await?;
     if cluster_workspace.capabilities.packed_v3_ready() && packed_binding.is_none() {
         return Err(anyhow!("packed-v3 workspace is missing its mandatory binding").into());
@@ -1028,7 +1033,7 @@ async fn cleanup_workspace(
     if view
         .leases
         .iter()
-        .any(|lease| lease.state == LeaseState::Active)
+        .any(|lease| matches!(lease.state, LeaseState::Active | LeaseState::Releasing))
     {
         bail!("waiting for the workspace writable lease to be released");
     }
@@ -1102,14 +1107,56 @@ async fn verify_mount_lease_released(
         .ok_or_else(|| anyhow!("workspace has no backend identity"))?
         .parse()?;
     let view = admin.inspect_workspace(workspace_id).await?;
-    if view
-        .leases
-        .iter()
-        .any(|lease| lease.state == LeaseState::Active)
-    {
-        bail!("waiting for backend confirmation that the writable lease is released");
-    }
+    require_mount_lease_released(
+        &view.leases,
+        mount
+            .status
+            .as_ref()
+            .and_then(|status| status.lease_id.as_deref()),
+    )?;
     Ok(())
+}
+
+/// Validate the exact lease recorded by the mount before removing its
+/// Kubernetes finalizer. Historical expired leases are retained in the
+/// catalog, so checking that *all* leases are Released would deadlock cleanup;
+/// the mount's own lease must instead reach Released, while an unknown lease
+/// ID remains fail-closed.
+fn require_mount_lease_released(
+    leases: &[SnapshotLease],
+    lease_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(lease_id) = lease_id else {
+        if let Some(lease) = leases
+            .iter()
+            .find(|lease| lease.state != LeaseState::Released)
+        {
+            match lease.state {
+                LeaseState::Active | LeaseState::Releasing => {
+                    bail!("waiting for backend confirmation that the writable lease is released")
+                }
+                LeaseState::Expired => {
+                    bail!("mount lease identity is missing and an expired lease needs recovery")
+                }
+                LeaseState::Released => unreachable!("filtered above"),
+            }
+        }
+        return Ok(());
+    };
+    let lease_id: LeaseId = lease_id.parse().context("parse mount lease ID")?;
+    let lease = leases
+        .iter()
+        .find(|lease| lease.lease_id == lease_id)
+        .ok_or_else(|| anyhow!("mount lease is missing from the authoritative backend"))?;
+    match lease.state {
+        LeaseState::Released => Ok(()),
+        LeaseState::Active | LeaseState::Releasing => {
+            bail!("waiting for backend confirmation that the writable lease is released")
+        }
+        LeaseState::Expired => {
+            bail!("mount lease expired without a clean release; recovery is required")
+        }
+    }
 }
 
 async fn cleanup_snapshot(
@@ -1500,6 +1547,47 @@ mod tests {
             ..ObjectMeta::default()
         };
         assert!(force_delete_requested(&workspace).is_err());
+    }
+
+    fn synthetic_lease(id: u128, state: LeaseState) -> SnapshotLease {
+        SnapshotLease {
+            lease_id: LeaseId::from_uuid(Uuid::from_u128(id)),
+            workspace_id: WorkspaceId::from_uuid(Uuid::from_u128(10)),
+            base_revision: brewfs::workspace_overlay::model::BaseRevision {
+                layer_id: LayerId::from_uuid(Uuid::from_u128(11)),
+                sealed_version: 1,
+                root_hash: [0; 32],
+            },
+            holder_generation: 1,
+            writable: true,
+            state,
+            expires_at_ns: 0,
+            created_at_ns: id as i64,
+            updated_at_ns: id as i64,
+        }
+    }
+
+    #[test]
+    fn mount_finalizer_requires_its_exact_lease_to_be_released() {
+        let released = synthetic_lease(20, LeaseState::Released);
+        let expired = synthetic_lease(21, LeaseState::Expired);
+        let active = synthetic_lease(22, LeaseState::Active);
+        let leases = vec![released.clone(), expired, active.clone()];
+        let released_id = released.lease_id.to_string();
+        require_mount_lease_released(&leases, Some(&released_id)).unwrap();
+
+        let expired_id = leases[1].lease_id.to_string();
+        let error = require_mount_lease_released(&leases, Some(&expired_id)).unwrap_err();
+        assert!(error.to_string().contains("recovery is required"));
+
+        let missing_id = LeaseId::from_uuid(Uuid::from_u128(99)).to_string();
+        let error = require_mount_lease_released(&[released], Some(&missing_id)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("missing from the authoritative backend"));
+
+        let error = require_mount_lease_released(&[active], None).unwrap_err();
+        assert!(error.to_string().contains("writable lease is released"));
     }
 }
 
