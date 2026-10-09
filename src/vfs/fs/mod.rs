@@ -6924,6 +6924,7 @@ where
         ino: i64,
         name: &str,
         value: Option<&[u8]>,
+        flags: u32,
         uid: u32,
         groups: &[u32],
     ) -> Result<(), crate::meta::store::MetaError> {
@@ -6946,6 +6947,7 @@ where
                         ino,
                         &name,
                         value.as_deref(),
+                        flags,
                         uid,
                         &groups,
                     )
@@ -6954,7 +6956,7 @@ where
                 .await
                 .map_err(|error| crate::meta::store::MetaError::Anyhow(anyhow::anyhow!(error)))?;
         }
-        self.packed_owned_update_posix_acl_ino(ino, name, value, uid, groups)
+        self.packed_owned_update_posix_acl_ino(ino, name, value, flags, uid, groups)
             .await
     }
 
@@ -6964,11 +6966,12 @@ where
         ino: i64,
         name: &str,
         value: Option<&[u8]>,
+        flags: u32,
         uid: u32,
         groups: &[u32],
     ) -> Result<(), crate::meta::store::MetaError> {
         self.meta_layer()
-            .update_posix_acl(ino, name, value, uid, groups)
+            .update_posix_acl_with_flags(ino, name, value, flags, uid, groups)
             .await?;
         if let Some(attr) = self.meta_layer().stat_fresh(ino).await? {
             self.state.handles.update_attr_for_inode(ino, &attr);

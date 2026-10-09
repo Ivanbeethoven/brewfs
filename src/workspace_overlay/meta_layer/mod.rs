@@ -1277,7 +1277,27 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         uid: u32,
         groups: &[u32],
     ) -> Result<(), MetaError> {
+        self.update_posix_acl_with_flags(ino, name, value, 0, uid, groups)
+            .await
+    }
+
+    async fn update_posix_acl_with_flags(
+        &self,
+        ino: i64,
+        name: &str,
+        value: Option<&[u8]>,
+        flags: u32,
+        uid: u32,
+        groups: &[u32],
+    ) -> Result<(), MetaError> {
         if name.as_bytes() != ACCESS_XATTR && name.as_bytes() != DEFAULT_XATTR {
+            return Err(MetaError::Io(std::io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )));
+        }
+        if flags & !(libc::XATTR_CREATE as u32 | libc::XATTR_REPLACE as u32) != 0
+            || flags & libc::XATTR_CREATE as u32 != 0 && flags & libc::XATTR_REPLACE as u32 != 0
+        {
             return Err(MetaError::Io(std::io::Error::from_raw_os_error(
                 libc::EINVAL,
             )));
@@ -1294,7 +1314,7 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         for _ in 0..64 {
             let expected = self.mutation_version().await?;
             let result = async {
-                let (mut inode, _, _, _) = self.permission_inode(&expected, ino).await?;
+                let (mut inode, access, default, _) = self.permission_inode(&expected, ino).await?;
                 if inode.kind == file_type_code(FileType::Symlink) {
                     return Err(MetaError::Io(std::io::Error::from_raw_os_error(
                         libc::EOPNOTSUPP,
@@ -1303,6 +1323,21 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                 if uid != 0 && uid != inode.uid {
                     return Err(MetaError::Io(std::io::Error::from_raw_os_error(
                         libc::EPERM,
+                    )));
+                }
+                let existing = if name.as_bytes() == ACCESS_XATTR {
+                    access.is_some()
+                } else {
+                    default.is_some()
+                };
+                if flags & libc::XATTR_CREATE as u32 != 0 && existing {
+                    return Err(MetaError::Io(std::io::Error::from_raw_os_error(
+                        libc::EEXIST,
+                    )));
+                }
+                if flags & libc::XATTR_REPLACE as u32 != 0 && !existing {
+                    return Err(MetaError::Io(std::io::Error::from_raw_os_error(
+                        libc::ENODATA,
                     )));
                 }
                 if name.as_bytes() == DEFAULT_XATTR
@@ -2745,7 +2780,7 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                 )));
             }
             return self
-                .update_posix_acl(inode, name, Some(value), 0, &[])
+                .update_posix_acl_with_flags(inode, name, Some(value), flags, 0, &[])
                 .await;
         }
         let _mutation_guard = self.mutation_gate.lock().await;
@@ -2950,7 +2985,9 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
 
     async fn remove_xattr_bytes(&self, inode: i64, name: &[u8]) -> Result<(), MetaError> {
         if let Some(name) = posix_acl_xattr_name(name) {
-            return self.update_posix_acl(inode, name, None, 0, &[]).await;
+            return self
+                .update_posix_acl_with_flags(inode, name, None, libc::XATTR_REPLACE as u32, 0, &[])
+                .await;
         }
         let _mutation_guard = self.mutation_gate.lock().await;
         for _ in 0..64 {

@@ -132,8 +132,8 @@ pub trait MetaLayer: Send + Sync {
     }
 
     /// POSIX ACL owner policy and the mode update share one commit version.
-    /// None and an empty valid ACL mean removal; ordinary xattr flags do not
-    /// change Linux POSIX ACL set semantics.
+    /// None and an empty valid ACL mean removal. The flags-aware helper below
+    /// additionally preserves Linux XATTR_CREATE/XATTR_REPLACE semantics.
     async fn update_posix_acl(
         &self,
         _ino: i64,
@@ -145,6 +145,22 @@ pub trait MetaLayer: Send + Sync {
         Err(MetaError::NotSupported(
             "writable POSIX ACL is unavailable".into(),
         ))
+    }
+
+    /// Update a POSIX ACL xattr while preserving Linux xattr create/replace
+    /// semantics. Writable backends must override this method so the
+    /// existence check and ACL/mode commit share one metadata transaction.
+    async fn update_posix_acl_with_flags(
+        &self,
+        ino: i64,
+        name: &str,
+        value: Option<&[u8]>,
+        flags: u32,
+        uid: u32,
+        groups: &[u32],
+    ) -> Result<(), MetaError> {
+        let _ = flags;
+        self.update_posix_acl(ino, name, value, uid, groups).await
     }
 
     async fn set_attr_as(
