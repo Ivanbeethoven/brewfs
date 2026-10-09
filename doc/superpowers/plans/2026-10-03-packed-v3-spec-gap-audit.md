@@ -297,3 +297,7 @@ failed=1, cancelled=0, received_failed=10, and conserved counters.
 This does not close the G06 request graph, startup/object-class attribution,
 full retry accounting, raw/decoded/union amplification, or real FUSE evidence.
 See G06 HTTP evidence in the performance directory.
+
+## 2026-10-10 delta: G16 runner module invocation
+
+The bounded Python performance helpers now support both package-qualified invocation from the repository root and direct invocation from tools/perf. tools/perf/__init__.py marks the helper directory as a package; packed_partial_scan.py and its focused tests use relative imports with a direct-execution fallback. The repository-root suite (python3 -m unittest tools.perf.test_packed_local_runner tools.perf.test_packed_run_manifest tools.perf.test_packed_partial_scan tools.perf.test_smallfiles_scan) passes 18 tests, and the direct tools/perf runner-manifest/partial-scan suite passes 9 tests. This closes only the import/reproducibility sub-contract; cloud dispatch, release/toolchain provenance, resource journals, cleanup proof, and G17 paired acceptance remain open.

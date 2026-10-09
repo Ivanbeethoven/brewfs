@@ -3,7 +3,10 @@ import pathlib
 import tempfile
 import unittest
 
-from packed_run_manifest import ArtifactError, finalize_manifest, init_manifest
+try:
+    from .packed_run_manifest import ArtifactError, finalize_manifest, init_manifest
+except ImportError:  # direct execution from tools/perf
+    from packed_run_manifest import ArtifactError, finalize_manifest, init_manifest
 
 
 class PackedRunManifestTests(unittest.TestCase):
