@@ -101,15 +101,23 @@ function Resolve-Executable([string]$Name, [string[]]$Candidates = @()) {
 }
 
 $aliyunCandidates = @()
-if ($env:LOCALAPPDATA) { $aliyunCandidates += (Join-Path $env:LOCALAPPDATA 'AliyunCLI\aliyun.exe') }
-$Aliyun = Resolve-Executable 'aliyun' $aliyunCandidates
+if ($env:LOCALAPPDATA) {
+    $aliyunCandidates += (Join-Path $env:LOCALAPPDATA 'AliyunCLI\aliyun.exe')
+    $aliyunCandidates += (Join-Path $env:LOCALAPPDATA 'aliyun\aliyun.exe')
+    $wingetRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+    $aliyunCandidates += @(
+        Get-ChildItem -Path (Join-Path $wingetRoot 'Alibaba.AlibabaCloudCLI_*\aliyun.exe') -File -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName
+    )
+}
+$script:Aliyun = $null
 
 function Invoke-Checked([string]$File, [string[]]$Arguments) {
     $output = & $File @Arguments 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "命令失败: $File $($Arguments -join ' ')$([Environment]::NewLine)$($output -join [Environment]::NewLine)"
     }
-    return $output
+    return ($output -join [Environment]::NewLine)
 }
 
 function Invoke-AliyunJson([string[]]$Arguments) {
@@ -125,6 +133,37 @@ function Invoke-AliyunJson([string[]]$Arguments) {
 
 function Format-InstanceIds([string]$Value) {
     return '["' + $Value + '"]'
+}
+
+function Get-ResultVaultCurlArguments {
+    $arguments = @(
+        '--fail-with-body', '--silent', '--show-error', '--location',
+        '--retry', '5', '--retry-delay', '2', '--retry-all-errors'
+    )
+    # Schannel fails closed when the Windows host cannot reach the certificate
+    # revocation service (CRYPT_E_REVOCATION_OFFLINE). Keep certificate and
+    # hostname verification enabled, but allow Result Vault transfers to run
+    # while that separate revocation endpoint is unreachable.
+    if ($IsWindows) { $arguments += '--ssl-no-revoke' }
+    # TUN-mode VPNs commonly return an RFC 2544 fake IP (198.18.0.0/15). The
+    # proxy behind that address can truncate larger multipart uploads. Allow a
+    # caller to pin only Result Vault traffic to a real edge address without
+    # changing system DNS or disabling the VPN for the rest of the run.
+    if ($ResultVaultResolveIp) {
+        $parsedIp = $null
+        if (-not [Net.IPAddress]::TryParse($ResultVaultResolveIp, [ref]$parsedIp)) {
+            throw "ResultVaultResolveIp 不是有效 IP: $ResultVaultResolveIp"
+        }
+        if (-not $ResultVaultUrl) { throw 'ResultVaultResolveIp 需要 ResultVaultUrl。' }
+        $resultVaultUri = [Uri]$ResultVaultUrl
+        $resultVaultPort = if ($resultVaultUri.IsDefaultPort) {
+            if ($resultVaultUri.Scheme -eq 'https') { 443 } else { 80 }
+        } else {
+            $resultVaultUri.Port
+        }
+        $arguments += @('--resolve', "$($resultVaultUri.Host):${resultVaultPort}:$ResultVaultResolveIp")
+    }
+    return $arguments
 }
 
 function Wait-Until([scriptblock]$Condition, [string]$Description, [int]$TimeoutSeconds = 900) {
@@ -266,6 +305,9 @@ function New-EcsInstance {
         '--InternetMaxBandwidthOut', '20', '--AutoReleaseTime', $release,
         '--SystemDisk.Category', 'cloud_essd', '--SystemDisk.Size', [string]$SystemDiskSizeGiB,
         '--SystemDisk.PerformanceLevel', 'PL1',
+        '--DataDisk.1.Category', $DataDiskCategory, '--DataDisk.1.Size', $DataDiskSize.ToString(),
+        '--DataDisk.1.PerformanceLevel', $DataDiskPerformanceLevel,
+        '--DataDisk.1.DeleteWithInstance', 'true',
         '--Tag.1.Key', 'brewfs-test', '--Tag.1.Value', $InstanceName
     )
     $result = Invoke-AliyunJson $runArgs
@@ -584,4 +626,5 @@ finally {
     if ($Action -eq 'run' -and $script:CreatedInstance -and -not $KeepInstance -and -not $NoCleanup) {
         try { Remove-EcsInstance } catch { Write-Warning "ECS 自动清理失败: $($_.Exception.Message)" }
     }
+    Remove-BinaryUpload
 }

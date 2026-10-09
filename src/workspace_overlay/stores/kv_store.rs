@@ -4205,11 +4205,13 @@ where
             }
         }
         for lease in state.leases.values() {
-            if matches!(
-                lease.state,
-                LeaseState::Active | LeaseState::Releasing | LeaseState::Expired
-            ) && lease.expires_at_ns > lease_cutoff
-            {
+            let protected = match lease.state {
+                LeaseState::Active | LeaseState::Releasing | LeaseState::Expired => {
+                    lease.expires_at_ns > lease_cutoff
+                }
+                LeaseState::Released => lease.updated_at_ns > lease_cutoff,
+            };
+            if protected {
                 roots.insert(lease.base_revision.layer_id);
             }
         }
@@ -4293,6 +4295,12 @@ where
             }
             for layer_id in &request.layer_ids {
                 if let Some(layer) = state.layers.get_mut(layer_id) {
+                    if layer.state == LayerState::Deleting {
+                        continue;
+                    }
+                    if layer.state != LayerState::Sealed {
+                        return Err(WorkspaceError::Busy);
+                    }
                     layer.state = LayerState::Deleting;
                     layer.owner_workspace_id = None;
                 }
@@ -4610,6 +4618,11 @@ where
             {
                 return Err(WorkspaceError::Fenced);
             }
+            let parent = state
+                .layers
+                .get(&request.expected_parent_layer_id)
+                .ok_or(WorkspaceError::Fenced)?;
+            revision_from_layer(parent)?;
             if state.layers.contains_key(&request.compacted_layer_id)
                 || state
                     .layers
@@ -5455,11 +5468,11 @@ fn reachable_layers(state: &ControlState, lease_cutoff: i64) -> HashSet<LayerId>
         state
             .leases
             .values()
-            .filter(|lease| {
-                matches!(
-                    lease.state,
-                    LeaseState::Active | LeaseState::Releasing | LeaseState::Expired
-                ) && lease.expires_at_ns > lease_cutoff
+            .filter(|lease| match lease.state {
+                LeaseState::Active | LeaseState::Releasing | LeaseState::Expired => {
+                    lease.expires_at_ns > lease_cutoff
+                }
+                LeaseState::Released => lease.updated_at_ns > lease_cutoff,
             })
             .map(|lease| lease.base_revision.layer_id),
     );

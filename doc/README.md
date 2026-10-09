@@ -1,13 +1,16 @@
 # BrewFS Documentation
 
-This directory is the canonical documentation tree for BrewFS. Keep new design
-notes, operations guides, performance analysis, test plans, and implementation
-plans under `doc/` unless a tool explicitly requires another location.
+This directory is the canonical documentation tree for BrewFS. Keep current
+architecture, operations, testing, protocol, bug-fix, and workspace material
+under `doc/`. Historical execution records belong under `superpowers/` and
+should not be treated as current behavior without checking the source.
 
 ## Start Here
 
 | Topic | Document |
 |---|---|
+| Project overview and Quick Start | [../README.md](../README.md) |
+| 中文项目说明 | [../README_CN.md](../README_CN.md) |
 | Architecture overview | [architecture/arch.md](architecture/arch.md) |
 | Configuration | [operations/configuration.md](operations/configuration.md) |
 | Binary deployment | [operations/binary-deployment.md](operations/binary-deployment.md) |
@@ -28,8 +31,9 @@ plans under `doc/` unless a tool explicitly requires another location.
 | [gap/](gap/) | BrewFS/JuiceFS module gap analysis and iteration roadmap. |
 | [protocols/](protocols/) | Multi-protocol gateway specs (S3, WebDAV, NFS), shared conventions, and the milestone roadmap. |
 | [vfs/](vfs/) | VFS module-specific implementation guide. |
-| [bugfix/](bugfix/) | Historical bug investigations and fix notes that are still useful for regression context. |
+| [bugfix/](bugfix/) | Historical bug investigations and fix notes that remain useful for regression context. |
 | [superpowers/](superpowers/) | Dated agent plans and specs. Treat these as historical execution records unless a plan is explicitly current. |
+| [wechat/](wechat/) | Draft public-facing material and evidence checklist for the BrewFS introduction article. |
 
 ## Architecture
 
@@ -71,7 +75,7 @@ plans under `doc/` unless a tool explicitly requires another location.
 | pjdfstest compose plan | [superpowers/plans/2026-06-13-pjdfstest-compose.md](superpowers/plans/2026-06-13-pjdfstest-compose.md) |
 | GitHub Actions DAG plan | [superpowers/plans/2026-06-14-github-actions-dag-reorg.md](superpowers/plans/2026-06-14-github-actions-dag-reorg.md) |
 
-## Performance And JuiceFS Comparison
+## Performance And Comparison
 
 | Topic | Document |
 |---|---|
