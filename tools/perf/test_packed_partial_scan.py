@@ -2,8 +2,12 @@ import pathlib
 import tempfile
 import unittest
 from unittest.mock import patch
-from smallfiles_scan import FileSpec, expected_pattern, expected_payload_chunk
-from packed_partial_scan import requests, scan_one
+try:
+    from .smallfiles_scan import FileSpec, expected_pattern, expected_payload_chunk
+    from .packed_partial_scan import requests, scan_one
+except ImportError:  # direct execution from tools/perf
+    from smallfiles_scan import FileSpec, expected_pattern, expected_payload_chunk
+    from packed_partial_scan import requests, scan_one
 
 
 class PartialScanTests(unittest.TestCase):

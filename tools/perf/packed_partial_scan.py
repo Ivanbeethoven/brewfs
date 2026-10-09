@@ -10,7 +10,10 @@ import random
 import resource
 import time
 
-from smallfiles_scan import FileSpec, discover_files, expected_pattern, expected_payload_chunk, percentile_ns
+try:
+    from .smallfiles_scan import FileSpec, discover_files, expected_pattern, expected_payload_chunk, percentile_ns
+except ImportError:
+    from smallfiles_scan import FileSpec, discover_files, expected_pattern, expected_payload_chunk, percentile_ns
 
 
 def requests(spec: FileSpec, sizes: list[int], seed: int):
