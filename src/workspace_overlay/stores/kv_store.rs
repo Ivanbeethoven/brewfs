@@ -117,6 +117,25 @@ const DELTA_SCAN_PAGE_RECORDS: usize = 32;
 const DELTA_SCAN_MAX_ROWS: usize = 4096;
 const DELTA_SCAN_MAX_BYTES: usize = 32 << 20;
 
+// Administrative/listing paths still return a complete logical result, but
+// they must never materialize an unbounded Redis/TiKV prefix in one request.
+// Keep each backend response small and fail closed when a caller would exceed
+// the retained metadata budget.
+const GENERIC_SCAN_PAGE_RECORDS: usize = 64;
+const GENERIC_SCAN_MAX_ROWS: usize = 16_384;
+const GENERIC_SCAN_MAX_BYTES: usize = 64 << 20;
+
+fn generic_scan_limits() -> KvReadLimits {
+    KvReadLimits {
+        max_records: GENERIC_SCAN_PAGE_RECORDS,
+        max_key_bytes: 2048,
+        max_value_bytes: 256 << 10,
+        max_total_bytes: 4 << 20,
+        max_response_bytes: 4 << 20,
+        max_data_requests: 64,
+    }
+}
+
 fn delta_scan_limits() -> KvReadLimits {
     KvReadLimits {
         max_records: DELTA_SCAN_PAGE_RECORDS,
@@ -147,6 +166,41 @@ fn validate_delta_scan_page(
             .checked_add(entry.key.len())
             .and_then(|sum| sum.checked_add(entry.value.len()))
             .ok_or(WorkspaceError::Fenced)?;
+        previous = Some(&entry.key);
+    }
+    Ok(bytes)
+}
+
+fn validate_generic_scan_page(
+    page: &[KvEntry],
+    prefix: &[u8],
+    after: Option<&[u8]>,
+) -> Result<usize, WorkspaceError> {
+    let limits = generic_scan_limits();
+    if page.len() > limits.max_records {
+        return Err(WorkspaceError::Fenced);
+    }
+    let mut bytes = 0usize;
+    let mut previous = after;
+    for entry in page {
+        if !entry.key.starts_with(prefix) || previous.is_some_and(|key| entry.key.as_slice() <= key)
+        {
+            return Err(WorkspaceError::Fenced);
+        }
+        if entry.key.len() > limits.max_key_bytes || entry.value.len() > limits.max_value_bytes {
+            return Err(WorkspaceError::InvalidReadPlan(
+                "generic metadata page entry exceeds bounded value limits".into(),
+            ));
+        }
+        bytes = bytes
+            .checked_add(entry.key.len())
+            .and_then(|sum| sum.checked_add(entry.value.len()))
+            .ok_or(WorkspaceError::Fenced)?;
+        if bytes > limits.max_total_bytes {
+            return Err(WorkspaceError::InvalidReadPlan(
+                "generic metadata page exceeds bounded byte limits".into(),
+            ));
+        }
         previous = Some(&entry.key);
     }
     Ok(bytes)
@@ -652,7 +706,7 @@ where
             key: CONTROL_KEY.to_vec(),
             expected: Some(raw.to_vec()),
         }];
-        for entry in self.backend.scan_prefix(LEGACY_WORKSPACE_PREFIX).await? {
+        for entry in self.scan_entries(LEGACY_WORKSPACE_PREFIX.to_vec()).await? {
             let row: LegacyWorkspaceRecord = decode(&entry.value)?;
             state.workspaces.insert(row.workspace_id, row.into());
             checks.push(KvCheck {
@@ -660,7 +714,7 @@ where
                 expected: Some(entry.value),
             });
         }
-        for entry in self.backend.scan_prefix(LEGACY_LAYER_PREFIX).await? {
+        for entry in self.scan_entries(LEGACY_LAYER_PREFIX.to_vec()).await? {
             let row: LayerRecord = decode(&entry.value)?;
             state.layers.insert(row.layer_id, row);
             checks.push(KvCheck {
@@ -668,7 +722,7 @@ where
                 expected: Some(entry.value),
             });
         }
-        for entry in self.backend.scan_prefix(LEGACY_LEASE_PREFIX).await? {
+        for entry in self.scan_entries(LEGACY_LEASE_PREFIX.to_vec()).await? {
             let row: SnapshotLease = decode(&entry.value)?;
             state.leases.insert(row.lease_id, row);
             checks.push(KvCheck {
@@ -676,7 +730,7 @@ where
                 expected: Some(entry.value),
             });
         }
-        for entry in self.backend.scan_prefix(LEGACY_SNAPSHOT_PREFIX).await? {
+        for entry in self.scan_entries(LEGACY_SNAPSHOT_PREFIX.to_vec()).await? {
             let row: SnapshotRecord = decode(&entry.value)?;
             state.snapshots.insert(row.snapshot_id, row);
             checks.push(KvCheck {
@@ -684,7 +738,7 @@ where
                 expected: Some(entry.value),
             });
         }
-        for entry in self.backend.scan_prefix(LEGACY_ALLOCATOR_PREFIX).await? {
+        for entry in self.scan_entries(LEGACY_ALLOCATOR_PREFIX.to_vec()).await? {
             let name = String::from_utf8(
                 entry
                     .key
@@ -1681,16 +1735,65 @@ where
     }
 
     async fn scan<T: DeserializeOwned>(&self, prefix: Vec<u8>) -> Result<Vec<T>, WorkspaceError> {
-        self.backend
-            .scan_prefix(&prefix)
-            .await?
-            .into_iter()
-            .map(|entry| decode(&entry.value))
-            .collect()
+        let mut rows = Vec::new();
+        let mut after = None;
+        let mut scanned_rows = 0usize;
+        let mut scanned_bytes = 0usize;
+        loop {
+            let page = self
+                .backend
+                .scan_prefix_page_with_byte_limits(&prefix, after.as_deref(), generic_scan_limits())
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let page_bytes = validate_generic_scan_page(&page, &prefix, after.as_deref())?;
+            scanned_rows = scanned_rows
+                .checked_add(page.len())
+                .ok_or(WorkspaceError::Fenced)?;
+            scanned_bytes = scanned_bytes
+                .checked_add(page_bytes)
+                .ok_or(WorkspaceError::Fenced)?;
+            if scanned_rows > GENERIC_SCAN_MAX_ROWS || scanned_bytes > GENERIC_SCAN_MAX_BYTES {
+                return Err(WorkspaceError::InvalidReadPlan(
+                    "generic metadata scan exceeds bounded budget".into(),
+                ));
+            }
+            after = page.last().map(|entry| entry.key.clone());
+            rows.extend(page.into_iter().map(|entry| decode(&entry.value)));
+        }
+        rows.into_iter().collect()
     }
 
     async fn scan_entries(&self, prefix: Vec<u8>) -> Result<Vec<KvEntry>, WorkspaceError> {
-        self.backend.scan_prefix(&prefix).await
+        let mut rows = Vec::new();
+        let mut after = None;
+        let mut scanned_rows = 0usize;
+        let mut scanned_bytes = 0usize;
+        loop {
+            let page = self
+                .backend
+                .scan_prefix_page_with_byte_limits(&prefix, after.as_deref(), generic_scan_limits())
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let page_bytes = validate_generic_scan_page(&page, &prefix, after.as_deref())?;
+            scanned_rows = scanned_rows
+                .checked_add(page.len())
+                .ok_or(WorkspaceError::Fenced)?;
+            scanned_bytes = scanned_bytes
+                .checked_add(page_bytes)
+                .ok_or(WorkspaceError::Fenced)?;
+            if scanned_rows > GENERIC_SCAN_MAX_ROWS || scanned_bytes > GENERIC_SCAN_MAX_BYTES {
+                return Err(WorkspaceError::InvalidReadPlan(
+                    "generic metadata scan exceeds bounded budget".into(),
+                ));
+            }
+            after = page.last().map(|entry| entry.key.clone());
+            rows.extend(page);
+        }
+        Ok(rows)
     }
 
     /// Read every persisted PWB3 binding record and retain the exact values
@@ -4523,7 +4626,52 @@ where
         roots.extend(packed_roots);
         let mut layers = state.layers.into_values().collect::<Vec<_>>();
         layers.sort_by_key(|layer| (layer.created_at_ns, layer.layer_id));
-        let extents: Vec<DataExtentDelta> = self.scan(b"delta/extent/".to_vec()).await?;
+        let extent_prefix = b"delta/extent/";
+        let mut extents = Vec::new();
+        let mut after = None;
+        let mut scanned_rows_total = 0usize;
+        let mut scanned_bytes_total = 0usize;
+        loop {
+            let page = self
+                .backend
+                .scan_prefix_page_with_byte_limits(
+                    extent_prefix,
+                    after.as_deref(),
+                    delta_scan_limits(),
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let next = page.last().map(|entry| entry.key.clone());
+            scanned_rows_total = scanned_rows_total
+                .checked_add(page.len())
+                .ok_or(WorkspaceError::Fenced)?;
+            scanned_bytes_total = scanned_bytes_total
+                .checked_add(validate_delta_scan_page(
+                    &page,
+                    extent_prefix,
+                    after.as_deref(),
+                )?)
+                .ok_or(WorkspaceError::Fenced)?;
+            if scanned_rows_total > DELTA_SCAN_MAX_ROWS
+                || scanned_bytes_total > DELTA_SCAN_MAX_BYTES
+            {
+                return Err(WorkspaceError::InvalidReadPlan(
+                    "extent delta scan exceeds bounded metadata budget".into(),
+                ));
+            }
+            for entry in page {
+                let row: DataExtentDelta = decode(&entry.value)?;
+                if entry.key != extent_key(&row) {
+                    return Err(WorkspaceError::CorruptMetadata(
+                        "extent key/record identity mismatch".into(),
+                    ));
+                }
+                extents.push(row);
+            }
+            after = next;
+        }
         let mut slice_references = Vec::new();
         for extent in extents {
             if let ExtentKind::Data {
@@ -7125,6 +7273,40 @@ mod tests {
             store.backend.scans.load(Ordering::Relaxed) >= 2,
             "the result must cross a bounded page boundary"
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_scans_use_bounded_keyset_pages() {
+        let (store, workspace, _lease, _guard) = initialized().await;
+        {
+            let mut records = store.backend.records.lock().await;
+            for index in 0..(GENERIC_SCAN_PAGE_RECORDS + 3) {
+                let mut row = workspace.clone();
+                row.workspace_id = WorkspaceId::from_uuid(id(10_000 + index as u128));
+                row.created_at_ns = index as i64;
+                records.insert(workspace_key(row.workspace_id), encode(&row).unwrap());
+            }
+        }
+        store.backend.scans.store(0, Ordering::Relaxed);
+        let rows = store.list_workspaces().await.unwrap();
+        assert_eq!(rows.len(), GENERIC_SCAN_PAGE_RECORDS + 4);
+        assert!(
+            store.backend.scans.load(Ordering::Relaxed) >= 2,
+            "the catalog must cross a bounded page boundary"
+        );
+    }
+
+    #[test]
+    fn generic_scan_page_validation_rejects_oversized_values() {
+        let limits = generic_scan_limits();
+        let page = vec![KvEntry {
+            key: b"catalog/one".to_vec(),
+            value: vec![0; limits.max_value_bytes + 1],
+        }];
+        assert!(matches!(
+            validate_generic_scan_page(&page, b"catalog/", None),
+            Err(WorkspaceError::InvalidReadPlan(_))
+        ));
     }
 
     #[tokio::test]

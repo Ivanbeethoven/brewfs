@@ -728,12 +728,10 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                 if page.is_empty() {
                     break;
                 }
+                let page_bytes = validate_delta_scan_page(&page, prefix, after.as_deref())?;
                 for entry in &page {
                     count = count.checked_add(1).ok_or(WorkspaceError::Fenced)?;
-                    bytes = bytes
-                        .checked_add(entry.key.len() + entry.value.len())
-                        .ok_or(WorkspaceError::Fenced)?;
-                    if count > 4096 || bytes > 32 << 20 {
+                    if count > 4096 {
                         return Err(WorkspaceError::InvalidReadPlan(
                             "administrative topology census limit".into(),
                         ));
@@ -742,6 +740,14 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                         key: entry.key.clone(),
                         expected: Some(entry.value.clone()),
                     });
+                }
+                bytes = bytes
+                    .checked_add(page_bytes)
+                    .ok_or(WorkspaceError::Fenced)?;
+                if bytes > 32 << 20 {
+                    return Err(WorkspaceError::InvalidReadPlan(
+                        "administrative topology census limit".into(),
+                    ));
                 }
                 after = page.last().map(|entry| entry.key.clone());
             }
