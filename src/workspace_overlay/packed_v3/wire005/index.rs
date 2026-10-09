@@ -614,6 +614,20 @@ impl<B: ObjectBackend + Clone + 'static> V3IndexReader<B> {
     pub fn budget(&self) -> &Arc<V3MountBudget> {
         &self.budget
     }
+    /// Reader shutdown is a hard admission boundary. The mount budget is
+    /// closed by the outer session after transport drain, so checking it
+    /// alone leaves a window in which an already-closed reader can issue new
+    /// index GETs. Keep the runtime close bit as the authoritative reader
+    /// fence and check it before every page/cache operation.
+    async fn ensure_open(&self) -> PackedResult<()> {
+        let runtime = self.demand_pipeline.lock().await;
+        if runtime.closed || self.budget.state().closed {
+            return Err(PackedWireError::LimitExceeded(
+                "index reader is closed".into(),
+            ));
+        }
+        Ok(())
+    }
     pub(super) async fn demand_pipeline(
         &self,
     ) -> PackedResult<Arc<super::pipeline::V3DemandCoordinator<B>>> {
@@ -651,6 +665,7 @@ impl<B: ObjectBackend + Clone + 'static> V3IndexReader<B> {
         reference: &V3ObjectRef,
         expected: Option<ChildExpectation>,
     ) -> PackedResult<Arc<V3Owned<V3IndexPage>>> {
+        self.ensure_open().await?;
         // Cache hits and followers are mount work too. Admit before either
         // Moka operation or cloning the authenticated reference into a fetch
         // future. This request owner is deliberately independent of the

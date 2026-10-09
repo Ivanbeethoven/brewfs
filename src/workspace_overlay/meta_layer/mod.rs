@@ -623,10 +623,10 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                     .map_err(|_| MetaError::Io(std::io::Error::from_raw_os_error(libc::EIO)))?;
             crate::control::protocol::validate_acl_entries(&entries)
                 .map_err(|_| MetaError::Io(std::io::Error::from_raw_os_error(libc::EIO)))?;
-            if let Some(mode) = crate::meta::posix_acl::control_acl_access_mode(
-                &entries, inode.uid, inode.gid, uid, groups,
+            if let Some(allowed) = crate::meta::posix_acl::control_acl_allows_access(
+                &entries, inode.uid, inode.gid, uid, groups, requested,
             ) {
-                return Ok(mode & requested == requested);
+                return Ok(allowed);
             }
         }
         let shift = if uid == inode.uid {

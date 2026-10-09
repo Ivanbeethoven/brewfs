@@ -18,6 +18,38 @@ fn fixture() -> (
 }
 
 #[tokio::test]
+async fn reader_close_is_an_admission_fence_before_mount_budget_close() {
+    let (budget, reader, _dir) = fixture();
+    let bytes = V3IndexPage {
+        kind: V3ObjectKind::InodeIndex,
+        height: 0,
+        records: vec![V3IndexRecord {
+            first_key: vec![1],
+            last_key: vec![1],
+            value: V3IndexValue::Leaf(vec![9]),
+        }],
+    }
+    .encode()
+    .unwrap();
+    let reference = V3ObjectRef::from_bytes(
+        "closed-reader-index".into(),
+        V3ObjectKind::InodeIndex,
+        &bytes,
+    )
+    .unwrap();
+
+    // The outer session closes the budget only after transport drain. The
+    // reader itself must reject new index work in that interval.
+    reader.close().await;
+    let error = reader.lookup(&reference, &[1]).await.unwrap_err();
+    assert!(matches!(
+        error,
+        PackedWireError::LimitExceeded(message) if message.contains("reader is closed")
+    ));
+    assert_eq!(budget.state().used, [0; 8]);
+}
+
+#[tokio::test]
 async fn existing_reader_close_drops_actual_idle_coordinator_and_rejects_reinitialization() {
     let (budget, reader, _dir) = fixture();
     let pipeline = reader.demand_pipeline().await.unwrap();

@@ -3815,10 +3815,10 @@ where
                 } else {
                     verified_request_group_ids(pid, uid, gid)?
                 };
-                if let Some(mode) = crate::meta::posix_acl::control_acl_access_mode(
-                    &entries, attr.uid, attr.gid, uid, &groups,
+                if let Some(allowed) = crate::meta::posix_acl::control_acl_allows_access(
+                    &entries, attr.uid, attr.gid, uid, &groups, requested,
                 ) {
-                    return Ok(mode);
+                    return Ok(if allowed { requested } else { 0 });
                 }
             }
             if uid == attr.uid {
@@ -3832,14 +3832,21 @@ where
             });
         }
 
+        // This legacy control-ACL path predates the capability-aware
+        // permission snapshot above. Supplementary groups still require a
+        // verified request credential; an unreadable or exited process must
+        // not be allowed to grant group privileges.
+        let groups = verified_request_group_ids(pid, uid, gid)?;
         Ok(
-            match self.acl_access_mode_for_inode(ino, attr, uid, gid).await {
+            match self
+                .acl_access_mode_for_inode(ino, attr, uid, &groups, requested)
+                .await
+            {
                 Some(mode) => mode,
                 None if self.meta_layer().posix_acl_capability()
                     != crate::meta::layer::PosixAclCapability::Unsupported
                     && uid != attr.uid =>
                 {
-                    let groups = verified_request_group_ids(pid, uid, gid)?;
                     if groups.contains(&attr.gid) {
                         (attr.mode >> 3) & 7
                     } else {
@@ -3919,7 +3926,8 @@ where
         ino: i64,
         attr: &VfsFileAttr,
         uid: u32,
-        gid: u32,
+        groups: &[u32],
+        requested: u32,
     ) -> Option<u32> {
         let raw = match self.get_xattr_ino(ino, CONTROL_ACL_XATTR_NAME).await {
             Ok(Some(raw)) => raw,
@@ -3930,7 +3938,10 @@ where
             }
         };
         match serde_json::from_slice::<Vec<ControlAclEntry>>(&raw) {
-            Ok(entries) => acl_entries_access_mode(&entries, attr, uid, gid),
+            Ok(entries) => crate::meta::posix_acl::control_acl_allows_access(
+                &entries, attr.uid, attr.gid, uid, groups, requested,
+            )
+            .map(|allowed| if allowed { requested } else { 0 }),
             Err(err) => {
                 warn!(ino, error = %err, "invalid ACL xattr for access check");
                 None
@@ -4824,7 +4835,9 @@ mod fuse_init_tests {
             unique: 1,
             uid,
             gid,
-            pid: 42,
+            // Unit-test requests are synthetic and intentionally use the
+            // pid=0 path, which carries only the supplied primary group.
+            pid: 0,
         }
     }
 

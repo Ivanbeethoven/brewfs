@@ -390,6 +390,57 @@ pub(crate) fn control_acl_access_mode(
     matched.map(masked).or_else(|| find("other", None))
 }
 
+/// Evaluate a control ACL for one operation mask.
+///
+/// POSIX ACL group-class entries are alternatives: one matching group entry
+/// must grant the complete requested operation.  Combining read permission
+/// from one group with write permission from another would incorrectly allow
+/// `O_RDWR`, so callers that have a concrete operation must use this helper
+/// instead of materialising an aggregate mode first.
+pub(crate) fn control_acl_allows_access(
+    entries: &[crate::control::protocol::ControlAclEntry],
+    owner_uid: u32,
+    owner_gid: u32,
+    uid: u32,
+    groups: &[u32],
+    requested: u32,
+) -> Option<bool> {
+    let find = |tag: &str, id: Option<u32>| {
+        entries
+            .iter()
+            .find(|entry| entry.scope == "access" && entry.tag == tag && entry.id == id)
+            .and_then(|entry| control_acl_perm_bits(&entry.perm))
+    };
+    let masked = |mode: u32| mode & find("mask", None).unwrap_or(7);
+    if uid == owner_uid {
+        return find("user_obj", None).map(|mode| mode & requested == requested);
+    }
+    // A matching named-user entry is terminal, even when it denies access.
+    if let Some(mode) = find("user", Some(uid)) {
+        return Some(masked(mode) & requested == requested);
+    }
+
+    let mut matched_group = false;
+    if groups.contains(&owner_gid) {
+        matched_group = true;
+        if masked(find("group_obj", None).unwrap_or(0)) & requested == requested {
+            return Some(true);
+        }
+    }
+    for gid in groups {
+        if let Some(mode) = find("group", Some(*gid)) {
+            matched_group = true;
+            if masked(mode) & requested == requested {
+                return Some(true);
+            }
+        }
+    }
+    if matched_group {
+        return Some(false);
+    }
+    find("other", None).map(|mode| mode & requested == requested)
+}
+
 fn control_acl_perm_bits(perm: &str) -> Option<u32> {
     if perm.len() != 3 {
         return None;
@@ -409,7 +460,7 @@ fn control_acl_perm_bits(perm: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod control_policy_tests {
-    use super::control_acl_access_mode;
+    use super::{control_acl_access_mode, control_acl_allows_access};
     use crate::control::protocol::ControlAclEntry;
     #[test]
     fn supplementary_group_match_is_masked_and_other_cannot_bypass_it() {
@@ -438,6 +489,38 @@ mod control_policy_tests {
         assert_eq!(
             control_acl_access_mode(&entries, 1000, 2000, 1234, &[4444]),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn supplementary_group_entries_do_not_union_for_one_operation() {
+        let entry = |tag: &str, id, perm: &str| ControlAclEntry {
+            scope: "access".into(),
+            tag: tag.into(),
+            id,
+            perm: perm.into(),
+        };
+        let entries = vec![
+            entry("user_obj", None, "rwx"),
+            entry("group_obj", None, "r--"),
+            entry("group", Some(4444), "-w-"),
+            entry("mask", None, "rwx"),
+            entry("other", None, "---"),
+        ];
+        // The caller is a member of both groups, but neither individual
+        // entry grants read+write. OR-ing group entries would incorrectly
+        // authorize O_RDWR.
+        assert_eq!(
+            control_acl_allows_access(&entries, 1000, 2000, 1234, &[2000, 4444], 6),
+            Some(false)
+        );
+        assert_eq!(
+            control_acl_allows_access(&entries, 1000, 2000, 1234, &[2000, 4444], 4),
+            Some(true)
+        );
+        assert_eq!(
+            control_acl_allows_access(&entries, 1000, 2000, 1234, &[2000, 4444], 2),
+            Some(true)
         );
     }
 }
