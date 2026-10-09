@@ -80,3 +80,12 @@ SDK 的 put/delete 仍会重锁本事务已持有的键；production delta 保�
 | 完整 S / 三创新性能实验 | 先签收同源 S corpus、请求/内存/cookie/取消/清退，再冻结 matched 性能与消融及 placement/executor、provenance、cache/TTL 控制；已有 static1MiB / SizeOnly / inline-off 开关不等于实验验收。 |
 
 此文件仅为外置草稿；candidate04 只记录已存在的 receipts，没有修改活动报告、运行 Cargo/服务/auditor，也没有宣称全部 SPEC、Kubernetes、TLS、规模及三创新性能完成。
+
+
+## 2026-10-09 final source reconciliation
+
+PR #141 is retained as merge parent ff0e6d1 through merge commit 24b3b38. The automatic merge mixed the older upstream workspace implementation into packed-v3 source files, so the final reconciliation keeps the already validated packed-v3 Redis/TiKV implementation and the non-conflicting upstream runner/operator updates. The ordinary entity CAS, migration marker, lease lifecycle, and GC fencing paths remain in place; this branch does not add packed-v2 or v5 compatibility.
+
+The reconciliation closes three PR141 safety gaps in src/workspace_overlay/stores/kv_store.rs: released leases remain GC roots through the configured grace period, layer deletion only accepts sealed or already-deleting layers, and compaction authenticates the expected parent layer with revision_from_layer. The final kv_store.rs SHA256 is 99f818da3c56598d16aab9e3d6230ac111891f4c1db1f9f0ee7919be2a1f8a, and tikv.rs remains c4bfe3adf516f89af54131adbdf9af0854f48b40e032bfc690579a6954133f65.
+
+Validation after reconciliation: cargo fmt --all --check, git diff --check, and CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 cargo check --locked --workspace --all-targets passed. The four entity-CAS preparation tests and the two concurrent-fork selectors passed.
