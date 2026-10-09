@@ -41,7 +41,30 @@ class PackedRunManifestTests(unittest.TestCase):
             (artifact / "manifest-key.txt").write_text("local-validation/manifest\n")
             (artifact / "binary-sha256.txt").write_text("a" * 64 + "  brewfs\n")
             (artifact / "source-sha256.json").write_text(json.dumps({"src/lib.rs": "b" * 64}))
-            (artifact / "profile.env").write_text("mode=stat\n")
+            (artifact / "profile.env").write_text(
+                "\n".join(
+                    [
+                        "packed_version=v3",
+                        "wire_version=5",
+                        "scanner_seed=20261001",
+                        "fixture_prefix=local-validation",
+                        "manifest_schema=packed-v3-run-manifest-v1",
+                        "order=shuffle",
+                        "files=100",
+                        "file_bytes=102400",
+                        "metadata_bytes=8388608",
+                        "workers=16",
+                        "epochs=2",
+                        "mode=stat",
+                        "frame_policy=size-only",
+                        "inline_data=on",
+                        "metadata_codec=zstd",
+                        "data_codec=zstd",
+                        "access_profile=random-small-file",
+                    ]
+                )
+                + "\n"
+            )
             (artifact / "cache-proof.env").write_text("page_cache=dropped\n")
             (artifact / "summary.json").write_text(
                 json.dumps(
@@ -78,6 +101,55 @@ class PackedRunManifestTests(unittest.TestCase):
             self.assertEqual(manifest["controls"]["scanner_seed"], 20261001)
             self.assertEqual(manifest["measurement"]["request_trace_sha256"], "c" * 64)
             self.assertEqual(manifest["measurement"]["phases"], ["mount", "active", "drain", "total"])
+
+    def test_success_manifest_rejects_profile_control_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = pathlib.Path(directory)
+            init_manifest(
+                artifact,
+                run_id="profile-mismatch",
+                wire_version=5,
+                controls={"mode": "stat", "scanner_seed": 1},
+                fixture_prefix="local-validation",
+            )
+            (artifact / "manifest-key.txt").write_text("local-validation/manifest\n")
+            (artifact / "binary-sha256.txt").write_text("a" * 64 + "  brewfs\n")
+            (artifact / "source-sha256.json").write_text(json.dumps({"src/lib.rs": "b" * 64}))
+            (artifact / "profile.env").write_text(
+                "packed_version=v3\nwire_version=5\nscanner_seed=2\n"
+                "fixture_prefix=local-validation\nmanifest_schema=packed-v3-run-manifest-v1\n"
+                "order=shuffle\nmode=stat\n"
+            )
+            (artifact / "cache-proof.env").write_text("page_cache=dropped\n")
+            (artifact / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "epochs": [
+                            {
+                                "mode": "stat",
+                                "order": "shuffle",
+                                "shuffle_seed": 1,
+                                "files": 1,
+                                "expected_files": 1,
+                                "errors": 0,
+                                "trace_sha256": "c" * 64,
+                            }
+                        ]
+                    }
+                )
+            )
+            (artifact / "timing.json").write_text(
+                json.dumps(
+                    {
+                        "mount_seconds": 1.0,
+                        "active_seconds": 1.0,
+                        "drain_seconds": 1.0,
+                        "total_seconds": 3.0,
+                    }
+                )
+            )
+            with self.assertRaises(ArtifactError):
+                finalize_manifest(artifact, status=0)
 
     def test_layout_controls_are_validated_when_present(self):
         with tempfile.TemporaryDirectory() as directory:

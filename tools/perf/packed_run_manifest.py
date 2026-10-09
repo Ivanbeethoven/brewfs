@@ -64,6 +64,60 @@ def _validate_digest_file(path: pathlib.Path) -> int:
     return count
 
 
+def _read_profile(path: pathlib.Path) -> dict[str, str]:
+    """Read the runner's key/value profile without executing it as shell."""
+    values: dict[str, str] = {}
+    for line_number, raw_line in enumerate(path.read_text().splitlines(), 1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        name, separator, value = line.partition("=")
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ArtifactError(f"malformed profile.env line {line_number}")
+        if name in values:
+            raise ArtifactError(f"duplicate profile.env key: {name}")
+        values[name] = value
+    if not values:
+        raise ArtifactError("profile.env is empty")
+    return values
+
+
+def _validate_profile(manifest: dict[str, Any], path: pathlib.Path) -> None:
+    """Bind invocation controls to the profile captured by the runner."""
+    profile = _read_profile(path)
+    controls = manifest.get("controls")
+    if not isinstance(controls, dict):
+        raise ArtifactError("manifest controls are missing")
+    expected = {
+        "packed_version": "v3",
+        "wire_version": manifest.get("wire_version"),
+        "scanner_seed": controls.get("scanner_seed"),
+        "fixture_prefix": manifest.get("fixture_prefix"),
+        "manifest_schema": SCHEMA,
+        # The scanner contract is part of the request-trace identity.
+        "order": "shuffle",
+    }
+    control_bindings = {
+        "files": "files",
+        "file_bytes": "file_bytes",
+        "metadata_bytes": "metadata_bytes",
+        "workers": "workers",
+        "epochs": "epochs",
+        "mode": "mode",
+        "frame_policy": "frame_policy",
+        "inline_data": "inline_data",
+        "metadata_codec": "metadata_codec",
+        "data_codec": "data_codec",
+        "access_profile": "access_profile",
+    }
+    for profile_name, control_name in control_bindings.items():
+        if control_name in controls:
+            expected[profile_name] = controls[control_name]
+    for name, value in expected.items():
+        if value is None or profile.get(name) != str(value):
+            raise ArtifactError(f"profile.env does not bind {name} to the manifest")
+
+
 def init_manifest(
     artifact: pathlib.Path,
     *,
@@ -193,6 +247,7 @@ def finalize_manifest(artifact: pathlib.Path, *, status: int) -> dict[str, Any]:
         source = _read_json(artifact / "source-sha256.json")
         if not isinstance(source, dict) or not source or any(not isinstance(value, str) or not _HEX64.fullmatch(value) for value in source.values()):
             raise ArtifactError("source hash inventory is missing or malformed")
+        _validate_profile(manifest, artifact / "profile.env")
         summary_path = _require_file(artifact, "summary.json", success=True)
         timing_path = _require_file(artifact, "timing.json", success=True)
         assert summary_path is not None and timing_path is not None

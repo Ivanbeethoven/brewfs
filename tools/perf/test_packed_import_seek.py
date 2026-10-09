@@ -17,7 +17,7 @@ import unittest
 
 PREFIX = {
     "dentry": "SELECT p.path,p.parent,p.name,i.hot,i.cold,i.token,i.blocks,i.snapshot_inode,i.visible_links,parent.snapshot_inode",
-    "fence": "SELECT p.path,i.token FROM source_paths",
+    "fence": "SELECT p.path,i.token,i.source_id,i.snapshot_inode FROM source_paths",
     "assign": "SELECT source_id,master_path,kind,source_nlink,visible_links FROM source_inodes",
     "runs": "SELECT start,end FROM source_runs",
     "migration": "SELECT r.first_key,r.value FROM records r JOIN inode_identities",
@@ -178,7 +178,17 @@ class ImportSeekTests(unittest.TestCase):
                         sql = select_query(queries, True)
                         rows, steps = run_counted(connection, sql, parameters(name, sql, cursor))
                         self.assertEqual(len(rows), 1)
-                        next_cursor = (rows[0][1], rows[0][2]) if name == "dentry" else rows[0][1] if name == "assign" else rows[0][0]
+                        if name == "dentry":
+                            next_cursor = (rows[0][1], rows[0][2])
+                        elif name == "fence":
+                            # The production fence query returns identity and
+                            # snapshot columns after the path; continuation
+                            # is keyed by the first (path) column.
+                            next_cursor = rows[0][0]
+                        elif name == "assign":
+                            next_cursor = rows[0][1]
+                        else:
+                            next_cursor = rows[0][0]
                         eof, eof_steps = run_counted(connection, sql, parameters(name, sql, next_cursor))
                         OBSERVATIONS.append({"rows": size, "query": name, "tail_vm_steps": steps,
                             "eof_vm_steps": eof_steps, "plan": plan(connection, sql, parameters(name, sql, cursor))})
