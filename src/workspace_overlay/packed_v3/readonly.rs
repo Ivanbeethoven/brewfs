@@ -30,6 +30,12 @@ use super::meta::GroupMetaEntry;
 use super::wire::PackedWireError;
 
 const READ_ONLY_ERROR: &str = "packed metadata v3 snapshot is read-only";
+// The legacy Vec-returning MetaLayer API is a compatibility surface. Keep it
+// bounded so a large immutable directory cannot turn a caller metadata
+// request into an unbounded allocation. Callers that need larger directories
+// must use `opendir`/the paged DirectoryPageSource API.
+const MAX_LEGACY_READDIR_ENTRIES: usize = 4096;
+const MAX_LEGACY_READDIR_BYTES: usize = 256 << 10;
 
 mod transport;
 
@@ -1148,6 +1154,7 @@ where
     async fn readdir(&self, ino: i64) -> Result<Vec<DirEntry>, MetaError> {
         let mut offset = 0usize;
         let mut result = Vec::new();
+        let mut bytes = 0usize;
         loop {
             let page = self.readdir_page_raw(ino, offset, 256).await?;
             if page.is_empty() {
@@ -1155,6 +1162,15 @@ where
             }
             offset += page.len();
             for entry in page {
+                let entry_bytes = entry.name.len().saturating_add(32);
+                if result.len() >= MAX_LEGACY_READDIR_ENTRIES
+                    || bytes.saturating_add(entry_bytes) > MAX_LEGACY_READDIR_BYTES
+                {
+                    return Err(MetaError::Io(std::io::Error::from_raw_os_error(
+                        libc::E2BIG,
+                    )));
+                }
+                bytes = bytes.saturating_add(entry_bytes);
                 result.push(DirEntry {
                     name: String::from_utf8(entry.name).map_err(|_| MetaError::InvalidFilename)?,
                     ino: i64::try_from(entry.inode)

@@ -49,6 +49,18 @@ class PackedLocalRunnerTests(unittest.TestCase):
         self.assertIn("fixture_prefix=", script)
         self.assertIn("manifest_schema=packed-v3-run-manifest-v1", script)
 
+    def test_layout_controls_are_forwarded_and_recorded(self):
+        script = RUNNER.read_text()
+        for control in ("FRAME_POLICY", "INLINE_DATA", "METADATA_CODEC", "DATA_CODEC", "ACCESS_PROFILE"):
+            with self.subTest(control=control):
+                self.assertIn(f"PACKED_LOCAL_{control}", script)
+        self.assertIn('--frame-policy "$FRAME_POLICY"', script)
+        self.assertIn('--inline-data "$INLINE_DATA"', script)
+        self.assertIn('--metadata-codec "$METADATA_CODEC"', script)
+        self.assertIn('--data-codec "$DATA_CODEC"', script)
+        self.assertIn('--access-profile "$ACCESS_PROFILE"', script)
+        self.assertIn("frame_policy=%s", script)
+
     def test_conflicting_services_and_failed_cold_setup_stay_fatal(self):
         # Refuse an existing fixed-name Compose service instead of deleting it.
         script = RUNNER.read_text()

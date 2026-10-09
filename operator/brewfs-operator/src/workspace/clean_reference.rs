@@ -11,11 +11,21 @@ pub(super) async fn verified_clean_mount_reference(
     admin: &dyn WorkspaceAdmin,
 ) -> anyhow::Result<Option<PackedReleasedMountReference>> {
     let mounts = Api::<BrewFSWorkspaceMount>::namespaced(client.clone(), namespace)
-        .list(&ListParams::default())
+        .list(&ListParams::default().limit(256))
         .await?;
+    if mounts
+        .metadata
+        .continue_
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        bail!("clean mount reference inventory is incomplete");
+    }
     let mut candidates = Vec::new();
-    for mount in mounts {
-        if mount.spec.workspace_ref.name != workspace.name_any() {
+    for mount in mounts.items {
+        if mount.spec.workspace_ref.name != workspace.name_any()
+            || mount.spec.cluster_ref.name != workspace.spec.cluster_ref.name
+        {
             continue;
         }
         let Some(status) = &mount.status else {

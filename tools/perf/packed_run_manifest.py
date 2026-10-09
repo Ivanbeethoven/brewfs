@@ -81,6 +81,7 @@ def init_manifest(
     seed = controls.get("scanner_seed")
     if not isinstance(seed, int) or seed < 0:
         raise ArtifactError("scanner_seed must be a non-negative integer")
+    _validate_layout_controls(controls)
     artifact.mkdir(parents=True, exist_ok=True)
     _atomic_json(
         artifact / "run-manifest.json",
@@ -95,6 +96,20 @@ def init_manifest(
             "status": "running",
         },
     )
+
+
+def _validate_layout_controls(controls: dict[str, Any]) -> None:
+    allowed = {
+        "frame_policy": {"size-only", "static-256kib", "static-1mib", "static-4mib"},
+        "inline_data": {"on", "off"},
+        "metadata_codec": {"raw", "zstd"},
+        "data_codec": {"raw", "zstd"},
+        "access_profile": {"random-small-file", "sequential-small-file", "mixed"},
+    }
+    for name, values in allowed.items():
+        value = controls.get(name)
+        if value is not None and value not in values:
+            raise ArtifactError(f"invalid {name} control")
 
 
 def _summary_rows(path: pathlib.Path) -> list[dict[str, Any]]:
@@ -113,6 +128,7 @@ def _validate_summary(manifest: dict[str, Any], summary_path: pathlib.Path) -> d
         raise ArtifactError("manifest controls are missing")
     seed = controls.get("scanner_seed")
     mode = controls.get("mode")
+    _validate_layout_controls(controls)
     rows = _summary_rows(summary_path)
     traces: list[str] = []
     for row in rows:
@@ -211,6 +227,11 @@ def main() -> int:
     init.add_argument("--mode", required=True)
     init.add_argument("--scanner-seed", type=int, required=True)
     init.add_argument("--fixture-prefix", required=True)
+    init.add_argument("--frame-policy", choices=["size-only", "static-256kib", "static-1mib", "static-4mib"], default="size-only")
+    init.add_argument("--inline-data", choices=["on", "off"], default="on")
+    init.add_argument("--metadata-codec", choices=["raw", "zstd"], default="zstd")
+    init.add_argument("--data-codec", choices=["raw", "zstd"], default="zstd")
+    init.add_argument("--access-profile", choices=["random-small-file", "sequential-small-file", "mixed"], default="random-small-file")
     finish = subparsers.add_parser("finalize")
     finish.add_argument("--artifact", type=pathlib.Path, required=True)
     finish.add_argument("--status", type=int, required=True)
@@ -230,6 +251,11 @@ def main() -> int:
                     "mode": args.mode,
                     "order": "shuffle",
                     "scanner_seed": args.scanner_seed,
+                    "frame_policy": args.frame_policy,
+                    "inline_data": args.inline_data,
+                    "metadata_codec": args.metadata_codec,
+                    "data_codec": args.data_codec,
+                    "access_profile": args.access_profile,
                 },
                 fixture_prefix=args.fixture_prefix,
             )

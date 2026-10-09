@@ -292,6 +292,95 @@ async fn current_readonly_fixture(
     )
 }
 
+async fn current_readonly_directory_fixture(
+    entries: Vec<GroupMetaEntry>,
+) -> (tempfile::TempDir, PackedV3ReadonlyMeta<LocalFsBackend>) {
+    use super::super::wire005::{
+        AuthenticatedV3Snapshot, V3_HEADER_LEN, V3ProducerOptions, V3SnapshotProducer,
+    };
+    let temp = tempdir().unwrap();
+    let client = ObjectClient::new(LocalFsBackend::new(temp.path().join("objects")));
+    // Keep every authenticated GroupMeta page below its 256 KiB wire bound
+    // while preserving one parent directory across all groups.
+    let mut groups = Vec::new();
+    for (group_id, chunk) in entries.chunks(512).enumerate() {
+        let chunk = chunk.to_vec();
+        let metadata = GroupMeta::new(chunk.clone()).unwrap();
+        groups.push(PackedGroupInput {
+            group_id: group_id as u64 + 1,
+            parent_dir_key: [7; 32],
+            metadata: metadata.encode().unwrap(),
+            frame_ordinals: Vec::new(),
+            entry_count: chunk.len() as u32,
+            file_count: chunk.iter().filter(|entry| entry.kind == 1).count() as u32,
+            layout_profile: AccessProfile::RandomSmallFile,
+        });
+    }
+    let parent_inodes = vec![1; groups.len()];
+    let mut producer = V3SnapshotProducer::new(
+        client.clone(),
+        temp.path(),
+        "readonly-large-directory".into(),
+        V3ProducerOptions {
+            snapshot_id: [9; 32],
+            root_dir_key: [7; 32],
+            root_inode: 1,
+            profile: AccessProfile::RandomSmallFile,
+            size_classes: SizeClassTable::default(),
+            build_policy: Default::default(),
+            metadata_codec: super::super::PackedCodec::Raw,
+            data_codec: super::super::PackedCodec::Raw,
+        },
+    )
+    .await
+    .unwrap();
+    producer
+        .add_container(1, &groups, &[], &parent_inodes)
+        .await
+        .unwrap();
+    let reference = producer.finish().await.unwrap();
+    let published = client.get_object(&reference.key).await.unwrap().unwrap();
+    assert_eq!(&published[V3_HEADER_LEN..V3_HEADER_LEN + 4], b"PM11");
+    let snapshot = AuthenticatedV3Snapshot::open(&client, &reference)
+        .await
+        .unwrap();
+    (
+        temp,
+        PackedV3ReadonlyMeta::from_v3(client, snapshot, 4096, 0),
+    )
+}
+
+#[tokio::test]
+async fn legacy_readdir_rejects_large_directory_and_paged_api_remains_available() {
+    let entries = (0..4097)
+        .map(|index| GroupMetaEntry {
+            name: format!("entry-{index:04}").into_bytes(),
+            inode: index as u64 + 2,
+            kind: 1,
+            mode: 0o100644,
+            uid: 1,
+            gid: 2,
+            rdev: 0,
+            nlink: 1,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            size: 0,
+            flags: 0,
+            inline_data: Arc::from([]),
+            extents: Vec::new(),
+        })
+        .collect();
+    let (_temp, meta) = current_readonly_directory_fixture(entries).await;
+    let error = meta.readdir(1).await.unwrap_err();
+    assert!(matches!(error, MetaError::Io(error) if error.raw_os_error() == Some(libc::E2BIG)));
+    let directory = meta.opendir(1).await.unwrap();
+    assert_eq!(
+        directory.get_entries_page_raw(4096, 1).await.unwrap().len(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn readonly_meta_and_block_store_read_one_current_packed_file() {
     use crate::chunk::read_plan::WorkspaceReadPlanProvider;

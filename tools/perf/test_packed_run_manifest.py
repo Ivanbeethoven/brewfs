@@ -79,6 +79,27 @@ class PackedRunManifestTests(unittest.TestCase):
             self.assertEqual(manifest["measurement"]["request_trace_sha256"], "c" * 64)
             self.assertEqual(manifest["measurement"]["phases"], ["mount", "active", "drain", "total"])
 
+    def test_layout_controls_are_validated_when_present(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = pathlib.Path(directory)
+            init_manifest(
+                artifact,
+                run_id="layout-controls",
+                wire_version=5,
+                controls={"mode": "stat", "scanner_seed": 1, "frame_policy": "static-1mib", "inline_data": "off", "metadata_codec": "raw", "data_codec": "zstd", "access_profile": "mixed"},
+                fixture_prefix="local-validation",
+            )
+            manifest = json.loads((artifact / "run-manifest.json").read_text())
+            self.assertEqual(manifest["controls"]["frame_policy"], "static-1mib")
+            with self.assertRaises(ArtifactError):
+                init_manifest(
+                    pathlib.Path(directory) / "bad",
+                    run_id="layout-controls-bad",
+                    wire_version=5,
+                    controls={"mode": "stat", "scanner_seed": 1, "metadata_codec": "bogus"},
+                    fixture_prefix="local-validation",
+                )
+
     def test_failed_run_records_status_without_claiming_measurement(self):
         with tempfile.TemporaryDirectory() as directory:
             artifact = pathlib.Path(directory)

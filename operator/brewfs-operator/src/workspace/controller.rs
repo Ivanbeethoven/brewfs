@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::{Context as _, anyhow, bail};
 use brewfs::workspace_overlay::error::WorkspaceError;
 use brewfs::workspace_overlay::ids::{LayerId, SnapshotId, WorkspaceId};
 use brewfs::workspace_overlay::model::LeaseState;
@@ -9,8 +9,8 @@ use chrono::Utc;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::runtime::controller::Action;
 use kube::{Client, Resource, ResourceExt};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use thiserror::Error;
 use uuid::Uuid;
@@ -19,9 +19,9 @@ use crate::crd::BrewFSCluster;
 use crate::reconciler::OperatorContext;
 
 use super::admin::{
+    EnsureSnapshotRequest, EnsureWorkspaceRequest, VolumeIdentity, WorkspaceAdmin,
     catalog_namespace, connect_workspace_admin_for_cluster, deterministic_uuid,
-    revision_from_status, revision_to_status, EnsureSnapshotRequest, EnsureWorkspaceRequest,
-    VolumeIdentity, WorkspaceAdmin,
+    revision_from_status, revision_to_status,
 };
 use super::crd::{
     BrewFSWorkspace, BrewFSWorkspaceMount, BrewFSWorkspaceSnapshot, BrewFSWorkspaceSnapshotStatus,
@@ -93,25 +93,51 @@ pub async fn guard_cluster_workspace_lifecycle(
         return ensure_finalizer(&api, &cluster.name_any(), cluster, CLUSTER_FINALIZER).await;
     }
 
-    let workspaces = Api::<BrewFSWorkspace>::namespaced(client.clone(), namespace)
-        .list(&ListParams::default())
-        .await?
+    let workspace_list = Api::<BrewFSWorkspace>::namespaced(client.clone(), namespace)
+        .list(&ListParams::default().limit(256))
+        .await?;
+    if workspace_list
+        .metadata
+        .continue_
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        bail!("cluster deletion workspace inventory is incomplete");
+    }
+    let workspaces = workspace_list
+        .items
         .into_iter()
         .filter(|workspace| workspace.spec.cluster_ref.name == cluster.name_any())
         .collect::<Vec<_>>();
-    let workspace_names = workspaces
-        .iter()
-        .map(ResourceExt::name_any)
-        .collect::<std::collections::BTreeSet<_>>();
-    let mount_count = Api::<BrewFSWorkspaceMount>::namespaced(client.clone(), namespace)
-        .list(&ListParams::default())
-        .await?
+    let mount_list = Api::<BrewFSWorkspaceMount>::namespaced(client.clone(), namespace)
+        .list(&ListParams::default().limit(256))
+        .await?;
+    if mount_list
+        .metadata
+        .continue_
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        bail!("cluster deletion mount inventory is incomplete");
+    }
+    let mount_count = mount_list
+        .items
         .into_iter()
-        .filter(|mount| workspace_names.contains(&mount.spec.workspace_ref.name))
+        .filter(|mount| mount.spec.cluster_ref.name == cluster.name_any())
         .count();
-    let snapshot_count = Api::<BrewFSWorkspaceSnapshot>::namespaced(client.clone(), namespace)
-        .list(&ListParams::default())
-        .await?
+    let snapshot_list = Api::<BrewFSWorkspaceSnapshot>::namespaced(client.clone(), namespace)
+        .list(&ListParams::default().limit(256))
+        .await?;
+    if snapshot_list
+        .metadata
+        .continue_
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        bail!("cluster deletion snapshot inventory is incomplete");
+    }
+    let snapshot_count = snapshot_list
+        .items
         .into_iter()
         .filter(|snapshot| snapshot.spec.cluster_ref.name == cluster.name_any())
         .count();
@@ -618,12 +644,22 @@ async fn active_mount_name(
     workspace: &BrewFSWorkspace,
 ) -> anyhow::Result<Option<String>> {
     let mounts = Api::<BrewFSWorkspaceMount>::namespaced(client.clone(), namespace)
-        .list(&ListParams::default())
+        .list(&ListParams::default().limit(256))
         .await?;
+    if mounts
+        .metadata
+        .continue_
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        bail!("workspace mount inventory is incomplete");
+    }
     Ok(mounts
+        .items
         .into_iter()
         .filter(|mount| {
             mount.spec.workspace_ref.name == workspace.name_any()
+                && mount.spec.cluster_ref.name == workspace.spec.cluster_ref.name
                 && mount.meta().deletion_timestamp.is_none()
         })
         .map(|mount| mount.name_any())
@@ -952,10 +988,20 @@ async fn cleanup_workspace(
     workspace: &BrewFSWorkspace,
 ) -> anyhow::Result<()> {
     let mount_api: Api<BrewFSWorkspaceMount> = Api::namespaced(client.clone(), namespace);
-    let mounts = mount_api.list(&ListParams::default()).await?;
+    let mounts = mount_api.list(&ListParams::default().limit(256)).await?;
+    if mounts
+        .metadata
+        .continue_
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        bail!("workspace mount deletion inventory is incomplete");
+    }
     let mut remaining = false;
-    for mount in mounts {
-        if mount.spec.workspace_ref.name == workspace.name_any() {
+    for mount in mounts.items {
+        if mount.spec.workspace_ref.name == workspace.name_any()
+            && mount.spec.cluster_ref.name == workspace.spec.cluster_ref.name
+        {
             remaining = true;
             if mount.meta().deletion_timestamp.is_none() {
                 mount_api
@@ -1072,15 +1118,21 @@ async fn cleanup_snapshot(
     snapshot: &BrewFSWorkspaceSnapshot,
 ) -> anyhow::Result<()> {
     let workspace_api: Api<BrewFSWorkspace> = Api::namespaced(client.clone(), namespace);
-    if workspace_api
-        .list(&ListParams::default())
-        .await?
-        .iter()
-        .any(|workspace| {
-            workspace.spec.source.kind == WorkspaceSourceKind::Snapshot
-                && workspace.spec.source.name.as_deref() == Some(&snapshot.name_any())
-        })
+    let workspaces = workspace_api
+        .list(&ListParams::default().limit(256))
+        .await?;
+    if workspaces
+        .metadata
+        .continue_
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
     {
+        bail!("snapshot reference inventory is incomplete");
+    }
+    if workspaces.items.iter().any(|workspace| {
+        workspace.spec.source.kind == WorkspaceSourceKind::Snapshot
+            && workspace.spec.source.name.as_deref() == Some(&snapshot.name_any())
+    }) {
         bail!("snapshot is still referenced by a BrewFSWorkspace");
     }
     let Some(snapshot_id) = snapshot
@@ -1104,15 +1156,21 @@ async fn ensure_single_mount(
 ) -> anyhow::Result<()> {
     let api: Api<BrewFSWorkspaceMount> = Api::namespaced(client.clone(), namespace);
     let current_uid = resource_uid(mount)?;
-    let conflict = api
-        .list(&ListParams::default())
-        .await?
-        .into_iter()
-        .any(|candidate| {
-            candidate.spec.workspace_ref.name == mount.spec.workspace_ref.name
-                && candidate.meta().deletion_timestamp.is_none()
-                && resource_uid(&candidate).is_ok_and(|uid| uid < current_uid)
-        });
+    let candidates = api.list(&ListParams::default().limit(256)).await?;
+    if candidates
+        .metadata
+        .continue_
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        bail!("workspace mount ownership inventory is incomplete");
+    }
+    let conflict = candidates.items.into_iter().any(|candidate| {
+        candidate.spec.workspace_ref.name == mount.spec.workspace_ref.name
+            && candidate.spec.cluster_ref.name == mount.spec.cluster_ref.name
+            && candidate.meta().deletion_timestamp.is_none()
+            && resource_uid(&candidate).is_ok_and(|uid| uid < current_uid)
+    });
     if conflict {
         bail!("another BrewFSWorkspaceMount owns the writable mount slot");
     }

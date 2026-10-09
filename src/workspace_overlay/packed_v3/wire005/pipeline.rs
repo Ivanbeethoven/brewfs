@@ -164,6 +164,7 @@ impl V3FrameDemand {
         V3FlightKey {
             snapshot: self.generation.lower_snapshot,
             epoch: self.generation.workspace_head_epoch,
+            mutation_sequence: self.generation.workspace_mutation_sequence,
             context: self.context,
             container_key: self.container.key.clone(),
             container_kind: self.container.kind as u8,
@@ -190,6 +191,10 @@ impl V3FrameDemand {
 struct V3FlightKey {
     snapshot: [u8; 32],
     epoch: u64,
+    /// Same-head mutations advance this fence without changing the head
+    /// epoch. It must be part of the flight identity so a request submitted
+    /// after such a mutation cannot join a body captured by the prior view.
+    mutation_sequence: u64,
     context: ReadContext,
     container_key: String,
     container_kind: u8,
@@ -379,6 +384,7 @@ fn plan_v3_weighted_batches(
                 let c = d.key();
                 let same = a.snapshot == c.snapshot
                     && a.epoch == c.epoch
+                    && a.mutation_sequence == c.mutation_sequence
                     && a.context == c.context
                     && a.container_key == c.container_key
                     && a.container_kind == c.container_kind
@@ -983,6 +989,56 @@ mod tests {
         drop(batches);
         assert_eq!(budget.state().used[V3BudgetPool::Plans as usize], 0);
     }
+    #[test]
+    fn same_head_mutation_sequence_never_shares_a_flight() {
+        let budget = V3MountBudget::defaults();
+        let registry =
+            V3FlightRegistry::<Vec<u8>>::new(budget.clone(), V3PipelineLimits::default()).unwrap();
+        let first = demand(0, 0);
+        let mut after_same_epoch_mutation = first.clone();
+        after_same_epoch_mutation
+            .generation
+            .workspace_mutation_sequence = 1;
+
+        let (old_waiter, old_leader) = registry.begin(&first).unwrap();
+        let (new_waiter, new_leader) = registry.begin(&after_same_epoch_mutation).unwrap();
+        assert!(old_leader.is_some(), "the initial view must elect a leader");
+        assert!(
+            new_leader.is_some(),
+            "a same-head mutation must force a new physical flight"
+        );
+
+        drop(old_waiter);
+        drop(new_waiter);
+        drop(old_leader);
+        drop(new_leader);
+        drop(registry);
+        assert_eq!(budget.state().used, [0; 8]);
+    }
+
+    #[test]
+    fn demand_batches_keep_same_epoch_mutation_sequences_separate() {
+        let budget = V3MountBudget::defaults();
+        let first = demand(0, 0);
+        let mut after_same_epoch_mutation = first.clone();
+        after_same_epoch_mutation
+            .generation
+            .workspace_mutation_sequence = 1;
+        let batches = plan_v3_demand_batches(
+            &[first, after_same_epoch_mutation],
+            V3PipelineLimits::default(),
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(
+            batches.len(),
+            2,
+            "a plan must never coalesce frames from different mutation fences"
+        );
+        drop(batches);
+        assert_eq!(budget.state().used[V3BudgetPool::Plans as usize], 0);
+    }
+
     #[test]
     fn static_policy_keeps_file_class_and_separates_identical_frame_flights() {
         use super::super::V3FramePolicy;
