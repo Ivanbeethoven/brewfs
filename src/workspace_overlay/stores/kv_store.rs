@@ -7733,10 +7733,10 @@ mod tests {
         let actor = crate::meta::layer::NamespaceActor {
             uid: 1234,
             gid: 3000,
-            groups: vec![3000],
+            groups: vec![2000, 3000],
         };
         let error = crate::meta::layer::scope_namespace_actor(
-            Some(actor),
+            Some(actor.clone()),
             meta_b.open(
                 child,
                 crate::meta::store::OpenFlags::WRONLY | crate::meta::store::OpenFlags::TRUNC,
@@ -7751,6 +7751,63 @@ mod tests {
         assert_eq!(
             (after_denied.attr.size, after_denied.attr.ctime),
             (before_denied.attr.size, before_denied.attr.ctime)
+        );
+        meta_a
+            .remove_xattr(child, "system.brewfs.acl")
+            .await
+            .unwrap();
+        // A caller may belong to both the owning group and a named group.
+        // Their permissions are alternatives: read from one and write from
+        // the other must not combine into an O_RDWR grant.  This contract is
+        // exercised through the generic KV store so the same CAS policy is
+        // covered by Redis and TiKV when their ignored integration fixture is
+        // enabled.
+        let split_groups = serde_json::to_vec(&vec![
+            crate::control::protocol::ControlAclEntry {
+                scope: "access".into(),
+                tag: "user_obj".into(),
+                id: None,
+                perm: "rwx".into(),
+            },
+            crate::control::protocol::ControlAclEntry {
+                scope: "access".into(),
+                tag: "group_obj".into(),
+                id: None,
+                perm: "r--".into(),
+            },
+            crate::control::protocol::ControlAclEntry {
+                scope: "access".into(),
+                tag: "group".into(),
+                id: Some(3000),
+                perm: "-w-".into(),
+            },
+            crate::control::protocol::ControlAclEntry {
+                scope: "access".into(),
+                tag: "mask".into(),
+                id: None,
+                perm: "rwx".into(),
+            },
+            crate::control::protocol::ControlAclEntry {
+                scope: "access".into(),
+                tag: "other".into(),
+                id: None,
+                perm: "---".into(),
+            },
+        ])
+        .unwrap();
+        meta_a
+            .set_xattr(child, "system.brewfs.acl", &split_groups, 0)
+            .await
+            .unwrap();
+        let split_error = crate::meta::layer::scope_namespace_actor(
+            Some(actor.clone()),
+            meta_b.open(child, crate::meta::store::OpenFlags::RDWR),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&split_error, crate::meta::store::MetaError::Io(e) if e.raw_os_error() == Some(libc::EACCES)),
+            "group ACL entries must not be OR-ed across groups: {split_error:?}"
         );
         meta_a
             .remove_xattr(child, "system.brewfs.acl")
