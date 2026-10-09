@@ -82,6 +82,7 @@ jobs:
           bash -n docker/compose-xfstests/run_workspace_overlay_suite_in_container.sh
           bash -n docker/compose-xfstests/run_workspace_overlay_compose.sh
           bash -n docker/compose-xfstests/run_workspace_overlay_suites.sh
+          bash -n docker/compose-xfstests/run_s3_git_clone_smoke.sh
           bash docker/compose-xfstests/test_perf_report_delta.sh
           bash docker/compose-xfstests/test_juicefs_direct_matrix.sh
           bash docker/compose-xfstests/test_juicefs_perf_report.sh

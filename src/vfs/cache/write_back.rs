@@ -527,13 +527,14 @@ impl WriteBackCache for FsWriteBackCache {
             let allocation_len = allocation_end.saturating_sub(allocation_start);
             let allocation_path = slice_path.clone();
             tokio::task::spawn_blocking(move || {
-                use std::os::fd::AsRawFd;
-
                 let file = std::fs::OpenOptions::new()
                     .create(true)
                     .truncate(false)
                     .write(true)
                     .open(allocation_path)?;
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                use std::os::fd::AsRawFd;
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 let result = unsafe {
                     libc::fallocate(
                         file.as_raw_fd(),
@@ -542,8 +543,18 @@ impl WriteBackCache for FsWriteBackCache {
                         allocation_len as libc::off_t,
                     )
                 };
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 if result == -1 {
                     return Err(std::io::Error::last_os_error());
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                {
+                    let original_len = file.metadata()?.len();
+                    let allocation_end = allocation_start.saturating_add(allocation_len);
+                    if allocation_end > original_len {
+                        file.set_len(allocation_end)?;
+                        file.set_len(original_len)?;
+                    }
                 }
                 Ok::<(), std::io::Error>(())
             })
@@ -735,6 +746,10 @@ impl WriteBackCache for FsWriteBackCache {
 }
 
 impl FsWriteBackCache {
+    pub(crate) fn has_recoverable_data(&self) -> bool {
+        !self.recoverable_keys.is_empty()
+    }
+
     /// Overlay dirty data from SSD onto a read buffer.
     /// Scans dirty slices for the given inode/chunk and copies any
     /// overlapping ranges into `buf`.  Used as a fallback when in-memory

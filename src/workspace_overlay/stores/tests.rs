@@ -1,3 +1,4 @@
+use sea_orm::sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

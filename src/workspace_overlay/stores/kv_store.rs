@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::sync::Mutex;
+use tokio::time::sleep;
 
 use super::kv_backend::{KvCheck, KvEntry, KvReadLimits, KvWrite, WorkspaceKvBackend};
 use crate::workspace_overlay::catalog::*;
@@ -149,9 +149,66 @@ struct V3RecoveryRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct ControlState {
+struct ControlHeader {
     schema_version: u32,
     header: Option<VolumeHeader>,
+    catalog_format: u32,
+}
+
+impl Default for ControlHeader {
+    fn default() -> Self {
+        Self {
+            schema_version: WORKSPACE_SCHEMA_VERSION,
+            header: None,
+            catalog_format: CATALOG_FORMAT,
+        }
+    }
+}
+
+// bincode 按字段顺序编码结构体；迁移时保留旧记录的字段顺序。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LegacyWorkspaceRecord {
+    workspace_id: WorkspaceId,
+    head_layer_id: LayerId,
+    head_epoch: u64,
+    fork_base: Option<BaseRevision>,
+    owner_id: Option<String>,
+    state: WorkspaceState,
+    created_at_ns: i64,
+    updated_at_ns: i64,
+}
+
+impl From<LegacyWorkspaceRecord> for WorkspaceRecord {
+    fn from(row: LegacyWorkspaceRecord) -> Self {
+        Self {
+            workspace_id: row.workspace_id,
+            head_layer_id: row.head_layer_id,
+            head_epoch: row.head_epoch,
+            fork_base: row.fork_base,
+            owner_id: row.owner_id,
+            state: row.state,
+            active_lease: None,
+            created_at_ns: row.created_at_ns,
+            updated_at_ns: row.updated_at_ns,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LegacyControlState {
+    schema_version: u32,
+    header: Option<VolumeHeader>,
+    workspaces: BTreeMap<WorkspaceId, LegacyWorkspaceRecord>,
+    layers: BTreeMap<LayerId, LayerRecord>,
+    snapshots: BTreeMap<SnapshotId, SnapshotRecord>,
+    leases: BTreeMap<LeaseId, SnapshotLease>,
+    journals: BTreeMap<JournalId, SealJournal>,
+    allocators: BTreeMap<String, i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MigrationState {
+    header: ControlHeader,
     workspaces: BTreeMap<WorkspaceId, WorkspaceRecord>,
     layers: BTreeMap<LayerId, LayerRecord>,
     snapshots: BTreeMap<SnapshotId, SnapshotRecord>,
@@ -808,8 +865,30 @@ where
         self.read_complete_topology_census().await
     }
 
-    async fn load_control(&self) -> Result<ControlState, WorkspaceError> {
-        Ok(self.load_control_raw().await?.1)
+    async fn scan_catalog_once(&self) -> Result<CatalogState, WorkspaceError> {
+        self.current_control().await?;
+        let workspaces: Vec<WorkspaceRecord> = self.scan(WORKSPACE_PREFIX.to_vec()).await?;
+        let layers: Vec<LayerRecord> = self.scan(LAYER_PREFIX.to_vec()).await?;
+        let snapshots: Vec<SnapshotRecord> = self.scan(SNAPSHOT_PREFIX.to_vec()).await?;
+        let leases: Vec<SnapshotLease> = self.scan(LEASE_PREFIX.to_vec()).await?;
+        let journals: Vec<SealJournal> = self.scan(JOURNAL_PREFIX.to_vec()).await?;
+        let state = CatalogState {
+            workspaces: workspaces
+                .into_iter()
+                .map(|row| (row.workspace_id, row))
+                .collect(),
+            layers: layers.into_iter().map(|row| (row.layer_id, row)).collect(),
+            snapshots: snapshots
+                .into_iter()
+                .map(|row| (row.snapshot_id, row))
+                .collect(),
+            leases: leases.into_iter().map(|row| (row.lease_id, row)).collect(),
+            journals: journals
+                .into_iter()
+                .map(|row| (row.journal_id, row))
+                .collect(),
+        };
+        Ok(state)
     }
 
     async fn update_control<R, F>(&self, mut operation: F) -> Result<R, WorkspaceError>
@@ -1017,6 +1096,76 @@ where
         ))
     }
 
+    async fn migrate(&self) -> Result<(), WorkspaceError> {
+        for attempt in 0..CAS_MAX_RETRIES {
+            let raw = self.backend.get(CONTROL_KEY).await?;
+            let Some(raw) = raw else {
+                if self
+                    .backend
+                    .compare_and_swap(
+                        &[KvCheck {
+                            key: CONTROL_KEY.to_vec(),
+                            expected: None,
+                        }],
+                        &[put_control(&ControlHeader::default())?],
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
+                retry_backoff(attempt).await;
+                continue;
+            };
+            if raw.starts_with(CONTROL_MAGIC) {
+                self.current_control().await?;
+                return Ok(());
+            }
+            let state = if raw.starts_with(ENVELOPE_MAGIC) {
+                let (state, checks) = self.legacy_state(&raw).await?;
+                let marker = encode_migration(&state)?;
+                let mut writes = checks
+                    .iter()
+                    .skip(1)
+                    .map(|check| KvWrite::Delete {
+                        key: check.key.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                writes.push(KvWrite::Put {
+                    key: CONTROL_KEY.to_vec(),
+                    value: marker,
+                });
+                if !self.backend.compare_and_swap(&checks, &writes).await? {
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                state
+            } else if raw.starts_with(b"BWSMG002") {
+                decode_migration(&raw)?
+            } else {
+                return Err(WorkspaceError::CorruptMetadata(
+                    "invalid workspace catalog marker".into(),
+                ));
+            };
+            self.stage_migration(&state).await?;
+            let marker = encode_migration(&state)?;
+            if self
+                .backend
+                .compare_and_swap(
+                    &[KvCheck {
+                        key: CONTROL_KEY.to_vec(),
+                        expected: Some(marker),
+                    }],
+                    &[put_control(&state.header)?],
+                )
+                .await?
+            {
+                return Ok(());
+            }
+            retry_backoff(attempt).await;
+        }
+        Err(WorkspaceError::Busy)
+    }
+
     async fn load_hot<T: DeserializeOwned>(
         &self,
         key: Vec<u8>,
@@ -1115,7 +1264,7 @@ where
             if committed {
                 return Ok(result);
             }
-            tokio::task::yield_now().await;
+            retry_backoff(attempt).await;
         }
         Err(WorkspaceError::Busy)
     }
@@ -2350,14 +2499,16 @@ where
     }
 
     async fn load_workspace(&self, id: WorkspaceId) -> Result<WorkspaceRecord, WorkspaceError> {
-        self.load_hot(hot_workspace_key(id))
+        self.current_control().await?;
+        self.load_hot(workspace_key(id))
             .await?
             .1
             .ok_or(WorkspaceError::WorkspaceNotFound(id))
     }
 
     async fn load_layer(&self, id: LayerId) -> Result<LayerRecord, WorkspaceError> {
-        self.load_hot(hot_layer_key(id))
+        self.current_control().await?;
+        self.load_hot(layer_key(id))
             .await?
             .1
             .ok_or(WorkspaceError::LayerNotFound(id))
@@ -2387,8 +2538,9 @@ where
                 "unknown workspace allocator {name}"
             )));
         }
-        let key = hot_allocator_key(name);
-        for _ in 0..CAS_MAX_RETRIES {
+        self.current_control().await?;
+        let key = allocator_key(name);
+        for attempt in 0..CAS_MAX_RETRIES {
             let (raw, value) = self.load_hot::<i64>(key.clone()).await?;
             let current = value.unwrap_or(1);
             let next = current
@@ -2405,7 +2557,7 @@ where
             if self.commit_prepared_topology_packet(&packet).await? {
                 return Ok(current);
             }
-            tokio::task::yield_now().await;
+            retry_backoff(attempt).await;
         }
         Err(WorkspaceError::Busy)
     }
@@ -2602,7 +2754,8 @@ where
     }
 
     async fn load_snapshot(&self, id: SnapshotId) -> Result<SnapshotRecord, WorkspaceError> {
-        self.load_hot(hot_snapshot_key(id))
+        self.current_control().await?;
+        self.load_hot(snapshot_key(id))
             .await?
             .1
             .ok_or(WorkspaceError::SnapshotNotFound(id))
@@ -4291,15 +4444,51 @@ where
             {
                 return Err(WorkspaceError::Busy);
             }
-            for layer_id in &request.layer_ids {
-                if let Some(layer) = state.layers.get_mut(layer_id) {
-                    layer.state = LayerState::Deleting;
-                    layer.owner_workspace_id = None;
+            for attempt in 0..CAS_MAX_RETRIES {
+                let mut txn = self.topology_txn();
+                let Some(mut layer) = txn.read_layer(id).await? else {
+                    break;
+                };
+                if layer.state == LayerState::Deleting {
+                    break;
+                }
+                if layer.state != LayerState::Sealed {
+                    return Err(WorkspaceError::Busy);
+                }
+                layer.state = LayerState::Deleting;
+                txn.put_layer(&layer)?;
+                if txn.commit().await? {
+                    break;
+                }
+                retry_backoff(attempt).await;
+                if attempt + 1 == CAS_MAX_RETRIES {
+                    return Err(WorkspaceError::Busy);
                 }
             }
-            Ok(())
-        })
-        .await
+            let verify = self.scan_catalog().await?;
+            if reachable_layers(&verify, cutoff).contains(&id) {
+                for attempt in 0..CAS_MAX_RETRIES {
+                    let mut txn = self.topology_txn();
+                    let Some(mut layer) = txn.read_layer(id).await? else {
+                        return Err(WorkspaceError::Busy);
+                    };
+                    if layer.state != LayerState::Deleting {
+                        break;
+                    }
+                    layer.state = LayerState::Sealed;
+                    txn.put_layer(&layer)?;
+                    if txn.commit().await? {
+                        break;
+                    }
+                    retry_backoff(attempt).await;
+                    if attempt + 1 == CAS_MAX_RETRIES {
+                        return Err(WorkspaceError::Busy);
+                    }
+                }
+                return Err(WorkspaceError::Busy);
+            }
+        }
+        Ok(())
     }
 
     async fn reserve_gc_slice_deletion(
@@ -4587,11 +4776,11 @@ where
             .checked_add(1)
             .ok_or_else(|| WorkspaceError::CorruptMetadata("sequence overflows".into()))?;
         let now = self.now_ns().await?;
-        self.update_control(|state, writes| {
-            let workspace = state
-                .workspaces
-                .get(&request.workspace_id)
-                .cloned()
+        for attempt in 0..CAS_MAX_RETRIES {
+            let mut txn = self.topology_txn();
+            let mut workspace = txn
+                .read_workspace(request.workspace_id)
+                .await?
                 .ok_or(WorkspaceError::WorkspaceNotFound(request.workspace_id))?;
             if workspace.head_layer_id != request.expected_head_layer_id
                 || workspace.head_epoch != request.expected_head_epoch
@@ -4599,9 +4788,9 @@ where
             {
                 return Err(WorkspaceError::Fenced);
             }
-            let head = state
-                .layers
-                .get(&request.expected_head_layer_id)
+            let mut head = txn
+                .read_layer(request.expected_head_layer_id)
+                .await?
                 .ok_or(WorkspaceError::Fenced)?;
             if head.state != LayerState::Writable
                 || head.owner_workspace_id != Some(request.workspace_id)
@@ -4610,103 +4799,114 @@ where
             {
                 return Err(WorkspaceError::Fenced);
             }
-            if state.layers.contains_key(&request.compacted_layer_id)
-                || state
-                    .layers
-                    .contains_key(&request.replacement_head_layer_id)
+            let parent = txn
+                .read_layer(request.expected_parent_layer_id)
+                .await?
+                .ok_or(WorkspaceError::Fenced)?;
+            revision_from_layer(&parent)?;
+            if txn.read_layer(request.compacted_layer_id).await?.is_some()
+                || txn
+                    .read_layer(request.replacement_head_layer_id)
+                    .await?
+                    .is_some()
             {
                 return Err(conflict("compaction output layer already exists"));
             }
-            let sealed_version = u64::try_from(allocate_id_state(state, "sealed_version")?)
+            let next = txn.read_allocator("sealed_version").await?.ok_or_else(|| {
+                WorkspaceError::CorruptMetadata("sealed version allocator missing".into())
+            })?;
+            let sealed_version = u64::try_from(next)
                 .map_err(|_| WorkspaceError::CorruptMetadata("negative sealed version".into()))?;
-            state.layers.insert(
-                request.compacted_layer_id,
-                LayerRecord {
-                    layer_id: request.compacted_layer_id,
-                    parent_layer_id: None,
-                    state: LayerState::Sealed,
-                    schema_version: WORKSPACE_SCHEMA_VERSION,
-                    sealed_version: Some(sealed_version),
-                    delta_digest: Some(digest),
-                    root_hash: Some(root),
-                    depth: 1,
-                    owner_workspace_id: None,
-                    next_sequence,
-                    owned_slice_count: 0,
-                    owned_bytes: 0,
-                    created_at_ns: now,
-                    sealed_at_ns: Some(now),
-                },
-            );
-            state.layers.insert(
+            txn.put_allocator(
+                "sealed_version",
+                next.checked_add(1)
+                    .ok_or_else(|| WorkspaceError::CorruptMetadata("allocator overflows".into()))?,
+            )?;
+            let compacted = LayerRecord {
+                layer_id: request.compacted_layer_id,
+                parent_layer_id: None,
+                state: LayerState::Sealed,
+                schema_version: WORKSPACE_SCHEMA_VERSION,
+                sealed_version: Some(sealed_version),
+                delta_digest: Some(digest),
+                root_hash: Some(root),
+                depth: 1,
+                owner_workspace_id: None,
+                next_sequence,
+                owned_slice_count: 0,
+                owned_bytes: 0,
+                created_at_ns: now,
+                sealed_at_ns: Some(now),
+            };
+            txn.put_layer(&compacted)?;
+            txn.put_layer(&writable_layer(
                 request.replacement_head_layer_id,
-                writable_layer(
-                    request.replacement_head_layer_id,
-                    request.compacted_layer_id,
-                    2,
-                    request.workspace_id,
-                    now,
-                ),
-            );
+                request.compacted_layer_id,
+                2,
+                request.workspace_id,
+                now,
+            ))?;
             let epoch = workspace
                 .head_epoch
                 .checked_add(1)
                 .ok_or_else(|| WorkspaceError::CorruptMetadata("head epoch overflows".into()))?;
-            let workspace = state
-                .workspaces
-                .get_mut(&request.workspace_id)
-                .expect("workspace exists");
             workspace.head_layer_id = request.replacement_head_layer_id;
             workspace.head_epoch = epoch;
-            workspace.fork_base = Some(BaseRevision {
+            let revision = BaseRevision {
                 layer_id: request.compacted_layer_id,
                 sealed_version,
                 root_hash: root,
-            });
+            };
+            workspace.fork_base = Some(revision.clone());
             workspace.updated_at_ns = now;
-            let revision = workspace
-                .fork_base
-                .clone()
-                .expect("compaction installs a fork base");
-            for lease in state.leases.values_mut() {
-                if lease.workspace_id == request.workspace_id && lease.state == LeaseState::Active {
-                    lease.base_revision = revision.clone();
-                    lease.updated_at_ns = now;
-                }
+            if let Some(id) = workspace.active_lease
+                && let Some(mut lease) = txn.read_lease(request.workspace_id, id).await?
+                && lease.state == LeaseState::Active
+            {
+                lease.base_revision = revision.clone();
+                lease.updated_at_ns = now;
+                txn.put_lease(&lease)?;
             }
-            let old_head = state
-                .layers
-                .get_mut(&request.expected_head_layer_id)
-                .expect("head exists");
-            old_head.state = LayerState::Deleting;
-            old_head.owner_workspace_id = None;
-
+            txn.put_workspace(&workspace)?;
+            head.state = LayerState::Deleting;
+            head.owner_workspace_id = None;
+            txn.put_layer(&head)?;
+            let mut delta_writes = Vec::new();
             for row in &request.delta.dentries {
-                writes.push(put(dentry_key(row), row)?);
+                delta_writes.push(put(dentry_key(row), row)?);
             }
             for row in &request.delta.inodes {
-                writes.push(put(inode_key(row), row)?);
+                delta_writes.push(put(inode_key(row), row)?);
             }
             for row in &request.delta.xattrs {
-                writes.push(put(xattr_key(row), row)?);
+                delta_writes.push(put(xattr_key(row), row)?);
             }
             for row in &request.delta.acls {
-                writes.push(put(acl_key(row), row)?);
+                delta_writes.push(put(acl_key(row), row)?);
             }
             for row in &request.delta.extents {
-                writes.push(put(extent_key(row), row)?);
+                delta_writes.push(put(extent_key(row), row)?);
             }
-            Ok(CompactionResult {
-                revision: BaseRevision {
-                    layer_id: request.compacted_layer_id,
-                    sealed_version,
-                    root_hash: root,
-                },
-                replacement_head_layer_id: request.replacement_head_layer_id,
-                head_epoch: epoch,
-            })
-        })
-        .await
+            let keys = delta_writes
+                .iter()
+                .map(|write| match write {
+                    KvWrite::Put { key, .. } | KvWrite::Delete { key } => key.clone(),
+                })
+                .collect::<Vec<_>>();
+            txn.read_many_raw(&keys).await?;
+            for write in delta_writes {
+                txn.put_checked(write)?;
+            }
+            if txn.commit().await? {
+                return Ok(CompactionResult {
+                    revision,
+                    replacement_head_layer_id: request.replacement_head_layer_id,
+                    head_epoch: epoch,
+                });
+            }
+            retry_backoff(attempt).await;
+        }
+        Err(WorkspaceError::Busy)
     }
 }
 
@@ -5092,29 +5292,38 @@ fn hot_lease_index_key(id: LeaseId) -> Vec<u8> {
 fn hot_journal_index_key(id: JournalId) -> Vec<u8> {
     journal_index_key(id)
 }
-
-fn hot_snapshot_key(id: SnapshotId) -> Vec<u8> {
-    [HOT_SNAPSHOT_PREFIX, id.to_string().as_bytes()].concat()
+fn lease_prefix(workspace: WorkspaceId) -> Vec<u8> {
+    format!("lease/{workspace}/").into_bytes()
 }
 
 fn hot_allocator_key(name: &str) -> Vec<u8> {
     allocator_key(name)
 }
-
-fn is_hot_key(key: &[u8]) -> bool {
-    key.starts_with(HOT_WORKSPACE_PREFIX)
-        || key.starts_with(HOT_LAYER_PREFIX)
-        || key.starts_with(HOT_LEASE_PREFIX)
-        || key.starts_with(HOT_SNAPSHOT_PREFIX)
-        || key.starts_with(HOT_ALLOCATOR_PREFIX)
+fn journal_key(workspace: WorkspaceId, id: JournalId) -> Vec<u8> {
+    format!("journal/{workspace}/{id}").into_bytes()
+}
+fn journal_prefix(workspace: WorkspaceId) -> Vec<u8> {
+    format!("journal/{workspace}/").into_bytes()
+}
+fn journal_index_key(id: JournalId) -> Vec<u8> {
+    [JOURNAL_INDEX_PREFIX, id.to_string().as_bytes()].concat()
+}
+fn snapshot_key(id: SnapshotId) -> Vec<u8> {
+    [SNAPSHOT_PREFIX, id.to_string().as_bytes()].concat()
+}
+fn snapshot_name_key(name: &str) -> Vec<u8> {
+    [SNAPSHOT_NAME_PREFIX, hex::encode(name).as_bytes()].concat()
+}
+fn allocator_key(name: &str) -> Vec<u8> {
+    [ALLOCATOR_PREFIX, name.as_bytes()].concat()
 }
 
 fn allocator_name_from_key(key: &[u8]) -> Result<String, WorkspaceError> {
-    let name = key.strip_prefix(HOT_ALLOCATOR_PREFIX).ok_or_else(|| {
-        WorkspaceError::CorruptMetadata("invalid hot allocator key prefix".into())
+    let name = key.strip_prefix(LEGACY_ALLOCATOR_PREFIX).ok_or_else(|| {
+        WorkspaceError::CorruptMetadata("invalid legacy allocator key prefix".into())
     })?;
     String::from_utf8(name.to_vec())
-        .map_err(|_| WorkspaceError::CorruptMetadata("invalid hot allocator key".into()))
+        .map_err(|_| WorkspaceError::CorruptMetadata("invalid legacy allocator key".into()))
 }
 
 fn append_recovery_diff(
@@ -5191,28 +5400,36 @@ fn append_hot_diff(
     Ok(())
 }
 
-fn append_map_diff<K, V, F>(
-    before: &BTreeMap<K, V>,
-    after: &BTreeMap<K, V>,
-    writes: &mut Vec<KvWrite>,
-    key: F,
-) -> Result<(), WorkspaceError>
-where
-    K: Ord,
-    V: PartialEq + Serialize,
-    F: Fn(&K) -> Vec<u8>,
-{
-    for (id, value) in after {
-        if before.get(id) != Some(value) {
-            writes.push(put(key(id), value)?);
-        }
-    }
-    for id in before.keys() {
-        if !after.contains_key(id) {
-            writes.push(KvWrite::Delete { key: key(id) });
-        }
-    }
-    Ok(())
+fn decode_control(raw: &[u8]) -> Result<ControlHeader, WorkspaceError> {
+    let payload = raw
+        .strip_prefix(CONTROL_MAGIC)
+        .ok_or_else(|| WorkspaceError::CorruptMetadata("invalid control marker".into()))?;
+    bincode::deserialize(payload)
+        .map_err(|error| WorkspaceError::CorruptMetadata(format!("decode control: {error}")))
+}
+
+fn encode_migration(state: &MigrationState) -> Result<Vec<u8>, WorkspaceError> {
+    let payload = bincode::serialize(state)
+        .map_err(|error| WorkspaceError::Backend(format!("encode migration: {error}")))?;
+    Ok([b"BWSMG002".as_slice(), payload.as_slice()].concat())
+}
+
+fn decode_migration(raw: &[u8]) -> Result<MigrationState, WorkspaceError> {
+    let payload = raw
+        .strip_prefix(b"BWSMG002")
+        .ok_or_else(|| WorkspaceError::CorruptMetadata("invalid migration marker".into()))?;
+    bincode::deserialize(payload)
+        .map_err(|error| WorkspaceError::CorruptMetadata(format!("decode migration: {error}")))
+}
+
+async fn retry_backoff(attempt: usize) {
+    let base_ms = (1_u64 << attempt.min(7)).min(100);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .subsec_nanos();
+    let jitter_ms = u64::from(nanos) % (base_ms + 1);
+    sleep(Duration::from_millis((base_ms + jitter_ms).min(100))).await;
 }
 
 fn checked_hot_guard(
@@ -5284,14 +5501,6 @@ fn writable_layer(
     }
 }
 
-fn revision_state(state: &ControlState, layer_id: LayerId) -> Result<BaseRevision, WorkspaceError> {
-    let layer = state
-        .layers
-        .get(&layer_id)
-        .ok_or(WorkspaceError::LayerNotFound(layer_id))?;
-    revision_from_layer(layer)
-}
-
 fn revision_from_layer(layer: &LayerRecord) -> Result<BaseRevision, WorkspaceError> {
     if layer.state != LayerState::Sealed {
         return Err(WorkspaceError::LayerNotFound(layer.layer_id));
@@ -5305,46 +5514,6 @@ fn revision_from_layer(layer: &LayerRecord) -> Result<BaseRevision, WorkspaceErr
             WorkspaceError::CorruptMetadata("sealed layer has no root hash".into())
         })?,
     })
-}
-
-fn checked_guard(state: &ControlState, guard: &HeadGuard, now: i64) -> Result<(), WorkspaceError> {
-    let Some(workspace) = state.workspaces.get(&guard.workspace_id) else {
-        return Err(WorkspaceError::Fenced);
-    };
-    let Some(layer) = state.layers.get(&workspace.head_layer_id) else {
-        return Err(WorkspaceError::Fenced);
-    };
-    let Some(lease) = state.leases.get(&guard.lease_id) else {
-        return Err(WorkspaceError::Fenced);
-    };
-    if workspace.state != WorkspaceState::Active
-        || workspace.head_layer_id != guard.expected_head_layer_id
-        || workspace.head_epoch != guard.expected_head_epoch
-        || layer.state != LayerState::Writable
-        || layer.owner_workspace_id != Some(guard.workspace_id)
-        || lease.workspace_id != guard.workspace_id
-        || lease.state != LeaseState::Active
-        || !lease.writable
-        || lease.holder_generation != guard.holder_generation
-        || lease.expires_at_ns <= now
-    {
-        return Err(WorkspaceError::Fenced);
-    }
-    Ok(())
-}
-
-fn allocate_id_state(state: &mut ControlState, name: &str) -> Result<i64, WorkspaceError> {
-    let next = state.allocators.get_mut(name).ok_or_else(|| {
-        WorkspaceError::CorruptMetadata(format!("workspace allocator {name} is missing"))
-    })?;
-    if *next == i64::MAX {
-        return Err(WorkspaceError::CorruptMetadata(format!(
-            "workspace allocator {name} is exhausted"
-        )));
-    }
-    let allocated = *next;
-    *next += 1;
-    Ok(allocated)
 }
 
 fn checked_expiry(now: i64, ttl_ns: u64) -> Result<i64, WorkspaceError> {
@@ -5429,7 +5598,7 @@ fn u64_to_i64(value: u64, field: &str) -> Result<i64, WorkspaceError> {
         .map_err(|_| WorkspaceError::CorruptMetadata(format!("{field} exceeds i64 range")))
 }
 
-fn reachable_layers(state: &ControlState, lease_cutoff: i64) -> HashSet<LayerId> {
+fn catalog_roots_present(state: &CatalogState) -> bool {
     let mut pending = Vec::new();
     pending.extend(
         state
@@ -7039,6 +7208,93 @@ mod tests {
                 .extents
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_the_last_updated_terminal_journal() {
+        let (store, workspace, _, _) = initialized().await;
+        let earlier = SealJournal {
+            journal_id: JournalId::from_uuid(id(100)),
+            workspace_id: workspace.workspace_id,
+            old_head_layer_id: workspace.head_layer_id,
+            expected_head_epoch: workspace.head_epoch,
+            phase: SealPhase::Completed,
+            pending_bytes: 0,
+            delta_digest: None,
+            root_hash: None,
+            new_head_layer_id: None,
+            last_error: None,
+            created_at_ns: 1,
+            updated_at_ns: 4,
+        };
+        let later = SealJournal {
+            journal_id: JournalId::from_uuid(id(101)),
+            created_at_ns: 2,
+            updated_at_ns: 3,
+            ..earlier.clone()
+        };
+        for journal in [&earlier, &later] {
+            let mut txn = store.topology_txn();
+            txn.read_journal(workspace.workspace_id, journal.journal_id)
+                .await
+                .unwrap();
+            txn.read_journal_index(journal.journal_id).await.unwrap();
+            txn.put_journal(journal).unwrap();
+            txn.put(
+                journal_index_key(journal.journal_id),
+                &workspace.workspace_id,
+            )
+            .unwrap();
+            assert!(txn.commit().await.unwrap());
+        }
+        store.prune_terminal_records(100, 0).await.unwrap();
+        let journals = store
+            .list_seal_journals(workspace.workspace_id)
+            .await
+            .unwrap();
+        assert_eq!(journals, vec![earlier]);
+    }
+
+    #[tokio::test]
+    async fn prune_removes_expired_terminal_leases() {
+        let (store, workspace, _, _) = initialized().await;
+        let first = store
+            .list_leases(workspace.workspace_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        store
+            .release_lease(ReleaseLease {
+                lease_id: first.lease_id,
+                holder_generation: first.holder_generation,
+            })
+            .await
+            .unwrap();
+        let second = store
+            .acquire_lease(AcquireLease {
+                workspace_id: workspace.workspace_id,
+                lease_id: LeaseId::from_uuid(id(6)),
+                holder_generation: 2,
+                ttl_ns: 120_000_000_000,
+            })
+            .await
+            .unwrap();
+        store
+            .release_lease(ReleaseLease {
+                lease_id: second.lease_id,
+                holder_generation: second.holder_generation,
+            })
+            .await
+            .unwrap();
+        store.prune_terminal_records(i64::MAX / 2, 0).await.unwrap();
+        assert!(
+            store
+                .list_leases(workspace.workspace_id)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

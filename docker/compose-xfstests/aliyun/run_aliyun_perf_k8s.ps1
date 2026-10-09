@@ -8,10 +8,21 @@ param(
     [string]$ImageTag = ('aliyun-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss')),
     [string]$GhcrUsername = 'Ivanbeethoven',
     [string]$GhcrToken,
+    [ValidateSet('brewfs', 'juicefs')]
+    [string]$Workload = 'brewfs',
     [ValidateSet('redis', 'tikv')]
     [string]$Backend = 'redis',
+    [ValidateSet('managed', 'embedded')]
+    [string]$ServiceMode = 'managed',
     [ValidateSet('s3', 'local-fs')]
-    [string]$DataBackend = 'local-fs',
+    [string]$DataBackend = 's3',
+    [string]$MetaUrl,
+    [string]$S3Endpoint,
+    [string]$S3Bucket = 'brewfs-data',
+    [string]$S3Region = 'us-east-1',
+    [bool]$S3ForcePathStyle = $false,
+    [string]$S3AccessKey = $env:AWS_ACCESS_KEY_ID,
+    [string]$S3SecretKey = $env:AWS_SECRET_ACCESS_KEY,
     [string]$PerfTools = 'fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest',
     [switch]$SkipImageBuild,
     [switch]$KeepJob,
@@ -30,7 +41,8 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 $Image = "$RegistryImage`:$ImageTag"
-$JobName = if ($ExistingJobName) { $ExistingJobName } else { "brewfs-perf-$ImageTag".ToLowerInvariant() }
+$Dockerfile = if ($Workload -eq 'juicefs') { 'docker/compose-xfstests/Dockerfile.juicefs-perf' } else { 'docker/compose-xfstests/aliyun/Dockerfile.perf-local' }
+$JobName = if ($ExistingJobName) { $ExistingJobName } else { "$Workload-perf-$ImageTag".ToLowerInvariant() }
 $ManagedByLabel = 'app.kubernetes.io/managed-by=brewfs-perf-runner'
 $script:TestResourcesApplied = $false
 
@@ -144,13 +156,12 @@ function Export-Artifacts {
 
 function Upload-ResultVault {
     param([Parameter(Mandatory = $true)][string]$Archive)
-    if (-not $ResultVaultUrl) { return }
+    if (-not $ResultVaultUrl) { throw '必须设置 -ResultVaultUrl 或 BREWFS_RESULTS_URL，才能保证结果上传。' }
     $baseUrl = $ResultVaultUrl.Trim().TrimEnd('/')
     $parsedUrl = $null
     if (-not [Uri]::TryCreate($baseUrl, [UriKind]::Absolute, [ref]$parsedUrl) -or
         $parsedUrl.Scheme -notin @('http', 'https')) {
-        Write-Warning "忽略无效的 BREWFS_RESULTS_URL/ResultVaultUrl: $ResultVaultUrl"
-        return
+        throw "无效的 BREWFS_RESULTS_URL/ResultVaultUrl: $ResultVaultUrl"
     }
     $endpoint = "$baseUrl/api/runs"
     try {
@@ -158,7 +169,7 @@ function Upload-ResultVault {
         Write-Host "Result Vault 跑次: $($response.id)"
         Write-Host "Result Vault URL: $baseUrl"
     } catch {
-        Write-Warning "上传 Result Vault 失败（本地归档仍已保留）：$($_.Exception.Message)"
+        throw "上传 Result Vault 失败（本地归档仍已保留）：$($_.Exception.Message)"
     }
 }
 
@@ -166,7 +177,7 @@ function Ensure-Image {
     $docker = Resolve-Tool 'docker' @('C:\Program Files\Docker\Docker\resources\bin\docker.exe')
     Push-Location $RepoRoot
     try {
-        Invoke-Checked $docker @('build', '-f', 'docker/compose-xfstests/aliyun/Dockerfile.perf-local', '-t', $Image, '.') | Out-Host
+        Invoke-Checked $docker @('build', '-f', $Dockerfile, '-t', $Image, '.') | Out-Host
         if ($GhcrToken) {
             $GhcrToken | & $docker login ghcr.io --username $GhcrUsername --password-stdin 2>&1 | Out-Host
             if ($LASTEXITCODE -ne 0) { throw 'docker login ghcr.io 失败。' }
@@ -325,7 +336,127 @@ $initContainers
     return ($parts -join "`n---`n")
 }
 
+function Render-ManagedManifests {
+    $dataEnv = if ($DataBackend -eq 's3') { 's3' } else { 'local-fs' }
+    $runnerMount = if ($Workload -eq 'brewfs') {
+        '        - { name: perf-runner, mountPath: /usr/local/bin/run_perf_in_container.sh, subPath: run_perf_in_container.sh, readOnly: true }'
+    } else { '' }
+    $runnerVolume = if ($Workload -eq 'brewfs') {
+        @"
+      - name: perf-runner
+        configMap:
+          name: brewfs-perf-runner
+          defaultMode: 0755
+"@
+    } else { '' }
+    $juicefsCacheMount = if ($Workload -eq 'juicefs') {
+        '        - { name: state, mountPath: /var/lib/juicefs }'
+    } else { '' }
+    $workloadEnv = if ($Workload -eq 'brewfs') {
+        @"
+        - { name: BREWFS_DATA_BACKEND, value: '$dataEnv' }
+        - { name: BREWFS_META_BACKEND, value: '$Backend' }
+        - { name: BREWFS_META_URL, value: '$MetaUrl' }
+        - { name: BREWFS_META_TIKV_PD_ENDPOINTS, value: '$MetaUrl' }
+        - { name: BREWFS_S3_ENDPOINT, value: '$S3Endpoint' }
+        - { name: BREWFS_S3_BUCKET, value: '$S3Bucket' }
+        - { name: BREWFS_S3_FORCE_PATH_STYLE, value: '$($S3ForcePathStyle.ToString().ToLowerInvariant())' }
+        - { name: BREWFS_S3_REGION, value: '$S3Region' }
+"@
+    } else {
+        @"
+        - { name: JUICEFS_META_BACKEND, value: '$Backend' }
+        - { name: JFS_META_URL, value: '$MetaUrl' }
+        - { name: JFS_S3_ENDPOINT, value: '$S3Endpoint' }
+        - { name: JFS_S3_BUCKET, value: '$S3Bucket' }
+        - { name: JFS_S3_REGION, value: '$S3Region' }
+        - { name: JFS_COMPRESS, value: none }
+        - { name: JFS_WRITEBACK, value: "true" }
+        - { name: JFS_BUFFER_SIZE_MIB, value: "4096" }
+        - { name: JFS_CACHE_SIZE_MIB, value: "8192" }
+        - { name: JFS_CACHE_LARGE_WRITE, value: "true" }
+        - { name: JFS_MAX_UPLOADS, value: "4" }
+        - { name: JFS_MAX_STAGE_WRITE, value: "4" }
+        - { name: JFS_MAX_DOWNLOADS, value: "8" }
+        - { name: JFS_OPEN_CACHE, value: "1s" }
+        - { name: JFS_OPEN_CACHE_LIMIT, value: "65536" }
+        - { name: JFS_BACKUP_META, value: "0" }
+        - { name: JFS_NO_USAGE_REPORT, value: "true" }
+        - { name: JFS_CACHE_DIR, value: /var/lib/juicefs/cache }
+"@
+    }
+    $imagePullSecrets = if ($GhcrToken) { "      imagePullSecrets:`n      - name: brewfs-ghcr" } else { '' }
+    $credentialEnv = if ($Workload -eq 'juicefs' -or $DataBackend -eq 's3') {
+        @"
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom: { secretKeyRef: { name: brewfs-perf-backend, key: s3-access-key } }
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom: { secretKeyRef: { name: brewfs-perf-backend, key: s3-secret-key } }
+        - { name: AWS_DEFAULT_REGION, value: '$S3Region' }
+        - { name: AWS_EC2_METADATA_DISABLED, value: "true" }
+"@
+    } else { '' }
+    @"
+apiVersion: batch/v1
+kind: Job
+metadata: { name: $JobName, namespace: $Namespace, labels: { app: brewfs-perf, app.kubernetes.io/managed-by: brewfs-perf-runner } }
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata: { labels: { app: brewfs-perf, job: $JobName } }
+    spec:
+      restartPolicy: Never
+$imagePullSecrets
+      containers:
+      - name: perf
+        image: $Image
+        imagePullPolicy: Always
+        env:
+        - { name: PERF_TOOLS, value: '$PerfTools' }
+        - { name: PERF_FIO_DIRECT, value: "0" }
+        - { name: PERF_FIO_IOENGINE, value: io_uring }
+        - { name: PERF_FIO_IODEPTH, value: "1" }
+        - { name: PERF_FIO_PREFILL_DRAIN, value: "true" }
+        - { name: PERF_FIO_PREFILL_REMOUNT, value: "true" }
+        - { name: PERF_FIO_POST_WRITE_DRAIN, value: "true" }
+        - { name: BREWFS_ARTIFACT_ROOT, value: /artifacts }
+        - { name: BREWFS_ARTIFACT_DIR, value: /artifacts/$JobName }
+        - { name: BREWFS_ARTIFACT_HOLD_SECONDS, value: "$ArtifactHoldSeconds" }
+$workloadEnv
+$credentialEnv
+        securityContext:
+          privileged: true
+          capabilities: { add: [SYS_ADMIN] }
+          appArmorProfile: { type: Unconfined }
+        volumeMounts:
+        - { name: fuse, mountPath: /dev/fuse }
+        - { name: artifacts, mountPath: /artifacts }
+        - { name: state, mountPath: /var/lib/brewfs }
+$juicefsCacheMount
+$runnerMount
+      volumes:
+      - { name: fuse, hostPath: { path: /dev/fuse, type: CharDevice } }
+      - { name: artifacts, emptyDir: {} }
+      - { name: state, emptyDir: {} }
+$runnerVolume
+"@
+}
+
+function Assert-TestInputs {
+    if (-not $ResultVaultUrl) { throw '必须设置 -ResultVaultUrl 或 BREWFS_RESULTS_URL。' }
+    $parsed = $null
+    if (-not [Uri]::TryCreate($ResultVaultUrl.Trim().TrimEnd('/'), [UriKind]::Absolute, [ref]$parsed) -or $parsed.Scheme -notin @('http', 'https')) {
+        throw "无效的 Result Vault URL: $ResultVaultUrl"
+    }
+    if ($ServiceMode -eq 'managed' -and -not $MetaUrl) { throw 'managed 模式必须提供 -MetaUrl（托管 Redis URL 或 TiKV PD endpoint）。' }
+    if ($ServiceMode -eq 'embedded' -and $Workload -eq 'juicefs') { throw 'JuiceFS ACK runner 需要 managed 外部元数据服务；请使用 -ServiceMode managed。' }
+    if (($Workload -eq 'juicefs' -or $DataBackend -eq 's3') -and -not $S3Endpoint) { throw 'S3/OSS 测试必须提供 -S3Endpoint。' }
+    if (($Workload -eq 'juicefs' -or $DataBackend -eq 's3') -and (-not $S3AccessKey -or -not $S3SecretKey)) { throw 'S3/OSS 测试必须提供 -S3AccessKey 和 -S3SecretKey。' }
+}
+
 function Apply-Test {
+    Assert-TestInputs
     $namespaceYaml = Invoke-Checked $Kubectl @('create', 'namespace', $Namespace, '--dry-run=client', '-o', 'yaml')
     Invoke-KubectlYaml $namespaceYaml | Out-Host
     $existingJobs = & $Kubectl @(
@@ -336,18 +467,30 @@ function Apply-Test {
         throw "命名空间 $Namespace 已有 BrewFS 性能任务：$($existingJobs -join ', ')。请等待其结束、执行 -Action destroy，或使用不同的 -Namespace。"
     }
     $script:TestResourcesApplied = $true
-    $runnerSource = Join-Path $RepoRoot 'docker\compose-xfstests\run_perf_in_container.sh'
-    $runnerPath = Join-Path $env:TEMP "brewfs-perf-runner-$([guid]::NewGuid().ToString('N')).sh"
-    try {
-        $runnerContent = (Get-Content -LiteralPath $runnerSource -Raw) -replace "`r`n", "`n"
-        [IO.File]::WriteAllText($runnerPath, $runnerContent, [Text.UTF8Encoding]::new($false))
-        $configMapYaml = Invoke-Checked $Kubectl @('create', 'configmap', 'brewfs-perf-runner', '--namespace', $Namespace,
-            "--from-file=run_perf_in_container.sh=$runnerPath", '--dry-run=client', '-o', 'yaml')
-        Invoke-KubectlYaml $configMapYaml | Out-Host
-        Invoke-Checked $Kubectl @('label', 'configmap', 'brewfs-perf-runner', '--namespace', $Namespace,
-            $ManagedByLabel, '--overwrite') | Out-Null
-    } finally {
-        Remove-Item -LiteralPath $runnerPath -Force -ErrorAction SilentlyContinue
+    if ($Workload -eq 'brewfs') {
+        $runnerSource = Join-Path $RepoRoot 'docker\compose-xfstests\run_perf_in_container.sh'
+        $runnerPath = Join-Path $env:TEMP "brewfs-perf-runner-$([guid]::NewGuid().ToString('N')).sh"
+        try {
+            $runnerContent = (Get-Content -LiteralPath $runnerSource -Raw) -replace "`r`n", "`n"
+            [IO.File]::WriteAllText($runnerPath, $runnerContent, [Text.UTF8Encoding]::new($false))
+            $configMapYaml = Invoke-Checked $Kubectl @('create', 'configmap', 'brewfs-perf-runner', '--namespace', $Namespace,
+                "--from-file=run_perf_in_container.sh=$runnerPath", '--dry-run=client', '-o', 'yaml')
+            Invoke-KubectlYaml $configMapYaml | Out-Host
+            Invoke-Checked $Kubectl @('label', 'configmap', 'brewfs-perf-runner', '--namespace', $Namespace,
+                $ManagedByLabel, '--overwrite') | Out-Null
+        } finally {
+            Remove-Item -LiteralPath $runnerPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($Workload -eq 'juicefs' -or $DataBackend -eq 's3') {
+        $backendSecret = [ordered]@{
+            apiVersion = 'v1'
+            kind = 'Secret'
+            metadata = [ordered]@{ name = 'brewfs-perf-backend'; namespace = $Namespace; labels = [ordered]@{ 'app.kubernetes.io/managed-by' = 'brewfs-perf-runner' } }
+            type = 'Opaque'
+            stringData = [ordered]@{ 's3-access-key' = $S3AccessKey; 's3-secret-key' = $S3SecretKey }
+        } | ConvertTo-Json -Depth 8 -Compress
+        Invoke-KubectlYaml $backendSecret | Out-Host
     }
     if ($GhcrToken) {
         $auth = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("${GhcrUsername}:${GhcrToken}"))
@@ -372,14 +515,17 @@ function Apply-Test {
         Invoke-Checked $Kubectl @('label', 'secret', 'brewfs-ghcr', '--namespace', $Namespace,
             $ManagedByLabel, '--overwrite') | Out-Null
     }
-    $yaml = Render-Manifests
+    $yaml = if ($ServiceMode -eq 'managed') { Render-ManagedManifests } else { Render-Manifests }
     $yaml | & $Kubectl apply -f - 2>&1 | Out-Host
     if ($LASTEXITCODE -ne 0) {
         $debugManifest = Join-Path $env:TEMP "$JobName.yaml"
         Set-Content -LiteralPath $debugManifest -Value $yaml -Encoding utf8
         throw "Kubernetes manifest apply 失败，manifest 已保存到 $debugManifest。"
     }
-    Invoke-Checked $Kubectl @('wait', '--for=condition=available', "deployment/$($Backend -eq 'redis' ? 'redis' : 'pd')", '-n', $Namespace, '--timeout=10m') | Out-Host
+    if ($ServiceMode -eq 'embedded') {
+        Invoke-Checked $Kubectl @('wait', '--for=condition=available', "deployment/$($Backend -eq 'redis' ? 'redis' : 'pd')", '-n', $Namespace, '--timeout=10m') | Out-Host
+        if ($DataBackend -eq 's3') { Invoke-Checked $Kubectl @('wait', '--for=condition=available', 'deployment/rustfs', '-n', $Namespace, '--timeout=10m') | Out-Host }
+    }
     $exported = $null
     $deadline = [DateTime]::UtcNow.AddHours(48)
     while ([DateTime]::UtcNow -lt $deadline -and -not $exported) {
@@ -392,10 +538,10 @@ function Apply-Test {
                     $exported = Export-Artifacts -Pod $pod
                     Write-Host "测试结果目录: $($exported.Directory)"
                     Write-Host "测试结果归档: $($exported.Archive)"
-                    Upload-ResultVault -Archive $exported.Archive
                 } catch {
                     Write-Warning "导出 artifacts 失败，将在下一轮重试：$($_.Exception.Message)"
                 }
+                if ($exported) { Upload-ResultVault -Archive $exported.Archive }
             }
         } elseif ($phase -in @('Succeeded', 'Failed')) { break }
         if (-not $exported) { Start-Sleep -Seconds 10 }
@@ -452,6 +598,7 @@ function Remove-TestResources {
 switch ($Action) {
     'test' {
         try {
+            Assert-TestInputs
             if (-not $SkipImageBuild) { Ensure-Image }
             Apply-Test
         } finally {
