@@ -20,7 +20,6 @@ use crate::meta::store::{
 };
 use crate::posix::NAME_MAX;
 use asyncfuse::notify::Notify as FuseNotify;
-use bytes::Bytes;
 use dashmap::{DashMap, Entry};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[cfg(feature = "native-packed-base")]
@@ -1551,8 +1550,6 @@ where
                             object.read_range_gets,
                             object.read_full_gets,
                             object.read_piggyback_full,
-                            object.persistent_slice_read_ops,
-                            object.persistent_slice_read_bytes,
                             object.read_background_prefetches,
                             object.read_background_prefetch_dropped,
                         );
@@ -2212,49 +2209,7 @@ where
         if let Some(size) = self.inode_size_cached(ino) {
             attr.size = size;
         }
-        attr
-    }
 
-    pub(crate) async fn stat_ino_result(&self, ino: i64) -> Result<Option<FileAttr>, VfsError> {
-        Ok(self
-            .meta_stat(ino)
-            .await?
-            .map(|attr| self.apply_local_attr_state(ino, attr)))
-    }
-
-    /// Fetch and locally merge one directory window without changing its
-    /// input positions. Missing inodes remain `None` for the FUSE layer to
-    /// skip while retaining their original cookies.
-    pub(crate) async fn batch_stat_ino(
-        &self,
-        inodes: &[i64],
-    ) -> Result<Vec<Option<FileAttr>>, VfsError> {
-        let attrs = self
-            .meta_layer()
-            .batch_stat(inodes)
-            .await
-            .map_err(|err| VfsError::from_meta(PathHint::none(), err))?;
-        if attrs.len() != inodes.len() {
-            return Err(VfsError::from_meta(
-                PathHint::none(),
-                MetaError::Internal(format!(
-                    "metadata batch returned {} attributes for {} requested inodes",
-                    attrs.len(),
-                    inodes.len()
-                )),
-            ));
-        }
-        Ok(inodes
-            .iter()
-            .copied()
-            .zip(attrs)
-            .map(|(ino, attr)| attr.map(|attr| self.apply_local_attr_state(ino, attr)))
-            .collect())
-    }
-
-    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
-    pub(crate) async fn stat_ino(&self, ino: i64) -> Option<FileAttr> {
-        let attr = self.stat_ino_result(ino).await.ok().flatten()?;
         tracing::debug!(ino, nlink = attr.nlink, kind = ?attr.kind, "stat_ino");
         Ok(Some(attr))
     }
@@ -4871,12 +4826,8 @@ where
     }
 
     /// Read data by file handle and offset.
-    pub async fn read(&self, fh: u64, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
-        Ok(self.read_bytes(fh, offset, len).await?.to_vec())
-    }
-
     #[tracing::instrument(
-        name = "VFS.read_bytes",
+        name = "VFS.read",
         level = "trace",
         skip(self),
         fields(fh, offset, len)
@@ -5006,7 +4957,7 @@ where
             .inode_size_cached(handle.ino)
             .unwrap_or_else(|| handle.attr().size);
         if offset >= file_size {
-            return Ok(Bytes::new());
+            return Ok(Vec::new());
         }
         let actual_len = len.min((file_size - offset) as usize);
         self.wait_split_write_barrier(handle.ino, offset, actual_len)
@@ -5032,7 +4983,7 @@ where
                 .map_err(VfsError::from)?
         };
         if let Some(data) = dirty_data {
-            return Ok(Bytes::from(data));
+            return Ok(data);
         }
 
         // We intentionally do NOT call flush_if_exists here: blocking every
@@ -5062,42 +5013,34 @@ where
         // the current read can still see the write that won the race.
         let inode = self.ensure_inode_registered(handle.ino).await?;
         handle.ensure_reader_with(|| self.state.reader.open_for_handle(inode, fh));
-        let data = {
+        let mut data = {
             let _handle_read_timer = self.vfs_timing_timer(
                 &self.state.stats.vfs_read_handle_ops,
                 &self.state.stats.vfs_read_handle_lat_us,
             );
             handle
-                .read_bytes(offset, actual_len)
+                .read(offset, actual_len)
                 .await
                 .map_err(VfsError::from)?
         };
-        let needs_overlay = !dirty_snapshot.is_empty()
-            || self.state.writer.has_dirty_state(handle.ino as u64).await;
-        let data = if needs_overlay {
-            let mut data = data.to_vec();
-            for patch in dirty_snapshot {
-                if patch.offset >= data.len() {
-                    continue;
-                }
-                let end = (patch.offset + patch.data.len()).min(data.len());
-                data[patch.offset..end].copy_from_slice(&patch.data[..end - patch.offset]);
+        for patch in dirty_snapshot {
+            if patch.offset >= data.len() {
+                continue;
             }
-            {
-                let _overlay_timer = self.vfs_timing_timer(
-                    &self.state.stats.vfs_read_overlay_ops,
-                    &self.state.stats.vfs_read_overlay_lat_us,
-                );
-                self.state
-                    .writer
-                    .overlay_dirty_if_exists(handle.ino as u64, offset, &mut data)
-                    .await
-                    .map_err(VfsError::from)?;
-            }
-            Bytes::from(data)
-        } else {
-            data
-        };
+            let end = (patch.offset + patch.data.len()).min(data.len());
+            data[patch.offset..end].copy_from_slice(&patch.data[..end - patch.offset]);
+        }
+        {
+            let _overlay_timer = self.vfs_timing_timer(
+                &self.state.stats.vfs_read_overlay_ops,
+                &self.state.stats.vfs_read_overlay_lat_us,
+            );
+            self.state
+                .writer
+                .overlay_dirty_if_exists(handle.ino as u64, offset, &mut data)
+                .await
+                .map_err(VfsError::from)?;
+        }
 
         self.state
             .reader

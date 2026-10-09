@@ -14,9 +14,9 @@ use k8s_openapi::api::core::v1::{
     Capabilities, ConfigMap, ConfigMapEnvSource, Container, ContainerPort, EmptyDirVolumeSource,
     EnvFromSource, EnvVar, EnvVarSource, ExecAction, HTTPGetAction, HTTPHeader, Lifecycle,
     LifecycleHandler, LocalObjectReference, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    PodAffinity, PodAffinityTerm, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
-    ResourceRequirements, Secret, SecretEnvSource, SecretKeySelector, SecurityContext, Service,
-    ServicePort, ServiceSpec, TCPSocketAction, Toleration, Volume, VolumeMount,
+    PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ResourceRequirements, Secret,
+    SecretEnvSource, SecretKeySelector, SecurityContext, Service, ServicePort, ServiceSpec,
+    TCPSocketAction, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
@@ -91,20 +91,7 @@ pub async fn reconcile_cluster(
 
     apply_rustfs_secret(&client, &namespace, &cluster, &owner).await?;
     apply_rustfs_pvc(&client, &namespace, &cluster, &owner).await?;
-    match apply_redis_pvc(&client, &namespace, &cluster, &owner).await? {
-        RedisPvcApplyOutcome::Applied => {}
-        RedisPvcApplyOutcome::UnsupportedExpansion(reason) => {
-            patch_cluster_status(
-                &client,
-                &namespace,
-                &cluster,
-                "Failed",
-                &format!("Redis PVC expansion is unsupported: {reason}"),
-            )
-            .await?;
-            return Ok(Action::await_change());
-        }
-    }
+    apply_redis_pvc(&client, &namespace, &cluster, &owner).await?;
     apply_redis_service(&client, &namespace, &cluster, &owner).await?;
     apply_redis_deployment(&client, &namespace, &cluster, &owner).await?;
     apply_rustfs_service(&client, &namespace, &cluster, &owner).await?;
@@ -129,7 +116,7 @@ pub async fn reconcile_cluster(
     if !redis_pvc.as_ref().is_some_and(pvc_is_bound)
         || !redis_deployment.as_ref().is_some_and(deployment_is_ready)
     {
-        patch_cluster_status(
+        patch_cluster_status_phase(
             &client,
             &namespace,
             &cluster,
@@ -140,14 +127,19 @@ pub async fn reconcile_cluster(
         return Ok(Action::requeue(Duration::from_secs(5)));
     }
     apply_brewfs_config(&client, &namespace, &cluster, &owner).await?;
-    let (phase, message) = observe_cluster_readiness(&client, &namespace, &cluster).await?;
-    patch_cluster_status(&client, &namespace, &cluster, &phase, &message).await?;
+    patch_cluster_status(
+        &client,
+        &namespace,
+        &cluster,
+        "Ready",
+        "Backend resources reconciled and Redis persistence is ready",
+    )
+    .await?;
     #[cfg(feature = "workspace-operator")]
     crate::workspace::controller::reconcile_cluster_workspace(&cluster, &client, &namespace)
         .await?;
 
-    let requeue_after = if phase == "Ready" { 300 } else { 15 };
-    Ok(Action::requeue(Duration::from_secs(requeue_after)))
+    Ok(Action::requeue(Duration::from_secs(300)))
 }
 
 pub async fn reconcile_mount(
@@ -210,46 +202,6 @@ pub async fn reconcile_mount(
         .and_then(|status| status.config_map.clone())
         .unwrap_or_else(|| cluster_config_map_name(&cluster.name_any()));
 
-    if !cluster_status_is_ready(&cluster) {
-        cleanup_mount_resources_before_ready(
-            &client,
-            &namespace,
-            &workload_name,
-            &default_consumer_workload_name,
-            &default_consumer_service_name,
-        )
-        .await?;
-        patch_mount_status(
-            &client,
-            &namespace,
-            &mount,
-            "Pending",
-            &format!("waiting for BrewFSCluster {cluster_name} to become Ready"),
-            Some(config_map_name.clone()),
-            mount.spec.host_mount_path.clone(),
-            Some(mount.spec.mount_propagation.clone()),
-            Some(mount.spec.workload_kind.clone()),
-            Some(workload_name),
-            None,
-            None,
-            mount
-                .spec
-                .consumer
-                .as_ref()
-                .map(|consumer| consumer.workload_kind.clone()),
-            Some(default_consumer_workload_name.clone()),
-            mount
-                .spec
-                .consumer
-                .as_ref()
-                .map(|consumer| consumer.mount_path.clone()),
-            None,
-            None,
-        )
-        .await?;
-        return Ok(Action::requeue(Duration::from_secs(15)));
-    }
-
     if config_api
         .get_opt(&config_map_name)
         .await
@@ -296,16 +248,9 @@ pub async fn reconcile_mount(
         &owner,
     )
     .await?;
-    let workload_status =
+    let (desired_replicas, ready_replicas) =
         get_mount_workload_status(&client, &namespace, &mount, &workload_name).await?;
-    let desired_replicas = workload_status.desired;
-    let ready_replicas = workload_status.ready;
-    let phase = if workload_status.ready_for_generation
-        && replicas_are_ready(
-            desired_replicas,
-            ready_replicas,
-            matches!(mount.spec.workload_kind, MountWorkloadKind::Deployment),
-        ) {
+    let phase = if ready_replicas.unwrap_or_default() >= desired_replicas.unwrap_or_default() {
         "Ready"
     } else {
         "Progressing"
@@ -329,56 +274,28 @@ pub async fn reconcile_mount(
         consumer_mount_path = Some(consumer.mount_path.clone());
 
         if let Some(host_mount_path) = &mount.spec.host_mount_path {
-            let consumer_name = consumer_workload_name(&mount.name_any());
-            if phase != "Ready" {
-                delete_consumer_workloads_if_exist(
-                    &client,
-                    &namespace,
-                    &consumer_name,
-                    &default_consumer_service_name,
-                )
-                .await?;
-                phase = "Progressing".to_string();
-                message =
-                    format!("waiting for mount workload {workload_name} before creating consumer");
-                consumer_workload_name_status = Some(consumer_name);
-            } else {
-                publish_consumer_label_conflicts(&client, &mount, consumer).await;
-                let consumer_name = apply_consumer_workload(
-                    &client,
-                    &namespace,
-                    &mount,
-                    consumer,
-                    host_mount_path,
-                    &owner,
-                )
-                .await?;
-                let consumer_status =
-                    get_consumer_workload_status(&client, &namespace, consumer, &consumer_name)
-                        .await?;
-                let desired = consumer_status.desired;
-                let ready = consumer_status.ready;
-                consumer_workload_name_status = Some(consumer_name.clone());
-                consumer_desired_replicas = desired;
-                consumer_ready_replicas = ready;
+            publish_consumer_label_conflicts(&client, &mount, consumer).await;
+            let consumer_name = apply_consumer_workload(
+                &client,
+                &namespace,
+                &mount,
+                consumer,
+                host_mount_path,
+                &owner,
+            )
+            .await?;
+            let (desired, ready) =
+                get_consumer_workload_status(&client, &namespace, consumer, &consumer_name).await?;
+            consumer_workload_name_status = Some(consumer_name.clone());
+            consumer_desired_replicas = desired;
+            consumer_ready_replicas = ready;
 
-                if !consumer_status.ready_for_generation
-                    || !replicas_are_ready(
-                        desired,
-                        ready,
-                        matches!(
-                            consumer.workload_kind,
-                            ConsumerWorkloadKind::Deployment | ConsumerWorkloadKind::StatefulSet
-                        ),
-                    )
-                {
-                    phase = "Progressing".to_string();
-                    message = format!("consumer workload {consumer_name} is reconciling");
-                } else {
-                    message = format!(
-                        "mount workload {workload_name} and consumer workload {consumer_name} are ready"
-                    );
-                }
+            if ready.unwrap_or_default() < desired.unwrap_or_default() {
+                phase = "Progressing".to_string();
+                message = format!("consumer workload {consumer_name} is reconciling");
+            } else if phase == "Ready" {
+                message =
+                    format!("mount workload {workload_name} and consumer workload {consumer_name} are ready");
             }
         } else {
             delete_consumer_workloads_if_exist(
@@ -644,49 +561,16 @@ fn build_redis_pvc(cluster: &BrewFSCluster, owner: &OwnerReference) -> Persisten
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum RedisPvcApplyOutcome {
-    Applied,
-    UnsupportedExpansion(String),
-}
-
-fn is_unsupported_pvc_expansion_rejection(code: u16, message: &str) -> bool {
-    if code != 403 && code != 422 {
-        return false;
-    }
-    let message = message.to_ascii_lowercase();
-    message.contains("storageclass")
-        && (message.contains("resize")
-            || message.contains("resized")
-            || message.contains("expansion")
-            || message.contains("expand"))
-}
-
 async fn apply_redis_pvc(
     client: &kube::Client,
     namespace: &str,
     cluster: &BrewFSCluster,
     owner: &OwnerReference,
-) -> Result<RedisPvcApplyOutcome, anyhow::Error> {
+) -> Result<(), anyhow::Error> {
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
     let name = redis_pvc_name(&cluster.name_any());
     let desired = build_redis_pvc(cluster, owner);
-    match api
-        .patch(
-            &name,
-            &PatchParams::apply("brewfs-operator").force(),
-            &Patch::Apply(&desired),
-        )
-        .await
-    {
-        Ok(_) => Ok(RedisPvcApplyOutcome::Applied),
-        Err(kube::Error::Api(error))
-            if is_unsupported_pvc_expansion_rejection(error.code, &error.message) =>
-        {
-            Ok(RedisPvcApplyOutcome::UnsupportedExpansion(error.message))
-        }
-        Err(error) => Err(error).with_context(|| format!("apply resource {name}")),
-    }
+    apply(&api, &name, &desired).await
 }
 
 async fn apply_redis_service(
@@ -760,7 +644,6 @@ fn build_redis_deployment(cluster: &BrewFSCluster, owner: &OwnerReference) -> De
                             name: Some("redis".to_string()),
                             ..ContainerPort::default()
                         }]),
-                        readiness_probe: Some(redis_readiness_probe(cluster.spec.redis.port)),
                         volume_mounts: Some(vec![VolumeMount {
                             name: "data".to_string(),
                             mount_path: "/data".to_string(),
@@ -853,36 +736,6 @@ fn rustfs_container_args(port: i32, access_key: &str, secret_key: &str) -> Vec<S
         secret_key.to_string(),
         "/data".to_string(),
     ]
-}
-
-fn redis_readiness_probe(port: i32) -> Probe {
-    Probe {
-        exec: Some(ExecAction {
-            command: Some(vec![
-                "/bin/sh".to_string(),
-                "-ec".to_string(),
-                format!("redis-cli -p {port} ping | grep -qx PONG"),
-            ]),
-        }),
-        initial_delay_seconds: Some(2),
-        period_seconds: Some(2),
-        timeout_seconds: Some(2),
-        ..Probe::default()
-    }
-}
-
-fn rustfs_readiness_probe(port: i32) -> Probe {
-    Probe {
-        http_get: Some(HTTPGetAction {
-            path: Some("/health/ready".to_string()),
-            port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(port),
-            ..HTTPGetAction::default()
-        }),
-        initial_delay_seconds: Some(2),
-        period_seconds: Some(2),
-        timeout_seconds: Some(2),
-        ..Probe::default()
-    }
 }
 
 fn rustfs_init_pod_template(cluster: &BrewFSCluster) -> PodTemplateSpec {
@@ -1028,7 +881,6 @@ async fn apply_rustfs_deployment(
                                 ..ContainerPort::default()
                             },
                         ]),
-                        readiness_probe: Some(rustfs_readiness_probe(cluster.spec.rustfs.port)),
                         volume_mounts: Some(vec![VolumeMount {
                             name: "data".to_string(),
                             mount_path: "/data".to_string(),
@@ -1080,9 +932,10 @@ fn observe_rustfs_init_job(job: &Job) -> RustFsInitJobObservation {
             .any(|condition| condition.type_ == "Complete" && condition.status == "True")
     {
         RustFsInitJobObservation::Complete
-    } else if conditions
-        .iter()
-        .any(|condition| condition.type_ == "Failed" && condition.status == "True")
+    } else if status.failed.unwrap_or_default() > 0
+        || conditions
+            .iter()
+            .any(|condition| condition.type_ == "Failed" && condition.status == "True")
     {
         RustFsInitJobObservation::Failed
     } else {
@@ -1316,12 +1169,7 @@ async fn apply_consumer_workload(
     let match_labels = labels(&mount_name, "consumer");
     let workload_labels = build_consumer_workload_labels(consumer, match_labels.clone());
     let workload_annotations = consumer.workload_annotations.clone();
-    let template = build_consumer_pod_template(
-        consumer,
-        host_mount_path,
-        match_labels.clone(),
-        labels(&mount_name, "mount"),
-    );
+    let template = build_consumer_pod_template(consumer, host_mount_path, match_labels.clone());
     let headless_service_name = consumer_headless_service_name(&mount_name);
 
     match consumer.workload_kind {
@@ -1635,7 +1483,6 @@ fn build_consumer_pod_template(
     consumer: &MountConsumerSpec,
     host_mount_path: &str,
     match_labels: BTreeMap<String, String>,
-    mount_labels: BTreeMap<String, String>,
 ) -> PodTemplateSpec {
     let labels = merge_operator_labels(&consumer.pod_labels, match_labels);
 
@@ -1675,22 +1522,6 @@ fn build_consumer_pod_template(
             } else {
                 Some(consumer.node_selector.clone())
             },
-            affinity: Some(k8s_openapi::api::core::v1::Affinity {
-                pod_affinity: Some(PodAffinity {
-                    required_during_scheduling_ignored_during_execution: Some(vec![
-                        PodAffinityTerm {
-                            label_selector: Some(LabelSelector {
-                                match_labels: Some(mount_labels),
-                                ..LabelSelector::default()
-                            }),
-                            topology_key: "kubernetes.io/hostname".to_string(),
-                            ..PodAffinityTerm::default()
-                        },
-                    ]),
-                    ..PodAffinity::default()
-                }),
-                ..k8s_openapi::api::core::v1::Affinity::default()
-            }),
             priority_class_name: consumer.priority_class_name.clone(),
             host_network: Some(consumer.host_network),
             dns_policy: consumer.dns_policy.clone(),
@@ -2257,25 +2088,12 @@ fn mount_propagation_value(mode: &MountPropagationMode) -> &'static str {
     }
 }
 
-fn replicas_are_ready(desired: Option<i32>, ready: Option<i32>, allow_zero: bool) -> bool {
-    desired.zip(ready).is_some_and(|(desired, ready)| {
-        (allow_zero && desired == 0 && ready == 0) || (desired > 0 && ready >= desired)
-    })
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct WorkloadStatus {
-    desired: Option<i32>,
-    ready: Option<i32>,
-    ready_for_generation: bool,
-}
-
 async fn get_mount_workload_status(
     client: &kube::Client,
     namespace: &str,
     mount: &BrewFSMount,
     name: &str,
-) -> Result<WorkloadStatus, anyhow::Error> {
+) -> Result<(Option<i32>, Option<i32>), anyhow::Error> {
     match mount.spec.workload_kind {
         MountWorkloadKind::Deployment => {
             let api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
@@ -2286,14 +2104,8 @@ async fn get_mount_workload_status(
             let desired = deployment
                 .as_ref()
                 .and_then(|d| d.spec.as_ref().and_then(|spec| spec.replicas));
-            let ready = deployment
-                .as_ref()
-                .and_then(|d| d.status.as_ref().and_then(|status| status.ready_replicas));
-            Ok(WorkloadStatus {
-                desired,
-                ready,
-                ready_for_generation: deployment.as_ref().is_some_and(deployment_is_ready),
-            })
+            let ready = deployment.and_then(|d| d.status.and_then(|status| status.ready_replicas));
+            Ok((desired, ready))
         }
         MountWorkloadKind::DaemonSet => {
             let api: Api<DaemonSet> = Api::namespaced(client.clone(), namespace);
@@ -2306,14 +2118,8 @@ async fn get_mount_workload_status(
                     .as_ref()
                     .map(|status| status.desired_number_scheduled)
             });
-            let ready = daemonset
-                .as_ref()
-                .and_then(|d| d.status.as_ref().map(|status| status.number_ready));
-            Ok(WorkloadStatus {
-                desired,
-                ready,
-                ready_for_generation: daemonset.as_ref().is_some_and(daemonset_is_ready),
-            })
+            let ready = daemonset.and_then(|d| d.status.map(|status| status.number_ready));
+            Ok((desired, ready))
         }
     }
 }
@@ -2323,7 +2129,7 @@ async fn get_consumer_workload_status(
     namespace: &str,
     consumer: &MountConsumerSpec,
     name: &str,
-) -> Result<WorkloadStatus, anyhow::Error> {
+) -> Result<(Option<i32>, Option<i32>), anyhow::Error> {
     match consumer.workload_kind {
         ConsumerWorkloadKind::Deployment => {
             let api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
@@ -2334,14 +2140,8 @@ async fn get_consumer_workload_status(
             let desired = deployment
                 .as_ref()
                 .and_then(|d| d.spec.as_ref().and_then(|spec| spec.replicas));
-            let ready = deployment
-                .as_ref()
-                .and_then(|d| d.status.as_ref().and_then(|status| status.ready_replicas));
-            Ok(WorkloadStatus {
-                desired,
-                ready,
-                ready_for_generation: deployment.as_ref().is_some_and(deployment_is_ready),
-            })
+            let ready = deployment.and_then(|d| d.status.and_then(|status| status.ready_replicas));
+            Ok((desired, ready))
         }
         ConsumerWorkloadKind::DaemonSet => {
             let api: Api<DaemonSet> = Api::namespaced(client.clone(), namespace);
@@ -2354,14 +2154,8 @@ async fn get_consumer_workload_status(
                     .as_ref()
                     .map(|status| status.desired_number_scheduled)
             });
-            let ready = daemonset
-                .as_ref()
-                .and_then(|d| d.status.as_ref().map(|status| status.number_ready));
-            Ok(WorkloadStatus {
-                desired,
-                ready,
-                ready_for_generation: daemonset.as_ref().is_some_and(daemonset_is_ready),
-            })
+            let ready = daemonset.and_then(|d| d.status.map(|status| status.number_ready));
+            Ok((desired, ready))
         }
         ConsumerWorkloadKind::StatefulSet => {
             let api: Api<StatefulSet> = Api::namespaced(client.clone(), namespace);
@@ -2372,14 +2166,8 @@ async fn get_consumer_workload_status(
             let desired = statefulset
                 .as_ref()
                 .and_then(|s| s.spec.as_ref().and_then(|spec| spec.replicas));
-            let ready = statefulset
-                .as_ref()
-                .and_then(|s| s.status.as_ref().and_then(|status| status.ready_replicas));
-            Ok(WorkloadStatus {
-                desired,
-                ready,
-                ready_for_generation: statefulset.as_ref().is_some_and(statefulset_is_ready),
-            })
+            let ready = statefulset.and_then(|s| s.status.and_then(|status| status.ready_replicas));
+            Ok((desired, ready))
         }
     }
 }
@@ -2453,23 +2241,6 @@ async fn delete_consumer_workloads_if_exist(
     Ok(())
 }
 
-async fn cleanup_mount_resources_before_ready(
-    client: &kube::Client,
-    namespace: &str,
-    workload_name: &str,
-    consumer_name: &str,
-    consumer_service_name: &str,
-) -> Result<(), anyhow::Error> {
-    // Gate startup on backend readiness and remove every existing mount
-    // workload. This also clears stale images and obsolete workload kinds;
-    // the desired workload is recreated once the cluster is Ready.
-    delete_deployment_if_exists(client, namespace, workload_name).await?;
-    delete_daemonset_if_exists(client, namespace, workload_name).await?;
-    // A consumer must never be allowed to run against an unavailable mount.
-    delete_consumer_workloads_if_exist(client, namespace, consumer_name, consumer_service_name)
-        .await
-}
-
 fn render_config(cluster: &BrewFSCluster) -> String {
     let cluster_name = cluster.name_any();
     let redis_service = redis_name(&cluster_name);
@@ -2494,196 +2265,6 @@ layout:\n  chunk_size: {chunk_size}\n  block_size: {block_size}\n",
     )
 }
 
-fn deployment_is_ready(deployment: &Deployment) -> bool {
-    let desired = deployment
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.replicas)
-        .unwrap_or(1);
-    let Some(status) = deployment.status.as_ref() else {
-        return false;
-    };
-    if status.observed_generation.is_none() {
-        return false;
-    }
-    if let Some(generation) = deployment.metadata.generation {
-        if status.observed_generation < Some(generation) {
-            return false;
-        }
-    }
-    status.replicas == Some(desired)
-        && status.ready_replicas == Some(desired)
-        && status.available_replicas == Some(desired)
-        && status.updated_replicas == Some(desired)
-        && status.unavailable_replicas.unwrap_or_default() == 0
-}
-
-fn daemonset_is_ready(daemonset: &DaemonSet) -> bool {
-    let Some(status) = daemonset.status.as_ref() else {
-        return false;
-    };
-    if status.observed_generation.is_none() {
-        return false;
-    }
-    if let Some(generation) = daemonset.metadata.generation {
-        if status.observed_generation < Some(generation) {
-            return false;
-        }
-    }
-    let desired = status.desired_number_scheduled;
-    desired > 0
-        && status.current_number_scheduled == desired
-        && status.number_ready == desired
-        && status.number_available == Some(desired)
-        && status.updated_number_scheduled == Some(desired)
-        && status.number_unavailable.unwrap_or_default() == 0
-}
-
-fn statefulset_is_ready(statefulset: &StatefulSet) -> bool {
-    let desired = statefulset
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.replicas)
-        .unwrap_or(1);
-    let Some(status) = statefulset.status.as_ref() else {
-        return false;
-    };
-    if status.observed_generation.is_none() {
-        return false;
-    }
-    if let Some(generation) = statefulset.metadata.generation {
-        if status.observed_generation < Some(generation) {
-            return false;
-        }
-    }
-    let revisions_match = match (&status.current_revision, &status.update_revision) {
-        (Some(current), Some(update)) => current == update,
-        _ => false,
-    };
-    status.replicas == desired
-        && status.ready_replicas == Some(desired)
-        && status.updated_replicas == Some(desired)
-        && status.available_replicas == Some(desired)
-        && revisions_match
-}
-
-fn pvc_is_bound(pvc: &PersistentVolumeClaim) -> bool {
-    pvc.status
-        .as_ref()
-        .and_then(|status| status.phase.as_deref())
-        == Some("Bound")
-}
-
-fn job_is_succeeded(job: &Job) -> bool {
-    observe_rustfs_init_job(job) == RustFsInitJobObservation::Complete
-}
-
-fn job_is_terminally_failed(job: &Job) -> bool {
-    observe_rustfs_init_job(job) == RustFsInitJobObservation::Failed
-}
-
-async fn observe_cluster_readiness(
-    client: &kube::Client,
-    namespace: &str,
-    cluster: &BrewFSCluster,
-) -> Result<(String, String), anyhow::Error> {
-    let cluster_name = cluster.name_any();
-    let redis_name = redis_name(&cluster_name);
-    let deployment_api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
-    let Some(redis) = deployment_api
-        .get_opt(&redis_name)
-        .await
-        .with_context(|| format!("load Redis Deployment {redis_name}"))?
-    else {
-        return Ok((
-            "Progressing".to_string(),
-            format!("waiting for Redis Deployment {redis_name}"),
-        ));
-    };
-    if !deployment_is_ready(&redis) {
-        return Ok((
-            "Progressing".to_string(),
-            format!("Redis Deployment {redis_name} is not ready"),
-        ));
-    }
-
-    let rustfs_name = rustfs_name(&cluster_name);
-    let Some(rustfs) = deployment_api
-        .get_opt(&rustfs_name)
-        .await
-        .with_context(|| format!("load RustFS Deployment {rustfs_name}"))?
-    else {
-        return Ok((
-            "Progressing".to_string(),
-            format!("waiting for RustFS Deployment {rustfs_name}"),
-        ));
-    };
-    if !deployment_is_ready(&rustfs) {
-        return Ok((
-            "Progressing".to_string(),
-            format!("RustFS Deployment {rustfs_name} is not ready"),
-        ));
-    }
-
-    let pvc_name = rustfs_pvc_name(&cluster_name);
-    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
-    let Some(pvc) = pvc_api
-        .get_opt(&pvc_name)
-        .await
-        .with_context(|| format!("load RustFS PVC {pvc_name}"))?
-    else {
-        return Ok((
-            "Progressing".to_string(),
-            format!("waiting for RustFS PVC {pvc_name}"),
-        ));
-    };
-    if !pvc_is_bound(&pvc) {
-        return Ok((
-            "Progressing".to_string(),
-            format!("RustFS PVC {pvc_name} is not Bound"),
-        ));
-    }
-
-    let template_hash = rustfs_job_template_hash_for(&rustfs_init_pod_template(cluster));
-    let job_name = rustfs_job_name_for_hash(&cluster_name, &template_hash);
-    let job_api: Api<Job> = Api::namespaced(client.clone(), namespace);
-    let Some(job) = job_api
-        .get_opt(&job_name)
-        .await
-        .with_context(|| format!("load RustFS init Job {job_name}"))?
-    else {
-        return Ok((
-            "Progressing".to_string(),
-            format!("waiting for RustFS init Job {job_name}"),
-        ));
-    };
-    if !job_is_succeeded(&job) {
-        let message = if job_is_terminally_failed(&job) {
-            job_api
-                .delete(&job_name, &DeleteParams::default())
-                .await
-                .with_context(|| format!("delete failed RustFS init Job {job_name}"))?;
-            format!("RustFS init Job {job_name} failed; retrying")
-        } else {
-            format!("RustFS init Job {job_name} is not complete")
-        };
-        return Ok(("Progressing".to_string(), message));
-    }
-
-    Ok((
-        "Ready".to_string(),
-        "Redis, RustFS, storage, and bucket initialization are ready".to_string(),
-    ))
-}
-
-fn cluster_status_is_ready(cluster: &BrewFSCluster) -> bool {
-    cluster.status.as_ref().is_some_and(|status| {
-        status.phase == "Ready"
-            && status.observed_generation.is_some()
-            && status.observed_generation == cluster.metadata.generation
-    })
-}
-
 fn cluster_ready_status(
     cluster: &BrewFSCluster,
     phase: &str,
@@ -2706,6 +2287,26 @@ fn cluster_ready_status(
             .and_then(|status| status.workspace.clone()),
         last_reconciled_at,
     }
+}
+
+fn pvc_is_bound(pvc: &PersistentVolumeClaim) -> bool {
+    pvc.status
+        .as_ref()
+        .and_then(|status| status.phase.as_deref())
+        == Some("Bound")
+}
+
+fn deployment_is_ready(deployment: &Deployment) -> bool {
+    let Some(status) = deployment.status.as_ref() else {
+        return false;
+    };
+    let Some(spec) = deployment.spec.as_ref() else {
+        return false;
+    };
+    let desired = spec.replicas.unwrap_or(1);
+    status.observed_generation == deployment.metadata.generation
+        && status.updated_replicas == Some(desired)
+        && status.available_replicas == Some(desired)
 }
 
 fn cluster_status_semantically_equal(
@@ -2777,6 +2378,38 @@ async fn patch_cluster_status(
         "apiVersion": "storage.brewfs.io/v1alpha1",
         "kind": "BrewFSCluster",
         "status": status,
+    });
+    api.patch_status(
+        &cluster_name,
+        &PatchParams::apply("brewfs-operator").force(),
+        &Patch::Apply(&patch),
+    )
+    .await
+    .with_context(|| format!("patch status for {cluster_name}"))?;
+    Ok(())
+}
+
+async fn patch_cluster_status_phase(
+    client: &kube::Client,
+    namespace: &str,
+    cluster: &BrewFSCluster,
+    phase: &str,
+    message: &str,
+) -> Result<(), anyhow::Error> {
+    let api: Api<BrewFSCluster> = Api::namespaced(client.clone(), namespace);
+    let cluster_name = cluster.name_any();
+    let mut status = cluster_ready_status(
+        cluster,
+        "Ready",
+        "Backend resources reconciled and Redis persistence is ready",
+        None,
+    );
+    status.phase = phase.to_string();
+    status.message = message.to_string();
+    let patch = json!({
+        "apiVersion": "storage.brewfs.io/v1alpha1",
+        "kind": "BrewFSCluster",
+        "status": BrewFSClusterStatus { last_reconciled_at: Some(Utc::now()), ..status },
     });
     api.patch_status(
         &cluster_name,
@@ -2966,11 +2599,6 @@ mod tests {
         let failed = Job {
             status: Some(k8s_openapi::api::batch::v1::JobStatus {
                 failed: Some(3),
-                conditions: Some(vec![k8s_openapi::api::batch::v1::JobCondition {
-                    type_: "Failed".to_string(),
-                    status: "True".to_string(),
-                    ..Default::default()
-                }]),
                 ..Default::default()
             }),
             ..Job::default()
@@ -2990,34 +2618,6 @@ mod tests {
             observe_rustfs_init_job(&complete),
             RustFsInitJobObservation::Complete
         );
-    }
-
-    #[test]
-    fn rustfs_init_job_preserves_nonterminal_retries() {
-        for active in [Some(1), None] {
-            for condition_status in [None, Some("False"), Some("Unknown")] {
-                let job = Job {
-                    status: Some(k8s_openapi::api::batch::v1::JobStatus {
-                        failed: Some(1),
-                        active,
-                        conditions: condition_status.map(|status| {
-                            vec![k8s_openapi::api::batch::v1::JobCondition {
-                                type_: "Failed".to_string(),
-                                status: status.to_string(),
-                                ..Default::default()
-                            }]
-                        }),
-                        ..Default::default()
-                    }),
-                    ..Job::default()
-                };
-                assert_eq!(
-                    observe_rustfs_init_job(&job),
-                    RustFsInitJobObservation::Pending,
-                    "a failed Pod must not reset the Job controller's retry/backoff state"
-                );
-            }
-        }
     }
 
     #[test]
@@ -3329,56 +2929,6 @@ mod tests {
     }
 
     #[test]
-    fn consumer_requires_its_mount_on_the_same_node() {
-        let consumer: MountConsumerSpec =
-            serde_json::from_value(json!({"nodeSelector": {"pool": "apps"}})).unwrap();
-        let template = build_consumer_pod_template(
-            &consumer,
-            "/mnt/demo",
-            labels("demo-mount", "consumer"),
-            labels("demo-mount", "mount"),
-        );
-        let spec = template.spec.unwrap();
-        assert_eq!(spec.node_selector, Some(consumer.node_selector.clone()));
-        let terms = spec
-            .affinity
-            .expect("consumers require mount-node affinity")
-            .pod_affinity
-            .unwrap()
-            .required_during_scheduling_ignored_during_execution
-            .unwrap();
-        assert_eq!(terms.len(), 1);
-        let term = &terms[0];
-        assert_eq!(term.topology_key, "kubernetes.io/hostname");
-        // No namespace override: Kubernetes matches only this consumer's namespace.
-        assert!(term.namespaces.is_none());
-        assert!(term.namespace_selector.is_none());
-        let selector = term.label_selector.as_ref().unwrap();
-        let required_labels = selector.match_labels.as_ref().unwrap();
-        assert_eq!(required_labels, &labels("demo-mount", "mount"));
-
-        // Both nodes satisfy the consumer's nodeSelector, but only node A hosts
-        // this mount. A different mount or a consumer on B must not qualify B.
-        let pods = [
-            ("node-a", labels("demo-mount", "mount")),
-            ("node-b", labels("other-mount", "mount")),
-            ("node-b", labels("demo-mount", "consumer")),
-        ];
-        let eligible: Vec<_> = ["node-a", "node-b"]
-            .into_iter()
-            .filter(|node| {
-                pods.iter().any(|(pod_node, pod_labels)| {
-                    pod_node == node
-                        && required_labels
-                            .iter()
-                            .all(|(key, value)| pod_labels.get(key) == Some(value))
-                })
-            })
-            .collect();
-        assert_eq!(eligible, vec!["node-a"]);
-    }
-
-    #[test]
     fn consumer_pod_labels_cannot_override_selectors() {
         let mut consumer: MountConsumerSpec =
             serde_json::from_value(json!({})).expect("default consumer spec");
@@ -3398,12 +2948,7 @@ mod tests {
         ]);
         let selector_labels = labels("demo-mount", "consumer");
 
-        let template = build_consumer_pod_template(
-            &consumer,
-            "/mnt/demo",
-            selector_labels.clone(),
-            labels("demo-mount", "mount"),
-        );
+        let template = build_consumer_pod_template(&consumer, "/mnt/demo", selector_labels.clone());
         let template_labels = template
             .metadata
             .and_then(|metadata| metadata.labels)
@@ -3435,29 +2980,5 @@ mod tests {
                 .map(String::as_str),
             Some("kept")
         );
-    }
-
-    #[test]
-    fn unsupported_pvc_expansion_rejection_is_terminal() {
-        assert!(is_unsupported_pvc_expansion_rejection(
-            403,
-            "only dynamically provisioned pvc can be resized and the storageclass that provisions the pvc must support resize",
-        ));
-        assert!(is_unsupported_pvc_expansion_rejection(
-            422,
-            "StorageClass fast does not allow volume expansion",
-        ));
-    }
-
-    #[test]
-    fn unrelated_pvc_apply_errors_remain_retryable() {
-        assert!(!is_unsupported_pvc_expansion_rejection(
-            409,
-            "StorageClass fast does not allow volume expansion",
-        ));
-        assert!(!is_unsupported_pvc_expansion_rejection(
-            403,
-            "admission policy denied the PVC",
-        ));
     }
 }

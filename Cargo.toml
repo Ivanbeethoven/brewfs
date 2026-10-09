@@ -1,6 +1,6 @@
 [package]
 name = "brewfs"
-version = "0.1.3"
+version = "0.1.2"
 edition = "2024"
 autobins = false
 authors = ["rk8s-dev team"]

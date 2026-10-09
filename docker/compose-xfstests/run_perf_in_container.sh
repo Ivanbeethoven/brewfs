@@ -87,10 +87,10 @@ PERF_FIO_COLD_READ_DROP_CACHES=${PERF_FIO_COLD_READ_DROP_CACHES:-true}
 PERF_FIO_REQUIRE_DROP_CACHES=${PERF_FIO_REQUIRE_DROP_CACHES:-false}
 PERF_FIO_POST_WRITE_DRAIN=${PERF_FIO_POST_WRITE_DRAIN:-false}
 PERF_FIO_DIRECT_MATRIX=${PERF_FIO_DIRECT_MATRIX:-}
-PERF_FIO_BIGREAD_REPEATS=${PERF_FIO_BIGREAD_REPEATS:-3}
+PERF_FIO_BIGREAD_REPEATS=${PERF_FIO_BIGREAD_REPEATS:-1}
 PERF_FIO_BIGREAD_COOLDOWN_SECS=${PERF_FIO_BIGREAD_COOLDOWN_SECS:-10}
 PERF_FIO_BIGREAD_EVICT_LOCAL_CACHE_PAGES=${PERF_FIO_BIGREAD_EVICT_LOCAL_CACHE_PAGES:-true}
-PERF_FIO_BIGREAD_WARMUP_PASSES=${PERF_FIO_BIGREAD_WARMUP_PASSES:-1}
+PERF_FIO_BIGREAD_WARMUP_PASSES=${PERF_FIO_BIGREAD_WARMUP_PASSES:-0}
 PERF_FIO_BIGREAD_REMOUNT_BETWEEN_REPEATS=${PERF_FIO_BIGREAD_REMOUNT_BETWEEN_REPEATS:-true}
 BREWFS_DATA_BACKEND=${data_backend}
 BREWFS_META_BACKEND=${meta_backend}
@@ -153,7 +153,7 @@ PERF_PACKED_FIO_FILE_SIZE=${PERF_PACKED_FIO_FILE_SIZE:-67108864}
 PERF_FIO_BIGREAD_REPEATS=${PERF_FIO_BIGREAD_REPEATS:-1}
 PERF_FIO_BIGREAD_COOLDOWN_SECS=${PERF_FIO_BIGREAD_COOLDOWN_SECS:-10}
 PERF_FIO_BIGREAD_EVICT_LOCAL_CACHE_PAGES=${PERF_FIO_BIGREAD_EVICT_LOCAL_CACHE_PAGES:-true}
-PERF_FIO_BIGREAD_WARMUP_PASSES=${PERF_FIO_BIGREAD_WARMUP_PASSES:-1}
+PERF_FIO_BIGREAD_WARMUP_PASSES=${PERF_FIO_BIGREAD_WARMUP_PASSES:-0}
 PERF_FIO_BIGREAD_REMOUNT_BETWEEN_REPEATS=${PERF_FIO_BIGREAD_REMOUNT_BETWEEN_REPEATS:-true}
 EOF
 
@@ -664,9 +664,6 @@ copy_artifacts() {
     fi
     if [[ -f "$config_path" ]]; then
         cp -f "$config_path" "$artifact_dir/backend.yml" || true
-        if [[ -f "$artifact_dir/backend.yml" ]]; then
-            sed -E -i 's#(redis(s)?://)[^@[:space:]]+@#\1***@#g' "$artifact_dir/backend.yml"
-        fi
     fi
     chmod -R a+rwX "$artifact_dir" >/dev/null 2>&1 || true
 }
@@ -1964,9 +1961,9 @@ run_fio_profile() {
     fi
 
     if [[ "$mode" == "bigread" ]]; then
-        repeat_count="${PERF_FIO_BIGREAD_REPEATS:-3}"
+        repeat_count="${PERF_FIO_BIGREAD_REPEATS:-1}"
         repeat_cooldown_secs="${PERF_FIO_BIGREAD_COOLDOWN_SECS:-10}"
-        warmup_count="${PERF_FIO_BIGREAD_WARMUP_PASSES:-1}"
+        warmup_count="${PERF_FIO_BIGREAD_WARMUP_PASSES:-0}"
         if [[ ! "$repeat_count" =~ ^(1|3|5)$ ]]; then
             err "PERF_FIO_BIGREAD_REPEATS 只支持 1、3 或 5，当前值: $repeat_count"
             return 1
@@ -2642,8 +2639,6 @@ if brewfs_stats_paths:
         range_gets = delta("brewfs_read_range_gets_total")
         full_gets = delta("brewfs_read_full_gets_total")
         bg_prefetch = delta("brewfs_read_background_prefetch_total")
-        persistent_slice_read_ops = delta("brewfs_persistent_slice_read_ops_total")
-        persistent_slice_read_bytes = delta("brewfs_persistent_slice_read_bytes_total")
         stage_ops = delta("brewfs_writeback_stage_ops_total")
         stage_bytes = delta("brewfs_writeback_stage_bytes_total")
         stage_ms = delta("brewfs_writeback_stage_lat_us_total") / 1000.0
@@ -2766,8 +2761,6 @@ if brewfs_stats_paths:
             f"{fmt_mib(read_buffer)} | GET={int(s3_get)}, PUT={int(s3_put)} | "
             f"GET={s3_get_avg_ms:.2f} ms, PUT={s3_put_avg_ms:.2f} ms | "
             f"{rel}; range={int(range_gets)}, full={int(full_gets)}, bg_prefetch={int(bg_prefetch)}, "
-            f"persistent_slice={int(persistent_slice_read_ops)} ops/"
-            f"{fmt_mib(persistent_slice_read_bytes)}, "
             f"stage={int(stage_ops)} ops/{fmt_mib(stage_bytes)}/{stage_ms:.1f} ms, "
             f"foreground=stage {stage_s:.2f}s/commit_wait {commit_wait_s:.2f}s, "
             f"flush_wait={int(flush_wait_ops)} ops/{flush_wait_s:.2f}s/{int(flush_wait_slices)} slices, "
@@ -2986,9 +2979,7 @@ main() {
     if [[ -z "$artifact_dir" ]]; then
         local ts
         ts="$(date +%s)-$RANDOM"
-        # Keep the "perf-run-" prefix (host wrappers glob for it) and append the
-        # workload so the Result Vault run list shows BrewFS vs JuiceFS directly.
-        artifact_dir="${artifact_root%/}/perf-run-${ts}-brewfs"
+        artifact_dir="${artifact_root%/}/perf-run-${ts}"
     fi
 
     mkdir -p "$artifact_dir"
