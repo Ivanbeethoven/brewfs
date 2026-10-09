@@ -858,6 +858,103 @@ async fn writable_acl_set_and_chmod_keep_mode_and_named_entries_together() {
 }
 
 #[tokio::test]
+async fn writable_acl_xattr_flags_are_checked_atomically() {
+    let meta = test_meta().await;
+    let ino = meta.create_file(1, "acl-flags".into()).await.unwrap();
+    let first = named_acl(0o640);
+    let replacement = named_acl(0o750);
+
+    meta.set_xattr(
+        ino,
+        "system.posix_acl_access",
+        &first,
+        libc::XATTR_CREATE as u32,
+    )
+    .await
+    .unwrap();
+    let error = meta
+        .set_xattr(
+            ino,
+            "system.posix_acl_access",
+            &replacement,
+            libc::XATTR_CREATE as u32,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaError::Io(error) if error.raw_os_error() == Some(libc::EEXIST)));
+    assert_eq!(
+        meta.get_xattr(ino, "system.posix_acl_access")
+            .await
+            .unwrap(),
+        Some(first.clone())
+    );
+
+    meta.set_xattr(
+        ino,
+        "system.posix_acl_access",
+        &replacement,
+        libc::XATTR_REPLACE as u32,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        meta.get_xattr(ino, "system.posix_acl_access")
+            .await
+            .unwrap(),
+        Some(replacement.clone())
+    );
+    meta.remove_xattr(ino, "system.posix_acl_access")
+        .await
+        .unwrap();
+    let error = meta
+        .remove_xattr(ino, "system.posix_acl_access")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaError::Io(error) if error.raw_os_error() == Some(libc::ENODATA)));
+
+    let error = meta
+        .set_xattr(
+            ino,
+            "system.posix_acl_access",
+            &first,
+            libc::XATTR_REPLACE as u32,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaError::Io(error) if error.raw_os_error() == Some(libc::ENODATA)));
+    let error = meta
+        .set_xattr(
+            ino,
+            "system.posix_acl_access",
+            &first,
+            (libc::XATTR_CREATE | libc::XATTR_REPLACE) as u32,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaError::Io(error) if error.raw_os_error() == Some(libc::EINVAL)));
+
+    let dir = meta.mkdir(1, "acl-default-flags".into()).await.unwrap();
+    meta.set_xattr(
+        dir,
+        "system.posix_acl_default",
+        &first,
+        libc::XATTR_CREATE as u32,
+    )
+    .await
+    .unwrap();
+    let error = meta
+        .set_xattr(
+            dir,
+            "system.posix_acl_default",
+            &replacement,
+            libc::XATTR_CREATE as u32,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaError::Io(error) if error.raw_os_error() == Some(libc::EEXIST)));
+}
+
+#[tokio::test]
 async fn writable_acl_parent_default_is_inherited_and_directory_default_is_preserved() {
     let meta = test_meta().await;
     let directory = meta.mkdir(1, "acl-parent".into()).await.unwrap();

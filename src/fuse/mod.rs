@@ -2293,7 +2293,7 @@ where
             };
             let name = std::str::from_utf8(name).map_err(|_| Errno::from(libc::EINVAL))?;
             return self
-                .update_posix_acl_ino(inode as i64, name, Some(value), req.uid, &groups)
+                .update_posix_acl_ino(inode as i64, name, Some(value), flags, req.uid, &groups)
                 .await
                 .map_err(posix_acl_errno);
         }
@@ -2452,7 +2452,16 @@ where
             };
             let name = std::str::from_utf8(name).map_err(|_| Errno::from(libc::EINVAL))?;
             return self
-                .update_posix_acl_ino(inode as i64, name, None, req.uid, &groups)
+                // Removing an xattr has replace semantics: an absent ACL must
+                // return ENODATA instead of silently succeeding.
+                .update_posix_acl_ino(
+                    inode as i64,
+                    name,
+                    None,
+                    libc::XATTR_REPLACE as u32,
+                    req.uid,
+                    &groups,
+                )
                 .await
                 .map_err(posix_acl_errno);
         }
