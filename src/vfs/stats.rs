@@ -15,6 +15,80 @@ use std::time::{Duration, Instant};
 /// visibility, not happens-before relationships.
 const ORD: Ordering = Ordering::Relaxed;
 
+/// Optional mount-scoped backend statistics. Rendering must be synchronous and
+/// must not issue backend requests or retain an additional cache of data.
+pub trait FsStatsExtension: std::fmt::Debug + Send + Sync {
+    fn begin_stats_observation(&self) -> Option<crate::cadapter::read_observer::TerminalGuard> {
+        None
+    }
+    /// A conservative maximum for one render at the current finite state.
+    fn render_max_bytes(&self) -> usize {
+        64 * 1024
+    }
+    fn render_into(&self, output: &mut dyn std::fmt::Write);
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("statistics snapshot exceeds its admitted allocation or allocation failed")]
+pub struct StatsRenderLimit;
+
+/// The owner is shared by the handle and every zero-copy FUSE reply slice.
+pub(crate) struct VirtualStatsSnapshot {
+    pub(crate) text: String,
+    pub(crate) _output: Option<crate::meta::layer::MetadataMemoryGuard>,
+    pub(crate) _control: Option<crate::meta::layer::MetadataMemoryGuard>,
+}
+impl AsRef<[u8]> for VirtualStatsSnapshot {
+    fn as_ref(&self) -> &[u8] {
+        self.text.as_bytes()
+    }
+}
+
+struct StatsText {
+    text: String,
+    limit: Option<usize>,
+    failed: bool,
+}
+impl StatsText {
+    fn new(limit: Option<usize>) -> Self {
+        Self {
+            text: String::new(),
+            limit,
+            failed: false,
+        }
+    }
+    fn push_str(&mut self, text: &str) {
+        let _ = std::fmt::Write::write_str(self, text);
+    }
+    fn finish(self) -> Result<String, StatsRenderLimit> {
+        if self.failed {
+            Err(StatsRenderLimit)
+        } else {
+            Ok(self.text)
+        }
+    }
+}
+impl std::fmt::Write for StatsText {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let Some(next) = self.text.len().checked_add(text.len()) else {
+            self.failed = true;
+            return Err(std::fmt::Error);
+        };
+        if self.failed || self.limit.is_some_and(|limit| next > limit) {
+            self.failed = true;
+            return Err(std::fmt::Error);
+        }
+        if next > self.text.capacity()
+            && self.text.try_reserve_exact(next - self.text.len()).is_err()
+        {
+            self.failed = true;
+            return Err(std::fmt::Error);
+        }
+        self.text.push_str(text);
+        Ok(())
+    }
+}
+
 /// Point-in-time copy of the counters exposed through `.stats`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FsStatsSnapshot {
@@ -187,8 +261,6 @@ pub struct FsStatsSnapshot {
     pub read_range_gets: u64,
     pub read_full_gets: u64,
     pub read_piggyback_full: u64,
-    pub persistent_slice_read_ops: u64,
-    pub persistent_slice_read_bytes: u64,
     pub read_background_prefetches: u64,
     pub read_background_prefetch_dropped: u64,
     pub meta_stat_cache_hit: u64,
@@ -256,6 +328,7 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
 #[derive(Debug)]
 pub struct FsStats {
     pub start_time: Instant,
+    extension: std::sync::OnceLock<std::sync::Arc<dyn FsStatsExtension>>,
 
     // ─── FUSE layer ───────────────────────────────────────────────
     /// Total FUSE read operations
@@ -592,10 +665,6 @@ pub struct FsStats {
     pub read_full_gets: AtomicU64,
     /// Reads piggybacked onto an in-flight full-block GET
     pub read_piggyback_full: AtomicU64,
-    /// Positional reads issued against persistent writeback slices
-    pub persistent_slice_read_ops: AtomicU64,
-    /// Bytes read from persistent writeback slices
-    pub persistent_slice_read_bytes: AtomicU64,
     /// Background full-block prefetches scheduled by range reads
     pub read_background_prefetches: AtomicU64,
     /// Background full-block prefetches dropped before execution
@@ -629,9 +698,11 @@ pub struct FsStats {
 }
 
 impl FsStats {
+    pub(crate) const BASE_RENDER_MAX_BYTES: usize = 64 * 1024;
     pub fn new() -> Self {
         Self {
             start_time: Instant::now(),
+            extension: std::sync::OnceLock::new(),
             fuse_read_ops: AtomicU64::new(0),
             fuse_read_bytes: AtomicU64::new(0),
             fuse_read_lat_us: AtomicU64::new(0),
@@ -800,8 +871,6 @@ impl FsStats {
             read_range_gets: AtomicU64::new(0),
             read_full_gets: AtomicU64::new(0),
             read_piggyback_full: AtomicU64::new(0),
-            persistent_slice_read_ops: AtomicU64::new(0),
-            persistent_slice_read_bytes: AtomicU64::new(0),
             read_background_prefetches: AtomicU64::new(0),
             read_background_prefetch_dropped: AtomicU64::new(0),
             meta_stat_cache_hit: AtomicU64::new(0),
@@ -1107,8 +1176,6 @@ impl FsStats {
             read_range_gets: self.read_range_gets.load(ORD),
             read_full_gets: self.read_full_gets.load(ORD),
             read_piggyback_full: self.read_piggyback_full.load(ORD),
-            persistent_slice_read_ops: self.persistent_slice_read_ops.load(ORD),
-            persistent_slice_read_bytes: self.persistent_slice_read_bytes.load(ORD),
             read_background_prefetches: self.read_background_prefetches.load(ORD),
             read_background_prefetch_dropped: self.read_background_prefetch_dropped.load(ORD),
             meta_stat_cache_hit: self.meta_stat_cache_hit.load(ORD),
@@ -1544,8 +1611,6 @@ impl FsStats {
         range_gets: u64,
         full_gets: u64,
         piggyback_full: u64,
-        persistent_slice_read_ops: u64,
-        persistent_slice_read_bytes: u64,
         background_prefetches: u64,
         background_prefetch_dropped: u64,
     ) {
@@ -1555,10 +1620,6 @@ impl FsStats {
         self.read_range_gets.store(range_gets, ORD);
         self.read_full_gets.store(full_gets, ORD);
         self.read_piggyback_full.store(piggyback_full, ORD);
-        self.persistent_slice_read_ops
-            .store(persistent_slice_read_ops, ORD);
-        self.persistent_slice_read_bytes
-            .store(persistent_slice_read_bytes, ORD);
         self.read_background_prefetches
             .store(background_prefetches, ORD);
         self.read_background_prefetch_dropped
@@ -1605,11 +1666,33 @@ impl FsStats {
             .store(lookup_attr_fused_error, ORD);
     }
 
+    pub fn set_extension(&self, extension: std::sync::Arc<dyn FsStatsExtension>) -> bool {
+        self.extension.set(extension).is_ok()
+    }
+
     /// Render all counters in Prometheus text format (one metric per line).
     /// Format: `metric_name value\n`
+    pub fn render_allocation_limit(&self) -> usize {
+        Self::BASE_RENDER_MAX_BYTES
+            .saturating_add(self.extension.get().map_or(0, |e| e.render_max_bytes()))
+    }
+
     pub fn render(&self) -> String {
+        self.render_with_limit(None)
+            .expect("unbounded statistics rendering")
+    }
+
+    pub fn render_bounded(&self, limit: usize) -> Result<String, StatsRenderLimit> {
+        self.render_with_limit(Some(limit))
+    }
+
+    fn render_with_limit(&self, limit: Option<usize>) -> Result<String, StatsRenderLimit> {
+        let observation = self
+            .extension
+            .get()
+            .and_then(|extension| extension.begin_stats_observation());
         let snapshot = self.snapshot();
-        let mut out = String::with_capacity(4096);
+        let mut out = StatsText::new(limit);
 
         // System
         out.push_str(&format!(
@@ -2343,14 +2426,6 @@ impl FsStats {
             snapshot.read_piggyback_full
         ));
         out.push_str(&format!(
-            "brewfs_persistent_slice_read_ops_total {}\n",
-            snapshot.persistent_slice_read_ops
-        ));
-        out.push_str(&format!(
-            "brewfs_persistent_slice_read_bytes_total {}\n",
-            snapshot.persistent_slice_read_bytes
-        ));
-        out.push_str(&format!(
             "brewfs_read_background_prefetch_total {}\n",
             snapshot.read_background_prefetches
         ));
@@ -2411,7 +2486,13 @@ impl FsStats {
             snapshot.meta_lookup_attr_fused_error
         ));
 
-        out
+        if let Some(extension) = self.extension.get() {
+            extension.render_into(&mut out);
+        }
+        if let Some(observation) = observation {
+            observation.deliver(0);
+        }
+        out.finish()
     }
 
     pub fn record_duration(ops_counter: &AtomicU64, lat_counter: &AtomicU64, duration: Duration) {
@@ -2506,6 +2587,33 @@ macro_rules! timed_op {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct TestStatsExtension;
+
+    impl FsStatsExtension for TestStatsExtension {
+        fn render_into(&self, output: &mut dyn std::fmt::Write) {
+            let _ = output.write_str("brewfs_test_backend_gets_total 7\n");
+        }
+    }
+
+    #[test]
+    fn mount_extension_is_rendered_once_without_replacing_common_stats() {
+        let stats = FsStats::new();
+        assert!(stats.set_extension(std::sync::Arc::new(TestStatsExtension)));
+        assert!(!stats.set_extension(std::sync::Arc::new(TestStatsExtension)));
+        let rendered = stats.render();
+        assert_eq!(
+            rendered.matches("brewfs_test_backend_gets_total 7").count(),
+            1
+        );
+        assert!(rendered.contains("brewfs_fuse_read_ops_total 0"));
+        assert!(
+            !FsStats::new()
+                .render()
+                .contains("brewfs_test_backend_gets_total")
+        );
+    }
+
     #[test]
     fn render_contains_all_metrics() {
         let stats = FsStats::new();
@@ -2537,7 +2645,6 @@ mod tests {
         );
         stats.sync_writeback_upload_batch_shape_metrics(64, 65);
         stats.sync_writeback_upload_origin_metrics(32, 33, 34, 35, 36, 37, 38, 39);
-        stats.sync_read_strategy_metrics(40, 41, 42, 43, 44, 45, 46, 47, 48, 49);
 
         let output = stats.render();
         assert!(output.contains("brewfs_fuse_read_ops_total 42"));
@@ -2552,16 +2659,14 @@ mod tests {
         assert!(output.contains("brewfs_cache_misses_total 2"));
         assert!(output.contains("brewfs_cache_requests_total 10"));
         assert!(output.contains("brewfs_cache_hit_ratio 0.800000"));
-        assert!(output.contains("brewfs_read_block_cache_hits_total 40"));
-        assert!(output.contains("brewfs_read_page_cache_hits_total 41"));
-        assert!(output.contains("brewfs_read_page_cache_misses_total 42"));
-        assert!(output.contains("brewfs_read_range_gets_total 43"));
-        assert!(output.contains("brewfs_read_full_gets_total 44"));
-        assert!(output.contains("brewfs_read_piggyback_full_total 45"));
-        assert!(output.contains("brewfs_persistent_slice_read_ops_total 46"));
-        assert!(output.contains("brewfs_persistent_slice_read_bytes_total 47"));
-        assert!(output.contains("brewfs_read_background_prefetch_total 48"));
-        assert!(output.contains("brewfs_read_background_prefetch_dropped_total 49"));
+        assert!(output.contains("brewfs_read_block_cache_hits_total 0"));
+        assert!(output.contains("brewfs_read_page_cache_hits_total 0"));
+        assert!(output.contains("brewfs_read_page_cache_misses_total 0"));
+        assert!(output.contains("brewfs_read_range_gets_total 0"));
+        assert!(output.contains("brewfs_read_full_gets_total 0"));
+        assert!(output.contains("brewfs_read_piggyback_full_total 0"));
+        assert!(output.contains("brewfs_read_background_prefetch_total 0"));
+        assert!(output.contains("brewfs_read_background_prefetch_dropped_total 0"));
         assert!(output.contains("brewfs_meta_stat_cache_hit_total 0"));
         assert!(output.contains("brewfs_meta_stat_cache_miss_total 0"));
         assert!(output.contains("brewfs_meta_stat_fresh_store_hit_total 0"));
@@ -2921,5 +3026,44 @@ mod tests {
 
         assert_eq!(ops.load(ORD), 1);
         assert!(lat.load(ORD) >= 1000); // at least 1ms = 1000us
+    }
+}
+
+#[cfg(test)]
+mod bounded_snapshot_tests {
+    use super::*;
+    use std::sync::Arc;
+    #[derive(Debug)]
+    struct Guard(Arc<AtomicU64>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[test]
+    fn bounded_stats_does_not_deliver_truncation_and_reply_clones_keep_guards() {
+        let stats = FsStats::new();
+        assert!(stats.render_bounded(64).is_err());
+        assert_eq!(
+            stats
+                .render_bounded(stats.render_allocation_limit())
+                .unwrap(),
+            stats.render()
+        );
+        let drops = Arc::new(AtomicU64::new(0));
+        let owner = VirtualStatsSnapshot {
+            text: "long stable snapshot".into(),
+            _output: Some(Arc::new(Guard(drops.clone()))),
+            _control: Some(Arc::new(Guard(drops.clone()))),
+        };
+        let handle = bytes::Bytes::from_owner(owner);
+        let reply = handle.slice(0..4);
+        let clone = reply.clone();
+        drop(handle);
+        drop(reply);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(clone.as_ref(), b"long");
+        drop(clone);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 }

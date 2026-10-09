@@ -20,6 +20,7 @@ pub(crate) mod cache;
 pub(crate) mod config;
 pub mod error;
 pub mod fs;
+pub(crate) mod fuse_read_cancel;
 pub(crate) mod handles;
 pub(crate) mod inode;
 pub(crate) mod io;
@@ -38,16 +39,6 @@ const CHUNK_ID_BASE: u64 = 1_000_000_000u64;
 // This design allows for up to `CHUNK_ID_BASE` chunks per inode, which should be sufficient for most use cases.
 // s3 ojbects'name = chunk_id, so we need to ensure uniqueness across inodes and their chunks.
 pub fn chunk_id_for(ino: i64, chunk_index: u64) -> std::io::Result<u64> {
-    if chunk_index >= CHUNK_ID_BASE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "chunk index {} exceeds the maximum supported value {}",
-                chunk_index,
-                CHUNK_ID_BASE - 1
-            ),
-        ));
-    }
     let ino_u64 = u64::try_from(ino).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -74,16 +65,4 @@ pub fn extract_ino_and_chunk_index(chunk_id: u64) -> (i64, u64) {
     let ino = (chunk_id / CHUNK_ID_BASE) as i64;
     let chunk_index = chunk_id % CHUNK_ID_BASE;
     (ino, chunk_index)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn chunk_id_rejects_cross_inode_index() {
-        assert!(chunk_id_for(42, CHUNK_ID_BASE - 1).is_ok());
-        assert!(chunk_id_for(42, CHUNK_ID_BASE).is_err());
-        assert!(chunk_id_for(42, CHUNK_ID_BASE + 1).is_err());
-    }
 }

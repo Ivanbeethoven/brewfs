@@ -23,9 +23,10 @@ COPY --from=juicefs /usr/local/bin/juicefs /usr/local/bin/juicefs
 COPY tests/scripts/xfstests-prebuilt/xfstests-prebuilt.tar.gz /opt/xfstests-prebuilt.tar.gz
 COPY docker/compose-xfstests/run_juicefs_perf_in_container.sh /usr/local/bin/run_juicefs_perf_in_container.sh
 COPY docker/compose-xfstests/perf_metadata_fallback.py /usr/local/bin/perf_metadata_fallback.py
+COPY tools/perf/smallfiles_scan.py /usr/local/bin/smallfiles_scan.py
 
 RUN set -e; \
-    chmod +x /usr/local/bin/juicefs /usr/local/bin/run_juicefs_perf_in_container.sh /usr/local/bin/perf_metadata_fallback.py; \
+    chmod +x /usr/local/bin/juicefs /usr/local/bin/run_juicefs_perf_in_container.sh /usr/local/bin/perf_metadata_fallback.py /usr/local/bin/smallfiles_scan.py; \
     mkdir -p /opt/xfstests-dev /mnt/juicefs /artifacts; \
     if gzip -t /opt/xfstests-prebuilt.tar.gz >/dev/null 2>&1; then \
         tar -xzf /opt/xfstests-prebuilt.tar.gz -C /opt --transform 's|^xfstests|xfstests-dev|'; \

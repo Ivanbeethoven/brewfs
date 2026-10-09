@@ -2,7 +2,7 @@ use crate::workspace_overlay::error::WorkspaceError;
 use crate::workspace_overlay::ids::LayerId;
 use crate::workspace_overlay::model::{AclDelta, LayerRecord, ValueOp, XattrDelta};
 
-use super::validate_layer_chain;
+use super::{Resolution, validate_layer_chain};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedXattr {
@@ -24,6 +24,15 @@ pub fn resolve_xattr(
     ino: i64,
     name: &[u8],
 ) -> Result<Option<ResolvedXattr>, WorkspaceError> {
+    resolve_xattr_state(chain, deltas, ino, name).map(Resolution::into_option)
+}
+
+pub fn resolve_xattr_state(
+    chain: &[LayerRecord],
+    deltas: &[XattrDelta],
+    ino: i64,
+    name: &[u8],
+) -> Result<Resolution<ResolvedXattr>, WorkspaceError> {
     let head = chain
         .first()
         .ok_or_else(|| WorkspaceError::CorruptMetadata("empty layer chain".into()))?;
@@ -45,7 +54,7 @@ pub fn resolve_xattr(
             });
         }
     }
-    Ok(None)
+    Ok(Resolution::Absent)
 }
 
 pub fn resolve_acl(
@@ -55,6 +64,16 @@ pub fn resolve_acl(
     acl_type: u8,
     acl_id: i64,
 ) -> Result<Option<ResolvedAcl>, WorkspaceError> {
+    resolve_acl_state(chain, deltas, ino, acl_type, acl_id).map(Resolution::into_option)
+}
+
+pub fn resolve_acl_state(
+    chain: &[LayerRecord],
+    deltas: &[AclDelta],
+    ino: i64,
+    acl_type: u8,
+    acl_id: i64,
+) -> Result<Resolution<ResolvedAcl>, WorkspaceError> {
     let head = chain
         .first()
         .ok_or_else(|| WorkspaceError::CorruptMetadata("empty layer chain".into()))?;
@@ -79,13 +98,16 @@ pub fn resolve_acl(
             });
         }
     }
-    Ok(None)
+    Ok(Resolution::Absent)
 }
 
-fn resolve_value(op: ValueOp, value: Option<&Vec<u8>>) -> Result<Option<&Vec<u8>>, WorkspaceError> {
+fn resolve_value(
+    op: ValueOp,
+    value: Option<&Vec<u8>>,
+) -> Result<Resolution<&Vec<u8>>, WorkspaceError> {
     match (op, value) {
-        (ValueOp::Put, Some(value)) => Ok(Some(value)),
-        (ValueOp::Whiteout, None) => Ok(None),
+        (ValueOp::Put, Some(value)) => Ok(Resolution::Present(value)),
+        (ValueOp::Whiteout, None) => Ok(Resolution::Masked),
         _ => Err(WorkspaceError::CorruptMetadata(
             "value op/payload mismatch".into(),
         )),

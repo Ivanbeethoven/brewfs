@@ -20,6 +20,11 @@ use super::model::{
     SnapshotLease, SnapshotRecord, ViewContext, WorkspaceRecord,
 };
 
+mod packed_mount_session;
+pub(crate) use packed_mount_session::{
+    PackedMountAuthority, PackedMountCatalog, PackedMountSessionRequest, PackedNeverAttached,
+};
+
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -286,7 +291,8 @@ pub struct WorkspaceMountSession<W> {
     store: Arc<W>,
     pub lease: SnapshotLease,
     pub view: ViewContext,
-    heartbeat: LeaseHeartbeat,
+    heartbeat: Option<LeaseHeartbeat>,
+    packed: Option<packed_mount_session::PackedMountRuntime>,
 }
 
 impl<W: WorkspaceStore + 'static> WorkspaceMountSession<W> {
@@ -344,6 +350,33 @@ impl<W: WorkspaceStore + 'static> WorkspaceMountSession<W> {
                 ttl_ns,
             })
             .await?;
+        // The lease acquisition can race a control-plane head switch after
+        // the preflight chain read. Never return the old, unprotected view.
+        let checked_workspace = store.load_workspace(workspace_id).await;
+        let binding = match checked_workspace {
+            Ok(current)
+                if current.state == super::model::WorkspaceState::Active
+                    && current.head_layer_id == workspace.head_layer_id
+                    && current.head_epoch == workspace.head_epoch
+                    && current.active_lease == Some(lease.lease_id)
+                    && lease.base_revision.layer_id == chain[1].layer_id
+                    && Some(lease.base_revision.sealed_version) == chain[1].sealed_version
+                    && Some(lease.base_revision.root_hash) == chain[1].root_hash =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(WorkspaceError::Fenced),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = binding {
+            let _ = store
+                .release_lease(ReleaseLease {
+                    lease_id: lease.lease_id,
+                    holder_generation: lease.holder_generation,
+                })
+                .await;
+            return Err(error);
+        }
         let view = ViewContext {
             workspace_id,
             head_layer_id: workspace.head_layer_id,
@@ -362,19 +395,53 @@ impl<W: WorkspaceStore + 'static> WorkspaceMountSession<W> {
             store,
             lease,
             view,
-            heartbeat,
+            heartbeat: Some(heartbeat),
+            packed: None,
         })
     }
 
-    pub async fn release(self) -> Result<(), WorkspaceError> {
-        self.heartbeat.stop().await;
-        let result = self
-            .store
-            .release_lease(ReleaseLease {
-                lease_id: self.lease.lease_id,
-                holder_generation: self.lease.holder_generation,
-            })
-            .await;
+    pub async fn release_clean(
+        mut self,
+        proof: super::packed_shutdown::VerifiedCleanPackedShutdown,
+    ) -> Result<(), WorkspaceError> {
+        let expected = HeadGuard {
+            workspace_id: self.view.workspace_id,
+            expected_head_layer_id: self.view.head_layer_id,
+            expected_head_epoch: self.view.head_epoch,
+            lease_id: self.view.lease_id,
+            holder_generation: self.view.holder_generation,
+        };
+        if proof.reference().guard != expected || !proof.belongs_to_store(self.store.as_ref()) {
+            return Err(WorkspaceError::Fenced);
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.stop().await;
+        }
+        let result = if let Some(packed) = self.packed.take() {
+            packed.release_original(proof).await
+        } else {
+            self.store.release_clean_packed_shutdown(proof).await
+        };
+        if result.is_ok() {
+            global_workspace_metrics().remove_active_lease();
+        }
+        result
+    }
+
+    pub async fn release(mut self) -> Result<(), WorkspaceError> {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.stop().await;
+        }
+        let result = if let Some(packed) = self.packed.take() {
+            packed.abort_unattached().await
+        } else {
+            self.store
+                .release_lease(ReleaseLease {
+                    lease_id: self.lease.lease_id,
+                    holder_generation: self.lease.holder_generation,
+                })
+                .await
+        };
         if result.is_ok() {
             global_workspace_metrics().remove_active_lease();
         }
@@ -450,6 +517,9 @@ fn duration_ns(duration: Duration) -> Result<u64, WorkspaceError> {
 mod tests;
 
 #[cfg(test)]
+mod acquire_view_tests;
+
+#[cfg(test)]
 mod lease_recovery_tests {
     use super::super::catalog::{CreateVolumeRoot, CreateWorkspace};
     use super::super::model::WorkspaceState;
@@ -467,6 +537,8 @@ mod lease_recovery_tests {
         store.initialize_workspace_schema().await.unwrap();
         let workspace = store
             .create_volume_root(CreateVolumeRoot {
+                volume_format: "workspace-v1".into(),
+                schema_version: super::super::model::WORKSPACE_SCHEMA_VERSION,
                 volume_id: Uuid::new_v4(),
                 workspace_id: WorkspaceId::new(),
                 root_layer_id: LayerId::new(),
@@ -538,6 +610,8 @@ mod lease_recovery_tests {
         store.initialize_workspace_schema().await.unwrap();
         let workspace = store
             .create_volume_root(CreateVolumeRoot {
+                volume_format: "workspace-v1".into(),
+                schema_version: super::super::model::WORKSPACE_SCHEMA_VERSION,
                 volume_id: Uuid::new_v4(),
                 workspace_id: WorkspaceId::new(),
                 root_layer_id: LayerId::new(),

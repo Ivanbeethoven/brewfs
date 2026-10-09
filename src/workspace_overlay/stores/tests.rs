@@ -1,6 +1,8 @@
-use sea_orm::sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use sea_orm::sqlx::SqlitePool;
+use sea_orm::sqlx::sqlite::SqlitePoolOptions;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
@@ -20,7 +22,7 @@ use crate::workspace_overlay::model::{
     ValueOp, ViewContext, XattrDelta,
 };
 
-use super::database::{SqliteWorkspaceStore, StoreFailpoint};
+use super::database::{SqliteWorkspaceStore, StoreFailpoint, V3OpenState};
 
 fn id(value: u128) -> Uuid {
     Uuid::from_u128(value)
@@ -28,6 +30,8 @@ fn id(value: u128) -> Uuid {
 
 fn create_request() -> CreateVolumeRoot {
     CreateVolumeRoot {
+        volume_format: "workspace-v1".into(),
+        schema_version: crate::workspace_overlay::model::WORKSPACE_SCHEMA_VERSION,
         volume_id: id(1),
         workspace_id: WorkspaceId::from_uuid(id(2)),
         root_layer_id: LayerId::from_uuid(id(3)),
@@ -45,12 +49,323 @@ async fn initialized_store() -> SqliteWorkspaceStore {
 }
 
 #[tokio::test]
+async fn uninitialized_catalog_header_probe_does_not_create_schema() {
+    let store = SqliteWorkspaceStore::connect("sqlite::memory:")
+        .await
+        .unwrap();
+    assert_eq!(store.load_volume_header().await.unwrap(), None);
+    assert!(store.schema_table_names().await.unwrap().is_empty());
+    store.initialize_workspace_schema().await.unwrap();
+    let workspace = store.create_volume_root(create_request()).await.unwrap();
+    assert_eq!(workspace.workspace_id, create_request().workspace_id);
+    assert!(store.load_volume_header().await.unwrap().is_some());
+}
+
+// A separate connection corrupts an isolated durable catalog to exercise the
+// public open boundary, rather than replacing its validation with a stand-in.
+async fn v3_open_file_fixture() -> (
+    tempfile::TempDir,
+    SqliteWorkspaceStore,
+    SqlitePool,
+    CreateVolumeRoot,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let url = format!("sqlite://{}", temp.path().join("catalog.db").display());
+    let store = SqliteWorkspaceStore::connect(&url).await.unwrap();
+    store.initialize_workspace_schema().await.unwrap();
+    let request = create_request();
+    store.create_volume_root(request.clone()).await.unwrap();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    (temp, store, pool, request)
+}
+
+type V3SidecarRow = (String, i64, i64, i64, i64, i64, i64);
+
+async fn v3_sidecar_row(pool: &SqlitePool, workspace_id: WorkspaceId) -> Option<V3SidecarRow> {
+    sea_orm::sqlx::query_as(
+        "SELECT owner_id, generation, expires_at_ns, state, recovery_required,
+                opened_at_ns, updated_at_ns
+         FROM ws_v3_workspace_open WHERE workspace_id = ?",
+    )
+    .bind(workspace_id.as_bytes().as_slice())
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+async fn assert_v3_sidecar_bad_record_is_rejected(corruption: &str) {
+    let (_temp, store, pool, request) = v3_open_file_fixture().await;
+    let token = store
+        .open_workspace_v3(request.workspace_id, "valid", Duration::from_secs(30))
+        .await
+        .unwrap();
+    // Simulate corrupted/imported catalog bytes through a separate SQLite
+    // connection. Persisted record validation cannot rely on CREATE's CHECKs.
+    sea_orm::sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sea_orm::sqlx::query(corruption)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before = v3_sidecar_row(&pool, request.workspace_id).await;
+
+    let reopened = store
+        .open_workspace_v3(request.workspace_id, "valid", Duration::from_secs(30))
+        .await;
+    assert!(
+        matches!(reopened, Err(WorkspaceError::CorruptMetadata(_))),
+        "open: {corruption}: {reopened:?}"
+    );
+    assert_eq!(v3_sidecar_row(&pool, request.workspace_id).await, before);
+    let ready = store.mark_workspace_v3_ready(&token).await;
+    assert!(
+        matches!(ready, Err(WorkspaceError::CorruptMetadata(_))),
+        "ready: {corruption}: {ready:?}"
+    );
+    assert_eq!(v3_sidecar_row(&pool, request.workspace_id).await, before);
+    let renewed = store
+        .renew_workspace_v3(&token, Duration::from_secs(30))
+        .await;
+    assert!(
+        matches!(renewed, Err(WorkspaceError::CorruptMetadata(_))),
+        "renew: {corruption}: {renewed:?}"
+    );
+    assert_eq!(v3_sidecar_row(&pool, request.workspace_id).await, before);
+    let closed = store.close_workspace_v3(&token).await;
+    assert!(
+        matches!(closed, Err(WorkspaceError::CorruptMetadata(_))),
+        "close: {corruption}: {closed:?}"
+    );
+    assert_eq!(v3_sidecar_row(&pool, request.workspace_id).await, before);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn v3_sidecar_bad_record_owner_is_strictly_decoded_by_every_api() {
+    for corruption in [
+        "UPDATE ws_v3_workspace_open SET owner_id = ''",
+        "UPDATE ws_v3_workspace_open SET owner_id = ' '",
+        "UPDATE ws_v3_workspace_open SET owner_id = printf('%257s', 'x')",
+    ] {
+        assert_v3_sidecar_bad_record_is_rejected(corruption).await;
+    }
+}
+
+#[tokio::test]
+async fn v3_sidecar_bad_record_zero_generation_is_rejected_without_repair() {
+    assert_v3_sidecar_bad_record_is_rejected("UPDATE ws_v3_workspace_open SET generation = 0")
+        .await;
+}
+
+#[tokio::test]
+async fn v3_sidecar_bad_record_non_boolean_recovery_is_rejected_without_repair() {
+    assert_v3_sidecar_bad_record_is_rejected(
+        "UPDATE ws_v3_workspace_open SET recovery_required = 2",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn v3_sidecar_bad_record_ready_with_recovery_flag_is_rejected_without_repair() {
+    assert_v3_sidecar_bad_record_is_rejected(
+        "UPDATE ws_v3_workspace_open SET state = 1, recovery_required = 1",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn v3_sidecar_bad_record_recovering_without_flag_is_rejected_without_repair() {
+    assert_v3_sidecar_bad_record_is_rejected(
+        "UPDATE ws_v3_workspace_open SET state = 0, recovery_required = 0",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn v3_sidecar_expiry_new_open_rolls_back_at_new_deadline() {
+    let (_temp, store, pool, request) = v3_open_file_fixture().await;
+    store.set_sidecar_time_ns(1000);
+    store.set_sidecar_commit_time_ns(1100);
+    let workspace_before = store.load_workspace(request.workspace_id).await.unwrap();
+    let result = store
+        .open_workspace_v3(request.workspace_id, "first", Duration::from_nanos(100))
+        .await;
+    assert!(matches!(result, Err(WorkspaceError::Fenced)), "{result:?}");
+    assert_eq!(v3_sidecar_row(&pool, request.workspace_id).await, None);
+    assert_eq!(
+        store.load_workspace(request.workspace_id).await.unwrap(),
+        workspace_before
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn v3_sidecar_expiry_live_open_cannot_renew_past_old_deadline() {
+    let (_temp, store, pool, request) = v3_open_file_fixture().await;
+    store.set_sidecar_time_ns(1000);
+    let first = store
+        .open_workspace_v3(request.workspace_id, "same", Duration::from_nanos(100))
+        .await
+        .unwrap();
+    let before = v3_sidecar_row(&pool, request.workspace_id).await;
+    store.set_sidecar_commit_time_ns(1100);
+    let result = store
+        .open_workspace_v3(request.workspace_id, "same", Duration::from_nanos(1000))
+        .await;
+    assert!(matches!(result, Err(WorkspaceError::Fenced)), "{result:?}");
+    assert_eq!(v3_sidecar_row(&pool, request.workspace_id).await, before);
+    assert!(matches!(
+        store
+            .renew_workspace_v3(&first, Duration::from_nanos(1000))
+            .await,
+        Err(WorkspaceError::Fenced)
+    ));
+    let takeover = store
+        .open_workspace_v3(request.workspace_id, "next", Duration::from_nanos(100))
+        .await
+        .unwrap();
+    assert_eq!(takeover.generation, first.generation + 1);
+    assert_eq!(takeover.expires_at_ns, 1200);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn v3_sidecar_expiry_live_open_rolls_back_at_shorter_new_deadline() {
+    let (_temp, store, pool, request) = v3_open_file_fixture().await;
+    store.set_sidecar_time_ns(1000);
+    store
+        .open_workspace_v3(request.workspace_id, "same", Duration::from_nanos(1000))
+        .await
+        .unwrap();
+    let before = v3_sidecar_row(&pool, request.workspace_id).await;
+    store.set_sidecar_commit_time_ns(1100);
+    let result = store
+        .open_workspace_v3(request.workspace_id, "same", Duration::from_nanos(100))
+        .await;
+    assert!(matches!(result, Err(WorkspaceError::Fenced)), "{result:?}");
+    assert_eq!(v3_sidecar_row(&pool, request.workspace_id).await, before);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn v3_sidecar_expiry_renew_cannot_resurrect_owner_after_old_deadline() {
+    let (_temp, store, pool, request) = v3_open_file_fixture().await;
+    store.set_sidecar_time_ns(1000);
+    let token = store
+        .open_workspace_v3(request.workspace_id, "same", Duration::from_nanos(100))
+        .await
+        .unwrap();
+    let before = v3_sidecar_row(&pool, request.workspace_id).await;
+    store.set_sidecar_commit_time_ns(1100);
+    let result = store
+        .renew_workspace_v3(&token, Duration::from_nanos(1000))
+        .await;
+    assert!(matches!(result, Err(WorkspaceError::Fenced)), "{result:?}");
+    assert_eq!(v3_sidecar_row(&pool, request.workspace_id).await, before);
+    assert!(matches!(
+        store
+            .renew_workspace_v3(&token, Duration::from_nanos(1000))
+            .await,
+        Err(WorkspaceError::Fenced)
+    ));
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn v3_sidecar_expiry_renew_rolls_back_at_shorter_new_deadline() {
+    let (_temp, store, pool, request) = v3_open_file_fixture().await;
+    store.set_sidecar_time_ns(1000);
+    let token = store
+        .open_workspace_v3(request.workspace_id, "same", Duration::from_nanos(1000))
+        .await
+        .unwrap();
+    let before = v3_sidecar_row(&pool, request.workspace_id).await;
+    store.set_sidecar_commit_time_ns(1100);
+    let result = store
+        .renew_workspace_v3(&token, Duration::from_nanos(100))
+        .await;
+    assert!(matches!(result, Err(WorkspaceError::Fenced)), "{result:?}");
+    assert_eq!(v3_sidecar_row(&pool, request.workspace_id).await, before);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn v3_sidecar_expiry_ready_rolls_back_at_current_deadline() {
+    let (_temp, store, pool, request) = v3_open_file_fixture().await;
+    store.set_sidecar_time_ns(1000);
+    let token = store
+        .open_workspace_v3(request.workspace_id, "same", Duration::from_nanos(100))
+        .await
+        .unwrap();
+    // Recovery has completed in the valid workspace view, but its sidecar
+    // remains Recovering until the public Ready transaction commits.
+    sea_orm::sqlx::query("UPDATE ws_v3_workspace_open SET state = 0, recovery_required = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before = v3_sidecar_row(&pool, request.workspace_id).await;
+    store.set_sidecar_commit_time_ns(1100);
+    let result = store.mark_workspace_v3_ready(&token).await;
+    assert!(matches!(result, Err(WorkspaceError::Fenced)), "{result:?}");
+    assert_eq!(v3_sidecar_row(&pool, request.workspace_id).await, before);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn v3_sidecar_expiry_close_rolls_back_at_current_deadline() {
+    let (_temp, store, pool, request) = v3_open_file_fixture().await;
+    store.set_sidecar_time_ns(1000);
+    let token = store
+        .open_workspace_v3(request.workspace_id, "same", Duration::from_nanos(100))
+        .await
+        .unwrap();
+    let before = v3_sidecar_row(&pool, request.workspace_id).await;
+    store.set_sidecar_commit_time_ns(1100);
+    let result = store.close_workspace_v3(&token).await;
+    assert!(matches!(result, Err(WorkspaceError::Fenced)), "{result:?}");
+    assert_eq!(v3_sidecar_row(&pool, request.workspace_id).await, before);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn v3_sidecar_expiry_commit_before_deadline_remains_valid() {
+    let (_temp, store, pool, request) = v3_open_file_fixture().await;
+    store.set_sidecar_time_ns(1000);
+    store.set_sidecar_commit_time_ns(1099);
+    let token = store
+        .open_workspace_v3(request.workspace_id, "same", Duration::from_nanos(100))
+        .await
+        .unwrap();
+    assert_eq!(token.expires_at_ns, 1100);
+    let before = v3_sidecar_row(&pool, request.workspace_id).await;
+    store.set_sidecar_time_ns(1100);
+    assert!(matches!(
+        store
+            .renew_workspace_v3(&token, Duration::from_nanos(100))
+            .await,
+        Err(WorkspaceError::Fenced)
+    ));
+    assert_eq!(v3_sidecar_row(&pool, request.workspace_id).await, before);
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn schema_initialization_is_idempotent_and_does_not_create_a_marker() {
     let store = initialized_store().await;
     store.initialize_workspace_schema().await.unwrap();
     let names = store.schema_table_names().await.unwrap();
-    assert_eq!(names.len(), 12);
-    assert!(names.iter().all(|name| name.starts_with("ws_v1_")));
+    assert_eq!(names.len(), 15);
+    assert!(
+        names
+            .iter()
+            .all(|name| name.starts_with("ws_v1_") || name.starts_with("ws_v3_"))
+    );
     assert_eq!(store.load_volume_header().await.unwrap(), None);
 }
 
@@ -77,6 +392,319 @@ async fn volume_root_creation_is_atomic_and_builds_a_valid_two_layer_chain() {
     assert_eq!(chain[1].sealed_version, Some(1));
     assert!(chain[1].delta_digest.is_some());
     assert!(chain[1].root_hash.is_some());
+}
+
+#[tokio::test]
+async fn v3_open_sidecar_fences_live_owner_and_increments_takeover_generation() {
+    let store = initialized_store().await;
+    let request = create_request();
+    let workspace = store.create_volume_root(request).await.unwrap();
+    let first = store
+        .open_workspace_v3(workspace.workspace_id, "sidecar-a", Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(first.generation, 1);
+    assert_eq!(first.state, V3OpenState::Ready);
+    assert!(!first.recovery_required);
+
+    let same_owner = store
+        .open_workspace_v3(workspace.workspace_id, "sidecar-a", Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(same_owner.generation, first.generation);
+    assert!(matches!(
+        store
+            .open_workspace_v3(workspace.workspace_id, "sidecar-b", Duration::from_secs(30))
+            .await,
+        Err(crate::workspace_overlay::error::WorkspaceError::Busy)
+    ));
+
+    store.close_workspace_v3(&first).await.unwrap();
+    let takeover = store
+        .open_workspace_v3(workspace.workspace_id, "sidecar-b", Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(takeover.generation, 2);
+    assert!(matches!(
+        store.close_workspace_v3(&first).await,
+        Err(crate::workspace_overlay::error::WorkspaceError::Fenced)
+    ));
+    store.close_workspace_v3(&takeover).await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_open_sidecar_requires_recovery_for_an_incomplete_seal() {
+    let store = initialized_store().await;
+    let request = create_request();
+    let workspace = store.create_volume_root(request).await.unwrap();
+    let lease = store
+        .acquire_lease(AcquireLease {
+            workspace_id: workspace.workspace_id,
+            lease_id: crate::workspace_overlay::ids::LeaseId::from_uuid(id(40)),
+            holder_generation: 1,
+            ttl_ns: 30_000_000_000,
+        })
+        .await
+        .unwrap();
+    store
+        .begin_seal(BeginSeal {
+            guard: HeadGuard {
+                workspace_id: workspace.workspace_id,
+                expected_head_layer_id: workspace.head_layer_id,
+                expected_head_epoch: workspace.head_epoch,
+                lease_id: lease.lease_id,
+                holder_generation: lease.holder_generation,
+            },
+            journal_id: crate::workspace_overlay::ids::JournalId::from_uuid(id(41)),
+            new_head_layer_id: crate::workspace_overlay::ids::LayerId::from_uuid(id(42)),
+        })
+        .await
+        .unwrap();
+    let token = store
+        .open_workspace_v3(workspace.workspace_id, "recovery", Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(token.state, V3OpenState::Recovering);
+    assert!(token.recovery_required);
+    assert!(matches!(
+        store.mark_workspace_v3_ready(&token).await,
+        Err(crate::workspace_overlay::error::WorkspaceError::Busy)
+    ));
+}
+
+#[tokio::test]
+async fn v3_open_rejects_partial_schema_without_recreating_tables_or_claiming_owner() {
+    for table in [
+        "ws_v1_inode_delta",
+        "ws_v1_seal_journal",
+        "ws_v3_packed_bindings",
+    ] {
+        let (_temp, store, pool, request) = v3_open_file_fixture().await;
+        sea_orm::sqlx::query(&format!("DROP TABLE {table}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let names_before = store.schema_table_names().await.unwrap();
+        let header_before = store.load_volume_header().await.unwrap();
+        let workspace_before = store.load_workspace(request.workspace_id).await.unwrap();
+
+        let result = store
+            .open_workspace_v3(
+                request.workspace_id,
+                "must-not-claim",
+                Duration::from_secs(30),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(WorkspaceError::CorruptMetadata(_))),
+            "{table}"
+        );
+        assert_eq!(
+            store.schema_table_names().await.unwrap(),
+            names_before,
+            "{table}"
+        );
+        assert_eq!(
+            store.load_volume_header().await.unwrap(),
+            header_before,
+            "{table}"
+        );
+        assert_eq!(
+            store.load_workspace(request.workspace_id).await.unwrap(),
+            workspace_before,
+            "{table}"
+        );
+        let open_rows: i64 =
+            sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM ws_v3_workspace_open")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(open_rows, 0, "{table}");
+        pool.close().await;
+    }
+}
+
+#[tokio::test]
+async fn v3_open_rejects_invalid_workspace_marker_head_and_base_before_claim() {
+    for corruption in [
+        "UPDATE ws_v1_volume_header SET volume_id = X'01'",
+        "UPDATE ws_v1_workspaces SET state = 3",
+        "UPDATE ws_v1_workspaces SET state = 4",
+        "UPDATE ws_v1_workspaces SET state = 2",
+        "UPDATE ws_v1_workspaces SET head_layer_id = X'000000000000000000000000000003ff'",
+        "UPDATE ws_v1_layers SET state = 3 WHERE state = 0",
+        "UPDATE ws_v1_layers SET owner_workspace_id = NULL WHERE state = 0",
+        "UPDATE ws_v1_layers SET owner_workspace_id = X'000000000000000000000000000003ff' WHERE state = 0",
+        "UPDATE ws_v1_layers SET schema_version = 99 WHERE state = 0",
+        "UPDATE ws_v1_layers SET schema_version = 99 WHERE state = 2",
+        "UPDATE ws_v1_layers SET depth = 3 WHERE state = 0",
+        "UPDATE ws_v1_layers SET root_hash = NULL WHERE state = 2",
+    ] {
+        let (_temp, store, pool, request) = v3_open_file_fixture().await;
+        sea_orm::sqlx::query(corruption)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let result = store
+            .open_workspace_v3(
+                request.workspace_id,
+                "must-not-claim",
+                Duration::from_secs(30),
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(WorkspaceError::CorruptMetadata(_))
+                    | Err(WorkspaceError::UnsupportedSchemaVersion(_))
+                    | Err(WorkspaceError::LayerNotFound(_))
+            ),
+            "unexpected open result after {corruption}: {result:?}"
+        );
+        let open_rows: i64 =
+            sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM ws_v3_workspace_open")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(open_rows, 0, "{corruption}");
+        pool.close().await;
+    }
+}
+
+#[tokio::test]
+async fn v3_open_live_owner_rechecks_new_seal_and_ready_rechecks_damaged_head() {
+    let (_temp, store, pool, request) = v3_open_file_fixture().await;
+    let token = store
+        .open_workspace_v3(request.workspace_id, "same-owner", Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(token.state, V3OpenState::Ready);
+    let workspace = store.load_workspace(request.workspace_id).await.unwrap();
+    let lease = store
+        .acquire_lease(AcquireLease {
+            workspace_id: workspace.workspace_id,
+            lease_id: LeaseId::from_uuid(id(45)),
+            holder_generation: 1,
+            ttl_ns: 30_000_000_000,
+        })
+        .await
+        .unwrap();
+    let journal_id = crate::workspace_overlay::ids::JournalId::from_uuid(id(46));
+    store
+        .begin_seal(BeginSeal {
+            guard: HeadGuard {
+                workspace_id: workspace.workspace_id,
+                expected_head_layer_id: workspace.head_layer_id,
+                expected_head_epoch: workspace.head_epoch,
+                lease_id: lease.lease_id,
+                holder_generation: lease.holder_generation,
+            },
+            journal_id,
+            new_head_layer_id: LayerId::from_uuid(id(47)),
+        })
+        .await
+        .unwrap();
+
+    let reopened = store
+        .open_workspace_v3(request.workspace_id, "same-owner", Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(reopened.generation, token.generation);
+    assert_eq!(reopened.state, V3OpenState::Recovering);
+    assert!(reopened.recovery_required);
+    assert!(matches!(
+        store.mark_workspace_v3_ready(&reopened).await,
+        Err(WorkspaceError::Busy)
+    ));
+
+    store
+        .abort_recoverable_seal(crate::workspace_overlay::catalog::AbortSeal {
+            journal_id,
+            reason: "fixture recovery".into(),
+        })
+        .await
+        .unwrap();
+    sea_orm::sqlx::query("UPDATE ws_v1_layers SET owner_workspace_id = NULL WHERE state = 0")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.mark_workspace_v3_ready(&reopened).await,
+        Err(WorkspaceError::CorruptMetadata(_))
+    ));
+    let persisted_state: i64 =
+        sea_orm::sqlx::query_scalar("SELECT state FROM ws_v3_workspace_open")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(persisted_state, V3OpenState::Recovering as i64);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn v3_open_owner_bound_counts_utf8_bytes_before_writing_sidecar() {
+    let store = initialized_store().await;
+    let request = create_request();
+    store.create_volume_root(request.clone()).await.unwrap();
+    for invalid in [String::new(), " ".into(), "x".repeat(257), "中".repeat(86)] {
+        assert!(matches!(
+            store
+                .open_workspace_v3(request.workspace_id, invalid, Duration::from_secs(30))
+                .await,
+            Err(WorkspaceError::CorruptMetadata(_))
+        ));
+    }
+    let token = store
+        .open_workspace_v3(
+            request.workspace_id,
+            "x".repeat(256),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    assert_eq!(token.generation, 1);
+    assert_eq!(token.owner_id.len(), 256);
+}
+
+#[tokio::test]
+async fn v3_open_rejects_claimed_binding_without_current_or_with_corrupt_current() {
+    for install_current in [false, true] {
+        let (_temp, store, pool, request) = v3_open_file_fixture().await;
+        sea_orm::sqlx::query(
+            "INSERT INTO ws_v3_packed_bindings(workspace_id, binding_version, record) VALUES (?, 1, ?)",
+        )
+        .bind(request.workspace_id.as_bytes().as_slice())
+        .bind(b"corrupt-PWB3".as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+        if install_current {
+            sea_orm::sqlx::query(
+                "INSERT INTO ws_v3_packed_current(workspace_id, binding_version) VALUES (?, 1)",
+            )
+            .bind(request.workspace_id.as_bytes().as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert!(matches!(
+            store
+                .open_workspace_v3(
+                    request.workspace_id,
+                    "must-not-claim",
+                    Duration::from_secs(30)
+                )
+                .await,
+            Err(WorkspaceError::CorruptMetadata(_))
+        ));
+        let open_rows: i64 =
+            sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM ws_v3_workspace_open")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(open_rows, 0);
+        pool.close().await;
+    }
 }
 
 #[tokio::test]
@@ -1043,4 +1671,8 @@ async fn independent_store_instances_serialize_concurrent_workspace_writers() {
         .unwrap();
     assert_eq!(first_rows.len(), MUTATIONS as usize);
     assert_eq!(second_rows.len(), MUTATIONS as usize);
+}
+
+mod g13_gc_candidates {
+    include!("g13_sqlite_gc_tests.rs");
 }

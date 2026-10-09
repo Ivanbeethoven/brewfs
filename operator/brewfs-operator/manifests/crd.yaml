@@ -151,9 +151,49 @@ spec:
                     format: uint32
                     minimum: 0.0
                     type: integer
+                  metadataAdminSecretRef:
+                    additionalProperties: false
+                    description: Namespace-local transport credentials; their presence alone grants no admin capability.
+                    nullable: true
+                    properties:
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  metadataRuntimeSecretRef:
+                    additionalProperties: false
+                    description: Namespace-local transport credentials; their presence alone grants no admin capability.
+                    nullable: true
+                    properties:
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
                   namespace:
                     nullable: true
                     type: string
+                  objectAdminSecretRef:
+                    additionalProperties: false
+                    description: Namespace-local object credentials. Keys are accessKey and secretKey.
+                    nullable: true
+                    properties:
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  objectRuntimeSecretRef:
+                    additionalProperties: false
+                    description: Namespace-local object credentials. Keys are accessKey and secretKey.
+                    nullable: true
+                    properties:
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
                   tikvPdEndpoints:
                     default: []
                     items:
@@ -191,6 +231,50 @@ spec:
               workspace:
                 nullable: true
                 properties:
+                  capabilities:
+                    default:
+                      packedBinding:
+                        state: unavailable
+                      packedV3: unsupported
+                      volumeFormat: workspace-v1
+                    description: Explicit capability/binding state for lower metadata. The operator currently bootstraps the native catalog only; a missing capability is represented in status instead of being inferred from rootRevision.
+                    properties:
+                      packedBinding:
+                        default:
+                          state: unavailable
+                        properties:
+                          manifest_digest:
+                            maxLength: 64
+                            minLength: 64
+                            pattern: ^[0-9a-f]{64}$
+                            type: string
+                          state:
+                            enum:
+                            - unavailable
+                            - missing
+                            - corrupt
+                            - present
+                            type: string
+                          version:
+                            format: uint64
+                            minimum: 1.0
+                            type: integer
+                        required:
+                        - state
+                        type: object
+                        x-kubernetes-validations:
+                        - message: present bindings require version and manifest_digest; other states must omit both
+                          rule: 'self.state == ''present'' ? has(self.version) && has(self.manifest_digest) : !has(self.version) && !has(self.manifest_digest)'
+                      packedV3:
+                        default: unsupported
+                        enum:
+                        - unsupported
+                        - readonly
+                        type: string
+                      volumeFormat:
+                        default: workspace-v1
+                        type: string
+                    type: object
                   catalogBackend:
                     enum:
                     - Redis
@@ -198,6 +282,32 @@ spec:
                     type: string
                   catalogNamespace:
                     type: string
+                  conditions:
+                    items:
+                      properties:
+                        lastTransitionTime:
+                          format: date-time
+                          type: string
+                        message:
+                          type: string
+                        observedGeneration:
+                          format: int64
+                          nullable: true
+                          type: integer
+                        reason:
+                          type: string
+                        status:
+                          type: string
+                        type:
+                          type: string
+                      required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                      type: object
+                    type: array
                   rootRevision:
                     properties:
                       layerId:
@@ -1601,6 +1711,50 @@ spec:
               activeMountRef:
                 nullable: true
                 type: string
+              capabilities:
+                default:
+                  packedBinding:
+                    state: unavailable
+                  packedV3: unsupported
+                  volumeFormat: workspace-v1
+                description: Explicit capability/binding state for lower metadata. The operator currently bootstraps the native catalog only; a missing capability is represented in status instead of being inferred from rootRevision.
+                properties:
+                  packedBinding:
+                    default:
+                      state: unavailable
+                    properties:
+                      manifest_digest:
+                        maxLength: 64
+                        minLength: 64
+                        pattern: ^[0-9a-f]{64}$
+                        type: string
+                      state:
+                        enum:
+                        - unavailable
+                        - missing
+                        - corrupt
+                        - present
+                        type: string
+                      version:
+                        format: uint64
+                        minimum: 1.0
+                        type: integer
+                    required:
+                    - state
+                    type: object
+                    x-kubernetes-validations:
+                    - message: present bindings require version and manifest_digest; other states must omit both
+                      rule: 'self.state == ''present'' ? has(self.version) && has(self.manifest_digest) : !has(self.version) && !has(self.manifest_digest)'
+                  packedV3:
+                    default: unsupported
+                    enum:
+                    - unsupported
+                    - readonly
+                    type: string
+                  volumeFormat:
+                    default: workspace-v1
+                    type: string
+                type: object
               conditions:
                 items:
                   properties:
@@ -2728,6 +2882,17 @@ spec:
                     nullable: true
                     type: string
                 type: object
+              clusterRef:
+                description: |-
+                  Cluster that owns the referenced workspace and its catalog.
+
+                  Keeping this reference on the mount makes the catalog boundary explicit. The controller verifies it against the workspace before creating any workload or acquiring a lease.
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
               image:
                 default: brewfs:local
                 type: string
@@ -2758,6 +2923,7 @@ spec:
                 - name
                 type: object
             required:
+            - clusterRef
             - workspaceRef
             type: object
           status:

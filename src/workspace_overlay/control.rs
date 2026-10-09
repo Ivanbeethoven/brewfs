@@ -136,6 +136,8 @@ mod tests {
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(1001));
         store
             .create_volume_root(CreateVolumeRoot {
+                volume_format: "workspace-v1".into(),
+                schema_version: crate::workspace_overlay::model::WORKSPACE_SCHEMA_VERSION,
                 volume_id: Uuid::from_u128(1002),
                 workspace_id,
                 root_layer_id: LayerId::from_uuid(Uuid::from_u128(1003)),
@@ -178,6 +180,8 @@ mod tests {
         let workspace_id = WorkspaceId::new();
         store
             .create_volume_root(CreateVolumeRoot {
+                volume_format: "workspace-v1".into(),
+                schema_version: crate::workspace_overlay::model::WORKSPACE_SCHEMA_VERSION,
                 volume_id: Uuid::new_v4(),
                 workspace_id,
                 root_layer_id: LayerId::new(),

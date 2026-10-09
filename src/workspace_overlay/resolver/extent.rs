@@ -13,6 +13,14 @@ pub struct ResolvedExtent {
     pub kind: ExtentKind,
 }
 
+/// Upper Data/Hole winners and truly unclaimed intervals are separate. This
+/// in-memory type is not added to the persisted ExtentKind schema.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResolvedCoverage {
+    pub covered: Vec<ResolvedExtent>,
+    pub absent: Vec<Range<u64>>,
+}
+
 impl ResolvedExtent {
     fn end(&self) -> Result<u64, WorkspaceError> {
         self.logical_offset.checked_add(self.length).ok_or_else(|| {
@@ -28,6 +36,26 @@ pub fn resolve_extents(
     chunk_index: u64,
     requested: Range<u64>,
 ) -> Result<Vec<ResolvedExtent>, WorkspaceError> {
+    let ResolvedCoverage {
+        mut covered,
+        absent,
+    } = resolve_extent_coverage(chain, deltas, ino, chunk_index, requested)?;
+    covered.extend(absent.into_iter().map(|gap| ResolvedExtent {
+        logical_offset: gap.start,
+        length: gap.end - gap.start,
+        kind: ExtentKind::Hole,
+    }));
+    covered.sort_by_key(|extent| extent.logical_offset);
+    merge_adjacent(covered)
+}
+
+pub fn resolve_extent_coverage(
+    chain: &[LayerRecord],
+    deltas: &[DataExtentDelta],
+    ino: i64,
+    chunk_index: u64,
+    requested: Range<u64>,
+) -> Result<ResolvedCoverage, WorkspaceError> {
     let head = chain
         .first()
         .ok_or_else(|| WorkspaceError::CorruptMetadata("empty layer chain".into()))?;
@@ -38,14 +66,23 @@ pub fn resolve_extents(
         ));
     }
     if requested.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ResolvedCoverage::default());
     }
 
     let chain_ids: HashSet<_> = chain.iter().map(|layer| layer.layer_id).collect();
+    let mut sequences = HashSet::new();
     for delta in deltas.iter().filter(|delta| {
         chain_ids.contains(&delta.layer_id) && delta.ino == ino && delta.chunk_index == chunk_index
     }) {
         delta.validate()?;
+        // Validate identity collisions before full coverage can short-circuit
+        // older rows. Their order must never choose an ambiguous winner.
+        if !sequences.insert((delta.layer_id, delta.sequence)) {
+            return Err(WorkspaceError::CorruptMetadata(format!(
+                "duplicate extent sequence {} in layer {}",
+                delta.sequence, delta.layer_id
+            )));
+        }
     }
 
     let mut uncovered = vec![requested.clone()];
@@ -61,14 +98,7 @@ pub fn resolve_extents(
             .collect::<Vec<_>>();
         layer_extents.sort_by_key(|extent| std::cmp::Reverse(extent.sequence));
 
-        let mut sequences = HashSet::with_capacity(layer_extents.len());
         for extent in layer_extents {
-            if !sequences.insert(extent.sequence) {
-                return Err(WorkspaceError::CorruptMetadata(format!(
-                    "duplicate extent sequence {} in layer {}",
-                    extent.sequence, extent.layer_id
-                )));
-            }
             if uncovered.is_empty() {
                 break;
             }
@@ -126,13 +156,11 @@ pub fn resolve_extents(
         }
     }
 
-    resolved.extend(uncovered.into_iter().map(|gap| ResolvedExtent {
-        logical_offset: gap.start,
-        length: gap.end - gap.start,
-        kind: ExtentKind::Hole,
-    }));
     resolved.sort_by_key(|extent| extent.logical_offset);
-    merge_adjacent(resolved)
+    Ok(ResolvedCoverage {
+        covered: merge_adjacent(resolved)?,
+        absent: uncovered,
+    })
 }
 
 fn merge_adjacent(extents: Vec<ResolvedExtent>) -> Result<Vec<ResolvedExtent>, WorkspaceError> {

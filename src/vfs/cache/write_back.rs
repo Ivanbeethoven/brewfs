@@ -11,6 +11,11 @@ use crate::chunk::store::persistent_slice_cache_path;
 
 use super::keys::{DirtySliceKey, DirtySliceState};
 
+#[cfg(feature = "workspace-overlay")]
+mod packed_recovery;
+#[cfg(feature = "workspace-overlay")]
+pub(crate) use packed_recovery::MAX_PACKED_RECOVERY_SLICE_BYTES;
+
 /// Record describing a dirty slice persisted to local SSD.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DirtySliceRecord {
@@ -93,6 +98,27 @@ pub struct FsWriteBackCache {
 }
 
 impl FsWriteBackCache {
+    #[cfg(feature = "workspace-overlay")]
+    pub(crate) fn has_recoverable_for_inode(
+        &self,
+        ino: i64,
+        max_rows: usize,
+    ) -> anyhow::Result<bool> {
+        let mut found = false;
+        for (index, key) in self.recoverable_keys.iter().enumerate() {
+            if index >= max_rows {
+                return Err(
+                    crate::workspace_overlay::packed_v3::PackedWireError::LimitExceeded(
+                        "recovery overlay probe row cap".into(),
+                    )
+                    .into(),
+                );
+            }
+            found |= key.ino == ino;
+        }
+        Ok(found)
+    }
+
     pub fn new(root: PathBuf) -> Self {
         Self::new_with_sync(root, true)
     }
@@ -501,14 +527,13 @@ impl WriteBackCache for FsWriteBackCache {
             let allocation_len = allocation_end.saturating_sub(allocation_start);
             let allocation_path = slice_path.clone();
             tokio::task::spawn_blocking(move || {
+                use std::os::fd::AsRawFd;
+
                 let file = std::fs::OpenOptions::new()
                     .create(true)
                     .truncate(false)
                     .write(true)
                     .open(allocation_path)?;
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                use std::os::fd::AsRawFd;
-                #[cfg(any(target_os = "linux", target_os = "android"))]
                 let result = unsafe {
                     libc::fallocate(
                         file.as_raw_fd(),
@@ -517,18 +542,8 @@ impl WriteBackCache for FsWriteBackCache {
                         allocation_len as libc::off_t,
                     )
                 };
-                #[cfg(any(target_os = "linux", target_os = "android"))]
                 if result == -1 {
                     return Err(std::io::Error::last_os_error());
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                {
-                    let original_len = file.metadata()?.len();
-                    let allocation_end = allocation_start.saturating_add(allocation_len);
-                    if allocation_end > original_len {
-                        file.set_len(allocation_end)?;
-                        file.set_len(original_len)?;
-                    }
                 }
                 Ok::<(), std::io::Error>(())
             })
@@ -720,10 +735,6 @@ impl WriteBackCache for FsWriteBackCache {
 }
 
 impl FsWriteBackCache {
-    pub(crate) fn has_recoverable_data(&self) -> bool {
-        !self.recoverable_keys.is_empty()
-    }
-
     /// Overlay dirty data from SSD onto a read buffer.
     /// Scans dirty slices for the given inode/chunk and copies any
     /// overlapping ranges into `buf`.  Used as a fallback when in-memory

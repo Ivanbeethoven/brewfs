@@ -2,11 +2,11 @@
 
 use crate::chunk::BlockStore;
 use crate::meta::MetaLayer;
-use crate::meta::store::FileAttr;
+use crate::meta::store::{FileAttr, MetaError};
 use crate::vfs::fs::DirEntry;
 use crate::vfs::io::{FileReader, FileWriter};
 use anyhow::anyhow;
-use bytes::Bytes;
+use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -29,6 +29,64 @@ use tokio::task::JoinHandle;
 const MAX_READDIR_ENTRIES: usize = 256;
 const WRITE_DIRTY_DATA: u8 = 0b0000_0001;
 const WRITE_DIRTY_NEEDS_TIMESTAMP: u8 = 0b0000_0010;
+
+/// Async source for a snapshot-paged directory handle.
+///
+/// The source owns the immutable snapshot identity and fetches only the page
+/// requested by the caller.  It is deliberately kept behind a small trait so
+/// the generic VFS can retain its legacy materialized handles for mutable
+/// metadata backends while packed metadata uses the bounded path.
+#[async_trait]
+pub trait DirectoryPageSource: Send + Sync {
+    async fn read_page_owned(
+        &self,
+        ino: i64,
+        offset: u64,
+        max_entries: usize,
+    ) -> Result<OwnedDirectoryPage, MetaError> {
+        self.read_page(ino, offset, max_entries)
+            .await
+            .map(OwnedDirectoryPage::from)
+    }
+    async fn read_page(
+        &self,
+        ino: i64,
+        child_offset: u64,
+        max_entries: usize,
+    ) -> Result<Vec<RawDirEntry>, MetaError>;
+}
+
+/// A directory entry whose name remains in the POSIX byte domain.
+///
+/// Mutable metadata backends still expose the historical UTF-8 `DirEntry`
+/// type. Packed snapshots use this representation on the page path so a
+/// non-UTF-8 component is not normalized or lossy-converted before FUSE sees
+/// it.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RawDirEntry {
+    pub name: Vec<u8>,
+    pub ino: i64,
+    pub kind: crate::meta::store::FileType,
+}
+
+pub struct OwnedDirectoryPage {
+    pub entries: Vec<RawDirEntry>,
+    pub guard: Option<crate::meta::layer::MetadataMemoryGuard>,
+}
+impl From<Vec<RawDirEntry>> for OwnedDirectoryPage {
+    fn from(entries: Vec<RawDirEntry>) -> Self {
+        Self {
+            entries,
+            guard: None,
+        }
+    }
+}
+impl std::ops::Deref for OwnedDirectoryPage {
+    type Target = [RawDirEntry];
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct WriteDirtyState {
@@ -224,6 +282,7 @@ where
     write_dirty: AtomicU8,
     gate: Arc<HandleGate>,
     state: StdMutex<FileHandleState<B, M>>,
+    _memory_guard: Option<crate::meta::layer::MetadataMemoryGuard>,
 }
 
 /// Default attribute cache TTL for open files (seconds).
@@ -235,6 +294,15 @@ where
     M: MetaLayer + Send + Sync + 'static,
 {
     pub(crate) fn new(fh: u64, ino: i64, attr: FileAttr, flags: HandleFlags) -> Self {
+        Self::new_owned(fh, ino, attr, flags, None)
+    }
+    pub(crate) fn new_owned(
+        fh: u64,
+        ino: i64,
+        attr: FileAttr,
+        flags: HandleFlags,
+        memory_guard: Option<crate::meta::layer::MetadataMemoryGuard>,
+    ) -> Self {
         Self {
             fh,
             ino,
@@ -249,6 +317,7 @@ where
                 reader: None,
                 writer: None,
             }),
+            _memory_guard: memory_guard,
         }
     }
 
@@ -364,11 +433,6 @@ where
 
     #[tracing::instrument(name = "Handle.read", level = "trace", skip(self))]
     pub(crate) async fn read(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
-        Ok(self.read_bytes(offset, len).await?.to_vec())
-    }
-
-    #[tracing::instrument(name = "Handle.read_bytes", level = "trace", skip(self))]
-    pub(crate) async fn read_bytes(&self, offset: u64, len: usize) -> anyhow::Result<Bytes> {
         let _guard = self.gate.read_lock().await;
         let reader = {
             let guard = self.state.lock().unwrap();
@@ -377,7 +441,7 @@ where
                 .clone()
                 .ok_or_else(|| anyhow!("file handle reader not initialized"))?
         };
-        let data = reader.read_bytes(offset, len).await?;
+        let data = reader.read(offset, len).await?;
         self.update_offset(offset + data.len() as u64);
         Ok(data)
     }
@@ -439,6 +503,44 @@ where
         let guard = self.gate.write_lock().await;
         FileHandleWriteGuard { _guard: guard }
     }
+
+    #[cfg(feature = "workspace-overlay")]
+    pub(crate) async fn lock_read(&self) -> FileHandleReadGuard {
+        FileHandleReadGuard {
+            guard: self.gate.read_lock().await,
+        }
+    }
+
+    /// The caller holds the inode mutation lock before this handle gate, and
+    /// owns the complete request fence and logical delivery accounting.
+    #[cfg(feature = "workspace-overlay")]
+    pub(crate) async fn read_into_unaccounted_locked(
+        &self,
+        guard: &FileHandleReadGuard,
+        offset: u64,
+        output: &mut [u8],
+        delivery: Option<Arc<crate::cadapter::read_observer::OperationDelivery>>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Arc::ptr_eq(&guard.guard.gate, &self.gate),
+            "wrong handle read gate"
+        );
+        let reader = self
+            .state
+            .lock()
+            .unwrap()
+            .reader
+            .clone()
+            .ok_or_else(|| anyhow!("file handle reader not initialized"))?;
+        reader
+            .read_at_into_unaccounted(offset, output, delivery)
+            .await
+    }
+}
+
+#[cfg(feature = "workspace-overlay")]
+pub(crate) struct FileHandleReadGuard {
+    guard: HandleReadGuard,
 }
 
 pub(crate) struct FileHandleWriteGuard {
@@ -468,12 +570,14 @@ pub struct DirHandle {
     pub(crate) ino: i64,
     pub(crate) attr: Option<FileAttr>,
     pub(crate) entries: Vec<DirEntry>,
+    pub(crate) page_source: Option<Arc<dyn DirectoryPageSource>>,
     #[allow(dead_code)]
     pub(crate) opened_at: Instant,
     /// Background task handle for batch attribute prefetching
     pub(crate) prefetch_task: Option<JoinHandle<()>>,
     /// Flag indicating whether prefetch task has completed
     pub(crate) prefetch_done: Arc<AtomicBool>,
+    _memory_guard: Option<crate::meta::layer::MetadataMemoryGuard>,
 }
 
 impl DirHandle {
@@ -483,9 +587,11 @@ impl DirHandle {
             ino,
             attr: None,
             entries,
+            page_source: None,
             opened_at: Instant::now(),
             prefetch_task: None,
             prefetch_done: Arc::new(AtomicBool::new(false)),
+            _memory_guard: None,
         }
     }
 
@@ -499,9 +605,24 @@ impl DirHandle {
             ino,
             attr: None,
             entries,
+            page_source: None,
             opened_at: Instant::now(),
             prefetch_task: Some(task),
             prefetch_done: done_flag,
+            _memory_guard: None,
+        }
+    }
+
+    pub(crate) fn new_paged(ino: i64, page_source: Arc<dyn DirectoryPageSource>) -> Self {
+        Self {
+            ino,
+            attr: None,
+            entries: Vec::new(),
+            page_source: Some(page_source),
+            opened_at: Instant::now(),
+            prefetch_task: None,
+            prefetch_done: Arc::new(AtomicBool::new(true)),
+            _memory_guard: None,
         }
     }
 
@@ -509,15 +630,87 @@ impl DirHandle {
         self.attr = Some(attr);
         self
     }
+    pub(crate) fn with_memory_guard(
+        mut self,
+        guard: Option<crate::meta::layer::MetadataMemoryGuard>,
+    ) -> Self {
+        self._memory_guard = guard;
+        self
+    }
 
     /// Get entries starting from offset, limited to MAX_READDIR_ENTRIES
     pub(crate) fn get_entries(&self, offset: u64) -> Vec<DirEntry> {
+        if self.page_source.is_some() {
+            return Vec::new();
+        }
         let start = offset as usize;
         if start >= self.entries.len() {
             return Vec::new();
         }
         let end = std::cmp::min(start + MAX_READDIR_ENTRIES, self.entries.len());
         self.entries[start..end].to_vec()
+    }
+
+    pub(crate) async fn get_entries_page(
+        &self,
+        offset: u64,
+        max_entries: usize,
+    ) -> Result<Vec<DirEntry>, MetaError> {
+        self.get_entries_page_raw(offset, max_entries)
+            .await?
+            .into_iter()
+            .map(|entry| {
+                let name = String::from_utf8(entry.name).map_err(|_| MetaError::InvalidFilename)?;
+                Ok(DirEntry {
+                    name,
+                    ino: entry.ino,
+                    kind: entry.kind,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) async fn get_entries_page_raw(
+        &self,
+        offset: u64,
+        max_entries: usize,
+    ) -> Result<Vec<RawDirEntry>, MetaError> {
+        if let Some(source) = &self.page_source {
+            return source.read_page(self.ino, offset, max_entries).await;
+        }
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        if start >= self.entries.len() || max_entries == 0 {
+            return Ok(Vec::new());
+        }
+        let end = start
+            .saturating_add(max_entries.min(MAX_READDIR_ENTRIES))
+            .min(self.entries.len());
+        Ok(self.entries[start..end]
+            .iter()
+            .map(|entry| RawDirEntry {
+                name: entry.name.as_bytes().to_vec(),
+                ino: entry.ino,
+                kind: entry.kind,
+            })
+            .collect())
+    }
+
+    pub(crate) async fn get_entries_page_raw_owned(
+        &self,
+        offset: u64,
+        max_entries: usize,
+    ) -> Result<OwnedDirectoryPage, MetaError> {
+        if let Some(source) = &self.page_source {
+            source.read_page_owned(self.ino, offset, max_entries).await
+        } else {
+            self.get_entries_page_raw(offset, max_entries)
+                .await
+                .map(OwnedDirectoryPage::from)
+        }
+    }
+
+    pub(crate) fn is_paged(&self) -> bool {
+        self.page_source.is_some()
     }
 
     /// Get total number of entries
@@ -549,6 +742,35 @@ impl Drop for DirHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RawPageSource;
+
+    #[async_trait]
+    impl DirectoryPageSource for RawPageSource {
+        async fn read_page(
+            &self,
+            _ino: i64,
+            _child_offset: u64,
+            _max_entries: usize,
+        ) -> Result<Vec<RawDirEntry>, MetaError> {
+            Ok(vec![RawDirEntry {
+                name: vec![b'a', 0xff, b'b'],
+                ino: 7,
+                kind: crate::meta::store::FileType::File,
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn paged_handle_preserves_raw_name_bytes_until_fuse_boundary() {
+        let handle = DirHandle::new_paged(1, Arc::new(RawPageSource));
+        let raw = handle.get_entries_page_raw(0, 256).await.unwrap();
+        assert_eq!(raw[0].name, vec![b'a', 0xff, b'b']);
+        assert!(matches!(
+            handle.get_entries_page(0, 256).await,
+            Err(MetaError::InvalidFilename)
+        ));
+    }
 
     #[test]
     fn write_dirty_state_tracks_extending_writes_without_timestamp_update() {

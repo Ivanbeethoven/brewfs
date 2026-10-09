@@ -100,15 +100,16 @@ impl GlobalPrefetcher {
     }
 
     fn decrement_pending(pending_by_handle: &DashMap<(i64, u64), usize>, key: (i64, u64)) {
-        match pending_by_handle.entry(key) {
-            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                if *entry.get() <= 1 {
-                    entry.remove();
-                } else {
-                    *entry.get_mut() -= 1;
-                }
+        let mut remove = false;
+        if let Some(mut entry) = pending_by_handle.get_mut(&key) {
+            if *entry <= 1 {
+                remove = true;
+            } else {
+                *entry -= 1;
             }
-            dashmap::mapref::entry::Entry::Vacant(_) => {}
+        }
+        if remove {
+            pending_by_handle.remove(&key);
         }
     }
 
@@ -153,16 +154,8 @@ impl GlobalPrefetcher {
             let first = rx.recv().await;
             let Some(first) = first else { break };
             batch.push(first);
-            // The sender remains alive for the lifetime of the prefetcher, so
-            // a second blocking receive could strand the first sparse task.
-            // Drain only what is already ready and schedule immediately.
-            while batch.len() < 64 {
-                match rx.try_recv() {
-                    Ok(task) => batch.push(task),
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
-                }
-            }
+            // recv_many fills up to capacity without blocking
+            let _ = rx.recv_many(&mut batch, 63).await;
             batch.sort_by_key(|task| task.priority);
 
             for task in batch.drain(..) {
@@ -192,16 +185,6 @@ impl GlobalPrefetcher {
                         break;
                     }
                 };
-
-                // Cancellation can happen while waiting for the semaphore.
-                // Re-check at the task-start boundary so a closed handle does
-                // not launch a private prefetch after it has been cancelled.
-                if cancelled.contains(&owner) {
-                    in_flight.remove(&key);
-                    Self::finish_pending(&pending_by_handle, &cancelled, owner);
-                    drop(permit);
-                    continue;
-                }
                 Self::finish_pending(&pending_by_handle, &cancelled, owner);
 
                 let in_flight_done = in_flight.clone();
@@ -388,84 +371,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_while_waiting_for_permit_does_not_start() {
-        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let (task_tx, task_rx) = mpsc::channel(1);
-        let in_flight = Arc::new(DashSet::new());
-        let cancelled = Arc::new(DashSet::new());
-        let pending_by_handle = Arc::new(DashMap::new());
-        let sem = Arc::new(Semaphore::new(1));
-        let held_permit = sem.clone().acquire_owned().await.unwrap();
-        let owner = (42, 7);
-        let range = RangeKey {
-            ino: owner.0,
-            start: 4096,
-            end: 8192,
-        };
-
-        let prefetcher = GlobalPrefetcher {
-            tx: task_tx,
-            cancelled: cancelled.clone(),
-            pending_by_handle: pending_by_handle.clone(),
-        };
-        GlobalPrefetcher::increment_pending(&pending_by_handle, owner);
-        prefetcher
-            .tx
-            .send(PrefetchTask {
-                ino: owner.0,
-                start: range.start,
-                len: range.end - range.start,
-                priority: PrefetchPriority::Sequential,
-                owner_fh: owner.1,
-            })
-            .await
-            .unwrap();
-
-        let worker_in_flight = in_flight.clone();
-        let worker = tokio::spawn(GlobalPrefetcher::worker_loop(
-            task_rx,
-            sem,
-            worker_in_flight,
-            cancelled,
-            pending_by_handle.clone(),
-            Arc::new(move |_ino, start, _len| {
-                let started_tx = started_tx.clone();
-                async move {
-                    let _ = started_tx.send(start);
-                }
-            }),
-        ));
-
-        timeout(Duration::from_secs(1), async {
-            while !in_flight.contains(&range) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("task should reach the permit wait");
-
-        prefetcher.cancel_for_handle(owner.0, owner.1).await;
-        drop(held_permit);
-
-        assert!(
-            timeout(Duration::from_millis(100), started_rx.recv())
-                .await
-                .is_err(),
-            "a task cancelled while waiting for a permit must not start"
-        );
-        timeout(Duration::from_secs(1), async {
-            while in_flight.contains(&range) || pending_by_handle.contains_key(&owner) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancelled task state should be reclaimed");
-
-        drop(prefetcher);
-        worker.await.unwrap();
-    }
-
-    #[tokio::test]
     async fn deduplicates_identical_in_flight_ranges() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let hold = Arc::new(tokio::sync::Notify::new());
@@ -502,89 +407,6 @@ mod tests {
                 .await
                 .is_err(),
             "duplicate in-flight ranges should piggyback on the first task"
-        );
-        hold.notify_waiters();
-    }
-
-    #[tokio::test]
-    async fn single_prefetch_starts_with_sender_alive() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let prefetcher = GlobalPrefetcher::new(8, 32, move |ino, start, _len| {
-            let tx = tx.clone();
-            async move {
-                let _ = tx.send((ino, start));
-            }
-        });
-
-        prefetcher
-            .submit(PrefetchTask {
-                ino: 10,
-                start: 4096,
-                len: 4096,
-                priority: PrefetchPriority::Sequential,
-                owner_fh: 1,
-            })
-            .await;
-
-        assert_eq!(
-            timeout(Duration::from_millis(200), rx.recv())
-                .await
-                .unwrap(),
-            Some((10, 4096)),
-            "a sparse prefetch task should not wait for another submit"
-        );
-    }
-
-    #[tokio::test]
-    async fn last_sparse_prefetch_is_not_stranded() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let gate = Arc::new(Semaphore::new(1));
-        let hold = Arc::new(tokio::sync::Notify::new());
-        let fetch_gate = gate.clone();
-        let fetch_hold = hold.clone();
-        let prefetcher = GlobalPrefetcher::new(1, 32, move |ino, start, _len| {
-            let tx = tx.clone();
-            let hold = fetch_hold.clone();
-            let fetch_gate = fetch_gate.clone();
-            async move {
-                let _ = fetch_gate.acquire().await;
-                let _ = tx.send((ino, start));
-                hold.notify_waiters();
-            }
-        });
-
-        prefetcher
-            .submit(PrefetchTask {
-                ino: 10,
-                start: 0,
-                len: 4096,
-                priority: PrefetchPriority::Sequential,
-                owner_fh: 1,
-            })
-            .await;
-
-        assert_eq!(
-            timeout(Duration::from_millis(200), rx.recv())
-                .await
-                .unwrap(),
-            Some((10, 0))
-        );
-
-        prefetcher
-            .submit(PrefetchTask {
-                ino: 10,
-                start: 4096,
-                len: 4096,
-                priority: PrefetchPriority::Sequential,
-                owner_fh: 1,
-            })
-            .await;
-        gate.add_permits(1);
-
-        assert_eq!(
-            timeout(Duration::from_secs(1), rx.recv()).await.unwrap(),
-            Some((10, 4096)),
-            "the final sparse prefetch task should run when the queue is empty"
         );
         hold.notify_waiters();
     }

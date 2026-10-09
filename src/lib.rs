@@ -4,6 +4,9 @@
 
 pub mod cadapter;
 pub mod chunk;
+pub mod cli;
+pub mod config;
+pub(crate) mod console;
 pub(crate) mod control;
 pub mod daemon;
 pub(crate) mod fs;
@@ -14,6 +17,7 @@ pub mod gateway;
 pub mod hdfs;
 // Expose meta for E2E testing - tests should rely on design contracts, not impl details
 pub mod meta;
+pub mod native_base;
 pub(crate) mod posix;
 pub mod sdk_fs;
 // Expose vfs for E2E testing - tests should rely on design contracts, not impl details

@@ -1,5 +1,9 @@
 # BrewFS Workspace Overlay 实现规范
 
+2026-10-04当前任务范围仅v3：本规范的隔离、POSIX、fencing、publication/recovery与GC
+继续用于三创新系统验收；旧flat/workspace格式兼容不再是出口。具体边界见
+[当前v3目标](../plans/2026-10-04-brewfs-all-spec-completion.md)。
+
 - 状态：Implementation spec / 与当前代码同步
 - 日期：2026-08-23
 - 功能名：Workspace Overlay
@@ -8,6 +12,22 @@
 - catalog 格式：`catalog_format: 2`（entity-key 布局）
 - 首要生产 backend：Redis、TiKV
 - 本地语义与故障注入 backend：SQLite / SQLx
+
+### 2026-10-03 范围澄清：workspace-v1 与 packed-v3
+
+本文控制面契约适用于现有 `workspace-v1` sealed-layer/delta 实现；“与代码同步”不表示
+后续所有packed格式或新worktree都已全量审计。它不是004/005对象的wire定义，也不能由
+standalone packed readonly mount推导本规范的fork/seal/recovery/GC已支持packed lower。
+
+[packed-v3 SPEC](2026-09-27-brewfs-packed-metadata-v3-readonly-smallfiles.md)负责当前packed-v3
+对象与只读plan，packed lower集成为其P5待完成项。既有 `BaseRevision` 的layer/version/
+root_hash和bincode bytes保持不变；不能把root_hash暗解释成PM07 object digest。新binding
+需独立版本化、capability检查和原子head/binding切换；旧workspace不查询它，错误不回退。
+
+下面§9.6的“未覆盖范围为零”仅在完整native fixed layer pair已全部resolve后成立。
+组合packed fallback时upper未覆盖是 **Absent**，显式Hole/whiteout/truncate mask才阻断
+lower；fallback完成前不能调用补hole的兼容resolver将Absent丢失。同epoch内写入还需要
+inode data_version/sequence或等价locking，head_epoch/lease guard本身不是read一致性保证。
 
 ## 1. 实现目标
 
@@ -963,6 +983,18 @@ write/truncate/punch-hole 后增加 inode `data_version` 并删除对应 plan ca
 
 VFS 当前 `range_has_committed_slices()` 在 workspace provider 存在时必须改调
 `range_has_data()`；flat path 保持当前 `get_slices()` 实现。
+
+### 10.3 Prepared unified 接口与 packed 集成边界
+
+中立provider现有可选 `supports_prepared_unified_read` / `prepare_unified_read` 返回
+`PreparedUnifiedRead {UnifiedReadPlan, Arc<dyn UnifiedReadSourceFetcher>}`；VFS使用
+`execute_unified_into`，成功交付后计logical bytes。005 readonly已走该接缝；native
+workspace仍可以使用§10.1–10.2的旧slice计划，不能把接口存在等同mutable P5已经完成。
+
+packed lower需保持absolute/chunk-relative offsets明确，preserve raw names、cold attrs、
+hardlinks和holes，upper fully covered时无需lower GET。seal物化不得把未覆盖lower bytes
+省略成holes；普通fsync/close只做workspace durability，显式packed publish才repack。
+读取fence、packed graph可达性GC、journal/lease/head-CAS和实际双mount必须独立验收。
 
 ## 11. WorkspaceMetaLayer
 

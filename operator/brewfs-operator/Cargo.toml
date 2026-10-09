@@ -10,7 +10,7 @@ license = "MIT"
 
 [features]
 default = []
-workspace-operator = ["dep:async-trait", "dep:brewfs", "dep:hex", "dep:uuid"]
+workspace-operator = ["dep:async-trait", "dep:brewfs", "dep:hex", "dep:uuid", "dep:tempfile", "dep:sha2", "dep:tokio-util"]
 
 [dependencies]
 anyhow = "1.0"
@@ -26,8 +26,14 @@ schemars = { version = "0.8", features = ["chrono"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
+sha2 = { version = "0.10", optional = true }
+tempfile = { version = "3", optional = true }
 thiserror = "1.0"
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "v5"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["test-util", "sync"] }

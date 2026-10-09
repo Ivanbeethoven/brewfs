@@ -8,8 +8,5 @@ explicitly names one as active.
   iteration records.
 - [specs/](specs/): design specs that supported larger changes.
 
-For current performance priorities, prefer the maintained
-[Aliyun performance guide](../../docker/compose-xfstests/aliyun/README.md),
-the [local benchmark guide](../testing/bench.md), and the performance section
-of the [project README](../../README.md). The dated plans below are historical
-records and may describe configurations that no longer exist.
+For current performance evidence, prefer
+[../performance/native-packed-base-large-scale-validation-2026-09-24.md](../performance/native-packed-base-large-scale-validation-2026-09-24.md).

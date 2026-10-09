@@ -11,6 +11,34 @@ use crate::meta::store::{
 };
 use crate::vfs::handles::DirHandle;
 
+pub type MetadataMemoryGuard = Arc<dyn std::fmt::Debug + Send + Sync>;
+
+/// Raw xattr names and the admission retained through their final consumer.
+pub struct OwnedXattrNames {
+    pub names: Vec<Vec<u8>>,
+    pub guard: Option<MetadataMemoryGuard>,
+}
+
+/// Raw inode paths and the admission/reader retained through their consumer.
+/// Fields drop in declaration order: path storage is freed before its owner.
+#[derive(Debug)]
+pub struct OwnedPaths {
+    pub paths: Vec<Vec<u8>>,
+    pub guard: Option<MetadataMemoryGuard>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum MetadataMemoryKind {
+    Roots,
+    Request,
+    Reply,
+    /// Persistent handle attributes, readers and snapshot identity. The owner
+    /// remains alive independently of transient request/queue control state.
+    Handle,
+    /// Small request tokens and control replies, with no metadata workspace.
+    Control,
+}
+
 /// High-level metadata facade used by the VFS and daemon layers.
 ///
 /// This trait intentionally mirrors the shape of JuiceFS' `Meta` interface.
@@ -22,6 +50,32 @@ use crate::vfs::handles::DirHandle;
 #[async_trait]
 #[allow(dead_code)]
 pub trait MetaLayer: Send + Sync {
+    /// Opt in only when dropping a read future cannot leave mutable work.
+    fn supports_fuse_read_cancellation(&self) -> bool {
+        false
+    }
+    /// Reserve before allocating temporary state, reply copies, or a handle.
+    /// The returned owner follows the actual final consumer.
+    fn reserve_memory(
+        &self,
+        _kind: MetadataMemoryKind,
+        _bytes: u64,
+    ) -> Result<Option<MetadataMemoryGuard>, MetaError> {
+        Ok(None)
+    }
+    /// Roots permits may be carried inline through actual enclosing deallocation.
+    fn reserve_inline_roots(
+        &self,
+        _bytes: u64,
+    ) -> Result<Option<asyncfuse::raw::reply::InlineRootPermit>, MetaError> {
+        Ok(None)
+    }
+    /// Linux POSIX ACL support, distinct from control ACL/AclRule storage.
+    /// Writable implementations must supply atomic mode/xattr synchronization
+    /// and creation inheritance before opting into the kernel capability.
+    fn posix_acl_capability(&self) -> PosixAclCapability {
+        PosixAclCapability::Unsupported
+    }
     /// Optional human readable backend name.
     fn name(&self) -> &'static str {
         "meta-layer"
@@ -48,6 +102,62 @@ pub trait MetaLayer: Send + Sync {
     /// Do `stat` but bypass the inode cache.
     async fn stat_fresh(&self, ino: i64) -> Result<Option<FileAttr>, MetaError>;
 
+    /// Permission decisions must use attributes and ACLs from one metadata
+    /// commit. Immutable layers can safely compose reads; writable ACL layers
+    /// must override this method with a backend snapshot.
+    async fn inode_permissions(&self, ino: i64) -> Result<Option<InodePermissions>, MetaError> {
+        if self.posix_acl_capability() == PosixAclCapability::ReadWrite {
+            return Err(MetaError::NotSupported(
+                "atomic inode permission snapshot is unavailable".into(),
+            ));
+        }
+        let Some(attr) = self.stat_fresh(ino).await? else {
+            return Ok(None);
+        };
+        let access_acl = if self.posix_acl_capability() == PosixAclCapability::ReadOnly {
+            self.get_xattr(ino, "system.posix_acl_access").await?
+        } else {
+            None
+        };
+        let control_acl = self
+            .get_xattr(ino, "system.brewfs.acl")
+            .await
+            .ok()
+            .flatten();
+        Ok(Some(InodePermissions {
+            attr,
+            access_acl,
+            control_acl,
+        }))
+    }
+
+    /// POSIX ACL owner policy and the mode update share one commit version.
+    /// None and an empty valid ACL mean removal; ordinary xattr flags do not
+    /// change Linux POSIX ACL set semantics.
+    async fn update_posix_acl(
+        &self,
+        _ino: i64,
+        _name: &str,
+        _value: Option<&[u8]>,
+        _uid: u32,
+        _groups: &[u32],
+    ) -> Result<(), MetaError> {
+        Err(MetaError::NotSupported(
+            "writable POSIX ACL is unavailable".into(),
+        ))
+    }
+
+    async fn set_attr_as(
+        &self,
+        ino: i64,
+        request: &SetAttrRequest,
+        flags: SetAttrFlags,
+        _uid: u32,
+        _groups: &[u32],
+    ) -> Result<FileAttr, MetaError> {
+        self.set_attr(ino, request, flags).await
+    }
+
     /// Fetch the attribute used by an open operation. Implementations may
     /// reuse an explicitly enabled open-file scoped cache for read-only opens.
     async fn stat_for_open(
@@ -61,6 +171,9 @@ pub trait MetaLayer: Send + Sync {
     }
 
     /// Record that VFS successfully opened a file handle.
+    /// Fresh and cached-attribute VFS opens use this hook instead of `open`.
+    /// Immutable layers must reject write/append here before a handle is
+    /// allocated; checking only `open` does not protect those fast paths.
     async fn record_open(
         &self,
         _ino: i64,
@@ -103,6 +216,19 @@ pub trait MetaLayer: Send + Sync {
         Ok(Some((ino, attr)))
     }
 
+    /// Byte-preserving lookup capability for immutable packed snapshots.
+    /// Legacy metadata backends remain string based and therefore explicitly
+    /// reject names that are not valid UTF-8 instead of silently replacing
+    /// bytes.
+    async fn lookup_with_attr_bytes(
+        &self,
+        parent: i64,
+        name: &[u8],
+    ) -> Result<Option<(i64, FileAttr)>, MetaError> {
+        let name = std::str::from_utf8(name).map_err(|_| MetaError::InvalidFilename)?;
+        self.lookup_with_attr(parent, name).await
+    }
+
     async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError>;
 
     async fn lookup_path_with_attr(
@@ -118,20 +244,6 @@ pub trait MetaLayer: Send + Sync {
     }
 
     async fn readdir(&self, ino: i64) -> Result<Vec<DirEntry>, MetaError>;
-
-    /// Fetch attributes for a directory window in input order.
-    ///
-    /// `None` is a missing inode, not a malformed reply. Implementations must
-    /// return exactly one result for every input inode and preserve duplicate
-    /// input positions. The default keeps the bridge correct for layers that
-    /// do not have a native batch source.
-    async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
-        let mut results = Vec::with_capacity(inodes.len());
-        for &ino in inodes {
-            results.push(self.stat(ino).await?);
-        }
-        Ok(results)
-    }
 
     async fn opendir(&self, ino: i64) -> Result<DirHandle, MetaError>;
 
@@ -179,6 +291,22 @@ pub trait MetaLayer: Send + Sync {
             .await?;
         let attr = self.stat(ino).await.ok().flatten();
         Ok(CreateEntryResult { ino, attr })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_node_with_umask(
+        &self,
+        parent: i64,
+        name: String,
+        kind: FileType,
+        mode: u32,
+        umask: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+    ) -> Result<CreateEntryResult, MetaError> {
+        self.create_node_with_attr(parent, name, kind, mode & !umask, uid, gid, rdev)
+            .await
     }
 
     async fn link(&self, ino: i64, parent: i64, name: &str) -> Result<FileAttr, MetaError>;
@@ -346,7 +474,28 @@ pub trait MetaLayer: Send + Sync {
 
     async fn get_paths(&self, ino: i64) -> Result<Vec<String>, MetaError>;
 
+    /// Preserve raw namespace bytes for inode-based ancestor permission checks.
+    /// String-backed stores retain their existing path behavior by default.
+    async fn get_paths_bytes(&self, ino: i64) -> Result<Vec<Vec<u8>>, MetaError> {
+        self.get_paths(ino)
+            .await
+            .map(|paths| paths.into_iter().map(String::into_bytes).collect())
+    }
+
+    /// Keep path memory and the packed generation alive across subsequent
+    /// asynchronous ancestor permission checks.
+    async fn get_paths_bytes_owned(&self, ino: i64) -> Result<OwnedPaths, MetaError> {
+        Ok(OwnedPaths {
+            paths: self.get_paths_bytes(ino).await?,
+            guard: None,
+        })
+    }
+
     async fn read_symlink(&self, ino: i64) -> Result<String, MetaError>;
+
+    async fn read_symlink_bytes(&self, ino: i64) -> Result<Vec<u8>, MetaError> {
+        self.read_symlink(ino).await.map(String::into_bytes)
+    }
 
     // ---------- Attribute + handle helpers ----------
     async fn set_attr(
@@ -446,6 +595,38 @@ pub trait MetaLayer: Send + Sync {
     async fn get_xattr(&self, inode: i64, name: &str) -> Result<Option<Vec<u8>>, MetaError>;
     async fn list_xattr(&self, inode: i64) -> Result<Vec<String>, MetaError>;
     async fn remove_xattr(&self, inode: i64, name: &str) -> Result<(), MetaError>;
+
+    /// Linux xattr names are bytes. String-backed stores reject names they
+    /// cannot represent rather than looking up or mutating a lossy alias.
+    async fn get_xattr_bytes(&self, inode: i64, name: &[u8]) -> Result<Option<Vec<u8>>, MetaError> {
+        let name = std::str::from_utf8(name).map_err(|_| MetaError::InvalidFilename)?;
+        self.get_xattr(inode, name).await
+    }
+    async fn list_xattr_bytes(&self, inode: i64) -> Result<Vec<Vec<u8>>, MetaError> {
+        self.list_xattr(inode)
+            .await
+            .map(|names| names.into_iter().map(String::into_bytes).collect())
+    }
+    async fn list_xattr_bytes_owned(&self, inode: i64) -> Result<OwnedXattrNames, MetaError> {
+        Ok(OwnedXattrNames {
+            names: self.list_xattr_bytes(inode).await?,
+            guard: None,
+        })
+    }
+    async fn set_xattr_bytes(
+        &self,
+        inode: i64,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+    ) -> Result<(), MetaError> {
+        let name = std::str::from_utf8(name).map_err(|_| MetaError::InvalidFilename)?;
+        self.set_xattr(inode, name, value, flags).await
+    }
+    async fn remove_xattr_bytes(&self, inode: i64, name: &[u8]) -> Result<(), MetaError> {
+        let name = std::str::from_utf8(name).map_err(|_| MetaError::InvalidFilename)?;
+        self.remove_xattr(inode, name).await
+    }
     async fn set_acl(&self, inode: i64, rule: AclRule) -> Result<(), MetaError>;
     async fn get_acl(
         &self,
@@ -453,4 +634,122 @@ pub trait MetaLayer: Send + Sync {
         acl_type: u8,
         acl_id: u32,
     ) -> Result<Option<AclRule>, MetaError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PosixAclCapability {
+    Unsupported,
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Clone, Debug)]
+pub struct InodePermissions {
+    pub attr: FileAttr,
+    pub access_acl: Option<Vec<u8>>,
+    pub control_acl: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NamespaceActor {
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: Vec<u32>,
+}
+
+tokio::task_local! {
+    static NAMESPACE_ACTOR: NamespaceActor;
+}
+
+/// Request credentials are scoped to this future, never a process-global
+/// setting and never inherited by background tasks spawned from the request.
+pub(crate) async fn scope_namespace_actor<F: std::future::Future>(
+    actor: Option<NamespaceActor>,
+    operation: F,
+) -> F::Output {
+    match actor {
+        Some(actor) => NAMESPACE_ACTOR.scope(actor, operation).await,
+        None => operation.await,
+    }
+}
+
+pub(crate) fn namespace_actor() -> Option<NamespaceActor> {
+    NAMESPACE_ACTOR.try_with(Clone::clone).ok()
+}
+
+tokio::task_local! {
+    static OPEN_ACCESS_MASK: u32;
+    static SETATTR_WRITE_HANDLE: i64;
+    static CREATED_INODE_OPEN: std::cell::Cell<Option<i64>>;
+}
+
+pub(crate) async fn scope_open_actor<F: std::future::Future>(
+    actor: Option<NamespaceActor>,
+    access_mask: u32,
+    operation: F,
+) -> F::Output {
+    OPEN_ACCESS_MASK
+        .scope(access_mask, scope_namespace_actor(actor, operation))
+        .await
+}
+
+pub(crate) fn open_access_mask() -> Option<u32> {
+    OPEN_ACCESS_MASK.try_with(|mask| *mask).ok()
+}
+
+/// Only the FUSE path that verified a live writable handle may supply this
+/// authority. It applies to this inode's truncate, never to chmod or chown.
+pub(crate) async fn scope_setattr_write_handle<F: std::future::Future>(
+    ino: i64,
+    authorized: bool,
+    operation: F,
+) -> F::Output {
+    if authorized {
+        SETATTR_WRITE_HANDLE.scope(ino, operation).await
+    } else {
+        operation.await
+    }
+}
+
+pub(crate) fn setattr_write_handle_authorizes(ino: i64) -> bool {
+    SETATTR_WRITE_HANDLE
+        .try_with(|authorized| *authorized == ino)
+        .unwrap_or(false)
+}
+
+/// Creation authorizes its initial handle even when the requested mode is 000.
+/// A fallback to an existing inode never receives this authority.
+pub(crate) async fn scope_created_inode_open<F: std::future::Future>(
+    ino: i64,
+    created: bool,
+    operation: F,
+) -> F::Output {
+    if created {
+        CREATED_INODE_OPEN
+            .scope(std::cell::Cell::new(Some(ino)), operation)
+            .await
+    } else {
+        operation.await
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn created_inode_open_authorizes(ino: i64) -> bool {
+    CREATED_INODE_OPEN
+        .try_with(|created| created.get() == Some(ino))
+        .unwrap_or(false)
+}
+
+/// Consume the creation authority exactly once for the matching inode.
+pub(crate) fn take_created_inode_open_authority(ino: i64) -> bool {
+    CREATED_INODE_OPEN
+        .try_with(|created| {
+            if created.get() == Some(ino) {
+                created.set(None);
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false)
 }

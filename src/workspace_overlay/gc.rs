@@ -24,6 +24,7 @@ pub struct WorkspaceGc<W, B> {
     layout: ChunkLayout,
     layer_grace: Duration,
     lease_grace: Duration,
+    volume_format: Option<String>,
 }
 
 impl<W, B> WorkspaceGc<W, B>
@@ -44,7 +45,16 @@ where
             layout,
             layer_grace,
             lease_grace,
+            volume_format: None,
         }
+    }
+
+    /// Bind this legacy collector to a volume format. Native-v2 volumes must
+    /// use `native_base::lifecycle::cleanup::apply_private_cleanup`; allowing
+    /// the old mark-and-sweep would not distinguish permanent objects.
+    pub fn with_volume_format(mut self, volume_format: impl Into<String>) -> Self {
+        self.volume_format = Some(volume_format.into());
+        self
     }
 
     pub async fn run_once(&self) -> Result<GcReport, WorkspaceError> {
@@ -52,6 +62,30 @@ where
     }
 
     pub async fn run_at(&self, now_ns: i64) -> Result<GcReport, WorkspaceError> {
+        self.run_selected_at(now_ns, None).await
+    }
+
+    /// Collect one layer while retaining the complete catalog's root and
+    /// shared-slice evidence. Selection bounds the deletion set, not reads.
+    pub async fn run_layer_at(
+        &self,
+        now_ns: i64,
+        layer_id: LayerId,
+    ) -> Result<GcReport, WorkspaceError> {
+        self.run_selected_at(now_ns, Some(layer_id)).await
+    }
+
+    async fn run_selected_at(
+        &self,
+        now_ns: i64,
+        selected_layer: Option<LayerId>,
+    ) -> Result<GcReport, WorkspaceError> {
+        if self.volume_format.as_deref() == Some("workspace-native-v2") {
+            return Err(WorkspaceError::UnsupportedVolumeFormat(
+                "legacy WorkspaceGc is disabled for workspace-native-v2; use the private-domain cleaner".into(),
+            ));
+        }
+        self.store.reap_packed_reader_sessions().await?;
         let lease_grace_ns = duration_ns(self.lease_grace)?;
         self.store.reap_expired_leases().await?;
         // 宽限期结束后清理终止状态的租约与 journal，再扫描 GC 根集合。
@@ -80,20 +114,32 @@ where
             .layers
             .iter()
             .filter(|layer| {
-                !reachable.contains(&layer.layer_id) && layer.created_at_ns <= layer_cutoff
+                selected_layer.is_none_or(|selected| selected == layer.layer_id)
+                    && !reachable.contains(&layer.layer_id)
+                    && layer.created_at_ns <= layer_cutoff
             })
             .map(|layer| layer.layer_id)
             .collect::<BTreeSet<_>>();
-        let reachable_slices = snapshot
+        let protected_slices = snapshot
             .slice_references
             .iter()
-            .filter(|reference| reachable.contains(&reference.layer_id))
+            .filter(|reference| {
+                reachable.contains(&reference.layer_id)
+                    || (selected_layer.is_some() && !deletable.contains(&reference.layer_id))
+            })
             .map(|reference| reference.slice_id)
             .collect::<BTreeSet<_>>();
         let mut orphan_slices = BTreeMap::<u64, u64>::new();
+        let mut selected_slice_bounds = BTreeMap::<u64, u64>::new();
         for reference in &snapshot.slice_references {
+            if deletable.contains(&reference.layer_id) {
+                selected_slice_bounds
+                    .entry(reference.slice_id)
+                    .and_modify(|end| *end = (*end).max(reference.slice_end))
+                    .or_insert(reference.slice_end);
+            }
             if deletable.contains(&reference.layer_id)
-                && !reachable_slices.contains(&reference.slice_id)
+                && !protected_slices.contains(&reference.slice_id)
             {
                 orphan_slices
                     .entry(reference.slice_id)
@@ -112,9 +158,30 @@ where
             })
             .await?;
 
+        // A shared slice survives this layer's metadata deletion. Persist its
+        // largest observed range first so a later, shorter reference cannot
+        // cause the tail to be forgotten. Errors retain the Deleting layer.
+        for (slice_id, slice_end) in selected_slice_bounds {
+            self.blocks
+                .retain_gc_slice_upper_bound(slice_id, slice_end)
+                .await
+                .map_err(|error| WorkspaceError::Backend(error.to_string()))?;
+        }
+
         let mut deleted_slices = Vec::with_capacity(orphan_slices.len());
         let mut orphan_bytes = 0u64;
         for (slice_id, slice_end) in orphan_slices {
+            let slice_end = self
+                .blocks
+                .gc_slice_upper_bound(slice_id, slice_end)
+                .await
+                .map_err(|error| WorkspaceError::Backend(error.to_string()))?
+                .max(slice_end);
+            // This exact retained bound is authenticated before any DELETE.
+            // Busy/unknown outcomes preserve Deleting metadata for recovery.
+            self.store
+                .reserve_gc_slice_deletion(slice_id, slice_end, &deleted_layers)
+                .await?;
             let blocks = slice_end.div_ceil(u64::from(self.layout.block_size));
             if blocks != 0 {
                 self.blocks
@@ -166,7 +233,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::chunk::{InMemoryBlockStore, IncompleteBlockRead, SliceDesc};
+    use crate::chunk::{BlockKey, InMemoryBlockStore, IncompleteBlockRead, SliceDesc};
     use crate::meta::MetaLayer;
     use crate::workspace_overlay::catalog::{CreateVolumeRoot, RecordOrphanSlice, WorkspaceStore};
     use crate::workspace_overlay::ids::{LayerId, WorkspaceId};
@@ -176,6 +243,60 @@ mod tests {
     };
     use crate::workspace_overlay::meta_layer::WorkspaceMetaLayer;
     use crate::workspace_overlay::stores::database::SqliteWorkspaceStore;
+
+    // The same test store retains both bytes and monotonic GC range bounds.
+    // Bounds survive deletion; they do not authorize reachability or deletion.
+    #[derive(Default)]
+    struct RetainedRangeBlockStore {
+        inner: InMemoryBlockStore,
+        bounds: tokio::sync::RwLock<BTreeMap<u64, u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlockStore for RetainedRangeBlockStore {
+        async fn write_fresh_range(
+            &self,
+            key: BlockKey,
+            offset: u64,
+            data: &[u8],
+        ) -> anyhow::Result<u64> {
+            self.inner.write_fresh_range(key, offset, data).await
+        }
+
+        async fn read_range(
+            &self,
+            key: BlockKey,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> anyhow::Result<()> {
+            self.inner.read_range(key, offset, buf).await
+        }
+
+        async fn delete_range(&self, key: BlockKey, count: u64) -> anyhow::Result<()> {
+            self.inner.delete_range(key, count).await
+        }
+
+        async fn retain_gc_slice_upper_bound(&self, slice: u64, end: u64) -> anyhow::Result<()> {
+            anyhow::ensure!(slice != 0 && end != 0, "fixture GC bound must be positive");
+            self.bounds
+                .write()
+                .await
+                .entry(slice)
+                .and_modify(|bound| *bound = (*bound).max(end))
+                .or_insert(end);
+            Ok(())
+        }
+
+        async fn gc_slice_upper_bound(&self, slice: u64, observed: u64) -> anyhow::Result<u64> {
+            self.bounds
+                .read()
+                .await
+                .get(&slice)
+                .copied()
+                .filter(|bound| *bound >= observed)
+                .ok_or_else(|| anyhow::anyhow!("fixture GC range was not retained"))
+        }
+    }
 
     async fn setup() -> (
         Arc<SqliteWorkspaceStore>,
@@ -190,6 +311,8 @@ mod tests {
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(801));
         store
             .create_volume_root(CreateVolumeRoot {
+                volume_format: "workspace-v1".into(),
+                schema_version: crate::workspace_overlay::model::WORKSPACE_SCHEMA_VERSION,
                 volume_id: Uuid::from_u128(802),
                 workspace_id,
                 root_layer_id: LayerId::from_uuid(Uuid::from_u128(803)),
@@ -280,7 +403,7 @@ mod tests {
         lifecycle.discard(source_workspace_id, false).await.unwrap();
         let gc = WorkspaceGc::new(
             store,
-            Arc::new(InMemoryBlockStore::new()),
+            Arc::new(RetainedRangeBlockStore::default()),
             ChunkLayout::default(),
             Duration::ZERO,
             Duration::from_secs(60),
@@ -319,7 +442,7 @@ mod tests {
     #[tokio::test]
     async fn persisted_upload_orphan_is_deleted_end_to_end() {
         let (store, session) = setup().await;
-        let blocks = Arc::new(InMemoryBlockStore::new());
+        let blocks = Arc::new(RetainedRangeBlockStore::default());
         blocks
             .write_fresh_range((88, 0), 0, b"orphan")
             .await
@@ -355,6 +478,22 @@ mod tests {
             .unwrap_err();
         assert!(error.downcast_ref::<IncompleteBlockRead>().is_some());
         assert_eq!(output, [9; 6]);
+        session.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_gc_rejects_native_v2_volumes() {
+        let (store, session) = setup().await;
+        let gc = WorkspaceGc::new(
+            store,
+            Arc::new(InMemoryBlockStore::new()),
+            ChunkLayout::default(),
+            Duration::ZERO,
+            Duration::from_secs(60),
+        )
+        .with_volume_format("workspace-native-v2");
+        let error = gc.run_at(i64::MAX / 2).await.unwrap_err();
+        assert!(matches!(error, WorkspaceError::UnsupportedVolumeFormat(_)));
         session.release().await.unwrap();
     }
 }

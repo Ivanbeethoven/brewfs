@@ -1,13 +1,58 @@
 //! Redis transactional substrate for the workspace catalog.
 
+#[cfg(test)]
+#[path = "redis_operator_admin_tests.rs"]
+mod operator_admin_tests;
+
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 
-use super::kv_backend::{KvCheck, KvEntry, KvWrite, WorkspaceKvBackend};
+use super::kv_backend::{
+    KvCheck, KvEntry, KvReadLimits, KvWrite, WorkspaceKvBackend, validate_cas_time_window,
+};
 use crate::workspace_overlay::error::WorkspaceError;
 
 const CAS_LUA: &str = r#"
 local check_count = tonumber(ARGV[1])
+if check_count == nil or check_count < 0 or check_count % 1 ~= 0 then
+    return redis.error_reply('invalid workspace check count')
+end
+local write_cursor = 2 + 2 * check_count
+local write_count = tonumber(ARGV[write_cursor])
+if write_count == nil or write_count < 0 or write_count % 1 ~= 0
+    or #KEYS ~= check_count + write_count + 1
+    or #ARGV ~= write_cursor + 2 * write_count + 4 then
+    return redis.error_reply('invalid workspace mutation arguments')
+end
+local index_key = KEYS[#KEYS]
+local function key_type(key)
+    local reply = redis.call('TYPE', key)
+    if type(reply) == 'table' then return reply.ok end
+    return reply
+end
+-- Redis Lua cannot roll back an earlier write after a later type error.
+-- Validate the complete command/key plan before the first SET/DEL.
+local index_type = key_type(index_key)
+if index_type ~= 'none' and index_type ~= 'zset' then
+    return redis.error_reply('invalid workspace key index type')
+end
+for index = 1, check_count do
+    local check_type = key_type(KEYS[index])
+    if check_type ~= 'none' and check_type ~= 'string' then
+        return redis.error_reply('invalid workspace condition key type')
+    end
+    local present = ARGV[2 + 2 * (index - 1)]
+    if present ~= '0' and present ~= '1' then
+        return redis.error_reply('invalid workspace condition flag')
+    end
+end
+for index = 1, write_count do
+    local operation = ARGV[write_cursor + 1 + 2 * (index - 1)]
+    if (operation ~= 'put' and operation ~= 'delete')
+        or KEYS[check_count + index] == index_key then
+        return redis.error_reply('invalid workspace write plan')
+    end
+end
 local cursor = 2
 for index = 1, check_count do
     local expected_present = ARGV[cursor]
@@ -21,9 +66,40 @@ for index = 1, check_count do
     end
 end
 
-local write_count = tonumber(ARGV[cursor])
+-- Bound parts stay below 2^53. Converting full nanoseconds to a Lua double
+-- would silently round either boundary at contemporary timestamps.
+local function bound_parts(seconds_arg, nanos_arg)
+    if seconds_arg == '' and nanos_arg == '' then return nil, nil, nil end
+    local seconds = tonumber(seconds_arg)
+    local nanos = tonumber(nanos_arg)
+    if seconds == nil or seconds < 0 or seconds % 1 ~= 0
+        or nanos == nil or nanos < 0 or nanos >= 1000000000 or nanos % 1 ~= 0
+        or (seconds == 0 and nanos == 0) then
+        return nil, nil, 'invalid workspace temporal bound'
+    end
+    return seconds, nanos, nil
+end
+local lower_seconds, lower_ns, lower_error = bound_parts(ARGV[#ARGV - 3], ARGV[#ARGV - 2])
+local upper_seconds, upper_ns, upper_error = bound_parts(ARGV[#ARGV - 1], ARGV[#ARGV])
+if lower_error or upper_error then return redis.error_reply(lower_error or upper_error) end
+if lower_seconds and upper_seconds
+    and (lower_seconds > upper_seconds or (lower_seconds == upper_seconds and lower_ns >= upper_ns)) then
+    return redis.error_reply('invalid workspace temporal interval')
+end
+if lower_seconds or upper_seconds then
+    local now = redis.call('TIME')
+    local current_seconds = tonumber(now[1])
+    local current_ns = tonumber(now[2]) * 1000
+    if lower_seconds and (current_seconds < lower_seconds
+        or (current_seconds == lower_seconds and current_ns < lower_ns)) then
+        return -2
+    end
+    if upper_seconds and (current_seconds > upper_seconds
+        or (current_seconds == upper_seconds and current_ns >= upper_ns)) then
+        return -1
+    end
+end
 cursor = cursor + 1
-local index_key = KEYS[check_count + write_count + 1]
 for index = 1, write_count do
     local operation = ARGV[cursor]
     local value = ARGV[cursor + 1]
@@ -41,6 +117,67 @@ return 1
 "#;
 
 const KEY_INDEX: &[u8] = b"__index/keys";
+
+// STRLEN never copies the stored string into Lua or the client. All lengths
+// are checked in the same indivisible script before the first GET. Therefore
+// a corrupt oversized persistent value cannot be returned to the RESP decoder.
+const BOUNDED_TIMED_GET_LUA: &str = r#"
+local maximum_value = tonumber(ARGV[1])
+local maximum_total = tonumber(ARGV[2])
+local prefix_bytes = tonumber(ARGV[3])
+local total = 0
+local response_bytes = 128 + 32 * #KEYS
+for _, key in ipairs(KEYS) do
+    local bytes = redis.call('STRLEN', key)
+    total = total + #key - prefix_bytes + bytes
+    response_bytes = response_bytes + bytes
+    if bytes > maximum_value or total > maximum_total
+        or response_bytes > tonumber(ARGV[4]) then
+        return redis.error_reply('workspace bounded value bytes exceeded')
+    end
+end
+local values = {}
+for index, key in ipairs(KEYS) do
+    values[index] = redis.call('GET', key)
+end
+return {redis.call('TIME'), values}
+"#;
+
+const BOUNDED_PREFIX_LUA: &str = r#"
+local keys = redis.call('ZRANGEBYLEX', KEYS[1], ARGV[1], ARGV[2],
+    'LIMIT', 0, tonumber(ARGV[3]))
+local maximum_key = tonumber(ARGV[4])
+local maximum_value = tonumber(ARGV[5])
+local maximum_total = tonumber(ARGV[6])
+local namespace = ARGV[7]
+local requested_prefix = ARGV[8]
+local total = 0
+local response_bytes = 32 + 64 * #keys
+for _, key in ipairs(keys) do
+    if string.sub(key, 1, #namespace) ~= namespace
+        or string.sub(key, 1, #requested_prefix) ~= requested_prefix
+        or #key - #namespace > maximum_key then
+        return redis.error_reply('workspace bounded index key rejected')
+    end
+    -- An index ghost must fail closed; silently skipping it would turn a
+    -- record sentinel limit into incomplete-prefix success.
+    if redis.call('EXISTS', key) ~= 1 then
+        return redis.error_reply('workspace bounded index references missing value')
+    end
+    local bytes = redis.call('STRLEN', key)
+    total = total + #key - #namespace + bytes
+    response_bytes = response_bytes + #key + bytes
+    if bytes > maximum_value or total > maximum_total
+        or response_bytes > tonumber(ARGV[9]) then
+        return redis.error_reply('workspace bounded scan bytes exceeded')
+    end
+end
+local result = {}
+for index, key in ipairs(keys) do
+    result[index] = {key, redis.call('GET', key)}
+end
+return result
+"#;
 const KEY_INDEX_READY: &[u8] = b"__index/ready";
 const INDEX_BATCH_SIZE: usize = 1024;
 
@@ -48,6 +185,13 @@ const INDEX_BATCH_SIZE: usize = 1024;
 pub struct RedisWorkspaceBackend {
     connection: ConnectionManager,
     prefix: Vec<u8>,
+    operator_admin: Option<RedisOperatorAdminIdentity>,
+}
+
+#[derive(Clone)]
+struct RedisOperatorAdminIdentity {
+    admin_principal: String,
+    runtime_principal: String,
 }
 
 impl RedisWorkspaceBackend {
@@ -58,7 +202,66 @@ impl RedisWorkspaceBackend {
         // The hash tag keeps every catalog key in one Redis Cluster slot, which
         // is required for the multi-key Lua transactions below.
         let prefix = format!("{{brewfs-ws-v1}}:{namespace}:ws:v1/").into_bytes();
-        let backend = Self { connection, prefix };
+        let backend = Self {
+            connection,
+            prefix,
+            operator_admin: None,
+        };
+        backend.ensure_key_index().await?;
+        Ok(backend)
+    }
+
+    /// The trusted operator Secret resolver assigns roles to two independent
+    /// named ACL credentials. Both actual AUTH/WHOAMI exchanges must succeed
+    /// before catalog discovery or mutation. This does not claim Redis Lua can
+    /// authorize individual business transitions.
+    pub async fn connect_operator_admin(
+        admin_url: &str,
+        expected_admin_principal: &str,
+        runtime_url: &str,
+        expected_runtime_principal: &str,
+        namespace: &str,
+    ) -> Result<Self, WorkspaceError> {
+        validate_namespace(namespace)?;
+        validate_operator_principals(expected_admin_principal, expected_runtime_principal)?;
+        let admin_client = redis::Client::open(admin_url).map_err(|_| {
+            WorkspaceError::Backend("invalid operator Redis connection configuration".into())
+        })?;
+        let runtime_client = redis::Client::open(runtime_url).map_err(|_| {
+            WorkspaceError::Backend("invalid runtime Redis connection configuration".into())
+        })?;
+        let admin_info = &admin_client.get_connection_info().redis;
+        let runtime_info = &runtime_client.get_connection_info().redis;
+        if admin_client.get_connection_info().addr != runtime_client.get_connection_info().addr
+            || admin_info.db != runtime_info.db
+            || admin_info.username.as_deref() != Some(expected_admin_principal)
+            || runtime_info.username.as_deref() != Some(expected_runtime_principal)
+            || admin_info.password.as_ref().is_none_or(String::is_empty)
+            || runtime_info.password.as_ref().is_none_or(String::is_empty)
+            || admin_info.password == runtime_info.password
+        {
+            return Err(WorkspaceError::UnsupportedCapability(
+                "operator and runtime Redis ACL credentials must be independent",
+            ));
+        }
+        let mut runtime = ConnectionManager::new(runtime_client)
+            .await
+            .map_err(|_| WorkspaceError::Backend("runtime Redis authentication failed".into()))?;
+        authenticate_principal(&mut runtime, expected_runtime_principal).await?;
+        drop(runtime);
+        let mut connection = ConnectionManager::new(admin_client)
+            .await
+            .map_err(|_| WorkspaceError::Backend("operator Redis authentication failed".into()))?;
+        authenticate_principal(&mut connection, expected_admin_principal).await?;
+        let prefix = format!("{{brewfs-ws-v1}}:{namespace}:ws:v1/").into_bytes();
+        let backend = Self {
+            connection,
+            prefix,
+            operator_admin: Some(RedisOperatorAdminIdentity {
+                admin_principal: expected_admin_principal.to_owned(),
+                runtime_principal: expected_runtime_principal.to_owned(),
+            }),
+        };
         backend.ensure_key_index().await?;
         Ok(backend)
     }
@@ -68,6 +271,148 @@ impl RedisWorkspaceBackend {
         scoped.extend_from_slice(&self.prefix);
         scoped.extend_from_slice(key);
         scoped
+    }
+
+    async fn scan_prefix_with_byte_plan(
+        &self,
+        prefix: &[u8],
+        after_key_exclusive: Option<&[u8]>,
+        limits: KvReadLimits,
+    ) -> Result<Vec<KvEntry>, WorkspaceError> {
+        limits.validate()?;
+        if prefix.len() > limits.max_key_bytes {
+            return Err(WorkspaceError::InvalidReadPlan(
+                "KV scan prefix exceeds key byte limit".into(),
+            ));
+        }
+        let scoped_prefix = self.scoped(prefix);
+        let mut minimum = match after_key_exclusive {
+            Some(after) => {
+                let mut bound = b"(".to_vec();
+                bound.extend_from_slice(&self.scoped(after));
+                bound
+            }
+            None => b"[".to_vec(),
+        };
+        if after_key_exclusive.is_none() {
+            minimum.extend_from_slice(&scoped_prefix);
+        }
+        let maximum = match prefix_range_end(&scoped_prefix) {
+            Some(upper) => {
+                let mut bound = b"(".to_vec();
+                bound.extend_from_slice(&upper);
+                bound
+            }
+            None => b"+".to_vec(),
+        };
+        let mut connection = self.connection.clone();
+        // ZRANGEBYLEX seeks strictly past the last logical key. The script
+        // applies row and stored-byte limits before its first GET/RESP value.
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = redis::Script::new(BOUNDED_PREFIX_LUA)
+            .key(self.scoped(KEY_INDEX))
+            .arg(minimum)
+            .arg(maximum)
+            .arg(limits.max_records)
+            .arg(limits.max_key_bytes)
+            .arg(limits.max_value_bytes)
+            .arg(limits.max_total_bytes)
+            .arg(&self.prefix)
+            .arg(scoped_prefix)
+            .arg(limits.max_response_bytes)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(backend)?;
+        if pairs.len() > limits.max_records {
+            return Err(backend("bounded Redis scan exceeded record limit"));
+        }
+        let mut entries: Vec<KvEntry> = Vec::with_capacity(pairs.len());
+        for (key, value) in pairs {
+            let logical = key
+                .strip_prefix(self.prefix.as_slice())
+                .ok_or_else(|| backend("bounded Redis scan returned an out-of-namespace key"))?;
+            let previous = entries
+                .last()
+                .map(|entry| entry.key.as_slice())
+                .or(after_key_exclusive);
+            if !logical.starts_with(prefix) || previous.is_some_and(|last| logical <= last) {
+                return Err(backend(
+                    "bounded Redis scan returned invalid key order/prefix",
+                ));
+            }
+            entries.push(KvEntry {
+                key: logical.to_vec(),
+                value,
+            });
+        }
+        Ok(entries)
+    }
+
+    async fn cas(
+        &self,
+        checks: &[KvCheck],
+        writes: &[KvWrite],
+        not_before_ns: Option<i64>,
+        before_ns: Option<i64>,
+    ) -> Result<bool, WorkspaceError> {
+        let script = redis::Script::new(CAS_LUA);
+        let mut invocation = script.prepare_invoke();
+        for check in checks {
+            invocation.key(self.scoped(&check.key));
+        }
+        for write in writes {
+            let key = match write {
+                KvWrite::Put { key, .. } | KvWrite::Delete { key } => key,
+            };
+            invocation.key(self.scoped(key));
+        }
+        invocation.key(self.scoped(KEY_INDEX));
+        invocation.arg(checks.len());
+        for check in checks {
+            match &check.expected {
+                Some(expected) => {
+                    invocation.arg(1_u8).arg(expected);
+                }
+                None => {
+                    invocation.arg(0_u8).arg(Vec::<u8>::new());
+                }
+            }
+        }
+        invocation.arg(writes.len());
+        for write in writes {
+            match write {
+                KvWrite::Put { value, .. } => {
+                    invocation.arg("put").arg(value);
+                }
+                KvWrite::Delete { .. } => {
+                    invocation.arg("delete").arg(Vec::<u8>::new());
+                }
+            }
+        }
+        for bound in [not_before_ns, before_ns] {
+            match bound {
+                Some(value) if value > 0 => {
+                    invocation
+                        .arg(value / 1_000_000_000)
+                        .arg(value % 1_000_000_000);
+                }
+                Some(_) => return Err(WorkspaceError::Fenced),
+                None => {
+                    invocation.arg("").arg("");
+                }
+            }
+        }
+        let mut connection = self.connection.clone();
+        let result: i64 = invocation
+            .invoke_async(&mut connection)
+            .await
+            .map_err(backend)?;
+        match result {
+            -2 => Err(WorkspaceError::Busy),
+            -1 => Err(WorkspaceError::Fenced),
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(WorkspaceError::Backend("invalid Redis CAS result".into())),
+        }
     }
 
     async fn ensure_key_index(&self) -> Result<(), WorkspaceError> {
@@ -122,52 +467,17 @@ impl RedisWorkspaceBackend {
     }
 }
 
-#[async_trait]
-impl WorkspaceKvBackend for RedisWorkspaceBackend {
-    fn name(&self) -> &'static str {
-        "workspace-redis"
-    }
-
-    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, WorkspaceError> {
-        let mut connection = self.connection.clone();
-        redis::cmd("GET")
-            .arg(self.scoped(key))
-            .query_async(&mut connection)
-            .await
-            .map_err(backend)
-    }
-
-    async fn get_many(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, WorkspaceError> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let scoped = keys.iter().map(|key| self.scoped(key)).collect::<Vec<_>>();
-        let mut connection = self.connection.clone();
-        redis::cmd("MGET")
-            .arg(scoped)
-            .query_async(&mut connection)
-            .await
-            .map_err(backend)
-    }
-
-    async fn get_many_with_time(
+impl RedisWorkspaceBackend {
+    async fn scan_prefix_with_limit(
         &self,
-        keys: &[Vec<u8>],
-    ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
-        let scoped = keys.iter().map(|key| self.scoped(key)).collect::<Vec<_>>();
-        let mut connection = self.connection.clone();
-        let ((seconds, micros), values): ((i64, i64), Vec<Option<Vec<u8>>>) = redis::pipe()
-            .cmd("TIME")
-            .cmd("MGET")
-            .arg(scoped)
-            .query_async(&mut connection)
-            .await
-            .map_err(backend)?;
-        let now = redis_time_ns(seconds, micros)?;
-        Ok((values, now))
-    }
-
-    async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<KvEntry>, WorkspaceError> {
+        prefix: &[u8],
+        max_records: Option<usize>,
+    ) -> Result<Vec<KvEntry>, WorkspaceError> {
+        if max_records == Some(0) {
+            return Err(WorkspaceError::InvalidReadPlan(
+                "bounded prefix scan requires a positive row limit".into(),
+            ));
+        }
         let mut connection = self.connection.clone();
         let scoped_prefix = self.scoped(prefix);
         let mut minimum = Vec::with_capacity(scoped_prefix.len() + 1);
@@ -185,13 +495,19 @@ impl WorkspaceKvBackend for RedisWorkspaceBackend {
         let index = self.scoped(KEY_INDEX);
         let mut entries = Vec::new();
         loop {
+            if max_records.is_some_and(|limit| entries.len() >= limit) {
+                break;
+            }
+            let batch_limit = max_records
+                .map(|limit| INDEX_BATCH_SIZE.min(limit - entries.len()))
+                .unwrap_or(INDEX_BATCH_SIZE);
             let keys: Vec<Vec<u8>> = redis::cmd("ZRANGEBYLEX")
                 .arg(&index)
                 .arg(&minimum)
                 .arg(&maximum)
                 .arg("LIMIT")
                 .arg(0_u8)
-                .arg(INDEX_BATCH_SIZE)
+                .arg(batch_limit)
                 .query_async(&mut connection)
                 .await
                 .map_err(backend)?;
@@ -222,11 +538,157 @@ impl WorkspaceKvBackend for RedisWorkspaceBackend {
             minimum.clear();
             minimum.push(b'(');
             minimum.extend_from_slice(last);
-            if keys.len() < INDEX_BATCH_SIZE {
+            if keys.len() < batch_limit {
                 break;
             }
         }
         Ok(entries)
+    }
+}
+
+#[async_trait]
+impl WorkspaceKvBackend for RedisWorkspaceBackend {
+    async fn authenticate_gc_admin(&self) -> Result<(), WorkspaceError> {
+        let identity =
+            self.operator_admin
+                .as_ref()
+                .ok_or(WorkspaceError::UnsupportedCapability(
+                    "independent operator Redis credentials",
+                ))?;
+        validate_operator_principals(&identity.admin_principal, &identity.runtime_principal)?;
+        let mut connection = self.connection.clone();
+        authenticate_principal(&mut connection, &identity.admin_principal).await
+    }
+    fn supports_consistent_reads(&self) -> bool {
+        true
+    }
+    fn name(&self) -> &'static str {
+        "workspace-redis"
+    }
+
+    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, WorkspaceError> {
+        let mut connection = self.connection.clone();
+        redis::cmd("GET")
+            .arg(self.scoped(key))
+            .query_async(&mut connection)
+            .await
+            .map_err(backend)
+    }
+
+    async fn get_many(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, WorkspaceError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scoped = keys.iter().map(|key| self.scoped(key)).collect::<Vec<_>>();
+        let mut connection = self.connection.clone();
+        redis::cmd("MGET")
+            .arg(scoped)
+            .query_async(&mut connection)
+            .await
+            .map_err(backend)
+    }
+
+    async fn get_many_consistent(
+        &self,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>, WorkspaceError> {
+        // One Redis MGET is indivisible relative to the Lua writer.
+        self.get_many(keys).await
+    }
+
+    async fn get_many_consistent_with_time(
+        &self,
+        keys: &[Vec<u8>],
+    ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
+        if keys.is_empty() {
+            return Ok((Vec::new(), self.server_time_ns().await?));
+        }
+        let scoped = keys.iter().map(|key| self.scoped(key)).collect::<Vec<_>>();
+        let mut connection = self.connection.clone();
+        let ((seconds, micros), values): ((i64, i64), Vec<Option<Vec<u8>>>) = redis::pipe()
+            .atomic()
+            .cmd("TIME")
+            .cmd("MGET")
+            .arg(scoped)
+            .query_async(&mut connection)
+            .await
+            .map_err(backend)?;
+        Ok((values, redis_time_ns(seconds, micros)?))
+    }
+
+    async fn get_many_consistent_with_time_bounded(
+        &self,
+        keys: &[Vec<u8>],
+        limits: KvReadLimits,
+    ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
+        limits.validate_keys(keys)?;
+        let script = redis::Script::new(BOUNDED_TIMED_GET_LUA);
+        let mut invocation = script.prepare_invoke();
+        for key in keys {
+            invocation.key(self.scoped(key));
+        }
+        invocation
+            .arg(limits.max_value_bytes)
+            .arg(limits.max_total_bytes)
+            .arg(self.prefix.len())
+            .arg(limits.max_response_bytes);
+        let mut connection = self.connection.clone();
+        let ((seconds, micros), values): ((i64, i64), Vec<Option<Vec<u8>>>) = invocation
+            .invoke_async(&mut connection)
+            .await
+            .map_err(backend)?;
+        if values.len() != keys.len() {
+            return Err(backend("bounded timed GET returned a short result"));
+        }
+        Ok((values, redis_time_ns(seconds, micros)?))
+    }
+
+    async fn get_many_with_time(
+        &self,
+        keys: &[Vec<u8>],
+    ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
+        let scoped = keys.iter().map(|key| self.scoped(key)).collect::<Vec<_>>();
+        let mut connection = self.connection.clone();
+        let ((seconds, micros), values): ((i64, i64), Vec<Option<Vec<u8>>>) = redis::pipe()
+            .cmd("TIME")
+            .cmd("MGET")
+            .arg(scoped)
+            .query_async(&mut connection)
+            .await
+            .map_err(backend)?;
+        let now = redis_time_ns(seconds, micros)?;
+        Ok((values, now))
+    }
+
+    async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<KvEntry>, WorkspaceError> {
+        self.scan_prefix_with_limit(prefix, None).await
+    }
+
+    async fn scan_prefix_bounded(
+        &self,
+        prefix: &[u8],
+        max_records: usize,
+    ) -> Result<Vec<KvEntry>, WorkspaceError> {
+        self.scan_prefix_with_limit(prefix, Some(max_records)).await
+    }
+
+    async fn scan_prefix_with_byte_limits(
+        &self,
+        prefix: &[u8],
+        limits: KvReadLimits,
+    ) -> Result<Vec<KvEntry>, WorkspaceError> {
+        self.scan_prefix_with_byte_plan(prefix, None, limits).await
+    }
+
+    async fn scan_prefix_page_with_byte_limits(
+        &self,
+        prefix: &[u8],
+        after_key_exclusive: Option<&[u8]>,
+        limits: KvReadLimits,
+    ) -> Result<Vec<KvEntry>, WorkspaceError> {
+        limits.validate_scan_page(prefix, after_key_exclusive)?;
+        self.scan_prefix_with_byte_plan(prefix, after_key_exclusive, limits)
+            .await
     }
 
     async fn compare_and_swap(
@@ -234,46 +696,40 @@ impl WorkspaceKvBackend for RedisWorkspaceBackend {
         checks: &[KvCheck],
         writes: &[KvWrite],
     ) -> Result<bool, WorkspaceError> {
-        let script = redis::Script::new(CAS_LUA);
-        let mut invocation = script.prepare_invoke();
-        for check in checks {
-            invocation.key(self.scoped(&check.key));
-        }
-        for write in writes {
-            let key = match write {
-                KvWrite::Put { key, .. } | KvWrite::Delete { key } => key,
-            };
-            invocation.key(self.scoped(key));
-        }
-        invocation.key(self.scoped(KEY_INDEX));
-        invocation.arg(checks.len());
-        for check in checks {
-            match &check.expected {
-                Some(expected) => {
-                    invocation.arg(1_u8).arg(expected);
-                }
-                None => {
-                    invocation.arg(0_u8).arg(Vec::<u8>::new());
-                }
-            }
-        }
-        invocation.arg(writes.len());
-        for write in writes {
-            match write {
-                KvWrite::Put { value, .. } => {
-                    invocation.arg("put").arg(value);
-                }
-                KvWrite::Delete { .. } => {
-                    invocation.arg("delete").arg(Vec::<u8>::new());
-                }
-            }
-        }
-        let mut connection = self.connection.clone();
-        let result: i64 = invocation
-            .invoke_async(&mut connection)
-            .await
-            .map_err(backend)?;
-        Ok(result == 1)
+        self.cas(checks, writes, None, None).await
+    }
+
+    async fn authenticate_checks_before_bounded(
+        &self,
+        checks: &[KvCheck],
+        expires_at_ns: i64,
+        limits: KvReadLimits,
+    ) -> Result<bool, WorkspaceError> {
+        super::kv_backend::validate_bounded_authentication_checks(checks, limits)?;
+        validate_cas_time_window(None, Some(expires_at_ns))?;
+        // Existing Lua atomically compares all bytes and samples TIME; response
+        // materializes only an integer. Expected input is bounded above.
+        self.cas(checks, &[], None, Some(expires_at_ns)).await
+    }
+
+    async fn compare_and_swap_before(
+        &self,
+        checks: &[KvCheck],
+        writes: &[KvWrite],
+        expires_at_ns: i64,
+    ) -> Result<bool, WorkspaceError> {
+        self.cas(checks, writes, None, Some(expires_at_ns)).await
+    }
+
+    async fn compare_and_swap_in_time_window(
+        &self,
+        checks: &[KvCheck],
+        writes: &[KvWrite],
+        not_before_ns: Option<i64>,
+        before_ns: Option<i64>,
+    ) -> Result<bool, WorkspaceError> {
+        validate_cas_time_window(not_before_ns, before_ns)?;
+        self.cas(checks, writes, not_before_ns, before_ns).await
     }
 
     async fn server_time_ns(&self) -> Result<i64, WorkspaceError> {
@@ -319,6 +775,307 @@ fn validate_namespace(namespace: &str) -> Result<(), WorkspaceError> {
     Ok(())
 }
 
+fn validate_operator_principals(admin: &str, runtime: &str) -> Result<(), WorkspaceError> {
+    let valid = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value != "default"
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    if !valid(admin) || !valid(runtime) || admin == runtime {
+        return Err(WorkspaceError::UnsupportedCapability(
+            "operator and runtime Redis principals must be distinct named ACL users",
+        ));
+    }
+    Ok(())
+}
+
+async fn authenticate_principal(
+    connection: &mut ConnectionManager,
+    expected: &str,
+) -> Result<(), WorkspaceError> {
+    let actual: String = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        redis::cmd("ACL").arg("WHOAMI").query_async(connection),
+    )
+    .await
+    .map_err(|_| WorkspaceError::Backend("Redis identity check timed out".into()))?
+    .map_err(|_| WorkspaceError::Backend("Redis identity check failed".into()))?;
+    if actual != expected {
+        return Err(WorkspaceError::Fenced);
+    }
+    Ok(())
+}
+
 fn backend(error: impl std::fmt::Display) -> WorkspaceError {
     WorkspaceError::Backend(format!("Redis workspace catalog: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn operator_principals_reject_shared_default_or_unbounded_identity() {
+        assert!(super::validate_operator_principals("operator", "runtime").is_ok());
+        for (admin, runtime) in [
+            ("default", "runtime"),
+            ("operator", "operator"),
+            ("", "runtime"),
+            ("operator", "runtime\n"),
+        ] {
+            assert!(super::validate_operator_principals(admin, runtime).is_err());
+        }
+        assert!(super::validate_operator_principals(&"a".repeat(129), "runtime").is_err());
+    }
+    use super::*;
+    use futures::FutureExt;
+
+    #[tokio::test]
+    #[ignore = "requires BREWFS_TEST_REDIS_URL"]
+    async fn real_redis_bounded_keyset_pages_complete_large_prefix() {
+        let url = std::env::var("BREWFS_TEST_REDIS_URL").unwrap();
+        let namespace = format!("kv-pages-{}", uuid::Uuid::new_v4().simple());
+        let backend = RedisWorkspaceBackend::connect(&url, &namespace)
+            .await
+            .unwrap();
+        super::super::kv_backend::scan_page_contract::assert_real_pages(&backend).await;
+        let mut connection = backend.connection.clone();
+        redis::cmd("DEL")
+            .arg(backend.scoped(KEY_INDEX))
+            .arg(backend.scoped(KEY_INDEX_READY))
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BREWFS_TEST_REDIS_URL"]
+    async fn real_redis_bounded_values_reject_corrupt_oversized_point_and_scan() {
+        let url = std::env::var("BREWFS_TEST_REDIS_URL").unwrap();
+        let namespace = format!("kv-bytes-{}", uuid::Uuid::new_v4().simple());
+        let backend = RedisWorkspaceBackend::connect(&url, &namespace)
+            .await
+            .unwrap();
+        let keys = [b"pin/a".to_vec(), b"pin/b".to_vec()];
+        let limits = KvReadLimits {
+            max_records: 2,
+            max_key_bytes: 32,
+            max_value_bytes: 4,
+            max_total_bytes: 18,
+            max_response_bytes: 1024,
+            max_data_requests: 1,
+        };
+        let result = std::panic::AssertUnwindSafe(async {
+            backend
+                .compare_and_swap(
+                    &[],
+                    &[
+                        KvWrite::Put {
+                            key: keys[0].clone(),
+                            value: vec![1; 4],
+                        },
+                        KvWrite::Put {
+                            key: keys[1].clone(),
+                            value: vec![2; 4],
+                        },
+                    ],
+                )
+                .await?;
+            let (values, now) = backend
+                .get_many_consistent_with_time_bounded(&keys, limits)
+                .await?;
+            assert_eq!(values, vec![Some(vec![1; 4]), Some(vec![2; 4])]);
+            assert!(now > 0);
+            assert_eq!(
+                backend
+                    .scan_prefix_with_byte_limits(b"pin/", limits)
+                    .await?
+                    .len(),
+                2
+            );
+            let aggregate_too_small = KvReadLimits {
+                max_total_bytes: 17,
+                ..limits
+            };
+            assert!(
+                backend
+                    .get_many_consistent_with_time_bounded(&keys, aggregate_too_small)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                backend
+                    .scan_prefix_with_byte_limits(b"pin/", aggregate_too_small)
+                    .await
+                    .is_err()
+            );
+
+            // Inject corruption through the actual persistence backend. A GET
+            // plus a Rust len check would transfer this 2 MiB string first.
+            let mut connection = backend.connection.clone();
+            redis::cmd("SET")
+                .arg(backend.scoped(&keys[1]))
+                .arg(vec![3_u8; 2 << 20])
+                .query_async::<()>(&mut connection)
+                .await
+                .map_err(super::backend)?;
+            assert!(
+                backend
+                    .get_many_consistent_with_time_bounded(&keys, limits)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                backend
+                    .scan_prefix_with_byte_limits(b"pin/", limits)
+                    .await
+                    .is_err()
+            );
+            Ok::<(), WorkspaceError>(())
+        })
+        .catch_unwind()
+        .await;
+        let mut connection = backend.connection.clone();
+        let cleanup: Result<(), redis::RedisError> = redis::cmd("DEL")
+            .arg(backend.scoped(KEY_INDEX))
+            .arg(backend.scoped(KEY_INDEX_READY))
+            .arg(backend.scoped(&keys[0]))
+            .arg(backend.scoped(&keys[1]))
+            .query_async(&mut connection)
+            .await;
+        cleanup.unwrap();
+        result.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BREWFS_TEST_REDIS_URL"]
+    async fn real_redis_bounded_scan_rejects_oversized_index_key_and_ghost() {
+        let url = std::env::var("BREWFS_TEST_REDIS_URL").unwrap();
+        let namespace = format!("kv-index-bytes-{}", uuid::Uuid::new_v4().simple());
+        let backend = RedisWorkspaceBackend::connect(&url, &namespace)
+            .await
+            .unwrap();
+        let mut key = b"pin/".to_vec();
+        key.extend_from_slice(&[b'x'; 2048]);
+        let limits = KvReadLimits {
+            max_records: 2,
+            max_key_bytes: 32,
+            max_value_bytes: 4,
+            max_total_bytes: 72,
+            max_response_bytes: 1024,
+            max_data_requests: 1,
+        };
+        let result = std::panic::AssertUnwindSafe(async {
+            backend
+                .compare_and_swap(
+                    &[],
+                    &[KvWrite::Put {
+                        key: key.clone(),
+                        value: vec![1],
+                    }],
+                )
+                .await?;
+            assert!(
+                backend
+                    .scan_prefix_with_byte_limits(b"pin/", limits)
+                    .await
+                    .is_err()
+            );
+            let mut connection = backend.connection.clone();
+            redis::cmd("ZREM")
+                .arg(backend.scoped(KEY_INDEX))
+                .arg(backend.scoped(&key))
+                .query_async::<()>(&mut connection)
+                .await
+                .map_err(super::backend)?;
+            redis::cmd("ZADD")
+                .arg(backend.scoped(KEY_INDEX))
+                .arg(0)
+                .arg(backend.scoped(b"pin/ghost"))
+                .query_async::<()>(&mut connection)
+                .await
+                .map_err(super::backend)?;
+            assert!(
+                backend
+                    .scan_prefix_with_byte_limits(b"pin/", limits)
+                    .await
+                    .is_err()
+            );
+            Ok::<(), WorkspaceError>(())
+        })
+        .catch_unwind()
+        .await;
+        let mut connection = backend.connection.clone();
+        redis::cmd("DEL")
+            .arg(backend.scoped(KEY_INDEX))
+            .arg(backend.scoped(KEY_INDEX_READY))
+            .arg(backend.scoped(&key))
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
+        result.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BREWFS_TEST_REDIS_URL"]
+    async fn real_redis_clock_window_fences_reap_and_advances_generation_atomically() {
+        let backend = RedisWorkspaceBackend::connect(
+            &std::env::var("BREWFS_TEST_REDIS_URL").unwrap(),
+            &format!("g12-pin-clock-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await
+        .unwrap();
+        super::super::kv_backend::time_window_contract::assert_real_window(&backend).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BREWFS_TEST_REDIS_URL"]
+    async fn corrupt_key_index_rejects_cas_before_any_inode_acl_write() {
+        let url = std::env::var("BREWFS_TEST_REDIS_URL").unwrap();
+        let namespace = format!("acl-fault-{}", uuid::Uuid::new_v4().simple());
+        let backend = RedisWorkspaceBackend::connect(&url, &namespace)
+            .await
+            .unwrap();
+        let index = backend.scoped(KEY_INDEX);
+        let mut connection = backend.connection.clone();
+        redis::cmd("SET")
+            .arg(&index)
+            .arg("injected-wrong-type")
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
+        let result = backend
+            .compare_and_swap(
+                &[],
+                &[
+                    KvWrite::Put {
+                        key: b"test-inode".to_vec(),
+                        value: b"mode640".to_vec(),
+                    },
+                    KvWrite::Put {
+                        key: b"test-acl".to_vec(),
+                        value: b"mask4".to_vec(),
+                    },
+                ],
+            )
+            .await;
+        let inode = backend.get(b"test-inode").await.unwrap();
+        let acl = backend.get(b"test-acl").await.unwrap();
+        // Remove only this test's three explicit keys; no namespace-wide delete.
+        redis::cmd("DEL")
+            .arg(&index)
+            .arg(backend.scoped(KEY_INDEX_READY))
+            .arg(backend.scoped(b"test-inode"))
+            .arg(backend.scoped(b"test-acl"))
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            (inode, acl),
+            (None, None),
+            "Redis Lua error left half a permission update"
+        );
+    }
 }

@@ -7,16 +7,18 @@ use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 
-use crate::cadapter::client::ObjectBackend;
+use crate::cadapter::client::{ObjectBackend, ObjectByteStream};
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashSet;
+use futures_util::StreamExt;
 use std::io::{IoSlice, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{fs, io::AsyncReadExt, io::AsyncSeekExt, io::AsyncWriteExt};
+use tokio_util::io::ReaderStream;
 use tracing::field;
 
 fn can_block_in_place() -> bool {
@@ -60,6 +62,9 @@ impl LocalFsBackend {
 
 #[async_trait]
 impl ObjectBackend for LocalFsBackend {
+    fn forbids_mutation_replay(&self) -> bool {
+        true
+    }
     #[tracing::instrument(
         name = "LocalFs.put_object_vectored",
         level = "trace",
@@ -276,6 +281,61 @@ impl ObjectBackend for LocalFsBackend {
         })
     }
 
+    async fn get_object_stream(&self, key: &str) -> Result<Option<ObjectByteStream>> {
+        let file = match fs::File::open(self.path_for(key)).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let stream = ReaderStream::new(file).map(|item| item.map_err(anyhow::Error::from));
+        Ok(Some(Box::pin(stream)))
+    }
+
+    async fn get_object_range_stream(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<ObjectByteStream> {
+        if length == 0 {
+            return Ok(Box::pin(futures_util::stream::empty()));
+        }
+        let path = self.path_for(key);
+        let mut file = match fs::File::open(path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Box::pin(futures_util::stream::empty()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let stream =
+            ReaderStream::new(file.take(length)).map(|item| item.map_err(anyhow::Error::from));
+        Ok(Box::pin(stream))
+    }
+
+    async fn get_object_size(&self, key: &str) -> Result<Option<u64>> {
+        let path = self.path_for(key);
+        match fs::metadata(path).await {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn get_object_size_bounded(&self, key: &str) -> Result<Option<u64>> {
+        match fs::metadata(self.path_for(key)).await {
+            Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bounded object metadata is not a regular file",
+            )
+            .into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn get_etag(&self, key: &str) -> Result<String> {
         let path = self.path_for(key);
 
@@ -303,6 +363,36 @@ impl ObjectBackend for LocalFsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_size_uses_metadata_for_sparse_empty_missing_and_nonfile_objects() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = LocalFsBackend::new(root.path());
+        let sparse = std::fs::File::create(root.path().join("sparse")).unwrap();
+        sparse.set_len(1_u64 << 30).unwrap();
+        std::fs::File::create(root.path().join("empty")).unwrap();
+        std::fs::create_dir(root.path().join("directory")).unwrap();
+        assert_eq!(
+            backend.get_object_size_bounded("sparse").await.unwrap(),
+            Some(1_u64 << 30)
+        );
+        assert_eq!(
+            backend.get_object_size_bounded("empty").await.unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            backend.get_object_size_bounded("missing").await.unwrap(),
+            None
+        );
+        let error = backend
+            .get_object_size_bounded("directory")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
 
     #[tokio::test]
     async fn create_only_put_never_overwrites_an_existing_object() {

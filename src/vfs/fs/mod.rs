@@ -1,5 +1,13 @@
 //! FUSE/SDK-friendly VFS with path-based metadata ops and handle-based IO.
 
+#[cfg(feature = "workspace-overlay")]
+mod packed_mutation_gate;
+#[cfg(feature = "workspace-overlay")]
+use packed_mutation_gate::PackedMutationGate;
+#[cfg(feature = "workspace-overlay")]
+#[allow(unused_imports)] // Typed factory integration follows this local boundary.
+pub(crate) use packed_mutation_gate::PackedVfsDrainFence;
+
 use crate::chunk::store::BlockStore;
 use crate::chunk::{BlockGcConfig, ChunkLayout, CompactionWorker, CompactionWorkerConfig};
 use crate::meta::MetaLayer;
@@ -8,13 +16,14 @@ use crate::meta::config::CompactConfig;
 use crate::meta::config::MetaClientConfig;
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
 use crate::meta::store::{
-    AclRule, MetaError, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
+    AclRule, CreateEntryResult, MetaError, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
 };
 use crate::posix::NAME_MAX;
 use asyncfuse::notify::Notify as FuseNotify;
-use bytes::Bytes;
 use dashmap::{DashMap, Entry};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[cfg(feature = "native-packed-base")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -34,6 +43,15 @@ const FUSE_SPLIT_WRITE_BARRIER_TTL: Duration = Duration::from_millis(10);
 const FUSE_LOCKED_SPLIT_WRITE_BARRIER_TTL: Duration = Duration::from_millis(50);
 // FUSE_NOTIFY_INVAL_INODE uses len=0 to invalidate all cached pages for an inode.
 const FUSE_KERNEL_INVALIDATE_ALL_LEN: i64 = 0;
+
+#[cfg(test)]
+fn write_diagnostic(stage: &str, ino: i64, fh: u64, offset: u64, len: usize) {
+    if len == 57 {
+        eprintln!(
+            "[packed-v3-write-diag] stage={stage} ino={ino} fh={fh} offset={offset} len={len}"
+        );
+    }
+}
 
 /// Rename operation flags (similar to Linux renameat2 flags)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -114,13 +132,15 @@ fn vfs_timing_enabled_from_env() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "native-packed-base")]
+use crate::native_base::runtime::NativeDataRuntime;
 use crate::vfs::Inode;
 use crate::vfs::backend::Backend;
 use crate::vfs::cache::config::CacheConfig;
 use crate::vfs::chunk_id_for;
 use crate::vfs::config::VFSConfig;
 use crate::vfs::error::{PathHint, VfsError};
-use crate::vfs::handles::{DirHandle, FileHandle, HandleFlags, WriteDirtyState};
+use crate::vfs::handles::{DirHandle, FileHandle, HandleFlags, RawDirEntry, WriteDirtyState};
 use crate::vfs::io::{DataReader, DataWriter, split_chunk_spans};
 use crate::vfs::memory::MemoryBudget;
 
@@ -132,6 +152,7 @@ where
     handles: DashMap<u64, Arc<FileHandle<B, M>>>,
     inode_handles: DashMap<i64, Vec<u64>>,
     dir_handles: DashMap<u64, Arc<DirHandle>>,
+    stats_handles: DashMap<u64, bytes::Bytes>,
     next_fh: AtomicU64,
 }
 
@@ -145,13 +166,30 @@ where
             handles: DashMap::new(),
             inode_handles: DashMap::new(),
             dir_handles: DashMap::new(),
+            stats_handles: DashMap::new(),
             next_fh: AtomicU64::new(1),
         }
     }
 
-    fn allocate(&self, ino: i64, attr: FileAttr, flags: HandleFlags) -> Arc<FileHandle<B, M>> {
-        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        let handle = Arc::new(FileHandle::new(fh, ino, attr, flags));
+    fn next_handle(&self) -> Result<u64, VfsError> {
+        self.next_fh
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                if next == 0 { None } else { next.checked_add(1) }
+            })
+            .map_err(|_| VfsError::Anyhow(anyhow::anyhow!("FUSE handle namespace exhausted")))
+    }
+
+    // The caller reserves a unique nonzero fh before admission/metadata work.
+    // Failed opens may leave gaps; a reserved value is never rolled back/reused.
+    fn allocate(
+        &self,
+        fh: u64,
+        ino: i64,
+        attr: FileAttr,
+        flags: HandleFlags,
+        memory_guard: Option<crate::meta::layer::MetadataMemoryGuard>,
+    ) -> Arc<FileHandle<B, M>> {
+        let handle = Arc::new(FileHandle::new_owned(fh, ino, attr, flags, memory_guard));
         self.handles.insert(fh, handle.clone());
         self.inode_handles.entry(ino).or_default().push(fh);
         handle
@@ -195,6 +233,14 @@ where
             }
         }
         state
+    }
+
+    fn mark_write_dirty_for_inode(&self, ino: i64) {
+        for fh in self.handles_for(ino) {
+            if let Some(handle) = self.handles.get(&fh) {
+                handle.mark_write_dirty();
+            }
+        }
     }
 
     fn take_write_dirty(&self, fh: u64) -> WriteDirtyState {
@@ -256,8 +302,22 @@ where
         self.handles_for(ino).is_empty()
     }
 
-    fn allocate_dir(&self, handle: DirHandle) -> u64 {
-        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+    fn allocate_stats(&self, fh: u64, snapshot: bytes::Bytes) -> u64 {
+        self.stats_handles.insert(fh, snapshot);
+        fh
+    }
+
+    fn stats_snapshot(&self, fh: u64) -> Option<bytes::Bytes> {
+        self.stats_handles
+            .get(&fh)
+            .map(|entry| entry.value().clone())
+    }
+
+    fn release_stats(&self, fh: u64) {
+        self.stats_handles.remove(&fh);
+    }
+
+    fn allocate_dir(&self, fh: u64, handle: DirHandle) -> u64 {
         self.dir_handles.insert(fh, Arc::new(handle));
         fh
     }
@@ -295,9 +355,12 @@ where
     recently_unlinked_cleanup_tick: AtomicU64,
     reader: Arc<DataReader<S, M>>,
     writer: Arc<DataWriter<S, M>>,
+    #[cfg(feature = "workspace-overlay")]
+    packed_mutation_gate: Arc<PackedMutationGate>,
     append_locks: DashMap<i64, Arc<Mutex<()>>>,
     split_write_barriers: DashMap<i64, SplitWriteBarrier>,
     fuse_write_order: Arc<FuseWriteOrder>,
+    fuse_read_cancel: crate::vfs::fuse_read_cancel::ReadRegistry,
     fuse_notify: StdMutex<Option<FuseNotify>>,
     statfs_cache: StdMutex<Option<StatFsCache>>,
     fallocate_statfs_cache: StdMutex<Option<FallocateStatFsCache>>,
@@ -404,7 +467,12 @@ where
     S: BlockStore + Send + Sync + 'static,
     M: MetaLayer + Send + Sync + 'static,
 {
-    fn new(config: Arc<VFSConfig>, backend: Arc<Backend<S, M>>) -> Self {
+    fn new(
+        config: Arc<VFSConfig>,
+        backend: Arc<Backend<S, M>>,
+        fuse_read_cancel: crate::vfs::fuse_read_cancel::ReadRegistry,
+        #[cfg(feature = "workspace-overlay")] packed_mutation_gate: Arc<PackedMutationGate>,
+    ) -> Result<Self, VfsError> {
         let memory_budget = (config.cache.memory_budget_bytes > 0)
             .then(|| MemoryBudget::new(config.cache.memory_budget_bytes));
 
@@ -438,6 +506,37 @@ where
                             tasks.push(tokio::spawn(async move {
                                 #[cfg(feature = "workspace-overlay")]
                                 if let Some(provider) = backend.workspace_read_plan() {
+                                    if provider.supports_prepared_unified_read() {
+                                        let Ok(len) = usize::try_from(span.len) else {
+                                            return;
+                                        };
+                                        let Ok(_output_owner) = provider.reserve_read_output(len)
+                                        else {
+                                            return;
+                                        };
+                                        let Ok(Some(prepared)) = provider
+                                            .prepare_unified_read(
+                                                ino,
+                                                span.index,
+                                                span.offset,
+                                                span.len,
+                                            )
+                                            .await
+                                        else {
+                                            return;
+                                        };
+                                        let mut output = vec![0; len];
+                                        let _ = crate::chunk::read_plan::execute_unified_into(
+                                            prepared.fetcher.as_ref(),
+                                            span.offset,
+                                            &prepared.plan,
+                                            &mut output,
+                                        )
+                                        .await;
+                                        // Retain prepared child and output owners through
+                                        // execution. Prefetch has no caller delivery credit.
+                                        return;
+                                    }
                                     let Ok(plan) = provider
                                         .read_plan(ino, span.index, span.offset, span.len)
                                         .await
@@ -521,11 +620,81 @@ where
                 let wb_clone = wb.clone();
                 let backend_clone = backend.clone();
                 let layout = config.write.layout;
+                #[cfg(feature = "workspace-overlay")]
+                if packed_mutation_gate.enabled() {
+                    let recovery_owner = backend_clone
+                        .meta()
+                        .reserve_memory(crate::meta::layer::MetadataMemoryKind::Request, 4 << 20)
+                        .map_err(|error| VfsError::from_meta(PathHint::none(), error))?;
+                    let driver = packed_mutation_gate.admit(recovery_owner)?;
+                    packed_mutation_gate.begin_recovery();
+                    let recovery_gate = packed_mutation_gate.clone();
+                    // Tokio task-local state does not cross spawn. Capture the
+                    // private owner here and explicitly scope the actual I/O driver.
+                    let mounted_recovery_owner = crate::workspace_overlay::stores::kv_store::packed_admin::capture_mounted_recovery_owner();
+                    tokio::spawn(async move {
+                        let result = driver
+                            .run(async move {
+                                let replay = Self::recover_dirty_slices(
+                                    &wb_clone,
+                                    &backend_clone,
+                                    layout,
+                                    true,
+                                );
+                                let result = if let Some(owner) = mounted_recovery_owner {
+                                    owner.scope(replay).await
+                                } else {
+                                    replay.await
+                                };
+                                recovery_gate.finish_recovery(result.is_ok());
+                                result
+                            })
+                            .await;
+                        if let Err(error) = result.and_then(|result| result.map_err(VfsError::from))
+                        {
+                            tracing::warn!(?error, "packed writeback recovery failed");
+                        }
+                    });
+                } else {
+                    tokio::spawn(async move {
+                        let _ =
+                            Self::recover_dirty_slices(&wb_clone, &backend_clone, layout, false)
+                                .await;
+                    });
+                }
+                #[cfg(not(feature = "workspace-overlay"))]
                 tokio::spawn(async move {
-                    Self::recover_dirty_slices(&wb_clone, &backend_clone, layout).await;
+                    let _ =
+                        Self::recover_dirty_slices(&wb_clone, &backend_clone, layout, false).await;
                 });
             }
 
+            // Production's constructor starts the same owned replay. Tests
+            // opt in only through a genuinely minted typed recovery owner;
+            // ordinary test VFS construction retains its existing behavior.
+            #[cfg(all(test, feature = "workspace-overlay"))]
+            if let Some(owner) = crate::workspace_overlay::stores::kv_store::packed_admin::capture_mounted_recovery_owner() {
+                let recovery_owner = backend.meta().reserve_memory(
+                    crate::meta::layer::MetadataMemoryKind::Request, 4 << 20)
+                    .map_err(|error| VfsError::from_meta(PathHint::none(), error))?;
+                let driver = packed_mutation_gate.admit(recovery_owner)?;
+                packed_mutation_gate.begin_recovery();
+                let gate = packed_mutation_gate.clone();
+                let cache = wb.clone();
+                let recovery_backend = backend.clone();
+                let layout = config.write.layout;
+                tokio::spawn(async move {
+                    let result = driver.run(async move {
+                        let result = owner.scope(Self::recover_dirty_slices(
+                            &cache, &recovery_backend, layout, true)).await;
+                        gate.finish_recovery(result.is_ok());
+                        result
+                    }).await;
+                    if let Err(error) = result.and_then(|result| result.map_err(VfsError::from)) {
+                        tracing::warn!(?error, "typed packed writeback recovery failed");
+                    }
+                });
+            }
             Some(wb)
         } else {
             None
@@ -536,22 +705,27 @@ where
         #[cfg(feature = "workspace-overlay")]
         {
             writer_builder = writer_builder.with_writeback_epoch(config.workspace_writer_epoch);
+            writer_builder =
+                writer_builder.with_packed_publication_tracking(packed_mutation_gate.enabled());
         }
         if let Some(memory_budget) = memory_budget.clone() {
             writer_builder = writer_builder.with_memory_budget(memory_budget);
         }
         let writer = Arc::new(writer_builder);
         writer.start_flush_background();
-        Self {
+        Ok(Self {
             handles: HandleRegistry::new(),
             inodes: DashMap::new(),
             recently_unlinked: DashMap::new(),
             recently_unlinked_cleanup_tick: AtomicU64::new(0),
             reader,
             writer,
+            #[cfg(feature = "workspace-overlay")]
+            packed_mutation_gate,
             append_locks: DashMap::new(),
             split_write_barriers: DashMap::new(),
             fuse_write_order: Arc::new(FuseWriteOrder::default()),
+            fuse_read_cancel,
             fuse_notify: StdMutex::new(None),
             statfs_cache: StdMutex::new(None),
             fallocate_statfs_cache: StdMutex::new(None),
@@ -560,7 +734,7 @@ where
             stats: Arc::new(crate::vfs::stats::FsStats::new()),
             memory_budget,
             vfs_timing_enabled: vfs_timing_enabled_from_env(),
-        }
+        })
     }
 
     /// Scan local SSD for dirty slices from a previous session.
@@ -569,20 +743,32 @@ where
         wb: &crate::vfs::cache::write_back::FsWriteBackCache,
         backend: &Arc<Backend<S, M>>,
         layout: crate::chunk::ChunkLayout,
-    ) {
+        packed_publication: bool,
+    ) -> anyhow::Result<()> {
         use crate::vfs::cache::keys::DirtySliceState;
         use crate::vfs::cache::write_back::WriteBackCache;
 
-        let records = match wb.recover().await {
+        #[cfg(feature = "workspace-overlay")]
+        let recovery = if packed_publication {
+            wb.recover_packed_publication().await
+        } else {
+            wb.recover().await
+        };
+        #[cfg(not(feature = "workspace-overlay"))]
+        let recovery = {
+            let _ = packed_publication;
+            wb.recover().await
+        };
+        let records = match recovery {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = ?e, "write-back cache recovery scan failed");
-                return;
+                return Err(e);
             }
         };
 
         if records.is_empty() {
-            return;
+            return Ok(());
         }
 
         tracing::info!(
@@ -591,8 +777,21 @@ where
         );
 
         for record in records {
+            #[cfg(feature = "workspace-overlay")]
+            if let Some(owner) = crate::workspace_overlay::stores::kv_store::packed_admin::capture_mounted_recovery_owner() {
+                // A different mount generation's record is a recovery
+                // obligation, never a disposable orphan of this PVC replay.
+                owner.validate_dirty_epoch(record.key.epoch)?;
+            }
             if !record.path.exists() {
-                let _ = wb.remove(&record.key).await;
+                anyhow::ensure!(
+                    !packed_publication,
+                    "packed recovery data disappeared after inventory"
+                );
+                let result = wb.remove(&record.key).await;
+                if packed_publication {
+                    result?;
+                }
                 continue;
             }
 
@@ -605,13 +804,27 @@ where
                         state = ?record.state,
                         "re-uploading recovered slice"
                     );
-                    Self::reupload_recovered_slice(wb, backend, layout, &record).await;
+                    let result = Self::reupload_recovered_slice(
+                        wb,
+                        backend,
+                        layout,
+                        &record,
+                        packed_publication,
+                    )
+                    .await;
+                    if packed_publication {
+                        result?;
+                    }
                 }
                 _ => {
-                    let _ = wb.remove(&record.key).await;
+                    let result = wb.remove(&record.key).await;
+                    if packed_publication {
+                        result?;
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     async fn record_recovery_orphan(
@@ -641,15 +854,64 @@ where
         backend: &Arc<Backend<S, M>>,
         layout: crate::chunk::ChunkLayout,
         record: &crate::vfs::cache::write_back::DirtySliceRecord,
-    ) {
+        packed_publication: bool,
+    ) -> anyhow::Result<()> {
         use crate::chunk::writer::DataUploader;
         use crate::vfs::cache::write_back::WriteBackCache;
 
-        let data = match tokio::fs::read(&record.path).await {
+        let (ino, chunk_index) = crate::vfs::extract_ino_and_chunk_index(record.chunk_id);
+        if packed_publication {
+            anyhow::ensure!(
+                ino == record.ino
+                    && record
+                        .chunk_offset
+                        .checked_add(record.length)
+                        .is_some_and(|end| end <= layout.chunk_size),
+                "packed recovery inode or chunk range mismatch"
+            );
+        }
+
+        #[cfg(feature = "workspace-overlay")]
+        let _data_owner = if packed_publication {
+            anyhow::ensure!(
+                record.length <= crate::vfs::cache::write_back::MAX_PACKED_RECOVERY_SLICE_BYTES,
+                "packed recovery data byte cap"
+            );
+            backend.meta().reserve_memory(
+                crate::meta::layer::MetadataMemoryKind::Request,
+                record
+                    .length
+                    .checked_add(4096)
+                    .ok_or_else(|| anyhow::anyhow!("recovery byte overflow"))?,
+            )?
+        } else {
+            None
+        };
+        let read = if packed_publication {
+            use tokio::io::AsyncReadExt;
+            let file = tokio::fs::File::open(&record.path).await?;
+            let mut data = Vec::with_capacity(usize::try_from(record.length)? + 1);
+            file.take(
+                record
+                    .length
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("recovery byte overflow"))?,
+            )
+            .read_to_end(&mut data)
+            .await?;
+            anyhow::ensure!(
+                u64::try_from(data.len())? == record.length,
+                "packed recovery data size changed"
+            );
+            Ok(data)
+        } else {
+            tokio::fs::read(&record.path).await
+        };
+        let data = match read {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(path = ?record.path, error = ?e, "cannot read recovered slice");
-                return;
+                return Err(e.into());
             }
         };
 
@@ -657,7 +919,7 @@ where
             Ok(id) => id as u64,
             Err(e) => {
                 tracing::warn!(error = ?e, "failed to allocate slice_id for recovery");
-                return;
+                return Err(e.into());
             }
         };
 
@@ -668,7 +930,7 @@ where
             .await
         {
             tracing::warn!(slice_id, error = ?e, "recovery upload failed");
-            return;
+            return Err(e);
         }
 
         let desc = crate::chunk::SliceDesc {
@@ -677,9 +939,13 @@ where
             offset: record.chunk_offset,
             length: record.length,
         };
-        let (ino, chunk_index) = crate::vfs::extract_ino_and_chunk_index(record.chunk_id);
-        let file_offset = chunk_index * layout.chunk_size + desc.offset;
-        let new_size = file_offset + desc.length;
+        let file_offset = chunk_index
+            .checked_mul(layout.chunk_size)
+            .and_then(|offset| offset.checked_add(desc.offset))
+            .ok_or_else(|| anyhow::anyhow!("recovery file offset overflow"))?;
+        let new_size = file_offset
+            .checked_add(desc.length)
+            .ok_or_else(|| anyhow::anyhow!("recovery file size overflow"))?;
 
         // Check if the inode still exists before committing.  If the file was
         // deleted before the crash, the dirty record is orphaned and should be
@@ -692,9 +958,10 @@ where
                     "recovery skipped: inode deleted, removing orphan dirty record"
                 );
                 if Self::record_recovery_orphan(backend, slice_id, record.length).await {
-                    let _ = wb.remove(&record.key).await;
+                    wb.remove(&record.key).await?;
+                    return Ok(());
                 }
-                return;
+                anyhow::bail!("recovery orphan retention failed");
             }
             Err(e) => {
                 tracing::warn!(ino, slice_id, error = ?e, "recovery stat check failed, will retry commit");
@@ -714,6 +981,14 @@ where
                 && matches!(&e, MetaError::Io(error) if error.raw_os_error() == Some(libc::ESTALE));
             #[cfg(not(feature = "workspace-overlay"))]
             let workspace_fenced = false;
+            #[cfg(feature = "workspace-overlay")]
+            if workspace_fenced && packed_publication
+                && crate::workspace_overlay::stores::kv_store::packed_admin::capture_mounted_recovery_owner().is_some()
+            {
+                // Losing this recovery generation cannot authorize deletion
+                // of its pending data, even if the upload already completed.
+                return Err(e.into());
+            }
             if matches!(&e, MetaError::NotFound(_)) || workspace_fenced {
                 tracing::warn!(
                     ino,
@@ -722,12 +997,13 @@ where
                     "recovery metadata commit is terminal; recording uploaded orphan"
                 );
                 if Self::record_recovery_orphan(backend, slice_id, record.length).await {
-                    let _ = wb.remove(&record.key).await;
+                    wb.remove(&record.key).await?;
+                    return Ok(());
                 }
-                return;
+                anyhow::bail!("recovery orphan retention failed");
             }
             tracing::warn!(ino, slice_id, error = ?e, "recovery metadata commit failed");
-            return;
+            return Err(e.into());
         }
 
         tracing::info!(
@@ -736,7 +1012,8 @@ where
             length = record.length,
             "recovery commit success"
         );
-        let _ = wb.remove(&record.key).await;
+        wb.remove(&record.key).await?;
+        Ok(())
     }
 
     fn append_lock(&self, ino: i64) -> Arc<Mutex<()>> {
@@ -757,6 +1034,8 @@ where
     pub(crate) backend: Arc<Backend<S, M>>,
     pub(crate) meta_layer: Arc<M>,
     root: i64,
+    #[cfg(feature = "native-packed-base")]
+    native_runtime: OnceLock<Arc<NativeDataRuntime>>,
 }
 
 impl<S, M> VfsCore<S, M>
@@ -775,6 +1054,8 @@ where
             backend,
             meta_layer,
             root,
+            #[cfg(feature = "native-packed-base")]
+            native_runtime: OnceLock::new(),
         }
     }
 }
@@ -1001,6 +1282,36 @@ where
         Self::from_components_with_backend(config, store, meta_layer, None, backend)
     }
 
+    /// Use a native namespace with a separately bound immutable placement provider.
+    #[cfg(feature = "workspace-overlay")]
+    pub(crate) fn from_readonly_components_with_provider(
+        config: VFSConfig,
+        store: Arc<S>,
+        meta_layer: Arc<M>,
+        provider: Arc<dyn crate::chunk::read_plan::WorkspaceReadPlanProvider>,
+    ) -> Result<Self, VfsError> {
+        let backend = Arc::new(Backend::new_workspace(
+            store.clone(),
+            meta_layer.clone(),
+            provider,
+        ));
+        Self::from_components_with_backend(config, store, meta_layer, None, backend)
+    }
+
+    /// Build a VFS over an immutable metadata facade.  Frozen snapshots do
+    /// not implement the workspace read-plan provider because their extent
+    /// resolution is owned by the packed-base reader; keeping this entry
+    /// point separate prevents a read-only snapshot from being coerced into
+    /// the mutable workspace overlay path.
+    pub(crate) fn from_readonly_components(
+        config: VFSConfig,
+        store: Arc<S>,
+        meta_layer: Arc<M>,
+    ) -> Result<Self, VfsError> {
+        let backend = Arc::new(Backend::new(store.clone(), meta_layer.clone()));
+        Self::from_components_with_backend(config, store, meta_layer, None, backend)
+    }
+
     fn from_components_with_backend(
         config: VFSConfig,
         store: Arc<S>,
@@ -1011,21 +1322,56 @@ where
         let layout = config.write.layout;
         let root_ino = meta_layer.root_ino();
         let meta_metrics = meta_layer.metrics();
+        // Acquire the actual packed mount Roots owner before either initial
+        // registry Arc is allocated. Generic unbudgeted mounts preserve Default.
+        let fuse_read_cancel = if meta_layer.supports_fuse_read_cancellation() {
+            let bytes = crate::vfs::fuse_read_cancel::ReadRegistry::roots_requested_layout_bytes()
+                .checked_add(Self::client_roots_owner_bytes())
+                .ok_or_else(|| VfsError::Anyhow(anyhow::anyhow!("client Roots size overflow")))?;
+            let owner = meta_layer
+                .reserve_memory(crate::meta::layer::MetadataMemoryKind::Roots, bytes)
+                .map_err(|error| VfsError::from_meta(PathHint::none(), error))?;
+            crate::vfs::fuse_read_cancel::ReadRegistry::new_owned(owner)
+        } else {
+            crate::vfs::fuse_read_cancel::ReadRegistry::default()
+        };
         let core = Arc::new(VfsCore::new(layout, backend.clone(), meta_layer, root_ino));
         let config = Arc::new(config);
-        let state = Arc::new(VfsState::new(config, backend));
+        #[cfg(feature = "workspace-overlay")]
+        let packed_mutation_gate = {
+            let enabled = backend
+                .workspace_read_plan()
+                .is_some_and(|provider| provider.requires_unified_read_request_fence());
+            let owner = if enabled {
+                core.meta_layer
+                    .reserve_memory(
+                        crate::meta::layer::MetadataMemoryKind::Roots,
+                        PackedMutationGate::requested_layout_bytes(),
+                    )
+                    .map_err(|error| VfsError::from_meta(PathHint::none(), error))?
+            } else {
+                None
+            };
+            PackedMutationGate::new(enabled, owner)
+        };
+        let state = Arc::new(VfsState::new(
+            config,
+            backend,
+            fuse_read_cancel,
+            #[cfg(feature = "workspace-overlay")]
+            packed_mutation_gate,
+        )?);
 
-        // Background statistics logger — JuiceFS-stats equivalent.
-        let fuse_stats = state.stats.clone();
+        // Statistics observe the mount; they must not keep its writer, metadata,
+        // reader, or stats extension alive after the final VFS owner disappears.
+        let stats_state = Arc::downgrade(&state);
         let (cache_hits, cache_misses) = store.cache_counters();
         let object_metrics = store.object_store_metrics();
-        let memory_budget = state.memory_budget.clone();
-        let writer = state.writer.clone();
         if cache_hits.is_some()
             || cache_misses.is_some()
             || object_metrics.is_some()
             || meta_metrics.is_some()
-            || memory_budget.is_some()
+            || state.memory_budget.is_some()
         {
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(100));
@@ -1034,19 +1380,23 @@ where
                 let mut prev_lat_us: u64 = 0;
                 loop {
                     interval.tick().await;
+                    let Some(state) = stats_state.upgrade() else {
+                        break;
+                    };
+                    let fuse_stats = &state.stats;
                     if let (Some(hits), Some(misses)) = (&cache_hits, &cache_misses) {
                         fuse_stats.sync_cache_counters(
                             hits.load(std::sync::atomic::Ordering::Relaxed),
                             misses.load(std::sync::atomic::Ordering::Relaxed),
                         );
                     }
-                    if let Some(memory_budget) = &memory_budget {
+                    if let Some(memory_budget) = &state.memory_budget {
                         fuse_stats.sync_buffer_bytes(
                             memory_budget.writer_bytes(),
                             memory_budget.reader_bytes(),
                         );
                     }
-                    let dirty = writer.dirty_breakdown().await;
+                    let dirty = state.writer.dirty_breakdown().await;
                     fuse_stats.sync_writeback_dirty_breakdown(
                         dirty.live_bytes,
                         dirty.live_slices,
@@ -1200,8 +1550,6 @@ where
                             object.read_range_gets,
                             object.read_full_gets,
                             object.read_piggyback_full,
-                            object.persistent_slice_read_ops,
-                            object.persistent_slice_read_bytes,
                             object.read_background_prefetches,
                             object.read_background_prefetch_dropped,
                         );
@@ -1253,6 +1601,8 @@ where
                         avg_read_lat_us = avg_lat_us,
                         "stats"
                     );
+                    // Never carry a strong mount owner across the next timer wait.
+                    drop(state);
                 }
             });
         }
@@ -1273,6 +1623,59 @@ where
         &self.state.stats
     }
 
+    /// Admit before rendering; bytes and both guards stay owned through the
+    /// last handle/reply clone. Rendering never silently truncates telemetry.
+    pub(crate) fn create_virtual_stats_snapshot(
+        &self,
+        handle: bool,
+    ) -> Result<bytes::Bytes, VfsError> {
+        for _ in 0..3 {
+            let limit = self.stats().render_allocation_limit();
+            let output = self
+                .meta_layer()
+                .reserve_memory(crate::meta::layer::MetadataMemoryKind::Reply, limit as u64)?;
+            let control = if handle {
+                self.meta_layer()
+                    .reserve_memory(crate::meta::layer::MetadataMemoryKind::Handle, 8192)?
+            } else {
+                None
+            };
+            match self.stats().render_bounded(limit) {
+                Ok(text) => {
+                    return Ok(bytes::Bytes::from_owner(
+                        crate::vfs::stats::VirtualStatsSnapshot {
+                            text,
+                            _output: output,
+                            _control: control,
+                        },
+                    ));
+                }
+                Err(_) => {
+                    drop(output);
+                    drop(control);
+                }
+            }
+        }
+        Err(crate::meta::store::MetaError::Internal(
+            "statistics snapshot changed beyond its admitted bound".into(),
+        )
+        .into())
+    }
+
+    pub(crate) fn open_virtual_stats(&self) -> Result<u64, VfsError> {
+        let fh = self.state.handles.next_handle()?;
+        let snapshot = self.create_virtual_stats_snapshot(true)?;
+        Ok(self.state.handles.allocate_stats(fh, snapshot))
+    }
+
+    pub(crate) fn virtual_stats_snapshot(&self, fh: u64) -> Option<bytes::Bytes> {
+        self.state.handles.stats_snapshot(fh)
+    }
+
+    pub(crate) fn release_virtual_stats(&self, fh: u64) {
+        self.state.handles.release_stats(fh);
+    }
+
     fn vfs_timing_timer<'a>(
         &'a self,
         ops_counter: &'a AtomicU64,
@@ -1289,8 +1692,123 @@ where
         self.core.meta_layer.as_ref()
     }
 
+    pub(crate) fn register_fuse_read(
+        &self,
+        unique: u64,
+    ) -> Result<
+        (
+            crate::vfs::fuse_read_cancel::ReadRegistration,
+            futures_util::future::AbortRegistration,
+        ),
+        asyncfuse::Errno,
+    > {
+        let owner = self
+            .meta_layer()
+            .reserve_memory(crate::meta::layer::MetadataMemoryKind::Control, 1024)
+            .map_err(|error| {
+                asyncfuse::Errno::from(VfsError::from_meta(PathHint::none(), error))
+            })?;
+        self.state.fuse_read_cancel.register(unique, owner)
+    }
+
+    pub(crate) fn interrupt_fuse_read(&self, unique: u64) -> Result<(), asyncfuse::Errno> {
+        self.state.fuse_read_cancel.interrupt(unique)
+    }
+
+    // Current packed MetadataMemoryGuard holds Arc<V3OwnedPermit>. This charges
+    // its requested allocation without changing Roots capacity or generic API.
+    // Its final Arc deallocation/allocator padding proof remains an OPEN gate.
+    fn client_roots_owner_bytes() -> u64 {
+        #[cfg(feature = "workspace-overlay")]
+        {
+            (2 * std::mem::size_of::<usize>()
+                + std::mem::size_of::<crate::workspace_overlay::packed_v3::wire005::V3OwnedPermit>(
+                )) as u64
+        }
+        #[cfg(not(feature = "workspace-overlay"))]
+        {
+            0
+        }
+    }
+
+    pub(crate) fn begin_fuse_client_open(
+        &self,
+        ino: u64,
+        kind: crate::vfs::fuse_read_cancel::ClientKind,
+        unique: u64,
+    ) -> Result<Option<crate::vfs::fuse_read_cancel::PendingClientOpen<'_>>, asyncfuse::Errno> {
+        if !self.meta_layer().supports_fuse_read_cancellation() {
+            return Ok(None);
+        }
+        // Preserve ENODEV for an already closed mount even if Roots is full.
+        // begin_client_open repeats this check atomically after admission.
+        self.state.fuse_read_cancel.check_client_open()?;
+        let bytes = crate::vfs::fuse_read_cancel::ReadRegistry::client_requested_layout_bytes()
+            .checked_add(Self::client_roots_owner_bytes())
+            .ok_or(asyncfuse::Errno::from(libc::EOVERFLOW))?;
+        let owner = self
+            .meta_layer()
+            .reserve_memory(crate::meta::layer::MetadataMemoryKind::Roots, bytes)
+            .map_err(|error| {
+                asyncfuse::Errno::from(VfsError::from_meta(PathHint::none(), error))
+            })?;
+        self.state
+            .fuse_read_cancel
+            .begin_client_open(ino, kind, unique, owner)
+            .map(Some)
+    }
+
+    pub(crate) fn begin_fuse_client_release(
+        &self,
+        ino: u64,
+        fh: u64,
+        kind: crate::vfs::fuse_read_cancel::ClientKind,
+    ) -> Result<Option<crate::vfs::fuse_read_cancel::ClientRelease<'_>>, asyncfuse::Errno> {
+        if !self.meta_layer().supports_fuse_read_cancellation() || fh == 0 {
+            return Ok(None);
+        }
+        self.state
+            .fuse_read_cancel
+            .begin_client_release(ino, fh, kind)
+            .map(Some)
+    }
+
+    pub(crate) async fn prepare_fuse_client_unmount(&self) -> Result<(), asyncfuse::Errno> {
+        self.state.fuse_read_cancel.prepare_unmount().await
+    }
+
+    pub(crate) async fn shutdown_fuse_reads(&self) {
+        self.state.fuse_read_cancel.shutdown().await;
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    pub(crate) fn requires_packed_mutation_drain(&self) -> bool {
+        self.state.packed_mutation_gate.enabled()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_file_handle_count(&self) -> usize {
+        self.state.handles.handles.len()
+    }
+
     pub(crate) fn meta_layer_arc(&self) -> Arc<M> {
         Arc::clone(&self.core.meta_layer)
+    }
+
+    #[cfg(feature = "native-packed-base")]
+    pub(crate) fn attach_native_runtime(
+        &self,
+        runtime: Arc<NativeDataRuntime>,
+    ) -> Result<(), VfsError> {
+        self.core
+            .native_runtime
+            .set(runtime)
+            .map_err(|_| VfsError::Anyhow(anyhow::anyhow!("native runtime already attached")))
+    }
+
+    #[cfg(feature = "native-packed-base")]
+    fn native_runtime(&self) -> Option<Arc<NativeDataRuntime>> {
+        self.core.native_runtime.get().cloned()
     }
 
     fn file_handle(&self, fh: u64) -> Option<Arc<FileHandle<S, M>>> {
@@ -1613,9 +2131,31 @@ where
         self.meta_get_paths(ino).await
     }
 
+    // Compatibility entry; asynchronous consumers retain the owned form below.
+    #[allow(dead_code)]
+    pub(crate) async fn paths_of_bytes(&self, ino: i64) -> Result<Vec<Vec<u8>>, VfsError> {
+        self.meta_get_paths_bytes(ino).await
+    }
+
+    pub(crate) async fn paths_of_bytes_owned(
+        &self,
+        ino: i64,
+    ) -> Result<crate::meta::layer::OwnedPaths, VfsError> {
+        self.meta_get_paths_bytes_owned(ino).await
+    }
+
     /// get the node's child inode by name.
     pub(crate) async fn child_of(&self, parent: i64, name: &str) -> Option<i64> {
-        self.meta_lookup(parent, name).await.ok().flatten()
+        self.child_of_checked(parent, name).await.ok().flatten()
+    }
+
+    /// Preserve metadata errors when resolving a permission-check ancestor.
+    pub(crate) async fn child_of_checked(
+        &self,
+        parent: i64,
+        name: &str,
+    ) -> Result<Option<i64>, VfsError> {
+        self.meta_lookup(parent, name).await
     }
 
     /// get the node's child inode and attributes by name.
@@ -1637,57 +2177,41 @@ where
         Ok(Some((ino, attr)))
     }
 
-    fn apply_local_attr_state(&self, ino: i64, mut attr: FileAttr) -> FileAttr {
-        // Metadata is authoritative for every field except the local size
-        // already promised by close-to-open VFS semantics.
+    pub(crate) async fn child_attr_of_bytes(
+        &self,
+        parent: i64,
+        name: &[u8],
+    ) -> Result<Option<(i64, FileAttr)>, VfsError> {
+        let Some((ino, mut attr)) = self.meta_lookup_with_attr_bytes(parent, name).await? else {
+            return Ok(None);
+        };
         if let Some(size) = self.inode_size_cached(ino) {
             attr.size = size;
         }
-        attr
-    }
-
-    pub(crate) async fn stat_ino_result(&self, ino: i64) -> Result<Option<FileAttr>, VfsError> {
-        Ok(self
-            .meta_stat(ino)
-            .await?
-            .map(|attr| self.apply_local_attr_state(ino, attr)))
-    }
-
-    /// Fetch and locally merge one directory window without changing its
-    /// input positions. Missing inodes remain `None` for the FUSE layer to
-    /// skip while retaining their original cookies.
-    pub(crate) async fn batch_stat_ino(
-        &self,
-        inodes: &[i64],
-    ) -> Result<Vec<Option<FileAttr>>, VfsError> {
-        let attrs = self
-            .meta_layer()
-            .batch_stat(inodes)
-            .await
-            .map_err(|err| VfsError::from_meta(PathHint::none(), err))?;
-        if attrs.len() != inodes.len() {
-            return Err(VfsError::from_meta(
-                PathHint::none(),
-                MetaError::Internal(format!(
-                    "metadata batch returned {} attributes for {} requested inodes",
-                    attrs.len(),
-                    inodes.len()
-                )),
-            ));
-        }
-        Ok(inodes
-            .iter()
-            .copied()
-            .zip(attrs)
-            .map(|(ino, attr)| attr.map(|attr| self.apply_local_attr_state(ino, attr)))
-            .collect())
+        tracing::debug!(ino, nlink = attr.nlink, kind = ?attr.kind, "child_attr_of_bytes");
+        Ok(Some((ino, attr)))
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     pub(crate) async fn stat_ino(&self, ino: i64) -> Option<FileAttr> {
-        let attr = self.stat_ino_result(ino).await.ok().flatten()?;
+        self.stat_ino_checked(ino).await.ok().flatten()
+    }
+
+    /// Distinguish an absent inode from a metadata/backend failure.
+    /// Like `stat_ino`, successful reads include the current local size.
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
+    pub(crate) async fn stat_ino_checked(&self, ino: i64) -> Result<Option<FileAttr>, VfsError> {
+        let Some(mut attr) = self.meta_stat(ino).await? else {
+            return Ok(None);
+        };
+
+        // close-to-open semantics: if there is a local state, it should be considered as the newest state.
+        if let Some(size) = self.inode_size_cached(ino) {
+            attr.size = size;
+        }
+
         tracing::debug!(ino, nlink = attr.nlink, kind = ?attr.kind, "stat_ino");
-        Some(attr)
+        Ok(Some(attr))
     }
 
     pub(crate) fn blocks_for_attr(&self, attr: &FileAttr) -> u64 {
@@ -1712,6 +2236,19 @@ where
 
     /// Update atime (access time) for an inode to current time
     pub(crate) async fn update_atime(&self, ino: i64) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_update_atime(ino).await })
+                .await?;
+        }
+        self.packed_owned_update_atime(ino).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_update_atime(&self, ino: i64) -> Result<(), VfsError> {
         let now = Self::current_timestamp_nanos()?;
 
         let req = SetAttrRequest {
@@ -1734,6 +2271,19 @@ where
     /// This is called during flush/fsync to handle mmap writes where the kernel
     /// doesn't call the write() callback
     pub(crate) async fn update_mtime_ctime(&self, ino: i64) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_update_mtime_ctime(ino).await })
+                .await?;
+        }
+        self.packed_owned_update_mtime_ctime(ino).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_update_mtime_ctime(&self, ino: i64) -> Result<(), VfsError> {
         let now = Self::current_timestamp_nanos()?;
         let local_size = self.inode_size_cached(ino);
 
@@ -1817,6 +2367,20 @@ where
     /// - Returns the inode of the target directory.
     #[tracing::instrument(level = "trace", skip(self), fields(path))]
     pub async fn mkdir_p(&self, path: &str) -> Result<i64, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[path.len()])?;
+            let path = path.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_mkdir_p(&path).await })
+                .await?;
+        }
+        self.packed_owned_mkdir_p(path).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_mkdir_p(&self, path: &str) -> Result<i64, VfsError> {
         let path = Self::norm_path(path);
         if &path == "/" {
             return Ok(self.core.root);
@@ -1858,6 +2422,20 @@ where
     /// - If the target exists as a non-directory, returns `AlreadyExists`.
     /// - If parent does not exist, returns `NotFound`.
     pub async fn mkdir_err(&self, path: &str) -> Result<i64, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[path.len()])?;
+            let path = path.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_mkdir_err(&path).await })
+                .await?;
+        }
+        self.packed_owned_mkdir_err(path).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_mkdir_err(&self, path: &str) -> Result<i64, VfsError> {
         let path = Self::norm_path(path);
         if path == "/" {
             return Ok(self.core.root);
@@ -1883,6 +2461,28 @@ where
         path: &str,
         create_new: bool,
     ) -> Result<i64, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[path.len()])?;
+            let path = path.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_create_file_in_existing_dir_err(&path, create_new)
+                        .await
+                })
+                .await?;
+        }
+        self.packed_owned_create_file_in_existing_dir_err(path, create_new)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_create_file_in_existing_dir_err(
+        &self,
+        path: &str,
+        create_new: bool,
+    ) -> Result<i64, VfsError> {
         let path = Self::norm_path(path);
         if path == "/" {
             return Err(VfsError::IsADirectory { path: path.into() });
@@ -1903,6 +2503,20 @@ where
     /// - If the file already exists, returns its inode instead of creating a new one.
     #[tracing::instrument(level = "trace", skip(self), fields(path))]
     pub async fn create_file(&self, path: &str) -> Result<i64, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[path.len()])?;
+            let path = path.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_create_file(&path).await })
+                .await?;
+        }
+        self.packed_owned_create_file(path).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_create_file(&self, path: &str) -> Result<i64, VfsError> {
         let path = Self::norm_path(path);
         let (dir, name) = Self::split_dir_file(&path);
         let dir_ino = self.mkdir_p(&dir).await?;
@@ -1918,6 +2532,29 @@ where
         parent_ino: i64,
         name: &str,
     ) -> Result<FileAttr, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[name.len()])?;
+            let name = name.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_link_by_ino(src_ino, parent_ino, &name)
+                        .await
+                })
+                .await?;
+        }
+        self.packed_owned_link_by_ino(src_ino, parent_ino, name)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_link_by_ino(
+        &self,
+        src_ino: i64,
+        parent_ino: i64,
+        name: &str,
+    ) -> Result<FileAttr, VfsError> {
         Self::validate_entry_name(name)?;
 
         let attr = self.meta_link(src_ino, parent_ino, name).await?;
@@ -1928,6 +2565,29 @@ where
     /// Create a directory using a parent inode and entry name directly.
     #[tracing::instrument(level = "debug", skip(self), fields(parent_ino, name))]
     async fn mkdir_at_inner(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        existing_dir_ok: bool,
+    ) -> Result<i64, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[name.len()])?;
+            let name = name.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_mkdir_at_inner(parent_ino, &name, existing_dir_ok)
+                        .await
+                })
+                .await?;
+        }
+        self.packed_owned_mkdir_at_inner(parent_ino, name, existing_dir_ok)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_mkdir_at_inner(
         &self,
         parent_ino: i64,
         name: &str,
@@ -1990,7 +2650,36 @@ where
         parent_ino: i64,
         name: &str,
         create_new: bool,
-        create_attrs: Option<(u32, u32, u32)>,
+        create_attrs: Option<(u32, u32, u32, u32)>,
+    ) -> Result<CreateFileAtResult, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[name.len()])?;
+            let name = name.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_create_file_at_inner(
+                        parent_ino,
+                        &name,
+                        create_new,
+                        create_attrs,
+                    )
+                    .await
+                })
+                .await?;
+        }
+        self.packed_owned_create_file_at_inner(parent_ino, name, create_new, create_attrs)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_create_file_at_inner(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        create_new: bool,
+        create_attrs: Option<(u32, u32, u32, u32)>,
     ) -> Result<CreateFileAtResult, VfsError> {
         let _total_timer = self.vfs_timing_timer(
             &self.stats().vfs_create_total_ops,
@@ -2003,13 +2692,14 @@ where
                 &self.stats().vfs_create_meta_ops,
                 &self.stats().vfs_create_meta_lat_us,
             );
-            if let Some((mode, uid, gid)) = create_attrs {
+            if let Some((mode, umask, uid, gid)) = create_attrs {
                 match self
-                    .meta_create_node_with_attr(
+                    .meta_create_node_with_umask(
                         parent_ino,
                         name.to_string(),
                         FileType::File,
                         mode,
+                        umask,
                         uid,
                         gid,
                         0,
@@ -2110,7 +2800,83 @@ where
             parent_ino,
             name,
             create_new,
-            Some((mode & 0o7777, uid, gid)),
+            Some((mode & 0o7777, 0, uid, gid)),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_file_at_with_umask(
+        &self,
+        parent: i64,
+        name: &str,
+        create_new: bool,
+        mode: u32,
+        umask: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<CreateFileAtResult, VfsError> {
+        self.create_file_at_inner(
+            parent,
+            name,
+            create_new,
+            Some((mode & 0o7777, umask, uid, gid)),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_node_at_with_umask(
+        &self,
+        parent: i64,
+        name: &str,
+        kind: FileType,
+        mode: u32,
+        umask: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+    ) -> Result<CreateEntryResult, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[name.len()])?;
+            let name = name.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_create_node_at_with_umask(
+                        parent, &name, kind, mode, umask, uid, gid, rdev,
+                    )
+                    .await
+                })
+                .await?;
+        }
+        self.packed_owned_create_node_at_with_umask(parent, name, kind, mode, umask, uid, gid, rdev)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_create_node_at_with_umask(
+        &self,
+        parent: i64,
+        name: &str,
+        kind: FileType,
+        mode: u32,
+        umask: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+    ) -> Result<CreateEntryResult, VfsError> {
+        Self::validate_entry_name(name)?;
+        self.meta_create_node_with_umask(
+            parent,
+            name.to_string(),
+            kind,
+            mode,
+            umask,
+            uid,
+            gid,
+            rdev,
         )
         .await
     }
@@ -2119,6 +2885,35 @@ where
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(level = "debug", skip(self), fields(parent_ino, name, kind = ?kind, mode, rdev))]
     pub(crate) async fn create_special_node_at(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        kind: FileType,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+    ) -> Result<i64, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[name.len()])?;
+            let name = name.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_create_special_node_at(
+                        parent_ino, &name, kind, mode, uid, gid, rdev,
+                    )
+                    .await
+                })
+                .await?;
+        }
+        self.packed_owned_create_special_node_at(parent_ino, name, kind, mode, uid, gid, rdev)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_create_special_node_at(
         &self,
         parent_ino: i64,
         name: &str,
@@ -2142,6 +2937,30 @@ where
     /// Create a symbolic link using a parent inode and entry name directly.
     #[tracing::instrument(level = "debug", skip(self), fields(parent_ino, name))]
     pub(crate) async fn create_symlink_at(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        target: &str,
+    ) -> Result<(i64, FileAttr), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[name.len(), target.len()])?;
+            let name = name.to_owned();
+            let target = target.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_create_symlink_at(parent_ino, &name, &target)
+                        .await
+                })
+                .await?;
+        }
+        self.packed_owned_create_symlink_at(parent_ino, name, target)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_create_symlink_at(
         &self,
         parent_ino: i64,
         name: &str,
@@ -2171,6 +2990,20 @@ where
     /// Remove a regular file or symlink using parent inode and name directly.
     #[tracing::instrument(level = "debug", skip(self), fields(parent_ino, name))]
     pub(crate) async fn unlink_at(&self, parent_ino: i64, name: &str) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[name.len()])?;
+            let name = name.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_unlink_at(parent_ino, &name).await })
+                .await?;
+        }
+        self.packed_owned_unlink_at(parent_ino, name).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_unlink_at(&self, parent_ino: i64, name: &str) -> Result<(), VfsError> {
         let _total_timer = self.vfs_timing_timer(
             &self.stats().vfs_unlink_total_ops,
             &self.stats().vfs_unlink_total_lat_us,
@@ -2230,6 +3063,30 @@ where
         ino: i64,
         attr: FileAttr,
     ) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[name.len()])?;
+            let name = name.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_unlink_at_with_known_attr_inner(parent_ino, &name, ino, attr)
+                        .await
+                })
+                .await?;
+        }
+        self.packed_owned_unlink_at_with_known_attr_inner(parent_ino, name, ino, attr)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_unlink_at_with_known_attr_inner(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        ino: i64,
+        attr: FileAttr,
+    ) -> Result<(), VfsError> {
         if attr.kind == FileType::Dir {
             return Err(VfsError::IsADirectory {
                 path: PathHint::none(),
@@ -2257,6 +3114,20 @@ where
     /// Remove an empty directory using parent inode and name directly.
     #[tracing::instrument(level = "debug", skip(self), fields(parent_ino, name))]
     pub(crate) async fn rmdir_at(&self, parent_ino: i64, name: &str) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[name.len()])?;
+            let name = name.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_rmdir_at(parent_ino, &name).await })
+                .await?;
+        }
+        self.packed_owned_rmdir_at(parent_ino, name).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_rmdir_at(&self, parent_ino: i64, name: &str) -> Result<(), VfsError> {
         Self::validate_entry_name(name)?;
 
         let ino = self
@@ -2268,7 +3139,7 @@ where
                 path: PathHint::none(),
             });
         }
-        if !self.meta_readdir(ino).await?.is_empty() {
+        if !self.meta_directory_is_empty(ino).await? {
             return Err(VfsError::DirectoryNotEmpty {
                 path: PathHint::none(),
             });
@@ -2314,6 +3185,31 @@ where
         new_parent_ino: i64,
         new_name: &str,
     ) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[old_name.len(), new_name.len()])?;
+            let old_name = old_name.to_owned();
+            let new_name = new_name.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_rename_at(old_parent_ino, &old_name, new_parent_ino, &new_name)
+                        .await
+                })
+                .await?;
+        }
+        self.packed_owned_rename_at(old_parent_ino, old_name, new_parent_ino, new_name)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_rename_at(
+        &self,
+        old_parent_ino: i64,
+        old_name: &str,
+        new_parent_ino: i64,
+        new_name: &str,
+    ) -> Result<(), VfsError> {
         Self::validate_entry_name(old_name)?;
         Self::validate_entry_name(new_name)?;
 
@@ -2353,6 +3249,54 @@ where
     )]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn rename_at_with_known_attrs(
+        &self,
+        old_parent_ino: i64,
+        old_name: &str,
+        new_parent_ino: i64,
+        new_name: String,
+        src_ino: i64,
+        src_attr: &FileAttr,
+        new_parent_attr: &FileAttr,
+        known_dest_ino: Option<Option<i64>>,
+    ) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[old_name.len(), new_name.len()])?;
+            let old_name = old_name.to_owned();
+            let src_attr = src_attr.clone();
+            let new_parent_attr = new_parent_attr.clone();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_rename_at_with_known_attrs(
+                        old_parent_ino,
+                        &old_name,
+                        new_parent_ino,
+                        new_name,
+                        src_ino,
+                        &src_attr,
+                        &new_parent_attr,
+                        known_dest_ino,
+                    )
+                    .await
+                })
+                .await?;
+        }
+        self.packed_owned_rename_at_with_known_attrs(
+            old_parent_ino,
+            old_name,
+            new_parent_ino,
+            new_name,
+            src_ino,
+            src_attr,
+            new_parent_attr,
+            known_dest_ino,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_rename_at_with_known_attrs(
         &self,
         old_parent_ino: i64,
         old_name: &str,
@@ -2416,6 +3360,36 @@ where
         new_parent_ino: i64,
         new_name: &str,
     ) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[old_name.len(), new_name.len()])?;
+            let old_name = old_name.to_owned();
+            let new_name = new_name.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_rename_at_noreplace(
+                        old_parent_ino,
+                        &old_name,
+                        new_parent_ino,
+                        &new_name,
+                    )
+                    .await
+                })
+                .await?;
+        }
+        self.packed_owned_rename_at_noreplace(old_parent_ino, old_name, new_parent_ino, new_name)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_rename_at_noreplace(
+        &self,
+        old_parent_ino: i64,
+        old_name: &str,
+        new_parent_ino: i64,
+        new_name: &str,
+    ) -> Result<(), VfsError> {
         Self::validate_entry_name(old_name)?;
         Self::validate_entry_name(new_name)?;
 
@@ -2453,6 +3427,25 @@ where
     /// Create a hard link at `link_path` that references `existing_path`.
     #[tracing::instrument(level = "debug", skip(self), fields(existing_path, link_path))]
     pub async fn link(&self, existing_path: &str, link_path: &str) -> Result<FileAttr, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[existing_path.len(), link_path.len()])?;
+            let existing_path = existing_path.to_owned();
+            let link_path = link_path.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_link(&existing_path, &link_path).await })
+                .await?;
+        }
+        self.packed_owned_link(existing_path, link_path).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_link(
+        &self,
+        existing_path: &str,
+        link_path: &str,
+    ) -> Result<FileAttr, VfsError> {
         let existing_path = Self::norm_path(existing_path);
         let link_path = Self::norm_path(link_path);
 
@@ -2486,6 +3479,25 @@ where
     /// Create a symbolic link at `link_path` pointing to `target`.
     #[tracing::instrument(level = "trace", skip(self), fields(link_path, target))]
     pub async fn create_symlink(
+        &self,
+        link_path: &str,
+        target: &str,
+    ) -> Result<(i64, FileAttr), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[link_path.len(), target.len()])?;
+            let link_path = link_path.to_owned();
+            let target = target.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_create_symlink(&link_path, &target).await })
+                .await?;
+        }
+        self.packed_owned_create_symlink(link_path, target).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_create_symlink(
         &self,
         link_path: &str,
         target: &str,
@@ -2539,6 +3551,14 @@ where
         self.meta_read_symlink(ino).await
     }
 
+    pub(crate) async fn readlink_bytes_ino(&self, ino: i64) -> Result<Vec<u8>, VfsError> {
+        let attr = self.meta_stat_required(ino, PathHint::none()).await?;
+        if attr.kind != FileType::Symlink {
+            return Err(VfsError::InvalidInput);
+        }
+        self.meta_read_symlink_bytes(ino).await
+    }
+
     /// Read a symlink target by path.
     #[tracing::instrument(level = "trace", skip(self), fields(path))]
     pub async fn readlink(&self, path: &str) -> Result<String, VfsError> {
@@ -2561,6 +3581,20 @@ where
     /// Remove a regular file or symlink (directories are not supported here).
     #[tracing::instrument(level = "trace", skip(self), fields(path))]
     pub async fn unlink(&self, path: &str) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[path.len()])?;
+            let path = path.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_unlink(&path).await })
+                .await?;
+        }
+        self.packed_owned_unlink(path).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_unlink(&self, path: &str) -> Result<(), VfsError> {
         let path = Self::norm_path(path);
         let (dir, name) = Self::split_dir_file(&path);
 
@@ -2572,6 +3606,20 @@ where
     /// Remove an empty directory (root cannot be removed; non-empty dirs error out).
     #[tracing::instrument(level = "trace", skip(self), fields(path))]
     pub async fn rmdir(&self, path: &str) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[path.len()])?;
+            let path = path.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_rmdir(&path).await })
+                .await?;
+        }
+        self.packed_owned_rmdir(path).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_rmdir(&self, path: &str) -> Result<(), VfsError> {
         let path = Self::norm_path(path);
         if path == "/" {
             return Err(VfsError::PermissionDenied {
@@ -2605,6 +3653,21 @@ where
 
     #[tracing::instrument(level = "debug", skip(self), fields(old, new))]
     pub async fn rename(&self, old: &str, new: &str) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[old.len(), new.len()])?;
+            let old = old.to_owned();
+            let new = new.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_rename(&old, &new).await })
+                .await?;
+        }
+        self.packed_owned_rename(old, new).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_rename(&self, old: &str, new: &str) -> Result<(), VfsError> {
         let old = Self::norm_path(old);
         let new = Self::norm_path(new);
         let (old_dir, old_name) = Self::split_dir_file(&old);
@@ -2627,6 +3690,26 @@ where
         new: &str,
         flags: RenameFlags,
     ) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[old.len(), new.len()])?;
+            let old = old.to_owned();
+            let new = new.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_rename_with_flags(&old, &new, flags).await })
+                .await?;
+        }
+        self.packed_owned_rename_with_flags(old, new, flags).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_rename_with_flags(
+        &self,
+        old: &str,
+        new: &str,
+        flags: RenameFlags,
+    ) -> Result<(), VfsError> {
         if flags.exchange {
             return self.rename_exchange(old, new).await;
         }
@@ -2642,6 +3725,21 @@ where
     /// Rename without replacing the destination (RENAME_NOREPLACE).
     /// Returns an error if the destination already exists.
     pub async fn rename_noreplace(&self, old: &str, new: &str) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[old.len(), new.len()])?;
+            let old = old.to_owned();
+            let new = new.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_rename_noreplace(&old, &new).await })
+                .await?;
+        }
+        self.packed_owned_rename_noreplace(old, new).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_rename_noreplace(&self, old: &str, new: &str) -> Result<(), VfsError> {
         let old = Self::norm_path(old);
         let new = Self::norm_path(new);
         let (old_dir, old_name) = Self::split_dir_file(&old);
@@ -2655,6 +3753,21 @@ where
     /// Atomically exchange the source and destination (RENAME_EXCHANGE).
     /// Both source and destination must exist.
     pub async fn rename_exchange(&self, old: &str, new: &str) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[old.len(), new.len()])?;
+            let old = old.to_owned();
+            let new = new.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_rename_exchange(&old, &new).await })
+                .await?;
+        }
+        self.packed_owned_rename_exchange(old, new).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_rename_exchange(&self, old: &str, new: &str) -> Result<(), VfsError> {
         let old = Self::norm_path(old);
         let new = Self::norm_path(new);
 
@@ -2746,8 +3859,7 @@ where
             match (src_attr.kind, dest_kind) {
                 // Directory replacing directory
                 (FileType::Dir, FileType::Dir) => {
-                    let children = self.meta_readdir(dest_ino).await?;
-                    if !children.is_empty() {
+                    if !self.meta_directory_is_empty(dest_ino).await? {
                         return Err(VfsError::DirectoryNotEmpty {
                             path: PathHint::some(new.as_str()),
                         });
@@ -2795,6 +3907,20 @@ where
     /// Shrinking does not eagerly reclaim block data.
     #[tracing::instrument(level = "trace", skip(self), fields(path, size))]
     pub async fn truncate(&self, path: &str, size: u64) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[path.len()])?;
+            let path = path.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_truncate(&path, size).await })
+                .await?;
+        }
+        self.packed_owned_truncate(path, size).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_truncate(&self, path: &str, size: u64) -> Result<(), VfsError> {
         let path = Self::norm_path(path);
 
         let (ino, _) = self.meta_lookup_path_required(&path).await?;
@@ -2844,6 +3970,52 @@ where
     /// Truncate/extend file size by inode (metadata only; holes are read as zeros).
     /// Shrinking does not eagerly reclaim block data.
     pub async fn truncate_inode(&self, ino: i64, size: u64) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_truncate_inode(ino, size).await })
+                .await?;
+        }
+        self.packed_owned_truncate_inode(ino, size).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_truncate_inode(&self, ino: i64, size: u64) -> Result<(), VfsError> {
+        #[cfg(feature = "native-packed-base")]
+        if let Some(runtime) = self.native_runtime() {
+            let attr = self.meta_stat_required(ino, PathHint::none()).await?;
+            if attr.kind != FileType::File {
+                return Err(if attr.kind == FileType::Dir {
+                    VfsError::IsADirectory {
+                        path: PathHint::none(),
+                    }
+                } else {
+                    VfsError::InvalidInput
+                });
+            }
+            runtime
+                .truncate(ino as u64, size)
+                .await
+                .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?;
+            self.meta_truncate(ino, size, self.core.layout.chunk_size)
+                .await?;
+            self.state.reader.invalidate_all(ino as u64).await;
+            let inode = self
+                .lock_inode(ino)
+                .or_insert_with(|| Inode::new(ino, size));
+            inode.set_size(size);
+            inode.invalidate_allocated_blocks();
+            inode.bump_data_epoch();
+            if let Some(mut attr) = self.state.handles.attr_for_inode(ino) {
+                attr.size = size;
+                self.state.handles.update_attr_for_inode(ino, &attr);
+            }
+            self.notify_kernel_invalidate_inode_all(ino);
+            return Ok(());
+        }
+
         // Flush dirty data BEFORE acquiring mutation_lock so that we do not hold the
         // lock across a potentially long upload wait (up to FLUSH_DEADLINE = 300 s).
         // Holding the lock during flush would cause all concurrent FUSE WRITEs for
@@ -2925,6 +4097,29 @@ where
         length: u64,
         notify_kernel: bool,
     ) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_fallocate_ino_inner(ino, offset, length, notify_kernel)
+                        .await
+                })
+                .await?;
+        }
+        self.packed_owned_fallocate_ino_inner(ino, offset, length, notify_kernel)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_fallocate_ino_inner(
+        &self,
+        ino: i64,
+        offset: u64,
+        length: u64,
+        notify_kernel: bool,
+    ) -> Result<(), VfsError> {
         let attr = self.meta_stat_required(ino, PathHint::none()).await?;
         if matches!(attr.kind, FileType::Dir) {
             return Err(VfsError::IsADirectory {
@@ -2935,6 +4130,21 @@ where
             return Err(VfsError::InvalidInput);
         }
         if length == 0 {
+            return Ok(());
+        }
+
+        #[cfg(feature = "native-packed-base")]
+        if let Some(runtime) = self.native_runtime() {
+            let end = offset.checked_add(length).ok_or(VfsError::FileTooLarge)?;
+            let current_size = self.inode_size_cached(ino).unwrap_or(attr.size);
+            if end > current_size {
+                runtime
+                    .truncate(ino as u64, end)
+                    .await
+                    .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?;
+                self.meta_extend_file_size(ino, end).await?;
+                self.extend_local_file_size(ino, end);
+            }
             return Ok(());
         }
 
@@ -2981,6 +4191,33 @@ where
         length: u64,
         keep_size: bool,
     ) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_workspace_hole_fallocate_from_fuse(
+                        fh, ino, offset, length, keep_size,
+                    )
+                    .await
+                })
+                .await?;
+        }
+        self.packed_owned_workspace_hole_fallocate_from_fuse(fh, ino, offset, length, keep_size)
+            .await
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_workspace_hole_fallocate_from_fuse(
+        &self,
+        fh: u64,
+        ino: i64,
+        offset: u64,
+        length: u64,
+        keep_size: bool,
+    ) -> Result<(), VfsError> {
         let Some(provider) = self.core.backend.workspace_read_plan() else {
             return Err(VfsError::Unsupported);
         };
@@ -3001,6 +4238,29 @@ where
             return Err(VfsError::InvalidInput);
         }
         if length == 0 {
+            return Ok(());
+        }
+
+        #[cfg(feature = "native-packed-base")]
+        if let Some(runtime) = self.native_runtime() {
+            runtime
+                .discard(ino as u64, offset, length, keep_size)
+                .await
+                .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?;
+            if !keep_size {
+                let end = offset.checked_add(length).ok_or(VfsError::FileTooLarge)?;
+                self.meta_extend_file_size(ino, end).await?;
+                self.extend_local_file_size(ino, end);
+            }
+            let _ = self
+                .state
+                .reader
+                .invalidate(
+                    ino as u64,
+                    offset,
+                    usize::try_from(length).map_err(|_| VfsError::FileTooLarge)?,
+                )
+                .await;
             return Ok(());
         }
 
@@ -3052,6 +4312,30 @@ where
         length: u64,
         notify_kernel: bool,
     ) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_fallocate_handle_inner(fh, ino, offset, length, notify_kernel)
+                        .await
+                })
+                .await?;
+        }
+        self.packed_owned_fallocate_handle_inner(fh, ino, offset, length, notify_kernel)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_fallocate_handle_inner(
+        &self,
+        fh: u64,
+        ino: i64,
+        offset: u64,
+        length: u64,
+        notify_kernel: bool,
+    ) -> Result<(), VfsError> {
         let handle = self.file_handle_required(fh)?;
         if handle.ino != ino {
             return Err(VfsError::StaleNetworkFileHandle);
@@ -3072,6 +4356,23 @@ where
             return Err(VfsError::InvalidInput);
         }
         if length == 0 {
+            return Ok(());
+        }
+
+        #[cfg(feature = "native-packed-base")]
+        if let Some(runtime) = self.native_runtime() {
+            let end = offset.checked_add(length).ok_or(VfsError::FileTooLarge)?;
+            let current_size = self.inode_size_cached(ino).unwrap_or(attr.size);
+            if end > current_size {
+                self.ensure_fallocate_space_available(current_size, end)
+                    .await?;
+                runtime
+                    .truncate(ino as u64, end)
+                    .await
+                    .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?;
+                self.meta_extend_file_size(ino, end).await?;
+                self.extend_local_file_size(ino, end);
+            }
             return Ok(());
         }
 
@@ -3182,7 +4483,7 @@ where
         req: &SetAttrRequest,
         flags: SetAttrFlags,
     ) -> Result<FileAttr, VfsError> {
-        self.set_attr_inner(ino, req, flags, true).await
+        self.set_attr_inner(ino, req, flags, true, None).await
     }
 
     /// Apply an attribute change originating from the mounted FUSE connection.
@@ -3196,7 +4497,19 @@ where
         req: &SetAttrRequest,
         flags: SetAttrFlags,
     ) -> Result<FileAttr, VfsError> {
-        self.set_attr_inner(ino, req, flags, false).await
+        self.set_attr_inner(ino, req, flags, false, None).await
+    }
+
+    pub(crate) async fn set_attr_from_fuse_as(
+        &self,
+        ino: i64,
+        req: &SetAttrRequest,
+        flags: SetAttrFlags,
+        uid: u32,
+        groups: &[u32],
+    ) -> Result<FileAttr, VfsError> {
+        self.set_attr_inner(ino, req, flags, false, Some((uid, groups)))
+            .await
     }
 
     async fn set_attr_inner(
@@ -3205,6 +4518,43 @@ where
         req: &SetAttrRequest,
         flags: SetAttrFlags,
         notify_kernel: bool,
+        actor: Option<(u32, &[u32])>,
+    ) -> Result<FileAttr, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[
+                actor.map_or(0, |(_, groups)| std::mem::size_of_val(groups))
+            ])?;
+            let req = *req;
+            let actor = actor.map(|(uid, groups)| (uid, groups.to_vec()));
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_set_attr_inner(
+                        ino,
+                        &req,
+                        flags,
+                        notify_kernel,
+                        actor
+                            .as_ref()
+                            .map(|(uid, groups)| (*uid, groups.as_slice())),
+                    )
+                    .await
+                })
+                .await?;
+        }
+        self.packed_owned_set_attr_inner(ino, req, flags, notify_kernel, actor)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_set_attr_inner(
+        &self,
+        ino: i64,
+        req: &SetAttrRequest,
+        flags: SetAttrFlags,
+        notify_kernel: bool,
+        actor: Option<(u32, &[u32])>,
     ) -> Result<FileAttr, VfsError> {
         if Self::deleted_inode_timestamp_only_setattr(req, &flags) {
             let remove_after = self.state.handles.has_no_handle(ino);
@@ -3266,6 +4616,8 @@ where
         // the lock during a potentially long upload wait (see truncate_inode for the
         // full rationale).  writer.clear() inside the lock discards any dirty slices
         // that arrived between the pre-flush and the lock acquisition.
+        let atomic_permissions = self.meta_layer().posix_acl_capability()
+            == crate::meta::layer::PosixAclCapability::ReadWrite;
         let _guards = if let Some(size) = req.size {
             self.flush_before_truncate(ino, size, "set_attr").await?;
 
@@ -3280,21 +4632,23 @@ where
                 guards.push(handle.lock_write().await);
             }
 
-            self.meta_truncate(ino, size, self.core.layout.chunk_size)
-                .await?;
-            self.state.reader.invalidate_all(ino as u64).await;
-            self.state.writer.clear(ino as u64).await;
+            if !atomic_permissions {
+                self.meta_truncate(ino, size, self.core.layout.chunk_size)
+                    .await?;
+                self.state.reader.invalidate_all(ino as u64).await;
+                self.state.writer.clear(ino as u64).await;
 
-            let guard = self
-                .lock_inode(ino)
-                .or_insert_with(|| Inode::new(ino, size));
-            guard.set_size(size);
-            guard.invalidate_allocated_blocks();
-            guard.bump_data_epoch();
+                let guard = self
+                    .lock_inode(ino)
+                    .or_insert_with(|| Inode::new(ino, size));
+                guard.set_size(size);
+                guard.invalidate_allocated_blocks();
+                guard.bump_data_epoch();
 
-            if let Some(mut attr) = self.state.handles.attr_for_inode(ino) {
-                attr.size = size;
-                self.state.handles.update_attr_for_inode(ino, &attr);
+                if let Some(mut attr) = self.state.handles.attr_for_inode(ino) {
+                    attr.size = size;
+                    self.state.handles.update_attr_for_inode(ino, &attr);
+                }
             }
 
             Some((_mutation_guard, guards))
@@ -3303,14 +4657,33 @@ where
         };
 
         let mut filtered = *req;
-        filtered.size = None;
+        if !atomic_permissions {
+            filtered.size = None;
+        }
 
-        let mut attr = self.meta_set_attr(ino, &filtered, flags).await?;
+        let mut attr = if let Some((uid, groups)) = actor {
+            self.meta_layer()
+                .set_attr_as(ino, &filtered, flags, uid, groups)
+                .await
+                .map_err(|error| VfsError::from_meta(PathHint::none(), error))?
+        } else {
+            self.meta_set_attr(ino, &filtered, flags).await?
+        };
 
         // Ensure the returned attr carries exactly the requested truncation size.
         // The kernel trusts this value for truncate_pagecache decisions; a stale
         // or extended size here can cause it to keep or invalidate wrong pages.
         if let Some(size) = req.size {
+            if atomic_permissions {
+                self.state.reader.invalidate_all(ino as u64).await;
+                self.state.writer.clear(ino as u64).await;
+                let inode = self
+                    .lock_inode(ino)
+                    .or_insert_with(|| Inode::new(ino, size));
+                inode.set_size(size);
+                inode.invalidate_allocated_blocks();
+                inode.bump_data_epoch();
+            }
             attr.size = size;
             if let Some(inode) = self.state.inodes.get(&ino) {
                 inode.set_size(size);
@@ -3325,7 +4698,9 @@ where
         }
 
         self.state.handles.update_attr_for_inode(ino, &attr);
-        if req.size.is_some() && notify_kernel {
+        if atomic_permissions && (req.mode.is_some() || req.uid.is_some() || req.gid.is_some()) {
+            self.notify_kernel_invalidate_inode_all_and_wait(ino).await;
+        } else if req.size.is_some() && notify_kernel {
             self.notify_kernel_invalidate_inode_all(ino);
         }
 
@@ -3384,9 +4759,27 @@ where
     /// Returns `VfsError::NotFound` when the inode does not exist.
     #[tracing::instrument(level = "trace", skip(self), fields(ino, new_mode))]
     pub async fn chmod(&self, ino: i64, new_mode: u32) -> Result<FileAttr, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_chmod(ino, new_mode).await })
+                .await?;
+        }
+        self.packed_owned_chmod(ino, new_mode).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_chmod(&self, ino: i64, new_mode: u32) -> Result<FileAttr, VfsError> {
         let attr = self.meta_chmod(ino, new_mode).await?;
 
         self.state.handles.update_attr_for_inode(ino, &attr);
+        if self.meta_layer().posix_acl_capability()
+            == crate::meta::layer::PosixAclCapability::ReadWrite
+        {
+            self.notify_kernel_invalidate_inode_all_and_wait(ino).await;
+        }
 
         Ok(attr)
     }
@@ -3402,32 +4795,118 @@ where
         uid: Option<u32>,
         gid: Option<u32>,
     ) -> Result<FileAttr, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_chown(ino, uid, gid).await })
+                .await?;
+        }
+        self.packed_owned_chown(ino, uid, gid).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_chown(
+        &self,
+        ino: i64,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<FileAttr, VfsError> {
         let attr = self.meta_chown(ino, uid, gid).await?;
 
         self.state.handles.update_attr_for_inode(ino, &attr);
+        if self.meta_layer().posix_acl_capability()
+            == crate::meta::layer::PosixAclCapability::ReadWrite
+        {
+            self.notify_kernel_invalidate_inode_all_and_wait(ino).await;
+        }
 
         Ok(attr)
     }
 
     /// Read data by file handle and offset.
-    pub async fn read(&self, fh: u64, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
-        Ok(self.read_bytes(fh, offset, len).await?.to_vec())
-    }
-
     #[tracing::instrument(
-        name = "VFS.read_bytes",
+        name = "VFS.read",
         level = "trace",
         skip(self),
         fields(fh, offset, len)
     )]
-    pub(crate) async fn read_bytes(
+    /// FUSE uses an owned reply so a slow kernel consumer keeps the output
+    /// reservation. The public Vec API remains caller-owned compatibility.
+    pub(crate) async fn read_owned(
         &self,
         fh: u64,
         offset: u64,
         len: usize,
-    ) -> Result<Bytes, VfsError> {
+    ) -> Result<bytes::Bytes, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        let guard = if let Some(provider) = self.core.backend.workspace_read_plan() {
+            provider
+                .reserve_read_output(len)
+                .map_err(|error| VfsError::from_meta(PathHint::none(), error))?
+        } else {
+            None
+        };
+        #[cfg(not(feature = "workspace-overlay"))]
+        let guard: Option<Box<dyn Send + Sync>> = None;
+        let data = match self.read_inner(fh, offset, len, true).await {
+            Ok(data) => data,
+            Err(error) => {
+                #[cfg(feature = "workspace-overlay")]
+                if let VfsError::Anyhow(error) = &error {
+                    // Preparation maps metadata admission to an IO error;
+                    // execution retains the packed error. Both can be wrapped
+                    // by the common reader and must keep the same FUSE errno.
+                    if crate::vfs::error::is_read_admission_error(error) {
+                        return Err(VfsError::OutOfMemory);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        Ok(match guard {
+            Some(guard) => bytes::Bytes::from_owner(crate::vfs::io::reader::OwnedReadReply {
+                data,
+                _guard: guard,
+            }),
+            None => bytes::Bytes::from(data),
+        })
+    }
+
+    pub(crate) fn prepared_max_read_bytes(&self) -> Option<usize> {
+        #[cfg(feature = "workspace-overlay")]
+        if let Some(provider) = self.core.backend.workspace_read_plan() {
+            return provider.max_read_bytes();
+        }
+        None
+    }
+
+    pub async fn read(&self, fh: u64, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
+        self.read_inner(fh, offset, len, false).await
+    }
+
+    async fn read_inner(
+        &self,
+        fh: u64,
+        offset: u64,
+        len: usize,
+        output_reserved: bool,
+    ) -> Result<Vec<u8>, VfsError> {
+        #[cfg(not(feature = "workspace-overlay"))]
+        let _ = output_reserved;
         if len == 0 {
-            return Ok(Bytes::new());
+            #[cfg(feature = "workspace-overlay")]
+            let fenced = self
+                .core
+                .backend
+                .workspace_read_plan()
+                .is_some_and(|provider| provider.requires_unified_read_request_fence());
+            #[cfg(not(feature = "workspace-overlay"))]
+            let fenced = false;
+            if !fenced {
+                return Ok(Vec::new());
+            }
         }
 
         let handle = self.file_handle_required(fh)?;
@@ -3440,11 +4919,45 @@ where
             });
         }
 
+        #[cfg(feature = "native-packed-base")]
+        if let Some(runtime) = self.native_runtime() {
+            let operation = self.core.backend.store().begin_read_operation(len as u64);
+            let data = match runtime.read(handle.ino as u64, offset, len).await {
+                Ok(data) => data,
+                Err(error) => {
+                    if let Some(operation) = operation {
+                        operation.fail(crate::cadapter::read_observer::FailureClass::Backend);
+                    }
+                    return Err(VfsError::Anyhow(anyhow::anyhow!(error.to_string())));
+                }
+            };
+            if let Some(operation) = operation {
+                operation.deliver(data.len() as u64);
+            }
+            handle.update_offset(offset + data.len() as u64);
+            return Ok(data);
+        }
+
+        #[cfg(feature = "workspace-overlay")]
+        if let Some(provider) = self.core.backend.workspace_read_plan()
+            && provider.requires_unified_read_request_fence()
+        {
+            return self
+                .read_packed_workspace_request(
+                    handle,
+                    (offset, len),
+                    output_reserved,
+                    provider,
+                    None,
+                )
+                .await;
+        }
+
         let file_size = self
             .inode_size_cached(handle.ino)
             .unwrap_or_else(|| handle.attr().size);
         if offset >= file_size {
-            return Ok(Bytes::new());
+            return Ok(Vec::new());
         }
         let actual_len = len.min((file_size - offset) as usize);
         self.wait_split_write_barrier(handle.ino, offset, actual_len)
@@ -3470,7 +4983,7 @@ where
                 .map_err(VfsError::from)?
         };
         if let Some(data) = dirty_data {
-            return Ok(Bytes::from(data));
+            return Ok(data);
         }
 
         // We intentionally do NOT call flush_if_exists here: blocking every
@@ -3500,42 +5013,34 @@ where
         // the current read can still see the write that won the race.
         let inode = self.ensure_inode_registered(handle.ino).await?;
         handle.ensure_reader_with(|| self.state.reader.open_for_handle(inode, fh));
-        let data = {
+        let mut data = {
             let _handle_read_timer = self.vfs_timing_timer(
                 &self.state.stats.vfs_read_handle_ops,
                 &self.state.stats.vfs_read_handle_lat_us,
             );
             handle
-                .read_bytes(offset, actual_len)
+                .read(offset, actual_len)
                 .await
                 .map_err(VfsError::from)?
         };
-        let needs_overlay = !dirty_snapshot.is_empty()
-            || self.state.writer.has_dirty_state(handle.ino as u64).await;
-        let data = if needs_overlay {
-            let mut data = data.to_vec();
-            for patch in dirty_snapshot {
-                if patch.offset >= data.len() {
-                    continue;
-                }
-                let end = (patch.offset + patch.data.len()).min(data.len());
-                data[patch.offset..end].copy_from_slice(&patch.data[..end - patch.offset]);
+        for patch in dirty_snapshot {
+            if patch.offset >= data.len() {
+                continue;
             }
-            {
-                let _overlay_timer = self.vfs_timing_timer(
-                    &self.state.stats.vfs_read_overlay_ops,
-                    &self.state.stats.vfs_read_overlay_lat_us,
-                );
-                self.state
-                    .writer
-                    .overlay_dirty_if_exists(handle.ino as u64, offset, &mut data)
-                    .await
-                    .map_err(VfsError::from)?;
-            }
-            Bytes::from(data)
-        } else {
-            data
-        };
+            let end = (patch.offset + patch.data.len()).min(data.len());
+            data[patch.offset..end].copy_from_slice(&patch.data[..end - patch.offset]);
+        }
+        {
+            let _overlay_timer = self.vfs_timing_timer(
+                &self.state.stats.vfs_read_overlay_ops,
+                &self.state.stats.vfs_read_overlay_lat_us,
+            );
+            self.state
+                .writer
+                .overlay_dirty_if_exists(handle.ino as u64, offset, &mut data)
+                .await
+                .map_err(VfsError::from)?;
+        }
 
         self.state
             .reader
@@ -3544,9 +5049,185 @@ where
         Ok(data)
     }
 
+    #[cfg(feature = "workspace-overlay")]
+    async fn read_packed_workspace_request(
+        &self,
+        handle: Arc<FileHandle<S, M>>,
+        range: (u64, usize),
+        output_reserved: bool,
+        provider: &dyn crate::chunk::read_plan::WorkspaceReadPlanProvider,
+        held_inode_guard: Option<&tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<Vec<u8>, VfsError> {
+        let (offset, len) = range;
+        let mut operation = provider
+            .begin_unified_read_operation(len as u64)
+            .or_else(|| self.core.backend.store().begin_read_operation(len as u64));
+        let mut output_guard = None;
+        let result = async {
+            anyhow::ensure!(
+                provider.supports_prepared_unified_read(),
+                "mutable provider requires prepared reads"
+            );
+            if provider.max_read_bytes().is_some_and(|max| len > max) {
+                return Err(
+                    crate::workspace_overlay::packed_v3::PackedWireError::LimitExceeded(
+                        "read exceeds negotiated max_read".into(),
+                    )
+                    .into(),
+                );
+            }
+            if !output_reserved {
+                output_guard = provider.reserve_read_output(len)?;
+            }
+            // A split WRITE tail takes the same inode lock. Wait for it before
+            // taking that lock, then use the normal append -> handle order.
+            let mutation_lock = self.state.append_lock(handle.ino);
+            let _mutation_guard = if let Some(guard) = held_inode_guard {
+                anyhow::ensure!(
+                    Arc::ptr_eq(tokio::sync::OwnedMutexGuard::mutex(guard), &mutation_lock),
+                    "read must hold the source inode mutation lock"
+                );
+                None
+            } else {
+                self.wait_split_write_barrier(handle.ino, offset, len).await;
+                Some(mutation_lock.lock_owned().await)
+            };
+            let handle_guard = handle.lock_read().await;
+            let inode = self.ensure_inode_registered(handle.ino).await?;
+            handle.ensure_reader_with(|| self.state.reader.open_for_handle(inode, handle.fh));
+
+            for attempt in 0..3 {
+                let result = async {
+                    let fence = provider
+                        .begin_unified_read_request(handle.ino)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("mutable provider returned no request fence")
+                        })?;
+                    fence.ensure_current().await?;
+                    let durable_size = fence.file_size();
+                    let snapshot = self
+                        .state
+                        .writer
+                        .canonical_dirty_snapshot_if_exists(handle.ino as u64, offset, len)
+                        .await?;
+                    // Only actual pending bytes can extend the fresh catalog
+                    // EOF. A stale handle/inode size is never authoritative.
+                    let visible_size = durable_size.max(snapshot.local_eof.unwrap_or(0));
+                    let actual_len = (len as u64).min(visible_size.saturating_sub(offset)) as usize;
+                    // Allocate the final output once. The committed reader
+                    // fills its prefix directly; the rest is a local hole.
+                    let mut data = vec![0; actual_len];
+                    let committed_len =
+                        (actual_len as u64).min(durable_size.saturating_sub(offset)) as usize;
+                    if committed_len > 0 && !snapshot.fully_covered(actual_len) {
+                        self.state
+                            .writer
+                            .wait_committed_uploads_for_range(
+                                handle.ino as u64,
+                                offset,
+                                committed_len,
+                            )
+                            .await?;
+                        let committed = handle
+                            .read_into_unaccounted_locked(
+                                &handle_guard,
+                                offset,
+                                &mut data[..committed_len],
+                                operation.as_ref().and_then(|guard| guard.delivery_token()),
+                            )
+                            .await;
+                        match committed {
+                            Err(error)
+                                if crate::chunk::read_plan::is_read_request_beyond_view(&error) =>
+                            {
+                                // Only this explicit fresh-EOF mismatch asks
+                                // whether the original view changed. A real
+                                // backend/corruption error stays a failure.
+                                fence.ensure_current().await?;
+                                return Err(error);
+                            }
+                            result => result?,
+                        }
+                    }
+                    // Unwritten bytes between durable EOF and a coherent
+                    // local extension are holes, including hole-only reads.
+                    snapshot.apply(&mut data);
+                    fence.ensure_current().await?;
+                    handle.update_offset(offset + data.len() as u64);
+                    Ok::<_, anyhow::Error>((data, snapshot))
+                }
+                .await;
+                match result {
+                    Err(error)
+                        if attempt < 2 && crate::chunk::read_plan::is_read_view_changed(&error) =>
+                    {
+                        if let Some(operation) = operation.as_mut() {
+                            operation.restart_delivery_attempt();
+                        }
+                    }
+                    result => return result,
+                }
+            }
+            unreachable!("whole packed read retry loop always returns")
+        }
+        .await;
+
+        let result = match result {
+            Ok((data, _snapshot)) => {
+                provider.record_unified_read_success(data.len() as u64);
+                if let Some(operation) = operation.take() {
+                    operation.deliver(data.len() as u64);
+                }
+                Ok(data)
+            }
+            Err(error) => {
+                #[cfg(test)]
+                eprintln!(
+                    "[packed-v3-native-kernel-read-diag] stage=packed-request inode={} fh={} offset={offset} len={len} error={error:#}",
+                    handle.ino, handle.fh
+                );
+                if let Some(operation) = operation.take() {
+                    let reason = if crate::vfs::error::is_read_admission_error(&error) {
+                        crate::cadapter::read_observer::FailureClass::Admission
+                    } else {
+                        crate::cadapter::read_observer::FailureClass::Backend
+                    };
+                    operation.fail(reason);
+                }
+                Err(VfsError::from(error))
+            }
+        };
+        drop(output_guard);
+        result
+    }
+
     /// Write data by file handle and offset.
     #[tracing::instrument(level = "trace", skip(self, data), fields(fh, offset, len = data.len()))]
     pub async fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<usize, VfsError> {
+        #[cfg(test)]
+        write_diagnostic("vfs-entry", 0, fh, offset, data.len());
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[std::mem::size_of_val(data)])?;
+            let data = data.to_vec();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_write(fh, offset, &data).await })
+                .await?;
+        }
+        self.packed_owned_write(fh, offset, data).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_write(
+        &self,
+        fh: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, VfsError> {
+        #[cfg(test)]
+        write_diagnostic("vfs-owned-entry", 0, fh, offset, data.len());
         if data.is_empty() {
             return Ok(0);
         }
@@ -3558,13 +5239,55 @@ where
             });
         }
 
+        #[cfg(feature = "native-packed-base")]
+        if let Some(runtime) = self.native_runtime() {
+            self.ensure_inode_registered(handle.ino).await?;
+            let write_offset = if handle.flags.append {
+                runtime
+                    .size(handle.ino as u64)
+                    .await
+                    .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?
+            } else {
+                offset
+            };
+            let write_end = write_offset
+                .checked_add(data.len() as u64)
+                .ok_or(VfsError::FileTooLarge)?;
+            if write_end >= i64::MAX as u64 {
+                return Err(VfsError::FileTooLarge);
+            }
+            let receipt = runtime
+                .write(handle.ino as u64, write_offset, data)
+                .await
+                .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?;
+            let written = receipt.accepted_len;
+            let prior_size = handle.attr().size;
+            handle.update_offset(write_end);
+            handle.extend_size(write_end);
+            if write_end > prior_size {
+                self.meta_extend_file_size(handle.ino, write_end).await?;
+                self.extend_local_file_size(handle.ino, write_end);
+            }
+            handle.mark_write_dirty_extending_size();
+            let _ = self
+                .state
+                .reader
+                .invalidate(handle.ino as u64, write_offset, written)
+                .await;
+            return Ok(written);
+        }
+
         tracing::trace!(fh, ino = handle.ino, offset, len = data.len(), "vfs.write");
 
         let inode = self.ensure_inode_registered(handle.ino).await?;
         handle.ensure_writer_with(|| self.state.writer.ensure_file(inode));
 
         let mutation_lock = self.state.append_lock(handle.ino);
+        #[cfg(test)]
+        write_diagnostic("vfs-append-lock-before", handle.ino, fh, offset, data.len());
         let _mutation_guard = mutation_lock.lock_owned().await;
+        #[cfg(test)]
+        write_diagnostic("vfs-append-lock-after", handle.ino, fh, offset, data.len());
 
         self.write_with_inode_lock_held(handle, offset, data).await
     }
@@ -3576,8 +5299,24 @@ where
         data: &[u8],
     ) -> Result<usize, VfsError> {
         let data_len = data.len() as u64;
+        #[cfg(test)]
+        write_diagnostic(
+            "vfs-handle-gate-before",
+            handle.ino,
+            handle.fh,
+            offset,
+            data.len(),
+        );
         let (write_offset, written) = if handle.flags.append {
             let _handle_guard = handle.lock_write().await;
+            #[cfg(test)]
+            write_diagnostic(
+                "vfs-handle-gate-after",
+                handle.ino,
+                handle.fh,
+                offset,
+                data.len(),
+            );
 
             let append_offset = self.inode_size(handle.ino).await?;
             let append_end = append_offset
@@ -3595,7 +5334,23 @@ where
                 handle.mark_write_dirty_extending_size();
                 data.len()
             } else {
+                #[cfg(test)]
+                write_diagnostic(
+                    "vfs-handle-writer-before",
+                    handle.ino,
+                    handle.fh,
+                    append_offset,
+                    data.len(),
+                );
                 let written = handle.write_unlocked(append_offset, data).await?;
+                #[cfg(test)]
+                write_diagnostic(
+                    "vfs-handle-writer-after",
+                    handle.ino,
+                    handle.fh,
+                    append_offset,
+                    data.len(),
+                );
                 if written > 0 {
                     handle.mark_write_dirty_extending_size();
                 }
@@ -3612,6 +5367,14 @@ where
             (append_offset, written)
         } else {
             let _handle_guard = handle.lock_write().await;
+            #[cfg(test)]
+            write_diagnostic(
+                "vfs-handle-gate-after",
+                handle.ino,
+                handle.fh,
+                offset,
+                data.len(),
+            );
             let write_end = offset.checked_add(data_len).ok_or(VfsError::FileTooLarge)?;
             if write_end >= i64::MAX as u64 {
                 return Err(VfsError::FileTooLarge);
@@ -3630,7 +5393,23 @@ where
                 }
                 data.len()
             } else {
+                #[cfg(test)]
+                write_diagnostic(
+                    "vfs-handle-writer-before",
+                    handle.ino,
+                    handle.fh,
+                    offset,
+                    data.len(),
+                );
                 let written = handle.write_unlocked(offset, data).await?;
+                #[cfg(test)]
+                write_diagnostic(
+                    "vfs-handle-writer-after",
+                    handle.ino,
+                    handle.fh,
+                    offset,
+                    data.len(),
+                );
                 if written > 0 {
                     let new_end = offset + written as u64;
                     if new_end > visible_size {
@@ -3647,11 +5426,27 @@ where
         // Invalidate reader cache for the written range so subsequent reads
         // (including FUSE reads on kernel page-cache miss) see committed data
         // instead of a stale cached snapshot from before this write.
+        #[cfg(test)]
+        write_diagnostic(
+            "vfs-invalidate-before",
+            handle.ino,
+            handle.fh,
+            write_offset,
+            data.len(),
+        );
         let _ = self
             .state
             .reader
             .invalidate(handle.ino as u64, write_offset, written)
             .await;
+        #[cfg(test)]
+        write_diagnostic(
+            "vfs-invalidate-after",
+            handle.ino,
+            handle.fh,
+            write_offset,
+            data.len(),
+        );
         // Keep local inode and handle sizes in sync immediately.  Metadata size
         // is persisted by the writer commit/flush path; doing it here forces
         // every write through metadata and makes buffered writes serialize on
@@ -3675,12 +5470,70 @@ where
 
     /// Write data by inode directly (used by FUSE to avoid path resolution).
     pub async fn write_ino(&self, ino: i64, offset: u64, data: &[u8]) -> Result<usize, VfsError> {
+        #[cfg(test)]
+        write_diagnostic("vfs-inode-entry", ino, 0, offset, data.len());
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[std::mem::size_of_val(data)])?;
+            let data = data.to_vec();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_write_ino(ino, offset, &data).await })
+                .await?;
+        }
+        self.packed_owned_write_ino(ino, offset, data).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_write_ino(
+        &self,
+        ino: i64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, VfsError> {
+        #[cfg(test)]
+        write_diagnostic("vfs-inode-owned-entry", ino, 0, offset, data.len());
         if data.is_empty() {
             return Ok(0);
         }
 
+        #[cfg(feature = "native-packed-base")]
+        if let Some(runtime) = self.native_runtime() {
+            let attr = self.meta_stat_required(ino, PathHint::none()).await?;
+            if attr.kind == FileType::Dir {
+                return Err(VfsError::IsADirectory {
+                    path: PathHint::none(),
+                });
+            }
+            if attr.kind != FileType::File {
+                return Err(VfsError::InvalidInput);
+            }
+            let receipt = runtime
+                .write(ino as u64, offset, data)
+                .await
+                .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?;
+            let written = receipt.accepted_len;
+            let new_end = offset
+                .checked_add(written as u64)
+                .ok_or(VfsError::FileTooLarge)?;
+            if new_end > attr.size {
+                self.meta_extend_file_size(ino, new_end).await?;
+                self.extend_local_file_size(ino, new_end);
+            }
+            let _ = self
+                .state
+                .reader
+                .invalidate(ino as u64, offset, written)
+                .await;
+            return Ok(written);
+        }
+
         let mutation_lock = self.state.append_lock(ino);
+        #[cfg(test)]
+        write_diagnostic("vfs-inode-append-lock-before", ino, 0, offset, data.len());
         let _mutation_guard = mutation_lock.lock_owned().await;
+        #[cfg(test)]
+        write_diagnostic("vfs-inode-append-lock-after", ino, 0, offset, data.len());
 
         let attr = self.meta_stat_required(ino, PathHint::none()).await?;
         if attr.kind == FileType::Dir {
@@ -3701,10 +5554,14 @@ where
         }
 
         let writer = self.state.writer.ensure_file(inode);
+        #[cfg(test)]
+        write_diagnostic("vfs-inode-writer-before", ino, 0, offset, data.len());
         let written = writer
             .write_at(offset, data)
             .await
             .map_err(VfsError::from)?;
+        #[cfg(test)]
+        write_diagnostic("vfs-inode-writer-after", ino, 0, offset, data.len());
 
         // Invalidate reader cache for the written range so any subsequent
         // read path flushes pending writer data instead of serving a stale
@@ -3740,8 +5597,106 @@ where
         data: &[u8],
         creation_unique: u64,
     ) -> Result<usize, VfsError> {
+        #[cfg(test)]
+        write_diagnostic("vfs-cache-entry", ino, 0, offset, data.len());
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[std::mem::size_of_val(data)])?;
+            let data = data.to_vec();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_write_cached_ino(ino, offset, &data, creation_unique)
+                        .await
+                })
+                .await?;
+        }
+        self.packed_owned_write_cached_ino(ino, offset, data, creation_unique)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_write_cached_ino(
+        &self,
+        ino: i64,
+        offset: u64,
+        data: &[u8],
+        creation_unique: u64,
+    ) -> Result<usize, VfsError> {
+        #[cfg(test)]
+        write_diagnostic("vfs-cache-owned-entry", ino, 0, offset, data.len());
         if data.is_empty() {
             return Ok(0);
+        }
+
+        #[cfg(feature = "native-packed-base")]
+        if let Some(runtime) = self.native_runtime() {
+            let receipt = runtime
+                .write(ino as u64, offset, data)
+                .await
+                .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?;
+            let written = receipt.accepted_len;
+            let new_end = offset
+                .checked_add(written as u64)
+                .ok_or(VfsError::FileTooLarge)?;
+            let attr = self.meta_stat_required(ino, PathHint::none()).await?;
+            if new_end > attr.size {
+                self.meta_extend_file_size(ino, new_end).await?;
+                self.extend_local_file_size(ino, new_end);
+            }
+            let _ = self
+                .state
+                .reader
+                .invalidate(ino as u64, offset, written)
+                .await;
+            return Ok(written);
+        }
+
+        #[cfg(feature = "workspace-overlay")]
+        if self
+            .core
+            .backend
+            .workspace_read_plan()
+            .is_some_and(|provider| provider.requires_unified_read_request_fence())
+        {
+            let mutation_lock = self.state.append_lock(ino);
+            #[cfg(test)]
+            write_diagnostic("vfs-cache-append-lock-before", ino, 0, offset, data.len());
+            let _mutation_guard = mutation_lock.lock_owned().await;
+            #[cfg(test)]
+            write_diagnostic("vfs-cache-append-lock-after", ino, 0, offset, data.len());
+            let inode = self.ensure_inode_registered(ino).await?;
+            if self
+                .try_sparse_zero_extend(ino, offset, data, inode.file_size())
+                .await?
+            {
+                return Ok(data.len());
+            }
+            let writer = self.state.writer.ensure_file(inode.clone());
+            #[cfg(test)]
+            write_diagnostic("vfs-cache-writer-before", ino, 0, offset, data.len());
+            let written = writer
+                .write_at_cached(offset, data, creation_unique)
+                .await
+                .map_err(VfsError::from)?;
+            #[cfg(test)]
+            write_diagnostic("vfs-cache-writer-after", ino, 0, offset, data.len());
+            #[cfg(test)]
+            write_diagnostic("vfs-cache-invalidate-before", ino, 0, offset, data.len());
+            let _ = self
+                .state
+                .reader
+                .invalidate(ino as u64, offset, written)
+                .await;
+            #[cfg(test)]
+            write_diagnostic("vfs-cache-invalidate-after", ino, 0, offset, data.len());
+            let new_end = offset
+                .checked_add(written as u64)
+                .ok_or(VfsError::FileTooLarge)?;
+            if new_end > inode.file_size() {
+                self.extend_local_file_size(ino, new_end);
+            }
+            return Ok(written);
         }
 
         let inode = self.ensure_inode_registered(ino).await?;
@@ -3787,6 +5742,30 @@ where
         off_out: u64,
         length: u64,
     ) -> Result<usize, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_copy_file_range(fh_in, off_in, fh_out, off_out, length)
+                        .await
+                })
+                .await?;
+        }
+        self.packed_owned_copy_file_range(fh_in, off_in, fh_out, off_out, length)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_copy_file_range(
+        &self,
+        fh_in: u64,
+        off_in: u64,
+        fh_out: u64,
+        off_out: u64,
+        length: u64,
+    ) -> Result<usize, VfsError> {
         if length == 0 {
             return Ok(0);
         }
@@ -3794,9 +5773,24 @@ where
         let src = self.file_handle_required(fh_in)?;
         let dst = self.file_handle_required(fh_out)?;
 
+        #[cfg(feature = "workspace-overlay")]
+        let packed_provider = self
+            .core
+            .backend
+            .workspace_read_plan()
+            .filter(|provider| provider.requires_unified_read_request_fence());
+        #[cfg(feature = "workspace-overlay")]
+        if packed_provider.is_some() {
+            // The tail WRITE must be able to take the source lock before the
+            // copy takes both inode locks for its source snapshot and write.
+            self.wait_split_write_barrier(src.ino, off_in, length.min(usize::MAX as u64) as usize)
+                .await;
+        }
+
         let mut mutation_guards = Vec::new();
         let mut mutation_locks = BTreeMap::new();
-        mutation_locks.insert(src.ino, self.state.append_lock(src.ino));
+        let source_mutation_lock = self.state.append_lock(src.ino);
+        mutation_locks.insert(src.ino, source_mutation_lock.clone());
         mutation_locks.insert(dst.ino, self.state.append_lock(dst.ino));
         for lock in mutation_locks.into_values() {
             mutation_guards.push(lock.lock_owned().await);
@@ -3856,6 +5850,43 @@ where
 
         // Read the full source snapshot before writing so same-file overlap keeps
         // copy_file_range semantics close to a memmove-style copy.
+        #[cfg(feature = "workspace-overlay")]
+        let data = if let Some(provider) = packed_provider {
+            let source_handle = self.file_handle_required(src_guard.fh())?;
+            let held_guard = mutation_guards
+                .iter()
+                .find(|guard| {
+                    Arc::ptr_eq(
+                        tokio::sync::OwnedMutexGuard::mutex(*guard),
+                        &source_mutation_lock,
+                    )
+                })
+                .ok_or_else(|| {
+                    VfsError::Anyhow(anyhow::anyhow!("copy source inode lock is missing"))
+                })?;
+            let output_guard = provider
+                .reserve_read_output(len)
+                .map_err(|error| VfsError::from_meta(PathHint::none(), error))?;
+            let data = self
+                .read_packed_workspace_request(
+                    source_handle,
+                    (off_in, len),
+                    true,
+                    provider,
+                    Some(held_guard),
+                )
+                .await?;
+            match output_guard {
+                Some(guard) => bytes::Bytes::from_owner(crate::vfs::io::reader::OwnedReadReply {
+                    data,
+                    _guard: guard,
+                }),
+                None => bytes::Bytes::from(data),
+            }
+        } else {
+            bytes::Bytes::from(src_guard.read(off_in, len).await?)
+        };
+        #[cfg(not(feature = "workspace-overlay"))]
         let data = src_guard.read(off_in, len).await?;
         let dst_handle = self.file_handle_required(dst_guard.fh())?;
         let dst_inode = self.ensure_inode_registered(dst.ino).await?;
@@ -3876,6 +5907,32 @@ where
 
     /// Copy a byte range between two inodes by opening temporary handles.
     pub async fn copy_file_range_inodes(
+        &self,
+        src_ino: i64,
+        off_in: u64,
+        dst_ino: i64,
+        off_out: u64,
+        length: u64,
+    ) -> Result<usize, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_copy_file_range_inodes(
+                        src_ino, off_in, dst_ino, off_out, length,
+                    )
+                    .await
+                })
+                .await?;
+        }
+        self.packed_owned_copy_file_range_inodes(src_ino, off_in, dst_ino, off_out, length)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_copy_file_range_inodes(
         &self,
         src_ino: i64,
         off_in: u64,
@@ -3911,7 +5968,7 @@ where
         write: bool,
         append: bool,
     ) -> Result<u64, VfsError> {
-        self.open_with_attr_refresh(ino, attr, read, write, append, true)
+        self.open_with_attr_refresh(ino, Some(attr), read, write, append, true)
             .await
     }
 
@@ -3923,12 +5980,7 @@ where
         write: bool,
         append: bool,
     ) -> Result<u64, VfsError> {
-        // `allocate` is infallible, so record the metadata open first. If a
-        // stale cached attr loses a race with unlink/final-close, no VFS handle
-        // is left behind when the metadata layer rejects the open.
-        self.meta_record_open(ino, attr.clone(), read, write, append)
-            .await?;
-        self.open_with_attr_refresh(ino, attr, read, write, append, false)
+        self.open_with_attr_refresh(ino, Some(attr), read, write, append, false)
             .await
     }
 
@@ -3939,50 +5991,66 @@ where
         write: bool,
         append: bool,
     ) -> Result<u64, VfsError> {
-        let attr = match self.meta_stat_for_open(ino, read, write, append).await {
-            Ok(Some(attr)) => attr,
-            Ok(None) => {
-                return Err(VfsError::NotFound {
-                    path: PathHint::none(),
-                });
-            }
-            Err(err) => {
-                tracing::warn!("open: stat_fresh failed for ino {}: {}", ino, err);
-                return Err(VfsError::StaleNetworkFileHandle);
-            }
-        };
-
-        if attr.kind == FileType::Dir {
-            return Err(VfsError::IsADirectory {
-                path: PathHint::none(),
-            });
-        }
-
-        self.meta_record_open(ino, attr.clone(), read, write, append)
-            .await?;
-        self.open_with_attr_refresh(ino, attr, read, write, append, false)
+        self.open_with_attr_refresh(ino, None, read, write, append, false)
             .await
     }
 
     async fn open_with_attr_refresh(
         &self,
         ino: i64,
-        attr: FileAttr,
+        attr: Option<FileAttr>,
         read: bool,
         write: bool,
         append: bool,
         refresh_attr: bool,
     ) -> Result<u64, VfsError> {
-        let mut latest_attr = attr;
-        let mut record_open = false;
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_open_with_attr_refresh(
+                        ino,
+                        attr,
+                        read,
+                        write,
+                        append,
+                        refresh_attr,
+                    )
+                    .await
+                })
+                .await?;
+        }
+        self.packed_owned_open_with_attr_refresh(ino, attr, read, write, append, refresh_attr)
+            .await
+    }
 
-        // Retrieve the latest attr for close-to-open semantics.
-        if refresh_attr {
-            match self.meta_stat_for_open(ino, read, write, append).await {
-                Ok(Some(fresh)) => {
-                    latest_attr = fresh;
-                    record_open = true;
-                }
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_open_with_attr_refresh(
+        &self,
+        ino: i64,
+        attr: Option<FileAttr>,
+        read: bool,
+        write: bool,
+        append: bool,
+        refresh_attr: bool,
+    ) -> Result<u64, VfsError> {
+        // Exhaustion must fail before admission, fresh stat, record_open, or
+        // inode mutation. A later failed admission/stat/open consumes a gap.
+        let fh = self.state.handles.next_handle()?;
+        let memory_guard = self
+            .meta_layer()
+            .reserve_memory(crate::meta::layer::MetadataMemoryKind::Handle, 16384)
+            .map_err(|error| VfsError::from_meta(PathHint::none(), error))?;
+        let fresh_ino = attr.is_none();
+
+        // Cached callers retain their attr path; only a requested refresh or
+        // an attr-less fresh-ino open performs the original fresh stat.
+        let mut latest_attr = match attr {
+            Some(attr) if !refresh_attr => attr,
+            _ => match self.meta_stat_for_open(ino, read, write, append).await {
+                Ok(Some(fresh)) => fresh,
                 Ok(None) => {
                     return Err(VfsError::NotFound {
                         path: PathHint::none(),
@@ -3992,18 +6060,27 @@ where
                     tracing::warn!("open: stat_fresh failed for ino {}: {}", ino, err);
                     return Err(VfsError::StaleNetworkFileHandle);
                 }
-            }
+            },
+        };
+        if fresh_ino && latest_attr.kind == FileType::Dir {
+            return Err(VfsError::IsADirectory {
+                path: PathHint::none(),
+            });
         }
 
-        if record_open {
-            if let Some(inode) = self.state.inodes.get(&ino)
-                && inode.file_size() > latest_attr.size
-            {
-                latest_attr.size = inode.file_size();
-            }
-            self.meta_record_open(ino, latest_attr.clone(), read, write, append)
-                .await?;
+        // Preserve the original refresh-only dirty-size adjustment before
+        // record_open. Cached/fresh-ino attrs keep their original ordering.
+        if refresh_attr
+            && let Some(inode) = self.state.inodes.get(&ino)
+            && inode.file_size() > latest_attr.size
+        {
+            latest_attr.size = inode.file_size();
         }
+        // Admission has already succeeded, and the later allocation is now
+        // infallible with this pre-reserved fh. No failed admission leaks an
+        // unmatched metadata open, and metadata rejection leaves no inode.
+        self.meta_record_open(ino, latest_attr.clone(), read, write, append)
+            .await?;
 
         let guard = self
             .lock_inode(ino)
@@ -4014,10 +6091,13 @@ where
             latest_attr.size = guard.file_size();
         }
 
-        let handle =
-            self.state
-                .handles
-                .allocate(ino, latest_attr, HandleFlags::new(read, write, append));
+        let handle = self.state.handles.allocate(
+            fh,
+            ino,
+            latest_attr,
+            HandleFlags::new(read, write, append),
+            memory_guard,
+        );
         Ok(handle.fh)
     }
 
@@ -4035,6 +6115,19 @@ where
 
     /// Release a previously allocated file handle.
     pub async fn close(&self, fh: u64) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_close(fh).await })
+                .await?;
+        }
+        self.packed_owned_close(fh).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_close(&self, fh: u64) -> Result<(), VfsError> {
         // Note that we cannot hold the lock during the entire function, because `handle.flush()` is a I/O operation.
         let handle = self.file_handle_required(fh)?;
 
@@ -4049,11 +6142,29 @@ where
 
             let dirty_state = self.state.handles.take_write_dirty(fh);
             let flushed_pending = if dirty_state.dirty {
-                self.state
-                    .writer
-                    .flush_for_close(handle.ino as u64)
-                    .await
-                    .map_err(VfsError::from)?
+                #[cfg(feature = "native-packed-base")]
+                {
+                    if let Some(runtime) = self.native_runtime() {
+                        runtime.fsync(handle.ino as u64).await.map_err(|error| {
+                            VfsError::Anyhow(anyhow::anyhow!(error.to_string()))
+                        })?;
+                        false
+                    } else {
+                        self.state
+                            .writer
+                            .flush_for_close(handle.ino as u64)
+                            .await
+                            .map_err(VfsError::from)?
+                    }
+                }
+                #[cfg(not(feature = "native-packed-base"))]
+                {
+                    self.state
+                        .writer
+                        .flush_for_close(handle.ino as u64)
+                        .await
+                        .map_err(VfsError::from)?
+                }
             } else {
                 false
             };
@@ -4123,7 +6234,29 @@ where
     }
 
     pub(crate) async fn flush_dirty_handle_snapshot(&self, fh: u64) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_flush_dirty_handle_snapshot(fh).await })
+                .await?;
+        }
+        self.packed_owned_flush_dirty_handle_snapshot(fh).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_flush_dirty_handle_snapshot(&self, fh: u64) -> Result<(), VfsError> {
         let handle = self.file_handle_required(fh)?;
+
+        #[cfg(feature = "native-packed-base")]
+        if let Some(runtime) = self.native_runtime() {
+            runtime
+                .fsync(handle.ino as u64)
+                .await
+                .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?;
+            return Ok(());
+        }
 
         tracing::trace!(
             fh,
@@ -4178,7 +6311,30 @@ where
     /// mmap writes via FUSE writeback (write_ino) deposit data in the shared
     /// writer and a subsequent fsync on a read-only handle must commit them.
     async fn flush_and_sync_handle(&self, fh: u64) -> Result<i64, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_flush_and_sync_handle(fh).await })
+                .await?;
+        }
+        self.packed_owned_flush_and_sync_handle(fh).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_flush_and_sync_handle(&self, fh: u64) -> Result<i64, VfsError> {
         let handle = self.file_handle_required(fh)?;
+
+        #[cfg(feature = "native-packed-base")]
+        if let Some(runtime) = self.native_runtime() {
+            runtime.fsync(handle.ino as u64).await.map_err(|error| {
+                tracing::warn!(fh, ino = handle.ino, error = %error, "native fsync failed");
+                VfsError::Anyhow(anyhow::anyhow!(error.to_string()))
+            })?;
+            self.update_mtime_ctime(handle.ino).await?;
+            return Ok(handle.ino);
+        }
 
         tracing::info!(fh, ino = handle.ino, "vfs.flush_handle_start");
         let dirty_state = self.state.handles.take_write_dirty_for_inode(handle.ino);
@@ -4227,7 +6383,63 @@ where
     /// Used by rename and other metadata operations that need write-back
     /// convergence before modifying directory entries.
     pub async fn flush_inode(&self, ino: u64) {
+        #[cfg(feature = "native-packed-base")]
+        if let Some(runtime) = self.native_runtime() {
+            let _ = runtime.fsync(ino).await;
+            return;
+        }
         let _ = self.state.writer.flush_if_exists(ino).await;
+    }
+
+    /// Flush pending inode writeback for a stateless FUSE request and retain
+    /// the error.  `flush_inode` is intentionally best-effort for metadata
+    /// operations such as rename; FUSE flush/release must report a failed
+    /// upload instead of silently acknowledging it.
+    pub(crate) async fn flush_inode_required(&self, ino: u64) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_flush_inode_required(ino).await })
+                .await?;
+        }
+        self.packed_owned_flush_inode_required(ino).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_flush_inode_required(&self, ino: u64) -> Result<(), VfsError> {
+        #[cfg(feature = "native-packed-base")]
+        if let Some(runtime) = self.native_runtime() {
+            let report = runtime
+                .fsync(ino)
+                .await
+                .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?;
+            if !report.committed.is_empty() {
+                self.update_mtime_ctime(ino as i64).await?;
+            }
+            return Ok(());
+        }
+
+        let dirty_state = self.state.handles.take_write_dirty_for_inode(ino as i64);
+        let flushed_pending = match self.state.writer.flush_required_snapshot(ino).await {
+            Ok(flushed_pending) => flushed_pending,
+            Err(error) => {
+                if dirty_state.dirty {
+                    self.state.handles.mark_write_dirty_for_inode(ino as i64);
+                }
+                return Err(VfsError::from(error));
+            }
+        };
+        if Self::flush_needs_mtime_ctime_update(dirty_state, flushed_pending)
+            && let Err(error) = self.update_mtime_ctime(ino as i64).await
+        {
+            if dirty_state.dirty {
+                self.state.handles.mark_write_dirty_for_inode(ino as i64);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Sync file content (fsync): flush pending writes.
@@ -4250,7 +6462,33 @@ where
     /// for earlier cached-write requests.  This flushes the current dirty
     /// snapshot without chasing writes that arrive after this fsync started.
     pub(crate) async fn fsync_snapshot(&self, fh: u64, _datasync: bool) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_fsync_snapshot(fh, _datasync).await })
+                .await?;
+        }
+        self.packed_owned_fsync_snapshot(fh, _datasync).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_fsync_snapshot(&self, fh: u64, _datasync: bool) -> Result<(), VfsError> {
         let handle = self.file_handle_required(fh)?;
+
+        #[cfg(feature = "native-packed-base")]
+        if let Some(runtime) = self.native_runtime() {
+            runtime
+                .fsync(handle.ino as u64)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(fh, ino = handle.ino, error = %error, "native fsync snapshot failed");
+                    VfsError::Anyhow(anyhow::anyhow!(error.to_string()))
+                })?;
+            self.update_mtime_ctime(handle.ino).await?;
+            return Ok(());
+        }
 
         tracing::trace!(
             fh,
@@ -4304,11 +6542,18 @@ where
     /// This pre-loads all directory entries and starts background batch prefetch for attributes.
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     pub async fn opendir(&self, ino: i64) -> Result<u64, VfsError> {
+        let fh = self.state.handles.next_handle()?;
+        let memory_guard = self
+            .meta_layer()
+            .reserve_memory(crate::meta::layer::MetadataMemoryKind::Handle, 8192)
+            .map_err(|error| VfsError::from_meta(PathHint::none(), error))?;
         let attr = self.meta_stat_required(ino, PathHint::none()).await?;
-        let handle = self.meta_opendir(ino).await?.with_attr(attr);
-        let fh = self.state.handles.allocate_dir(handle);
-
-        Ok(fh)
+        let handle = self
+            .meta_opendir(ino)
+            .await?
+            .with_attr(attr)
+            .with_memory_guard(memory_guard);
+        Ok(self.state.handles.allocate_dir(fh, handle))
     }
 
     /// Refresh a directory handle by re-reading entries from the meta layer.
@@ -4316,11 +6561,18 @@ where
     /// Used for rewinddir(3): files created after opendir(3) must become
     /// visible after rewinddir(3) + readdir(3).
     pub async fn refresh_dir_handle(&self, fh: u64) -> Result<(), VfsError> {
+        let memory_guard = self
+            .meta_layer()
+            .reserve_memory(crate::meta::layer::MetadataMemoryKind::Handle, 8192)
+            .map_err(|error| VfsError::from_meta(PathHint::none(), error))?;
         let ino = self
             .dir_handle(fh)
             .ok_or(VfsError::StaleNetworkFileHandle)?
             .ino;
-        let fresh = self.meta_opendir(ino).await?;
+        let fresh = self
+            .meta_opendir(ino)
+            .await?
+            .with_memory_guard(memory_guard);
         self.state.handles.replace_dir(fh, fresh);
         Ok(())
     }
@@ -4355,6 +6607,58 @@ where
         let handle = self.dir_handle(fh)?;
 
         Some(handle.get_entries(offset))
+    }
+
+    /// Read one bounded directory page. Snapshot-paged handles use their
+    /// asynchronous source here; legacy handles keep the existing in-memory
+    /// slice behavior. Keeping the async method separate avoids forcing every
+    /// mutable metadata backend to implement the packed snapshot protocol.
+    pub async fn readdir_page(
+        &self,
+        fh: u64,
+        offset: u64,
+    ) -> Result<Option<Vec<DirEntry>>, VfsError> {
+        let Some(handle) = self.dir_handle(fh) else {
+            return Ok(None);
+        };
+        handle
+            .get_entries_page(offset, 256)
+            .await
+            .map(Some)
+            .map_err(|error| VfsError::from_meta(PathHint::none(), error))
+    }
+
+    /// Read one bounded directory page without converting packed names to
+    /// UTF-8. The raw method is used by the FUSE adapter for immutable
+    /// snapshots; legacy callers can keep using `readdir_page` above.
+    pub async fn readdir_page_raw(
+        &self,
+        fh: u64,
+        offset: u64,
+    ) -> Result<Option<Vec<RawDirEntry>>, VfsError> {
+        let Some(handle) = self.dir_handle(fh) else {
+            return Ok(None);
+        };
+        handle
+            .get_entries_page_raw(offset, 256)
+            .await
+            .map(Some)
+            .map_err(|error| VfsError::from_meta(PathHint::none(), error))
+    }
+
+    pub(crate) async fn readdir_page_raw_owned(
+        &self,
+        fh: u64,
+        offset: u64,
+    ) -> Result<Option<crate::vfs::handles::OwnedDirectoryPage>, VfsError> {
+        let Some(handle) = self.dir_handle(fh) else {
+            return Ok(None);
+        };
+        handle
+            .get_entries_page_raw_owned(offset, 256)
+            .await
+            .map(Some)
+            .map_err(|error| VfsError::from_meta(PathHint::none(), error))
     }
 
     /// Update cached information about a handle (e.g. last observed offset).
@@ -4427,6 +6731,31 @@ where
 
     /// Set file lock for a given inode.
     pub(crate) async fn set_plock_ino(
+        &self,
+        inode: i64,
+        owner: i64,
+        block: bool,
+        lock_type: FileLockType,
+        range: FileLockRange,
+        pid: u32,
+    ) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_set_plock_ino(inode, owner, block, lock_type, range, pid)
+                        .await
+                })
+                .await?;
+        }
+        self.packed_owned_set_plock_ino(inode, owner, block, lock_type, range, pid)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_set_plock_ino(
         &self,
         inode: i64,
         owner: i64,
@@ -4527,6 +6856,31 @@ where
         value: &[u8],
         flags: u32,
     ) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[name.len(), std::mem::size_of_val(value)])?;
+            let name = name.to_owned();
+            let value = value.to_vec();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_set_xattr_ino(inode, &name, &value, flags)
+                        .await
+                })
+                .await?;
+        }
+        self.packed_owned_set_xattr_ino(inode, name, value, flags)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_set_xattr_ino(
+        &self,
+        inode: i64,
+        name: &str,
+        value: &[u8],
+        flags: u32,
+    ) -> Result<(), VfsError> {
         self.meta_set_xattr(inode, name, value, flags).await?;
         self.notify_kernel_invalidate_inode_all_and_wait(inode)
             .await;
@@ -4545,7 +6899,180 @@ where
 
     /// Remove xattr for a given inode.
     pub async fn remove_xattr_ino(&self, inode: i64, name: &str) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[name.len()])?;
+            let name = name.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_remove_xattr_ino(inode, &name).await })
+                .await?;
+        }
+        self.packed_owned_remove_xattr_ino(inode, name).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_remove_xattr_ino(&self, inode: i64, name: &str) -> Result<(), VfsError> {
         self.meta_remove_xattr(inode, name).await?;
+        self.notify_kernel_invalidate_inode_all_and_wait(inode)
+            .await;
+        Ok(())
+    }
+
+    pub(crate) async fn update_posix_acl_ino(
+        &self,
+        ino: i64,
+        name: &str,
+        value: Option<&[u8]>,
+        uid: u32,
+        groups: &[u32],
+    ) -> Result<(), crate::meta::store::MetaError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self
+                .packed_mutation_admit(&[
+                    name.len(),
+                    value.map_or(0, <[u8]>::len),
+                    std::mem::size_of_val(groups),
+                ])
+                .map_err(|error| crate::meta::store::MetaError::Anyhow(anyhow::anyhow!(error)))?;
+            let name = name.to_owned();
+            let value = value.map(<[u8]>::to_vec);
+            let groups = groups.to_vec();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_update_posix_acl_ino(
+                        ino,
+                        &name,
+                        value.as_deref(),
+                        uid,
+                        &groups,
+                    )
+                    .await
+                })
+                .await
+                .map_err(|error| crate::meta::store::MetaError::Anyhow(anyhow::anyhow!(error)))?;
+        }
+        self.packed_owned_update_posix_acl_ino(ino, name, value, uid, groups)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_update_posix_acl_ino(
+        &self,
+        ino: i64,
+        name: &str,
+        value: Option<&[u8]>,
+        uid: u32,
+        groups: &[u32],
+    ) -> Result<(), crate::meta::store::MetaError> {
+        self.meta_layer()
+            .update_posix_acl(ino, name, value, uid, groups)
+            .await?;
+        if let Some(attr) = self.meta_layer().stat_fresh(ino).await? {
+            self.state.handles.update_attr_for_inode(ino, &attr);
+        }
+        self.notify_kernel_invalidate_inode_all_and_wait(ino).await;
+        Ok(())
+    }
+
+    /// FUSE byte-name operations keep immutable source xattrs lossless.
+    pub async fn get_xattr_bytes_ino(
+        &self,
+        inode: i64,
+        name: &[u8],
+    ) -> Result<Option<Vec<u8>>, VfsError> {
+        self.meta_layer()
+            .get_xattr_bytes(inode, name)
+            .await
+            .map_err(|error| VfsError::from_meta(PathHint::none(), error))
+    }
+
+    pub async fn list_xattr_bytes_ino(&self, inode: i64) -> Result<Vec<Vec<u8>>, VfsError> {
+        self.meta_layer()
+            .list_xattr_bytes(inode)
+            .await
+            .map_err(|error| VfsError::from_meta(PathHint::none(), error))
+    }
+
+    pub async fn list_xattr_bytes_owned_ino(
+        &self,
+        inode: i64,
+    ) -> Result<crate::meta::layer::OwnedXattrNames, VfsError> {
+        self.meta_layer()
+            .list_xattr_bytes_owned(inode)
+            .await
+            .map_err(|error| VfsError::from_meta(PathHint::none(), error))
+    }
+
+    pub async fn set_xattr_bytes_ino(
+        &self,
+        inode: i64,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+    ) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[
+                std::mem::size_of_val(name),
+                std::mem::size_of_val(value),
+            ])?;
+            let name = name.to_vec();
+            let value = value.to_vec();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_set_xattr_bytes_ino(inode, &name, &value, flags)
+                        .await
+                })
+                .await?;
+        }
+        self.packed_owned_set_xattr_bytes_ino(inode, name, value, flags)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_set_xattr_bytes_ino(
+        &self,
+        inode: i64,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+    ) -> Result<(), VfsError> {
+        self.meta_layer()
+            .set_xattr_bytes(inode, name, value, flags)
+            .await
+            .map_err(|error| VfsError::from_meta(PathHint::none(), error))?;
+        self.notify_kernel_invalidate_inode_all_and_wait(inode)
+            .await;
+        Ok(())
+    }
+
+    pub async fn remove_xattr_bytes_ino(&self, inode: i64, name: &[u8]) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[std::mem::size_of_val(name)])?;
+            let name = name.to_vec();
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_remove_xattr_bytes_ino(inode, &name).await })
+                .await?;
+        }
+        self.packed_owned_remove_xattr_bytes_ino(inode, name).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_remove_xattr_bytes_ino(
+        &self,
+        inode: i64,
+        name: &[u8],
+    ) -> Result<(), VfsError> {
+        self.meta_layer()
+            .remove_xattr_bytes(inode, name)
+            .await
+            .map_err(|error| VfsError::from_meta(PathHint::none(), error))?;
         self.notify_kernel_invalidate_inode_all_and_wait(inode)
             .await;
         Ok(())
@@ -4553,6 +7080,19 @@ where
 
     /// Set ACL rule for a given inode.
     pub async fn set_acl_ino(&self, inode: i64, rule: AclRule) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[])?;
+            let vfs = self.clone();
+            return driver
+                .run(async move { vfs.packed_owned_set_acl_ino(inode, rule).await })
+                .await?;
+        }
+        self.packed_owned_set_acl_ino(inode, rule).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_set_acl_ino(&self, inode: i64, rule: AclRule) -> Result<(), VfsError> {
         self.meta_set_acl(inode, rule).await
     }
 
@@ -4585,6 +7125,32 @@ where
 
     /// Set file lock by path.
     pub async fn set_plock(
+        &self,
+        path: &str,
+        owner: i64,
+        block: bool,
+        lock_type: FileLockType,
+        range: FileLockRange,
+        pid: u32,
+    ) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.packed_mutation_needs_driver() {
+            let driver = self.packed_mutation_admit(&[path.len()])?;
+            let path = path.to_owned();
+            let vfs = self.clone();
+            return driver
+                .run(async move {
+                    vfs.packed_owned_set_plock(&path, owner, block, lock_type, range, pid)
+                        .await
+                })
+                .await?;
+        }
+        self.packed_owned_set_plock(path, owner, block, lock_type, range, pid)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn packed_owned_set_plock(
         &self,
         path: &str,
         owner: i64,
@@ -4701,8 +7267,10 @@ where
     }
 
     pub async fn close(mut self) -> Result<(), VfsError> {
+        let result = self.vfs.close(self.fh).await;
+        // If this future itself is dropped, Drop still owns cleanup.
         self.closed = true;
-        self.vfs.close(self.fh).await
+        result
     }
 }
 
