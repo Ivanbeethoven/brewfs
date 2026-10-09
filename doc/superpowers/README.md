@@ -8,5 +8,5 @@ explicitly names one as active.
   iteration records.
 - [specs/](specs/): design specs that supported larger changes.
 
-For current performance priorities, prefer
-[../performance/perf-optimization-roadmap.md](../performance/perf-optimization-roadmap.md).
+For current performance evidence, prefer
+[../performance/native-packed-base-large-scale-validation-2026-09-24.md](../performance/native-packed-base-large-scale-validation-2026-09-24.md).

@@ -8,6 +8,7 @@ use crate::meta::client::{MetaClientOptions, OpenFileCacheConfig};
 use crate::meta::config::MetaClientConfig;
 use crate::meta::factory::create_meta_store_from_url;
 use crate::meta::file_lock::FileLockType;
+use crate::meta::store::MetaStore;
 use crate::posix::NAME_MAX;
 use crate::vfs::fs::VFS;
 use std::sync::Arc;
@@ -48,6 +49,384 @@ fn test_file_attr(ino: i64) -> super::FileAttr {
         mtime: 0,
         ctime: 0,
         nlink: 1,
+    }
+}
+
+#[cfg(feature = "workspace-overlay")]
+mod packed_request_tests {
+    use super::*;
+    use crate::chunk::read_plan::{
+        LogicalSegment, PreparedUnifiedRead, ReadGeneration, ReadSource, ResolvedReadPlan,
+        UnifiedReadPlan, UnifiedReadRequestFence, UnifiedReadSourceFetcher,
+        WorkspaceReadPlanProvider,
+    };
+    use crate::meta::store::MetaError;
+    use crate::vfs::config::{VFSConfig, WriteConfig};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct RequestState {
+        file_size: AtomicU64,
+        begins: AtomicU64,
+        checks: AtomicU64,
+        completed: AtomicU64,
+        owned: AtomicBool,
+        lose_on_begin: AtomicBool,
+        block_source: AtomicBool,
+        source_entered: Notify,
+        source_release: Notify,
+    }
+
+    struct RequestProvider(Arc<RequestState>);
+
+    struct RequestFence {
+        state: Arc<RequestState>,
+        file_size: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl UnifiedReadRequestFence for RequestFence {
+        fn file_size(&self) -> u64 {
+            self.file_size
+        }
+
+        async fn ensure_current(&self) -> anyhow::Result<()> {
+            self.state.checks.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(
+                self.state.owned.load(Ordering::SeqCst),
+                crate::workspace_overlay::error::WorkspaceError::Fenced
+            );
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UnifiedReadSourceFetcher for RequestProvider {
+        async fn read_source(&self, source: &ReadSource, out: &mut [u8]) -> anyhow::Result<()> {
+            if self.0.block_source.swap(false, Ordering::SeqCst) {
+                self.0.source_entered.notify_one();
+                self.0.source_release.notified().await;
+            }
+            let ReadSource::PackedInline { data, raw_offset } = source else {
+                anyhow::bail!("unexpected packed fixture source");
+            };
+            let start = *raw_offset as usize;
+            out.copy_from_slice(&data[start..start + out.len()]);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceReadPlanProvider for RequestProvider {
+        fn supports_prepared_unified_read(&self) -> bool {
+            true
+        }
+
+        fn requires_unified_read_request_fence(&self) -> bool {
+            true
+        }
+
+        async fn begin_unified_read_request(
+            &self,
+            _ino: i64,
+        ) -> anyhow::Result<Option<Arc<dyn UnifiedReadRequestFence>>> {
+            self.0.begins.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(
+                self.0.owned.load(Ordering::SeqCst),
+                crate::workspace_overlay::error::WorkspaceError::Fenced
+            );
+            if self.0.lose_on_begin.swap(false, Ordering::SeqCst) {
+                self.0.owned.store(false, Ordering::SeqCst);
+            }
+            Ok(Some(Arc::new(RequestFence {
+                state: self.0.clone(),
+                file_size: self.0.file_size.load(Ordering::SeqCst),
+            })))
+        }
+
+        fn record_unified_read_success(&self, bytes: u64) {
+            self.0.completed.fetch_add(bytes, Ordering::SeqCst);
+        }
+
+        async fn read_plan(
+            &self,
+            _ino: i64,
+            _chunk_index: u64,
+            _offset: u64,
+            _len: u64,
+        ) -> Result<ResolvedReadPlan, MetaError> {
+            panic!("mutable packed fixture must use prepared reads")
+        }
+
+        async fn range_has_data(
+            &self,
+            _ino: i64,
+            _offset: u64,
+            _len: u64,
+        ) -> Result<bool, MetaError> {
+            Ok(true)
+        }
+
+        async fn prepare_unified_read(
+            &self,
+            _ino: i64,
+            chunk_index: u64,
+            offset: u64,
+            len: u64,
+        ) -> Result<Option<PreparedUnifiedRead>, MetaError> {
+            let size = self.0.file_size.load(Ordering::SeqCst);
+            let file_offset = chunk_index * 8 + offset;
+            let data_len = len.min(size.saturating_sub(file_offset));
+            let data: Arc<[u8]> = (0..data_len)
+                .map(|i| b"BASE"[((file_offset + i) % 4) as usize])
+                .collect::<Vec<_>>()
+                .into();
+            let segments = if data_len == 0 {
+                Vec::new()
+            } else {
+                vec![LogicalSegment {
+                    logical_offset: offset,
+                    length: data_len,
+                    source: ReadSource::PackedInline {
+                        data,
+                        raw_offset: 0,
+                    },
+                }]
+            };
+            Ok(Some(PreparedUnifiedRead {
+                plan: UnifiedReadPlan {
+                    generation: ReadGeneration::readonly([17; 32]),
+                    logical_size: offset + len,
+                    segments,
+                },
+                fetcher: Arc::new(RequestProvider(self.0.clone())),
+            }))
+        }
+    }
+
+    async fn fixture(
+        cached_size: u64,
+        durable_size: u64,
+    ) -> (
+        Arc<VFS<InMemoryBlockStore, impl MetaLayer>>,
+        Arc<RequestState>,
+        i64,
+        u64,
+    ) {
+        let layout = ChunkLayout {
+            chunk_size: 8,
+            block_size: 4,
+        };
+        let meta = create_meta_store_from_url("sqlite::memory:")
+            .await
+            .unwrap()
+            .layer();
+        let state = Arc::new(RequestState::default());
+        state.owned.store(true, Ordering::SeqCst);
+        state.file_size.store(durable_size, Ordering::SeqCst);
+        let config = VFSConfig::new(layout).write_config(
+            WriteConfig::new(layout)
+                .page_size(4)
+                .freeze_min_bytes(1024 * 1024)
+                .auto_flush_max_age(Duration::from_secs(3600))
+                .flush_all_interval(Duration::from_secs(3600)),
+        );
+        let fs = Arc::new(
+            VFS::from_readonly_components_with_provider(
+                config,
+                Arc::new(InMemoryBlockStore::new()),
+                meta,
+                Arc::new(RequestProvider(state.clone())),
+            )
+            .unwrap(),
+        );
+        let ino = fs
+            .create_file_at(fs.root_ino(), "packed", false)
+            .await
+            .unwrap();
+        fs.truncate_inode(ino, cached_size).await.unwrap();
+        let attr = fs.stat_ino(ino).await.unwrap();
+        let fh = fs.open(ino, attr, true, true, false).await.unwrap();
+        (fs, state, ino, fh)
+    }
+
+    #[tokio::test]
+    async fn actual_vfs_mutable_packed_read_uses_fresh_eof_before_cached_eof() {
+        let (fs, state, _ino, fh) = fixture(0, 16).await;
+        assert_eq!(fs.read(fh, 8, 8).await.unwrap(), b"BASEBASE");
+        assert_eq!(state.begins.load(Ordering::SeqCst), 1);
+        assert!(state.checks.load(Ordering::SeqCst) > 0);
+        assert_eq!(state.completed.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn actual_vfs_mutable_packed_zero_read_still_requires_current_owner() {
+        let (fs, state, _ino, fh) = fixture(0, 0).await;
+        assert!(fs.read(fh, 0, 0).await.unwrap().is_empty());
+        assert_eq!(state.begins.load(Ordering::SeqCst), 1);
+        assert!(state.checks.load(Ordering::SeqCst) >= 2);
+        state.owned.store(false, Ordering::SeqCst);
+        assert!(fs.read(fh, 0, 0).await.is_err());
+        assert_eq!(state.begins.load(Ordering::SeqCst), 2);
+        assert_eq!(state.completed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn actual_vfs_mutable_packed_fully_dirty_read_still_fences_delivery() {
+        let (fs, state, _ino, fh) = fixture(16, 16).await;
+        fs.write(fh, 0, b"dirty bytes!!!!!").await.unwrap();
+        assert_eq!(fs.read(fh, 0, 16).await.unwrap(), b"dirty bytes!!!!!");
+        assert_eq!(state.begins.load(Ordering::SeqCst), 1);
+        assert!(state.checks.load(Ordering::SeqCst) > 0);
+        assert_eq!(state.completed.load(Ordering::SeqCst), 16);
+    }
+
+    #[tokio::test]
+    async fn actual_vfs_mutable_packed_dirty_read_rejects_lost_owner_without_success() {
+        for lose_on_begin in [false, true] {
+            let (fs, state, _ino, fh) = fixture(16, 16).await;
+            fs.write(fh, 0, b"dirty bytes!!!!!").await.unwrap();
+            if lose_on_begin {
+                state.lose_on_begin.store(true, Ordering::SeqCst);
+            } else {
+                state.owned.store(false, Ordering::SeqCst);
+            }
+            assert!(fs.read(fh, 0, 16).await.is_err());
+            assert_eq!(state.begins.load(Ordering::SeqCst), 1);
+            assert_eq!(state.completed.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_vfs_mutable_packed_dirty_extension_survives_durable_eof() {
+        let (fs, state, _ino, fh) = fixture(4, 4).await;
+        fs.write(fh, 8, b"TAIL").await.unwrap();
+        assert_eq!(fs.read(fh, 0, 12).await.unwrap(), b"BASE\0\0\0\0TAIL");
+        // The dirty extension sets EOF even when this request contains only its hole.
+        assert_eq!(fs.read(fh, 4, 4).await.unwrap(), [0; 4]);
+        assert_eq!(state.begins.load(Ordering::SeqCst), 2);
+        assert_eq!(state.completed.load(Ordering::SeqCst), 16);
+    }
+
+    #[tokio::test]
+    async fn actual_vfs_mutable_packed_read_excludes_other_handle_and_cached_writer() {
+        for cached in [false, true] {
+            let (fs, state, ino, fh) = fixture(16, 16).await;
+            let attr = fs.stat_ino(ino).await.unwrap();
+            let other = fs.open(ino, attr, true, true, false).await.unwrap();
+            state.block_source.store(true, Ordering::SeqCst);
+            let read_fs = fs.clone();
+            let read = tokio::spawn(async move { read_fs.read(fh, 0, 16).await });
+            tokio::time::timeout(Duration::from_secs(5), state.source_entered.notified())
+                .await
+                .unwrap();
+            let write_fs = fs.clone();
+            let mut write = tokio::spawn(async move {
+                if cached {
+                    write_fs.write_cached_ino(ino, 2, b"NEW", 7).await
+                } else {
+                    write_fs.write(other, 2, b"NEW").await
+                }
+            });
+            let premature = tokio::time::timeout(Duration::from_millis(50), &mut write).await;
+            state.source_release.notify_one();
+            let output = tokio::time::timeout(Duration::from_secs(5), read)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if premature.is_err() {
+                tokio::time::timeout(Duration::from_secs(5), write)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+            assert!(
+                premature.is_err(),
+                "local write crossed a packed read attempt"
+            );
+            assert_eq!(output, b"BASEBASEBASEBASE");
+            assert_eq!(fs.read(fh, 0, 8).await.unwrap(), b"BANEWASE");
+        }
+    }
+
+    async fn read_committed_upper<S, M>(
+        fs: &VFS<S, M>,
+        ino: i64,
+        offset: u64,
+        len: usize,
+    ) -> Vec<u8>
+    where
+        S: BlockStore + Send + Sync + 'static,
+        M: MetaLayer + Send + Sync + 'static,
+    {
+        use crate::chunk::reader::DataFetcher;
+        let layout = ChunkLayout {
+            chunk_size: 8,
+            block_size: 4,
+        };
+        let mut output = Vec::with_capacity(len);
+        for span in crate::vfs::io::split_chunk_spans(layout, offset, len) {
+            let cid = crate::vfs::chunk_id_for(ino, span.index).unwrap();
+            let slices = fs.core.meta_layer.get_slices(cid).await.unwrap();
+            output.extend_from_slice(
+                &DataFetcher::read_at_from_slices(
+                    layout,
+                    cid,
+                    fs.core.backend.as_ref(),
+                    &slices,
+                    span.offset.into(),
+                    span.len as usize,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        output
+    }
+
+    #[tokio::test]
+    async fn actual_vfs_mutable_packed_copy_across_files_reuses_source_inode_lock() {
+        let (fs, state, _src, fh) = fixture(16, 16).await;
+        let dst = fs
+            .create_file_at(fs.root_ino(), "destination", false)
+            .await
+            .unwrap();
+        let attr = fs.stat_ino(dst).await.unwrap();
+        let dst_fh = fs.open(dst, attr, true, true, false).await.unwrap();
+        let copied = tokio::time::timeout(
+            Duration::from_secs(2),
+            fs.copy_file_range(fh, 3, dst_fh, 1, 8),
+        )
+        .await
+        .expect("packed copy must reuse its already-held source inode lock")
+        .unwrap();
+        assert_eq!(copied, 8);
+        assert_eq!(
+            read_committed_upper(fs.as_ref(), dst, 1, 8).await,
+            b"EBASEBAS"
+        );
+        assert_eq!(state.begins.load(Ordering::SeqCst), 1);
+        assert!(state.checks.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn actual_vfs_mutable_packed_copy_same_file_overlap_keeps_source_snapshot() {
+        let (fs, state, ino, fh) = fixture(16, 16).await;
+        let copied =
+            tokio::time::timeout(Duration::from_secs(2), fs.copy_file_range(fh, 3, fh, 5, 8))
+                .await
+                .expect("same-file packed copy must not recursively lock its inode")
+                .unwrap();
+        assert_eq!(copied, 8);
+        assert_eq!(
+            read_committed_upper(fs.as_ref(), ino, 5, 8).await,
+            b"EBASEBAS"
+        );
+        assert_eq!(state.begins.load(Ordering::SeqCst), 1);
+        assert!(state.checks.load(Ordering::SeqCst) >= 2);
     }
 }
 
@@ -364,6 +743,53 @@ mod rename_tests {
         assert!(fs.exists("/test/batch2_renamed.txt").await);
 
         println!("All VFS rename boundary condition tests passed!");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rename_noreplace_preserves_concurrently_created_destination() {
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let fs = Arc::new(
+            VFS::new(
+                ChunkLayout::default(),
+                InMemoryBlockStore::new(),
+                meta_handle.store(),
+            )
+            .await
+            .unwrap(),
+        );
+        fs.mkdir_p("/race").await.unwrap();
+        fs.create_file("/race/left").await.unwrap();
+        fs.create_file("/race/right").await.unwrap();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let left_fs = Arc::clone(&fs);
+        let left_barrier = Arc::clone(&barrier);
+        let left = tokio::spawn(async move {
+            left_barrier.wait().await;
+            left_fs
+                .rename_noreplace("/race/left", "/race/destination")
+                .await
+        });
+        let right_fs = Arc::clone(&fs);
+        let right_barrier = Arc::clone(&barrier);
+        let right = tokio::spawn(async move {
+            right_barrier.wait().await;
+            right_fs
+                .rename_noreplace("/race/right", "/race/destination")
+                .await
+        });
+
+        let left = left.await.unwrap();
+        let right = right.await.unwrap();
+        assert_ne!(left.is_ok(), right.is_ok(), "exactly one rename must win");
+        assert!(fs.exists("/race/destination").await);
+        if left.is_ok() {
+            assert!(!fs.exists("/race/left").await);
+            assert!(fs.exists("/race/right").await);
+        } else {
+            assert!(fs.exists("/race/left").await);
+            assert!(!fs.exists("/race/right").await);
+        }
     }
 
     #[tokio::test]
@@ -850,6 +1276,86 @@ mod basic_tests {
 
         assert_eq!(file_a_attr_after.ino, file_b_attr_before.ino);
         assert_eq!(file_b_attr_after.ino, file_a_attr_before.ino);
+    }
+
+    #[tokio::test]
+    async fn test_rename_exchange_rejects_descendants_in_both_directions() {
+        let fs = new_basic_fs().await;
+        fs.mkdir_p("/a/b/c").await.unwrap();
+        fs.create_file("/a/file").await.unwrap();
+        let a_ino = fs.stat("/a").await.unwrap().ino;
+        let c_ino = fs.stat("/a/b/c").await.unwrap().ino;
+        let file_ino = fs.stat("/a/file").await.unwrap().ino;
+        let flags = crate::vfs::fs::RenameFlags {
+            noreplace: false,
+            exchange: true,
+            whiteout: false,
+        };
+
+        let descendant_target = fs
+            .rename_with_flags("/a", "/a/b/c", flags)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            descendant_target,
+            crate::vfs::error::VfsError::CircularRename { .. }
+        ));
+        assert_eq!(fs.stat("/a").await.unwrap().ino, a_ino);
+        assert_eq!(fs.stat("/a/b/c").await.unwrap().ino, c_ino);
+
+        let ancestor_target = fs
+            .rename_with_flags("/a/b/c", "/a", flags)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            ancestor_target,
+            crate::vfs::error::VfsError::CircularRename { .. }
+        ));
+        assert_eq!(fs.stat("/a").await.unwrap().ino, a_ino);
+        assert_eq!(fs.stat("/a/b/c").await.unwrap().ino, c_ino);
+
+        let file_target = fs
+            .rename_with_flags("/a", "/a/file", flags)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            file_target,
+            crate::vfs::error::VfsError::CircularRename { .. }
+        ));
+        assert_eq!(fs.stat("/a").await.unwrap().ino, a_ino);
+        assert_eq!(fs.stat("/a/file").await.unwrap().ino, file_ino);
+    }
+
+    #[tokio::test]
+    async fn test_parent_ancestry_walk_rejects_existing_cycle() {
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let raw_meta = meta_handle.store();
+        let fs = VFS::new(
+            ChunkLayout::default(),
+            InMemoryBlockStore::new(),
+            raw_meta.clone(),
+        )
+        .await
+        .unwrap();
+        let root = fs.root_ino();
+        let ancestor = raw_meta.mkdir(root, "ancestor".into()).await.unwrap();
+        let descendant = raw_meta.mkdir(ancestor, "descendant".into()).await.unwrap();
+        raw_meta
+            .set_directory_parent_for_test(ancestor, descendant)
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            fs.parent_is_descendant_of(ancestor, root),
+        )
+        .await
+        .expect("ancestry walk must terminate")
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::vfs::error::VfsError::CircularRename { .. }
+        ));
     }
 
     #[tokio::test]
@@ -3356,3 +3862,7 @@ mod truncate_flush_tests {
         assert_eq!(attr.size, 0);
     }
 }
+
+#[cfg(feature = "workspace-overlay")]
+#[path = "tests/handle_namespace_exhaustion_existing_api_tests.rs"]
+mod handle_namespace_exhaustion_existing_api_tests;

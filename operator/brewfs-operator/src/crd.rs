@@ -5,6 +5,9 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "workspace-operator")]
+use crate::workspace::crd::{WorkspaceClusterSpec, WorkspaceClusterStatus};
+
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[kube(
     group = "storage.brewfs.io",
@@ -22,6 +25,9 @@ pub struct BrewFSClusterSpec {
     pub rustfs: RustFsSpec,
     #[serde(default, rename = "mountConfig")]
     pub mount_config: MountConfigSpec,
+    #[cfg(feature = "workspace-operator")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceClusterSpec>,
 }
 
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
@@ -85,6 +91,9 @@ pub struct BrewFSClusterStatus {
     pub bucket: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_map: Option<String>,
+    #[cfg(feature = "workspace-operator")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceClusterStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_reconciled_at: Option<DateTime<Utc>>,
 }
@@ -434,13 +443,101 @@ pub struct ConsumerVolumeSpec {
     pub host_path_type: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RedisSpec {
     #[serde(default = "default_redis_image")]
     pub image: String,
     #[serde(default = "default_redis_port")]
     pub port: i32,
+    #[serde(default = "default_redis_storage_size")]
+    pub storage_size: String,
+    #[serde(default)]
+    pub storage_class_name: Option<String>,
+}
+
+impl JsonSchema for RedisSpec {
+    fn schema_name() -> String {
+        "RedisSpec".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, ObjectValidation, Schema, SchemaObject, SingleOrVec};
+        use serde_json::json;
+        use std::collections::BTreeMap;
+
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "image".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
+                metadata: Some(Box::new(schemars::schema::Metadata {
+                    default: Some(json!(default_redis_image())),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+        );
+        properties.insert(
+            "port".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Integer))),
+                format: Some("int32".to_string()),
+                metadata: Some(Box::new(schemars::schema::Metadata {
+                    default: Some(json!(default_redis_port())),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+        );
+        properties.insert(
+            "storageSize".to_string(),
+            Schema::Object(SchemaObject {
+                instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
+                metadata: Some(Box::new(schemars::schema::Metadata {
+                    default: Some(json!(default_redis_storage_size())),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+        );
+        properties.insert(
+            "storageClassName".to_string(),
+            Schema::Object({
+                let mut schema = SchemaObject {
+                    instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
+                    ..Default::default()
+                };
+                schema
+                    .extensions
+                    .insert("nullable".to_string(), json!(true));
+                schema
+            }),
+        );
+
+        let mut schema = SchemaObject {
+            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Object))),
+            object: Some(Box::new(ObjectValidation {
+                properties,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        schema.extensions.insert(
+            "x-kubernetes-validations".to_string(),
+            json!([
+                {
+                    "rule": "self.storageClassName == oldSelf.storageClassName",
+                    "message": "redis.storageClassName is immutable after creation"
+                },
+                {
+                    "rule": "quantity(self.storageSize).compareTo(quantity(oldSelf.storageSize)) >= 0",
+                    "message": "redis.storageSize cannot be reduced"
+                }
+            ]),
+        );
+        Schema::Object(schema)
+    }
 }
 
 impl Default for RedisSpec {
@@ -448,6 +545,8 @@ impl Default for RedisSpec {
         Self {
             image: default_redis_image(),
             port: default_redis_port(),
+            storage_size: default_redis_storage_size(),
+            storage_class_name: None,
         }
     }
 }
@@ -524,6 +623,10 @@ fn default_redis_image() -> String {
 
 fn default_redis_port() -> i32 {
     6379
+}
+
+fn default_redis_storage_size() -> String {
+    "1Gi".to_string()
 }
 
 fn default_rustfs_image() -> String {
@@ -634,7 +737,8 @@ fn default_force_path_style() -> bool {
 mod tests {
     use serde_json::Value;
 
-    use super::BrewFSMountStatus;
+    use super::{BrewFSCluster, BrewFSMountStatus};
+    use kube::CustomResourceExt;
 
     #[test]
     fn mount_status_omits_absent_optional_fields() {
@@ -674,5 +778,21 @@ mod tests {
         assert!(!status.contains_key("consumerWorkloadKind"));
         assert!(!status.contains_key("observedGeneration"));
         assert!(!status.contains_key("lastReconciledAt"));
+    }
+
+    #[test]
+    fn redis_schema_rejects_immutable_class_and_storage_shrink() {
+        let crd = serde_json::to_value(BrewFSCluster::crd()).expect("serialize CRD");
+        let validations = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"]["redis"]["x-kubernetes-validations"];
+        let rules: Vec<&str> = validations
+            .as_array()
+            .expect("validation rules array")
+            .iter()
+            .map(|rule| rule["rule"].as_str().expect("rule string"))
+            .collect();
+        assert!(rules.contains(&"self.storageClassName == oldSelf.storageClassName"));
+        assert!(rules
+            .contains(&"quantity(self.storageSize).compareTo(quantity(oldSelf.storageSize)) >= 0"));
     }
 }

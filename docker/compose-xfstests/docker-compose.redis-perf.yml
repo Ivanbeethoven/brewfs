@@ -34,18 +34,21 @@ services:
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
       RUSTFS_CONSOLE_ENABLE: ${RUSTFS_CONSOLE_ENABLE:-true}
-      RUSTFS_SERVER_DOMAINS: ${RUSTFS_SERVER_DOMAINS:-rustfs}
     command:
       - --address
       - :9000
       - --console-enable
-      - --server-domains
-      - ${RUSTFS_SERVER_DOMAINS:-rustfs}
       - --access-key
       - ${RUSTFS_ACCESS_KEY:-rustfsadmin}
       - --secret-key
       - ${RUSTFS_SECRET_KEY:-rustfsadmin}
       - /data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
     volumes:
       - ${BREWFS_PERF_RUSTFS_DATA_MOUNT:-rustfs-data-perf-redis}:/data
     networks:
@@ -55,7 +58,7 @@ services:
     image: amazon/aws-cli:latest
     depends_on:
       rustfs:
-        condition: service_started
+        condition: service_healthy
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
@@ -130,8 +133,13 @@ services:
       redis:
         condition: service_healthy
     environment:
-      BREWFS_META_BACKEND: redis
-      BREWFS_META_URL: redis://redis:6379/0
+      BREWFS_META_BACKEND: ${BREWFS_META_BACKEND:-redis}
+      BREWFS_META_URL: ${BREWFS_META_URL-redis://redis:6379/0}
+      BREWFS_VOLUME_FORMAT: ${BREWFS_VOLUME_FORMAT:-}
+      BREWFS_PACKED_MANIFEST_KEY: ${BREWFS_PACKED_MANIFEST_KEY:-}
+      BREWFS_WORKSPACE_ID: ${BREWFS_WORKSPACE_ID:-}
+      BREWFS_WORKSPACE_NAMESPACE: ${BREWFS_WORKSPACE_NAMESPACE:-}
+      BREWFS_WRITEBACK_MODE: ${BREWFS_WRITEBACK_MODE:-}
       BREWFS_DATA_BACKEND: ${BREWFS_DATA_BACKEND:-local-fs}
       BREWFS_DATA_DIR: /var/lib/brewfs/data
       BREWFS_S3_BUCKET: ${BREWFS_S3_BUCKET:-brewfs-data}
@@ -154,6 +162,7 @@ services:
       BREWFS_FUSE_KEEP_CACHE: ${BREWFS_FUSE_KEEP_CACHE:-}
       BREWFS_FUSE_WRITEBACK: ${BREWFS_FUSE_WRITEBACK:-}
       BREWFS_FUSE_LOG_FILE: /artifacts/brewfs_fuse_ops.log
+      ASYNCFUSE_PREPOST_READ: ${ASYNCFUSE_PREPOST_READ:-}
       BREWFS_WRITEBACK_UPLOAD_CONCURRENCY: ${BREWFS_WRITEBACK_UPLOAD_CONCURRENCY:-}
       BREWFS_CACHED_BLOCK_ASSEMBLER: ${BREWFS_CACHED_BLOCK_ASSEMBLER:-}
       BREWFS_UPLOAD_LIMIT_MIBPS: ${BREWFS_UPLOAD_LIMIT_MIBPS:-}

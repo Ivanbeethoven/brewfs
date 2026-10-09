@@ -16,6 +16,18 @@ rules:
     resources: ["brewfsclusters/status"]
     verbs: ["get", "update", "patch"]
   - apiGroups: ["storage.brewfs.io"]
+    resources: ["brewfsclusters/finalizers"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["storage.brewfs.io"]
+    resources: ["brewfsworkspaces", "brewfsworkspacemounts", "brewfsworkspacesnapshots"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["storage.brewfs.io"]
+    resources: ["brewfsworkspaces/status", "brewfsworkspacemounts/status", "brewfsworkspacesnapshots/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["storage.brewfs.io"]
+    resources: ["brewfsworkspaces/finalizers", "brewfsworkspacemounts/finalizers", "brewfsworkspacesnapshots/finalizers"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["storage.brewfs.io"]
     resources: ["brewfsmounts"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: ["storage.brewfs.io"]
@@ -35,7 +47,10 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
@@ -48,6 +63,34 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: brewfs-operator
+subjects:
+  - kind: ServiceAccount
+    name: brewfs-operator
+    namespace: brewfs-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: brewfs-operator-gc-election
+  namespace: brewfs-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["brewfs-packed-v3-gc"]
+    verbs: ["get", "update"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: brewfs-operator-gc-election
+  namespace: brewfs-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: brewfs-operator-gc-election
 subjects:
   - kind: ServiceAccount
     name: brewfs-operator

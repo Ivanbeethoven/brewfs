@@ -9,6 +9,7 @@ err()  { log "ERROR $*" >&2; }
 
 mount_dir="${JFS_MOUNT_POINT:-/mnt/juicefs}"
 meta_url="${JFS_META_URL:-redis://redis:6379/0}"
+meta_url_display="$(printf '%s' "$meta_url" | sed -E 's#(redis(s)?://)[^@[:space:]]+@#\1***@#')"
 s3_bucket="${JFS_S3_BUCKET:-brewfs-data}"
 s3_endpoint="${JFS_S3_ENDPOINT:-http://rustfs:9000}"
 s3_region="${JFS_S3_REGION:-us-east-1}"
@@ -24,11 +25,15 @@ jfs_buffer_size_mib="${JFS_BUFFER_SIZE_MIB:-}"
 jfs_cache_size_mib="${JFS_CACHE_SIZE_MIB:-}"
 jfs_cache_large_write="${JFS_CACHE_LARGE_WRITE:-false}"
 jfs_max_uploads="${JFS_MAX_UPLOADS:-}"
+jfs_max_stage_write="${JFS_MAX_STAGE_WRITE:-}"
 jfs_max_downloads="${JFS_MAX_DOWNLOADS:-}"
 jfs_max_readahead_mib="${JFS_MAX_READAHEAD_MIB:-}"
 jfs_prefetch="${JFS_PREFETCH:-}"
 jfs_open_cache="${JFS_OPEN_CACHE:-}"
 jfs_open_cache_limit="${JFS_OPEN_CACHE_LIMIT:-}"
+jfs_attr_cache="${JFS_ATTR_CACHE:-}"
+jfs_entry_cache="${JFS_ENTRY_CACHE:-}"
+jfs_dir_entry_cache="${JFS_DIR_ENTRY_CACHE:-}"
 jfs_backup_meta="${JFS_BACKUP_META:-}"
 jfs_no_usage_report="${JFS_NO_USAGE_REPORT:-false}"
 jfs_cache_dir="${JFS_CACHE_DIR:-}"
@@ -85,21 +90,34 @@ PERF_FIO_DROP_CACHES=${PERF_FIO_DROP_CACHES:-false}
 PERF_FIO_COLD_READ=${PERF_FIO_COLD_READ:-false}
 PERF_FIO_COLD_READ_DROP_CACHES=${PERF_FIO_COLD_READ_DROP_CACHES:-false}
 PERF_FIO_DIRECT_MATRIX=${PERF_FIO_DIRECT_MATRIX:-}
+PERF_FIO_BIGREAD_REPEATS=${PERF_FIO_BIGREAD_REPEATS:-3}
+PERF_FIO_BIGREAD_COOLDOWN_SECS=${PERF_FIO_BIGREAD_COOLDOWN_SECS:-10}
+PERF_FIO_BIGREAD_EVICT_LOCAL_CACHE_PAGES=${PERF_FIO_BIGREAD_EVICT_LOCAL_CACHE_PAGES:-true}
+PERF_FIO_BIGREAD_WARMUP_PASSES=${PERF_FIO_BIGREAD_WARMUP_PASSES:-1}
+PERF_FIO_BIGREAD_REMOUNT_BETWEEN_REPEATS=${PERF_FIO_BIGREAD_REMOUNT_BETWEEN_REPEATS:-true}
 JFS_COMPRESS=${jfs_compress}
 JFS_WRITEBACK=${jfs_writeback}
 JFS_BUFFER_SIZE_MIB=${jfs_buffer_size_mib}
 JFS_CACHE_SIZE_MIB=${jfs_cache_size_mib}
 JFS_CACHE_LARGE_WRITE=${jfs_cache_large_write}
 JFS_MAX_UPLOADS=${jfs_max_uploads}
+JFS_MAX_STAGE_WRITE=${jfs_max_stage_write}
 JFS_MAX_DOWNLOADS=${jfs_max_downloads}
 JFS_MAX_DOWNLOADS_EFFECTIVE=${max_downloads_effective}
 JFS_MAX_READAHEAD_MIB=${jfs_max_readahead_mib}
 JFS_PREFETCH=${jfs_prefetch}
 JFS_OPEN_CACHE=${jfs_open_cache}
 JFS_OPEN_CACHE_LIMIT=${jfs_open_cache_limit}
+JFS_ATTR_CACHE=${jfs_attr_cache}
+JFS_ENTRY_CACHE=${jfs_entry_cache}
+JFS_DIR_ENTRY_CACHE=${jfs_dir_entry_cache}
 JFS_BACKUP_META=${jfs_backup_meta}
 JFS_NO_USAGE_REPORT=${jfs_no_usage_report}
 JFS_CACHE_DIR=${jfs_cache_dir}
+PERF_SMALLFILE_DIRS=${PERF_SMALLFILE_DIRS:-8}
+PERF_SMALLFILE_FILES_PER_DIR=${PERF_SMALLFILE_FILES_PER_DIR:-4500}
+PERF_SMALLFILE_SIZE=${PERF_SMALLFILE_SIZE:-4096}
+PERF_SMALLFILE_COLD_READ=${PERF_SMALLFILE_COLD_READ:-true}
 EOF
 
     {
@@ -121,15 +139,23 @@ JFS_BUFFER_SIZE_MIB=${jfs_buffer_size_mib}
 JFS_CACHE_SIZE_MIB=${jfs_cache_size_mib}
 JFS_CACHE_LARGE_WRITE=${jfs_cache_large_write}
 JFS_MAX_UPLOADS=${jfs_max_uploads}
+JFS_MAX_STAGE_WRITE=${jfs_max_stage_write}
 JFS_MAX_DOWNLOADS=${jfs_max_downloads}
 JFS_MAX_DOWNLOADS_EFFECTIVE=${max_downloads_effective}
 JFS_MAX_READAHEAD_MIB=${jfs_max_readahead_mib}
 JFS_PREFETCH=${jfs_prefetch}
 JFS_OPEN_CACHE=${jfs_open_cache}
 JFS_OPEN_CACHE_LIMIT=${jfs_open_cache_limit}
+JFS_ATTR_CACHE=${jfs_attr_cache}
+JFS_ENTRY_CACHE=${jfs_entry_cache}
+JFS_DIR_ENTRY_CACHE=${jfs_dir_entry_cache}
 JFS_BACKUP_META=${jfs_backup_meta}
 JFS_NO_USAGE_REPORT=${jfs_no_usage_report}
 JFS_CACHE_DIR=${jfs_cache_dir}
+JUICEFS_META_BACKEND=${JUICEFS_META_BACKEND:-redis}
+JFS_META_URL=${meta_url_display}
+JFS_S3_ENDPOINT=${s3_endpoint}
+JFS_S3_BUCKET=${s3_bucket}
 EOF
 }
 
@@ -256,7 +282,7 @@ run_logged_tool() {
 }
 
 format_juicefs() {
-    info "检查 JuiceFS 是否已格式化: $meta_url"
+    info "检查 JuiceFS 是否已格式化: $meta_url_display"
     if /usr/local/bin/juicefs status "$meta_url" >/dev/null 2>&1; then
         info "JuiceFS 已格式化，跳过 format"
         return 0
@@ -264,11 +290,23 @@ format_juicefs() {
 
     # JuiceFS uses bucket URL to specify custom S3 endpoint:
     #   http://<endpoint>/<bucket>
-    local bucket_url="${s3_endpoint}/${s3_bucket}"
+    # JuiceFS takes a bucket URL; Aliyun OSS requires virtual-hosted style, so
+    # prefer the explicit URL when the caller derived one.
+    local bucket_url="${JFS_S3_BUCKET_URL:-${s3_endpoint}/${s3_bucket}}"
 
-    info "格式化 JuiceFS: $meta_url (bucket=$bucket_url)"
+    # Aliyun OSS rejects path-style object requests (SecondLevelDomainForbidden).
+    # JuiceFS only switches to virtual-hosted addressing through its dedicated
+    # "oss" storage type; with "-storage s3" the generic S3 client keeps
+    # path-style addressing for *.aliyuncs.com endpoints. Verified locally
+    # against the same release: s3 => 403, oss => format succeeds.
+    local storage="s3"
+    if [[ "$bucket_url" == *aliyuncs.com* ]]; then
+        storage="oss"
+    fi
+
+    info "格式化 JuiceFS: $meta_url_display (bucket=$bucket_url)"
     /usr/local/bin/juicefs format \
-        --storage s3 \
+        --storage "$storage" \
         --bucket "$bucket_url" \
         --access-key "$access_key" \
         --secret-key "$secret_key" \
@@ -299,6 +337,7 @@ mount_juicefs() {
         mount_args+=(--cache-large-write)
     fi
     [[ -n "$jfs_max_uploads" ]] && mount_args+=(--max-uploads="$jfs_max_uploads")
+    [[ -n "$jfs_max_stage_write" ]] && mount_args+=(--max-stage-write="$jfs_max_stage_write")
     if [[ -n "$jfs_max_downloads" ]]; then
         if juicefs_mount_supports "--max-downloads"; then
             mount_args+=(--max-downloads="$jfs_max_downloads")
@@ -310,6 +349,9 @@ mount_juicefs() {
     [[ -n "$jfs_prefetch" ]] && mount_args+=(--prefetch="$jfs_prefetch")
     [[ -n "$jfs_open_cache" ]] && mount_args+=(--open-cache="$jfs_open_cache")
     [[ -n "$jfs_open_cache_limit" ]] && mount_args+=(--open-cache-limit="$jfs_open_cache_limit")
+    [[ -n "$jfs_attr_cache" ]] && mount_args+=(--attr-cache="$jfs_attr_cache")
+    [[ -n "$jfs_entry_cache" ]] && mount_args+=(--entry-cache="$jfs_entry_cache")
+    [[ -n "$jfs_dir_entry_cache" ]] && mount_args+=(--dir-entry-cache="$jfs_dir_entry_cache")
     [[ -n "$jfs_backup_meta" ]] && mount_args+=(--backup-meta="$jfs_backup_meta")
     [[ -n "$jfs_cache_dir" ]] && mount_args+=(--cache-dir="$jfs_cache_dir")
     if truthy "$jfs_no_usage_report"; then
@@ -573,6 +615,110 @@ run_dirperf() {
     run_logged_tool dirperf "$bin" "${args[@]}"
 }
 
+run_smallfiles_read() {
+    local root="$mount_dir"
+    local dirs="${PERF_SMALLFILE_DIRS:-8}"
+    local files_per_dir="${PERF_SMALLFILE_FILES_PER_DIR:-4500}"
+    local file_size="${PERF_SMALLFILE_SIZE:-4096}"
+    local stat_only="${PERF_SMALLFILE_STAT_ONLY:-false}"
+    local prep_log="$artifact_dir/tools/smallfiles-read-prepare.log"
+    local expected=$((dirs * files_per_dir))
+
+    info "准备 JuiceFS 小文件只读扫描: dirs=$dirs files_per_dir=$files_per_dir size=$file_size"
+    python3 - "$root" "$dirs" "$files_per_dir" "$file_size" >"$prep_log" 2>&1 <<'PY'
+import pathlib
+import sys
+import time
+
+root = pathlib.Path(sys.argv[1])
+dirs = int(sys.argv[2])
+files_per_dir = int(sys.argv[3])
+file_size = int(sys.argv[4])
+data = bytes([0x5A]) * file_size
+started = time.monotonic()
+for directory_index in range(dirs):
+    directory = root / f"d{directory_index:03d}"
+    directory.mkdir()
+    for file_index in range(files_per_dir):
+        (directory / f"f{file_index:05d}").write_bytes(data)
+elapsed = time.monotonic() - started
+print(f"smallfiles_prepare_summary files={dirs * files_per_dir} bytes={dirs * files_per_dir * file_size} seconds={elapsed:.6f}")
+PY
+    cat "$prep_log"
+    sync || true
+
+    if truthy "${PERF_SMALLFILE_COLD_READ:-true}"; then
+        info "为 JuiceFS 小文件扫描重挂载并清理数据缓存"
+        cleanup
+        PERF_FIO_COLD_READ=true PERF_FIO_COLD_READ_CLEAR_CACHE=true clear_juicefs_cache_if_requested
+        PERF_FIO_COLD_READ_DROP_CACHES=true drop_kernel_page_cache_if_requested
+        mount_juicefs
+    fi
+
+    if truthy "$stat_only" && [[ -x /usr/local/bin/smallfiles_scan.py ]]; then
+        run_logged_tool smallfiles-stat /usr/local/bin/smallfiles_scan.py \
+            --root "$root" \
+            --label "juicefs-${meta_url%%:*}-stat" \
+            --mode stat \
+            --expected-files "$expected" \
+            --min-size "$file_size" \
+            --max-size "$file_size" \
+            --dir-levels 1 \
+            --dirs-per-level "$dirs" \
+            --files-per-leaf "$files_per_dir" \
+            --workers "${PERF_SMALLFILE_WORKERS:-16}" \
+            --json-output "$artifact_dir/results/smallfiles-stat.json"
+        return
+    fi
+
+    smallfiles_scan() {
+        python3 - "$root" "$expected" "$file_size" <<'PY'
+import os
+import pathlib
+import sys
+import time
+
+root = pathlib.Path(sys.argv[1])
+expected = int(sys.argv[2])
+file_size = int(sys.argv[3])
+started = time.monotonic()
+files = 0
+bytes_read = 0
+checksum = 0
+errors = 0
+for directory, dirs, names in os.walk(root):
+    dirs[:] = sorted(name for name in dirs if name.startswith("d"))
+    # JuiceFS keeps implementation files (for example .stats and .config)
+    # at the mount root. The benchmark corpus lives only below d* dirs.
+    if pathlib.Path(directory) == root:
+        continue
+    for name in sorted(names):
+        path = pathlib.Path(directory) / name
+        try:
+            st = path.stat()
+            with path.open("rb") as handle:
+                first = handle.read(1)
+            if st.st_size != file_size:
+                raise OSError(f"unexpected size {st.st_size}")
+            files += 1
+            bytes_read += st.st_size
+            checksum = (checksum + (first[0] if first else 0)) & 0xffffffff
+        except OSError as error:
+            errors += 1
+            print(f"error path={path} error={error}")
+elapsed = time.monotonic() - started
+print(f"smallfiles_read_summary files={files} expected={expected} bytes={bytes_read} errors={errors} checksum={checksum} seconds={elapsed:.6f} files_per_sec={files / elapsed if elapsed else 0:.2f}")
+if files != expected or errors:
+    raise SystemExit(1)
+PY
+    }
+    run_logged_tool smallfiles-read smallfiles_scan
+}
+
+run_smallfiles_stat() {
+    PERF_SMALLFILE_STAT_ONLY=true run_smallfiles_read
+}
+
 run_metaperf() {
     local bin="$xfstests_dir/src/metaperf"
     local work_dir="$mount_dir/.perf-metaperf"
@@ -792,6 +938,155 @@ run_fio_custom() {
     append_fio_log_summary "$json_path" "$artifact_dir/tools/fio.log" "fio"
 }
 
+evict_juicefs_local_cache_pages() {
+    local root="${jfs_cache_dir:-/var/lib/juicefs/cache}"
+    if [[ "$root" != /* || "$root" == "/" || ! -d "$root" ]]; then
+        err "无法定向驱逐 JuiceFS cache page cache，路径无效: $root"
+        return 1
+    fi
+
+    sync
+    python3 - "$root" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+files = 0
+bytes_advised = 0
+for directory, _, names in os.walk(root):
+    for name in names:
+        path = pathlib.Path(directory) / name
+        try:
+            metadata = path.stat()
+            if not stat.S_ISREG(metadata.st_mode):
+                continue
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+            files += 1
+            bytes_advised += metadata.st_size
+        except FileNotFoundError:
+            continue
+print(
+    f"evicted local cache pages: root={root} files={files} "
+    f"bytes={bytes_advised}"
+)
+PY
+}
+
+run_repeated_bigread() {
+    local tool="$1"
+    local canonical_path="$2"
+    local warmup_count="$3"
+    local repeats="$4"
+    local cooldown_secs="$5"
+    shift 5
+    local -a fio_args=("$@")
+    local repeat_dir="$artifact_dir/results/${tool}-repeats"
+    local summary_path="$artifact_dir/${tool}-repeat-summary.json"
+    local -a repeat_paths=()
+    local i repeat_path lat_prefix
+
+    mkdir -p "$repeat_dir"
+    for ((i = 1; i <= warmup_count; i++)); do
+        info "热身 Large read: $tool 第 ${i}/${warmup_count} 轮（不计入结果）"
+        fio "${fio_args[@]}" \
+            --output-format=json \
+            --output="$repeat_dir/warmup-${i}.json" \
+            --write_lat_log="$repeat_dir/warmup-${i}_lat" \
+            --log_avg_msec=1000 || return $?
+    done
+
+    for ((i = 1; i <= repeats; i++)); do
+        repeat_path="$repeat_dir/run-${i}.json"
+        lat_prefix="$repeat_dir/run-${i}_lat"
+        repeat_paths+=("$repeat_path")
+        if truthy "${PERF_FIO_BIGREAD_EVICT_LOCAL_CACHE_PAGES:-true}"; then
+            evict_juicefs_local_cache_pages || return $?
+        fi
+        info "运行稳定 Large read: $tool 第 ${i}/${repeats} 轮"
+        fio "${fio_args[@]}" \
+            --output-format=json \
+            --output="$repeat_path" \
+            --write_lat_log="$lat_prefix" \
+            --log_avg_msec=1000 || return $?
+
+        if ((i < repeats)); then
+            info "Large read 轮间冷却 ${cooldown_secs}s"
+            sleep "$cooldown_secs"
+            if truthy "${PERF_FIO_BIGREAD_REMOUNT_BETWEEN_REPEATS:-true}"; then
+                info "重挂载以清空进程内热缓存"
+                remount_juicefs_for_fio_profile "${tool}-repeat-$((i + 1))" || return $?
+            else
+                info "保持挂载，保留热本地缓存供下一轮测量"
+            fi
+        fi
+    done
+
+    python3 - "$canonical_path" "$summary_path" "$warmup_count" "${repeat_paths[@]}" <<'PY'
+import json
+import pathlib
+import shutil
+import sys
+
+canonical = pathlib.Path(sys.argv[1])
+summary_path = pathlib.Path(sys.argv[2])
+warmup_count = int(sys.argv[3])
+paths = [pathlib.Path(raw) for raw in sys.argv[4:]]
+runs = []
+for index, path in enumerate(paths, 1):
+    data = json.loads(path.read_text())
+    jobs = data.get("jobs", [])
+    if not jobs:
+        raise SystemExit(f"missing fio jobs in {path}")
+    read_bw = sum(float(job.get("read", {}).get("bw_bytes", 0)) for job in jobs)
+    write_bw = sum(float(job.get("write", {}).get("bw_bytes", 0)) for job in jobs)
+    runs.append({
+        "run": index,
+        "path": str(path),
+        "read_bw_bytes_per_sec": read_bw,
+        "write_bw_bytes_per_sec": write_bw,
+        "total_bw_bytes_per_sec": read_bw + write_bw,
+        "total_bw_mib_per_sec": (read_bw + write_bw) / (1024 * 1024),
+    })
+
+ordered = sorted(runs, key=lambda item: (item["total_bw_bytes_per_sec"], item["run"]))
+median = ordered[len(ordered) // 2]
+shutil.copyfile(median["path"], canonical)
+median_bw = median["total_bw_bytes_per_sec"]
+spread_pct = (
+    (ordered[-1]["total_bw_bytes_per_sec"] - ordered[0]["total_bw_bytes_per_sec"])
+    / median_bw
+    * 100
+    if median_bw
+    else 0
+)
+summary = {
+    "schema_version": 1,
+    "warmup_count": warmup_count,
+    "repeat_count": len(runs),
+    "selection": "median_total_bw_bytes_per_sec",
+    "median_run": median["run"],
+    "median_bw_mib_per_sec": median["total_bw_mib_per_sec"],
+    "min_bw_mib_per_sec": ordered[0]["total_bw_mib_per_sec"],
+    "max_bw_mib_per_sec": ordered[-1]["total_bw_mib_per_sec"],
+    "spread_percent_of_median": spread_pct,
+    "canonical_result": str(canonical),
+    "runs": runs,
+}
+summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+print(
+    f"stable bigread median: run={median['run']} "
+    f"bw={median['total_bw_mib_per_sec']:.2f} MiB/s "
+    f"spread={spread_pct:.2f}%"
+)
+PY
+}
+
 run_fio_profile() {
     local tool="$1"
     local mode="$2"
@@ -818,6 +1113,9 @@ run_fio_profile() {
     local use_time_based=true
     local use_end_fsync=false
     local use_refill_buffers=false
+    local repeat_count=1
+    local repeat_cooldown_secs=10
+    local warmup_count=0
     local -a args=()
 
     if [[ -n "$profile_key_override" ]]; then
@@ -967,7 +1265,12 @@ run_fio_profile() {
         )
 
         if [[ "${use_time_based:-true}" == true ]]; then
-            args+=(--runtime="$runtime" --time_based)
+            # A zero runtime means a size-bounded fio job. Passing --time_based
+            # with runtime=0 only emits a fio warning and can break report parsing.
+            args+=(--runtime="$runtime")
+            if [[ "$runtime" =~ ^[1-9][0-9]*$ ]]; then
+                args+=(--time_based)
+            fi
         fi
         if [[ "${use_end_fsync:-false}" == true ]]; then
             args+=(--end_fsync=1)
@@ -994,10 +1297,33 @@ run_fio_profile() {
         fi
     fi
 
+    if [[ "$mode" == "bigread" ]]; then
+        repeat_count="${PERF_FIO_BIGREAD_REPEATS:-3}"
+        repeat_cooldown_secs="${PERF_FIO_BIGREAD_COOLDOWN_SECS:-10}"
+        warmup_count="${PERF_FIO_BIGREAD_WARMUP_PASSES:-1}"
+        if [[ ! "$repeat_count" =~ ^(1|3|5)$ ]]; then
+            err "PERF_FIO_BIGREAD_REPEATS 只支持 1、3 或 5，当前值: $repeat_count"
+            return 1
+        fi
+        if [[ ! "$repeat_cooldown_secs" =~ ^[0-9]+$ ]] || ((repeat_cooldown_secs > 300)); then
+            err "PERF_FIO_BIGREAD_COOLDOWN_SECS 必须是 0..300 的整数，当前值: $repeat_cooldown_secs"
+            return 1
+        fi
+        if [[ ! "$warmup_count" =~ ^[0-9]+$ ]] || ((warmup_count > 10)); then
+            err "PERF_FIO_BIGREAD_WARMUP_PASSES 必须是 0..10 的整数，当前值: $warmup_count"
+            return 1
+        fi
+    fi
+
     local lat_log_prefix="$artifact_dir/results/${tool}_lat"
-    args+=(--output-format=json --output="$json_path")
-    args+=(--write_lat_log="$lat_log_prefix" --log_avg_msec=1000)
-    run_logged_tool "$tool" fio "${args[@]}"
+    if ((repeat_count > 1)); then
+        run_logged_tool "$tool" run_repeated_bigread \
+            "$tool" "$json_path" "$warmup_count" "$repeat_count" "$repeat_cooldown_secs" "${args[@]}"
+    else
+        args+=(--output-format=json --output="$json_path")
+        args+=(--write_lat_log="$lat_log_prefix" --log_avg_msec=1000)
+        run_logged_tool "$tool" fio "${args[@]}"
+    fi
     append_fio_log_summary "$json_path" "$artifact_dir/tools/${tool}.log" "$tool"
     wait_for_fio_post_write_drain "$tool"
 }
@@ -1241,6 +1567,8 @@ run_perf_suite() {
         case "$tool" in
             dirstress)    run_dirstress || status=1 ;;
             dirperf)      run_dirperf || status=1 ;;
+            smallfiles-read) run_smallfiles_read || status=1 ;;
+            smallfiles-stat) run_smallfiles_stat || status=1 ;;
             metaperf)     run_metaperf || status=1 ;;
             looptest)     run_looptest || status=1 ;;
             stress-ng)    run_stress_ng || status=1 ;;
@@ -1279,7 +1607,9 @@ main() {
     if [[ -z "$artifact_dir" ]]; then
         local ts
         ts="$(date +%s)-$RANDOM"
-        artifact_dir="${artifact_root%/}/perf-run-${ts}"
+        # Keep the "perf-run-" prefix (host wrappers glob for it) and append the
+        # workload so the Result Vault run list shows BrewFS vs JuiceFS directly.
+        artifact_dir="${artifact_root%/}/perf-run-${ts}-juicefs"
     fi
 
     mkdir -p "$artifact_dir"
@@ -1312,11 +1642,20 @@ main() {
     local status=$?
     set -e
     generate_perf_report || true
+    touch "$artifact_dir/perf.complete"
 
     if [[ "$status" -eq 0 ]]; then
         ok "性能测试全部完成"
     else
         err "性能测试存在失败项 (exit=$status)"
+    fi
+
+    # Keep the pod alive briefly so Kubernetes clients can copy artifacts before
+    # the completed container becomes non-executable.
+    local hold_seconds="${BREWFS_ARTIFACT_HOLD_SECONDS:-0}"
+    if [[ "$hold_seconds" =~ ^[0-9]+$ ]] && (( hold_seconds > 0 )); then
+        info "保留产物窗口: ${hold_seconds}s"
+        sleep "$hold_seconds"
     fi
 
     return "$status"

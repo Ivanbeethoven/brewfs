@@ -25,6 +25,9 @@ pub struct FuseConcurrencyConfig {
 
 /// Build default mount options for BrewFS.
 fn default_mount_options() -> MountOptions {
+    mount_options_with_max_read(BREWFS_FUSE_MAX_WRITE as usize)
+}
+fn mount_options_with_max_read(max_read: usize) -> MountOptions {
     let mut mo = MountOptions::default();
     mo.fs_name("brewfs");
     mo.default_permissions(true);
@@ -38,13 +41,36 @@ fn default_mount_options() -> MountOptions {
     mo.allow_other(true);
     // Default to 4 MiB for higher throughput while keeping memory usage reasonable.
     mo.max_write(NonZeroU32::new(BREWFS_FUSE_MAX_WRITE).unwrap());
-    mo.custom_options(format!("max_read={BREWFS_FUSE_MAX_WRITE}"));
+    mo.custom_options(format!("max_read={max_read}"));
     // Set kernel readahead to 16 MiB (4 blocks). Larger values cause excessive
     // concurrent FUSE reads that create scheduling contention. 16 MiB lets the
     // kernel pipeline 4 read requests while our userspace prefetcher handles
     // deeper look-ahead independently.
     mo.max_readahead(Some(16 * 1024 * 1024));
     mo
+}
+
+fn mount_options_for_fs<S, M>(fs: &VFS<S, M>) -> MountOptions
+where
+    S: BlockStore + Send + Sync + 'static,
+    M: MetaLayer + Send + Sync + 'static,
+{
+    let mut options = mount_options_with_max_read(
+        fs.prepared_max_read_bytes()
+            .unwrap_or(BREWFS_FUSE_MAX_WRITE as usize),
+    );
+    #[cfg(feature = "workspace-overlay")]
+    if fs.requires_packed_mutation_drain() {
+        options.write_back(false);
+    }
+    options.posix_acl(
+        fs.meta_layer().posix_acl_capability()
+            != crate::meta::layer::PosixAclCapability::Unsupported,
+    );
+    options.dont_mask(
+        fs.meta_layer().posix_acl_capability() == crate::meta::layer::PosixAclCapability::ReadWrite,
+    );
+    options
 }
 
 fn fuse_writeback_enabled() -> bool {
@@ -63,12 +89,13 @@ fn parse_fuse_writeback_enabled(value: Option<String>) -> bool {
 fn configure_session<FS>(
     session: asyncfuse::raw::Session<FS>,
     config: FuseConcurrencyConfig,
+    budgeted: bool,
 ) -> asyncfuse::raw::Session<FS>
 where
     FS: asyncfuse::raw::Filesystem + Send + Sync + 'static,
 {
-    if config.worker_count > 1 {
-        session.with_workers(config.worker_count, config.max_background.max(1))
+    if config.worker_count > 1 || budgeted {
+        session.with_workers(config.worker_count.max(1), config.max_background.max(1))
     } else {
         session
     }
@@ -96,21 +123,17 @@ where
     M: MetaLayer + Send + Sync + 'static,
 {
     let mount_point = mount_point.as_ref();
+    let options = mount_options_for_fs(&fs);
+    let budgeted = fs.prepared_max_read_bytes().is_some();
     // Prefer unprivileged mount on Linux (requires fusermount3 in PATH)
     if fuse_op_log_enabled() {
-        configure_session(
-            asyncfuse::raw::Session::new(default_mount_options()),
-            concurrency,
-        )
-        .mount_with_unprivileged(LoggingFileSystem::new(fs), mount_point)
-        .await
+        configure_session(asyncfuse::raw::Session::new(options), concurrency, budgeted)
+            .mount_with_unprivileged(LoggingFileSystem::new(fs), mount_point)
+            .await
     } else {
-        configure_session(
-            asyncfuse::raw::Session::new(default_mount_options()),
-            concurrency,
-        )
-        .mount_with_unprivileged(fs, mount_point)
-        .await
+        configure_session(asyncfuse::raw::Session::new(options), concurrency, budgeted)
+            .mount_with_unprivileged(fs, mount_point)
+            .await
     }
 }
 
@@ -127,20 +150,16 @@ where
     M: MetaLayer + Send + Sync + 'static,
 {
     let mount_point = mount_point.as_ref();
+    let options = mount_options_for_fs(&fs);
+    let budgeted = fs.prepared_max_read_bytes().is_some();
     if fuse_op_log_enabled() {
-        configure_session(
-            asyncfuse::raw::Session::new(default_mount_options()),
-            concurrency,
-        )
-        .mount(LoggingFileSystem::new(fs), mount_point)
-        .await
+        configure_session(asyncfuse::raw::Session::new(options), concurrency, budgeted)
+            .mount(LoggingFileSystem::new(fs), mount_point)
+            .await
     } else {
-        configure_session(
-            asyncfuse::raw::Session::new(default_mount_options()),
-            concurrency,
-        )
-        .mount(fs, mount_point)
-        .await
+        configure_session(asyncfuse::raw::Session::new(options), concurrency, budgeted)
+            .mount(fs, mount_point)
+            .await
     }
 }
 

@@ -15,8 +15,8 @@ use crate::meta::file_lock::{
 };
 use crate::meta::store::{
     CreateEntryResult, DirEntry, DirStat, FileAttr, FileType, LockName, MetaError, MetaStore,
-    RetryReason, SetAttrFlags, SetAttrRequest, StatFsSnapshot, stat_fs_snapshot_from_usage,
-    stat_fs_used_bytes,
+    RenameOutcome, RetryReason, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
+    stat_fs_snapshot_from_usage, stat_fs_used_bytes,
 };
 use crate::meta::{INODE_ID_KEY, SLICE_ID_KEY};
 use async_trait::async_trait;
@@ -39,10 +39,13 @@ use tracing::{Instrument, error, info};
 use uuid::Uuid;
 
 const ROOT_INODE: i64 = 1;
+const REDIS_CLUSTER_PROBE_KEY_A: &str = "c{brewfs-cluster-probe-a}";
+const REDIS_CLUSTER_PROBE_KEY_B: &str = "ds_{brewfs-cluster-probe-b}";
 const COUNTER_INODE_KEY: &str = "nextinode";
 const COUNTER_SLICE_KEY: &str = "nextchunk";
 const NODE_KEY_PREFIX: &str = "i";
 const DIR_KEY_PREFIX: &str = "d";
+const XATTR_KEY_PREFIX: &str = "x";
 const CHUNK_KEY_PREFIX: &str = "c";
 const DELETED_SET_KEY: &str = "delslices";
 const ALL_SESSIONS_KEY: &str = "allsessions";
@@ -84,6 +87,127 @@ const CHUNK_CAS_LUA: &str = r#"
         redis.call('SET', KEYS[2], new_ver)
     else
         redis.call('DEL', KEYS[2])
+    end
+
+    return 1
+"#;
+
+// Atomically replace a compacted chunk and create the delayed-GC ledger for
+// every removed slice. Redis does not roll back earlier writes when a Lua
+// script hits a runtime error, so all fallible type checks and delayed-ID
+// allocation happen before the chunk list is changed.
+// KEYS: chunk list, chunk version, delayed counter, delayed index,
+// uncommitted pending index, uncommitted orphan index.
+// ARGV: expected version, new version, delayed key prefix, chunk id,
+// timestamp, delayed count, uncommitted key prefix, new-slice count,
+// delayed (sid, offset, size) triples, new slice IDs, serialized final slices.
+const CHUNK_COMPACT_LUA: &str = r#"
+    local expected = tonumber(ARGV[1])
+    local new_ver = tonumber(ARGV[2])
+    local prefix = ARGV[3]
+    local cid = ARGV[4]
+    local now = ARGV[5]
+    local n = tonumber(ARGV[6])
+    local uc_prefix = ARGV[7]
+    local new_count = tonumber(ARGV[8])
+
+    if expected == nil or new_ver == nil or n == nil or new_count == nil
+        or n < 0 or n % 1 ~= 0 or new_count < 0 or new_count % 1 ~= 0 then
+        return redis.error_reply('invalid compact arguments')
+    end
+    if #ARGV < 8 + 3 * n + new_count then
+        return redis.error_reply('missing compact arguments')
+    end
+
+    local current = redis.call('GET', KEYS[2])
+    local current_ver = 0
+    if current then
+        current_ver = tonumber(current)
+        if current_ver == nil then
+            return redis.error_reply('invalid chunk version value')
+        end
+    end
+    if current_ver ~= expected then
+        return 0
+    end
+
+    local function key_type(key)
+        local reply = redis.call('TYPE', key)
+        if type(reply) == 'table' then
+            return reply.ok
+        end
+        return reply
+    end
+
+    local first_id = 0
+    if n > 0 then
+        local counter_type = key_type(KEYS[3])
+        if counter_type ~= 'none' and counter_type ~= 'string' then
+            return redis.error_reply('invalid delayed counter type')
+        end
+        local index_type = key_type(KEYS[4])
+        if index_type ~= 'none' and index_type ~= 'zset' then
+            return redis.error_reply('invalid delayed index type')
+        end
+
+        local allocation = redis.pcall('INCRBY', KEYS[3], n)
+        if type(allocation) == 'table' and allocation.err then
+            return redis.error_reply(allocation.err)
+        end
+        first_id = allocation - n + 1
+
+        -- A collision indicates a corrupt/out-of-sync counter. Reject it
+        -- before touching the chunk; consuming an ID range is harmless.
+        for i = 0, n - 1 do
+            local ds_key = prefix .. (first_id + i)
+            if key_type(ds_key) ~= 'none' then
+                return redis.error_reply('delayed id collision')
+            end
+        end
+    end
+
+    if new_count > 0 then
+        local pending_type = key_type(KEYS[5])
+        if pending_type ~= 'none' and pending_type ~= 'zset' then
+            return redis.error_reply('invalid uncommitted pending index type')
+        end
+        local orphan_type = key_type(KEYS[6])
+        if orphan_type ~= 'none' and orphan_type ~= 'zset' then
+            return redis.error_reply('invalid uncommitted orphan index type')
+        end
+    end
+
+    local new_id_start = 9 + 3 * n
+    local data_start = new_id_start + new_count
+    redis.call('DEL', KEYS[1])
+    for i = data_start, #ARGV do
+        redis.call('RPUSH', KEYS[1], ARGV[i])
+    end
+    if new_ver > 0 then
+        redis.call('SET', KEYS[2], new_ver)
+    else
+        redis.call('DEL', KEYS[2])
+    end
+
+    for i = 0, n - 1 do
+        local delayed_id = first_id + i
+        local ds_key = prefix .. delayed_id
+        local base = 9 + 3 * i
+        redis.call('HSET', ds_key,
+            'sid', ARGV[base],
+            'off', ARGV[base + 1],
+            'sz', ARGV[base + 2],
+            'st', 'pending',
+            'ca', now,
+            'cid', cid)
+        redis.call('ZADD', KEYS[4], now, delayed_id)
+    end
+
+    for i = 0, new_count - 1 do
+        local slice_id = ARGV[new_id_start + i]
+        redis.call('DEL', uc_prefix .. slice_id)
+        redis.call('ZREM', KEYS[5], slice_id)
+        redis.call('ZREM', KEYS[6], slice_id)
     end
 
     return 1
@@ -410,6 +534,21 @@ const UNCOMMITTED_PENDING_INDEX_KEY: &str = "uc_pending_idx";
 const UNCOMMITTED_ORPHAN_INDEX_KEY: &str = "uc_orphan_idx";
 const COMPACT_RETRY_LIMIT: usize = 64;
 
+/// Keep repeated `df`/statfs calls from rescanning every inode in Redis.
+///
+/// This is deliberately a per-client, best-effort snapshot: metadata
+/// mutations do not invalidate it, so local or remote changes may remain
+/// invisible until the TTL expires. That bounded staleness avoids adding a
+/// global mutation epoch write to every metadata operation.
+const STAT_FS_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// Suggested number of inode keys Redis should return for each SCAN call.
+const STAT_FS_SCAN_COUNT: usize = 1000;
+
+/// Hard upper bound for node payloads fetched by one MGET. Unlike SCAN's COUNT,
+/// this is enforced client-side because COUNT is only a hint to Redis.
+const STAT_FS_MGET_BATCH_SIZE: usize = 512;
+
 // Lua script for atomically appending a slice, extending file size, and updating
 // best-effort allocated block accounting in one RTT.
 // KEYS[1] = chunk_key, KEYS[2] = version_key, KEYS[3] = node_key
@@ -706,6 +845,57 @@ const UNLINK_LUA: &str = r#"
     return cjson.encode({ok=true, ino=child_ino})
 "#;
 
+// Atomically remove a tombstoned inode and all of its xattrs during final GC.
+// KEYS[1] = inode node key, KEYS[2] = deleted-inode hash, KEYS[3] = xattr hash
+// ARGV[1] = inode field in the deleted-inode hash
+//
+// Idempotent by design: if the node is already gone (e.g. a concurrent GC run
+// finished the cleanup first), the stale tombstone index entry and any orphaned
+// xattr hash are still removed and the script reports success, so GC batches
+// never abort on a lost race.
+const REMOVE_FILE_METADATA_LUA: &str = r#"
+    local function key_type(key)
+        local reply = redis.call('TYPE', key)
+        if type(reply) == 'table' then
+            return reply.ok
+        end
+        return reply
+    end
+
+    local node_type = key_type(KEYS[1])
+    if node_type == 'none' then
+        redis.call('HDEL', KEYS[2], ARGV[1])
+        redis.call('DEL', KEYS[3])
+        return cjson.encode({ok=true})
+    end
+    if node_type ~= 'string' then
+        return cjson.encode({ok=false, error='corrupt_node'})
+    end
+
+    local node_json = redis.call('GET', KEYS[1])
+    local decoded, node = pcall(cjson.decode, node_json)
+    if not decoded or not node or not node.attr then
+        return cjson.encode({ok=false, error='corrupt_node'})
+    end
+    if node.deleted ~= true then
+        return cjson.encode({ok=false, error='not_deleted'})
+    end
+
+    local deleted_type = key_type(KEYS[2])
+    if deleted_type ~= 'none' and deleted_type ~= 'hash' then
+        return cjson.encode({ok=false, error='corrupt_deleted_set'})
+    end
+    local xattr_type = key_type(KEYS[3])
+    if xattr_type ~= 'none' and xattr_type ~= 'hash' then
+        return cjson.encode({ok=false, error='corrupt_xattr'})
+    end
+
+    redis.call('HDEL', KEYS[2], ARGV[1])
+    redis.call('DEL', KEYS[1])
+    redis.call('DEL', KEYS[3])
+    return cjson.encode({ok=true})
+"#;
+
 // Lua script for atomically removing directory entry and updating parent nlink
 const RMDIR_LUA: &str = r#"
     local cjson = cjson
@@ -714,6 +904,7 @@ const RMDIR_LUA: &str = r#"
     local child_node_key = KEYS[2]
     local parent_node_key = KEYS[3]
     local child_dir_key = KEYS[4]
+    local child_xattr_key = KEYS[5]
     local name = ARGV[1]
     local child_ino = tonumber(ARGV[2])
     local parent_ino = tonumber(ARGV[3])
@@ -767,6 +958,7 @@ const RMDIR_LUA: &str = r#"
     redis.call('HDEL', parent_dir_key, name)
     redis.call('DEL', child_node_key)
     redis.call('DEL', child_dir_key)
+    redis.call('DEL', child_xattr_key)
 
     return cjson.encode({ok=true})
 "#;
@@ -880,6 +1072,40 @@ const RENAME_LUA: &str = r#"
     local timestamp = tonumber(ARGV[5])
     local node_prefix = ARGV[6]
     local link_parent_prefix = ARGV[7]
+    local xattr_prefix = ARGV[8]
+    local noreplace = ARGV[9] == "1"
+
+    local function validate_ancestry(parent_ino, ancestor_ino)
+        local seen = {}
+        local depth = 0
+        while true do
+            if parent_ino == ancestor_ino then
+                return "circular_rename"
+            end
+            if parent_ino == 1 then
+                return nil
+            end
+            if seen[parent_ino] or depth >= 4096 then
+                return "corrupt_ancestry"
+            end
+            seen[parent_ino] = true
+            depth = depth + 1
+
+            local node_json = redis.call('GET', node_prefix .. parent_ino)
+            if not node_json then
+                return "corrupt_ancestry"
+            end
+            local ok_node, node = pcall(cjson.decode, node_json)
+            if not ok_node or not node or not node.attr or node.kind ~= "Dir"
+                or not node.parent or node.parent == parent_ino then
+                return "corrupt_ancestry"
+            end
+            parent_ino = tonumber(node.parent)
+            if not parent_ino then
+                return "corrupt_ancestry"
+            end
+        end
+    end
 
     -- Check source dentry exists.
     local dentry_ino = redis.call('HGET', old_parent_dir_key, old_name)
@@ -912,15 +1138,25 @@ const RENAME_LUA: &str = r#"
     if not ok_child or not child_node or not child_node.attr then
         return cjson.encode({ok=false, error="corrupt_node"})
     end
+    if child_node.kind == "Dir" then
+        local ancestry_error = validate_ancestry(new_parent_ino, child_ino)
+        if ancestry_error then
+            return cjson.encode({ok=false, error=ancestry_error})
+        end
+    end
 
     -- Atomically handle existing destination (POSIX rename semantics: destination is
     -- replaced atomically; no window for concurrent renames to observe a partial state).
     local new_parent_nlink_adj = 0
     local replaced_ino = nil
+    local replaced_is_dir = false
     local dest_ino_str = redis.call('HGET', new_parent_dir_key, new_name)
     if dest_ino_str then
+        if noreplace then
+            return cjson.encode({ok=false, error="already_exists", ino=tonumber(dest_ino_str)})
+        end
         if dest_ino_str == dentry_ino then
-            return cjson.encode({ok=true, ino=child_ino})
+            return cjson.encode({ok=true, ino=child_ino, source_is_dir=child_node.kind == "Dir", renamed=false})
         end
         replaced_ino = tonumber(dest_ino_str)
         local dest_node_key = node_prefix .. dest_ino_str
@@ -935,6 +1171,7 @@ const RENAME_LUA: &str = r#"
 
         local src_kind = child_node.kind
         local dest_kind = dest_node.kind
+        replaced_is_dir = dest_kind == "Dir"
 
         if src_kind == "Dir" and dest_kind == "Dir" then
             -- Destination directory must be empty
@@ -947,6 +1184,7 @@ const RENAME_LUA: &str = r#"
             redis.call('HDEL', new_parent_dir_key, new_name)
             redis.call('DEL', dest_node_key)
             redis.call('DEL', dest_dir_key)
+            redis.call('DEL', xattr_prefix .. dest_ino_str)
             -- Destination dir had a ".." entry pointing to new_parent; account for its removal
             new_parent_nlink_adj = new_parent_nlink_adj - 1
         elseif src_kind == "Dir" then
@@ -1056,7 +1294,7 @@ const RENAME_LUA: &str = r#"
     new_parent_node.attr.ctime = timestamp
     redis.call('SET', new_parent_node_key, cjson.encode(new_parent_node))
 
-    return cjson.encode({ok=true, ino=child_ino, replaced_ino=replaced_ino})
+    return cjson.encode({ok=true, ino=child_ino, replaced_ino=replaced_ino, source_is_dir=child_node.kind == "Dir", replaced_is_dir=replaced_is_dir})
 "#;
 
 const RENAME_EXCHANGE_LUA: &str = r#"
@@ -1064,36 +1302,67 @@ const RENAME_EXCHANGE_LUA: &str = r#"
 
     local old_parent_dir_key = KEYS[1]
     local new_parent_dir_key = KEYS[2]
-    local old_node_key = KEYS[3]
-    local new_node_key = KEYS[4]
-    local old_parent_node_key = KEYS[5]
-    local new_parent_node_key = KEYS[6]
-    local old_link_parents_key = KEYS[7]
-    local new_link_parents_key = KEYS[8]
+    local old_parent_node_key = KEYS[3]
+    local new_parent_node_key = KEYS[4]
     local old_name = ARGV[1]
     local new_name = ARGV[2]
     local old_parent_ino = tonumber(ARGV[3])
     local new_parent_ino = tonumber(ARGV[4])
     local timestamp = tonumber(ARGV[5])
-    local expected_old_ino = tonumber(ARGV[6])
-    local expected_new_ino = tonumber(ARGV[7])
+    local node_prefix = ARGV[6]
+    local link_parent_prefix = ARGV[7]
 
-    -- Check both entries exist and match expected inodes
+    local function validate_ancestry(parent_ino, ancestor_ino)
+        local seen = {}
+        local depth = 0
+        while true do
+            if parent_ino == ancestor_ino then
+                return "circular_rename"
+            end
+            if parent_ino == 1 then
+                return nil
+            end
+            if seen[parent_ino] or depth >= 4096 then
+                return "corrupt_ancestry"
+            end
+            seen[parent_ino] = true
+            depth = depth + 1
+
+            local node_json = redis.call('GET', node_prefix .. parent_ino)
+            if not node_json then
+                return "corrupt_ancestry"
+            end
+            local ok_node, node = pcall(cjson.decode, node_json)
+            if not ok_node or not node or not node.attr or node.kind ~= "Dir"
+                or not node.parent or node.parent == parent_ino then
+                return "corrupt_ancestry"
+            end
+            parent_ino = tonumber(node.parent)
+            if not parent_ino then
+                return "corrupt_ancestry"
+            end
+        end
+    end
+
+    -- Read both entries and derive their current inode keys atomically.
     local old_dentry_ino = redis.call('HGET', old_parent_dir_key, old_name)
     if not old_dentry_ino then
-        return cjson.encode({ok=false, error="not_found", ino=old_parent_ino})
+        return cjson.encode({ok=false, error="not_found", ino=old_parent_ino, msg="old"})
     end
-    if tonumber(old_dentry_ino) ~= expected_old_ino then
-        return cjson.encode({ok=false, error="stale_conflict"})
-    end
+    local old_ino = tonumber(old_dentry_ino)
+    local old_node_key = node_prefix .. old_dentry_ino
+    local old_link_parents_key = link_parent_prefix .. old_dentry_ino
 
     local new_dentry_ino = redis.call('HGET', new_parent_dir_key, new_name)
     if not new_dentry_ino then
-        return cjson.encode({ok=false, error="not_found", ino=new_parent_ino})
+        return cjson.encode({ok=false, error="not_found", ino=new_parent_ino, msg="new"})
     end
-    if tonumber(new_dentry_ino) ~= expected_new_ino then
-        return cjson.encode({ok=false, error="stale_conflict"})
+    local new_ino = tonumber(new_dentry_ino)
+    if old_ino == new_ino then
+        return cjson.encode({ok=true, ino=old_ino, replaced_ino=new_ino})
     end
+    local new_node_key = node_prefix .. new_dentry_ino
+    local new_link_parents_key = link_parent_prefix .. new_dentry_ino
 
     -- GET both nodes
     local old_node_json = redis.call('GET', old_node_key)
@@ -1112,6 +1381,36 @@ const RENAME_EXCHANGE_LUA: &str = r#"
     local ok_new, new_node = pcall(cjson.decode, new_node_json)
     if not ok_new or not new_node or not new_node.attr then
         return cjson.encode({ok=false, error="corrupt_node"})
+    end
+
+    if old_node.kind == "Dir" then
+        local ancestry_error = validate_ancestry(new_parent_ino, old_ino)
+        if ancestry_error then
+            return cjson.encode({ok=false, error=ancestry_error})
+        end
+    end
+    if new_node.kind == "Dir" then
+        local ancestry_error = validate_ancestry(old_parent_ino, new_ino)
+        if ancestry_error then
+            return cjson.encode({ok=false, error=ancestry_error})
+        end
+    end
+
+    local old_parent_json = redis.call('GET', old_parent_node_key)
+    local ok_op, old_parent_node = pcall(cjson.decode, old_parent_json or "")
+    if not ok_op or not old_parent_node or not old_parent_node.attr
+        or old_parent_node.kind ~= "Dir" then
+        return cjson.encode({ok=false, error="corrupt_ancestry"})
+    end
+    local new_parent_node = old_parent_node
+    if old_parent_ino ~= new_parent_ino then
+        local new_parent_json = redis.call('GET', new_parent_node_key)
+        local ok_np
+        ok_np, new_parent_node = pcall(cjson.decode, new_parent_json or "")
+        if not ok_np or not new_parent_node or not new_parent_node.attr
+            or new_parent_node.kind ~= "Dir" then
+            return cjson.encode({ok=false, error="corrupt_ancestry"})
+        end
     end
 
     -- Pre-check link_parents for hardlinked nodes before swapping dentries
@@ -1222,27 +1521,125 @@ const RENAME_EXCHANGE_LUA: &str = r#"
     redis.call('SET', old_node_key, cjson.encode(old_node))
     redis.call('SET', new_node_key, cjson.encode(new_node))
 
-    -- Update parent directory timestamps
-    local old_parent_json = redis.call('GET', old_parent_node_key)
-    if old_parent_json then
-        local ok_op, old_parent_node = pcall(cjson.decode, old_parent_json)
-        if ok_op and old_parent_node and old_parent_node.attr then
-            old_parent_node.attr.mtime = timestamp
-            old_parent_node.attr.ctime = timestamp
-            redis.call('SET', old_parent_node_key, cjson.encode(old_parent_node))
+    old_parent_node.attr.mtime = timestamp
+    old_parent_node.attr.ctime = timestamp
+    if old_parent_ino ~= new_parent_ino then
+        local old_delta = (new_node.kind == "Dir" and 1 or 0)
+            - (old_node.kind == "Dir" and 1 or 0)
+        local new_delta = -old_delta
+        old_parent_node.attr.nlink = old_parent_node.attr.nlink + old_delta
+        new_parent_node.attr.nlink = new_parent_node.attr.nlink + new_delta
+        new_parent_node.attr.mtime = timestamp
+        new_parent_node.attr.ctime = timestamp
+        redis.call('SET', new_parent_node_key, cjson.encode(new_parent_node))
+    end
+    redis.call('SET', old_parent_node_key, cjson.encode(old_parent_node))
+
+    return cjson.encode({ok=true, ino=old_ino, replaced_ino=new_ino})
+"#;
+
+// Atomically set one xattr and update the inode ctime. Redis hash values
+// preserve arbitrary bytes, so the value is passed directly as a binary ARGV.
+// KEYS[1] = inode node key, KEYS[2] = xattr hash key
+// ARGV[1] = xattr name, ARGV[2] = value, ARGV[3] = create-only,
+// ARGV[4] = replace-only, ARGV[5] = new ctime
+//
+// Known limitation: like the other node-mutating scripts here, this re-encodes
+// the whole node JSON via cjson. Lua numbers are doubles, so nanosecond
+// timestamps above 2^53 lose precision on the round trip — an xattr-only
+// update therefore passively truncates mtime/atime (and other ns timestamps)
+// to roughly microsecond granularity. A ms-granularity timestamp migration is
+// tracked separately and is out of scope for this script.
+const SET_XATTR_LUA: &str = r#"
+    local function key_type(key)
+        local reply = redis.call('TYPE', key)
+        if type(reply) == 'table' then
+            return reply.ok
         end
+        return reply
     end
 
-    local new_parent_json = redis.call('GET', new_parent_node_key)
-    if new_parent_json then
-        local ok_np, new_parent_node = pcall(cjson.decode, new_parent_json)
-        if ok_np and new_parent_node and new_parent_node.attr then
-            new_parent_node.attr.mtime = timestamp
-            new_parent_node.attr.ctime = timestamp
-            redis.call('SET', new_parent_node_key, cjson.encode(new_parent_node))
-        end
+    local node_type = key_type(KEYS[1])
+    if node_type == 'none' then
+        return cjson.encode({ok=false, error='node_not_found'})
+    end
+    if node_type ~= 'string' then
+        return cjson.encode({ok=false, error='corrupt_node'})
     end
 
+    local node_json = redis.call('GET', KEYS[1])
+    local decoded, node = pcall(cjson.decode, node_json)
+    if not decoded or not node or not node.attr then
+        return cjson.encode({ok=false, error='corrupt_node'})
+    end
+
+    local xattr_type = key_type(KEYS[2])
+    if xattr_type ~= 'none' and xattr_type ~= 'hash' then
+        return cjson.encode({ok=false, error='corrupt_xattr'})
+    end
+
+    local exists = redis.call('HEXISTS', KEYS[2], ARGV[1]) == 1
+    local create_only = ARGV[3] == '1'
+    local replace_only = ARGV[4] == '1'
+    if exists and create_only then
+        return cjson.encode({ok=false, error='already_exists'})
+    end
+    if not exists and replace_only then
+        return cjson.encode({ok=false, error='xattr_not_found'})
+    end
+
+    local timestamp = tonumber(ARGV[5])
+    if not timestamp then
+        return cjson.encode({ok=false, error='invalid_ctime'})
+    end
+    node.attr.ctime = timestamp
+    redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
+    redis.call('SET', KEYS[1], cjson.encode(node))
+    return cjson.encode({ok=true})
+"#;
+
+// Atomically remove one xattr and update the inode ctime.
+// KEYS[1] = inode node key, KEYS[2] = xattr hash key
+// ARGV[1] = xattr name, ARGV[2] = new ctime
+// Same cjson ns-timestamp truncation caveat as SET_XATTR_LUA above.
+const REMOVE_XATTR_LUA: &str = r#"
+    local function key_type(key)
+        local reply = redis.call('TYPE', key)
+        if type(reply) == 'table' then
+            return reply.ok
+        end
+        return reply
+    end
+
+    local node_type = key_type(KEYS[1])
+    if node_type == 'none' then
+        return cjson.encode({ok=false, error='node_not_found'})
+    end
+    if node_type ~= 'string' then
+        return cjson.encode({ok=false, error='corrupt_node'})
+    end
+
+    local node_json = redis.call('GET', KEYS[1])
+    local decoded, node = pcall(cjson.decode, node_json)
+    if not decoded or not node or not node.attr then
+        return cjson.encode({ok=false, error='corrupt_node'})
+    end
+
+    local xattr_type = key_type(KEYS[2])
+    if xattr_type ~= 'none' and xattr_type ~= 'hash' then
+        return cjson.encode({ok=false, error='corrupt_xattr'})
+    end
+    if redis.call('HEXISTS', KEYS[2], ARGV[1]) == 0 then
+        return cjson.encode({ok=false, error='xattr_not_found'})
+    end
+
+    local timestamp = tonumber(ARGV[2])
+    if not timestamp then
+        return cjson.encode({ok=false, error='invalid_ctime'})
+    end
+    node.attr.ctime = timestamp
+    redis.call('HDEL', KEYS[2], ARGV[1])
+    redis.call('SET', KEYS[1], cjson.encode(node))
     return cjson.encode({ok=true})
 "#;
 
@@ -1301,10 +1698,20 @@ struct LuaResponse {
     #[serde(default)]
     replaced_ino: Option<i64>,
     #[serde(default)]
+    renamed: Option<bool>,
+    #[serde(default)]
+    source_is_dir: Option<bool>,
+    #[serde(default)]
+    replaced_is_dir: Option<bool>,
+    #[serde(default)]
     msg: Option<String>, // For Internal error details
 }
 
 /// Minimal Redis-backed meta store.
+///
+/// This backend requires standalone Redis command semantics. Redis Cluster is
+/// not supported because filesystem transitions use atomic Lua scripts across
+/// multiple metadata keys, including keys allocated dynamically by a script.
 pub struct RedisMetaStore {
     conn: ConnectionManager,
     _config: Config,
@@ -1320,9 +1727,45 @@ pub struct RedisMetaStore {
     chunk_scan_buffer: std::sync::Mutex<Vec<u64>>,
     chunk_scan_next_cursor: std::sync::Mutex<Option<String>>,
     global_lock_tokens: std::sync::Mutex<HashMap<String, String>>,
+    /// The async mutex also provides single-flight behavior on a cold cache:
+    /// concurrent statfs callers wait for the first scan instead of duplicating it.
+    stat_fs_cache: tokio::sync::Mutex<Option<(std::time::Instant, StatFsSnapshot)>>,
 }
 
 impl RedisMetaStore {
+    async fn verify_standalone_redis(conn: &mut ConnectionManager) -> Result<(), MetaError> {
+        // The backend requires EVAL and cross-key atomicity in normal operation.
+        // Probe that exact capability with two deliberately different hash tags;
+        // Redis Cluster rejects the request with CROSSSLOT before running the
+        // side-effect-free script. Other errors are also fatal because the real
+        // metadata scripts would be unusable for the same connection.
+        let probe: i32 = redis::cmd("EVAL")
+            .arg("return 1")
+            .arg(2)
+            .arg(REDIS_CLUSTER_PROBE_KEY_A)
+            .arg(REDIS_CLUSTER_PROBE_KEY_B)
+            .query_async(conn)
+            .await
+            .map_err(|err| {
+                if err.to_string().to_ascii_uppercase().contains("CROSSSLOT") {
+                    MetaError::Config(
+                        "Redis Cluster is not supported by the metadata backend; use a standalone Redis endpoint"
+                            .to_string(),
+                    )
+                } else {
+                    MetaError::Config(format!(
+                        "Redis standalone capability probe failed: {err}"
+                    ))
+                }
+            })?;
+        if probe != 1 {
+            return Err(MetaError::Config(
+                "Redis standalone capability probe returned an unexpected result".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn resolve_redis_url(url: &str) -> Result<String, MetaError> {
         let Some((scheme, rest)) = url.split_once("://") else {
             return Ok(url.to_string());
@@ -1415,6 +1858,7 @@ impl RedisMetaStore {
             chunk_scan_buffer: std::sync::Mutex::new(Vec::new()),
             chunk_scan_next_cursor: std::sync::Mutex::new(None),
             global_lock_tokens: std::sync::Mutex::new(HashMap::new()),
+            stat_fs_cache: tokio::sync::Mutex::new(None),
         };
         store.init_root_directory().await?;
         Ok(store)
@@ -1448,11 +1892,12 @@ impl RedisMetaStore {
                         "Failed to parse Redis URL {resolved_url} (from {url}): {e}"
                     ))
                 })?;
-                let cm = ConnectionManager::new(client).await.map_err(|e| {
+                let mut cm = ConnectionManager::new(client).await.map_err(|e| {
                     MetaError::Config(format!(
                         "Failed to connect to Redis backend using {resolved_url}: {e}"
                     ))
                 })?;
+                Self::verify_standalone_redis(&mut cm).await?;
                 info!("redis connection established");
                 Ok(cm)
             }
@@ -1467,6 +1912,10 @@ impl RedisMetaStore {
 
     fn dir_key(&self, ino: i64) -> String {
         format!("{DIR_KEY_PREFIX}{ino}")
+    }
+
+    fn xattr_key(&self, ino: i64) -> String {
+        format!("{XATTR_KEY_PREFIX}{ino}")
     }
 
     fn chunk_key(&self, chunk_id: u64) -> String {
@@ -1721,15 +2170,6 @@ impl RedisMetaStore {
             .map_err(redis_err)?;
         self.node_cache.insert(node.ino, Some(node.clone())).await;
         Ok(())
-    }
-
-    async fn delete_node(&self, ino: i64) -> Result<(), MetaError> {
-        let mut conn = self.conn.clone();
-        let result = conn.del(self.node_key(ino)).await.map_err(redis_err);
-        if result.is_ok() {
-            self.node_cache.invalidate(&ino).await;
-        }
-        result
     }
 
     async fn load_link_parents(&self, ino: i64) -> Result<Vec<(i64, String)>, MetaError> {
@@ -2175,12 +2615,126 @@ impl MetaStore for RedisMetaStore {
             global_locks: true,
             plocks: true,
             flocks: true,
-            xattr: false,
+            xattr: true,
             acl: false,
             quota: false,
             dump_load: false,
             compaction: true,
             watch_invalidation: false,
+        }
+    }
+
+    async fn set_xattr(
+        &self,
+        inode: i64,
+        name: &str,
+        value: &[u8],
+        flags: u32,
+    ) -> Result<(), MetaError> {
+        let create_only = flags & (libc::XATTR_CREATE as u32) != 0;
+        let replace_only = flags & (libc::XATTR_REPLACE as u32) != 0;
+        let result: String = redis::Script::new(SET_XATTR_LUA)
+            .key(self.node_key(inode))
+            .key(self.xattr_key(inode))
+            .arg(name)
+            .arg(value)
+            .arg(if create_only { 1 } else { 0 })
+            .arg(if replace_only { 1 } else { 0 })
+            .arg(current_time())
+            .invoke_async(&mut self.conn.clone())
+            .await
+            .map_err(redis_err)?;
+        let response: LuaResponse = serde_json::from_str(&result)
+            .map_err(|e| MetaError::Internal(format!("Lua response parse error: {e}")))?;
+
+        match response.error.as_deref() {
+            Some("node_not_found") => Err(MetaError::NotFound(inode)),
+            Some("already_exists") => Err(MetaError::AlreadyExists {
+                parent: inode,
+                name: name.to_string(),
+            }),
+            // Convention: `xattr_not_found` deliberately reuses
+            // MetaError::NotFound(inode) instead of a dedicated variant so the
+            // Redis and database stores share one mapping. This is safe at the
+            // syscall boundary: the FUSE layer pre-checks inode existence
+            // (ENOENT) and maps VfsError::NotFound to ENODATA for xattr
+            // operations, giving XATTR_REPLACE the correct errno.
+            Some("xattr_not_found") => Err(MetaError::NotFound(inode)),
+            Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
+            Some("corrupt_xattr") => Err(MetaError::Internal("corrupt xattr data".into())),
+            Some(other) => Err(MetaError::Internal(format!("Lua error: {other}"))),
+            None if response.ok => {
+                self.invalidate_nodes(&[inode]).await;
+                Ok(())
+            }
+            None => Err(MetaError::Internal("unexpected Lua response".into())),
+        }
+    }
+
+    async fn get_xattr(&self, inode: i64, name: &str) -> Result<Option<Vec<u8>>, MetaError> {
+        let node_key = self.node_key(inode);
+        let xattr_key = self.xattr_key(inode);
+        let mut conn = self.conn.clone();
+        let mut pipe = redis::pipe();
+        pipe.atomic()
+            .cmd("GET")
+            .arg(&node_key)
+            .cmd("HGET")
+            .arg(&xattr_key)
+            .arg(name);
+        let (node_data, value): (Option<Vec<u8>>, Option<Vec<u8>>) =
+            pipe.query_async(&mut conn).await.map_err(redis_err)?;
+        let Some(node_data) = node_data else {
+            return Err(MetaError::NotFound(inode));
+        };
+        serde_json::from_slice::<StoredNode>(&node_data)
+            .map_err(|e| MetaError::Internal(format!("stored node parse error: {e}")))?;
+        Ok(value)
+    }
+
+    async fn list_xattr(&self, inode: i64) -> Result<Vec<String>, MetaError> {
+        let node_key = self.node_key(inode);
+        let xattr_key = self.xattr_key(inode);
+        let mut conn = self.conn.clone();
+        let mut pipe = redis::pipe();
+        pipe.atomic()
+            .cmd("GET")
+            .arg(&node_key)
+            .cmd("HKEYS")
+            .arg(&xattr_key);
+        let (node_data, names): (Option<Vec<u8>>, Vec<String>) =
+            pipe.query_async(&mut conn).await.map_err(redis_err)?;
+        let Some(node_data) = node_data else {
+            return Err(MetaError::NotFound(inode));
+        };
+        serde_json::from_slice::<StoredNode>(&node_data)
+            .map_err(|e| MetaError::Internal(format!("stored node parse error: {e}")))?;
+        Ok(names)
+    }
+
+    async fn remove_xattr(&self, inode: i64, name: &str) -> Result<(), MetaError> {
+        let result: String = redis::Script::new(REMOVE_XATTR_LUA)
+            .key(self.node_key(inode))
+            .key(self.xattr_key(inode))
+            .arg(name)
+            .arg(current_time())
+            .invoke_async(&mut self.conn.clone())
+            .await
+            .map_err(redis_err)?;
+        let response: LuaResponse = serde_json::from_str(&result)
+            .map_err(|e| MetaError::Internal(format!("Lua response parse error: {e}")))?;
+
+        match response.error.as_deref() {
+            Some("node_not_found") => Err(MetaError::NotFound(inode)),
+            Some("xattr_not_found") => Err(MetaError::NotFound(inode)),
+            Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
+            Some("corrupt_xattr") => Err(MetaError::Internal("corrupt xattr data".into())),
+            Some(other) => Err(MetaError::Internal(format!("Lua error: {other}"))),
+            None if response.ok => {
+                self.invalidate_nodes(&[inode]).await;
+                Ok(())
+            }
+            None => Err(MetaError::Internal("unexpected Lua response".into())),
         }
     }
 
@@ -2324,6 +2878,7 @@ impl MetaStore for RedisMetaStore {
         let child_node_key = self.node_key(child);
         let parent_node_key = self.node_key(parent);
         let child_dir_key = self.dir_key(child);
+        let child_xattr_key = self.xattr_key(child);
         let now = current_time();
 
         // Step 3: Invoke Lua script atomically
@@ -2333,6 +2888,7 @@ impl MetaStore for RedisMetaStore {
             .key(&child_node_key)
             .key(&parent_node_key)
             .key(&child_dir_key)
+            .key(&child_xattr_key)
             .arg(name)
             .arg(child)
             .arg(parent)
@@ -2584,16 +3140,82 @@ impl MetaStore for RedisMetaStore {
         skip(self),
         fields(old_parent, old_name, new_parent, new_name)
     )]
-    async fn rename(
+    async fn rename_with_mode(
         &self,
         old_parent: i64,
         old_name: &str,
         new_parent: i64,
         new_name: String,
-    ) -> Result<(), MetaError> {
-        self.rename_with_outcome(old_parent, old_name, new_parent, new_name)
+        noreplace: bool,
+    ) -> Result<RenameOutcome, MetaError> {
+        if !noreplace {
+            return self
+                .rename_with_outcome(old_parent, old_name, new_parent, new_name)
+                .await;
+        }
+
+        let old_parent_dir_key = self.dir_key(old_parent);
+        let new_parent_dir_key = self.dir_key(new_parent);
+        let old_parent_node_key = self.node_key(old_parent);
+        let new_parent_node_key = self.node_key(new_parent);
+        let deleted_set_key = self.deleted_set_key();
+        let now = current_time();
+
+        let result: String = redis::Script::new(RENAME_LUA)
+            .key(&old_parent_dir_key)
+            .key(&new_parent_dir_key)
+            .key(&old_parent_node_key)
+            .key(&new_parent_node_key)
+            .key(deleted_set_key)
+            .arg(old_name)
+            .arg(&new_name)
+            .arg(old_parent)
+            .arg(new_parent)
+            .arg(now)
+            .arg(NODE_KEY_PREFIX)
+            .arg(LINK_PARENT_KEY_PREFIX)
+            .arg(XATTR_KEY_PREFIX)
+            .arg(1)
+            .invoke_async(&mut self.conn.clone())
             .await
-            .map(|_| ())
+            .map_err(redis_err)?;
+        let response: LuaResponse = serde_json::from_str(&result)
+            .map_err(|e| MetaError::Internal(format!("Lua response parse error: {e}")))?;
+
+        match response.error.as_deref() {
+            Some("already_exists") => Err(MetaError::AlreadyExists {
+                parent: new_parent,
+                name: new_name,
+            }),
+            Some("not_found") => Err(MetaError::NotFound(response.ino.unwrap_or(old_parent))),
+            Some("parent_not_found") => Err(MetaError::ParentNotFound(new_parent)),
+            Some("parent_not_directory") => Err(MetaError::NotDirectory(new_parent)),
+            Some("node_not_found") => Err(MetaError::NotFound(response.ino.unwrap_or(old_parent))),
+            Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
+            Some("circular_rename") | Some("corrupt_ancestry") => Err(MetaError::InvalidPath(
+                "directory ancestry contains a cycle or invalid parent".into(),
+            )),
+            Some("link_parent_not_found") => Err(MetaError::Internal(format!(
+                "expected link parent binding {old_parent}/{old_name} for inode {}",
+                response.ino.unwrap_or(old_parent)
+            ))),
+            Some(other) => Err(MetaError::Internal(format!("Lua error: {other}"))),
+            None if response.ok => {
+                let child = response
+                    .ino
+                    .ok_or_else(|| MetaError::Internal("missing ino in rename response".into()))?;
+                self.invalidate_nodes(&[old_parent, new_parent, child])
+                    .await;
+                Ok(RenameOutcome {
+                    ino: child,
+                    replaced_ino: None,
+                    source_is_dir: response.source_is_dir.unwrap_or(false),
+                    replaced_is_dir: false,
+                    renamed: true,
+                })
+            }
+            None => Err(MetaError::Internal("unexpected Lua response".into())),
+        }
     }
 
     async fn rename_with_outcome(
@@ -2612,6 +3234,9 @@ impl MetaStore for RedisMetaStore {
             return Ok(crate::meta::store::RenameOutcome {
                 ino,
                 replaced_ino: None,
+                source_is_dir: false,
+                replaced_is_dir: false,
+                renamed: false,
             });
         }
 
@@ -2636,6 +3261,7 @@ impl MetaStore for RedisMetaStore {
             .arg(now) // ARGV[5]
             .arg(NODE_KEY_PREFIX) // ARGV[6]
             .arg(LINK_PARENT_KEY_PREFIX) // ARGV[7]
+            .arg(XATTR_KEY_PREFIX) // ARGV[8]
             .invoke_async(&mut self.conn.clone())
             .await
             .map_err(redis_err)?;
@@ -2658,6 +3284,9 @@ impl MetaStore for RedisMetaStore {
             ))),
             Some("node_not_found") => Err(MetaError::NotFound(response.ino.unwrap_or(old_parent))),
             Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
+            Some("circular_rename") | Some("corrupt_ancestry") => Err(MetaError::InvalidPath(
+                "directory ancestry contains a cycle or invalid parent".into(),
+            )),
             Some("link_parent_not_found") => Err(MetaError::Internal(format!(
                 "expected link parent binding {old_parent}/{old_name} for inode {}",
                 response.ino.unwrap_or(old_parent)
@@ -2676,6 +3305,9 @@ impl MetaStore for RedisMetaStore {
                 Ok(crate::meta::store::RenameOutcome {
                     ino: child,
                     replaced_ino,
+                    source_is_dir: response.source_is_dir.unwrap_or(false),
+                    replaced_is_dir: response.replaced_is_dir.unwrap_or(false),
+                    renamed: response.renamed.unwrap_or(true),
                 })
             }
             None => Err(MetaError::Internal("unexpected Lua response".into())),
@@ -2693,47 +3325,25 @@ impl MetaStore for RedisMetaStore {
             return Ok(());
         }
 
-        let Some(old_ino) = self.lookup(old_parent, old_name).await? else {
-            return Err(MetaError::Internal(format!(
-                "Entry '{}' not found in parent {} for exchange",
-                old_name, old_parent
-            )));
-        };
-
-        let Some(new_ino) = self.lookup(new_parent, new_name).await? else {
-            return Err(MetaError::Internal(format!(
-                "Entry '{}' not found in parent {} for exchange",
-                new_name, new_parent
-            )));
-        };
-
         let old_parent_dir_key = self.dir_key(old_parent);
         let new_parent_dir_key = self.dir_key(new_parent);
-        let old_node_key = self.node_key(old_ino);
-        let new_node_key = self.node_key(new_ino);
         let old_parent_node_key = self.node_key(old_parent);
         let new_parent_node_key = self.node_key(new_parent);
-        let old_link_parents_key = Self::link_parent_key(old_ino);
-        let new_link_parents_key = Self::link_parent_key(new_ino);
         let now = current_time();
 
         let script = redis::Script::new(RENAME_EXCHANGE_LUA);
         let result: String = script
             .key(&old_parent_dir_key)
             .key(&new_parent_dir_key)
-            .key(&old_node_key)
-            .key(&new_node_key)
             .key(&old_parent_node_key)
             .key(&new_parent_node_key)
-            .key(&old_link_parents_key)
-            .key(&new_link_parents_key)
             .arg(old_name)
             .arg(new_name)
             .arg(old_parent)
             .arg(new_parent)
             .arg(now)
-            .arg(old_ino)
-            .arg(new_ino)
+            .arg(NODE_KEY_PREFIX)
+            .arg(LINK_PARENT_KEY_PREFIX)
             .invoke_async(&mut self.conn.clone())
             .await
             .map_err(redis_err)?;
@@ -2741,18 +3351,35 @@ impl MetaStore for RedisMetaStore {
         let response: LuaResponse = serde_json::from_str(&result)
             .map_err(|e| MetaError::Internal(format!("Failed to parse Lua response: {e}")))?;
         match response.error.as_deref() {
-            Some("stale_conflict") => Err(MetaError::ContinueRetry(RetryReason::VersionConflict)),
-            Some("not_found") => Err(MetaError::NotFound(response.ino.unwrap_or(old_parent))),
+            Some("not_found") if response.msg.as_deref() == Some("new") => {
+                Err(MetaError::EntryNotFound {
+                    parent: new_parent,
+                    name: new_name.to_owned(),
+                })
+            }
+            Some("not_found") => Err(MetaError::EntryNotFound {
+                parent: old_parent,
+                name: old_name.to_owned(),
+            }),
             Some("internal") => {
                 let msg = response.msg.unwrap_or_else(|| "unknown error".to_string());
                 Err(MetaError::Internal(msg))
             }
             Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
+            Some("circular_rename") | Some("corrupt_ancestry") => Err(MetaError::InvalidPath(
+                "directory ancestry contains a cycle or invalid parent".into(),
+            )),
             Some("link_parent_not_found") => Err(MetaError::Internal(
                 "expected link parent binding not found during exchange".into(),
             )),
             Some(other) => Err(MetaError::Internal(format!("Lua error: {other}"))),
             None if response.ok => {
+                let old_ino = response.ino.ok_or_else(|| {
+                    MetaError::Internal("missing old inode in exchange response".into())
+                })?;
+                let new_ino = response.replaced_ino.ok_or_else(|| {
+                    MetaError::Internal("missing new inode in exchange response".into())
+                })?;
                 self.invalidate_nodes(&[old_parent, new_parent, old_ino, new_ino])
                     .await;
                 Ok(())
@@ -3023,43 +3650,65 @@ impl MetaStore for RedisMetaStore {
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn stat_fs(&self) -> Result<StatFsSnapshot, MetaError> {
-        let mut conn = self.conn.clone();
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg(format!("{NODE_KEY_PREFIX}*"))
-            .query_async(&mut conn)
-            .await
-            .map_err(redis_err)?;
-
-        if keys.is_empty() {
-            return Ok(stat_fs_snapshot_from_usage(0, 0));
+        let mut cached = self.stat_fs_cache.lock().await;
+        if let Some((cached_at, snapshot)) = cached.as_ref()
+            && cached_at.elapsed() < STAT_FS_CACHE_TTL
+        {
+            return Ok(snapshot.clone());
         }
 
-        let nodes: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
-            .arg(&keys)
-            .query_async(&mut conn)
-            .await
-            .map_err(redis_err)?;
-
+        let mut conn = self.conn.clone();
         let mut used_space = 0u64;
         let mut used_inodes = 0u64;
+        let mut cursor = 0u64;
 
-        for (key, data) in keys.iter().zip(nodes.into_iter()) {
-            let Some(bytes) = data else {
-                continue;
-            };
-            let node: StoredNode = serde_json::from_slice(&bytes)
-                .map_err(|e| MetaError::Internal(format!("Failed to parse node {key}: {e}")))?;
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(format!("{NODE_KEY_PREFIX}*"))
+                .arg("COUNT")
+                .arg(STAT_FS_SCAN_COUNT)
+                .query_async(&mut conn)
+                .instrument(tracing::trace_span!("stat_fs.redis_scan", cursor))
+                .await
+                .map_err(redis_err)?;
 
-            if node.deleted || node.attr.nlink == 0 {
-                continue;
+            for key_batch in keys.chunks(STAT_FS_MGET_BATCH_SIZE) {
+                let nodes: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
+                    .arg(key_batch)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(redis_err)?;
+
+                for (key, data) in key_batch.iter().zip(nodes) {
+                    let Some(bytes) = data else {
+                        continue;
+                    };
+                    let node: StoredNode = serde_json::from_slice(&bytes).map_err(|e| {
+                        MetaError::Internal(format!("Failed to parse node {key}: {e}"))
+                    })?;
+
+                    if node.deleted || node.attr.nlink == 0 {
+                        continue;
+                    }
+
+                    let attr = node.as_file_attr();
+                    used_space =
+                        used_space.saturating_add(stat_fs_used_bytes(attr.size, attr.blocks));
+                    used_inodes = used_inodes.saturating_add(1);
+                }
             }
 
-            let attr = node.as_file_attr();
-            used_space = used_space.saturating_add(stat_fs_used_bytes(attr.size, attr.blocks));
-            used_inodes = used_inodes.saturating_add(1);
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
         }
 
-        Ok(stat_fs_snapshot_from_usage(used_space, used_inodes))
+        let snapshot = stat_fs_snapshot_from_usage(used_space, used_inodes);
+        *cached = Some((std::time::Instant::now(), snapshot.clone()));
+        Ok(snapshot)
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -3249,12 +3898,35 @@ impl MetaStore for RedisMetaStore {
 
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn remove_file_metadata(&self, ino: i64) -> Result<(), MetaError> {
-        let mut conn = self.conn.clone();
-        let _: () = conn
-            .hdel(self.deleted_set_key(), ino.to_string())
+        let result: String = redis::Script::new(REMOVE_FILE_METADATA_LUA)
+            .key(self.node_key(ino))
+            .key(self.deleted_set_key())
+            .key(self.xattr_key(ino))
+            .arg(ino)
+            .invoke_async(&mut self.conn.clone())
             .await
             .map_err(redis_err)?;
-        self.delete_node(ino).await
+        let response: LuaResponse = serde_json::from_str(&result)
+            .map_err(|e| MetaError::Internal(format!("Lua response parse error: {e}")))?;
+
+        match response.error.as_deref() {
+            // The script treats a missing node as already-GC'd success, so
+            // `remove_file_metadata` is idempotent for concurrent GC runs.
+            Some("not_deleted") => Err(MetaError::Internal(
+                "File is not marked as deleted".to_string(),
+            )),
+            Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
+            Some("corrupt_deleted_set") => {
+                Err(MetaError::Internal("corrupt deleted-file index".into()))
+            }
+            Some("corrupt_xattr") => Err(MetaError::Internal("corrupt xattr data".into())),
+            Some(other) => Err(MetaError::Internal(format!("Lua error: {other}"))),
+            None if response.ok => {
+                self.invalidate_nodes(&[ino]).await;
+                Ok(())
+            }
+            None => Err(MetaError::Internal("unexpected Lua response".into())),
+        }
     }
 
     #[tracing::instrument(
@@ -3279,6 +3951,62 @@ impl MetaStore for RedisMetaStore {
         }
         tracing::Span::current().record("slice_count", slices.len());
         Ok(slices)
+    }
+
+    #[tracing::instrument(
+        level = "trace",
+        skip(self),
+        fields(chunk_id, slice_count = tracing::field::Empty)
+    )]
+    async fn get_slices_with_version(
+        &self,
+        chunk_id: u64,
+    ) -> Result<(Option<u64>, Vec<SliceDesc>), MetaError> {
+        let chunk_key = self.chunk_key(chunk_id);
+        let version_key = self.chunk_version_key(chunk_id);
+        let mut conn = self.conn.clone();
+        let mut pipe = redis::pipe();
+        pipe.atomic()
+            .cmd("GET")
+            .arg(&version_key)
+            .cmd("LRANGE")
+            .arg(&chunk_key)
+            .arg(0)
+            .arg(-1);
+        let (version, raw): (Option<u64>, Vec<Vec<u8>>) = pipe
+            .query_async(&mut conn)
+            .instrument(tracing::trace_span!(
+                "get_slices_with_version.redis_transaction",
+                chunk_id
+            ))
+            .await
+            .map_err(redis_err)?;
+
+        let mut slices = Vec::with_capacity(raw.len());
+        for entry in raw {
+            slices.push(crate::meta::serialization::deserialize_meta(&entry)?);
+        }
+        tracing::Span::current().record("slice_count", slices.len());
+
+        // Redis supports version validation even before the first mutation.
+        // Version zero keeps an empty cached list distinguishable from a
+        // backend that does not support version tokens at all.
+        Ok((Some(version.unwrap_or(0)), slices))
+    }
+
+    #[tracing::instrument(level = "trace", skip(self), fields(chunk_id))]
+    async fn get_chunk_version(&self, chunk_id: u64) -> Result<Option<u64>, MetaError> {
+        let mut conn = self.conn.clone();
+        let version: Option<u64> = redis::cmd("GET")
+            .arg(self.chunk_version_key(chunk_id))
+            .query_async(&mut conn)
+            .instrument(tracing::trace_span!(
+                "get_chunk_version.redis_get",
+                chunk_id
+            ))
+            .await
+            .map_err(redis_err)?;
+        Ok(Some(version.unwrap_or(0)))
     }
 
     #[tracing::instrument(
@@ -3479,8 +4207,22 @@ impl MetaStore for RedisMetaStore {
 
         let chunk_key = self.chunk_key(chunk_id);
         let version_key = self.chunk_version_key(chunk_id);
-        let script = redis::Script::new(CHUNK_CAS_LUA);
+        let script = redis::Script::new(CHUNK_COMPACT_LUA);
         let _txn_guard = Self::local_lock_for_key(&chunk_key).lock().await;
+        let delayed_args: Vec<String> = delayed_slices
+            .iter()
+            .flat_map(|(slice_id, offset, size)| {
+                [
+                    slice_id.to_string(),
+                    offset.to_string(),
+                    u64::from(*size).to_string(),
+                ]
+            })
+            .collect();
+        let new_slice_ids: Vec<String> = new_slices
+            .iter()
+            .map(|slice| slice.slice_id.to_string())
+            .collect();
 
         for _ in 0..COMPACT_RETRY_LIMIT {
             let mut conn = self.conn.clone();
@@ -3515,12 +4257,25 @@ impl MetaStore for RedisMetaStore {
 
             let new_version = current_version + 1;
 
-            // Atomic CAS via Lua: replace list iff version still matches.
+            // The chunk swap and delayed-GC ledger are one script. All script
+            // errors that can be preflighted occur before the chunk changes.
             let ok: i32 = script
                 .key(&chunk_key)
                 .key(&version_key)
+                .key(DELAYED_COUNTER_KEY)
+                .key(DELAYED_INDEX_KEY)
+                .key(UNCOMMITTED_PENDING_INDEX_KEY)
+                .key(UNCOMMITTED_ORPHAN_INDEX_KEY)
                 .arg(current_version)
                 .arg(new_version)
+                .arg(DELAYED_KEY_PREFIX)
+                .arg(chunk_id)
+                .arg(Utc::now().timestamp())
+                .arg(delayed_slices.len())
+                .arg(UNCOMMITTED_KEY_PREFIX)
+                .arg(new_slice_ids.len())
+                .arg(&delayed_args)
+                .arg(&new_slice_ids)
                 .arg(&final_data)
                 .invoke_async(&mut conn)
                 .await
@@ -3528,38 +4283,6 @@ impl MetaStore for RedisMetaStore {
 
             if ok == 0 {
                 continue;
-            }
-
-            // CAS succeeded — create delayed records for removed slices.
-            if !delayed_slices.is_empty() {
-                let n = delayed_slices.len() as i64;
-                let last_id: i64 = redis::cmd("INCRBY")
-                    .arg(DELAYED_COUNTER_KEY)
-                    .arg(n)
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(redis_err)?;
-                let first_id = last_id - n + 1;
-                let now = Utc::now().timestamp();
-
-                let mut pipe = redis::pipe();
-                pipe.atomic();
-                for (i, (slice_id, offset, size)) in delayed_slices.iter().enumerate() {
-                    let delayed_id = first_id + i as i64;
-                    let ds_key = self.delayed_key(delayed_id);
-                    pipe.hset(&ds_key, "sid", slice_id.to_string());
-                    pipe.hset(&ds_key, "off", offset.to_string());
-                    pipe.hset(&ds_key, "sz", u64::from(*size).to_string());
-                    pipe.hset(&ds_key, "st", "pending");
-                    pipe.hset(&ds_key, "ca", now.to_string());
-                    pipe.hset(&ds_key, "cid", chunk_id.to_string());
-                    pipe.cmd("ZADD")
-                        .arg(DELAYED_INDEX_KEY)
-                        .arg(now)
-                        .arg(delayed_id)
-                        .ignore();
-                }
-                pipe.query_async::<()>(&mut conn).await.map_err(redis_err)?;
             }
 
             return Ok(());
@@ -3597,8 +4320,22 @@ impl MetaStore for RedisMetaStore {
 
         let chunk_key = self.chunk_key(chunk_id);
         let version_key = self.chunk_version_key(chunk_id);
-        let script = redis::Script::new(CHUNK_CAS_LUA);
+        let script = redis::Script::new(CHUNK_COMPACT_LUA);
         let _txn_guard = Self::local_lock_for_key(&chunk_key).lock().await;
+        let delayed_args: Vec<String> = delayed_slices
+            .iter()
+            .flat_map(|(slice_id, offset, size)| {
+                [
+                    slice_id.to_string(),
+                    offset.to_string(),
+                    u64::from(*size).to_string(),
+                ]
+            })
+            .collect();
+        let new_slice_ids: Vec<String> = new_slices
+            .iter()
+            .map(|slice| slice.slice_id.to_string())
+            .collect();
 
         for _ in 0..COMPACT_RETRY_LIMIT {
             let mut conn = self.conn.clone();
@@ -3673,12 +4410,25 @@ impl MetaStore for RedisMetaStore {
                 final_data.push(crate::meta::serialization::serialize_meta(slice)?);
             }
 
-            // Atomic CAS via Lua: replace list iff version still matches.
+            // Commit the replacement, delayed-GC records, and uncommitted
+            // cleanup as one metadata transition.
             let ok: i32 = script
                 .key(&chunk_key)
                 .key(&version_key)
+                .key(DELAYED_COUNTER_KEY)
+                .key(DELAYED_INDEX_KEY)
+                .key(UNCOMMITTED_PENDING_INDEX_KEY)
+                .key(UNCOMMITTED_ORPHAN_INDEX_KEY)
                 .arg(current_version)
                 .arg(new_version)
+                .arg(DELAYED_KEY_PREFIX)
+                .arg(chunk_id)
+                .arg(Utc::now().timestamp())
+                .arg(delayed_slices.len())
+                .arg(UNCOMMITTED_KEY_PREFIX)
+                .arg(new_slice_ids.len())
+                .arg(&delayed_args)
+                .arg(&new_slice_ids)
                 .arg(&final_data)
                 .invoke_async(&mut conn)
                 .await
@@ -3686,72 +4436,6 @@ impl MetaStore for RedisMetaStore {
 
             if ok == 0 {
                 continue;
-            }
-
-            // CAS succeeded — create delayed records and clean up uncommitted entries.
-            if !delayed_slices.is_empty() {
-                let n = delayed_slices.len() as i64;
-                let last_id: i64 = redis::cmd("INCRBY")
-                    .arg(DELAYED_COUNTER_KEY)
-                    .arg(n)
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(redis_err)?;
-                let first_id = last_id - n + 1;
-                let now = Utc::now().timestamp();
-
-                let mut pipe = redis::pipe();
-                pipe.atomic();
-                for (i, (slice_id, offset, size)) in delayed_slices.iter().enumerate() {
-                    let delayed_id = first_id + i as i64;
-                    let ds_key = self.delayed_key(delayed_id);
-                    pipe.hset(&ds_key, "sid", slice_id.to_string());
-                    pipe.hset(&ds_key, "off", offset.to_string());
-                    pipe.hset(&ds_key, "sz", u64::from(*size).to_string());
-                    pipe.hset(&ds_key, "st", "pending");
-                    pipe.hset(&ds_key, "ca", now.to_string());
-                    pipe.hset(&ds_key, "cid", chunk_id.to_string());
-                    pipe.cmd("ZADD")
-                        .arg(DELAYED_INDEX_KEY)
-                        .arg(now)
-                        .arg(delayed_id)
-                        .ignore();
-                }
-                // Clean up uncommitted records for new slices
-                for slice in new_slices {
-                    let uc_key = self.uncommitted_key(slice.slice_id);
-                    pipe.cmd("DEL").arg(&uc_key).ignore();
-                    pipe.cmd("ZREM")
-                        .arg(UNCOMMITTED_PENDING_INDEX_KEY)
-                        .arg(slice.slice_id.to_string())
-                        .ignore();
-                    pipe.cmd("ZREM")
-                        .arg(UNCOMMITTED_ORPHAN_INDEX_KEY)
-                        .arg(slice.slice_id.to_string())
-                        .ignore();
-                }
-                pipe.query_async::<()>(&mut conn).await.map_err(redis_err)?;
-            } else {
-                // No delayed slices, still clean up uncommitted records.
-                for slice in new_slices {
-                    let uc_key = self.uncommitted_key(slice.slice_id);
-                    redis::pipe()
-                        .atomic()
-                        .cmd("DEL")
-                        .arg(&uc_key)
-                        .ignore()
-                        .cmd("ZREM")
-                        .arg(UNCOMMITTED_PENDING_INDEX_KEY)
-                        .arg(slice.slice_id.to_string())
-                        .ignore()
-                        .cmd("ZREM")
-                        .arg(UNCOMMITTED_ORPHAN_INDEX_KEY)
-                        .arg(slice.slice_id.to_string())
-                        .ignore()
-                        .query_async::<()>(&mut conn)
-                        .await
-                        .map_err(redis_err)?;
-                }
             }
 
             return Ok(());
@@ -4491,7 +5175,9 @@ impl MetaStore for RedisMetaStore {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredNode {
+    #[serde(deserialize_with = "deserialize_i64_from_number")]
     ino: i64,
+    #[serde(deserialize_with = "deserialize_i64_from_number")]
     parent: i64,
     name: String,
     kind: NodeKind,

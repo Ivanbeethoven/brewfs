@@ -28,6 +28,22 @@ impl fmt::Display for PathHint {
     }
 }
 
+#[cfg(feature = "workspace-overlay")]
+pub(crate) fn is_read_admission_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(cause.downcast_ref::<std::io::Error>(), Some(error)
+            if error.kind() == ErrorKind::OutOfMemory)
+            || matches!(
+                cause.downcast_ref::<crate::workspace_overlay::packed_v3::PackedWireError>(),
+                Some(crate::workspace_overlay::packed_v3::PackedWireError::LimitExceeded(_))
+            )
+            || matches!(
+                cause.downcast_ref::<crate::cadapter::read_observer::ReadBoundaryError>(),
+                Some(crate::cadapter::read_observer::ReadBoundaryError::Admission)
+            )
+    })
+}
+
 impl From<String> for PathHint {
     fn from(value: String) -> Self {
         Self::some(value)
@@ -181,7 +197,9 @@ impl VfsError {
     pub fn from_meta(path: impl Into<PathHint>, err: MetaError) -> Self {
         let path = path.into();
         match err {
-            MetaError::NotFound(_) | MetaError::ParentNotFound(_) => VfsError::NotFound { path },
+            MetaError::NotFound(_)
+            | MetaError::EntryNotFound { .. }
+            | MetaError::ParentNotFound(_) => VfsError::NotFound { path },
             MetaError::AlreadyExists { .. } => VfsError::AlreadyExists { path },
             MetaError::NotDirectory(_) => VfsError::NotADirectory { path },
             MetaError::DirectoryNotEmpty(_) => VfsError::DirectoryNotEmpty { path },

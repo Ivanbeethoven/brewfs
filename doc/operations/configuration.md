@@ -149,6 +149,7 @@ meta:
   open_file_cache_ttl_ms: 30000
   open_file_cache_capacity: 65536
   allow_write_open_cache: false
+  slice_version_check_interval_ms: 1000
 
 cache:
   root: /var/cache/brewfs
@@ -268,13 +269,16 @@ export AWS_EC2_METADATA_DISABLED=true
 |---|---:|---|
 | `meta.backend` | `sqlx` | `sqlx`、`redis`、`etcd` 或 `tikv`。 |
 | `meta.sqlx.url` | `sqlite::memory:` | SQLite 或 PostgreSQL URL。 |
-| `meta.redis.url` | 无 | Redis URL；`backend=redis` 时必须显式配置。 |
+| `meta.redis.url` | 无 | 单一 Redis endpoint URL；`backend=redis` 时必须显式配置。当前元数据后端依赖跨 key Lua 原子事务，不支持 Redis Cluster。 |
 | `meta.etcd.urls` | `[]` | Etcd endpoint 列表。 |
 | `meta.tikv.pd_endpoints` | `[]` | TiKV PD endpoint 列表。 |
 | `meta.tikv.namespace` | `brewfs` | TiKV key namespace。 |
 | `meta.open_file_cache_ttl_ms` | 关闭 | 只读 open 文件属性缓存 TTL，单位 ms。 |
 | `meta.open_file_cache_capacity` | 默认值 | open file cache 容量。 |
 | `meta.allow_write_open_cache` | `false` | 允许写 open 复用属性缓存。仅建议在单客户端或可接受跨客户端 close-to-open 新鲜度减弱的性能场景中启用。 |
+| `meta.slice_version_check_interval_ms` | `1000` | Redis slice-list 缓存的后端版本复检间隔。远端 compact/write 最多可在该窗口内暂未被当前客户端看到；设为 `0` 会在每次缓存命中时复检。与复检重叠的变更可能在下一次复检时可见。 |
+
+Redis 后端的 `statfs`/`df` 是每个客户端独立维护的近似快照，固定缓存 5 秒。`create`、`unlink`、`write`、`truncate` 等本地或远端变更可能要到该窗口过期后的第一次查询才会反映到 `used_space` / `used_inodes`；这是为了避免重复 SCAN 全 inode 空间以及在每次元数据变更上增加全局 epoch 写入。
 
 示例：
 
@@ -329,20 +333,25 @@ meta:
 | 字段 | 默认值 | 说明 |
 |---|---:|---|
 | `cache.root` / `cache.cache_root` | `$XDG_CACHE_HOME/brewfs` 或 `/tmp/brewfs` | 本地缓存根目录。 |
-| `cache.read_memory_bytes` | `4294967296` | 读缓存内存预算，默认 4 GiB。 |
-| `cache.read_ssd_bytes` | `21474836480` | 读缓存磁盘预算，默认 20 GiB。 |
-| `cache.write_memory_bytes` | `402653184` | 写缓存内存预算，默认 384 MiB。 |
-| `cache.write_ssd_bytes` | `21474836480` | 写缓存磁盘预算，默认 20 GiB。 |
+| `cache.read_memory_bytes` | `8589934592` | 读缓存内存预算，默认 8 GiB。 |
+| `cache.read_ssd_bytes` | `68719476736` | 读缓存磁盘预算，默认 64 GiB。 |
+| `cache.write_memory_bytes` | `805306368` | 写缓存内存预算，默认 768 MiB。 |
+| `cache.write_ssd_bytes` | `68719476736` | 写缓存磁盘预算，默认 64 GiB。 |
 | `cache.dirty_slice_target_size` | `33554432` | 脏 slice 聚合目标，默认 32 MiB。 |
 | `cache.dirty_slice_max_age_ms` | `2000` | 脏 slice 最大聚合时间。 |
 | `cache.upload_concurrency` | `10` | 单 writer 内 block upload 并发。 |
 | `cache.prefetch_enabled` | `true` | VFS 顺序预取开关。 |
-| `cache.prefetch_max_bytes` | `67108864` | 最大预读距离，默认 64 MiB。 |
+| `cache.prefetch_max_bytes` | `134217728` | 最大预读距离，默认 128 MiB。 |
 | `cache.prefetch_concurrency` | `64` | 预取并发。 |
 | `cache.range_background_prefetch` | `true` | range miss 后后台补全 block。 |
 | `cache.populate_write_cache_after_upload` | `true` | 上传后把写入 block 放入读缓存。 |
 | `cache.persist_write_cache_after_upload` | `false` | 上传后是否持久化到磁盘读缓存。 |
-| `cache.memory_budget_bytes` | `1342177280` | VFS reader/writer buffer 总预算，默认 1280 MiB。 |
+| `cache.memory_budget_bytes` | `2147483648` | VFS reader/writer buffer 总预算，默认 2 GiB。 |
+| `BREWFS_PACKED_METADATA_CACHE_BYTES` | `268435456` | packed v3 解码元数据总预算；按 index page、GroupMeta、frame directory、inode 热项和 locator 分层，不写入 `cache.root`。 |
+| `BREWFS_PACKED_METADATA_PREFETCH` | `auto` | packed v3 挂载前预热模式：默认 `auto` 按独立 index 子预算预热稳定页前缀，再按 GroupMeta 和 frame-directory byte budget 预热可驻留的 group/container；`eager`/`true` 并行预热指定 GroupMeta，`off` 保留严格 metadata-cold 请求图。超预算的尾部页/group/container 留给按需 LRU；数据 frame 仍按请求读取。 |
+| `BREWFS_PACKED_METADATA_PREFETCH_CONCURRENCY` | `8` | metadata warm-up 最大并发。 |
+| `BREWFS_PACKED_METADATA_PREFETCH_MAX_GROUPS` | 未设置 | 预热的 GroupMeta 数量上限；未设置表示按索引预热全部 group，`0` 表示只预热 index。 |
+| block page cache | `32768 x 65536` | 普通小范围数据读的 page cache，默认约 2 GiB；冷读 profile 会显式禁用。 |
 | `cache.compression` | `lz4` | 对象压缩：`none`、`lz4`、`zstd`。 |
 | `cache.zstd_level` | `3` | `compression=zstd` 时的 level。 |
 | `cache.verify_cache_checksum` | `full` | 本地缓存校验：`full` 或 `none`。 |

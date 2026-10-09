@@ -11,5 +11,6 @@
 //!
 pub mod client;
 pub mod localfs;
+pub mod read_observer;
 pub mod s3;
 // Module-level TODOs remain: implement concrete adapter logic and tests.

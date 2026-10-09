@@ -1,4 +1,4 @@
-use crate::meta::client::MetaClient;
+use crate::meta::client::{MetaClient, MetaClientOptions};
 use crate::meta::config::Config;
 use crate::meta::config::{
     CacheCapacity, CacheConfig, CacheTtl, ClientOptions, CompactConfig, DatabaseConfig,
@@ -10,8 +10,11 @@ use crate::meta::stores::RedisMetaStore;
 use crate::meta::{MetaLayer, MetaStore};
 use crate::vfs::fs::VFS;
 use crate::{chunk::layout::ChunkLayout, chunk::store::InMemoryBlockStore};
+use asyncfuse::Errno;
+use asyncfuse::raw::{Filesystem, Request};
 use redis::AsyncCommands;
 use serial_test::serial;
+use std::ffi::OsStr;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
@@ -74,8 +77,13 @@ async fn local_txlock_serializes_same_primary_key() {
     assert_eq!(max_active.load(Ordering::SeqCst), 1);
 }
 
+fn redis_test_url() -> String {
+    std::env::var("BREWFS_REDIS_TEST_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string())
+}
+
 async fn cleanup_test_data() -> Result<(), MetaError> {
-    let url = "redis://127.0.0.1:6379/0";
+    let url = redis_test_url();
     let client = redis::Client::open(url)
         .map_err(|e| MetaError::Config(format!("Failed to create Redis client: {}", e)))?;
     let mut conn = client
@@ -100,7 +108,7 @@ fn test_config() -> Config {
     Config {
         database: DatabaseConfig {
             db_config: DatabaseType::Redis {
-                url: "redis://127.0.0.1:6379/0".to_string(),
+                url: redis_test_url(),
             },
         },
         cache: CacheConfig::default(),
@@ -109,12 +117,20 @@ fn test_config() -> Config {
     }
 }
 
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn redis_standalone_capability_probe_accepts_test_server() {
+    cleanup_test_data().await.unwrap();
+    RedisMetaStore::from_config(test_config()).await.unwrap();
+}
+
 /// Configuration for shared database testing (multi-session)
 fn shared_db_config() -> Config {
     Config {
         database: DatabaseConfig {
             db_config: DatabaseType::Redis {
-                url: "redis://127.0.0.1:6379/0".to_string(),
+                url: redis_test_url(),
             },
         },
         cache: CacheConfig::default(),
@@ -1777,17 +1793,11 @@ async fn test_rename_exchange_lua_old_not_found() {
         .rename_exchange(root, "nonexistent.txt", root, "file2.txt")
         .await;
 
-    assert!(result.is_err());
-    if let Err(MetaError::Internal(msg)) = result {
-        assert!(
-            msg.contains("Entry 'nonexistent.txt' not found in parent")
-                && msg.contains("for exchange"),
-            "error message should match format: got '{}'",
-            msg
-        );
-    } else {
-        panic!("expected Internal error");
-    }
+    assert!(matches!(
+        result,
+        Err(MetaError::EntryNotFound { parent, name })
+            if parent == root && name == "nonexistent.txt"
+    ));
 }
 
 #[serial]
@@ -1806,17 +1816,11 @@ async fn test_rename_exchange_lua_new_not_found() {
         .rename_exchange(root, "file1.txt", root, "nonexistent.txt")
         .await;
 
-    assert!(result.is_err());
-    if let Err(MetaError::Internal(msg)) = result {
-        assert!(
-            msg.contains("Entry 'nonexistent.txt' not found in parent")
-                && msg.contains("for exchange"),
-            "error message should match format: got '{}'",
-            msg
-        );
-    } else {
-        panic!("expected Internal error");
-    }
+    assert!(matches!(
+        result,
+        Err(MetaError::EntryNotFound { parent, name })
+            if parent == root && name == "nonexistent.txt"
+    ));
 }
 
 #[serial]
@@ -1903,6 +1907,77 @@ async fn test_rename_exchange_lua_hardlinks() {
     assert_eq!(node2_after.attr.nlink, 2);
     assert_eq!(node2_after.parent, 0);
     assert_eq!(node2_after.name, "");
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_rename_scripts_prevent_concurrent_parent_cycle() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let a = store.mkdir(root, "a".into()).await.unwrap();
+    let q = store.mkdir(root, "q".into()).await.unwrap();
+    let x = store.mkdir(q, "x".into()).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+    let exchange = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.rename_exchange(root, "a", q, "x").await
+        })
+    };
+    let rename = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.rename(root, "q", a, "q".into()).await
+        })
+    };
+    barrier.wait().await;
+
+    let exchange = exchange.await.unwrap();
+    let rename = rename.await.unwrap();
+    assert!(exchange.is_ok() ^ rename.is_ok());
+    assert!(matches!(
+        exchange.err().or_else(|| rename.err()).unwrap(),
+        MetaError::InvalidPath(_)
+    ));
+
+    for start in [a, q, x] {
+        let mut current = start;
+        let mut visited = std::collections::HashSet::new();
+        while current != root {
+            assert!(visited.insert(current));
+            current = store.get_dir_parent(current).await.unwrap().unwrap();
+        }
+    }
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_rename_exchange_rejects_corrupt_ancestry_without_writes() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let source = store.mkdir(root, "source".into()).await.unwrap();
+    let parent = store.mkdir(root, "parent".into()).await.unwrap();
+    let child = store.mkdir(parent, "child".into()).await.unwrap();
+    let file = store.create_file(parent, "file".into()).await.unwrap();
+
+    let mut parent_node = store.get_node(parent).await.unwrap().unwrap();
+    parent_node.parent = child;
+    store.save_node(&parent_node).await.unwrap();
+
+    let error = store
+        .rename_exchange(root, "source", parent, "file")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaError::InvalidPath(_)));
+    assert_eq!(store.lookup(root, "source").await.unwrap(), Some(source));
+    assert_eq!(store.lookup(parent, "file").await.unwrap(), Some(file));
 }
 
 #[test]
@@ -2223,6 +2298,96 @@ async fn test_file_full_lifecycle_flow() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn get_slices_cache_detects_remote_compact_via_version_token() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let client = MetaClient::with_options(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+        MetaClientOptions {
+            slice_version_check_interval: Duration::ZERO,
+            ..MetaClientOptions::default()
+        },
+    );
+
+    let ino = client
+        .create_file(root, "slice_version.txt".to_string())
+        .await
+        .unwrap();
+    let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+    let old_slice = crate::chunk::SliceDesc {
+        slice_id: 201,
+        chunk_id,
+        offset: 0,
+        length: 4096,
+    };
+    client.append_slice(chunk_id, old_slice).await.unwrap();
+    assert_eq!(client.get_slices(chunk_id).await.unwrap(), vec![old_slice]);
+
+    let new_slice = crate::chunk::SliceDesc {
+        slice_id: 202,
+        chunk_id,
+        offset: 0,
+        length: 8192,
+    };
+    store
+        .replace_slices_for_compact_with_version(chunk_id, &[new_slice], &[], &[old_slice])
+        .await
+        .unwrap();
+    assert_eq!(
+        client.get_slices(chunk_id).await.unwrap(),
+        vec![new_slice],
+        "a client must not keep serving slices replaced by a remote compaction"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn get_slices_cache_detects_first_remote_append_after_empty_read() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let client = MetaClient::with_options(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+        MetaClientOptions {
+            slice_version_check_interval: Duration::ZERO,
+            ..MetaClientOptions::default()
+        },
+    );
+
+    let ino = client
+        .create_file(root, "empty_slice_version.txt".to_string())
+        .await
+        .unwrap();
+    let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+    assert!(client.get_slices(chunk_id).await.unwrap().is_empty());
+
+    let remote_slice = crate::chunk::SliceDesc {
+        slice_id: 301,
+        chunk_id,
+        offset: 0,
+        length: 4096,
+    };
+    store.append_slice(chunk_id, remote_slice).await.unwrap();
+    assert_eq!(
+        client.get_slices(chunk_id).await.unwrap(),
+        vec![remote_slice],
+        "a cached empty chunk must observe the first remote append"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_directory_full_lifecycle_flow() {
     let store = new_test_store().await;
     let root = store.root_ino();
@@ -2513,6 +2678,100 @@ async fn test_lookup_with_attr_returns_inode_attr_and_warms_node_cache() {
 
     let missing = store.lookup_with_attr(root, "missing.txt").await.unwrap();
     assert!(missing.is_none());
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_meta_client_lookup_uses_fused_store_path() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let ino = store
+        .create_file(root, "client_lookup_attr.txt".to_string())
+        .await
+        .unwrap();
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+
+    store.node_cache.invalidate(&ino).await;
+    store
+        .lookup_with_attr(root, "warm-lookup-script")
+        .await
+        .unwrap();
+    reset_redis_commandstats(&store).await;
+
+    assert_eq!(
+        client.lookup(root, "client_lookup_attr.txt").await.unwrap(),
+        Some(ino)
+    );
+
+    let script_calls = redis_script_calls(&store).await;
+    assert!(
+        (1..=2).contains(&script_calls),
+        "MetaClient::lookup should use Redis lookup_with_attr as one business Lua script; observed {script_calls} script calls including client-side script cache handling"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_dangling_dentry_lookup_returns_not_found_and_fuse_enoent() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let name = "dangling-client-lookup.txt";
+    let ino = store.create_file(root, name.to_string()).await.unwrap();
+
+    let deleted: usize = store.conn.clone().del(store.node_key(ino)).await.unwrap();
+    assert_eq!(
+        deleted, 1,
+        "test must remove the inode but retain its dentry"
+    );
+    store.node_cache.invalidate(&ino).await;
+    assert_eq!(
+        store.lookup(root, name).await.unwrap(),
+        Some(ino),
+        "the directory entry must remain after deleting the inode record"
+    );
+
+    let client = MetaClient::new(
+        store,
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+    assert!(matches!(
+        client.lookup(root, name).await,
+        Err(MetaError::NotFound(found)) if found == ino
+    ));
+
+    let fs = VFS::with_meta_layer_with_default_background(
+        ChunkLayout::default(),
+        Arc::new(InMemoryBlockStore::new()),
+        client,
+    )
+    .unwrap();
+    let err = Filesystem::lookup(
+        &fs,
+        Request {
+            unique: 1,
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        },
+        root as u64,
+        OsStr::new(name),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, Errno::from(libc::ENOENT));
 }
 
 #[serial]
@@ -3204,6 +3463,131 @@ async fn test_delayed_slice_workflow_consistency() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn compact_delayed_record_failure_keeps_old_chunk_reachable() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let ino = store
+        .create_file(root, "compact_atomic_failure.txt".to_string())
+        .await
+        .unwrap();
+    let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+    let old_slice = crate::chunk::SliceDesc {
+        slice_id: 421,
+        chunk_id,
+        offset: 0,
+        length: 1024,
+    };
+    let new_slice = crate::chunk::SliceDesc {
+        slice_id: 422,
+        chunk_id,
+        offset: 0,
+        length: 1024,
+    };
+    store.append_slice(chunk_id, old_slice).await.unwrap();
+
+    // Fault injection: INCRBY on a hash fails. The old implementation had
+    // already committed the chunk CAS before discovering this error.
+    let mut conn = store.conn.clone();
+    redis::cmd("HSET")
+        .arg(super::DELAYED_COUNTER_KEY)
+        .arg("invalid")
+        .arg("counter")
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+    let delayed_data = crate::chunk::SliceDesc::encode_delayed_data(&[old_slice], &[421]);
+
+    assert!(
+        store
+            .replace_slices_for_compact(chunk_id, &[new_slice], &delayed_data)
+            .await
+            .is_err(),
+        "the injected delayed-record failure must surface"
+    );
+    assert_eq!(
+        store.get_slices(chunk_id).await.unwrap(),
+        vec![old_slice],
+        "a failed compact must leave the old object reachable from the chunk list"
+    );
+    assert!(
+        store
+            .process_delayed_slices(10, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn compact_version_conflict_leaves_chunk_and_delayed_index_unchanged() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let ino = store
+        .create_file(root, "compact_conflict.txt".to_string())
+        .await
+        .unwrap();
+    let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+    let old_slice = crate::chunk::SliceDesc {
+        slice_id: 431,
+        chunk_id,
+        offset: 0,
+        length: 1024,
+    };
+    let new_slice = crate::chunk::SliceDesc {
+        slice_id: 432,
+        chunk_id,
+        offset: 0,
+        length: 1024,
+    };
+    store.append_slice(chunk_id, old_slice).await.unwrap();
+    let delayed_data = crate::chunk::SliceDesc::encode_delayed_data(&[old_slice], &[431]);
+
+    let conflict = store
+        .replace_slices_for_compact_with_version(chunk_id, &[new_slice], &delayed_data, &[])
+        .await;
+    assert!(matches!(conflict, Err(MetaError::ContinueRetry(_))));
+    assert_eq!(store.get_slices(chunk_id).await.unwrap(), vec![old_slice]);
+    assert!(
+        store
+            .process_delayed_slices(10, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    store
+        .record_uncommitted_slice(new_slice.slice_id, chunk_id, new_slice.length, "compact")
+        .await
+        .unwrap();
+    store
+        .replace_slices_for_compact_with_version(
+            chunk_id,
+            &[new_slice],
+            &delayed_data,
+            &[old_slice],
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.get_slices(chunk_id).await.unwrap(), vec![new_slice]);
+    assert_eq!(store.process_delayed_slices(10, 0).await.unwrap().len(), 1);
+
+    let mut conn = store.conn.clone();
+    let uncommitted_exists: bool = redis::cmd("EXISTS")
+        .arg(store.uncommitted_key(new_slice.slice_id))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        !uncommitted_exists,
+        "the newly referenced compacted slice must not remain eligible for orphan GC"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_uncommitted_slice_workflow_consistency() {
     let store = new_test_store().await;
     let slice_id = 501u64;
@@ -3444,6 +3828,8 @@ async fn test_stat_fs_batches_node_fetches_with_mget() {
     assert!(snap.used_inodes >= 6);
     let get_calls = redis_command_calls(&store, "get").await;
     let mget_calls = redis_command_calls(&store, "mget").await;
+    let scan_calls = redis_command_calls(&store, "scan").await;
+    let keys_calls = redis_command_calls(&store, "keys").await;
     assert!(
         get_calls <= 1,
         "stat_fs should batch node loads instead of issuing one GET per inode; observed {get_calls} GET calls"
@@ -3451,6 +3837,117 @@ async fn test_stat_fs_batches_node_fetches_with_mget() {
     assert_eq!(
         mget_calls, 1,
         "stat_fs should fetch all node payloads with one Redis MGET"
+    );
+    assert!(
+        scan_calls >= 1,
+        "stat_fs should page node keys with SCAN instead of KEYS"
+    );
+    assert_eq!(
+        keys_calls, 0,
+        "stat_fs must not use blocking KEYS; observed {keys_calls} KEYS calls"
+    );
+
+    let snap2 = store.stat_fs().await.unwrap();
+    assert_eq!(snap2.used_inodes, snap.used_inodes);
+    assert_eq!(
+        redis_command_calls(&store, "mget").await,
+        mget_calls,
+        "cached stat_fs should not re-fetch node payloads"
+    );
+    assert_eq!(
+        redis_command_calls(&store, "scan").await,
+        scan_calls,
+        "cached stat_fs should not re-scan the node key space"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_stat_fs_bounds_each_mget_batch() {
+    let store = new_test_store().await;
+    let template: Vec<u8> = redis::cmd("GET")
+        .arg(store.node_key(store.root_ino()))
+        .query_async(&mut store.conn.clone())
+        .await
+        .unwrap();
+    let mut pipeline = redis::pipe();
+    for idx in 0..super::STAT_FS_MGET_BATCH_SIZE {
+        pipeline
+            .cmd("SET")
+            .arg(store.node_key(10_000 + idx as i64))
+            .arg(&template)
+            .ignore();
+    }
+    let _: () = pipeline.query_async(&mut store.conn.clone()).await.unwrap();
+
+    reset_redis_commandstats(&store).await;
+    let snapshot = store.stat_fs().await.unwrap();
+
+    assert_eq!(
+        snapshot.used_inodes,
+        super::STAT_FS_MGET_BATCH_SIZE as u64 + 1
+    );
+    assert!(
+        redis_command_calls(&store, "mget").await >= 2,
+        "more than one MGET batch should be used after crossing the hard batch limit"
+    );
+    assert_eq!(redis_command_calls(&store, "keys").await, 0);
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_stat_fs_cold_cache_is_single_flight() {
+    let store = new_test_store().await;
+    reset_redis_commandstats(&store).await;
+
+    let (first, second, third) = tokio::join!(store.stat_fs(), store.stat_fs(), store.stat_fs());
+    let first = first.unwrap();
+    assert_eq!(second.unwrap().used_inodes, first.used_inodes);
+    assert_eq!(third.unwrap().used_inodes, first.used_inodes);
+    assert_eq!(
+        redis_command_calls(&store, "scan").await,
+        1,
+        "concurrent cold stat_fs calls should share one Redis scan"
+    );
+    assert_eq!(redis_command_calls(&store, "mget").await, 1);
+    assert_eq!(redis_command_calls(&store, "keys").await, 0);
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_stat_fs_cache_staleness_is_bounded_by_ttl() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let before = store.stat_fs().await.unwrap();
+    store
+        .create_file(root, "sf_bounded_stale.txt".to_string())
+        .await
+        .unwrap();
+
+    let cached = store.stat_fs().await.unwrap();
+    assert_eq!(
+        cached.used_inodes, before.used_inodes,
+        "stat_fs intentionally reuses its snapshot within the cache TTL"
+    );
+
+    {
+        let mut cache = store.stat_fs_cache.lock().await;
+        let (cached_at, _) = cache
+            .as_mut()
+            .expect("the first stat_fs populates the cache");
+        *cached_at = std::time::Instant::now()
+            .checked_sub(super::STAT_FS_CACHE_TTL + Duration::from_millis(1))
+            .unwrap();
+    }
+    let refreshed = store.stat_fs().await.unwrap();
+    assert_eq!(
+        refreshed.used_inodes,
+        before.used_inodes + 1,
+        "the first stat_fs after the TTL must refresh the Redis snapshot"
     );
 }
 
@@ -3479,8 +3976,8 @@ async fn test_stat_fs_accounting_fallback() {
     );
     let used_space = snap.total_space - snap.available_space;
     assert_eq!(
-        used_space, 1536,
-        "should count allocated file and symlink blocks"
+        used_space, 1512,
+        "used bytes = file size fallback (1000) + allocated symlink block (512)"
     );
     assert!(snap.total_space > used_space);
     assert!(snap.available_inodes > 0);
@@ -4120,5 +4617,277 @@ async fn test_blocking_set_plock_succeeds_after_unlink_releases_lock() {
         result.is_ok(),
         "set_plock on tombstoned inode after unlock should succeed, got: {:?}",
         result
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_redis_xattr_crud_flags_and_binary_values() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    assert!(store.capabilities().xattr);
+
+    let inode = store
+        .create_file(root, "xattr-crud.bin".to_string())
+        .await
+        .unwrap();
+    assert_eq!(store.get_xattr(inode, "missing").await.unwrap(), None);
+    assert!(store.list_xattr(inode).await.unwrap().is_empty());
+
+    store.node_cache.invalidate(&inode).await;
+    let before = store.stat(inode).await.unwrap().unwrap();
+    store
+        .set_xattr(inode, "user.test", b"first", 0)
+        .await
+        .unwrap();
+    let after_create = store.stat(inode).await.unwrap().unwrap();
+    assert!(after_create.ctime > before.ctime);
+    assert_eq!(after_create.mtime, before.mtime);
+    assert_eq!(
+        store.get_xattr(inode, "user.test").await.unwrap(),
+        Some(b"first".to_vec())
+    );
+
+    store
+        .set_xattr(inode, "user.test", b"second", 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_xattr(inode, "user.test").await.unwrap(),
+        Some(b"second".to_vec())
+    );
+
+    let create_result = store
+        .set_xattr(inode, "user.test", b"third", libc::XATTR_CREATE as u32)
+        .await;
+    assert!(matches!(
+        create_result,
+        Err(MetaError::AlreadyExists { parent, name }) if parent == inode && name == "user.test"
+    ));
+
+    let replace_missing = store
+        .set_xattr(inode, "user.missing", b"value", libc::XATTR_REPLACE as u32)
+        .await;
+    assert!(matches!(replace_missing, Err(MetaError::NotFound(found)) if found == inode));
+
+    let binary = vec![0, 0xff, 0x80, b'\n', 0];
+    store
+        .set_xattr(inode, "user.binary", &binary, 0)
+        .await
+        .unwrap();
+    store.set_xattr(inode, "user.empty", &[], 0).await.unwrap();
+    assert_eq!(
+        store.get_xattr(inode, "user.binary").await.unwrap(),
+        Some(binary)
+    );
+    assert_eq!(
+        store.get_xattr(inode, "user.empty").await.unwrap(),
+        Some(Vec::new())
+    );
+
+    let mut names = store.list_xattr(inode).await.unwrap();
+    names.sort();
+    assert_eq!(names, vec!["user.binary", "user.empty", "user.test"]);
+
+    store.remove_xattr(inode, "user.test").await.unwrap();
+    assert_eq!(store.get_xattr(inode, "user.test").await.unwrap(), None);
+    assert!(matches!(
+        store.remove_xattr(inode, "user.test").await,
+        Err(MetaError::NotFound(found)) if found == inode
+    ));
+
+    for operation in [
+        store.get_xattr(999_999, "x").await.map(|_| ()),
+        store.list_xattr(999_999).await.map(|_| ()),
+        store.remove_xattr(999_999, "x").await,
+        store.set_xattr(999_999, "x", b"x", 0).await,
+    ] {
+        assert!(matches!(operation, Err(MetaError::NotFound(found)) if found == 999_999));
+    }
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_redis_xattr_create_is_atomic_across_store_instances() {
+    let store_a = new_test_store().await;
+    let root = store_a.root_ino();
+    let inode = store_a
+        .create_file(root, "xattr-race".to_string())
+        .await
+        .unwrap();
+    let store_b = RedisMetaStore::from_config(test_config()).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let barrier_a = barrier.clone();
+    let task_a = tokio::spawn(async move {
+        barrier_a.wait().await;
+        store_a
+            .set_xattr(inode, "user.race", b"value-a", libc::XATTR_CREATE as u32)
+            .await
+    });
+    let barrier_b = barrier.clone();
+    let task_b = tokio::spawn(async move {
+        barrier_b.wait().await;
+        store_b
+            .set_xattr(inode, "user.race", b"value-b", libc::XATTR_CREATE as u32)
+            .await
+    });
+
+    let result_a = task_a.await.unwrap();
+    let result_b = task_b.await.unwrap();
+    let results = [result_a, result_b];
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "exactly one XATTR_CREATE contender must succeed: {results:?}"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(MetaError::AlreadyExists { .. })))
+            .count(),
+        1,
+        "exactly one XATTR_CREATE contender must lose: {results:?}"
+    );
+
+    let verifier = RedisMetaStore::from_config(test_config()).await.unwrap();
+    let value = verifier.get_xattr(inode, "user.race").await.unwrap();
+    assert!(value == Some(b"value-a".to_vec()) || value == Some(b"value-b".to_vec()));
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_redis_xattr_inode_cleanup() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let dir = store.mkdir(root, "xattr-dir".to_string()).await.unwrap();
+    store
+        .set_xattr(dir, "user.dir", b"directory", 0)
+        .await
+        .unwrap();
+    store.rmdir(root, "xattr-dir").await.unwrap();
+    let mut conn = store.conn.clone();
+    let dir_xattr_exists: bool = conn.exists(store.xattr_key(dir)).await.unwrap();
+    assert!(!dir_xattr_exists);
+
+    let file = store
+        .create_file(root, "xattr-file".to_string())
+        .await
+        .unwrap();
+    store
+        .set_xattr(file, "user.file", b"file", 0)
+        .await
+        .unwrap();
+    store.unlink(root, "xattr-file").await.unwrap();
+    assert_eq!(
+        store.get_xattr(file, "user.file").await.unwrap(),
+        Some(b"file".to_vec())
+    );
+    store.remove_file_metadata(file).await.unwrap();
+    let file_xattr_exists: bool = conn.exists(store.xattr_key(file)).await.unwrap();
+    assert!(!file_xattr_exists);
+    assert!(matches!(
+        store.get_xattr(file, "user.file").await,
+        Err(MetaError::NotFound(found)) if found == file
+    ));
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_remove_file_metadata_is_idempotent() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let file = store
+        .create_file(root, "gc-me.txt".to_string())
+        .await
+        .unwrap();
+    store.set_xattr(file, "user.gc", b"gone", 0).await.unwrap();
+    store.unlink(root, "gc-me.txt").await.unwrap();
+
+    store.remove_file_metadata(file).await.unwrap();
+    // A concurrent GC run must not fail when the tombstone is already gone:
+    // the script reports success and clears stale index/xattr leftovers.
+    store.remove_file_metadata(file).await.unwrap();
+
+    let deleted = store.get_deleted_files().await.unwrap();
+    assert!(
+        !deleted.contains(&file),
+        "stale tombstone entry must be removed from the deleted set"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_rename_lua_dir_over_dir_removes_destination_xattrs() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let src_ino = store.mkdir(root, "src".to_string()).await.unwrap();
+    let dst_ino = store.mkdir(root, "dst".to_string()).await.unwrap();
+    store
+        .set_xattr(dst_ino, "user.stale", b"stale", 0)
+        .await
+        .unwrap();
+
+    store
+        .rename(root, "src", root, "dst".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(store.lookup(root, "dst").await.unwrap(), Some(src_ino));
+    assert!(store.get_node(dst_ino).await.unwrap().is_none());
+    let mut conn = store.conn.clone();
+    let dst_xattr_exists: bool = conn.exists(store.xattr_key(dst_ino)).await.unwrap();
+    assert!(
+        !dst_xattr_exists,
+        "replaced directory xattrs must be deleted with the inode"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_rename_lua_file_over_file_preserves_destination_xattrs() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let src_ino = store
+        .create_file(root, "src.txt".to_string())
+        .await
+        .unwrap();
+    let dst_ino = store
+        .create_file(root, "dst.txt".to_string())
+        .await
+        .unwrap();
+    store
+        .set_xattr(dst_ino, "user.keep", b"kept", 0)
+        .await
+        .unwrap();
+
+    store
+        .rename(root, "src.txt", root, "dst.txt".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(store.lookup(root, "dst.txt").await.unwrap(), Some(src_ino));
+    // The overwritten file inode is tombstoned rather than freed so open
+    // handles keep observing its state until final GC; its xattrs are
+    // therefore preserved alongside the tombstone (GC's remove_file_metadata
+    // deletes them later).
+    assert_eq!(
+        store.get_xattr(dst_ino, "user.keep").await.unwrap(),
+        Some(b"kept".to_vec())
+    );
+    let mut conn = store.conn.clone();
+    let dst_xattr_exists: bool = conn.exists(store.xattr_key(dst_ino)).await.unwrap();
+    assert!(
+        dst_xattr_exists,
+        "tombstoned destination xattrs must be preserved until GC"
     );
 }

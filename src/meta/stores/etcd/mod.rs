@@ -17,8 +17,8 @@ use crate::meta::file_lock::{
     FileLockInfo, FileLockQuery, FileLockRange, FileLockType, PlockRecord,
 };
 use crate::meta::store::{
-    DirEntry, FileAttr, LockName, MetaError, MetaStore, RetryReason, SetAttrFlags, SetAttrRequest,
-    StatFsSnapshot, stat_fs_snapshot_from_usage, stat_fs_used_bytes,
+    DirEntry, FileAttr, LockName, MetaError, MetaStore, RenameOutcome, RetryReason, SetAttrFlags,
+    SetAttrRequest, StatFsSnapshot, stat_fs_snapshot_from_usage, stat_fs_used_bytes,
 };
 use crate::meta::stores::pool::IdPool;
 use crate::meta::{INODE_ID_KEY, Permission};
@@ -119,6 +119,84 @@ impl EtcdMetaStore {
     /// Etcd helper method: generate reverse index key for inode
     fn etcd_reverse_key(ino: i64) -> String {
         format!("r:{}", ino)
+    }
+
+    async fn update_entry_binding_in_txn(
+        tx: &mut EtcdTxnCtx<'_>,
+        info: &mut EtcdEntryInfo,
+        ino: i64,
+        old_parent: i64,
+        old_name: &str,
+        new_parent: i64,
+        new_name: &str,
+    ) -> Result<(), MetaError> {
+        if info.to_file_attr(ino).kind == FileType::Dir || info.nlink <= 1 {
+            info.parent_inode = new_parent;
+            info.entry_name = new_name.to_owned();
+            return Ok(());
+        }
+
+        let key = Self::etcd_link_parent_key(ino);
+        let mut links: Vec<EtcdLinkParent> = tx
+            .get_typed_json(&key)
+            .await?
+            .ok_or(MetaError::NotFound(ino))?;
+        let Some(link) = links
+            .iter_mut()
+            .find(|link| link.parent_inode == old_parent && link.entry_name == old_name)
+        else {
+            return Err(MetaError::InvalidPath(format!(
+                "missing link parent for inode {ino} at {old_parent}/{old_name}"
+            )));
+        };
+        link.parent_inode = new_parent;
+        link.entry_name = new_name.to_owned();
+        tx.set_typed_json(key, &links)?;
+        info.parent_inode = 0;
+        info.entry_name.clear();
+        Ok(())
+    }
+
+    async fn validate_directory_move_in_txn(
+        tx: &mut EtcdTxnCtx<'_>,
+        mut parent: i64,
+        ancestor: i64,
+    ) -> Result<(), MetaError> {
+        let mut visited = HashSet::new();
+        loop {
+            if parent == ancestor {
+                return Err(MetaError::InvalidPath(format!(
+                    "cannot move directory inode {ancestor} below itself"
+                )));
+            }
+            if parent == 1 {
+                return Ok(());
+            }
+            if !visited.insert(parent) {
+                return Err(MetaError::InvalidPath(format!(
+                    "directory ancestry contains a cycle at inode {parent}"
+                )));
+            }
+
+            let info: EtcdEntryInfo = tx
+                .get_typed_json(Self::etcd_reverse_key(parent))
+                .await?
+                .ok_or_else(|| {
+                    MetaError::InvalidPath(format!(
+                        "directory ancestry references missing inode {parent}"
+                    ))
+                })?;
+            if info.deleted
+                || info.nlink == 0
+                || info.to_file_attr(parent).kind != FileType::Dir
+                || info.parent_inode == parent
+            {
+                return Err(MetaError::InvalidPath(format!(
+                    "invalid directory ancestry at inode {parent}"
+                )));
+            }
+            parent = info.parent_inode;
+        }
     }
 
     fn etcd_session_key(session_id: Option<Uuid>) -> String {
@@ -2181,15 +2259,26 @@ impl MetaStore for EtcdMetaStore {
         skip(self),
         fields(old_parent, old_name, new_parent, new_name)
     )]
-    async fn rename(
+    async fn rename_with_mode(
         &self,
         old_parent: i64,
         old_name: &str,
         new_parent: i64,
         new_name: String,
-    ) -> Result<(), MetaError> {
+        noreplace: bool,
+    ) -> Result<RenameOutcome, MetaError> {
         if old_parent == new_parent && old_name == new_name {
-            return Ok(());
+            let ino = self
+                .lookup(old_parent, old_name)
+                .await?
+                .ok_or(MetaError::NotFound(old_parent))?;
+            return Ok(RenameOutcome {
+                ino,
+                replaced_ino: None,
+                source_is_dir: false,
+                replaced_is_dir: false,
+                renamed: false,
+            });
         }
 
         let old_forward_key = Self::etcd_forward_key(old_parent, old_name);
@@ -2199,7 +2288,7 @@ impl MetaStore for EtcdMetaStore {
             old_name, old_parent, new_name, new_parent
         );
 
-        let entry_ino = EtcdTxn::new(&self.client)
+        let outcome = EtcdTxn::new(&self.client)
             .max_retries(10)
             .run(|tx| {
                 let old_forward_key = old_forward_key.clone();
@@ -2220,25 +2309,45 @@ impl MetaStore for EtcdMetaStore {
                         .get_typed_json(&reverse_key)
                         .await?
                         .ok_or(MetaError::NotFound(entry_ino))?;
+                    let source_is_dir = entry_info.to_file_attr(entry_ino).kind == FileType::Dir;
+                    if source_is_dir {
+                        Self::validate_directory_move_in_txn(tx, new_parent, entry_ino).await?;
+                    }
 
+                    let mut replaced_ino = None;
+                    let mut replaced_is_dir = false;
                     if let Some(replaced_forward) = tx
                         .get_typed_json::<EtcdForwardEntry>(&new_forward_key)
                         .await?
                     {
+                        if noreplace {
+                            return Err(MetaError::AlreadyExists {
+                                parent: new_parent,
+                                name: new_name,
+                            });
+                        }
                         if replaced_forward.inode == entry_ino {
-                            return Ok(entry_ino);
+                            return Ok(RenameOutcome {
+                                ino: entry_ino,
+                                replaced_ino: None,
+                                source_is_dir,
+                                replaced_is_dir: false,
+                                renamed: false,
+                            });
                         }
 
-                        let replaced_ino = replaced_forward.inode;
-                        let replaced_reverse_key = Self::etcd_reverse_key(replaced_ino);
+                        replaced_ino = Some(replaced_forward.inode);
+                        replaced_is_dir = !replaced_forward.is_file;
+                        let replaced_ino_value = replaced_forward.inode;
+                        let replaced_reverse_key = Self::etcd_reverse_key(replaced_ino_value);
                         let mut replaced_info: EtcdEntryInfo = tx
                             .get_typed_json(&replaced_reverse_key)
                             .await?
-                            .ok_or(MetaError::NotFound(replaced_ino))?;
+                            .ok_or(MetaError::NotFound(replaced_ino_value))?;
 
                         match (entry_info.is_file, replaced_info.is_file) {
                             (false, false) => {
-                                let child_prefix = format!("f:{}:", replaced_ino);
+                                let child_prefix = format!("f:{}:", replaced_ino_value);
                                 let children = get_with_retry(&client, &child_prefix, || {
                                     Some(
                                         etcd_client::GetOptions::new()
@@ -2253,7 +2362,7 @@ impl MetaStore for EtcdMetaStore {
                                         ))
                                     })?;
                                 if !children.kvs().is_empty() {
-                                    return Err(MetaError::DirectoryNotEmpty(replaced_ino));
+                                    return Err(MetaError::DirectoryNotEmpty(replaced_ino_value));
                                 }
                                 tx.delete(replaced_reverse_key);
                             }
@@ -2273,13 +2382,13 @@ impl MetaStore for EtcdMetaStore {
                                     .unwrap_or(0);
                                 if replaced_info.nlink > 1 {
                                     let link_parent_key =
-                                        Self::etcd_link_parent_key(replaced_ino);
+                                        Self::etcd_link_parent_key(replaced_ino_value);
                                     let mut link_parents: Vec<EtcdLinkParent> = tx
                                         .get_typed_json(&link_parent_key)
                                         .await?
                                         .ok_or_else(|| {
                                             MetaError::Internal(format!(
-                                                "LinkParent key {link_parent_key} not found for replaced inode {replaced_ino}"
+                                                "LinkParent key {link_parent_key} not found for replaced inode {replaced_ino_value}"
                                             ))
                                         })?;
                                     let original_len = link_parents.len();
@@ -2289,14 +2398,14 @@ impl MetaStore for EtcdMetaStore {
                                     });
                                     if link_parents.len() == original_len {
                                         return Err(MetaError::Internal(format!(
-                                            "No destination LinkParent for inode {replaced_ino}"
+                                            "No destination LinkParent for inode {replaced_ino_value}"
                                         )));
                                     }
 
                                     if replaced_info.nlink == 2 {
                                         let remaining = link_parents.first().ok_or_else(|| {
                                             MetaError::Internal(format!(
-                                                "No remaining LinkParent for inode {replaced_ino}"
+                                                "No remaining LinkParent for inode {replaced_ino_value}"
                                             ))
                                         })?;
                                         replaced_info.parent_inode = remaining.parent_inode;
@@ -2364,10 +2473,20 @@ impl MetaStore for EtcdMetaStore {
                     tx.delete(&old_forward_key);
                     tx.set_typed_json(&reverse_key, &entry_info)?;
 
-                    Ok(entry_ino)
+                    Ok(RenameOutcome {
+                        ino: entry_ino,
+                        replaced_ino,
+                        source_is_dir,
+                        replaced_is_dir,
+                        renamed: true,
+                    })
                 })
             })
             .await?;
+
+        if !outcome.renamed {
+            return Ok(outcome);
+        }
 
         // Update parent directory timestamps
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -2390,10 +2509,10 @@ impl MetaStore for EtcdMetaStore {
 
         info!(
             "Rename completed successfully: {} -> {}, inode={}",
-            old_name, new_name, entry_ino
+            old_name, new_name, outcome.ino
         );
 
-        Ok(())
+        Ok(outcome)
     }
 
     async fn rename_exchange(
@@ -2403,6 +2522,10 @@ impl MetaStore for EtcdMetaStore {
         new_parent: i64,
         new_name: &str,
     ) -> Result<(), MetaError> {
+        if old_parent == new_parent && old_name == new_name {
+            return Ok(());
+        }
+
         let old_forward_key = Self::etcd_forward_key(old_parent, old_name);
         let new_forward_key = Self::etcd_forward_key(new_parent, new_name);
 
@@ -2415,21 +2538,109 @@ impl MetaStore for EtcdMetaStore {
                 let new_name = new_name.to_string();
 
                 Box::pin(async move {
-                    let old_forward_entry: EtcdForwardEntry =
-                        tx.get_typed_json(&old_forward_key).await?.ok_or_else(|| {
-                            MetaError::Internal(format!(
-                                "Entry '{}' not found in parent {} for exchange",
-                                old_name, old_parent
-                            ))
+                    let old_forward_entry: EtcdForwardEntry = tx
+                        .get_typed_json(&old_forward_key)
+                        .await?
+                        .ok_or_else(|| MetaError::EntryNotFound {
+                            parent: old_parent,
+                            name: old_name.clone(),
                         })?;
 
-                    let new_forward_entry: EtcdForwardEntry =
-                        tx.get_typed_json(&new_forward_key).await?.ok_or_else(|| {
-                            MetaError::Internal(format!(
-                                "Entry '{}' not found in parent {} for exchange",
-                                new_name, new_parent
-                            ))
+                    let new_forward_entry: EtcdForwardEntry = tx
+                        .get_typed_json(&new_forward_key)
+                        .await?
+                        .ok_or_else(|| MetaError::EntryNotFound {
+                            parent: new_parent,
+                            name: new_name.clone(),
                         })?;
+                    if old_forward_entry.inode == new_forward_entry.inode {
+                        return Ok(());
+                    }
+                    let old_reverse_key = Self::etcd_reverse_key(old_forward_entry.inode);
+                    let new_reverse_key = Self::etcd_reverse_key(new_forward_entry.inode);
+                    let mut old_info: EtcdEntryInfo = tx
+                        .get_typed_json(&old_reverse_key)
+                        .await?
+                        .ok_or(MetaError::NotFound(old_forward_entry.inode))?;
+                    let mut new_info: EtcdEntryInfo = tx
+                        .get_typed_json(&new_reverse_key)
+                        .await?
+                        .ok_or(MetaError::NotFound(new_forward_entry.inode))?;
+                    let old_is_dir =
+                        old_info.to_file_attr(old_forward_entry.inode).kind == FileType::Dir;
+                    let new_is_dir =
+                        new_info.to_file_attr(new_forward_entry.inode).kind == FileType::Dir;
+                    if old_is_dir {
+                        Self::validate_directory_move_in_txn(
+                            tx,
+                            new_parent,
+                            old_forward_entry.inode,
+                        )
+                        .await?;
+                    }
+                    if new_is_dir {
+                        Self::validate_directory_move_in_txn(
+                            tx,
+                            old_parent,
+                            new_forward_entry.inode,
+                        )
+                        .await?;
+                    }
+
+                    let old_parent_key = Self::etcd_reverse_key(old_parent);
+                    let mut old_parent_info: EtcdEntryInfo = tx
+                        .get_typed_json(&old_parent_key)
+                        .await?
+                        .ok_or(MetaError::ParentNotFound(old_parent))?;
+                    if old_parent_info.to_file_attr(old_parent).kind != FileType::Dir {
+                        return Err(MetaError::NotDirectory(old_parent));
+                    }
+                    let mut new_parent_record = if old_parent == new_parent {
+                        None
+                    } else {
+                        let key = Self::etcd_reverse_key(new_parent);
+                        let info: EtcdEntryInfo = tx
+                            .get_typed_json(&key)
+                            .await?
+                            .ok_or(MetaError::ParentNotFound(new_parent))?;
+                        if info.to_file_attr(new_parent).kind != FileType::Dir {
+                            return Err(MetaError::NotDirectory(new_parent));
+                        }
+                        Some((key, info))
+                    };
+
+                    Self::update_entry_binding_in_txn(
+                        tx,
+                        &mut old_info,
+                        old_forward_entry.inode,
+                        old_parent,
+                        &old_name,
+                        new_parent,
+                        &new_name,
+                    )
+                    .await?;
+                    Self::update_entry_binding_in_txn(
+                        tx,
+                        &mut new_info,
+                        new_forward_entry.inode,
+                        new_parent,
+                        &new_name,
+                        old_parent,
+                        &old_name,
+                    )
+                    .await?;
+                    let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                    old_info.modify_time = now;
+                    new_info.modify_time = now;
+                    tx.set_typed_json(old_reverse_key, &old_info)?;
+                    tx.set_typed_json(new_reverse_key, &new_info)?;
+
+                    old_parent_info.modify_time = now;
+                    if let Some((new_parent_key, mut new_parent_info)) = new_parent_record.take() {
+                        new_parent_info.modify_time = now;
+                        tx.set_typed_json(new_parent_key, &new_parent_info)?;
+                    }
+                    tx.set_typed_json(old_parent_key, &old_parent_info)?;
 
                     let swapped_old_forward = EtcdForwardEntry {
                         parent_inode: old_parent,

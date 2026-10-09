@@ -45,6 +45,10 @@ pub enum WriteBackMode {
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
     pub cache_root: PathBuf,
+    /// Runtime-only identity of the flat volume that owns this cache tree.
+    /// Configuration parsing leaves this unset; mount startup derives it from
+    /// the metadata and object-store identities before constructing the VFS.
+    pub volume_scope: Option<String>,
 
     // Read cache budgets
     pub read_memory_bytes: u64,
@@ -96,16 +100,20 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             cache_root: default_cache_root(),
-            read_memory_bytes: 4096 * 1024 * 1024,
-            read_ssd_bytes: 20 * 1024 * 1024 * 1024,
-            write_memory_bytes: 384 * 1024 * 1024,
-            write_ssd_bytes: 20 * 1024 * 1024 * 1024,
+            volume_scope: None,
+            // Production defaults favor immutable/read-heavy workloads. The
+            // cold-read harness overrides these explicitly to zero, so these
+            // larger budgets cannot contaminate comparison artifacts.
+            read_memory_bytes: 8 * 1024 * 1024 * 1024,
+            read_ssd_bytes: 64 * 1024 * 1024 * 1024,
+            write_memory_bytes: 768 * 1024 * 1024,
+            write_ssd_bytes: 64 * 1024 * 1024 * 1024,
             dirty_slice_target_size: 32 * 1024 * 1024,
             dirty_slice_max_age_ms: 2000,
             upload_concurrency: 10,
             prefetch_enabled: true,
             prefetch_initial_bytes: 4 * 1024 * 1024,
-            prefetch_max_bytes: 64 * 1024 * 1024,
+            prefetch_max_bytes: 128 * 1024 * 1024,
             prefetch_concurrency: 64,
             range_background_prefetch: true,
             populate_write_cache_after_upload: true,
@@ -122,7 +130,7 @@ impl Default for CacheConfig {
             bandwidth: BandwidthConfig::default(),
             // Keep enough foreground write headroom for full 32MiB slice batches
             // without letting close absorb a large upload backlog.
-            memory_budget_bytes: 1280 * 1024 * 1024,
+            memory_budget_bytes: 2 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -143,13 +151,15 @@ mod tests {
         let config = CacheConfig::default();
 
         assert_eq!(config.compression, Compression::Lz4);
-        assert_eq!(config.read_memory_bytes, 4096 * 1024 * 1024);
-        assert_eq!(config.write_memory_bytes, 384 * 1024 * 1024);
-        assert_eq!(config.memory_budget_bytes, 1280 * 1024 * 1024);
+        assert_eq!(config.read_memory_bytes, 8 * 1024 * 1024 * 1024);
+        assert_eq!(config.read_ssd_bytes, 64 * 1024 * 1024 * 1024);
+        assert_eq!(config.write_memory_bytes, 768 * 1024 * 1024);
+        assert_eq!(config.write_ssd_bytes, 64 * 1024 * 1024 * 1024);
+        assert_eq!(config.memory_budget_bytes, 2 * 1024 * 1024 * 1024);
         assert_eq!(config.dirty_slice_target_size, 32 * 1024 * 1024);
         assert_eq!(config.dirty_slice_max_age_ms, 2000);
         assert_eq!(config.upload_concurrency, 10);
-        assert_eq!(config.prefetch_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.prefetch_max_bytes, 128 * 1024 * 1024);
         assert!(config.range_background_prefetch);
         assert!(config.populate_write_cache_after_upload);
         assert!(!config.persist_write_cache_after_upload);

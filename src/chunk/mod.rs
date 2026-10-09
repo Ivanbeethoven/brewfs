@@ -22,7 +22,10 @@ pub mod compact;
 pub mod compress;
 pub mod layout;
 pub mod page_cache;
+#[cfg(feature = "workspace-overlay")]
+pub mod read_plan;
 pub mod reader;
+pub mod runtime_store;
 pub mod singleflight;
 pub mod slice;
 pub mod span;
@@ -42,5 +45,7 @@ pub use layout::{
 pub use singleflight::SingleFlight;
 pub use slice::{BlockSpan, ChunkOffset, SliceDesc, SliceOffset, block_span_iter_slice};
 pub use span::{BlockTag, ChunkTag, PageTag, Span, SpanTag};
-pub use store::{BlockStore, InMemoryBlockStore, ObjectBlockStore, S3BlockStore};
+pub use store::{
+    BlockKey, BlockStore, InMemoryBlockStore, IncompleteBlockRead, ObjectBlockStore, S3BlockStore,
+};
 pub use util::ChunkSpan;

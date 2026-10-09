@@ -4,6 +4,9 @@
 
 ## 文档导航
 
+- `../../../doc/superpowers/specs/2026-09-03-brewfs-workspace-operator-lifecycle-spec.md`
+  - Workspace Operator 的 CRD、生命周期、lower 不可变保护、finalizer 和实现验收规范。
+
 - `architecture.md`
   - 说明 operator 的整体分层、控制循环、资源关系和设计边界。
 - `brewfscluster.md`
@@ -30,6 +33,9 @@
 - 当前 CR：
   - `BrewFSCluster`
   - `BrewFSMount`
+  - `BrewFSWorkspace`（启用 `workspace-operator` feature）
+  - `BrewFSWorkspaceMount`（启用 `workspace-operator` feature）
+  - `BrewFSWorkspaceSnapshot`（启用 `workspace-operator` feature）
 
 ## 当前能力边界
 
@@ -39,6 +45,8 @@
 - 管理 BrewFS 挂载 workload
 - 通过 `hostMountPath` 把挂载点暴露到宿主机目录
 - 可选自动创建一个 consumer workload 来消费相同宿主机目录
+- 使用 Redis 或 TiKV catalog 管理固定两层 workspace、独占写租约和不可变快照
+- 为 agent 创建单副本 StatefulSet，将有特权的 FUSE sidecar 与无后端凭据的 agent container 隔离
 
 当前 operator 还没有做到：
 

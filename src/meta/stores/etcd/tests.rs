@@ -10,6 +10,7 @@ use crate::meta::stores::EtcdMetaStore;
 use crate::vfs::chunk_id_for;
 use chrono::Utc;
 use serial_test::serial;
+use std::sync::Arc;
 use tokio::time;
 use uuid::Uuid;
 
@@ -65,6 +66,71 @@ fn shared_db_config() -> Config {
         cache: CacheConfig::default(),
         client: ClientOptions::default(),
         compact: CompactConfig::default(),
+    }
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn rename_exchange_updates_bindings_and_prevents_concurrent_cycle() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let left = store.mkdir(root, "left".into()).await.unwrap();
+    let right = store.mkdir(root, "right".into()).await.unwrap();
+    let directory = store.mkdir(left, "directory".into()).await.unwrap();
+    let file = store.create_file(right, "file".into()).await.unwrap();
+
+    store
+        .rename_exchange(left, "directory", right, "file")
+        .await
+        .unwrap();
+    assert_eq!(store.lookup(left, "directory").await.unwrap(), Some(file));
+    assert_eq!(store.lookup(right, "file").await.unwrap(), Some(directory));
+    assert_eq!(store.get_dir_parent(directory).await.unwrap(), Some(right));
+    assert_eq!(
+        store.get_names(file).await.unwrap(),
+        vec![(Some(left), "directory".into())]
+    );
+
+    cleanup_test_data().await.unwrap();
+    let store = Arc::new(EtcdMetaStore::from_config(test_config()).await.unwrap());
+    let root = store.root_ino();
+    let a = store.mkdir(root, "a".into()).await.unwrap();
+    let q = store.mkdir(root, "q".into()).await.unwrap();
+    let x = store.mkdir(q, "x".into()).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let exchange = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.rename_exchange(root, "a", q, "x").await
+        })
+    };
+    let rename = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.rename(root, "q", a, "q".into()).await
+        })
+    };
+    barrier.wait().await;
+
+    let exchange = exchange.await.unwrap();
+    let rename = rename.await.unwrap();
+    assert!(exchange.is_ok() ^ rename.is_ok());
+    assert!(matches!(
+        exchange.err().or_else(|| rename.err()).unwrap(),
+        MetaError::InvalidPath(_)
+    ));
+    for start in [a, q, x] {
+        let mut current = start;
+        let mut visited = std::collections::HashSet::new();
+        while current != root {
+            assert!(visited.insert(current));
+            current = store.get_dir_parent(current).await.unwrap().unwrap();
+        }
     }
 }
 

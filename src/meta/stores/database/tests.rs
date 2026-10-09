@@ -1,8 +1,16 @@
 use super::*;
+use crate::chunk::{layout::ChunkLayout, store::InMemoryBlockStore};
+use crate::meta::MetaLayer;
+use crate::meta::client::MetaClient;
+use crate::meta::config::{CacheCapacity, CacheTtl};
 use crate::meta::config::{CacheConfig, ClientOptions, CompactConfig, DatabaseConfig};
 use crate::meta::file_lock::{FileLockQuery, FileLockRange, FileLockType};
+use crate::vfs::fs::VFS;
+use asyncfuse::Errno;
+use asyncfuse::raw::{Filesystem, Request};
 use sea_orm::sqlx::sqlite::SqliteConnectOptions;
 use sea_orm::sqlx::{Connection, Executor, SqliteConnection};
+use std::ffi::OsStr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +67,66 @@ async fn new_test_store_with_session(session_id: Uuid) -> DatabaseMetaStore {
     let store = new_test_store().await;
     store.set_sid(session_id).expect("Failed to set session ID");
     store
+}
+
+#[tokio::test]
+async fn dangling_dentry_fused_lookup_returns_not_found_and_fuse_enoent() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let name = "dangling-client-lookup.txt";
+    let ino = store.create_file(root, name.to_string()).await.unwrap();
+
+    let deleted = FileMeta::delete_by_id(ino)
+        .exec(&store.db)
+        .await
+        .expect("delete inode metadata while retaining the dentry");
+    assert_eq!(deleted.rows_affected, 1);
+    assert_eq!(
+        store.lookup(root, name).await.unwrap(),
+        Some(ino),
+        "the directory entry must remain after deleting the inode record"
+    );
+
+    let client = MetaClient::new(
+        store,
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl {
+            inode_ttl: Duration::from_secs(60),
+            path_ttl: Duration::from_secs(60),
+        },
+    );
+    assert!(matches!(
+        client.lookup(root, name).await,
+        Err(MetaError::NotFound(found)) if found == ino
+    ));
+    assert!(matches!(
+        client.lookup_with_attr(root, name).await,
+        Err(MetaError::NotFound(found)) if found == ino
+    ));
+
+    let fs = VFS::with_meta_layer_with_default_background(
+        ChunkLayout::default(),
+        Arc::new(InMemoryBlockStore::new()),
+        client,
+    )
+    .unwrap();
+    let err = Filesystem::lookup(
+        &fs,
+        Request {
+            unique: 1,
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        },
+        root as u64,
+        OsStr::new(name),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, Errno::from(libc::ENOENT));
 }
 
 #[tokio::test]
@@ -685,6 +753,163 @@ async fn test_hardlink_dentry_binding_cross_dir_move_rename() {
     assert_eq!(store.lookup(dir_b, "y").await.unwrap(), None);
     assert_eq!(store.lookup(dir_c, "z").await.unwrap(), Some(ino));
     assert_eq!(store.lookup(dir_a, "x").await.unwrap(), Some(ino));
+}
+
+#[tokio::test]
+async fn rename_exchange_rejects_descendants_at_store_boundary() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let ancestor = store.mkdir(root, "ancestor".to_string()).await.unwrap();
+    let intermediate = store
+        .mkdir(ancestor, "intermediate".to_string())
+        .await
+        .unwrap();
+    let descendant = store
+        .mkdir(intermediate, "descendant".to_string())
+        .await
+        .unwrap();
+    let file = store
+        .create_file(ancestor, "file".to_string())
+        .await
+        .unwrap();
+
+    let error = store
+        .rename(root, "ancestor", intermediate, "moved".to_string())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaError::InvalidPath(_)));
+    assert_eq!(
+        store.lookup(root, "ancestor").await.unwrap(),
+        Some(ancestor)
+    );
+    assert_eq!(store.lookup(intermediate, "moved").await.unwrap(), None);
+
+    let error = store
+        .rename_exchange(root, "ancestor", intermediate, "descendant")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaError::InvalidPath(_)));
+    assert_eq!(
+        store.lookup(root, "ancestor").await.unwrap(),
+        Some(ancestor)
+    );
+    assert_eq!(
+        store.lookup(intermediate, "descendant").await.unwrap(),
+        Some(descendant)
+    );
+
+    let error = store
+        .rename_exchange(intermediate, "descendant", root, "ancestor")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaError::InvalidPath(_)));
+    assert_eq!(
+        store.lookup(root, "ancestor").await.unwrap(),
+        Some(ancestor)
+    );
+    assert_eq!(
+        store.lookup(intermediate, "descendant").await.unwrap(),
+        Some(descendant)
+    );
+
+    let error = store
+        .rename_exchange(root, "ancestor", ancestor, "file")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaError::InvalidPath(_)));
+    assert_eq!(
+        store.lookup(root, "ancestor").await.unwrap(),
+        Some(ancestor)
+    );
+    assert_eq!(store.lookup(ancestor, "file").await.unwrap(), Some(file));
+
+    let error = store
+        .rename_exchange(root, "missing", ancestor, "file")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MetaError::EntryNotFound { parent, name }
+            if parent == root && name == "missing"
+    ));
+}
+
+#[tokio::test]
+async fn rename_exchange_updates_directory_and_file_bindings() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let left = store.mkdir(root, "left".into()).await.unwrap();
+    let right = store.mkdir(root, "right".into()).await.unwrap();
+    let directory = store.mkdir(left, "directory".into()).await.unwrap();
+    let file = store.create_file(right, "file".into()).await.unwrap();
+
+    store
+        .rename_exchange(left, "directory", right, "file")
+        .await
+        .unwrap();
+
+    assert_eq!(store.lookup(left, "directory").await.unwrap(), Some(file));
+    assert_eq!(store.lookup(right, "file").await.unwrap(), Some(directory));
+    assert_eq!(store.get_dir_parent(directory).await.unwrap(), Some(right));
+    assert_eq!(
+        store.get_names(file).await.unwrap(),
+        vec![(Some(left), "directory".into())]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_directory_moves_cannot_commit_a_parent_cycle() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("rename-cycle-race.db");
+    let config = file_db_config(&db_path);
+    let first = Arc::new(
+        DatabaseMetaStore::from_config(config.clone())
+            .await
+            .unwrap(),
+    );
+    let second = Arc::new(DatabaseMetaStore::from_config(config).await.unwrap());
+    let root = first.root_ino();
+    let a = first.mkdir(root, "a".into()).await.unwrap();
+    let q = first.mkdir(root, "q".into()).await.unwrap();
+    let x = first.mkdir(q, "x".into()).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+    let exchange = {
+        let store = Arc::clone(&first);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.rename_exchange(root, "a", q, "x").await
+        })
+    };
+    let rename = {
+        let store = Arc::clone(&second);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.rename(root, "q", a, "q".into()).await
+        })
+    };
+    barrier.wait().await;
+
+    let exchange = exchange.await.unwrap();
+    let rename = rename.await.unwrap();
+    assert!(exchange.is_ok() ^ rename.is_ok());
+    let error = exchange.err().or_else(|| rename.err()).unwrap();
+    assert!(matches!(error, MetaError::InvalidPath(_)));
+
+    for start in [a, q, x] {
+        let mut current = start;
+        let mut visited = std::collections::HashSet::new();
+        while current != root {
+            assert!(visited.insert(current), "cycle detected at inode {current}");
+            current = first
+                .get_dir_parent(current)
+                .await
+                .unwrap()
+                .expect("directory must retain a parent");
+        }
+    }
 }
 
 #[tokio::test]
@@ -1347,6 +1572,22 @@ async fn test_chown_updates_uid_and_gid() {
     let stat = store.stat(ino).await.unwrap().unwrap();
     assert_eq!(stat.uid, 1000);
     assert_eq!(stat.gid, 1000);
+}
+
+#[tokio::test]
+async fn test_chown_ctime_does_not_advance_past_wall_clock() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let mut attr = store.stat(root).await.unwrap().unwrap();
+    for uid in [1000, 1001, 1002] {
+        attr = store.chown(root, Some(uid), None).await.unwrap();
+    }
+
+    assert!(
+        attr.ctime <= DatabaseMetaStore::now_nanos(),
+        "ctime must describe when the metadata change happened, not a synthetic future time"
+    );
 }
 
 #[tokio::test]

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "codex/**"]
+    branches: [main, "feat/**", "fix/**", "docs/**", "perf/**"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -20,6 +20,7 @@ on:
           - tikv-xfstests-smoke
           - tikv-pjdfstest
           - tikv-ltp
+          - workspace-overlay
           - all
       stress_ng_profile:
         description: stress-ng profile for the Docker stress job
@@ -30,6 +31,10 @@ on:
           - metadata-heavy
           - link-symlink-heavy
           - write-smallfile
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -72,12 +77,27 @@ jobs:
           bash -n docker/compose-xfstests/run_tikv_perf.sh
           bash -n docker/compose-xfstests/run_juicefs_perf_in_container.sh
           bash -n docker/compose-xfstests/run_juicefs_perf.sh
+          bash -n docker/compose-xfstests/run_workspace_overlay_dual_mount_in_container.sh
+          bash -n docker/compose-xfstests/run_workspace_overlay_control_in_container.sh
+          bash -n docker/compose-xfstests/run_workspace_overlay_suite_in_container.sh
+          bash -n docker/compose-xfstests/run_workspace_overlay_compose.sh
+          bash -n docker/compose-xfstests/run_workspace_overlay_suites.sh
+          bash -n docker/compose-xfstests/run_s3_git_clone_smoke.sh
           bash docker/compose-xfstests/test_perf_report_delta.sh
           bash docker/compose-xfstests/test_juicefs_direct_matrix.sh
           bash docker/compose-xfstests/test_juicefs_perf_report.sh
+          bash tools/perf/test_packed_runner_ttl.sh
+          python3 -m unittest discover -s tools/perf -p test_smallfiles_scan.py
+          bash -n tools/perf/run_packed_local.sh
+          python3 -m unittest discover -s tools/perf -p test_packed_local_runner.py
 
-      - name: Check workspace
-        run: cargo check --workspace
+      - name: Check patched FUSE transport
+        run: |
+          rustfmt --edition 2021 --check vendor/asyncfuse/src/raw/session/mod.rs vendor/asyncfuse/src/raw/session/handlers.rs vendor/asyncfuse/src/raw/session/xattr_reply.rs
+          cargo test --manifest-path vendor/asyncfuse/Cargo.toml --lib --no-default-features --features tokio-runtime
+          cargo check --manifest-path vendor/asyncfuse/Cargo.toml --no-default-features --features tokio-runtime
+          cargo check --manifest-path vendor/asyncfuse/Cargo.toml --no-default-features --features io-uring-runtime
+          cargo check --manifest-path vendor/asyncfuse/Cargo.toml --no-default-features --features async-io-runtime
 
       - name: Build workspace
         run: cargo build --workspace
@@ -86,12 +106,170 @@ jobs:
         run: |
           cargo check -p brewfs --no-default-features --features fuse-tokio-runtime
           cargo check -p brewfs --no-default-features --features fuse-io-uring-runtime
+          cargo check -p brewfs --no-default-features --features fuse-tokio-runtime,workspace-overlay
+          cargo check -p brewfs --no-default-features --features fuse-io-uring-runtime,workspace-overlay
 
       - name: Test workspace
         run: cargo test --workspace --lib --bins -- --test-threads=1
 
-      - name: Clippy
-        run: cargo clippy --workspace
+      - name: Test all features
+        run: cargo test --workspace --all-features -- --test-threads=1
+
+      - name: Clippy default features
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy workspace overlay
+        run: cargo clippy --workspace --all-targets --features workspace-overlay -- -D warnings
+
+      - name: Test workspace operator
+        working-directory: operator/brewfs-operator
+        run: |
+          cargo check
+          cargo test --features workspace-operator
+          cargo clippy --features workspace-operator --all-targets -- -D warnings
+
+      - name: Verify generated operator CRDs
+        working-directory: operator/brewfs-operator
+        run: |
+          cargo run --features workspace-operator -- crdgen > /tmp/brewfs-operator-crd.yaml
+          diff -u manifests/crd.yaml /tmp/brewfs-operator-crd.yaml
+
+  docker-workspace-overlay-smoke:
+    name: Docker workspace overlay smoke (${{ matrix.meta-backend }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        meta-backend: [redis, tikv]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler fuse3
+
+      - name: Enable FUSE
+        run: |
+          sudo modprobe fuse
+          test -e /dev/fuse
+          sudo chmod 666 /dev/fuse
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Show Docker versions
+        run: |
+          docker version
+          docker compose version
+
+      - name: Run workspace overlay control smoke
+        run: >-
+          bash docker/compose-xfstests/run_workspace_overlay_compose.sh
+          --backend "${{ matrix.meta-backend }}"
+          --control-only
+
+      - name: Upload workspace overlay smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-overlay-smoke-${{ matrix.meta-backend }}-artifacts
+          path: docker/compose-xfstests/artifacts/**
+          if-no-files-found: warn
+  docker-workspace-overlay:
+    name: Docker workspace overlay (${{ matrix.meta-backend }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' &&
+        (inputs.docker_suite == 'workspace-overlay' || inputs.docker_suite == 'all')
+      }}
+    strategy:
+      fail-fast: false
+      matrix:
+        meta-backend: [redis, tikv]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler fuse3
+
+      - name: Enable FUSE
+        run: |
+          sudo modprobe fuse
+          test -e /dev/fuse
+          sudo chmod 666 /dev/fuse
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Show Docker versions
+        run: |
+          docker version
+          docker compose version
+
+      - name: Run workspace overlay xfstests and LTP Compose suite
+        run: >-
+          bash docker/compose-xfstests/run_workspace_overlay_compose.sh
+          --backend "${{ matrix.meta-backend }}"
+
+      - name: Upload workspace overlay artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-overlay-${{ matrix.meta-backend }}-artifacts
+          path: docker/compose-xfstests/artifacts/**
+          if-no-files-found: warn
+
+  results-web:
+    name: Results web
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/results/package-lock.json
+
+      - name: Install dependencies
+        working-directory: web/results
+        run: npm ci
+
+      - name: Test frontend
+        working-directory: web/results
+        run: npm test -- --run
+
+      - name: Build frontend
+        working-directory: web/results
+        run: npm run build
+
+      - name: Test result server
+        working-directory: web/results
+        run: python3 -m unittest -v test_server.py
 
   docker-pjdfstest:
     name: Docker pjdfstest smoke

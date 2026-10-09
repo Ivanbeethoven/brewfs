@@ -3,14 +3,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashSet;
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use crate::chunk::store::persistent_slice_cache_path;
+
 use super::keys::{DirtySliceKey, DirtySliceState};
+
+#[cfg(feature = "workspace-overlay")]
+mod packed_recovery;
+#[cfg(feature = "workspace-overlay")]
+pub(crate) use packed_recovery::MAX_PACKED_RECOVERY_SLICE_BYTES;
 
 /// Record describing a dirty slice persisted to local SSD.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DirtySliceRecord {
+    #[serde(default)]
+    pub volume_scope: Option<String>,
     pub key: DirtySliceKey,
     pub ino: i64,
     pub chunk_id: u64,
@@ -59,6 +69,14 @@ pub trait WriteBackCache: Send + Sync {
 
     /// Remove a committed or obsolete slice from local storage.
     async fn remove(&self, key: &DirtySliceKey) -> anyhow::Result<()>;
+
+    /// Publish a staged immutable slice into the persistent read cache without
+    /// copying its bytes. Returns false when stage reuse is not configured.
+    async fn promote_to_read_cache(
+        &self,
+        key: &DirtySliceKey,
+        slice_id: u64,
+    ) -> anyhow::Result<bool>;
 }
 
 /// Filesystem-backed write-back cache implementation.
@@ -70,12 +88,37 @@ pub trait WriteBackCache: Send + Sync {
 ///     — sealed data and record for high-throughput unsynced writeback
 pub struct FsWriteBackCache {
     root: PathBuf,
+    volume_scope: Option<String>,
     seq: AtomicU64,
     sync_on_persist: bool,
+    read_cache_root: Option<PathBuf>,
+    allocation_unit: u64,
     created_dirs: DashSet<PathBuf>,
+    recoverable_keys: DashSet<DirtySliceKey>,
 }
 
 impl FsWriteBackCache {
+    #[cfg(feature = "workspace-overlay")]
+    pub(crate) fn has_recoverable_for_inode(
+        &self,
+        ino: i64,
+        max_rows: usize,
+    ) -> anyhow::Result<bool> {
+        let mut found = false;
+        for (index, key) in self.recoverable_keys.iter().enumerate() {
+            if index >= max_rows {
+                return Err(
+                    crate::workspace_overlay::packed_v3::PackedWireError::LimitExceeded(
+                        "recovery overlay probe row cap".into(),
+                    )
+                    .into(),
+                );
+            }
+            found |= key.ino == ino;
+        }
+        Ok(found)
+    }
+
     pub fn new(root: PathBuf) -> Self {
         Self::new_with_sync(root, true)
     }
@@ -83,14 +126,47 @@ impl FsWriteBackCache {
     pub fn new_with_sync(root: PathBuf, sync_on_persist: bool) -> Self {
         Self {
             root,
+            volume_scope: None,
             seq: AtomicU64::new(0),
             sync_on_persist,
+            read_cache_root: None,
+            allocation_unit: 0,
             created_dirs: DashSet::new(),
+            recoverable_keys: DashSet::new(),
         }
+    }
+
+    pub fn new_with_sync_and_read_cache(
+        root: PathBuf,
+        sync_on_persist: bool,
+        read_cache_root: PathBuf,
+        allocation_unit: u64,
+    ) -> Self {
+        Self {
+            root,
+            volume_scope: None,
+            seq: AtomicU64::new(0),
+            sync_on_persist,
+            read_cache_root: Some(read_cache_root),
+            allocation_unit,
+            created_dirs: DashSet::new(),
+            recoverable_keys: DashSet::new(),
+        }
+    }
+
+    pub fn with_volume_scope(mut self, volume_scope: Option<String>) -> Self {
+        self.volume_scope = volume_scope;
+        self
     }
 
     pub fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn volume_scope_fingerprint(&self) -> Option<String> {
+        self.volume_scope
+            .as_ref()
+            .map(|scope| hex::encode(Sha256::digest(scope.as_bytes())))
     }
 
     async fn write_meta_at(
@@ -128,6 +204,13 @@ impl FsWriteBackCache {
     async fn read_meta(&self, meta_path: &Path) -> anyhow::Result<DirtySliceRecord> {
         let data = fs::read(meta_path).await?;
         let record: DirtySliceRecord = serde_json::from_slice(&data)?;
+        anyhow::ensure!(
+            record.volume_scope == self.volume_scope,
+            "writeback volume scope mismatch at {}: expected {:?}, found {:?}",
+            meta_path.display(),
+            self.volume_scope,
+            record.volume_scope
+        );
         Ok(record)
     }
 
@@ -139,10 +222,15 @@ impl FsWriteBackCache {
         path.extension().and_then(|e| e.to_str()) == Some("sealed")
     }
 
-    fn sealed_record_from_path(path: PathBuf) -> Option<DirtySliceRecord> {
+    fn sealed_record_from_path(&self, path: PathBuf) -> Option<DirtySliceRecord> {
         let file_name = path.file_name()?.to_str()?;
-        let (key, chunk_offset, length) = DirtySliceKey::parse_sealed_file_name(file_name)?;
+        let (key, chunk_offset, length, record_scope) =
+            DirtySliceKey::parse_sealed_file_name(file_name)?;
+        if record_scope != self.volume_scope_fingerprint() {
+            return None;
+        }
         Some(DirtySliceRecord {
+            volume_scope: self.volume_scope.clone(),
             key,
             ino: key.ino,
             chunk_id: key.chunk_id,
@@ -178,8 +266,8 @@ impl FsWriteBackCache {
         Ok(())
     }
 
-    fn push_recoverable_sealed(path: PathBuf, records: &mut Vec<DirtySliceRecord>) {
-        match Self::sealed_record_from_path(path.clone()) {
+    fn push_recoverable_sealed(&self, path: PathBuf, records: &mut Vec<DirtySliceRecord>) {
+        match self.sealed_record_from_path(path.clone()) {
             Some(record) => records.push(record),
             None => {
                 tracing::warn!(path = ?path, "invalid sealed writeback record name");
@@ -201,7 +289,7 @@ impl FsWriteBackCache {
             if Self::is_meta_path(&path) {
                 self.push_recoverable_meta(&path, records).await?;
             } else if Self::is_sealed_path(&path) {
-                Self::push_recoverable_sealed(path, records);
+                self.push_recoverable_sealed(path, records);
             }
         }
         Ok(())
@@ -223,7 +311,9 @@ impl FsWriteBackCache {
             let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if file_name.starts_with(&prefix) {
+            if file_name.starts_with(&prefix)
+                && self.sealed_record_from_path(path.clone()).is_some()
+            {
                 return Ok(Some(path));
             }
         }
@@ -246,7 +336,9 @@ impl FsWriteBackCache {
             let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if file_name.starts_with(&prefix) {
+            if file_name.starts_with(&prefix)
+                && self.sealed_record_from_path(path.clone()).is_some()
+            {
                 let _ = fs::remove_file(path).await;
             }
         }
@@ -274,7 +366,7 @@ impl FsWriteBackCache {
                     Ok(_) | Err(_) => continue,
                 }
             } else if Self::is_sealed_path(&path) {
-                match Self::sealed_record_from_path(path) {
+                match self.sealed_record_from_path(path) {
                     Some(record) if record.ino == ino && record.chunk_id == chunk_id => record,
                     Some(_) | None => continue,
                 }
@@ -331,7 +423,7 @@ impl FsWriteBackCache {
                     Ok(_) | Err(_) => continue,
                 }
             } else if Self::is_sealed_path(&path) {
-                match Self::sealed_record_from_path(path) {
+                match self.sealed_record_from_path(path) {
                     Some(record) if record.ino == ino && record.chunk_id == chunk_id => record,
                     Some(_) | None => continue,
                 }
@@ -373,6 +465,7 @@ impl FsWriteBackCache {
         path: PathBuf,
     ) -> anyhow::Result<()> {
         let record = DirtySliceRecord {
+            volume_scope: self.volume_scope.clone(),
             key,
             ino: key.ino,
             chunk_id: key.chunk_id,
@@ -394,7 +487,13 @@ impl FsWriteBackCache {
         length: u64,
         slice_path: PathBuf,
     ) -> anyhow::Result<()> {
-        let sealed_path = key.sealed_slice_path(&self.root, chunk_offset, length);
+        let scope_fingerprint = self.volume_scope_fingerprint();
+        let sealed_path = key.sealed_slice_path(
+            &self.root,
+            chunk_offset,
+            length,
+            scope_fingerprint.as_deref(),
+        );
         fs::rename(&slice_path, &sealed_path).await?;
         Ok(())
     }
@@ -417,6 +516,39 @@ impl WriteBackCache for FsWriteBackCache {
         self.ensure_dir(&dir).await?;
 
         let slice_path = key.slice_path(&self.root);
+
+        if let Some(allocation_unit) = std::num::NonZeroU64::new(self.allocation_unit) {
+            let allocation_unit = allocation_unit.get();
+            let data_len = data.iter().map(Bytes::len).sum::<usize>() as u64;
+            let allocation_start = slice_offset / allocation_unit * allocation_unit;
+            let data_end = slice_offset.saturating_add(data_len);
+            let allocation_end =
+                data_end.saturating_add(allocation_unit - 1) / allocation_unit * allocation_unit;
+            let allocation_len = allocation_end.saturating_sub(allocation_start);
+            let allocation_path = slice_path.clone();
+            tokio::task::spawn_blocking(move || {
+                use std::os::fd::AsRawFd;
+
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(allocation_path)?;
+                let result = unsafe {
+                    libc::fallocate(
+                        file.as_raw_fd(),
+                        libc::FALLOC_FL_KEEP_SIZE,
+                        allocation_start as libc::off_t,
+                        allocation_len as libc::off_t,
+                    )
+                };
+                if result == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .await??;
+        }
 
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -466,6 +598,7 @@ impl WriteBackCache for FsWriteBackCache {
             self.seal_by_rename(key, chunk_offset, length, slice_path)
                 .await?;
         }
+        self.recoverable_keys.insert(key);
         Ok(())
     }
 
@@ -502,6 +635,12 @@ impl WriteBackCache for FsWriteBackCache {
         {
             self.remove_sealed_paths(key).await?;
         }
+        if matches!(
+            state,
+            DirtySliceState::Committed | DirtySliceState::Obsolete
+        ) {
+            self.recoverable_keys.remove(key);
+        }
         Ok(())
     }
 
@@ -520,7 +659,7 @@ impl WriteBackCache for FsWriteBackCache {
                 if Self::is_meta_path(&path) {
                     self.push_recoverable_meta(&path, &mut records).await?;
                 } else if Self::is_sealed_path(&path) {
-                    Self::push_recoverable_sealed(path, &mut records);
+                    self.push_recoverable_sealed(path, &mut records);
                 }
                 continue;
             }
@@ -542,6 +681,9 @@ impl WriteBackCache for FsWriteBackCache {
                 }
             }
         }
+        for record in &records {
+            self.recoverable_keys.insert(record.key);
+        }
         Ok(records)
     }
 
@@ -555,7 +697,40 @@ impl WriteBackCache for FsWriteBackCache {
             let _ = fs::remove_file(&path).await;
         }
         self.remove_sealed_paths(key).await?;
+        self.recoverable_keys.remove(key);
         Ok(())
+    }
+
+    async fn promote_to_read_cache(
+        &self,
+        key: &DirtySliceKey,
+        slice_id: u64,
+    ) -> anyhow::Result<bool> {
+        let Some(read_cache_root) = &self.read_cache_root else {
+            return Ok(false);
+        };
+        fs::create_dir_all(read_cache_root).await?;
+
+        let source = if key.slice_path(&self.root).exists() {
+            key.slice_path(&self.root)
+        } else {
+            self.sealed_path_for_key(key)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("sealed writeback slice not found for {key:?}"))?
+        };
+        let target = persistent_slice_cache_path(read_cache_root, slice_id);
+        if target.exists() {
+            return Ok(true);
+        }
+
+        let temporary = target.with_extension(format!("link-{}", std::process::id()));
+        let _ = fs::remove_file(&temporary).await;
+        fs::hard_link(&source, &temporary).await?;
+        if let Err(err) = fs::rename(&temporary, &target).await {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(err.into());
+        }
+        Ok(true)
     }
 }
 
@@ -571,6 +746,10 @@ impl FsWriteBackCache {
         chunk_offset: u64,
         buf: &mut [u8],
     ) -> anyhow::Result<()> {
+        if self.recoverable_keys.is_empty() {
+            return Ok(());
+        }
+
         let chunk_dir = self
             .root
             .join("dirty")
@@ -607,6 +786,9 @@ impl FsWriteBackCache {
     ) -> anyhow::Result<Option<Vec<u8>>> {
         if len == 0 {
             return Ok(Some(Vec::new()));
+        }
+        if self.recoverable_keys.is_empty() {
+            return Ok(None);
         }
 
         let dirty_root = self.root.join("dirty");
@@ -718,6 +900,132 @@ mod tests {
         let records = cache.recover().await.unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].path, path);
+    }
+
+    #[tokio::test]
+    async fn volume_scopes_isolate_overlapping_dirty_slice_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = DirtySliceKey {
+            ino: 7,
+            chunk_id: 11,
+            local_seq: 13,
+            epoch: 0,
+        };
+        let first =
+            FsWriteBackCache::new_with_sync(temp.path().join("flat-v1/first/writeback"), true)
+                .with_volume_scope(Some("first".to_string()));
+        let second =
+            FsWriteBackCache::new_with_sync(temp.path().join("flat-v1/second/writeback"), true)
+                .with_volume_scope(Some("second".to_string()));
+
+        first
+            .persist_slice_data(key, vec![Bytes::from_static(b"first-volume")], 0)
+            .await
+            .unwrap();
+        first.seal_slice_record(key, 0, 12).await.unwrap();
+        second
+            .persist_slice_data(key, vec![Bytes::from_static(b"second-volume")], 0)
+            .await
+            .unwrap();
+        second.seal_slice_record(key, 0, 13).await.unwrap();
+
+        let first_records = first.recover().await.unwrap();
+        let second_records = second.recover().await.unwrap();
+        assert_eq!(first_records[0].volume_scope.as_deref(), Some("first"));
+        assert_eq!(second_records[0].volume_scope.as_deref(), Some("second"));
+        assert_eq!(
+            tokio::fs::read(&first_records[0].path).await.unwrap(),
+            b"first-volume"
+        );
+        assert_eq!(
+            tokio::fs::read(&second_records[0].path).await.unwrap(),
+            b"second-volume"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_json_record_from_another_volume_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = DirtySliceKey {
+            ino: 7,
+            chunk_id: 11,
+            local_seq: 13,
+            epoch: 0,
+        };
+        let writer = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), true)
+            .with_volume_scope(Some("first".to_string()));
+        writer
+            .persist_slice_data(key, vec![Bytes::from_static(b"payload")], 0)
+            .await
+            .unwrap();
+        writer.seal_slice_record(key, 0, 7).await.unwrap();
+
+        let wrong_volume = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), true)
+            .with_volume_scope(Some("second".to_string()));
+        assert!(wrong_volume.recover().await.unwrap().is_empty());
+        assert!(
+            wrong_volume
+                .read_meta(&key.meta_path(temp.path()))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_compact_record_from_another_volume_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = DirtySliceKey {
+            ino: 7,
+            chunk_id: 11,
+            local_seq: 13,
+            epoch: 0,
+        };
+        let writer = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), false)
+            .with_volume_scope(Some("first".to_string()));
+        writer
+            .persist_slice_data(key, vec![Bytes::from_static(b"payload")], 0)
+            .await
+            .unwrap();
+        writer.seal_slice_record(key, 0, 7).await.unwrap();
+        assert_eq!(writer.recover().await.unwrap().len(), 1);
+
+        let wrong_volume = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), false)
+            .with_volume_scope(Some("second".to_string()));
+        assert!(wrong_volume.recover().await.unwrap().is_empty());
+        assert!(wrong_volume.open_slice(&key).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn promoted_slice_survives_dirty_record_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let read_cache_root = temp.path().join("chunks");
+        let cache = FsWriteBackCache::new_with_sync_and_read_cache(
+            temp.path().join("writeback"),
+            false,
+            read_cache_root.clone(),
+            4 * 1024 * 1024,
+        );
+        let key = DirtySliceKey {
+            ino: 7,
+            chunk_id: 11,
+            local_seq: 13,
+            epoch: 0,
+        };
+
+        cache
+            .persist_slice_data(key, vec![Bytes::from_static(b"persistent")], 0)
+            .await
+            .unwrap();
+        cache.seal_slice_record(key, 0, 10).await.unwrap();
+        assert!(cache.promote_to_read_cache(&key, 13).await.unwrap());
+        cache.remove(&key).await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read(persistent_slice_cache_path(&read_cache_root, 13))
+                .await
+                .unwrap(),
+            b"persistent"
+        );
     }
 
     #[tokio::test]
@@ -860,6 +1168,33 @@ mod tests {
                 .is_none(),
             "a trailing gap must not be treated as covered"
         );
+    }
+
+    #[tokio::test]
+    async fn recoverable_key_index_tracks_seal_recovery_and_remove() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = DirtySliceKey {
+            ino: 10,
+            chunk_id: 22,
+            local_seq: 3,
+            epoch: 0,
+        };
+
+        let cache = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), false);
+        cache
+            .persist_slice_data(key, vec![Bytes::from_static(b"payload")], 0)
+            .await
+            .unwrap();
+        cache.seal_slice_record(key, 0, 7).await.unwrap();
+        assert!(!cache.recoverable_keys.is_empty());
+
+        let recovered = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), false);
+        assert!(recovered.recoverable_keys.is_empty());
+        assert_eq!(recovered.recover().await.unwrap().len(), 1);
+        assert!(!recovered.recoverable_keys.is_empty());
+
+        recovered.remove(&key).await.unwrap();
+        assert!(recovered.recoverable_keys.is_empty());
     }
 
     #[tokio::test]

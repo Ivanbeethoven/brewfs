@@ -35,7 +35,7 @@ usage() {
   --bigwrite-throughput-profile
                              启用 fio-bigwrite/大 buffered write 吞吐 profile；这是 --writeback-throughput-profile 的明确别名，会启用 commit-before-upload 写回语义
   --writeback-throughput-profile
-                             启用 S3 writeback 全场景吞吐 profile（cache root=/var/lib/brewfs/cache, 4GiB read/write memory+SSD cache, 12GiB memory budget, S3 max concurrency=16, writeback upload concurrency=6, pending soft/hard=2GiB/3GiB, writeback persist fsync=false, compression=none, full cache checksum, fuse workers=16, fuse max_background=512, read-throughput profile, fio prefill/post-write drain+remount）
+                             启用 S3 writeback 全场景吞吐 profile（cache root=/var/lib/brewfs/cache, 4GiB memory + 8GiB read-SSD/4GiB write-SSD cache, 上传后持久块缓存并在 prefill remount 后保留, 12GiB memory budget, S3 max concurrency=16, writeback upload concurrency=6, pending soft/hard=2GiB/3GiB, writeback persist fsync=false, compression=none, full cache checksum, fuse workers=16, fuse max_background=512, 1GiB readahead, read-throughput profile, fio prefill/post-write drain+remount）
   --tools "<tool...>"        指定压力工具列表，默认: "fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
   --brewfs-bench           额外运行一次宿主机 cargo bench --bench brewfs_bench
   --bench-args "<args...>"   透传给 cargo bench 之后的 Criterion 参数
@@ -50,6 +50,7 @@ usage() {
   PERF_STRESS_NG_ARGS 可完全覆盖默认 stress-ng 参数；如需 link/symlink stressor 请用该变量显式指定
   PERF_METADATA_POST_TOOL_DRAIN PERF_METADATA_POST_TOOL_DRAIN_TIMEOUT_SECS PERF_METADATA_POST_TOOL_DRAIN_PENDING_BYTES
   PERF_FIO_ARGS PERF_FIO_RUNTIME PERF_FIO_SIZE PERF_FIO_BS PERF_FIO_NUMJOBS PERF_FIO_DIRECT
+  PERF_FIO_BIGREAD_REPEATS=1|3|5 PERF_FIO_BIGREAD_WARMUP_PASSES=0|1 PERF_FIO_BIGREAD_COOLDOWN_SECS=10 PERF_FIO_BIGREAD_EVICT_LOCAL_CACHE_PAGES=true PERF_FIO_BIGREAD_REMOUNT_BETWEEN_REPEATS=true
   PERF_FIO_DIRECT_MATRIX="0 1" 可对 fio profile 显式跑 buffered/direct 矩阵（默认不启用）
   PERF_FIO_{SEQREAD,SEQWRITE,RANDREAD,RANDWRITE,RANDRW,BIGREAD,BIGWRITE}_{ARGS,BS,SIZE,NUMJOBS,IOENGINE,IODEPTH,DIRECT,DIRECT_MATRIX,RUNTIME}
   PERF_FIO_COLD_READ PERF_FIO_PREFILL_DRAIN PERF_FIO_PREFILL_REMOUNT PERF_FIO_PREFILL_DRAIN_TIMEOUT_SECS PERF_FIO_PREFILL_DRAIN_PENDING_BYTES
@@ -93,6 +94,41 @@ require_value() {
     fi
 }
 
+truthy_env() {
+    local value
+    value="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+    case "$value" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+size_to_bytes() {
+    local value="${1:-}"
+    local number suffix multiplier
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$value"
+        return 0
+    fi
+    if [[ ! "$value" =~ ^([0-9]+)([kKmMgGtTpP])([iI]?[bB])?$ ]]; then
+        return 1
+    fi
+    number="${BASH_REMATCH[1]}"
+    suffix="${BASH_REMATCH[2]}"
+    case "${suffix,,}" in
+        k) multiplier=1024 ;;
+        m) multiplier=$((1024 * 1024)) ;;
+        g) multiplier=$((1024 * 1024 * 1024)) ;;
+        t) multiplier=$((1024 * 1024 * 1024 * 1024)) ;;
+        p) multiplier=$((1024 * 1024 * 1024 * 1024 * 1024)) ;;
+        *) return 1 ;;
+    esac
+    if (( number > (9223372036854775807 / multiplier) )); then
+        return 1
+    fi
+    printf '%s' "$((number * multiplier))"
+}
+
 KEEP=false
 STORAGE_BACKEND="rustfs"  # rustfs | minio | local-fs
 RUN_BREWFS_BENCH=false
@@ -100,6 +136,7 @@ READ_THROUGHPUT_PROFILE=false
 METADATA_THROUGHPUT_PROFILE=false
 WRITEBACK_THROUGHPUT_PROFILE=false
 PERF_TOOLS_VALUE="fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
+PERF_TOOLS_EXPLICIT=false
 BENCH_ARGS_VALUE=""
 BREWFS_WRITEBACK_MODE_VALUE="${BREWFS_WRITEBACK_MODE:-}"
 
@@ -144,6 +181,7 @@ while [[ $# -gt 0 ]]; do
         --tools)
             require_value "$1" "${2:-}"
             PERF_TOOLS_VALUE="${2:-}"
+            PERF_TOOLS_EXPLICIT=true
             shift 2
             ;;
         --brewfs-bench)
@@ -193,7 +231,8 @@ enable_writeback_throughput_profile() {
     export BREWFS_CACHE_ROOT="${BREWFS_CACHE_ROOT:-/var/lib/brewfs/cache}"
     export BREWFS_READ_MEMORY_BYTES="${BREWFS_READ_MEMORY_BYTES:-4294967296}"
     export BREWFS_WRITE_MEMORY_BYTES="${BREWFS_WRITE_MEMORY_BYTES:-4294967296}"
-    export BREWFS_READ_SSD_BYTES="${BREWFS_READ_SSD_BYTES:-4294967296}"
+    # Allow a 4GiB fio prefill plus integrity framing to survive remount intact.
+    export BREWFS_READ_SSD_BYTES="${BREWFS_READ_SSD_BYTES:-8589934592}"
     export BREWFS_WRITE_SSD_BYTES="${BREWFS_WRITE_SSD_BYTES:-4294967296}"
     export BREWFS_MEMORY_BUDGET_BYTES="${BREWFS_MEMORY_BUDGET_BYTES:-12884901888}"
     export BREWFS_S3_MAX_CONCURRENCY="${BREWFS_S3_MAX_CONCURRENCY:-16}"
@@ -205,8 +244,13 @@ enable_writeback_throughput_profile() {
     export BREWFS_WRITEBACK_PERSIST_SYNC="${BREWFS_WRITEBACK_PERSIST_SYNC:-false}"
     export BREWFS_WRITEBACK_REQUIRE_STAGE_BEFORE_COMMIT="${BREWFS_WRITEBACK_REQUIRE_STAGE_BEFORE_COMMIT:-false}"
     export BREWFS_CACHED_BLOCK_ASSEMBLER="${BREWFS_CACHED_BLOCK_ASSEMBLER:-true}"
+    export BREWFS_POPULATE_WRITE_CACHE_AFTER_UPLOAD="${BREWFS_POPULATE_WRITE_CACHE_AFTER_UPLOAD:-true}"
+    export BREWFS_PERSIST_WRITE_CACHE_AFTER_UPLOAD="${BREWFS_PERSIST_WRITE_CACHE_AFTER_UPLOAD:-true}"
     export BREWFS_COMPRESSION="${BREWFS_COMPRESSION:-none}"
     export BREWFS_VERIFY_CACHE_CHECKSUM="${BREWFS_VERIFY_CACHE_CHECKSUM:-full}"
+    # Align the compose profile's readahead cap with the JuiceFS comparison
+    # leg. Three-read evidence showed bigread gain without randread loss.
+    export BREWFS_PREFETCH_MAX_BYTES="${BREWFS_PREFETCH_MAX_BYTES:-1073741824}"
     # Eight fio jobs need enough request consumers to overlap object GET latency.
     # The 16-worker setting passed the complete data and metadata regression gate.
     export BREWFS_FUSE_WORKERS="${BREWFS_FUSE_WORKERS:-16}"
@@ -215,13 +259,88 @@ enable_writeback_throughput_profile() {
     export BREWFS_METADATA_OPEN_CACHE_CAPACITY="${BREWFS_METADATA_OPEN_CACHE_CAPACITY:-65536}"
     export PERF_FIO_PREFILL_DRAIN="${PERF_FIO_PREFILL_DRAIN:-true}"
     export PERF_FIO_PREFILL_REMOUNT="${PERF_FIO_PREFILL_REMOUNT:-true}"
-    export PERF_FIO_COLD_READ_CLEAR_CACHE="${PERF_FIO_COLD_READ_CLEAR_CACHE:-true}"
+    # Preserve BrewFS's persistent disk block cache across the prefill remount.
+    export PERF_FIO_COLD_READ_CLEAR_CACHE="${PERF_FIO_COLD_READ_CLEAR_CACHE:-false}"
     export PERF_FIO_POST_WRITE_DRAIN="${PERF_FIO_POST_WRITE_DRAIN:-true}"
     export PERF_METADATA_POST_TOOL_DRAIN="${PERF_METADATA_POST_TOOL_DRAIN:-true}"
 }
 
 if [[ "$WRITEBACK_THROUGHPUT_PROFILE" == true ]]; then
     enable_writeback_throughput_profile
+fi
+
+validate_packed_fixture() {
+    if [[ -n "${PERF_PACKED_DIRS:-}" || -n "${PERF_PACKED_FIO_FILE_SIZE:-}" ]]; then
+        err "packed-v3 fixture does not support PERF_PACKED_DIRS or PERF_PACKED_FIO_FILE_SIZE; use directory levels/fanout/files-per-leaf"
+        return 1
+    fi
+    export PERF_PACKED_DIR_LEVELS="${PERF_PACKED_DIR_LEVELS:-1}"
+    export PERF_PACKED_DIRS_PER_LEVEL="${PERF_PACKED_DIRS_PER_LEVEL:-8}"
+    export PERF_PACKED_FILES_PER_DIR="${PERF_PACKED_FILES_PER_DIR:-4500}"
+    export PERF_PACKED_SMALLFILE_SIZE="${PERF_PACKED_SMALLFILE_SIZE:-4096}"
+    local expected
+    expected="$(python3 - "$PERF_PACKED_DIR_LEVELS" "$PERF_PACKED_DIRS_PER_LEVEL" "$PERF_PACKED_FILES_PER_DIR" "$PERF_PACKED_SMALLFILE_SIZE" "${PERF_PACKED_SMALLFILE_COUNT:-}" <<'PY'
+import re
+import sys
+
+values = sys.argv[1:]
+if any(not re.fullmatch(r"[0-9]+", value) for value in values[:4]):
+    raise SystemExit("packed-v3 fixture dimensions and size must be unsigned integers")
+levels, fanout, per_leaf, size = map(int, values[:4])
+maximum = (1 << 64) - 1
+if levels > 8 or not 0 < fanout <= maximum or not 0 < per_leaf <= maximum or not 0 < size <= 4 * 1024 * 1024:
+    raise SystemExit("packed-v3 requires levels 0..8, nonzero u64 fanout/files-per-leaf and file size 1..4 MiB")
+count = fanout ** levels * per_leaf
+if count > maximum:
+    raise SystemExit("packed-v3 fixture file count overflows u64")
+if values[4] and (not re.fullmatch(r"[0-9]+", values[4]) or int(values[4]) != count):
+    raise SystemExit(f"packed-v3 fixture count mismatch: expected={count} configured={values[4]}")
+print(count)
+PY
+)" || return 1
+    export PERF_PACKED_SMALLFILE_COUNT="$expected"
+}
+
+PACKED_MODE=false
+case "${BREWFS_VOLUME_FORMAT:-}" in
+    packed-metadata-v3) PACKED_MODE=true ;;
+    packed-*) err "unsupported packed volume format: $BREWFS_VOLUME_FORMAT (only packed-metadata-v3)"; exit 1 ;;
+esac
+if [[ "$PACKED_MODE" == true ]]; then
+    if [[ "$PERF_TOOLS_EXPLICIT" == false ]]; then
+        PERF_TOOLS_VALUE="packed-tree packed-smallfiles"
+    fi
+    read -r -a packed_tools <<<"$PERF_TOOLS_VALUE"
+    [[ "${#packed_tools[@]}" -gt 0 ]] || { err "packed-v3 PERF_TOOLS cannot be empty"; exit 1; }
+    for tool in "${packed_tools[@]}"; do
+        case "$tool" in
+            packed-tree|packed-smallfiles) ;;
+            *) err "unsupported packed-v3 tool: $tool; tree/smallfiles are supported, fio/POSIX fixture layout remains OPEN"; exit 1 ;;
+        esac
+    done
+    validate_packed_fixture || exit 1
+    if [[ "$STORAGE_BACKEND" == "local-fs" ]]; then
+        err "packed-metadata-v3 requires --s3 or --minio because its fixture is published to object storage"
+        exit 1
+    fi
+    if [[ "$RUN_BREWFS_BENCH" == true ]]; then
+        err "--brewfs-bench is a Redis metadata benchmark and cannot run in packed-metadata-v3 mode"
+        exit 1
+    fi
+    export BREWFS_META_BACKEND="${BREWFS_META_BACKEND:-none}"
+    export BREWFS_META_URL="${BREWFS_META_URL:-}"
+    export BREWFS_CARGO_BUILD_ARGS="${BREWFS_CARGO_BUILD_ARGS:---features native-packed-base,frozen-base-metadata}"
+    if truthy_env "${PERF_FIO_COLD_READ:-false}" \
+        || truthy_env "${PERF_FIO_COLD_READ_CLEAR_CACHE:-false}"; then
+        # A cold-read profile must not warm and reuse BrewFS's block cache
+        # during a time-based fio job. Keep explicit caller budgets intact so
+        # cached packed profiles remain available when requested deliberately.
+        export BREWFS_READ_MEMORY_BYTES="${BREWFS_READ_MEMORY_BYTES:-0}"
+        export BREWFS_READ_SSD_BYTES="${BREWFS_READ_SSD_BYTES:-0}"
+        export BREWFS_PREFETCH_ENABLED="${BREWFS_PREFETCH_ENABLED:-false}"
+        export BREWFS_RANGE_BACKGROUND_PREFETCH="${BREWFS_RANGE_BACKGROUND_PREFETCH:-false}"
+        export BREWFS_CACHE_ROOT="${BREWFS_CACHE_ROOT:-/tmp/brewfs-packed-cold-cache}"
+    fi
 fi
 
 mkdir -p "$ARTIFACTS_DIR"
@@ -371,22 +490,96 @@ case "$STORAGE_BACKEND" in
         ;;
 esac
 
-services=(redis)
+publish_packed_fixture() {
+    local fixture_log="$host_artifact_dir/packed-fixture.log"
+    local manifest_output="$host_artifact_dir/packed-manifest-key.txt"
+    local fixture_bin="$PROJECT_DIR/target/release/packed_v3_snapshot_fixture"
+    if [[ -n "${BREWFS_PACKED_MANIFEST_KEY:-}" ]]; then
+        printf '%s\n' "$BREWFS_PACKED_MANIFEST_KEY" >"$manifest_output"
+        info "复用 packed manifest key: $BREWFS_PACKED_MANIFEST_KEY"
+        return 0
+    fi
+
+    info "构建并发布 packed metadata fixture（无 Redis）"
+    cargo build --release \
+        --features native-packed-base,frozen-base-metadata \
+        --bin packed_v3_snapshot_fixture
+    if [[ ! -x "$fixture_bin" ]]; then
+        err "fixture binary not found: $fixture_bin"
+        return 1
+    fi
+    local prefix="${BREWFS_PACKED_FIXTURE_PREFIX:-packed-fixture-${ts}}"
+    set +e
+    env \
+        AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+        AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+        AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}" \
+        "$fixture_bin" \
+        --bucket "$BREWFS_S3_BUCKET" \
+        --endpoint "http://127.0.0.1:${S3_HOST_PORT}" \
+        --region "${BREWFS_S3_REGION:-us-east-1}" \
+        --prefix "$prefix" \
+        --wire-version 5 \
+        --dir-levels "$PERF_PACKED_DIR_LEVELS" \
+        --dirs-per-level "$PERF_PACKED_DIRS_PER_LEVEL" \
+        --files-per-dir "${PERF_PACKED_FILES_PER_DIR:-4500}" \
+        --small-file-size "${PERF_PACKED_SMALLFILE_SIZE:-4096}" \
+        --force-path-style true \
+        --manifest-output "$manifest_output" \
+        >"$fixture_log" 2>&1
+    local fixture_status=$?
+    set -e
+    if [[ "$fixture_status" -ne 0 ]]; then
+        err "packed fixture 发布失败 (exit=$fixture_status)，日志: $fixture_log"
+        return "$fixture_status"
+    fi
+    BREWFS_PACKED_MANIFEST_KEY="$(tr -d '\r\n' <"$manifest_output")"
+    if [[ -z "$BREWFS_PACKED_MANIFEST_KEY" ]]; then
+        err "packed fixture 未产生 manifest key"
+        return 1
+    fi
+    export BREWFS_PACKED_MANIFEST_KEY
+    printf 'manifest_key=%s\n' "$BREWFS_PACKED_MANIFEST_KEY" >>"$fixture_log"
+    ok "packed fixture 已发布: $BREWFS_PACKED_MANIFEST_KEY"
+}
+
+services=()
+if [[ "$PACKED_MODE" != true ]]; then
+    services+=(redis)
+fi
 if [[ -n "$storage_service" ]]; then
     services+=("$storage_service")
 fi
 info "启动依赖服务: ${services[*]}"
 docker compose -f "$COMPOSE_FILE" up -d "${services[@]}"
+docker compose -f "$COMPOSE_FILE" ps >"$host_artifact_dir/compose-services-before-perf.txt" 2>&1 || true
+if [[ "$PACKED_MODE" == true ]] && grep -q 'redis-brewfs-perf' "$host_artifact_dir/compose-services-before-perf.txt"; then
+    err "packed-metadata-v3 unexpectedly started Redis; refusing to run"
+    exit 1
+fi
 
 if [[ -n "$init_service" ]]; then
     info "初始化 ${storage_service} bucket（一次性容器）"
     docker compose -f "$COMPOSE_FILE" run --rm "$init_service"
 fi
 
+if [[ "$PACKED_MODE" == true ]]; then
+    publish_packed_fixture
+fi
+
 info "运行容器内性能测试（退出码由 perf 容器决定）"
 set +e
 docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e PERF_TOOLS="$PERF_TOOLS_VALUE" \
+    -e BREWFS_META_BACKEND \
+    -e BREWFS_META_URL \
+    -e BREWFS_PACKED_MANIFEST_KEY \
+    -e PERF_PACKED_DIR_LEVELS \
+    -e PERF_PACKED_DIRS_PER_LEVEL \
+    -e PERF_PACKED_FILES_PER_DIR \
+    -e PERF_PACKED_SMALLFILE_COUNT \
+    -e PERF_PACKED_SMALLFILE_SIZE \
+    -e PERF_PACKED_SMALLFILE_READ_BYTES \
     -e PERF_DIRSTRESS_ARGS \
     -e PERF_DIRPERF_ARGS \
     -e PERF_METAPERF_ARGS \
@@ -486,6 +679,11 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e PERF_FIO_DIRECT \
     -e PERF_FIO_DIRECT_MATRIX \
     -e PERF_FIO_RUNTIME \
+    -e PERF_FIO_BIGREAD_REPEATS \
+    -e PERF_FIO_BIGREAD_WARMUP_PASSES \
+    -e PERF_FIO_BIGREAD_COOLDOWN_SECS \
+    -e PERF_FIO_BIGREAD_EVICT_LOCAL_CACHE_PAGES \
+    -e PERF_FIO_BIGREAD_REMOUNT_BETWEEN_REPEATS \
     -e PERF_FIO_COLD_READ \
     -e PERF_FIO_PREFILL_DRAIN \
     -e PERF_FIO_PREFILL_REMOUNT \
@@ -537,6 +735,7 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e BREWFS_RANGE_BACKGROUND_PREFETCH \
     -e BREWFS_MEMORY_BUDGET_BYTES \
     -e BREWFS_COMPRESSION \
+    -e ASYNCFUSE_PREPOST_READ \
     -e BREWFS_WRITEBACK_UPLOAD_CONCURRENCY \
     -e BREWFS_WRITEBACK_RECENT_PENDING_SOFT_BYTES \
     -e BREWFS_WRITEBACK_RECENT_PENDING_HARD_BYTES \

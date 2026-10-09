@@ -7,7 +7,7 @@ use crate::meta::config::Config;
 use crate::meta::entities::content_meta::EntryType;
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::SystemTime;
 use tokio_util::sync::CancellationToken;
@@ -324,6 +324,11 @@ pub struct MetaStoreCapabilities {
 pub struct RenameOutcome {
     pub ino: i64,
     pub replaced_ino: Option<i64>,
+    pub source_is_dir: bool,
+    pub replaced_is_dir: bool,
+    /// False when source and destination resolved to the same inode and the
+    /// backend left both names unchanged.
+    pub renamed: bool,
 }
 
 /// Directory entry
@@ -481,6 +486,9 @@ impl std::fmt::Display for RetryReason {
 pub enum MetaError {
     #[error("Entry not found: {0}")]
     NotFound(i64),
+
+    #[error("Entry not found: {name} in parent {parent}")]
+    EntryNotFound { parent: i64, name: String },
 
     #[error("Parent directory not found: {0}")]
     ParentNotFound(i64),
@@ -712,7 +720,38 @@ pub trait MetaStore: Send + Sync {
         old_name: &str,
         new_parent: i64,
         new_name: String,
-    ) -> Result<(), MetaError>;
+    ) -> Result<(), MetaError> {
+        self.rename_with_outcome(old_parent, old_name, new_parent, new_name)
+            .await
+            .map(|_| ())
+    }
+
+    /// Atomically rename an entry only if `new_parent/new_name` is absent.
+    ///
+    /// Implementations must perform the absence check in the same transaction,
+    /// compare-and-swap, or script as the namespace mutation. Callers must not
+    /// emulate this operation with a lookup followed by [`Self::rename`].
+    async fn rename_noreplace(
+        &self,
+        old_parent: i64,
+        old_name: &str,
+        new_parent: i64,
+        new_name: String,
+    ) -> Result<(), MetaError> {
+        self.rename_with_mode(old_parent, old_name, new_parent, new_name, true)
+            .await
+            .map(|_| ())
+    }
+
+    /// Backend implementation for ordinary and no-replace rename.
+    async fn rename_with_mode(
+        &self,
+        old_parent: i64,
+        old_name: &str,
+        new_parent: i64,
+        new_name: String,
+        noreplace: bool,
+    ) -> Result<RenameOutcome, MetaError>;
 
     async fn rename_with_outcome(
         &self,
@@ -721,26 +760,94 @@ pub trait MetaStore: Send + Sync {
         new_parent: i64,
         new_name: String,
     ) -> Result<RenameOutcome, MetaError> {
+        self.rename_with_mode(old_parent, old_name, new_parent, new_name, false)
+            .await
+    }
+
+    /// Reject an exchange that would move a directory below itself.
+    ///
+    /// Backends call this at their mutation boundary so callers that bypass
+    /// the VFS cannot create a cyclic directory namespace.
+    async fn validate_rename_exchange_ancestry(
+        &self,
+        old_parent: i64,
+        old_name: &str,
+        new_parent: i64,
+        new_name: &str,
+    ) -> Result<(), MetaError> {
         if old_parent == new_parent && old_name == new_name {
-            let ino = self
-                .lookup(old_parent, old_name)
-                .await?
-                .ok_or(MetaError::NotFound(old_parent))?;
-            return Ok(RenameOutcome {
-                ino,
-                replaced_ino: None,
-            });
+            return Ok(());
         }
 
-        let ino = self
-            .lookup(old_parent, old_name)
+        let old_ino =
+            self.lookup(old_parent, old_name)
+                .await?
+                .ok_or_else(|| MetaError::EntryNotFound {
+                    parent: old_parent,
+                    name: old_name.to_owned(),
+                })?;
+        let new_ino =
+            self.lookup(new_parent, new_name)
+                .await?
+                .ok_or_else(|| MetaError::EntryNotFound {
+                    parent: new_parent,
+                    name: new_name.to_owned(),
+                })?;
+        if old_ino == new_ino {
+            return Ok(());
+        }
+
+        let old_attr = self
+            .stat(old_ino)
             .await?
-            .ok_or(MetaError::NotFound(old_parent))?;
-        let replaced_ino = self.lookup(new_parent, &new_name).await?;
-        let replaced_ino = replaced_ino.filter(|&replaced| replaced != ino);
-        self.rename(old_parent, old_name, new_parent, new_name)
-            .await?;
-        Ok(RenameOutcome { ino, replaced_ino })
+            .ok_or(MetaError::NotFound(old_ino))?;
+        let new_attr = self
+            .stat(new_ino)
+            .await?
+            .ok_or(MetaError::NotFound(new_ino))?;
+
+        if old_attr.kind == FileType::Dir
+            && self.directory_is_descendant_of(new_parent, old_ino).await?
+        {
+            return Err(MetaError::InvalidPath(format!(
+                "cannot exchange directory inode {old_ino} with an entry below it"
+            )));
+        }
+        if new_attr.kind == FileType::Dir
+            && self.directory_is_descendant_of(old_parent, new_ino).await?
+        {
+            return Err(MetaError::InvalidPath(format!(
+                "cannot exchange directory inode {new_ino} with an entry below it"
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn directory_is_descendant_of(
+        &self,
+        mut directory: i64,
+        ancestor: i64,
+    ) -> Result<bool, MetaError> {
+        let root = self.root_ino();
+        let mut visited = HashSet::new();
+        loop {
+            if directory == ancestor {
+                return Ok(true);
+            }
+            if directory == root {
+                return Ok(false);
+            }
+            if !visited.insert(directory) {
+                return Err(MetaError::InvalidPath(format!(
+                    "directory ancestry contains a cycle at inode {directory}"
+                )));
+            }
+            match self.get_dir_parent(directory).await? {
+                Some(parent) if parent != directory => directory = parent,
+                _ => return Ok(false),
+            }
+        }
     }
 
     /// Atomically exchange two files (RENAME_EXCHANGE)
@@ -809,6 +916,21 @@ pub trait MetaStore: Send + Sync {
     }
 
     async fn get_slices(&self, chunk_id: u64) -> Result<Vec<SliceDesc>, MetaError>;
+
+    /// Fetch slices with an opaque version token when the backend supports it.
+    /// Backends returning `None` retain explicit local-invalidation semantics.
+    async fn get_slices_with_version(
+        &self,
+        chunk_id: u64,
+    ) -> Result<(Option<u64>, Vec<SliceDesc>), MetaError> {
+        Ok((None, self.get_slices(chunk_id).await?))
+    }
+
+    /// Fetch the current opaque chunk version, or `None` when unsupported.
+    async fn get_chunk_version(&self, chunk_id: u64) -> Result<Option<u64>, MetaError> {
+        let _ = chunk_id;
+        Ok(None)
+    }
 
     /// Return all distinct chunk IDs that have at least one slice.
     /// Used by the compaction scheduler to discover compaction candidates.

@@ -27,14 +27,28 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 use tracing::Instrument;
 
+/// Bytes and their reservation stay together through the last FUSE consumer.
+/// This owner is available to every read backend and build feature set.
+pub(crate) struct OwnedReadReply {
+    pub data: Vec<u8>,
+    pub _guard: Box<dyn Send + Sync>,
+}
+impl AsRef<[u8]> for OwnedReadReply {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
 const DEFAULT_TOTAL_AHEAD_LIMIT: u64 = 256 * 1024 * 1024;
 const READ_SESSIONS: usize = 2;
 const MAX_SLICE_READ_RETRIES: u32 = 5;
+#[cfg(feature = "workspace-overlay")]
+pub(crate) const MAX_WHOLE_READ_ATTEMPTS: usize = 3;
 
 /// Send-able wrapper for one non-overlapping read output span.
 ///
 /// SAFETY: Callers must build these from disjoint ranges of a stable backing
-/// buffer, then await all futures before the backing buffer is moved or dropped.
+/// buffer, then await or drop all futures before the buffer is moved or dropped.
 struct ReadSpanBuf {
     ptr: *mut u8,
     len: usize,
@@ -517,10 +531,6 @@ where
     }
 
     pub(crate) async fn read(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-
         self.read_at(offset, len).await
     }
 
@@ -767,18 +777,149 @@ where
     }
 
     pub(crate) async fn read_at(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
-        if len == 0 {
-            return Ok(Vec::new());
+        #[cfg(feature = "workspace-overlay")]
+        let prepared_provider = self
+            .backend
+            .workspace_read_plan()
+            .filter(|provider| provider.supports_prepared_unified_read());
+        #[cfg(feature = "workspace-overlay")]
+        let mut operation = prepared_provider
+            .and_then(|provider| provider.begin_unified_read_operation(len as u64))
+            .or_else(|| self.backend.store().begin_read_operation(len as u64));
+        #[cfg(feature = "workspace-overlay")]
+        let result = {
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let result = async {
+                    // Capture fresh authority before consulting cached EOF,
+                    // including zero-byte replies. Each retry owns new plans
+                    // and output; no bytes from an earlier attempt survive.
+                    let fence = match prepared_provider {
+                        Some(provider) => {
+                            let fence = provider
+                                .begin_unified_read_request(self.inode.ino())
+                                .await?;
+                            if provider.requires_unified_read_request_fence() && fence.is_none() {
+                                anyhow::bail!("mutable provider returned no request fence");
+                            }
+                            fence
+                        }
+                        None => None,
+                    };
+                    if let Some(fence) = &fence {
+                        fence.ensure_current().await?;
+                    }
+                    let file_size = fence
+                        .as_ref()
+                        .map_or_else(|| self.inode.file_size(), |fence| fence.file_size());
+                    let delivery = operation.as_ref().and_then(|guard| guard.delivery_token());
+                    let data = self
+                        .read_at_unaccounted(offset, len, file_size, delivery)
+                        .await;
+                    if let Err(error) = &data
+                        && crate::chunk::read_plan::is_read_request_beyond_view(error)
+                        && let Some(fence) = &fence
+                    {
+                        // A shortened chunk can precede the whole-view final
+                        // check. Only this typed bounds error may ask the
+                        // original fence to prove a concurrent view change.
+                        fence.ensure_current().await?;
+                    }
+                    let data = data?;
+                    if let Some(fence) = &fence {
+                        fence.ensure_current().await?;
+                    }
+                    Ok::<_, anyhow::Error>(data)
+                }
+                .await;
+                match result {
+                    Err(error)
+                        if prepared_provider.is_some()
+                            && attempt < MAX_WHOLE_READ_ATTEMPTS
+                            && crate::chunk::read_plan::is_read_view_changed(&error) =>
+                    {
+                        if let Some(operation) = &mut operation {
+                            operation.restart_delivery_attempt();
+                        }
+                    }
+                    result => break result,
+                }
+            }
+        };
+        #[cfg(not(feature = "workspace-overlay"))]
+        let result = self
+            .read_at_unaccounted(offset, len, self.inode.file_size())
+            .await;
+        match result {
+            Ok(data) => {
+                #[cfg(feature = "workspace-overlay")]
+                {
+                    if let Some(provider) = prepared_provider {
+                        provider.record_unified_read_success(data.len() as u64);
+                    }
+                    if let Some(operation) = operation.take() {
+                        operation.deliver(data.len() as u64);
+                    }
+                }
+                Ok(data)
+            }
+            Err(error) => {
+                #[cfg(test)]
+                eprintln!(
+                    "[packed-v3-native-kernel-read-diag] stage=reader inode={} offset={offset} len={len} error={error:#}",
+                    self.inode.ino()
+                );
+                #[cfg(feature = "workspace-overlay")]
+                if let Some(operation) = operation.take() {
+                    let reason = if crate::vfs::error::is_read_admission_error(&error) {
+                        crate::cadapter::read_observer::FailureClass::Admission
+                    } else {
+                        crate::cadapter::read_observer::FailureClass::Backend
+                    };
+                    operation.fail(reason);
+                }
+                Err(error)
+            }
         }
+    }
 
-        let file_size = self.inode.file_size();
-        if file_size <= offset {
-            return Ok(Vec::new());
-        }
+    /// The outer VFS owns the request fence and terminal delivery when it
+    /// includes local dirty data. This method only reads committed spans.
+    pub(crate) async fn read_at_unaccounted(
+        &self,
+        offset: u64,
+        len: usize,
+        file_size: u64,
+        #[cfg(feature = "workspace-overlay")] delivery: Option<
+            Arc<crate::cadapter::read_observer::OperationDelivery>,
+        >,
+    ) -> anyhow::Result<Vec<u8>> {
+        let actual_len = (len as u64).min(file_size.saturating_sub(offset)) as usize;
+        let mut data = vec![0; actual_len];
+        self.read_at_into_unaccounted(
+            offset,
+            &mut data,
+            #[cfg(feature = "workspace-overlay")]
+            delivery,
+        )
+        .await?;
+        Ok(data)
+    }
 
-        let actual_len = std::cmp::min(len, file_size as usize - offset as usize);
+    /// Fill a preallocated committed range, with the outer request retaining
+    /// its output reservation, metadata fence and terminal delivery guard.
+    pub(crate) async fn read_at_into_unaccounted(
+        &self,
+        offset: u64,
+        data: &mut [u8],
+        #[cfg(feature = "workspace-overlay")] delivery: Option<
+            Arc<crate::cadapter::read_observer::OperationDelivery>,
+        >,
+    ) -> anyhow::Result<()> {
+        let actual_len = data.len();
         if actual_len == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         let track_read_slices = actual_len as u64 >= self.config.layout.block_size as u64;
@@ -812,7 +953,6 @@ where
             let _ahead = self.check_session(offset, actual_len);
         }
 
-        let mut data = vec![0; actual_len];
         let result = async {
             let mut reads = FuturesUnordered::new();
             let mut cursor = 0;
@@ -824,12 +964,20 @@ where
                 };
                 cursor += span_len;
 
+                #[cfg(feature = "workspace-overlay")]
+                let delivery = delivery.clone();
                 reads.push(async move {
                     // SAFETY: every ReadSpanBuf points at a disjoint range of
-                    // `data`, and all futures are awaited before `data` is used.
+                    // `data`, and futures are awaited or dropped before it is used.
                     let out = unsafe { out.as_mut_slice() };
-                    self.read_chunk_span_into(span.index, span.offset, out)
-                        .await
+                    self.read_chunk_span_into_observed(
+                        span.index,
+                        span.offset,
+                        out,
+                        #[cfg(feature = "workspace-overlay")]
+                        delivery,
+                    )
+                    .await
                 });
             }
 
@@ -847,7 +995,8 @@ where
                 .instrument(tracing::trace_span!("read_at.cleanup_invalid"))
                 .await;
         }
-        result.map(|_| data)
+        result?;
+        Ok(())
     }
 
     // Read one chunk span directly into the caller buffer through DataFetcher →
@@ -859,10 +1008,74 @@ where
         offset: u64,
         out: &mut [u8],
     ) -> anyhow::Result<()> {
+        self.read_chunk_span_into_observed(
+            index,
+            offset,
+            out,
+            #[cfg(feature = "workspace-overlay")]
+            None,
+        )
+        .await
+    }
+
+    async fn read_chunk_span_into_observed(
+        &self,
+        index: u64,
+        offset: u64,
+        out: &mut [u8],
+        #[cfg(feature = "workspace-overlay")] delivery: Option<
+            Arc<crate::cadapter::read_observer::OperationDelivery>,
+        >,
+    ) -> anyhow::Result<()> {
         let chunk_id = chunk_id_for(self.inode.ino(), index)?;
+        #[cfg(feature = "workspace-overlay")]
+        let retry_transport = !self
+            .backend
+            .workspace_read_plan()
+            .is_some_and(|provider| provider.supports_prepared_unified_read());
+        #[cfg(not(feature = "workspace-overlay"))]
+        let retry_transport = true;
 
         for attempt in 0..MAX_SLICE_READ_RETRIES {
             let result = async {
+                #[cfg(feature = "workspace-overlay")]
+                if let Some(provider) = self.backend.workspace_read_plan() {
+                    if provider.supports_prepared_unified_read() {
+                        let prepared = provider
+                            .prepare_unified_read_observed(
+                                self.inode.ino(),
+                                index,
+                                offset,
+                                out.len() as u64,
+                                delivery.clone(),
+                            )
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("unified provider returned no prepared plan")
+                            })?;
+                        crate::chunk::read_plan::execute_unified_into(
+                            prepared.fetcher.as_ref(),
+                            offset,
+                            &prepared.plan,
+                            out,
+                        )
+                        .await?;
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    let plan = provider
+                        .read_plan(self.inode.ino(), index, offset, u64::try_from(out.len())?)
+                        .await?;
+                    crate::chunk::read_plan::execute_into(
+                        self.backend.store(),
+                        self.config.layout,
+                        offset,
+                        &plan,
+                        out,
+                    )
+                    .await?;
+                    return Ok::<(), anyhow::Error>(());
+                }
+
                 let slices_arc = match self.chunk_slices.get(&chunk_id) {
                     Some(cached) => cached.clone(),
                     None => {
@@ -891,7 +1104,9 @@ where
             match result {
                 Ok(()) => return Ok(()),
                 Err(err)
-                    if attempt + 1 < MAX_SLICE_READ_RETRIES && is_transient_read_error(&err) =>
+                    if retry_transport
+                        && attempt + 1 < MAX_SLICE_READ_RETRIES
+                        && is_transient_read_error(&err) =>
                 {
                     self.chunk_slices.remove(&chunk_id);
                     let _ = self
@@ -1030,6 +1245,741 @@ mod tests {
             chunk_size: 8 * 1024,
             block_size: 4 * 1024,
         }
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    struct StaticWorkspacePlan {
+        plan: crate::chunk::read_plan::ResolvedReadPlan,
+        calls: AtomicUsize,
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[async_trait::async_trait]
+    impl crate::chunk::read_plan::WorkspaceReadPlanProvider for StaticWorkspacePlan {
+        async fn read_plan(
+            &self,
+            _ino: i64,
+            _chunk_index: u64,
+            _offset: u64,
+            _len: u64,
+        ) -> Result<crate::chunk::read_plan::ResolvedReadPlan, crate::meta::store::MetaError>
+        {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.plan.clone())
+        }
+
+        async fn range_has_data(
+            &self,
+            _ino: i64,
+            _offset: u64,
+            _len: u64,
+        ) -> Result<bool, crate::meta::store::MetaError> {
+            Ok(true)
+        }
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[tokio::test]
+    async fn workspace_reader_executes_read_plan_without_flat_slice_metadata() {
+        use crate::chunk::read_plan::{ReadPlanSegment, ResolvedReadPlan};
+
+        let layout = ChunkLayout {
+            chunk_size: 16,
+            block_size: 8,
+        };
+        let block_store = Arc::new(InMemoryBlockStore::new());
+        block_store
+            .write_fresh_range((99, 0), 0, b"workspace")
+            .await
+            .unwrap();
+        let meta = create_meta_store_from_url("sqlite::memory:")
+            .await
+            .unwrap()
+            .layer();
+        let provider = Arc::new(StaticWorkspacePlan {
+            plan: ResolvedReadPlan {
+                segments: vec![
+                    ReadPlanSegment::Zero {
+                        logical_offset: 0,
+                        length: 2,
+                    },
+                    ReadPlanSegment::Data {
+                        logical_offset: 2,
+                        length: 4,
+                        slice_id: 99,
+                        slice_offset: 1,
+                    },
+                    ReadPlanSegment::Zero {
+                        logical_offset: 6,
+                        length: 2,
+                    },
+                ],
+            },
+            calls: AtomicUsize::new(0),
+        });
+        let backend = Arc::new(Backend::new_workspace(block_store, meta, provider.clone()));
+        let inode = Inode::new(123, 8);
+        let reader = DataReader::new(Arc::new(ReadConfig::new(layout)), backend);
+        let output = reader.open_for_handle(inode, 1).read(0, 8).await.unwrap();
+        assert_eq!(&output, b"\0\0orks\0\0");
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    struct PreparedProvider {
+        completed: AtomicU64,
+        fail_generation: bool,
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[async_trait::async_trait]
+    impl crate::chunk::read_plan::WorkspaceReadPlanProvider for PreparedProvider {
+        async fn read_plan(
+            &self,
+            _ino: i64,
+            _chunk: u64,
+            _offset: u64,
+            _len: u64,
+        ) -> Result<crate::chunk::read_plan::ResolvedReadPlan, crate::meta::store::MetaError>
+        {
+            Err(crate::meta::store::MetaError::Internal(
+                "legacy slice plan must not be called".into(),
+            ))
+        }
+        fn supports_prepared_unified_read(&self) -> bool {
+            true
+        }
+        fn record_unified_read_success(&self, bytes: u64) {
+            self.completed.fetch_add(bytes, Ordering::Relaxed);
+        }
+        async fn range_has_data(
+            &self,
+            _ino: i64,
+            _offset: u64,
+            _len: u64,
+        ) -> Result<bool, crate::meta::store::MetaError> {
+            Ok(true)
+        }
+        async fn prepare_unified_read(
+            &self,
+            _ino: i64,
+            _chunk: u64,
+            _offset: u64,
+            _len: u64,
+        ) -> Result<
+            Option<crate::chunk::read_plan::PreparedUnifiedRead>,
+            crate::meta::store::MetaError,
+        > {
+            use crate::chunk::read_plan::{
+                LogicalSegment, PreparedUnifiedRead, ReadGeneration, ReadSource, UnifiedReadPlan,
+                UnifiedReadSourceFetcher,
+            };
+            struct Source {
+                fail: bool,
+            }
+            #[async_trait::async_trait]
+            impl UnifiedReadSourceFetcher for Source {
+                async fn read_source(
+                    &self,
+                    source: &ReadSource,
+                    output: &mut [u8],
+                ) -> anyhow::Result<()> {
+                    let ReadSource::PackedInline { data, raw_offset } = source else {
+                        anyhow::bail!("unexpected source");
+                    };
+                    output.copy_from_slice(
+                        &data[*raw_offset as usize..*raw_offset as usize + output.len()],
+                    );
+                    Ok(())
+                }
+                async fn ensure_generation(
+                    &self,
+                    generation: ReadGeneration,
+                ) -> anyhow::Result<()> {
+                    if self.fail || generation != ReadGeneration::readonly([7; 32]) {
+                        anyhow::bail!("injected generation failure");
+                    }
+                    Ok(())
+                }
+            }
+            let plan = UnifiedReadPlan {
+                generation: ReadGeneration::readonly([7; 32]),
+                logical_size: 8,
+                segments: vec![
+                    LogicalSegment {
+                        logical_offset: 0,
+                        length: 2,
+                        source: ReadSource::Hole,
+                    },
+                    LogicalSegment {
+                        logical_offset: 2,
+                        length: 4,
+                        source: ReadSource::PackedInline {
+                            data: Arc::from(b"data".as_slice()),
+                            raw_offset: 0,
+                        },
+                    },
+                    LogicalSegment {
+                        logical_offset: 6,
+                        length: 2,
+                        source: ReadSource::Hole,
+                    },
+                ],
+            };
+            Ok(Some(PreparedUnifiedRead {
+                plan,
+                fetcher: Arc::new(Source {
+                    fail: self.fail_generation,
+                }),
+            }))
+        }
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[tokio::test]
+    async fn prepared_unified_reader_avoids_slices_and_counts_only_successful_delivery() {
+        for fail in [false, true] {
+            let meta = create_meta_store_from_url("sqlite::memory:")
+                .await
+                .unwrap()
+                .layer();
+            let provider = Arc::new(PreparedProvider {
+                completed: AtomicU64::new(0),
+                fail_generation: fail,
+            });
+            let backend = Arc::new(Backend::new_workspace(
+                Arc::new(InMemoryBlockStore::new()),
+                meta,
+                provider.clone(),
+            ));
+            let reader = DataReader::new(
+                Arc::new(ReadConfig::new(ChunkLayout {
+                    chunk_size: 16,
+                    block_size: 8,
+                })),
+                backend,
+            );
+            let result = reader
+                .open_for_handle(Inode::new(123, 8), 1)
+                .read(0, 8)
+                .await;
+            if fail {
+                assert!(result.is_err());
+                assert_eq!(provider.completed.load(Ordering::Relaxed), 0);
+            } else {
+                assert_eq!(result.unwrap(), b"\0\0data\0\0");
+                assert_eq!(provider.completed.load(Ordering::Relaxed), 8);
+            }
+        }
+    }
+
+    /// Standalone behavior red: add inside reader.rs tests using existing API.
+    /// It does not require a new observer module or new trait method to compile.
+    #[cfg(feature = "workspace-overlay")]
+    struct CrossSpanProvider {
+        completed: std::sync::atomic::AtomicU64,
+        fail_second: std::sync::atomic::AtomicBool,
+        first_done: Arc<tokio::sync::Notify>,
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[async_trait::async_trait]
+    impl crate::chunk::read_plan::WorkspaceReadPlanProvider for CrossSpanProvider {
+        async fn read_plan(
+            &self,
+            _: i64,
+            _: u64,
+            _: u64,
+            _: u64,
+        ) -> Result<crate::chunk::read_plan::ResolvedReadPlan, crate::meta::store::MetaError>
+        {
+            Err(crate::meta::store::MetaError::Internal(
+                "legacy plan forbidden".into(),
+            ))
+        }
+        fn supports_prepared_unified_read(&self) -> bool {
+            true
+        }
+        fn record_unified_read_success(&self, bytes: u64) {
+            self.completed.fetch_add(bytes, Ordering::Relaxed);
+        }
+        async fn range_has_data(
+            &self,
+            _: i64,
+            _: u64,
+            _: u64,
+        ) -> Result<bool, crate::meta::store::MetaError> {
+            Ok(true)
+        }
+        async fn prepare_unified_read(
+            &self,
+            _: i64,
+            chunk: u64,
+            offset: u64,
+            len: u64,
+        ) -> Result<
+            Option<crate::chunk::read_plan::PreparedUnifiedRead>,
+            crate::meta::store::MetaError,
+        > {
+            use crate::chunk::read_plan::{
+                LogicalSegment, PreparedUnifiedRead, ReadGeneration, ReadSource, UnifiedReadPlan,
+                UnifiedReadSourceFetcher,
+            };
+            struct Source {
+                chunk: u64,
+                fail: bool,
+                checks: std::sync::atomic::AtomicUsize,
+                first_done: Arc<tokio::sync::Notify>,
+            }
+            #[async_trait::async_trait]
+            impl UnifiedReadSourceFetcher for Source {
+                async fn read_source(
+                    &self,
+                    _: &ReadSource,
+                    output: &mut [u8],
+                ) -> anyhow::Result<()> {
+                    output.fill(b'x');
+                    Ok(())
+                }
+                async fn ensure_generation(&self, _: ReadGeneration) -> anyhow::Result<()> {
+                    if self.fail && self.chunk == 1 {
+                        self.first_done.notified().await;
+                        anyhow::bail!("second chunk generation failed after first chunk completed");
+                    }
+                    if self.chunk == 0 && self.checks.fetch_add(1, Ordering::Relaxed) == 1 {
+                        self.first_done.notify_one();
+                    }
+                    Ok(())
+                }
+            }
+            Ok(Some(PreparedUnifiedRead {
+                plan: UnifiedReadPlan {
+                    generation: ReadGeneration::readonly([7; 32]),
+                    logical_size: 8,
+                    segments: vec![LogicalSegment {
+                        logical_offset: offset,
+                        length: len,
+                        source: ReadSource::PackedInline {
+                            data: Arc::from(b"xxxxxxxx".as_slice()),
+                            raw_offset: offset as u32,
+                        },
+                    }],
+                },
+                fetcher: Arc::new(Source {
+                    chunk,
+                    fail: self.fail_second.load(Ordering::Relaxed),
+                    checks: std::sync::atomic::AtomicUsize::new(0),
+                    first_done: Arc::clone(&self.first_done),
+                }),
+            }))
+        }
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[tokio::test]
+    async fn complete_read_failure_after_one_successful_span_counts_no_delivery() {
+        let provider = Arc::new(CrossSpanProvider {
+            completed: std::sync::atomic::AtomicU64::new(0),
+            fail_second: std::sync::atomic::AtomicBool::new(true),
+            first_done: Arc::new(tokio::sync::Notify::new()),
+        });
+        let meta = create_meta_store_from_url("sqlite::memory:")
+            .await
+            .unwrap()
+            .layer();
+        let backend = Arc::new(Backend::new_workspace(
+            Arc::new(InMemoryBlockStore::new()),
+            meta,
+            provider.clone(),
+        ));
+        let reader = DataReader::new(
+            Arc::new(ReadConfig::new(ChunkLayout {
+                chunk_size: 8,
+                block_size: 4,
+            })),
+            backend,
+        );
+        let handle = reader.open_for_handle(Inode::new(123, 16), 1);
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(5), handle.read(0, 16))
+            .await
+            .unwrap();
+        assert!(failed.is_err());
+        assert_eq!(
+            provider.completed.load(Ordering::Relaxed),
+            0,
+            "no chunk span of a failed whole read was delivered"
+        );
+        provider.fail_second.store(false, Ordering::Relaxed);
+        assert_eq!(handle.read(0, 16).await.unwrap(), b"xxxxxxxxxxxxxxxx");
+        assert_eq!(
+            provider.completed.load(Ordering::Relaxed),
+            16,
+            "count once after the whole read succeeds"
+        );
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    struct WholeViewProvider {
+        version: Arc<AtomicU64>,
+        switch_once: Arc<std::sync::atomic::AtomicBool>,
+        first_done: Arc<Notify>,
+        requests: AtomicU64,
+        completed: AtomicU64,
+        observer: Arc<crate::cadapter::read_observer::ReadObserver>,
+        mode: u8,
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    fn whole_view_read_context() -> crate::cadapter::read_observer::ReadContext {
+        use crate::cadapter::read_observer::{Engine, Origin, Phase, ReadClass, ReadContext};
+        ReadContext {
+            engine: Engine::PackedV3,
+            phase: Phase::Runtime,
+            class: ReadClass::PackedPayload,
+            origin: Origin::Demand,
+        }
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[async_trait::async_trait]
+    impl crate::chunk::read_plan::WorkspaceReadPlanProvider for WholeViewProvider {
+        fn begin_unified_read_operation(
+            &self,
+            requested: u64,
+        ) -> Option<crate::cadapter::read_observer::TerminalGuard> {
+            Some(self.observer.start(
+                crate::cadapter::read_observer::Ledger::LogicalOperation,
+                whole_view_read_context(),
+                requested,
+            ))
+        }
+        fn supports_prepared_unified_read(&self) -> bool {
+            true
+        }
+        fn record_unified_read_success(&self, bytes: u64) {
+            self.completed.fetch_add(bytes, Ordering::SeqCst);
+        }
+        async fn prepare_unified_read_observed(
+            &self,
+            ino: i64,
+            chunk: u64,
+            offset: u64,
+            len: u64,
+            delivery: Option<Arc<crate::cadapter::read_observer::OperationDelivery>>,
+        ) -> Result<
+            Option<crate::chunk::read_plan::PreparedUnifiedRead>,
+            crate::meta::store::MetaError,
+        > {
+            use crate::cadapter::read_observer::{RawCoverage, RawLease};
+            use crate::chunk::read_plan::{ReadGeneration, ReadSource, UnifiedReadSourceFetcher};
+            struct ObservedSource {
+                inner: Arc<dyn UnifiedReadSourceFetcher>,
+                raw: Mutex<RawLease>,
+            }
+            #[async_trait::async_trait]
+            impl UnifiedReadSourceFetcher for ObservedSource {
+                async fn ensure_generation(
+                    &self,
+                    generation: ReadGeneration,
+                ) -> anyhow::Result<()> {
+                    self.inner.ensure_generation(generation).await
+                }
+                async fn read_source(
+                    &self,
+                    source: &ReadSource,
+                    out: &mut [u8],
+                ) -> anyhow::Result<()> {
+                    self.inner.read_source(source, out).await?;
+                    let ReadSource::PackedInline { raw_offset, .. } = source else {
+                        unreachable!()
+                    };
+                    self.raw
+                        .lock()
+                        .await
+                        .copied(u64::from(*raw_offset), out.len() as u64)
+                }
+            }
+            let mut prepared = self
+                .prepare_unified_read(ino, chunk, offset, len)
+                .await?
+                .unwrap();
+            if let Some(delivery) = delivery {
+                let mut raw = RawLease::new(
+                    8,
+                    RawCoverage::required_tracking_bytes(8).unwrap(),
+                    delivery,
+                    whole_view_read_context(),
+                )
+                .unwrap();
+                raw.request(offset, len).unwrap();
+                prepared.fetcher = Arc::new(ObservedSource {
+                    inner: prepared.fetcher,
+                    raw: Mutex::new(raw),
+                });
+            }
+            Ok(Some(prepared))
+        }
+        async fn read_plan(
+            &self,
+            _: i64,
+            _: u64,
+            _: u64,
+            _: u64,
+        ) -> Result<crate::chunk::read_plan::ResolvedReadPlan, crate::meta::store::MetaError>
+        {
+            panic!("prepared workspace must not use legacy slices")
+        }
+        async fn range_has_data(
+            &self,
+            _: i64,
+            _: u64,
+            _: u64,
+        ) -> Result<bool, crate::meta::store::MetaError> {
+            Ok(true)
+        }
+        async fn begin_unified_read_request(
+            &self,
+            _: i64,
+        ) -> anyhow::Result<Option<Arc<dyn crate::chunk::read_plan::UnifiedReadRequestFence>>>
+        {
+            use crate::chunk::read_plan::{ReadViewChanged, UnifiedReadRequestFence};
+            struct Fence {
+                version: Arc<AtomicU64>,
+                expected: u64,
+                mode: u8,
+            }
+            #[async_trait::async_trait]
+            impl UnifiedReadRequestFence for Fence {
+                fn file_size(&self) -> u64 {
+                    if self.mode == 6 && self.expected > 0 {
+                        8
+                    } else {
+                        16
+                    }
+                }
+                async fn ensure_current(&self) -> anyhow::Result<()> {
+                    if self.version.load(Ordering::SeqCst) != self.expected {
+                        match self.mode {
+                            2 => {
+                                return Err(
+                                    crate::workspace_overlay::error::WorkspaceError::Fenced.into(),
+                                );
+                            }
+                            3 => anyhow::bail!("injected request fence backend failure"),
+                            _ => return Err(ReadViewChanged.into()),
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(Arc::new(Fence {
+                expected: self.version.load(Ordering::SeqCst),
+                version: self.version.clone(),
+                mode: self.mode,
+            })))
+        }
+        async fn prepare_unified_read(
+            &self,
+            _: i64,
+            chunk: u64,
+            offset: u64,
+            len: u64,
+        ) -> Result<
+            Option<crate::chunk::read_plan::PreparedUnifiedRead>,
+            crate::meta::store::MetaError,
+        > {
+            use crate::chunk::read_plan::{
+                LogicalSegment, PreparedUnifiedRead, ReadGeneration, ReadSource, UnifiedReadPlan,
+                UnifiedReadSourceFetcher,
+            };
+            struct Source {
+                chunk: u64,
+                checks: AtomicU64,
+                version: Arc<AtomicU64>,
+                switch_once: Arc<std::sync::atomic::AtomicBool>,
+                first_done: Arc<Notify>,
+                mode: u8,
+            }
+            #[async_trait::async_trait]
+            impl UnifiedReadSourceFetcher for Source {
+                async fn read_source(
+                    &self,
+                    source: &ReadSource,
+                    out: &mut [u8],
+                ) -> anyhow::Result<()> {
+                    if self.mode == 5 {
+                        anyhow::bail!("injected timeout backend failure");
+                    }
+                    let ReadSource::PackedInline { data, raw_offset } = source else {
+                        unreachable!()
+                    };
+                    out.copy_from_slice(
+                        &data[*raw_offset as usize..*raw_offset as usize + out.len()],
+                    );
+                    Ok(())
+                }
+                async fn ensure_generation(&self, _: ReadGeneration) -> anyhow::Result<()> {
+                    // The first chunk's own final check passes. A concurrent
+                    // same-epoch mutation then precedes the next chunk's prepare.
+                    if self.chunk == 0 && self.checks.fetch_add(1, Ordering::SeqCst) == 1 {
+                        if self.mode == 1 || self.switch_once.swap(false, Ordering::SeqCst) {
+                            self.version.fetch_add(1, Ordering::SeqCst);
+                        }
+                        self.first_done.notify_one();
+                        if self.mode == 4 {
+                            return Err(crate::chunk::read_plan::ReadViewChanged.into());
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            if chunk == 1 {
+                self.first_done.notified().await;
+            }
+            if self.mode == 7
+                || (self.mode == 6 && chunk == 1 && self.version.load(Ordering::SeqCst) > 0)
+            {
+                return Err(crate::meta::store::MetaError::Anyhow(
+                    crate::chunk::read_plan::ReadRequestBeyondView.into(),
+                ));
+            }
+            let byte = b'A' + self.version.load(Ordering::SeqCst) as u8;
+            Ok(Some(PreparedUnifiedRead {
+                plan: UnifiedReadPlan {
+                    generation: ReadGeneration::readonly([7; 32]),
+                    logical_size: 8,
+                    segments: vec![LogicalSegment {
+                        logical_offset: offset,
+                        length: len,
+                        source: ReadSource::PackedInline {
+                            data: Arc::from(vec![byte; 8]),
+                            raw_offset: offset as u32,
+                        },
+                    }],
+                },
+                fetcher: Arc::new(Source {
+                    chunk,
+                    checks: AtomicU64::new(0),
+                    version: self.version.clone(),
+                    switch_once: self.switch_once.clone(),
+                    first_done: self.first_done.clone(),
+                    mode: self.mode,
+                }),
+            }))
+        }
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    async fn whole_view_fixture(
+        mode: u8,
+        cached_size: u64,
+    ) -> (
+        Arc<
+            FileReader<
+                InMemoryBlockStore,
+                crate::meta::client::MetaClient<crate::meta::stores::DatabaseMetaStore>,
+            >,
+        >,
+        Arc<WholeViewProvider>,
+    ) {
+        let provider = Arc::new(WholeViewProvider {
+            version: Arc::new(AtomicU64::new(0)),
+            switch_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            first_done: Arc::new(Notify::new()),
+            requests: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            observer: Arc::new(crate::cadapter::read_observer::ReadObserver::default()),
+            mode,
+        });
+        let meta = create_meta_store_from_url("sqlite::memory:")
+            .await
+            .unwrap()
+            .layer();
+        let backend = Arc::new(Backend::new_workspace(
+            Arc::new(InMemoryBlockStore::new()),
+            meta,
+            provider.clone(),
+        ));
+        let reader = DataReader::new(
+            Arc::new(ReadConfig::new(ChunkLayout {
+                chunk_size: 8,
+                block_size: 4,
+            })),
+            backend,
+        );
+        (
+            reader.open_for_handle(Inode::new(123, cached_size), 1),
+            provider,
+        )
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[tokio::test]
+    async fn whole_view_request_retries_all_chunks_and_uses_fresh_eof() {
+        for cached_size in [0, 16] {
+            let (reader, provider) = whole_view_fixture(0, cached_size).await;
+            let data = tokio::time::timeout(Duration::from_secs(5), reader.read(0, 16))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(data, vec![b'B'; 16], "must discard mixed old/new chunks");
+            assert_eq!(provider.requests.load(Ordering::SeqCst), 2);
+            assert_eq!(provider.completed.load(Ordering::SeqCst), 16);
+        }
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[tokio::test]
+    async fn whole_view_request_retry_is_bounded_and_never_reclaims_lost_ownership() {
+        for mode in [1, 2, 3, 4, 5, 7] {
+            let (reader, provider) = whole_view_fixture(mode, 16).await;
+            let result = tokio::time::timeout(Duration::from_secs(5), reader.read(0, 16))
+                .await
+                .unwrap();
+            assert!(result.is_err());
+            assert_eq!(
+                provider.requests.load(Ordering::SeqCst),
+                if matches!(mode, 1 | 4) { 3 } else { 1 }
+            );
+            assert_eq!(provider.completed.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[tokio::test]
+    async fn whole_view_request_shrink_during_chunk_preparation_retries_fresh_eof() {
+        let (reader, provider) = whole_view_fixture(6, 16).await;
+        let data = tokio::time::timeout(Duration::from_secs(5), reader.read(0, 16))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, vec![b'B'; 8]);
+        assert_eq!(provider.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.completed.load(Ordering::SeqCst), 8);
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[tokio::test]
+    async fn whole_view_request_marks_discarded_attempt_raw_bytes_undelivered() {
+        use crate::cadapter::read_observer::Ledger;
+        let (reader, provider) = whole_view_fixture(0, 16).await;
+        assert_eq!(reader.read(0, 16).await.unwrap(), vec![b'B'; 16]);
+        let snapshot = provider.observer.snapshot();
+        let raw = &snapshot.raw[&whole_view_read_context()];
+        assert_eq!(raw.decoded_raw, 32);
+        assert_eq!(raw.copied_union, 32);
+        assert_eq!(raw.delivered_union, 16);
+        assert_eq!(raw.undelivered_decoded_raw, 16);
+        assert_eq!(
+            raw.decoded_raw,
+            raw.delivered_union + raw.undelivered_decoded_raw
+        );
+        let logical = &snapshot.rows[&(Ledger::LogicalOperation, whole_view_read_context())];
+        assert_eq!(logical.started, 1);
+        assert_eq!(logical.success, 1);
+        assert_eq!(logical.logical_delivered, 16);
+        assert!(logical.conserved());
     }
 
     #[derive(Default)]
@@ -1533,7 +2483,7 @@ mod tests {
             let active = self.active_reads.fetch_add(1, Ordering::SeqCst) + 1;
             let _ =
                 self.max_active_reads
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                         Some(current.max(active))
                     });
             sleep(self.read_delay).await;

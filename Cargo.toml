@@ -2,16 +2,30 @@
 name = "brewfs"
 version = "0.1.2"
 edition = "2024"
+autobins = false
 authors = ["rk8s-dev team"]
 description = "High-performance Rust & Layers-aware Distributed Filesystem"
 repository = "https://github.com/brewfs/brewfs"
 license = "MIT"
+
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "brewfs"
+path = "src/main.rs"
+
+[[bin]]
+name = "packed_v3_snapshot_fixture"
+path = "src/bin/packed_v3_snapshot_fixture.rs"
+required-features = ["workspace-overlay"]
 
 [workspace]
 members = [
     "tools/stats"
 ]
 
+exclude = ["vendor/asyncfuse", "vendor/tikv-client"]
 default-members = ["."]
 resolver = "2"
 
@@ -31,7 +45,7 @@ rks = { path = "rks" }
 dagrs-derive = { path = "dagrs-derive", version = "0.5.0" }
 quote = "1.0"
 proc-macro2 = "1.0"
-asyncfuse = { version = "0.1.12", default-features = false }
+asyncfuse = { path = "vendor/asyncfuse", version = "0.1.12", default-features = false }
 brewfs = { path = "." }
 libcgroups = { version = "0.5.7", default-features = false }
 libcontainer = "0.5.7"
@@ -63,6 +77,9 @@ blake3 = "1.8"
 builder-pattern = "0.4.2"
 bytes = "1.10.1"
 object_store = { version = "0.13", features = ["aws"] }
+s3s = "0.15"
+dav-server = { version = "0.11", default-features = false }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 caps = "0.5.5"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.49", features = ["derive"] }
@@ -198,10 +215,11 @@ tokio-util = "0.7.18"
 toml = "0.8.19"
 aligned_box = "0.3.0"
 tikv-jemallocator = "0.5.4"
-tikv-client = { version = "0.4.0", default-features = false }
+tikv-client = { version = "0.4.0", path = "vendor/tikv-client", default-features = false }
 tonic = "0.14.2"
 tower = "0.5.2"
 tower-http = "0.6.6"
+cbindgen = "0.28.0"
 tower-sessions = { version = "0.12.3", features = ["memory-store"] }
 tracing = "0.1.41"
 tracing-log = "0.2.0"
@@ -241,8 +259,11 @@ rkyv = "0.8.14"
 proptest = "1.10.0"
 ssh-key = { version = "0.6.7", features = ["std", "crypto"] }
 lz4_flex = "0.11"
-zstd = "0.13"
+zstd = { version = "0.13", features = ["experimental"] }
 governor = "0.8"
+
+[build-dependencies]
+cbindgen = { workspace = true }
 
 [dependencies]
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "time", "net", "signal", "tracing"] }
@@ -250,6 +271,12 @@ async-trait = { workspace = true }
 async-recursion = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest"] }
+aws-smithy-runtime-api = { version = "=1.16.0", features = ["client", "http-1x"] }
+aws-smithy-types = { version = "=1.6.3", features = ["http-body-1-x"] }
+aws-smithy-http-client = { version = "=1.4.0", features = ["rustls-aws-lc"] }
+http-body-1x = { package = "http-body", version = "1" }
+http-body-util = { workspace = true }
+http = { workspace = true }
 base64 = { workspace = true }
 md5 = { workspace = true }
 futures = { workspace = true }
@@ -259,7 +286,7 @@ bytes = { workspace = true }
 crc32c = { workspace = true }
 hex = { workspace = true }
 tokio-util = { workspace = true }
-moka = { workspace = true, features = ["future"] }
+moka = { workspace = true, features = ["future", "sync"] }
 dashmap = { workspace = true }
 dirs = { workspace = true }
 sha2 = { workspace = true }
@@ -292,8 +319,11 @@ rand = { workspace = true }
 hostname = { workspace = true }
 bitflags = { workspace = true }
 redis = { workspace = true }
+bincode = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 if-addrs = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
+url = { workspace = true }
 parking_lot = { workspace = true }
 tikv-jemallocator = { workspace = true, optional = true }
 tikv-client = { workspace = true }
@@ -301,11 +331,23 @@ rkyv = { workspace = true, optional = true, features = ["uuid-1"] }
 lz4_flex = { workspace = true }
 zstd = { workspace = true }
 governor = { workspace = true }
+blake3 = { workspace = true, optional = true }
+s3s = { workspace = true, optional = true }
+tower = { workspace = true, features = ["util"], optional = true }
+dav-server = { workspace = true, optional = true }
+axum-server = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 
 [features]
-default = ["fuse-io-uring-runtime"]
+default = ["fuse-io-uring-runtime", "gateway-s3", "gateway-webdav"]
 fuse-io-uring-runtime = ["asyncfuse/io-uring-runtime"]
 fuse-tokio-runtime = ["asyncfuse/tokio-runtime"]
+gateway-s3 = ["dep:s3s", "dep:tower"]
+gateway-webdav = ["dep:dav-server", "dep:axum-server", "dep:rustls"]
+hdfs-sdk = []
+workspace-overlay = ["dep:bincode", "dep:blake3", "dep:tempfile"]
+native-packed-base = ["workspace-overlay"]
+frozen-base-metadata = ["native-packed-base"]
 profiling = ["dep:tracing-flame", "dep:tracing-chrome", "dep:console-subscriber"]
 jemalloc = ["dep:tikv-jemallocator"]
 jemalloc-profiling = ["jemalloc", "tikv-jemallocator/profiling"]

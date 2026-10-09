@@ -1,6 +1,8 @@
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use url::Url;
 
 use crate::chunk::bandwidth::BandwidthConfig;
 use crate::chunk::cache_integrity::CacheIntegrityMode;
@@ -55,6 +57,10 @@ pub enum Command {
     )]
     Mount(Box<MountArgs>),
 
+    /// Manage isolated BrewFS workspaces.
+    #[cfg(feature = "workspace-overlay")]
+    Workspace(WorkspaceArgs),
+
     /// Talk to a mounted BrewFS instance and run orphan gc.
     Gc(GcArgs),
 
@@ -64,9 +70,102 @@ pub enum Command {
     /// Run the BrewFS web console.
     Console(ConsoleArgs),
 
+    /// Run protocol gateways that expose a BrewFS volume over S3/WebDAV/NFS
+    /// without a FUSE mount.
+    #[cfg(any(feature = "gateway-s3", feature = "gateway-webdav"))]
+    Gateway(Box<GatewayArgs>),
+
     /// Run a direct S3 object PUT benchmark without going through FUSE.
     #[command(hide = true)]
     ObjectPutBench(ObjectPutBenchArgs),
+}
+
+#[cfg(any(feature = "gateway-s3", feature = "gateway-webdav"))]
+#[derive(Subcommand, Debug)]
+pub enum GatewayProtocol {
+    /// S3-compatible gateway (see doc/protocols/s3-gateway.md).
+    #[cfg(feature = "gateway-s3")]
+    S3(S3GatewayArgs),
+
+    /// WebDAV gateway for filesystem clients.
+    #[cfg(feature = "gateway-webdav")]
+    #[command(name = "webdav")]
+    WebDav(WebDavGatewayArgs),
+}
+
+#[cfg(any(feature = "gateway-s3", feature = "gateway-webdav"))]
+#[derive(Args, Debug)]
+pub struct GatewayArgs {
+    #[command(subcommand)]
+    pub protocol: GatewayProtocol,
+}
+
+#[cfg(feature = "gateway-webdav")]
+#[derive(Args, Debug)]
+pub struct WebDavGatewayArgs {
+    /// HTTP or HTTPS listen address of the WebDAV endpoint.
+    #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:9001")]
+    pub listen: std::net::SocketAddr,
+
+    /// Basic authentication username (or env BREWFS_WEBDAV_USER).
+    #[arg(long, value_name = "USER", env = "BREWFS_WEBDAV_USER")]
+    pub user: Option<String>,
+
+    /// Basic authentication password (or env BREWFS_WEBDAV_PASSWORD).
+    #[arg(long, value_name = "PASSWORD", env = "BREWFS_WEBDAV_PASSWORD")]
+    pub password: Option<String>,
+
+    /// PEM certificate chain for HTTPS.
+    #[arg(long, value_name = "FILE", env = "BREWFS_WEBDAV_TLS_CERT")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// PEM private key for HTTPS.
+    #[arg(long, value_name = "FILE", env = "BREWFS_WEBDAV_TLS_KEY")]
+    pub tls_key: Option<PathBuf>,
+
+    /// Allow unauthenticated read/write access.
+    #[arg(long, default_value_t = false)]
+    pub allow_anonymous: bool,
+
+    /// Publish PUT/PATCH content atomically after a successful flush.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub atomic_put: bool,
+
+    /// Volume backend options; the same set accepted by `brewfs mount`.
+    #[command(flatten)]
+    pub mount: MountArgs,
+}
+
+#[cfg(feature = "gateway-s3")]
+#[derive(Args, Debug)]
+pub struct S3GatewayArgs {
+    /// HTTP listen address of the S3 endpoint.
+    #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:9000")]
+    pub listen: std::net::SocketAddr,
+
+    /// Static access key for SigV4 (or env BREWFS_S3_ACCESS_KEY).
+    #[arg(long, value_name = "KEY", env = "BREWFS_S3_ACCESS_KEY")]
+    pub access_key: Option<String>,
+
+    /// Static secret key for SigV4 (or env BREWFS_S3_SECRET_KEY).
+    #[arg(long, value_name = "KEY", env = "BREWFS_S3_SECRET_KEY")]
+    pub secret_key: Option<String>,
+
+    /// Bucket name exposed in single-bucket mode (defaults to "brewfs").
+    #[arg(long, value_name = "NAME", default_value = "brewfs")]
+    pub bucket: String,
+
+    /// Expose top-level directories as buckets instead of a single bucket.
+    #[arg(long, default_value_t = false)]
+    pub multi_buckets: bool,
+
+    /// Hide directory objects in listings.
+    #[arg(long, default_value_t = false)]
+    pub hide_dir_objects: bool,
+
+    /// Volume backend options; the same set accepted by `brewfs mount`.
+    #[command(flatten)]
+    pub mount: MountArgs,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -74,6 +173,31 @@ pub struct MountArgs {
     /// YAML config file path.
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
+
+    /// On-disk metadata format. Existing configurations default to flat-v1.
+    #[cfg_attr(feature = "workspace-overlay", arg(long, value_enum))]
+    #[cfg_attr(not(feature = "workspace-overlay"), arg(skip))]
+    pub volume_format: Option<VolumeFormat>,
+
+    /// Workspace mounted by a workspace-v1 volume.
+    #[cfg_attr(feature = "workspace-overlay", arg(long, value_name = "WORKSPACE_ID"))]
+    #[cfg_attr(not(feature = "workspace-overlay"), arg(skip))]
+    pub workspace: Option<uuid::Uuid>,
+
+    /// Object-store key of the immutable packed-metadata manifest.
+    #[arg(long, value_name = "KEY")]
+    pub packed_manifest_key: Option<String>,
+
+    /// Key namespace for the workspace overlay catalog.
+    #[cfg_attr(feature = "workspace-overlay", arg(long, value_name = "NAMESPACE"))]
+    #[cfg_attr(not(feature = "workspace-overlay"), arg(skip))]
+    pub workspace_namespace: Option<String>,
+
+    /// Disable mount-local workspace recovery and garbage collection. The
+    /// Kubernetes operator owns those control-plane duties in this mode.
+    #[cfg_attr(feature = "workspace-overlay", arg(long, default_value_t = false))]
+    #[cfg_attr(not(feature = "workspace-overlay"), arg(skip))]
+    pub workspace_operator_managed: bool,
 
     /// Directory to mount the filesystem.
     #[arg(value_name = "MOUNT_POINT")]
@@ -156,6 +280,173 @@ pub struct MountArgs {
     /// Uses /dev/fuse directly instead of fusermount3.
     #[arg(long, default_value_t = false)]
     pub privileged: bool,
+}
+
+#[derive(ValueEnum, Deserialize, Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum VolumeFormat {
+    #[default]
+    FlatV1,
+    WorkspaceV1,
+    WorkspaceNativeV2,
+    #[cfg(feature = "native-packed-base")]
+    PackedMetadataV1,
+    #[cfg(feature = "workspace-overlay")]
+    PackedMetadataV2,
+    #[cfg(feature = "workspace-overlay")]
+    PackedMetadataV3,
+}
+
+#[cfg(feature = "workspace-overlay")]
+#[derive(Args, Debug, Clone)]
+pub struct WorkspaceArgs {
+    /// Workspace catalog backend (sqlx, redis or tikv).
+    #[arg(long, global = true, value_enum, default_value = "sqlx")]
+    pub meta_backend: WorkspaceMetaBackendKind,
+
+    /// SQLite or Redis URL containing the workspace-v1 catalog.
+    #[arg(long, global = true, default_value = DEFAULT_META_URL)]
+    pub meta_url: String,
+
+    /// TiKV PD endpoint URLs (comma-separated).
+    #[arg(long, global = true, value_name = "URLS", value_delimiter = ',')]
+    pub meta_tikv_pd_endpoints: Vec<String>,
+
+    /// CA PEM for an authenticated TiKV workspace connection.
+    #[arg(long, global = true, requires_all = ["meta_tikv_cert_path", "meta_tikv_key_path"])]
+    pub meta_tikv_ca_path: Option<PathBuf>,
+    /// Client certificate PEM for an authenticated TiKV workspace connection.
+    #[arg(long, global = true, requires_all = ["meta_tikv_ca_path", "meta_tikv_key_path"])]
+    pub meta_tikv_cert_path: Option<PathBuf>,
+    /// Client private key PEM for an authenticated TiKV workspace connection.
+    #[arg(long, global = true, requires_all = ["meta_tikv_ca_path", "meta_tikv_cert_path"])]
+    pub meta_tikv_key_path: Option<PathBuf>,
+
+    /// Key namespace for the workspace overlay catalog.
+    #[arg(long, global = true, default_value = "brewfs")]
+    pub workspace_namespace: String,
+
+    #[command(subcommand)]
+    pub command: WorkspaceCommand,
+}
+
+#[cfg(feature = "workspace-overlay")]
+#[derive(Args, Debug, Clone)]
+pub struct PackedMountRecoveryArgs {
+    /// The original mount configuration, using its same persistent cache PVC.
+    #[arg(long)]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub workspace: crate::workspace_overlay::ids::WorkspaceId,
+    #[arg(long)]
+    pub head_layer: crate::workspace_overlay::ids::LayerId,
+    #[arg(long)]
+    pub head_epoch: u64,
+    #[arg(long)]
+    pub original_lease: crate::workspace_overlay::ids::LeaseId,
+    #[arg(long)]
+    pub original_generation: u64,
+    #[arg(long)]
+    pub mount_uid: uuid::Uuid,
+    #[arg(long)]
+    pub original_pod_uid: uuid::Uuid,
+    #[arg(long)]
+    pub recovery_lease: crate::workspace_overlay::ids::LeaseId,
+    #[arg(long)]
+    pub recovery_generation: u64,
+    #[arg(long)]
+    pub recovery_pod_uid: uuid::Uuid,
+    #[arg(long, default_value_t = 30)]
+    pub ttl_seconds: u64,
+}
+
+#[cfg(feature = "workspace-overlay")]
+#[derive(Args, Debug, Clone)]
+pub struct NativeReverseIndexArgs {
+    /// Private JSON file containing independent administrator/runtime identities.
+    #[arg(long)]
+    pub admin_credentials: PathBuf,
+    #[arg(long)]
+    pub layer: crate::workspace_overlay::ids::LayerId,
+    /// Start a new build, replacing any earlier build's progress.
+    #[arg(long, conflicts_with = "initialize_gc_incarnation")]
+    pub start: bool,
+    /// Give an old Deleting layer a GC identity without claiming index readiness.
+    #[arg(long, conflicts_with = "start")]
+    pub initialize_gc_incarnation: bool,
+    /// Maximum 16-row pages to persist in this invocation; rerun to resume.
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=256))]
+    pub max_pages: u16,
+}
+
+#[cfg(feature = "workspace-overlay")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum WorkspaceCommand {
+    /// Build or resume the bounded native reverse index for a packed-v3 layer.
+    IndexNativeReverse(Box<NativeReverseIndexArgs>),
+    /// Recover an expired packed mount from its original persistent cache.
+    /// Metadata and PVC checks authorize replay; arguments only route it.
+    RecoverPackedMount(Box<PackedMountRecoveryArgs>),
+    /// Initialize a new workspace-v1 volume and its default workspace.
+    InitVolume {
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Add the explicit native-v2 control header for an existing workspace-v1
+    /// catalog. This never rewrites the catalog header or migrates data.
+    #[cfg(feature = "native-packed-base")]
+    InitNative,
+    /// Migrate an existing workspace catalog to the current entity format.
+    Migrate,
+    /// Create a workspace from an exact sealed revision.
+    Create {
+        #[arg(long = "from", value_name = "REVISION")]
+        revision: Option<crate::workspace_overlay::model::BaseRevision>,
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Seal a workspace and create a named snapshot root.
+    Snapshot {
+        workspace: crate::workspace_overlay::ids::WorkspaceId,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Fork one or more workspaces from a workspace UUID or exact revision.
+    Fork {
+        source: String,
+        #[arg(long, default_value_t = 1)]
+        count: usize,
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// List workspaces.
+    List,
+    /// Inspect one workspace and its active lease/seal state.
+    Inspect {
+        workspace: crate::workspace_overlay::ids::WorkspaceId,
+    },
+    /// Show path-level changes against the fork base or an exact revision.
+    Diff {
+        workspace: crate::workspace_overlay::ids::WorkspaceId,
+        #[arg(long, value_name = "REVISION")]
+        against: Option<crate::workspace_overlay::model::BaseRevision>,
+        #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
+        chunk_size: u64,
+    },
+    /// Mark a workspace for lease-aware garbage collection.
+    Discard {
+        workspace: crate::workspace_overlay::ids::WorkspaceId,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Seal and fast-forward a target workspace if its base is unchanged.
+    Commit {
+        workspace: crate::workspace_overlay::ids::WorkspaceId,
+        #[arg(long = "to")]
+        target: crate::workspace_overlay::ids::WorkspaceId,
+    },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -284,15 +575,284 @@ pub enum MetaBackendKind {
     TiKv,
 }
 
+#[cfg(feature = "workspace-overlay")]
+#[derive(ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceMetaBackendKind {
+    Sqlx,
+    Redis,
+    #[value(name = "tikv", alias = "ti-kv")]
+    TiKv,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MountFileConfig {
     pub mount_point: Option<PathBuf>,
+    pub volume_format: Option<VolumeFormat>,
+    pub volume: Option<VolumeFileConfig>,
+    pub native_base: Option<NativeBaseFileConfig>,
+    pub workspace: Option<uuid::Uuid>,
+    /// Immutable packed-metadata manifest object key (read-only format).
+    pub packed_manifest_key: Option<String>,
+    pub workspace_namespace: Option<String>,
+    #[serde(default)]
+    pub workspace_operator_managed: bool,
     pub data: Option<DataFileConfig>,
     pub meta: Option<MetaFileConfig>,
     pub layout: Option<LayoutFileConfig>,
     pub fuse: Option<FuseFileConfig>,
     pub cache: Option<CacheFileConfig>,
     pub compact: Option<CompactConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeFileConfig {
+    pub format: Option<VolumeFormat>,
+    pub schema_version: Option<u32>,
+    pub native_control_version: Option<u32>,
+    pub chunk_size: Option<u64>,
+    pub block_size: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeBaseFileConfig {
+    pub release_profile: String,
+    pub format_version: u16,
+    pub namespace_mode: String,
+    pub packing: NativePackingFileConfig,
+    pub reader: NativeReaderFileConfig,
+    pub cache: NativeCacheFileConfig,
+    pub prefetch: NativePrefetchFileConfig,
+    pub commit: NativeCommitFileConfig,
+    pub durability: NativeDurabilityFileConfig,
+    pub retention: NativeRetentionFileConfig,
+    pub cleanup: NativeCleanupFileConfig,
+    pub repack: NativeRepackFileConfig,
+    pub limits: NativeLimitsFileConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePackingFileConfig {
+    pub payload_format: String,
+    pub pack_target_bytes: u64,
+    pub codec: String,
+    pub multipart_part_target_bytes: u64,
+    pub retention_grouping: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeReaderFileConfig {
+    pub capture_protocol: String,
+    pub ordered_inode_commits: bool,
+    pub capture_deadline_ms: u64,
+    pub capture_max_retries: u32,
+    pub max_read_capture_bytes: u64,
+    pub max_plan_segments: u64,
+    pub max_plan_bytes: u64,
+    pub demand_get_concurrency: usize,
+    pub request_deadline_ms: u64,
+    pub inflight_encoded_bytes: u64,
+    pub inflight_decoded_bytes: u64,
+    pub physical_coalescing: bool,
+    pub exact_range_response_required: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCacheFileConfig {
+    pub scope: String,
+    pub shared_service: bool,
+    pub metadata_ram_bytes: u64,
+    pub decoded_data_bytes: u64,
+    pub encoded_disk_bytes: u64,
+    pub trust_domain_isolation: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePrefetchFileConfig {
+    pub enabled: bool,
+    pub get_concurrency: usize,
+    pub metadata_only_ops_fetch_data: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCommitFileConfig {
+    pub max_receipts: usize,
+    pub max_payload_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeDurabilityFileConfig {
+    pub write_mode: String,
+    pub remote_verification: String,
+    pub require_atomic_create_only: bool,
+    pub coordinator_profile: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRetentionFileConfig {
+    pub published: String,
+    pub published_gc: bool,
+    pub read_retention_leases: bool,
+    pub promotion: String,
+    pub private_write_domain: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCleanupFileConfig {
+    pub mode: String,
+    pub closed_private_domains_only: bool,
+    pub require_close_certificate: bool,
+    pub backend_mode: String,
+    pub allow_legacy_slice_gc: bool,
+    pub unknown_upload_policy: String,
+    pub count_delete_markers_as_freed_bytes: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRepackFileConfig {
+    pub automatic: bool,
+    pub reclaim_published: bool,
+    pub require_explicit_extra_bytes_budget: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeLimitsFileConfig {
+    pub namespace_hard_bytes: u64,
+    pub private_domain_soft_bytes: u64,
+    pub private_domain_hard_bytes: u64,
+    pub completion_reserve_bytes: u64,
+    pub on_hard_limit: String,
+}
+
+impl NativeBaseFileConfig {
+    fn validate_p1(&self) -> anyhow::Result<()> {
+        if !matches!(
+            self.release_profile.as_str(),
+            "p1-retained-trial" | "p1-private-cleanup"
+        ) {
+            anyhow::bail!(
+                "unsupported native_base.release_profile {}",
+                self.release_profile
+            )
+        }
+        if self.format_version != 3 {
+            anyhow::bail!(
+                "unsupported native_base.format_version {}",
+                self.format_version
+            )
+        }
+        if self.namespace_mode != "kv" {
+            anyhow::bail!(
+                "PR07 requires native_base.namespace_mode=kv; found {}",
+                self.namespace_mode
+            )
+        }
+        if self.packing.payload_format != "native-block-v1"
+            || self.packing.codec != "none"
+            || self.packing.retention_grouping != "required"
+        {
+            anyhow::bail!(
+                "PR07 supports only native-block-v1/none packing with required retention grouping"
+            )
+        }
+        if self.packing.pack_target_bytes == 0
+            || self.packing.multipart_part_target_bytes == 0
+            || self.reader.capture_deadline_ms == 0
+            || self.reader.capture_max_retries == 0
+            || self.reader.max_read_capture_bytes == 0
+            || self.reader.max_plan_segments == 0
+            || self.reader.max_plan_bytes == 0
+            || self.reader.demand_get_concurrency == 0
+            || self.reader.request_deadline_ms == 0
+            || self.reader.inflight_encoded_bytes == 0
+            || self.reader.inflight_decoded_bytes == 0
+            || self.cache.metadata_ram_bytes == 0
+            || self.cache.decoded_data_bytes == 0
+            || self.cache.encoded_disk_bytes == 0
+            || self.commit.max_receipts == 0
+            || self.commit.max_payload_bytes == 0
+        {
+            anyhow::bail!("native_base P1 budgets and limits must be greater than zero")
+        }
+        if self.reader.capture_protocol != "single-writer-bounded-capture"
+            || !self.reader.ordered_inode_commits
+            || self.reader.physical_coalescing
+            || !self.reader.exact_range_response_required
+        {
+            anyhow::bail!("native_base.reader does not match the supported PR07 P1 profile")
+        }
+        if self.cache.scope != "per-mount"
+            || self.cache.shared_service
+            || !self.cache.trust_domain_isolation
+        {
+            anyhow::bail!("native_base.cache does not match the supported PR07 P1 profile")
+        }
+        if self.prefetch.enabled
+            || self.prefetch.get_concurrency != 0
+            || self.prefetch.metadata_only_ops_fetch_data
+        {
+            anyhow::bail!("native_base.prefetch must be disabled for the PR07 P1 profile")
+        }
+        if self.durability.write_mode != "upload-before-commit"
+            || self.durability.remote_verification != "exact-readback"
+            || !self.durability.require_atomic_create_only
+            || self.durability.coordinator_profile.trim().is_empty()
+        {
+            anyhow::bail!("native_base.durability does not satisfy the PR07 P1 contract")
+        }
+        if self.retention.published != "forever"
+            || self.retention.published_gc
+            || self.retention.read_retention_leases
+            || self.retention.promotion != "exact-object-retain-batches"
+            || self.retention.private_write_domain != "workspace-lifetime"
+        {
+            anyhow::bail!("native_base.retention violates permanent published retention")
+        }
+        if !matches!(self.cleanup.mode.as_str(), "disabled" | "dry-run" | "apply")
+            || !self.cleanup.closed_private_domains_only
+            || !self.cleanup.require_close_certificate
+            || self.cleanup.backend_mode != "unversioned-only"
+            || self.cleanup.allow_legacy_slice_gc
+            || self.cleanup.unknown_upload_policy != "quarantine"
+            || self.cleanup.count_delete_markers_as_freed_bytes
+        {
+            anyhow::bail!("native_base.cleanup violates the private-domain cleanup contract")
+        }
+        if self.release_profile == "p1-retained-trial" && self.cleanup.mode != "disabled" {
+            anyhow::bail!("p1-retained-trial requires native_base.cleanup.mode=disabled")
+        }
+        if self.release_profile == "p1-private-cleanup" && self.cleanup.mode == "disabled" {
+            anyhow::bail!("p1-private-cleanup requires dry-run or apply cleanup mode")
+        }
+        if self.repack.automatic
+            || self.repack.reclaim_published
+            || !self.repack.require_explicit_extra_bytes_budget
+        {
+            anyhow::bail!("native_base.repack cannot reclaim published objects")
+        }
+        if self.limits.namespace_hard_bytes == 0
+            || self.limits.private_domain_soft_bytes == 0
+            || self.limits.private_domain_hard_bytes == 0
+            || self.limits.completion_reserve_bytes == 0
+            || self.limits.private_domain_soft_bytes > self.limits.private_domain_hard_bytes
+            || self.limits.private_domain_hard_bytes > self.limits.namespace_hard_bytes
+            || self.limits.on_hard_limit != "reject-new-admissions-not-accepted-drain"
+        {
+            anyhow::bail!("native_base.limits are invalid for the PR07 P1 profile")
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -327,7 +887,9 @@ pub struct MetaFileConfig {
     pub tikv: Option<TiKvMetaFileConfig>,
     pub open_file_cache_ttl_ms: Option<u64>,
     pub open_file_cache_capacity: Option<u64>,
+    pub read_plan_cache_max_weight: Option<u64>,
     pub allow_write_open_cache: Option<bool>,
+    pub slice_version_check_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -344,6 +906,29 @@ pub struct EtcdMetaFileConfig {
 pub struct TiKvMetaFileConfig {
     pub pd_endpoints: Option<Vec<String>>,
     pub namespace: Option<String>,
+    pub tls: Option<TiKvTlsFileConfig>,
+}
+
+/// TLS is all-or-none. A missing or misspelled field cannot silently select a
+/// plaintext TiKV connection.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TiKvTlsFileConfig {
+    pub ca_path: PathBuf,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
+impl TiKvTlsFileConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if [&self.ca_path, &self.cert_path, &self.key_path]
+            .iter()
+            .any(|path| path.as_os_str().is_empty())
+        {
+            anyhow::bail!("TiKV TLS requires nonempty ca_path, cert_path and key_path");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -397,6 +982,11 @@ pub struct BandwidthFileConfig {
 #[derive(Debug, Clone)]
 pub struct MountConfig {
     pub mount_point: PathBuf,
+    pub volume_format: VolumeFormat,
+    pub workspace: Option<uuid::Uuid>,
+    pub packed_manifest_key: Option<String>,
+    pub workspace_namespace: String,
+    pub workspace_operator_managed: bool,
     pub data_backend: DataBackendKind,
     pub data_dir: PathBuf,
     pub s3_bucket: Option<String>,
@@ -411,9 +1001,12 @@ pub struct MountConfig {
     pub meta_etcd_urls: Vec<String>,
     pub meta_tikv_pd_endpoints: Vec<String>,
     pub meta_tikv_namespace: String,
+    pub meta_tikv_tls: Option<TiKvTlsFileConfig>,
     pub meta_open_file_cache_ttl_ms: Option<u64>,
     pub meta_open_file_cache_capacity: Option<u64>,
+    pub meta_read_plan_cache_max_weight: Option<u64>,
     pub meta_allow_write_open_cache: bool,
+    pub meta_slice_version_check_interval_ms: Option<u64>,
     pub chunk_size: u64,
     pub block_size: u32,
     pub fuse_workers: usize,
@@ -421,6 +1014,30 @@ pub struct MountConfig {
     pub privileged: bool,
     pub cache: VfsCacheConfig,
     pub compact: CompactConfig,
+    pub native_base: Option<NativeBaseFileConfig>,
+}
+
+fn resolve_volume_size<T>(
+    name: &str,
+    cli: Option<T>,
+    legacy: Option<T>,
+    volume: Option<T>,
+    default: T,
+) -> anyhow::Result<T>
+where
+    T: Copy + Eq + std::fmt::Display,
+{
+    if let Some(contract) = volume {
+        for (source, value) in [("CLI", cli), ("layout", legacy)] {
+            if value.is_some_and(|value| value != contract) {
+                anyhow::bail!(
+                    "{source} {name} conflicts with the declared volume {name} {contract}"
+                );
+            }
+        }
+        return Ok(contract);
+    }
+    Ok(cli.or(legacy).unwrap_or(default))
 }
 
 impl MountConfig {
@@ -433,6 +1050,8 @@ impl MountConfig {
             None => MountFileConfig::default(),
         };
 
+        let volume_cfg = file_cfg.volume.unwrap_or_default();
+        let native_base = file_cfg.native_base;
         let data_cfg = file_cfg.data.unwrap_or_default();
         let localfs_cfg = data_cfg.localfs.unwrap_or_default();
         let s3_cfg = data_cfg.s3.unwrap_or_default();
@@ -445,6 +1064,88 @@ impl MountConfig {
         let fuse_cfg = file_cfg.fuse.unwrap_or_default();
         let cache_cfg = file_cfg.cache.unwrap_or_default();
         let compact = file_cfg.compact.unwrap_or_default();
+        let workspace = args.workspace.or(file_cfg.workspace);
+        let packed_manifest_key = args
+            .packed_manifest_key
+            .or(file_cfg.packed_manifest_key)
+            .filter(|key| !key.is_empty());
+        if let (Some(legacy), Some(nested)) = (file_cfg.volume_format, volume_cfg.format)
+            && legacy != nested
+        {
+            anyhow::bail!("volume_format conflicts with volume.format");
+        }
+        let file_volume_format = volume_cfg.format.or(file_cfg.volume_format);
+        if let (Some(cli), Some(nested)) = (args.volume_format, volume_cfg.format)
+            && cli != nested
+        {
+            anyhow::bail!("--volume-format conflicts with config volume.format");
+        }
+        let volume_format = args
+            .volume_format
+            .or(file_volume_format)
+            .unwrap_or_else(|| {
+                if workspace.is_some() {
+                    VolumeFormat::WorkspaceV1
+                } else {
+                    VolumeFormat::FlatV1
+                }
+            });
+        if workspace.is_some() && volume_format == VolumeFormat::FlatV1 {
+            anyhow::bail!("workspace id cannot be used with volume_format=flat-v1");
+        }
+        if workspace.is_none() && volume_format == VolumeFormat::WorkspaceNativeV2 {
+            anyhow::bail!("workspace id is required with volume_format=workspace-native-v2");
+        }
+        #[cfg(feature = "native-packed-base")]
+        if volume_format == VolumeFormat::PackedMetadataV1 {
+            anyhow::bail!("packed-metadata-v1 is unsupported; use packed-metadata-v3");
+        }
+        #[cfg(feature = "workspace-overlay")]
+        if volume_format == VolumeFormat::PackedMetadataV2 {
+            anyhow::bail!("packed-metadata-v2 is unsupported; use packed-metadata-v3");
+        }
+        #[cfg(feature = "workspace-overlay")]
+        if volume_format == VolumeFormat::PackedMetadataV3 {
+            if workspace.is_some() {
+                anyhow::bail!("packed-metadata-v3 is a standalone read-only volume");
+            }
+            if packed_manifest_key.is_none() {
+                anyhow::bail!(
+                    "packed-metadata-v3 requires --packed-manifest-key or packed_manifest_key"
+                );
+            }
+            if native_base.is_some()
+                || volume_cfg.schema_version.is_some()
+                || volume_cfg.native_control_version.is_some()
+            {
+                anyhow::bail!("native workspace controls cannot be used with packed-metadata-v3");
+            }
+        }
+        if volume_format == VolumeFormat::WorkspaceNativeV2 {
+            if volume_cfg.format != Some(VolumeFormat::WorkspaceNativeV2) {
+                anyhow::bail!("workspace-native-v2 requires an explicit volume.format declaration");
+            }
+            if volume_cfg.schema_version != Some(2) {
+                anyhow::bail!("workspace-native-v2 requires volume.schema_version=2");
+            }
+            if volume_cfg.native_control_version != Some(2) {
+                anyhow::bail!("workspace-native-v2 requires volume.native_control_version=2");
+            }
+            if volume_cfg.chunk_size.is_none() || volume_cfg.block_size.is_none() {
+                anyhow::bail!(
+                    "workspace-native-v2 requires volume.chunk_size and volume.block_size"
+                );
+            }
+            native_base
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("workspace-native-v2 requires native_base config"))?
+                .validate_p1()?;
+        } else if native_base.is_some()
+            || volume_cfg.schema_version.is_some()
+            || volume_cfg.native_control_version.is_some()
+        {
+            anyhow::bail!("native volume controls require volume.format=workspace-native-v2");
+        }
         let cache = cache_cfg.into_cache_config()?;
         let data_backend = args
             .data_backend
@@ -456,6 +1157,13 @@ impl MountConfig {
         {
             anyhow::bail!("cache.writeback_mode=commit_before_upload requires data.backend=s3");
         }
+        if volume_format == VolumeFormat::WorkspaceNativeV2
+            && matches!(cache.writeback_mode, WriteBackMode::CommitBeforeUpload)
+        {
+            anyhow::bail!(
+                "volume_format=workspace-native-v2 requires cache.writeback_mode=upload_before_commit"
+            );
+        }
 
         let mount_point = args.mount_point.or(file_cfg.mount_point).ok_or_else(|| {
             anyhow::anyhow!("mount point is required (positional arg or config.mount_point)")
@@ -466,15 +1174,59 @@ impl MountConfig {
             .or(meta_cfg.backend)
             .unwrap_or(MetaBackendKind::Sqlx);
 
+        if volume_format == VolumeFormat::WorkspaceNativeV2
+            && !matches!(meta_backend, MetaBackendKind::Redis | MetaBackendKind::TiKv)
+        {
+            anyhow::bail!("volume_format=workspace-native-v2 requires meta.backend=redis or tikv");
+        }
+
         let meta_url_from_file = match meta_backend {
             MetaBackendKind::Sqlx => sqlx_cfg.url,
             MetaBackendKind::Redis => redis_cfg.url,
             MetaBackendKind::Etcd => None,
             MetaBackendKind::TiKv => None,
         };
+        if meta_cfg.read_plan_cache_max_weight == Some(0) {
+            anyhow::bail!("meta.read_plan_cache_max_weight must be greater than 0");
+        }
+        let chunk_size = resolve_volume_size(
+            "chunk_size",
+            args.chunk_size,
+            layout_cfg.chunk_size,
+            volume_cfg.chunk_size,
+            DEFAULT_CHUNK_SIZE,
+        )?;
+        let block_size = resolve_volume_size(
+            "block_size",
+            args.block_size,
+            layout_cfg.block_size,
+            volume_cfg.block_size,
+            DEFAULT_BLOCK_SIZE,
+        )?;
+        if block_size == 0 || chunk_size == 0 || chunk_size % u64::from(block_size) != 0 {
+            anyhow::bail!("chunk_size must be a non-zero multiple of block_size");
+        }
+
+        if let Some(tls) = tikv_cfg.tls.as_ref() {
+            tls.validate()?;
+            if !matches!(meta_backend, MetaBackendKind::TiKv)
+                || volume_format != VolumeFormat::WorkspaceV1
+            {
+                anyhow::bail!("meta.tikv.tls is supported only by the TiKV workspace catalog");
+            }
+        }
 
         Ok(Self {
             mount_point,
+            volume_format,
+            workspace,
+            packed_manifest_key,
+            workspace_namespace: args
+                .workspace_namespace
+                .or(file_cfg.workspace_namespace)
+                .unwrap_or_else(|| "brewfs".to_string()),
+            workspace_operator_managed: args.workspace_operator_managed
+                || file_cfg.workspace_operator_managed,
             data_backend,
             data_dir: args
                 .data_dir
@@ -513,17 +1265,14 @@ impl MountConfig {
                 .meta_tikv_namespace
                 .or(tikv_cfg.namespace)
                 .unwrap_or_else(crate::meta::config::default_tikv_namespace),
+            meta_tikv_tls: tikv_cfg.tls,
             meta_open_file_cache_ttl_ms: meta_cfg.open_file_cache_ttl_ms,
             meta_open_file_cache_capacity: meta_cfg.open_file_cache_capacity,
+            meta_read_plan_cache_max_weight: meta_cfg.read_plan_cache_max_weight,
             meta_allow_write_open_cache: meta_cfg.allow_write_open_cache.unwrap_or(false),
-            chunk_size: args
-                .chunk_size
-                .or(layout_cfg.chunk_size)
-                .unwrap_or(DEFAULT_CHUNK_SIZE),
-            block_size: args
-                .block_size
-                .or(layout_cfg.block_size)
-                .unwrap_or(DEFAULT_BLOCK_SIZE),
+            meta_slice_version_check_interval_ms: meta_cfg.slice_version_check_interval_ms,
+            chunk_size,
+            block_size,
             fuse_workers: args
                 .fuse_workers
                 .or(fuse_cfg.workers)
@@ -535,8 +1284,160 @@ impl MountConfig {
             privileged: args.privileged || fuse_cfg.privileged.unwrap_or(false),
             cache,
             compact,
+            native_base,
         })
     }
+
+    /// Derive a stable, non-secret identity for the persistent state owned by
+    /// a flat volume. Both halves are required: metadata identifies the inode
+    /// and slice namespace, while the data backend identifies the objects to
+    /// which those slice IDs refer.
+    pub(crate) fn flat_volume_cache_scope(&self) -> anyhow::Result<String> {
+        let mut parts = vec!["flat-v1".to_string()];
+
+        match self.meta_backend {
+            MetaBackendKind::Sqlx => {
+                parts.push("meta:sqlx".to_string());
+                if crate::meta::stores::database::is_sqlite_memory_url(&self.meta_url) {
+                    // In-memory metadata has no identity that survives a
+                    // restart, so it must never recover persistent cache state
+                    // produced by an earlier mount.
+                    parts.push(format!("ephemeral:{}", uuid::Uuid::new_v4()));
+                } else {
+                    parts.push(scrubbed_url_identity(&self.meta_url));
+                }
+            }
+            MetaBackendKind::Redis => {
+                parts.push("meta:redis".to_string());
+                parts.push(scrubbed_url_identity(&self.meta_url));
+            }
+            MetaBackendKind::Etcd => {
+                parts.push("meta:etcd".to_string());
+                let mut endpoints = self
+                    .meta_etcd_urls
+                    .iter()
+                    .map(|endpoint| scrubbed_url_identity(endpoint))
+                    .collect::<Vec<_>>();
+                endpoints.sort_unstable();
+                parts.extend(endpoints);
+            }
+            MetaBackendKind::TiKv => {
+                parts.push("meta:tikv".to_string());
+                let mut endpoints = self
+                    .meta_tikv_pd_endpoints
+                    .iter()
+                    .map(|endpoint| scrubbed_url_identity(endpoint))
+                    .collect::<Vec<_>>();
+                endpoints.sort_unstable();
+                parts.extend(endpoints);
+                parts.push(format!("namespace:{}", self.meta_tikv_namespace));
+            }
+        }
+
+        match self.data_backend {
+            DataBackendKind::LocalFs => {
+                parts.push("data:localfs".to_string());
+                // Keep this lexical rather than canonical: the identity must
+                // not change merely because the directory is created between
+                // two mounts, and treating symlink aliases as separate cache
+                // owners is safe.
+                let identity = std::path::absolute(&self.data_dir)?;
+                parts.push(identity.to_string_lossy().into_owned());
+            }
+            DataBackendKind::S3 => {
+                parts.push("data:s3".to_string());
+                parts.push(format!(
+                    "endpoint:{}",
+                    self.s3_endpoint
+                        .as_deref()
+                        .map(scrubbed_url_identity)
+                        // Without an explicit endpoint the AWS SDK may resolve
+                        // a different service from the environment or active
+                        // profile. Do not persistently reuse cache state when
+                        // that identity cannot be derived from MountConfig.
+                        .unwrap_or_else(|| format!("ephemeral:{}", uuid::Uuid::new_v4()))
+                ));
+                parts.push(format!(
+                    "bucket:{}",
+                    self.s3_bucket.as_deref().unwrap_or_default()
+                ));
+                parts.push(format!(
+                    "region:{}",
+                    self.s3_region.as_deref().unwrap_or_default()
+                ));
+            }
+        }
+
+        let mut hasher = Sha256::new();
+        for part in parts {
+            hasher.update((part.len() as u64).to_be_bytes());
+            hasher.update(part.as_bytes());
+        }
+        Ok(hex::encode(hasher.finalize()))
+    }
+}
+
+fn scrubbed_url_identity(raw: &str) -> String {
+    fn is_secret_query_key(key: &str) -> bool {
+        let key = key.to_ascii_lowercase().replace('-', "_");
+        key.contains("password")
+            || key.contains("passwd")
+            || key.contains("secret")
+            || key.contains("credential")
+            || key == "token"
+            || key.starts_with("token_")
+            || key.ends_with("_token")
+            || key == "api_key"
+            || key == "access_key"
+            || key == "access_key_id"
+            || key == "signature"
+            || key.ends_with("_signature")
+            || key == "authorization"
+    }
+
+    fn scrub(mut url: Url) -> String {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        let mut query = url
+            .query_pairs()
+            .map(|(key, value)| {
+                let key = key.into_owned();
+                let value = if is_secret_query_key(&key) {
+                    "<redacted>".to_string()
+                } else {
+                    value.into_owned()
+                };
+                (key, value)
+            })
+            .collect::<Vec<_>>();
+        query.sort_unstable();
+        url.set_query(None);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(
+                query
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            );
+        }
+        url.set_fragment(None);
+        url.to_string()
+    }
+
+    let raw = raw.trim();
+    if let Ok(url) = Url::parse(raw)
+        && url.has_host()
+    {
+        return scrub(url);
+    }
+    if let Ok(url) = Url::parse(&format!("http://{raw}"))
+        && url.has_host()
+    {
+        return scrub(url)
+            .strip_prefix("http://")
+            .unwrap_or(raw)
+            .to_string();
+    }
+    raw.to_string()
 }
 
 impl CacheFileConfig {
@@ -667,6 +1568,20 @@ fn parse_writeback_mode(value: &str) -> anyhow::Result<WriteBackMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tikv_tls_schema_rejects_partial_or_misspelled_configuration() {
+        let tls: TiKvTlsFileConfig = serde_yaml::from_str(
+            "ca_path: /run/brewfs/metadata/ca.crt\ncert_path: /run/brewfs/metadata/tls.crt\nkey_path: /run/brewfs/metadata/tls.key\n",
+        ).unwrap();
+        tls.validate().unwrap();
+        for source in [
+            "ca_path: ca\ncert_path: cert\n",
+            "ca_path: ca\ncert_path: cert\nkey_path: key\nkeypath: ignored\n",
+        ] {
+            assert!(serde_yaml::from_str::<TiKvTlsFileConfig>(source).is_err());
+        }
+    }
+
     use clap::CommandFactory;
     use clap::Parser;
     use clap::error::ErrorKind;
@@ -674,6 +1589,11 @@ mod tests {
     fn empty_mount_args(config: Option<PathBuf>, mount_point: Option<PathBuf>) -> MountArgs {
         MountArgs {
             config,
+            volume_format: None,
+            workspace: None,
+            packed_manifest_key: None,
+            workspace_namespace: None,
+            workspace_operator_managed: false,
             mount_point,
             data_backend: None,
             data_dir: None,
@@ -695,6 +1615,26 @@ mod tests {
             fuse_max_background: None,
             privileged: false,
         }
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[test]
+    fn workspace_migrate_parses_catalog_configuration() {
+        let cli = Cli::parse_from([
+            "brewfs",
+            "workspace",
+            "--meta-backend",
+            "redis",
+            "--meta-url",
+            "redis://localhost:6379/0",
+            "migrate",
+        ]);
+        let Command::Workspace(args) = cli.cmd else {
+            panic!("expected workspace command");
+        };
+        assert_eq!(args.meta_backend, WorkspaceMetaBackendKind::Redis);
+        assert_eq!(args.meta_url, "redis://localhost:6379/0");
+        assert!(matches!(args.command, WorkspaceCommand::Migrate));
     }
 
     #[test]
@@ -812,6 +1752,11 @@ mod tests {
     fn mount_config_defaults_use_low_overhead_fuse_dispatch() {
         let config = MountConfig::from_sources(MountArgs {
             config: None,
+            volume_format: None,
+            workspace: None,
+            packed_manifest_key: None,
+            workspace_namespace: None,
+            workspace_operator_managed: false,
             mount_point: Some(PathBuf::from("/mnt/slayer")),
             data_backend: None,
             data_dir: None,
@@ -837,12 +1782,49 @@ mod tests {
 
         assert_eq!(config.fuse_workers, 1);
         assert_eq!(config.fuse_max_background, DEFAULT_FUSE_MAX_BACKGROUND);
+        assert_eq!(config.volume_format, VolumeFormat::FlatV1);
+        assert!(config.workspace.is_none());
+    }
+
+    #[test]
+    fn default_cli_surface_does_not_expose_workspace_commands() {
+        let help = Cli::command().render_long_help().to_string();
+
+        #[cfg(not(feature = "workspace-overlay"))]
+        assert!(!help.contains("workspace"));
+        #[cfg(feature = "workspace-overlay")]
+        assert!(help.contains("workspace"));
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[test]
+    fn workspace_mount_flags_are_feature_gated_and_parse() {
+        let id = uuid::Uuid::from_u128(77);
+        let cli = Cli::parse_from([
+            "brewfs",
+            "mount",
+            "/mnt/workspace",
+            "--volume-format",
+            "workspace-v1",
+            "--workspace",
+            &id.to_string(),
+        ]);
+        let Command::Mount(args) = cli.cmd else {
+            panic!("expected mount command");
+        };
+        assert_eq!(args.volume_format, Some(VolumeFormat::WorkspaceV1));
+        assert_eq!(args.workspace, Some(id));
     }
 
     #[test]
     fn mount_config_defaults_raise_s3_concurrency() {
         let config = MountConfig::from_sources(MountArgs {
             config: None,
+            volume_format: None,
+            workspace: None,
+            packed_manifest_key: None,
+            workspace_namespace: None,
+            workspace_operator_managed: false,
             mount_point: Some(PathBuf::from("/mnt/slayer")),
             data_backend: None,
             data_dir: None,
@@ -868,6 +1850,163 @@ mod tests {
 
         assert_eq!(config.s3_max_concurrency, DEFAULT_S3_MAX_CONCURRENCY);
         assert_eq!(config.s3_max_concurrency, 32);
+    }
+
+    #[test]
+    fn legacy_config_defaults_flat_but_workspace_marker_is_parseable() {
+        let path = std::env::temp_dir().join(format!(
+            "brewfs-workspace-format-config-{}-{}.yaml",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(
+            &path,
+            "mount_point: /mnt/workspace\nvolume_format: workspace-v1\nworkspace: 00000000-0000-0000-0000-000000000077\n",
+        )
+        .unwrap();
+        let config = MountConfig::from_sources(empty_mount_args(Some(path.clone()), None)).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(config.volume_format, VolumeFormat::WorkspaceV1);
+        assert_eq!(config.workspace, Some(uuid::Uuid::from_u128(0x77)));
+    }
+
+    #[test]
+    fn workspace_operator_managed_mode_is_opt_in() {
+        let mut args = empty_mount_args(None, Some(PathBuf::from("/mnt/workspace")));
+        assert!(
+            !MountConfig::from_sources(args.clone())
+                .unwrap()
+                .workspace_operator_managed
+        );
+
+        args.workspace_operator_managed = true;
+        assert!(
+            MountConfig::from_sources(args)
+                .unwrap()
+                .workspace_operator_managed
+        );
+    }
+
+    #[test]
+    fn workspace_id_selects_workspace_format_and_rejects_explicit_flat_format() {
+        let workspace = uuid::Uuid::from_u128(88);
+        let mut args = empty_mount_args(None, Some(PathBuf::from("/mnt/workspace")));
+        args.workspace = Some(workspace);
+        let config = MountConfig::from_sources(args.clone()).unwrap();
+        assert_eq!(config.volume_format, VolumeFormat::WorkspaceV1);
+        assert_eq!(config.workspace, Some(workspace));
+
+        args.volume_format = Some(VolumeFormat::FlatV1);
+        assert!(
+            MountConfig::from_sources(args)
+                .unwrap_err()
+                .to_string()
+                .contains("workspace id cannot be used")
+        );
+    }
+
+    #[cfg(any(feature = "native-packed-base", feature = "workspace-overlay"))]
+    fn assert_legacy_packed_mount_rejected(format: &str, volume_format: VolumeFormat) {
+        let cli = Cli::parse_from([
+            "brewfs",
+            "mount",
+            "/mnt/legacy-packed",
+            "--volume-format",
+            format,
+            "--packed-manifest-key",
+            "snapshots/legacy-manifest",
+        ]);
+        let Command::Mount(args) = cli.cmd else {
+            panic!("expected mount command");
+        };
+        let error = MountConfig::from_sources(*args).unwrap_err().to_string();
+        assert!(
+            error.contains("unsupported") && error.contains("packed-metadata-v3"),
+            "{error}"
+        );
+
+        for selector in [
+            format!("volume_format: {format}\n"),
+            format!("volume:\n  format: {format}\n"),
+        ] {
+            let yaml = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(
+                yaml.path(),
+                format!(
+                    "mount_point: /mnt/legacy-packed\n{selector}packed_manifest_key: snapshots/legacy-manifest\n"
+                ),
+            )
+            .unwrap();
+            let error =
+                MountConfig::from_sources(empty_mount_args(Some(yaml.path().to_owned()), None))
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains("unsupported") && error.contains("packed-metadata-v3"),
+                "{error}"
+            );
+        }
+
+        // Rejection must not depend on an old manifest or object backend.
+        let mut args = empty_mount_args(None, Some(PathBuf::from("/mnt/legacy-packed")));
+        args.volume_format = Some(volume_format);
+        let error = MountConfig::from_sources(args).unwrap_err().to_string();
+        assert!(
+            error.contains("unsupported") && error.contains("packed-metadata-v3"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "native-packed-base")]
+    #[test]
+    fn legacy_packed_v1_mount_is_rejected_from_cli_and_yaml() {
+        assert_legacy_packed_mount_rejected("packed-metadata-v1", VolumeFormat::PackedMetadataV1);
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[test]
+    fn legacy_packed_v2_mount_is_rejected_from_cli_and_yaml() {
+        assert_legacy_packed_mount_rejected("packed-metadata-v2", VolumeFormat::PackedMetadataV2);
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[test]
+    fn packed_metadata_v3_mount_remains_supported_from_cli_and_yaml() {
+        let cli = Cli::parse_from([
+            "brewfs",
+            "mount",
+            "/mnt/packed-v3",
+            "--volume-format",
+            "packed-metadata-v3",
+            "--packed-manifest-key",
+            "snapshots/v3-manifest",
+        ]);
+        let Command::Mount(args) = cli.cmd else {
+            panic!("expected mount command");
+        };
+        let config = MountConfig::from_sources(*args).unwrap();
+        assert_eq!(config.volume_format, VolumeFormat::PackedMetadataV3);
+        assert_eq!(
+            config.packed_manifest_key.as_deref(),
+            Some("snapshots/v3-manifest")
+        );
+        assert!(config.workspace.is_none());
+
+        let yaml = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            yaml.path(),
+            "mount_point: /mnt/packed-v3\nvolume:\n  format: packed-metadata-v3\npacked_manifest_key: snapshots/v3-manifest\n",
+        )
+        .unwrap();
+        let config =
+            MountConfig::from_sources(empty_mount_args(Some(yaml.path().to_owned()), None))
+                .unwrap();
+        assert_eq!(config.volume_format, VolumeFormat::PackedMetadataV3);
+        assert_eq!(
+            config.packed_manifest_key.as_deref(),
+            Some("snapshots/v3-manifest")
+        );
     }
 
     #[test]
@@ -917,7 +2056,9 @@ mount_point: /mnt/slayer
 meta:
   open_file_cache_ttl_ms: 1000
   open_file_cache_capacity: 65536
+  read_plan_cache_max_weight: 32768
   allow_write_open_cache: true
+  slice_version_check_interval_ms: 250
 "#,
         )
         .unwrap();
@@ -927,7 +2068,33 @@ meta:
 
         assert_eq!(config.meta_open_file_cache_ttl_ms, Some(1000));
         assert_eq!(config.meta_open_file_cache_capacity, Some(65536));
+        assert_eq!(config.meta_read_plan_cache_max_weight, Some(32768));
         assert!(config.meta_allow_write_open_cache);
+        assert_eq!(config.meta_slice_version_check_interval_ms, Some(250));
+    }
+
+    #[test]
+    fn mount_config_rejects_zero_read_plan_cache_weight() {
+        let path = std::env::temp_dir().join(format!(
+            "brewfs-read-plan-cache-config-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(
+            &path,
+            "mount_point: /mnt/slayer\nmeta:\n  read_plan_cache_max_weight: 0\n",
+        )
+        .unwrap();
+
+        let error = MountConfig::from_sources(empty_mount_args(Some(path.clone()), None))
+            .expect_err("zero read-plan cache weight should be rejected");
+        let _ = std::fs::remove_file(path);
+
+        assert!(
+            error
+                .to_string()
+                .contains("meta.read_plan_cache_max_weight must be greater than 0")
+        );
     }
 
     #[test]
@@ -1162,6 +2329,132 @@ cache:
     }
 
     #[test]
+    fn flat_cache_scope_is_stable_across_credential_rotation() {
+        let data_dir = std::env::temp_dir().join("brewfs-flat-cache-scope-data");
+        let mut first = empty_mount_args(None, Some(PathBuf::from("/mnt/first")));
+        first.data_backend = Some(DataBackendKind::S3);
+        first.s3_bucket = Some("volume-bucket".to_string());
+        first.s3_region = Some("us-test-1".to_string());
+        first.s3_endpoint =
+            Some("https://alice:old-secret@objects.example.test?token=old".to_string());
+        first.meta_url = Some(
+            "postgres://alice:old-secret@metadata.example.test/brewfs?password=old".to_string(),
+        );
+        first.data_dir = Some(data_dir.clone());
+
+        let mut second = first.clone();
+        second.s3_endpoint =
+            Some("https://bob:new-secret@objects.example.test?token=new".to_string());
+        second.meta_url =
+            Some("postgres://bob:new-secret@metadata.example.test/brewfs?password=new".to_string());
+
+        let first = MountConfig::from_sources(first).unwrap();
+        let second = MountConfig::from_sources(second).unwrap();
+        assert_eq!(
+            first.flat_volume_cache_scope().unwrap(),
+            second.flat_volume_cache_scope().unwrap()
+        );
+    }
+
+    #[test]
+    fn flat_cache_scope_changes_with_either_volume_identity() {
+        let mut base = empty_mount_args(None, Some(PathBuf::from("/mnt/base")));
+        base.data_dir = Some(PathBuf::from("/var/lib/brewfs/objects-a"));
+        base.meta_url = Some("postgres://metadata.example.test/volume-a".to_string());
+
+        let mut other_metadata = base.clone();
+        other_metadata.meta_url = Some("postgres://metadata.example.test/volume-b".to_string());
+        let mut other_objects = base.clone();
+        other_objects.data_dir = Some(PathBuf::from("/var/lib/brewfs/objects-b"));
+
+        let base = MountConfig::from_sources(base).unwrap();
+        let other_metadata = MountConfig::from_sources(other_metadata).unwrap();
+        let other_objects = MountConfig::from_sources(other_objects).unwrap();
+        let base_scope = base.flat_volume_cache_scope().unwrap();
+
+        assert_ne!(
+            base_scope,
+            other_metadata.flat_volume_cache_scope().unwrap()
+        );
+        assert_ne!(base_scope, other_objects.flat_volume_cache_scope().unwrap());
+    }
+
+    #[test]
+    fn flat_cache_scope_preserves_non_secret_metadata_query_identity() {
+        let mut first = empty_mount_args(None, Some(PathBuf::from("/mnt/first")));
+        first.data_dir = Some(PathBuf::from("/var/lib/brewfs/objects"));
+        first.meta_url = Some(
+            "postgres://metadata.example.test/brewfs?options=-csearch_path%3Dvolume_a&password=old"
+                .to_string(),
+        );
+
+        let mut second = first.clone();
+        second.meta_url = Some(
+            "postgres://metadata.example.test/brewfs?password=new&options=-csearch_path%3Dvolume_b"
+                .to_string(),
+        );
+        let mut reordered = first.clone();
+        reordered.meta_url = Some(
+            "postgres://metadata.example.test/brewfs?password=rotated&options=-csearch_path%3Dvolume_a"
+                .to_string(),
+        );
+
+        let first = MountConfig::from_sources(first).unwrap();
+        let second = MountConfig::from_sources(second).unwrap();
+        let reordered = MountConfig::from_sources(reordered).unwrap();
+        assert_eq!(
+            first.flat_volume_cache_scope().unwrap(),
+            reordered.flat_volume_cache_scope().unwrap()
+        );
+        assert_ne!(
+            first.flat_volume_cache_scope().unwrap(),
+            second.flat_volume_cache_scope().unwrap()
+        );
+    }
+
+    #[test]
+    fn implicit_s3_endpoint_never_reuses_persistent_cache_scope() {
+        let mut args = empty_mount_args(None, Some(PathBuf::from("/mnt/first")));
+        args.data_backend = Some(DataBackendKind::S3);
+        args.s3_bucket = Some("volume-bucket".to_string());
+        args.s3_region = Some("us-test-1".to_string());
+        args.meta_url = Some("postgres://metadata.example.test/brewfs".to_string());
+
+        let first = MountConfig::from_sources(args).unwrap();
+        let second = first.clone();
+        assert_ne!(
+            first.flat_volume_cache_scope().unwrap(),
+            second.flat_volume_cache_scope().unwrap()
+        );
+    }
+
+    #[test]
+    fn in_memory_metadata_never_reuses_persistent_cache_scope() {
+        let first =
+            MountConfig::from_sources(empty_mount_args(None, Some(PathBuf::from("/mnt/first"))))
+                .unwrap();
+        let second = first.clone();
+
+        assert_ne!(
+            first.flat_volume_cache_scope().unwrap(),
+            second.flat_volume_cache_scope().unwrap()
+        );
+    }
+
+    #[test]
+    fn sqlite_file_memory_metadata_never_reuses_persistent_cache_scope() {
+        let mut args = empty_mount_args(None, Some(PathBuf::from("/mnt/first")));
+        args.meta_url = Some("sqlite:file::memory:?cache=shared".to_string());
+
+        let first = MountConfig::from_sources(args).unwrap();
+        let second = first.clone();
+        assert_ne!(
+            first.flat_volume_cache_scope().unwrap(),
+            second.flat_volume_cache_scope().unwrap()
+        );
+    }
+
+    #[test]
     fn parse_writeback_mode_accepts_aliases() {
         assert_eq!(
             parse_writeback_mode("upload-first").unwrap(),
@@ -1172,5 +2465,320 @@ cache:
             WriteBackMode::CommitBeforeUpload
         );
         assert!(parse_writeback_mode("fastest").is_err());
+    }
+
+    const NATIVE_P1_CONFIG: &str = r#"
+volume:
+  format: workspace-native-v2
+  schema_version: 2
+  native_control_version: 2
+  chunk_size: 67108864
+  block_size: 4194304
+native_base:
+  release_profile: p1-retained-trial
+  format_version: 3
+  namespace_mode: kv
+  packing:
+    payload_format: native-block-v1
+    pack_target_bytes: 134217728
+    codec: none
+    multipart_part_target_bytes: 16777216
+    retention_grouping: required
+  reader:
+    capture_protocol: single-writer-bounded-capture
+    ordered_inode_commits: true
+    capture_deadline_ms: 5000
+    capture_max_retries: 3
+    max_read_capture_bytes: 16777216
+    max_plan_segments: 65536
+    max_plan_bytes: 8388608
+    demand_get_concurrency: 16
+    request_deadline_ms: 30000
+    inflight_encoded_bytes: 134217728
+    inflight_decoded_bytes: 268435456
+    physical_coalescing: false
+    exact_range_response_required: true
+  cache:
+    scope: per-mount
+    shared_service: false
+    metadata_ram_bytes: 134217728
+    decoded_data_bytes: 268435456
+    encoded_disk_bytes: 4294967296
+    trust_domain_isolation: true
+  prefetch:
+    enabled: false
+    get_concurrency: 0
+    metadata_only_ops_fetch_data: false
+  commit:
+    max_receipts: 128
+    max_payload_bytes: 1048576
+  durability:
+    write_mode: upload-before-commit
+    remote_verification: exact-readback
+    require_atomic_create_only: true
+    coordinator_profile: test-profile
+  retention:
+    published: forever
+    published_gc: false
+    read_retention_leases: false
+    promotion: exact-object-retain-batches
+    private_write_domain: workspace-lifetime
+  cleanup:
+    mode: disabled
+    closed_private_domains_only: true
+    require_close_certificate: true
+    backend_mode: unversioned-only
+    allow_legacy_slice_gc: false
+    unknown_upload_policy: quarantine
+    count_delete_markers_as_freed_bytes: false
+  repack:
+    automatic: false
+    reclaim_published: false
+    require_explicit_extra_bytes_budget: true
+  limits:
+    namespace_hard_bytes: 68719476736
+    private_domain_soft_bytes: 8589934592
+    private_domain_hard_bytes: 17179869184
+    completion_reserve_bytes: 536870912
+    on_hard_limit: reject-new-admissions-not-accepted-drain
+"#;
+
+    const NATIVE_PREFIX: &str = "mount_point: /mnt/native\nworkspace: 00000000-0000-0000-0000-000000000077\nmeta:\n  backend: redis";
+
+    fn native_mount_config(prefix: &str) -> anyhow::Result<MountConfig> {
+        mount_config_from_yaml(&format!("{prefix}\n{NATIVE_P1_CONFIG}"))
+    }
+
+    /// Parse a mount config whose native_base block is `native_block`, so a
+    /// test can mutate exactly one shipped field and assert the gate refuses it.
+    fn native_mount_config_from(native_block: &str) -> anyhow::Result<MountConfig> {
+        mount_config_from_yaml(&format!("{NATIVE_PREFIX}\n{native_block}"))
+    }
+
+    fn mount_config_from_yaml(yaml: &str) -> anyhow::Result<MountConfig> {
+        let path = std::env::temp_dir().join(format!(
+            "brewfs-native-mount-config-{}-{}.yaml",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(&path, yaml).unwrap();
+        let result = MountConfig::from_sources(empty_mount_args(Some(path.clone()), None));
+        let _ = std::fs::remove_file(path);
+        result
+    }
+
+    #[test]
+    fn native_volume_requires_explicit_workspace_and_transactional_control_backend() {
+        let missing_workspace =
+            native_mount_config("mount_point: /mnt/native\nmeta:\n  backend: redis").unwrap_err();
+        assert!(
+            missing_workspace
+                .to_string()
+                .contains("workspace id is required")
+        );
+
+        let unsupported_backend = native_mount_config(
+            "mount_point: /mnt/native\nworkspace: 00000000-0000-0000-0000-000000000077",
+        )
+        .unwrap_err();
+        assert!(
+            unsupported_backend
+                .to_string()
+                .contains("requires meta.backend=redis or tikv")
+        );
+
+        let config = native_mount_config(
+            "mount_point: /mnt/native\nworkspace: 00000000-0000-0000-0000-000000000077\nmeta:\n  backend: redis",
+        )
+        .unwrap();
+        assert_eq!(config.volume_format, VolumeFormat::WorkspaceNativeV2);
+        assert!(matches!(config.meta_backend, MetaBackendKind::Redis));
+    }
+
+    #[test]
+    fn native_volume_rejects_commit_before_upload_even_for_s3() {
+        let error = native_mount_config(
+            "mount_point: /mnt/native\nworkspace: 00000000-0000-0000-0000-000000000077\ndata:\n  backend: s3\nmeta:\n  backend: redis\ncache:\n  writeback_mode: commit_before_upload",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires cache.writeback_mode=upload_before_commit")
+        );
+    }
+
+    /// GATE-001: only the shipped P1 release profiles are admissible, the
+    /// retained-trial profile must not claim private cleanup, and the P1
+    /// capacity limits must stay coherent.  This admits the retained-trial
+    /// profile only; it does not certify the full P1 private-cleanup delivery.
+    #[test]
+    fn native_release_profile_gate_admits_only_the_shipped_p1_profiles() {
+        let unshipped = native_mount_config_from(&NATIVE_P1_CONFIG.replace(
+            "release_profile: p1-retained-trial",
+            "release_profile: p2-frozen-read",
+        ))
+        .unwrap_err();
+        assert!(
+            unshipped
+                .to_string()
+                .contains("unsupported native_base.release_profile p2-frozen-read"),
+            "{unshipped}"
+        );
+
+        let cleanup_claimed = native_mount_config_from(
+            &NATIVE_P1_CONFIG.replace("    mode: disabled", "    mode: apply"),
+        )
+        .unwrap_err();
+        assert!(
+            cleanup_claimed
+                .to_string()
+                .contains("p1-retained-trial requires native_base.cleanup.mode=disabled"),
+            "{cleanup_claimed}"
+        );
+
+        let incoherent_limits = native_mount_config_from(&NATIVE_P1_CONFIG.replace(
+            "    private_domain_hard_bytes: 17179869184",
+            "    private_domain_hard_bytes: 137438953472",
+        ))
+        .unwrap_err();
+        assert!(
+            incoherent_limits
+                .to_string()
+                .contains("native_base.limits are invalid"),
+            "{incoherent_limits}"
+        );
+
+        native_mount_config_from(NATIVE_P1_CONFIG).unwrap();
+    }
+
+    /// GATE-004: durability is an explicit verified contract.  A brand-name
+    /// or no-op claim never admits a native volume.
+    #[test]
+    fn native_durability_profile_must_be_an_explicit_verified_contract() {
+        for (from, to) in [
+            (
+                "write_mode: upload-before-commit",
+                "write_mode: commit-before-upload",
+            ),
+            (
+                "remote_verification: exact-readback",
+                "remote_verification: trust-the-brand",
+            ),
+            (
+                "require_atomic_create_only: true",
+                "require_atomic_create_only: false",
+            ),
+            (
+                "coordinator_profile: test-profile",
+                "coordinator_profile: \"  \"",
+            ),
+        ] {
+            let error = native_mount_config_from(&NATIVE_P1_CONFIG.replace(from, to))
+                .expect_err(&format!("{from} must be refused"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("native_base.durability does not satisfy the PR07 P1 contract"),
+                "{from} produced {error}"
+            );
+        }
+    }
+
+    /// RET-021: the retired TTL / published_gc / read-retention-lease options
+    /// fail closed instead of being silently ignored.
+    #[test]
+    fn native_retention_rejects_retired_ttl_gc_and_lease_options() {
+        for (from, to) in [
+            ("    published_gc: false", "    published_gc: true"),
+            (
+                "    read_retention_leases: false",
+                "    read_retention_leases: true",
+            ),
+        ] {
+            let error = native_mount_config_from(&NATIVE_P1_CONFIG.replace(from, to))
+                .expect_err(&format!("{from} must be refused"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("native_base.retention violates permanent published retention"),
+                "{from} produced {error}"
+            );
+        }
+
+        let retired = NATIVE_P1_CONFIG.replace(
+            "  retention:\n    published: forever",
+            "  retention:\n    retention_ttl_seconds: 60\n    published: forever",
+        );
+        let error = native_mount_config_from(&retired).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `retention_ttl_seconds`"),
+            "{error}"
+        );
+    }
+
+    /// CLN-024: purge / force / age-based cleanup rules are not part of this
+    /// release, and there is no hidden switch that silently enables them.
+    #[test]
+    fn native_cleanup_rejects_purge_force_and_age_rules() {
+        for mode in ["purge", "force", "by-age"] {
+            let block = NATIVE_P1_CONFIG
+                .replace(
+                    "release_profile: p1-retained-trial",
+                    "release_profile: p1-private-cleanup",
+                )
+                .replace("    mode: disabled", &format!("    mode: {mode}"));
+            let error = native_mount_config_from(&block)
+                .expect_err(&format!("cleanup mode {mode} must be refused"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("native_base.cleanup violates the private-domain cleanup contract"),
+                "cleanup mode {mode} produced {error}"
+            );
+        }
+
+        let hidden = NATIVE_P1_CONFIG.replace(
+            "    mode: disabled",
+            "    mode: disabled\n    by_age_days: 30",
+        );
+        let error = native_mount_config_from(&hidden).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field `by_age_days`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn native_volume_control_versions_and_unknown_fields_fail_closed() {
+        let invalid_version =
+            NATIVE_P1_CONFIG.replace("native_control_version: 2", "native_control_version: 1");
+        let prefix = "mount_point: /mnt/native\nworkspace: 00000000-0000-0000-0000-000000000077\nmeta:\n  backend: redis";
+        let path = std::env::temp_dir().join(format!(
+            "brewfs-native-invalid-config-{}-{}.yaml",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(&path, format!("{prefix}\n{invalid_version}")).unwrap();
+        let error =
+            MountConfig::from_sources(empty_mount_args(Some(path.clone()), None)).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(error.to_string().contains("native_control_version=2"));
+
+        let unknown = NATIVE_P1_CONFIG.replace(
+            "  namespace_mode: kv",
+            "  namespace_mode: kv\n  published_ttl_days: 30",
+        );
+        std::fs::write(&path, format!("{prefix}\n{unknown}")).unwrap();
+        let error =
+            MountConfig::from_sources(empty_mount_args(Some(path.clone()), None)).unwrap_err();
+        let _ = std::fs::remove_file(path);
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `published_ttl_days`")
+        );
     }
 }

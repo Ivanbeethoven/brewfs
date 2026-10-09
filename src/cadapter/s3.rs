@@ -1,6 +1,6 @@
 //! S3 adapter: simplified aws-sdk-s3 implementation with multipart upload, retries, and validation.
 
-use crate::cadapter::client::ObjectBackend;
+use crate::cadapter::client::{ObjectBackend, ObjectByteStream};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -12,10 +12,12 @@ use aws_sdk_s3::{Client, config::Region};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use hyper::Body;
 use md5;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
+use tokio_util::io::ReaderStream;
 
 /// S3 backend configuration options
 #[derive(Debug, Clone)]
@@ -65,6 +67,91 @@ impl Default for S3Config {
 pub struct S3Backend {
     client: Client,
     config: S3Config,
+    mutation_replay_forbidden: bool,
+}
+
+#[derive(Clone, Copy)]
+enum S3MutationReplay {
+    Inherit,
+    Forbidden,
+}
+
+#[cfg(test)]
+mod gc_replay_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Exercise the complete GC constructor and physical SDK transport. A
+    // wrapper call count cannot detect an SDK retry beneath delete_object.
+    #[tokio::test]
+    async fn gc_factory_never_replays_retryable_or_lost_delete_reply() {
+        for lost_reply in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let observed = attempts.clone();
+            let (stop, mut stopping) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                loop {
+                    let accepted = tokio::select! {
+                        _=&mut stopping=>break,
+                        result=listener.accept()=>result.unwrap(),
+                    };
+                    let mut socket = accepted.0;
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while request.len() < 16384 && !request.ends_with(b"\r\n\r\n") {
+                        if socket.read(&mut byte).await.unwrap() == 0 {
+                            break;
+                        }
+                        request.push(byte[0]);
+                    }
+                    assert!(request.starts_with(b"DELETE "));
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    if !lost_reply {
+                        socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    }
+                    // Dropping the stream models a dispatched DELETE whose
+                    // result was lost, without guessing the object's state.
+                }
+            });
+            let backend = S3Backend::with_gc_static_credentials(
+                S3Config {
+                    bucket: "gc-test".into(),
+                    region: Some("us-east-1".into()),
+                    endpoint: Some(format!("http://{address}")),
+                    force_path_style: true,
+                    max_retries: 7,
+                    ..Default::default()
+                },
+                "test-admin".into(),
+                "test-admin-secret".into(),
+            )
+            .await
+            .unwrap();
+            assert!(backend.forbids_mutation_replay());
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    backend.delete_object("candidate")
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            stop.send(()).unwrap();
+            server.await.unwrap();
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "physical SDK retry must stay disabled"
+            );
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -80,6 +167,66 @@ impl S3Backend {
 
     /// Create new S3 backend with custom configuration
     pub async fn with_config(config: S3Config) -> Result<Self> {
+        Self::with_optional_static_credentials(config, None, S3MutationReplay::Inherit).await
+    }
+
+    /// GC keeps uncertain physical mutations quarantined. SDK retries must
+    /// not replay DELETE/PUT beneath that durable protocol, including when
+    /// AWS_MAX_ATTEMPTS or a shared SDK config enables retries elsewhere.
+    pub async fn with_gc_config(config: S3Config) -> Result<Self> {
+        Self::with_optional_static_credentials(config, None, S3MutationReplay::Forbidden).await
+    }
+
+    pub async fn with_gc_static_credentials(
+        config: S3Config,
+        access_key: String,
+        secret_key: String,
+    ) -> Result<Self> {
+        if access_key.is_empty() || secret_key.is_empty() {
+            anyhow::bail!("S3 GC credentials are missing");
+        }
+        let credentials = aws_sdk_s3::config::Credentials::new(
+            access_key,
+            secret_key,
+            None,
+            None,
+            "brewfs-operator-gc",
+        );
+        Self::with_optional_static_credentials(
+            config,
+            Some(credentials),
+            S3MutationReplay::Forbidden,
+        )
+        .await
+    }
+
+    pub async fn with_static_credentials(
+        config: S3Config,
+        access_key: String,
+        secret_key: String,
+    ) -> Result<Self> {
+        if access_key.is_empty() || secret_key.is_empty() {
+            anyhow::bail!("S3 credentials are missing");
+        }
+        let credentials = aws_sdk_s3::config::Credentials::new(
+            access_key,
+            secret_key,
+            None,
+            None,
+            "brewfs-operator",
+        );
+        Self::with_optional_static_credentials(config, Some(credentials), S3MutationReplay::Inherit)
+            .await
+    }
+
+    async fn with_optional_static_credentials(
+        mut config: S3Config,
+        credentials: Option<aws_sdk_s3::config::Credentials>,
+        replay: S3MutationReplay,
+    ) -> Result<Self> {
+        if matches!(replay, S3MutationReplay::Forbidden) {
+            config.max_retries = 1;
+        }
         if config.bucket.is_empty() {
             return Err(anyhow!("Bucket name cannot be empty"));
         }
@@ -104,10 +251,18 @@ impl S3Backend {
             bucket = %config.bucket,
             "s3 backend aws config load begin"
         );
+        if let Some(credentials) = credentials {
+            aws_config_loader = aws_config_loader.credentials_provider(credentials);
+        }
         let aws_config = aws_config_loader.load().await;
         tracing::info!("s3 backend aws config load complete");
 
         let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&aws_config);
+        if matches!(replay, S3MutationReplay::Forbidden) {
+            s3_config_builder = s3_config_builder.retry_config(
+                aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1),
+            );
+        }
 
         if let Some(endpoint) = &config.endpoint {
             s3_config_builder = s3_config_builder.endpoint_url(endpoint);
@@ -128,10 +283,277 @@ impl S3Backend {
             );
         }
 
+        if aws_config.http_client().is_none() {
+            let base_http = aws_smithy_http_client::Builder::new().build_with_connector_fn(
+                |settings, components| {
+                    let mut connector = aws_smithy_http_client::ConnectorBuilder::default()
+                        .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+                            aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+                        ));
+                    connector.set_connector_settings(settings.cloned());
+                    if let Some(components) = components {
+                        connector.set_sleep_impl(components.sleep_impl());
+                    }
+                    connector.set_proxy_config(Some(
+                        aws_smithy_http_client::proxy::ProxyConfig::from_env(),
+                    ));
+                    connector.build()
+                },
+            );
+            s3_config_builder = s3_config_builder.http_client(base_http);
+        }
         let client = Client::from_conf(s3_config_builder.build());
         tracing::info!("s3 backend client ready");
 
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            mutation_replay_forbidden: matches!(replay, S3MutationReplay::Forbidden),
+        })
+    }
+
+    async fn range_stream_with_observer(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+        observed: Option<(
+            crate::cadapter::read_observer::ReadContext,
+            Arc<crate::cadapter::read_observer::ReadObserver>,
+        )>,
+    ) -> Result<ObjectByteStream> {
+        Ok(self
+            .object_stream_with_observer(key, Some((offset, length)), Some(length), observed)
+            .await?
+            .unwrap_or_else(|| Box::pin(futures_util::stream::empty())))
+    }
+
+    async fn object_stream_with_observer(
+        &self,
+        key: &str,
+        range: Option<(u64, u64)>,
+        expected: Option<u64>,
+        observed: Option<(
+            crate::cadapter::read_observer::ReadContext,
+            Arc<crate::cadapter::read_observer::ReadObserver>,
+        )>,
+    ) -> Result<Option<ObjectByteStream>> {
+        let mut operation = self
+            .client
+            .get_object()
+            .bucket(&self.config.bucket)
+            .key(key);
+        if let Some((offset, length)) = range {
+            if length == 0 {
+                return Ok(Some(Box::pin(futures_util::stream::empty())));
+            }
+            let end = offset
+                .checked_add(length - 1)
+                .ok_or_else(|| anyhow!("S3 range end overflows u64"))?;
+            operation = operation.range(format!("bytes={offset}-{end}"));
+        }
+        let resp = match observed {
+            Some((context, observer)) => {
+                let delegate = self
+                    .client
+                    .config()
+                    .http_client()
+                    .ok_or_else(|| anyhow!("typed S3 HTTP client unavailable"))?;
+                let observed =
+                    crate::cadapter::read_observer::http::ObservedHttpClient::with_request_length(
+                        delegate, observer, context, expected,
+                    );
+                operation
+                    .customize()
+                    .config_override(aws_sdk_s3::config::Builder::new().http_client(observed))
+                    .send()
+                    .await
+            }
+            None => operation.send().await,
+        };
+
+        match resp {
+            Ok(object) => {
+                let stream = ReaderStream::new(object.body.into_async_read()).map(|item| {
+                    item.map_err(|error| {
+                        let mut checksum_failure = false;
+                        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+                        while let Some(cause) = source {
+                            // Inspect locally; never log the SDK source chain, which can
+                            // contain request headers, endpoint URLs or signatures.
+                            checksum_failure |=
+                                cause.to_string().to_ascii_lowercase().contains("checksum");
+                            source = cause.source();
+                        }
+                        anyhow!(
+                            "S3 range stream failure: kind={} checksum={checksum_failure}",
+                            Self::safe_stream_error_kind(error.kind()),
+                        )
+                    })
+                });
+                Ok(Some(Box::pin(stream)))
+            }
+            Err(SdkError::ServiceError(error)) if error.err().is_no_such_key() => Ok(None),
+            Err(SdkError::ServiceError(error)) => Err(anyhow!(
+                "S3 range service failure: status={} code={}",
+                error.raw().status().as_u16(),
+                Self::safe_service_code(error.err().meta().code()),
+            )),
+            Err(SdkError::ConstructionFailure(_)) => {
+                Err(anyhow!("S3 range request failure: class=construction"))
+            }
+            Err(SdkError::TimeoutError(_)) => {
+                Err(anyhow!("S3 range request failure: class=timeout"))
+            }
+            Err(SdkError::DispatchFailure(error)) if error.is_timeout() => {
+                Err(anyhow!("S3 range request failure: class=timeout"))
+            }
+            Err(SdkError::DispatchFailure(error)) => Err(anyhow!(
+                "S3 range request failure: class=dispatch io={} user={}",
+                error.is_io(),
+                error.is_user(),
+            )),
+            Err(SdkError::ResponseError(error)) => Err(anyhow!(
+                "S3 range request failure: class=response status={}",
+                error.raw().status().as_u16(),
+            )),
+            Err(_) => Err(anyhow!("S3 range request failure: class=unknown")),
+        }
+    }
+
+    async fn bounded_size_with_observer(
+        &self,
+        key: &str,
+        observed: Option<(
+            crate::cadapter::read_observer::ReadContext,
+            Arc<crate::cadapter::read_observer::ReadObserver>,
+        )>,
+    ) -> Result<Option<u64>> {
+        use std::io::{Error, ErrorKind};
+        let operation = self
+            .client
+            .head_object()
+            .bucket(&self.config.bucket)
+            .key(key);
+        let response = match observed {
+            Some((context, observer)) => {
+                let delegate = self.client.config().http_client().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unsupported,
+                        "typed S3 HEAD HTTP client unavailable",
+                    )
+                })?;
+                let observed = crate::cadapter::read_observer::http::ObservedHttpClient::new(
+                    delegate, observer, context, 0,
+                );
+                operation
+                    .customize()
+                    .config_override(aws_sdk_s3::config::Builder::new().http_client(observed))
+                    .send()
+                    .await
+            }
+            None => operation.send().await,
+        };
+        match response {
+            Ok(response) => {
+                let length = response.content_length().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        "S3 bounded HEAD is missing object length",
+                    )
+                })?;
+                let length = u64::try_from(length).map_err(|_| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        "S3 bounded HEAD has negative object length",
+                    )
+                })?;
+                Ok(Some(length))
+            }
+            Err(SdkError::ServiceError(error))
+                if error.raw().status().as_u16() == 404
+                    || error.err().meta().code() == Some("NoSuchKey") =>
+            {
+                Ok(None)
+            }
+            Err(SdkError::ServiceError(error)) => {
+                let status = error.raw().status().as_u16();
+                let kind = match status {
+                    200..=299 => ErrorKind::InvalidData,
+                    401 | 403 => ErrorKind::PermissionDenied,
+                    _ => ErrorKind::Other,
+                };
+                // In particular malformed Content-Length can be a 2xx SDK
+                // deserialization ServiceError. Do not expose its raw headers.
+                Err(Error::new(
+                    kind,
+                    format!(
+                        "S3 bounded HEAD service failure: status={status} code={}",
+                        Self::safe_service_code(error.err().meta().code()),
+                    ),
+                )
+                .into())
+            }
+            Err(SdkError::TimeoutError(_)) => Err(Error::new(
+                ErrorKind::TimedOut,
+                "S3 bounded HEAD request failure: class=timeout",
+            )
+            .into()),
+            Err(SdkError::DispatchFailure(error)) if error.is_timeout() => Err(Error::new(
+                ErrorKind::TimedOut,
+                "S3 bounded HEAD request failure: class=timeout",
+            )
+            .into()),
+            Err(SdkError::DispatchFailure(_)) => {
+                Err(Error::other("S3 bounded HEAD request failure: class=dispatch").into())
+            }
+            Err(SdkError::ConstructionFailure(_)) => {
+                Err(Error::other("S3 bounded HEAD request failure: class=construction").into())
+            }
+            Err(SdkError::ResponseError(error)) => {
+                let status = error.raw().status().as_u16();
+                let kind = if (200..300).contains(&status) {
+                    ErrorKind::InvalidData
+                } else {
+                    ErrorKind::Other
+                };
+                Err(Error::new(
+                    kind,
+                    format!("S3 bounded HEAD request failure: class=response status={status}",),
+                )
+                .into())
+            }
+            Err(_) => Err(Error::other("S3 bounded HEAD request failure: class=unknown").into()),
+        }
+    }
+
+    fn safe_stream_error_kind(kind: std::io::ErrorKind) -> &'static str {
+        match kind {
+            std::io::ErrorKind::TimedOut => "timeout",
+            std::io::ErrorKind::ConnectionReset => "connection reset",
+            std::io::ErrorKind::ConnectionRefused => "connection refused",
+            std::io::ErrorKind::BrokenPipe => "broken pipe",
+            std::io::ErrorKind::Interrupted => "interrupted",
+            std::io::ErrorKind::UnexpectedEof => "unexpected eof",
+            std::io::ErrorKind::InvalidData => "invalid data",
+            std::io::ErrorKind::PermissionDenied => "permission denied",
+            _ => "other",
+        }
+    }
+
+    fn safe_service_code(code: Option<&str>) -> &'static str {
+        match code {
+            Some("AccessDenied") => "AccessDenied",
+            Some("InvalidRange") => "InvalidRange",
+            Some("NoSuchKey") => "NoSuchKey",
+            Some("NoSuchBucket") => "NoSuchBucket",
+            Some("SignatureDoesNotMatch") => "SignatureDoesNotMatch",
+            Some("RequestTimeTooSkewed") => "RequestTimeTooSkewed",
+            Some("SlowDown") => "SlowDown",
+            Some("InternalError") => "InternalError",
+            Some("ServiceUnavailable") => "ServiceUnavailable",
+            _ => "unknown",
+        }
     }
 
     fn md5_base64(data: &[u8]) -> String {
@@ -549,6 +971,9 @@ impl Drop for MultipartCleanupGuard {
 
 #[async_trait]
 impl ObjectBackend for S3Backend {
+    fn forbids_mutation_replay(&self) -> bool {
+        self.mutation_replay_forbidden
+    }
     #[tracing::instrument(level = "trace", skip(self, chunks), fields(key, chunk_count = chunks.len()))]
     async fn put_object_vectored(&self, key: &str, chunks: Vec<Bytes>) -> Result<()> {
         let total_size = chunks.iter().map(|e| e.len()).sum::<usize>();
@@ -574,6 +999,48 @@ impl ObjectBackend for S3Backend {
 
         // Multipart upload for large objects
         self.multipart_upload(key, data).await
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, data), fields(key, size = data.len()))]
+    async fn put_object_create_only(&self, key: &str, data: &[u8]) -> Result<()> {
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&self.config.bucket)
+            .key(key)
+            .if_none_match("*")
+            .body(SdkBody::from(data.to_vec()).into());
+        if self.config.enable_md5 {
+            request = request.content_md5(Self::md5_base64(data));
+        }
+        let result = if self.config.disable_payload_checksum {
+            request.customize().disable_payload_signing().send().await
+        } else {
+            request.send().await
+        };
+        if let Err(error) = result {
+            // Alibaba OSS currently returns 501 NotImplemented for the
+            // conditional `If-None-Match: *` form. Native frozen objects are
+            // content-addressed and the ObjectSink caller verifies the exact
+            // bytes after every PUT, so use an unconditional PUT only for this
+            // explicit capability gap. Network and authorization failures
+            // still follow the create-only conflict path below.
+            let conditional_put_unsupported = matches!(
+                &error,
+                SdkError::ServiceError(service)
+                    if service.raw().status().as_u16() == 501
+                        || service.err().meta().code() == Some("NotImplemented")
+            );
+            if conditional_put_unsupported {
+                self.put_object(key, data).await?;
+                return Ok(());
+            }
+            if self.get_object(key).await?.as_deref() == Some(data) {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip(self), fields(key))]
@@ -644,6 +1111,77 @@ impl ObjectBackend for S3Backend {
         }
     }
 
+    async fn get_object_stream(&self, key: &str) -> Result<Option<ObjectByteStream>> {
+        self.object_stream_with_observer(key, None, None, None)
+            .await
+    }
+    async fn get_object_stream_observed(
+        &self,
+        key: &str,
+        expected: Option<u64>,
+        context: crate::cadapter::read_observer::ReadContext,
+        observer: Arc<crate::cadapter::read_observer::ReadObserver>,
+    ) -> Result<Option<ObjectByteStream>> {
+        self.object_stream_with_observer(key, None, expected, Some((context, observer)))
+            .await
+    }
+
+    async fn get_object_range_stream(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<ObjectByteStream> {
+        self.range_stream_with_observer(key, offset, length, None)
+            .await
+    }
+
+    async fn get_object_range_stream_observed(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+        context: crate::cadapter::read_observer::ReadContext,
+        observer: Arc<crate::cadapter::read_observer::ReadObserver>,
+    ) -> Result<ObjectByteStream> {
+        self.range_stream_with_observer(key, offset, length, Some((context, observer)))
+            .await
+    }
+
+    async fn get_object_size(&self, key: &str) -> Result<Option<u64>> {
+        let resp = self
+            .client
+            .head_object()
+            .bucket(&self.config.bucket)
+            .key(key)
+            .send()
+            .await;
+        match resp {
+            Ok(response) => Ok(response.content_length().map(|length| length as u64)),
+            Err(SdkError::ServiceError(error))
+                if error.raw().status().as_u16() == 404
+                    || error.err().meta().code() == Some("NoSuchKey") =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn get_object_size_bounded(&self, key: &str) -> Result<Option<u64>> {
+        self.bounded_size_with_observer(key, None).await
+    }
+
+    async fn get_object_size_bounded_observed(
+        &self,
+        key: &str,
+        context: crate::cadapter::read_observer::ReadContext,
+        observer: Arc<crate::cadapter::read_observer::ReadObserver>,
+    ) -> Result<Option<u64>> {
+        self.bounded_size_with_observer(key, Some((context, observer)))
+            .await
+    }
+
     async fn get_etag(&self, key: &str) -> Result<String> {
         let resp = self
             .client
@@ -683,6 +1221,165 @@ impl ObjectBackend for S3Backend {
 
 #[cfg(test)]
 mod tests {
+    use crate::cadapter::client::ObjectClient;
+    use crate::cadapter::read_observer::{Engine, Ledger, Origin, Phase, ReadClass, ReadObserver};
+    use aws_smithy_runtime_api::client::http::{
+        HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
+    use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+    use aws_smithy_runtime_api::http::StatusCode;
+
+    #[derive(Clone, Debug)]
+    struct HeadOnlyHttpClient {
+        status: u16,
+        length: Option<&'static str>,
+    }
+
+    impl HttpClient for HeadOnlyHttpClient {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+
+    impl HttpConnector for HeadOnlyHttpClient {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            assert_eq!(
+                request.method(),
+                "HEAD",
+                "size validation must never download an object"
+            );
+            assert!(request.headers().get("range").is_none());
+            let status = self.status;
+            let length = self.length;
+            HttpConnectorFuture::new(async move {
+                let mut response =
+                    HttpResponse::new(StatusCode::try_from(status).unwrap(), SdkBody::empty());
+                if let Some(length) = length {
+                    response.headers_mut().insert("content-length", length);
+                }
+                Ok(response)
+            })
+        }
+    }
+
+    fn bounded_head_backend(status: u16, length: Option<&'static str>) -> S3Backend {
+        let config = Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new(
+                "test-key",
+                "test-secret",
+                None,
+                None,
+                "bounded-head-test",
+            ))
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+            .http_client(HeadOnlyHttpClient { status, length })
+            .build();
+        S3Backend {
+            client: Client::from_conf(config),
+            mutation_replay_forbidden: false,
+            config: S3Config {
+                bucket: "test-bucket".into(),
+                ..S3Config::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_head_uses_sdk_head_and_conserves_terminal_observation() {
+        use std::io::ErrorKind;
+        for (status, length, expected, error_kind) in [
+            (200, Some("1099511627776"), Some(Some(1_u64 << 40)), None),
+            (200, Some("0"), Some(Some(0)), None),
+            (404, None, Some(None), None),
+            (403, None, None, Some(ErrorKind::PermissionDenied)),
+            (200, None, None, Some(ErrorKind::InvalidData)),
+            (200, Some("-1"), None, Some(ErrorKind::InvalidData)),
+            (
+                200,
+                Some("untrusted-secret-length"),
+                None,
+                Some(ErrorKind::InvalidData),
+            ),
+        ] {
+            let observer = Arc::new(ReadObserver::default());
+            let client = ObjectClient::new(bounded_head_backend(status, length))
+                .with_read_observer(
+                    Arc::clone(&observer),
+                    Engine::PackedV3,
+                    Phase::Startup,
+                    Origin::Demand,
+                );
+            let context = client.read_context(ReadClass::ContainerIndex).unwrap();
+            let result = client
+                .typed_object_size(ReadClass::ContainerIndex, "private-object-key")
+                .await;
+            match (expected, error_kind) {
+                (Some(expected), None) => assert_eq!(result.unwrap(), expected),
+                (None, Some(kind)) => {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), kind);
+                    assert!(!error.to_string().contains("private-object-key"));
+                    assert!(!error.to_string().contains("untrusted-secret-length"));
+                }
+                _ => unreachable!(),
+            }
+            let snapshot = observer.snapshot();
+            assert!(snapshot.http_observed);
+            assert!(!snapshot.overflowed);
+            for ledger in [
+                Ledger::HttpAttempt,
+                Ledger::BackendBody,
+                Ledger::ValidatedFetch,
+            ] {
+                let row = &snapshot.rows[&(ledger, context)];
+                assert_eq!(
+                    (
+                        row.started,
+                        row.cancelled,
+                        row.inflight,
+                        row.requested,
+                        row.received
+                    ),
+                    (1, 0, 0, 0, 0)
+                );
+                let failed = if ledger == Ledger::HttpAttempt {
+                    u64::from(status != 200)
+                } else {
+                    u64::from(error_kind.is_some())
+                };
+                assert_eq!((row.success, row.failed), (1 - failed, failed));
+                assert!(row.conserved());
+            }
+        }
+    }
+
+    #[test]
+    fn safe_range_diagnostics_preserve_retry_labels_and_reject_untrusted_codes() {
+        use std::io::ErrorKind;
+        for (kind, expected) in [
+            (ErrorKind::TimedOut, "timeout"),
+            (ErrorKind::BrokenPipe, "broken pipe"),
+            (ErrorKind::ConnectionReset, "connection reset"),
+        ] {
+            assert_eq!(super::S3Backend::safe_stream_error_kind(kind), expected);
+        }
+        assert_eq!(
+            super::S3Backend::safe_service_code(Some("untrusted-error-detail")),
+            "unknown"
+        );
+        assert_eq!(
+            super::S3Backend::safe_service_code(Some("AccessDenied")),
+            "AccessDenied"
+        );
+    }
+
     use super::*;
     use aws_sdk_s3::Config;
     use aws_sdk_s3::config::{Credentials, Region};
@@ -736,6 +1433,7 @@ mod tests {
 
         S3Backend {
             client: Client::from_conf(s3_config),
+            mutation_replay_forbidden: false,
             config: S3Config {
                 bucket,
                 region: None,

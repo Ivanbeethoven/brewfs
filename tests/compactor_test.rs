@@ -292,4 +292,37 @@ mod tests {
         let (should_compact, _) = compactor.should_compact(chunk_id).await.unwrap();
         assert!(should_compact, "Should trigger with low thresholds");
     }
+
+    #[tokio::test]
+    async fn heavy_compaction_preserves_metadata_when_a_referenced_block_is_missing() {
+        let (_tmp, meta_store, block_store) = setup_test_env().await;
+        let compactor = Compactor::new(meta_store.clone(), block_store);
+        let root = meta_store.root_ino();
+        let file = meta_store
+            .create_file(root, "missing-block.txt".to_string())
+            .await
+            .unwrap();
+        let chunk_id = brewfs::vfs::chunk_id_for(file, 0).unwrap();
+        let original = SliceDesc {
+            slice_id: 700,
+            chunk_id,
+            offset: 0,
+            length: 4096,
+        };
+        meta_store
+            .write(file, chunk_id, original, original.length)
+            .await
+            .unwrap();
+
+        let error = compactor.compact_heavy(chunk_id).await.unwrap_err();
+        assert!(
+            matches!(error, brewfs::chunk::CompactorError::BlockStoreError(_)),
+            "missing data must abort heavy compaction: {error}"
+        );
+        assert_eq!(
+            meta_store.get_slices(chunk_id).await.unwrap(),
+            vec![original],
+            "failed compaction must not replace the authoritative slice metadata"
+        );
+    }
 }

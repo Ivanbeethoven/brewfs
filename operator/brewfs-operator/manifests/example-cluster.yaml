@@ -11,3 +11,19 @@ spec:
     mountPoint: /mnt/brewfs
     chunkSize: 67108864
     blockSize: 4194304
+  workspace:
+    enabled: true
+    catalogBackend: Redis
+    namespace: demo-workspaces
+    metadataRuntimeSecretRef:
+      name: demo-runtime-metadata
+    metadataAdminSecretRef:
+      name: demo-admin-metadata
+    objectRuntimeSecretRef:
+      name: demo-runtime-objects
+    objectAdminSecretRef:
+      name: demo-admin-objects
+    leaseTtlSeconds: 30
+    heartbeatSeconds: 10
+    gcGraceSeconds: 60
+    catalogStorageSize: 5Gi

@@ -4,7 +4,7 @@ use crate::meta::config::{
     CacheConfig, ClientOptions, CompactConfig, DatabaseConfig, DatabaseType,
 };
 use crate::meta::factory::MetaStoreFactory;
-use crate::meta::store::{FileType, MetaStore};
+use crate::meta::store::{FileType, MetaError, MetaStore};
 
 #[test]
 fn special_node_round_trip_preserves_kind_mode_and_rdev() {
@@ -166,6 +166,25 @@ fn stored_node_decodes_legacy_json_defaults() {
     let decoded = TiKvMetaStore::decode_node(json).unwrap();
     assert!(!decoded.deleted);
     assert_eq!(decoded.symlink_target, None);
+}
+
+#[test]
+fn relatime_updates_after_metadata_change_or_one_day() {
+    let mut node = TiKvMetaStore::root_node();
+    node.atime = 30;
+    node.mtime = 20;
+    node.ctime = 20;
+
+    assert!(!TiKvMetaStore::atime_needs_update(&node, 40));
+
+    node.mtime = 30;
+    assert!(TiKvMetaStore::atime_needs_update(&node, 40));
+
+    node.mtime = 20;
+    assert!(TiKvMetaStore::atime_needs_update(
+        &node,
+        node.atime + RELATIME_MAX_AGE_NANOS
+    ));
 }
 
 #[test]
@@ -470,6 +489,60 @@ async fn tikv_transactional_file_data_schema() {
     assert_eq!(store.stat(file).await.unwrap().unwrap().size, 64);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires a running TiKV/PD cluster; set BREWFS_TIKV_PD_ENDPOINTS"]
+async fn tikv_serializes_hot_inode_and_parent_transactions() {
+    let store = Arc::new(
+        TiKvMetaStore::from_config(integration_config("hot-inode"))
+            .await
+            .expect("tikv store should connect"),
+    );
+    store.initialize().await.unwrap();
+    let root = store.root_ino();
+    let file = store
+        .create_file(root, "hot-file".to_string())
+        .await
+        .unwrap();
+
+    let mut writes = Vec::new();
+    for index in 0..64_u64 {
+        let store = Arc::clone(&store);
+        writes.push(tokio::spawn(async move {
+            let chunk_id = 10_000 + index;
+            let size = (index + 1) * 4096;
+            store
+                .write(
+                    file,
+                    chunk_id,
+                    SliceDesc {
+                        slice_id: 20_000 + index,
+                        chunk_id,
+                        offset: 0,
+                        length: 4096,
+                    },
+                    size,
+                )
+                .await
+        }));
+    }
+    for write in writes {
+        write.await.expect("write task should not panic").unwrap();
+    }
+    assert_eq!(store.stat(file).await.unwrap().unwrap().size, 64 * 4096);
+
+    let mut creates = Vec::new();
+    for index in 0..64_u64 {
+        let store = Arc::clone(&store);
+        creates.push(tokio::spawn(async move {
+            store.create_file(root, format!("entry-{index}")).await
+        }));
+    }
+    for create in creates {
+        create.await.expect("create task should not panic").unwrap();
+    }
+    assert_eq!(store.readdir(root).await.unwrap().len(), 65);
+}
+
 #[tokio::test]
 #[ignore = "requires a running TiKV/PD cluster; set BREWFS_TIKV_PD_ENDPOINTS"]
 async fn tikv_compaction_gc_workflow() {
@@ -590,6 +663,72 @@ async fn tikv_rename_exchange_swaps_entries() {
     assert_eq!(store.lookup(root, "b").await.unwrap(), Some(a));
     assert_eq!(store.get_paths(a).await.unwrap(), vec!["/b".to_string()]);
     assert_eq!(store.get_paths(b).await.unwrap(), vec!["/a".to_string()]);
+
+    let left = store.mkdir(root, "left".into()).await.unwrap();
+    let right = store.mkdir(root, "right".into()).await.unwrap();
+    let directory = store.mkdir(left, "directory".into()).await.unwrap();
+    let file = store.create_file(right, "file".into()).await.unwrap();
+    store
+        .rename_exchange(left, "directory", right, "file")
+        .await
+        .unwrap();
+    assert_eq!(store.lookup(left, "directory").await.unwrap(), Some(file));
+    assert_eq!(store.lookup(right, "file").await.unwrap(), Some(directory));
+    assert_eq!(store.get_dir_parent(directory).await.unwrap(), Some(right));
+    assert_eq!(
+        store.get_names(file).await.unwrap(),
+        vec![(Some(left), "directory".into())]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a running TiKV/PD cluster; set BREWFS_TIKV_PD_ENDPOINTS"]
+async fn tikv_rename_transactions_prevent_concurrent_parent_cycle() {
+    let store = Arc::new(
+        TiKvMetaStore::from_config(integration_config("rename-cycle-race"))
+            .await
+            .unwrap(),
+    );
+    store.initialize().await.unwrap();
+    let root = store.root_ino();
+    let a = store.mkdir(root, "a".into()).await.unwrap();
+    let q = store.mkdir(root, "q".into()).await.unwrap();
+    let x = store.mkdir(q, "x".into()).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+    let exchange = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.rename_exchange(root, "a", q, "x").await
+        })
+    };
+    let rename = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.rename(root, "q", a, "q".into()).await
+        })
+    };
+    barrier.wait().await;
+
+    let exchange = exchange.await.unwrap();
+    let rename = rename.await.unwrap();
+    assert!(exchange.is_ok() ^ rename.is_ok());
+    assert!(matches!(
+        exchange.err().or_else(|| rename.err()).unwrap(),
+        MetaError::InvalidPath(_)
+    ));
+    for start in [a, q, x] {
+        let mut current = start;
+        let mut visited = std::collections::HashSet::new();
+        while current != root {
+            assert!(visited.insert(current));
+            current = store.get_dir_parent(current).await.unwrap().unwrap();
+        }
+    }
 }
 
 #[tokio::test]

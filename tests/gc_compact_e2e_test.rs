@@ -107,6 +107,7 @@ async fn gc_removes_orphaned_blocks_after_compaction() {
         batch_size: 100,
         block_size: 4 * 1024 * 1024,
         orphan_cleanup_age_secs: 60,
+        volume_format: None,
     };
 
     gc.run_gc_cycle(&gc_config).await.unwrap();
@@ -258,6 +259,7 @@ async fn gc_handles_partial_failures() {
         batch_size: 100,
         block_size: 4 * 1024 * 1024,
         orphan_cleanup_age_secs: 60,
+        volume_format: None,
     };
 
     gc.run_gc_cycle(&gc_config).await.unwrap();

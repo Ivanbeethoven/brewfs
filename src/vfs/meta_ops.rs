@@ -121,6 +121,17 @@ where
             .map_err(meta_err_to_vfs)
     }
 
+    pub(super) async fn meta_lookup_with_attr_bytes(
+        &self,
+        parent: i64,
+        name: &[u8],
+    ) -> Result<Option<(i64, FileAttr)>, VfsError> {
+        self.meta_layer()
+            .lookup_with_attr_bytes(parent, name)
+            .await
+            .map_err(meta_err_to_vfs)
+    }
+
     pub(super) async fn meta_lookup_required(
         &self,
         parent: i64,
@@ -194,6 +205,16 @@ where
             .map_err(|err| VfsError::from_meta(PathHint::none(), err))
     }
 
+    /// Check effective emptiness without collecting the whole directory.
+    pub(super) async fn meta_directory_is_empty(&self, ino: i64) -> Result<bool, VfsError> {
+        let directory = self.meta_opendir(ino).await?;
+        let page = directory
+            .get_entries_page_raw_owned(0, 1)
+            .await
+            .map_err(meta_err_to_vfs)?;
+        Ok(page.entries.is_empty())
+    }
+
     // ------------------------------------------------------------------
     // File creation / linking
     // ------------------------------------------------------------------
@@ -254,6 +275,24 @@ where
             .map_err(meta_err_to_vfs)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn meta_create_node_with_umask(
+        &self,
+        parent: i64,
+        name: String,
+        kind: FileType,
+        mode: u32,
+        umask: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+    ) -> Result<CreateEntryResult, VfsError> {
+        self.meta_layer()
+            .create_node_with_umask(parent, name, kind, mode, umask, uid, gid, rdev)
+            .await
+            .map_err(meta_err_to_vfs)
+    }
+
     pub(super) async fn meta_link(
         &self,
         ino: i64,
@@ -298,6 +337,19 @@ where
     ) -> Result<(), VfsError> {
         self.meta_layer()
             .rename(old_parent, old_name, new_parent, new_name)
+            .await
+            .map_err(meta_err_to_vfs)
+    }
+
+    pub(super) async fn meta_rename_noreplace(
+        &self,
+        old_parent: i64,
+        old_name: &str,
+        new_parent: i64,
+        new_name: String,
+    ) -> Result<(), VfsError> {
+        self.meta_layer()
+            .rename_noreplace(old_parent, old_name, new_parent, new_name)
             .await
             .map_err(meta_err_to_vfs)
     }
@@ -422,6 +474,13 @@ where
             .map_err(meta_err_to_vfs)
     }
 
+    pub(super) async fn meta_read_symlink_bytes(&self, ino: i64) -> Result<Vec<u8>, VfsError> {
+        self.meta_layer()
+            .read_symlink_bytes(ino)
+            .await
+            .map_err(meta_err_to_vfs)
+    }
+
     pub(super) async fn meta_get_dir_parent(&self, ino: i64) -> Result<Option<i64>, VfsError> {
         self.meta_layer()
             .get_dir_parent(ino)
@@ -433,6 +492,40 @@ where
         self.meta_layer()
             .get_paths(ino)
             .await
+            .map_err(meta_err_to_vfs)
+    }
+
+    // Compatibility entry; asynchronous consumers retain the owned form below.
+    #[allow(dead_code)]
+    pub(super) async fn meta_get_paths_bytes(&self, ino: i64) -> Result<Vec<Vec<u8>>, VfsError> {
+        self.meta_layer()
+            .get_paths_bytes(ino)
+            .await
+            .map_err(meta_err_to_vfs)
+    }
+
+    pub(super) async fn meta_get_paths_bytes_owned(
+        &self,
+        ino: i64,
+    ) -> Result<crate::meta::layer::OwnedPaths, VfsError> {
+        self.meta_layer()
+            .get_paths_bytes_owned(ino)
+            .await
+            .inspect_err(|_error| {
+                #[cfg(test)]
+                {
+                    eprintln!(
+                        "[packed-v3-native-kernel-read-diag] stage=paths-forward inode={ino} error={_error:?}"
+                    );
+                    let mut cause = std::error::Error::source(_error);
+                    while let Some(error) = cause {
+                        eprintln!(
+                            "[packed-v3-native-kernel-read-diag] stage=paths-forward-cause inode={ino} error={error}"
+                        );
+                        cause = error.source();
+                    }
+                }
+            })
             .map_err(meta_err_to_vfs)
     }
 

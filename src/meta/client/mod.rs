@@ -51,6 +51,7 @@ use path_trie::PathTrie;
 use session::{SessionInfo, SessionManager};
 
 const ROOT_INODE: i64 = 1;
+const DEFAULT_SLICE_VERSION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenFileCacheConfig {
@@ -107,6 +108,11 @@ pub struct MetaClientOptions {
     /// to readonly opens; close may seed the final attr for a later readonly
     /// open without allowing write opens to skip their fresh stat.
     pub open_file_cache: OpenFileCacheConfig,
+    /// Maximum time a versioned slice-list cache hit may skip backend
+    /// revalidation. A remote mutation can therefore remain invisible for up
+    /// to this interval. `Duration::ZERO` revalidates every cache hit.
+    /// Mutations that overlap a validation may be observed by the next check.
+    pub slice_version_check_interval: Duration,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -287,6 +293,7 @@ impl Default for MetaClientOptions {
             max_symlinks: 40,
             batch_prefetch: BatchPrefetchConfig::default(),
             open_file_cache: OpenFileCacheConfig::default(),
+            slice_version_check_interval: DEFAULT_SLICE_VERSION_CHECK_INTERVAL,
         }
     }
 }
@@ -315,6 +322,12 @@ pub struct MetaClient<T: MetaStore + ?Sized> {
     /// Kept separate from trie for O(1) inode-to-paths lookup
     /// it's absolute path.
     inode_to_paths: Arc<DashMap<i64, Vec<String>>>,
+    /// Serializes attribute mutations for the same inode.  FUSE may issue
+    /// setattr requests concurrently (for example, a path reached through a
+    /// symlink can overlap a direct request).  Keeping this lock per inode
+    /// preserves the fast path for unrelated files while ensuring that
+    /// metadata stores observe a linear order for ctime and ownership updates.
+    attr_locks: Arc<DashMap<i64, Arc<Mutex<()>>>>,
     metrics: Arc<MetaClientMetrics>,
 
     /// Manages background session heartbeats when enabled by callers.
@@ -426,6 +439,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
                 .build(),
             path_trie: Arc::new(PathTrie::new()),
             inode_to_paths: Arc::new(DashMap::new()),
+            attr_locks: Arc::new(DashMap::new()),
             metrics: Arc::new(MetaClientMetrics::default()),
             session_manager: Arc::new(SessionManager::new(store.clone())),
             job_manager: Arc::new(JobManager::default()),
@@ -1494,6 +1508,10 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
     ///
     /// * `Ok(Some(i64))` - The inode number of the child entry if found
     /// * `Ok(None)` - If no entry with the given name exists in the parent
+    /// * `Err(MetaError::NotFound)` - If the store contains a dangling directory
+    ///   entry whose inode attributes no longer exist. This keeps inode-only
+    ///   lookup consistent with `lookup_with_attr` and maps to `ENOENT` at the
+    ///   FUSE boundary.
     /// * `Err(MetaError)` - On storage errors
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn cached_lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
@@ -1527,16 +1545,10 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         trace!("MetaClient: lookup MISS ({}, '{}')", parent, name);
         self.metrics.record_lookup_cache_miss();
 
-        let result = self.store.lookup(parent, name).await?;
+        let result = self.store.lookup_with_attr(parent, name).await?;
 
-        if let Some(ino) = result {
-            if let Ok(Some(attr)) = self.store.stat(ino).await {
-                self.cache_lookup_attr(parent, name, ino, attr).await;
-            } else {
-                self.inode_cache
-                    .add_child(parent, name.to_string(), ino)
-                    .await;
-            }
+        if let Some((ino, attr)) = result {
+            self.cache_lookup_attr(parent, name, ino, attr).await;
             Ok(Some(ino))
         } else if self.options.case_insensitive {
             self.resolve_case(parent, name).await
@@ -1709,7 +1721,8 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         new_name: String,
         known_src: Option<(i64, FileAttr)>,
         known_new_parent_attr: Option<FileAttr>,
-        known_dest_ino: Option<Option<i64>>,
+        _known_dest_ino: Option<Option<i64>>,
+        noreplace: bool,
     ) -> Result<(), MetaError> {
         self.ensure_writable()?;
 
@@ -1728,7 +1741,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
 
         Self::validate_entry_name(&new_name)?;
 
-        let (src_ino, src_attr) = match known_src {
+        let (_src_ino, _src_attr) = match known_src {
             Some((ino, attr)) => (self.check_root(ino), Some(attr)),
             None => {
                 let src_ino = self.cached_lookup_required(old_parent, old_name).await?;
@@ -1747,29 +1760,45 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
             }
         }
 
-        // Resolve destination inode before store rename so we can invalidate its
-        // cache entry afterwards.  When the store replaces an existing destination,
-        // its nlink is decremented (possibly to 0, which deletes the node).  The
-        // cache must reflect this, otherwise a subsequent stat on an fd that was
-        // open before the overwrite returns a stale (non-zero) nlink.
-        let dest_ino = match known_dest_ino {
-            Some(dest_ino) => dest_ino.map(|ino| self.check_root(ino)),
-            None => self.cached_lookup(new_parent, &new_name).await?,
+        // Only the backend transaction/script can decide whether the current
+        // destination is the source inode or a different inode. Destination
+        // hints may be stale across clients and must never control the rename.
+        let outcome = if noreplace {
+            self.store
+                .rename_with_mode(old_parent, old_name, new_parent, new_name.clone(), true)
+                .await?
+        } else {
+            self.store
+                .rename_with_outcome(old_parent, old_name, new_parent, new_name.clone())
+                .await?
         };
-        if dest_ino == Some(src_ino) {
+        let src_ino = outcome.ino;
+        if !outcome.renamed {
+            self.invalidate_open_file_cache_inode(src_ino).await;
+            self.inode_cache.invalidate_inode(src_ino).await;
+            self.inode_cache.remove_child(old_parent, old_name).await;
+            self.inode_cache.remove_child(new_parent, &new_name).await;
+            self.inode_cache
+                .ensure_node_in_cache(old_parent, &self.store, None)
+                .await?;
+            self.inode_cache
+                .ensure_node_in_cache(new_parent, &self.store, None)
+                .await?;
+            self.inode_cache
+                .ensure_node_in_cache(src_ino, &self.store, None)
+                .await?;
+            self.inode_cache
+                .add_child(old_parent, old_name.to_string(), src_ino)
+                .await;
+            self.inode_cache
+                .add_child(new_parent, new_name, src_ino)
+                .await;
             return Ok(());
         }
-        let dest_attr = match dest_ino {
-            Some(dest) => self.cached_stat(dest).await?,
-            None => None,
-        };
 
-        // Execute the store-level rename with atomic cache updates.
-        self.store
-            .rename(old_parent, old_name, new_parent, new_name.clone())
-            .await?;
+        let dest_ino = outcome.replaced_ino;
         self.invalidate_open_file_cache_inode(src_ino).await;
-        if let Some(dest_ino) = dest_ino {
+        if let Some(dest_ino) = outcome.replaced_ino {
             self.invalidate_open_file_cache_inode(dest_ino).await;
         }
 
@@ -1777,34 +1806,18 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
 
         // Update cache atomically with enhanced consistency management.
         let cache_result = async {
-            // Remove child from old parent (keep inode for later use).
-            let child_info = self
-                .inode_cache
-                .remove_child_but_keep_inode(old_parent, old_name)
+            self.inode_cache.remove_child(old_parent, old_name).await;
+            self.inode_cache.remove_child(new_parent, &new_name).await;
+            self.inode_cache.invalidate_inode(src_ino).await;
+            self.inode_cache
+                .ensure_node_in_cache(new_parent, &self.store, None)
+                .await?;
+            self.inode_cache
+                .ensure_node_in_cache(src_ino, &self.store, Some(new_parent))
+                .await?;
+            self.inode_cache
+                .add_child(new_parent, new_name.clone(), src_ino)
                 .await;
-
-            if let Some(child_ino) = child_info {
-                // Ensure new parent is in cache with up-to-date metadata.
-                self.inode_cache
-                    .ensure_node_in_cache(new_parent, &self.store, None)
-                    .await?;
-
-                // Add child to new parent.
-                self.inode_cache
-                    .add_child(new_parent, new_name.clone(), child_ino)
-                    .await;
-
-                // Directories keep their inline parent even though nlink is >= 2.
-                if let Some(attr) = &src_attr {
-                    if attr.kind == FileType::Dir || attr.nlink <= 1 {
-                        if let Some(child_node) = self.inode_cache.get_node(child_ino).await {
-                            child_node.set_parent(new_parent).await;
-                        }
-                    } else if let Some(child_node) = self.inode_cache.get_node(child_ino).await {
-                        child_node.clear_parent().await;
-                    }
-                }
-            }
 
             // Keep an overwritten destination inode addressable while it may
             // still be held open by the kernel, but refresh the link count from
@@ -1833,24 +1846,19 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
                 }
             }
 
-            // Precise path cache invalidation while retaining the updated child
-            // maps for subsequent lookups on the same hot directory.
-            let src_is_dir = matches!(src_attr.as_ref().map(|attr| attr.kind), Some(FileType::Dir));
-            let dest_is_dir = matches!(
-                dest_attr.as_ref().map(|attr| attr.kind),
-                Some(FileType::Dir)
-            );
-            let old_parent_delta = if src_is_dir && old_parent != new_parent {
+            // Apply link-count deltas from the backend's atomic outcome. The
+            // pre-rename source/destination kinds may both be stale.
+            let old_parent_delta = if outcome.source_is_dir && old_parent != new_parent {
                 -1
             } else {
                 0
             };
-            let mut new_parent_delta = if src_is_dir && old_parent != new_parent {
+            let mut new_parent_delta = if outcome.source_is_dir && old_parent != new_parent {
                 1
             } else {
                 0
             };
-            if dest_is_dir {
+            if outcome.replaced_is_dir {
                 new_parent_delta -= 1;
             }
 
@@ -2077,7 +2085,7 @@ fn control_invalid_request(message: impl Into<String>) -> ControlResponse {
 
 fn control_meta_error(err: MetaError) -> ControlResponse {
     let code = match &err {
-        MetaError::NotFound(_) => "not_found",
+        MetaError::NotFound(_) | MetaError::EntryNotFound { .. } => "not_found",
         MetaError::NotDirectory(_) => "not_directory",
         MetaError::AlreadyExists { .. } => "already_exists",
         MetaError::InvalidPath(_) | MetaError::InvalidFilename => "invalid_path",
@@ -2596,6 +2604,12 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
 
         self.inode_cache.remove_child(parent, name).await;
         if let Some(ino) = target_ino {
+            // The store-level unlink updates the target's nlink/ctime even
+            // when the parent directory was not present in the inode cache.
+            // In that case remove_child cannot invalidate the target entry,
+            // so explicitly drop it to ensure the next stat observes the
+            // post-unlink metadata (notably for hard-linked special files).
+            self.inode_cache.invalidate_inode(ino).await;
             self.invalidate_open_file_cache_inode(ino).await;
         }
         self.touch_cached_parent_after_namespace_mutation(parent)
@@ -2616,8 +2630,23 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         new_parent: i64,
         new_name: String,
     ) -> Result<(), MetaError> {
-        self.rename_cached(old_parent, old_name, new_parent, new_name, None, None, None)
-            .await
+        self.rename_cached(
+            old_parent, old_name, new_parent, new_name, None, None, None, false,
+        )
+        .await
+    }
+
+    async fn rename_noreplace(
+        &self,
+        old_parent: i64,
+        old_name: &str,
+        new_parent: i64,
+        new_name: String,
+    ) -> Result<(), MetaError> {
+        self.rename_cached(
+            old_parent, old_name, new_parent, new_name, None, None, None, true,
+        )
+        .await
     }
 
     #[tracing::instrument(
@@ -2654,6 +2683,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
             Some((src_ino, src_attr)),
             Some(new_parent_attr),
             known_dest_ino,
+            false,
         )
         .await
     }
@@ -2687,55 +2717,32 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         self.store
             .rename_exchange(old_parent, old_name, new_parent, new_name)
             .await?;
-        self.invalidate_open_file_cache_inode(old_ino).await;
-        self.invalidate_open_file_cache_inode(new_ino).await;
-
-        debug!("MetaClient: rename_exchange completed, updating cache");
-
-        // Update cache to reflect the exchange
-        let cache_result = async {
-            // Invalidate replaced child caches while preserving the parent child
-            // maps we rebuild below.
-            self.inode_cache.invalidate_inode(old_ino).await;
-            self.inode_cache.invalidate_inode(new_ino).await;
-
-            // Invalidate path caches
-            self.invalidate_parent_after_namespace_mutation(old_parent)
-                .await;
-            if old_parent != new_parent {
-                self.invalidate_parent_after_namespace_mutation(new_parent)
-                    .await;
+        let mut affected_inodes = HashSet::from([old_ino, new_ino]);
+        let (current_old, current_new) = tokio::join!(
+            self.store.lookup(old_parent, old_name),
+            self.store.lookup(new_parent, new_name),
+        );
+        for lookup in [current_old, current_new] {
+            match lookup {
+                Ok(Some(ino)) => {
+                    affected_inodes.insert(ino);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(%error, "failed to refresh inode after rename exchange");
+                }
             }
-
-            // Update directory entries
-            // Remove old entries
-            self.inode_cache.remove_child(old_parent, old_name).await;
-            self.inode_cache.remove_child(new_parent, new_name).await;
-
-            // Add swapped entries
-            self.inode_cache
-                .ensure_node_in_cache(old_parent, &self.store, None)
-                .await?;
-            self.inode_cache
-                .ensure_node_in_cache(new_parent, &self.store, None)
-                .await?;
-
-            self.inode_cache
-                .add_child(old_parent, old_name.to_string(), new_ino)
-                .await;
-            self.inode_cache
-                .add_child(new_parent, new_name.to_string(), old_ino)
-                .await;
-
-            Ok::<(), MetaError>(())
         }
-        .await;
+        for ino in affected_inodes {
+            self.invalidate_open_file_cache_inode(ino).await;
+            self.inode_cache.invalidate_inode(ino).await;
+        }
 
-        if let Err(cache_err) = cache_result {
-            warn!(
-                "MetaClient: cache update failed after successful rename_exchange: {}",
-                cache_err
-            );
+        self.invalidate_parent_path(old_parent).await;
+        self.inode_cache.invalidate_inode(old_parent).await;
+        if old_parent != new_parent {
+            self.invalidate_parent_path(new_parent).await;
+            self.inode_cache.invalidate_inode(new_parent).await;
         }
 
         Ok(())
@@ -2812,14 +2819,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
             self.rename_exchange(old_parent, old_name, new_parent, &new_name)
                 .await
         } else if flags.noreplace {
-            // Check if destination exists
-            if self.cached_lookup(new_parent, &new_name).await?.is_some() {
-                return Err(MetaError::AlreadyExists {
-                    parent: new_parent,
-                    name: new_name,
-                });
-            }
-            self.rename(old_parent, old_name, new_parent, new_name)
+            self.rename_noreplace(old_parent, old_name, new_parent, new_name)
                 .await
         } else {
             // Default behavior
@@ -2978,6 +2978,12 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
     ) -> Result<FileAttr, MetaError> {
         self.ensure_writable()?;
         let inode = self.check_root(ino);
+        let attr_lock = self
+            .attr_locks
+            .entry(inode)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _attr_guard = attr_lock.lock().await;
         let timestamp_only = Self::timestamp_only_setattr(req, &flags);
         let attr = self.store.set_attr(inode, req, flags).await?;
         if !self.inode_cache.refresh_attr(inode, attr.clone()).await {
@@ -3066,9 +3072,9 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
     )]
     async fn get_slices(&self, chunk_id: u64) -> Result<Vec<SliceDesc>, MetaError> {
         let (inode, chunk_index) = extract_ino_and_chunk_index(chunk_id);
-        if let Some(slices) = self
+        if let Some(cached) = self
             .inode_cache
-            .get_slices(inode, chunk_index)
+            .get_cached_slices(inode, chunk_index)
             .instrument(tracing::trace_span!(
                 "get_slices.cache_lookup",
                 inode,
@@ -3076,21 +3082,42 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
             ))
             .await
         {
-            tracing::Span::current().record("cache_hit", true);
-            tracing::Span::current().record("slice_count", slices.len());
-            self.metrics.record_get_slices_cache_hit();
-            return Ok(slices);
+            if let Some(cached_version) = cached.version
+                && cached.validated_at.elapsed() >= self.options.slice_version_check_interval
+            {
+                let store_version = self
+                    .store
+                    .get_chunk_version(chunk_id)
+                    .instrument(tracing::trace_span!("get_slices.version_check", chunk_id))
+                    .await?;
+                if store_version == Some(cached_version) {
+                    self.inode_cache
+                        .touch_slices_validation(inode, chunk_index, cached_version)
+                        .await;
+                } else {
+                    self.inode_cache
+                        .invalidate_slices_if_version(inode, chunk_index, cached_version)
+                        .await;
+                }
+            }
+
+            if let Some(slices) = self.inode_cache.get_slices(inode, chunk_index).await {
+                tracing::Span::current().record("cache_hit", true);
+                tracing::Span::current().record("slice_count", slices.len());
+                self.metrics.record_get_slices_cache_hit();
+                return Ok(slices);
+            }
         }
         tracing::Span::current().record("cache_hit", false);
         self.metrics.record_get_slices_cache_miss();
-        let slices = self
+        let (version, slices) = self
             .store
-            .get_slices(chunk_id)
+            .get_slices_with_version(chunk_id)
             .instrument(tracing::trace_span!("get_slices.store", chunk_id))
             .await?;
         let cached = self
             .inode_cache
-            .cache_slices_if_absent(inode, chunk_index, &slices)
+            .cache_slices_if_absent(inode, chunk_index, version, &slices)
             .await
             .unwrap_or(slices);
         tracing::Span::current().record("slice_count", cached.len());
@@ -3454,6 +3481,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_ignores_stale_same_inode_destination_hint() {
+        let client = create_test_client().await;
+        let src = client.create_file(1, "src".to_string()).await.unwrap();
+        client.link(src, 1, "dst").await.unwrap();
+
+        let src_attr = client.stat(src).await.unwrap().unwrap();
+        let parent_attr = client.stat(1).await.unwrap().unwrap();
+
+        // Simulate another client replacing dst after this client resolved it
+        // as a hard link to src but before the backend rename begins.
+        client.store.unlink(1, "dst").await.unwrap();
+        let replaced = client
+            .store
+            .create_file(1, "dst".to_string())
+            .await
+            .unwrap();
+        let replaced_before = client.stat(replaced).await.unwrap().unwrap();
+        assert_eq!(replaced_before.nlink, 1);
+
+        client
+            .rename_with_known_attrs(
+                1,
+                "src",
+                1,
+                "dst".to_string(),
+                src,
+                src_attr,
+                parent_attr,
+                Some(src),
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(client.lookup(1, "src").await.unwrap(), None);
+        assert_eq!(client.lookup(1, "dst").await.unwrap(), Some(src));
+        assert_eq!(client.stat(replaced).await.unwrap().unwrap().nlink, 0);
+    }
+
+    #[tokio::test]
     async fn directory_namespace_mutations_keep_cached_parent_nlink_current() {
         let client = create_test_client().await;
 
@@ -3645,7 +3712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_meta_client_lookup_only_does_not_count_lookup_attr_fused_path() {
+    async fn test_meta_client_lookup_only_does_not_change_lookup_with_attr_api_metrics() {
         let client = create_test_client().await;
         let ino = client
             .create_file(1, "lookup-only.txt".to_string())
@@ -3664,7 +3731,7 @@ mod tests {
 
         assert_eq!(
             after.lookup_attr_fused_miss, before.lookup_attr_fused_miss,
-            "lookup-only callers should stay on the lighter inode-only path"
+            "lookup-only callers should not be counted as lookup_with_attr API calls"
         );
     }
 
@@ -3928,7 +3995,7 @@ mod tests {
         }];
         client
             .inode_cache
-            .cache_slices_if_absent(ino, chunk_index, &cached_slices)
+            .cache_slices_if_absent(ino, chunk_index, None, &cached_slices)
             .await;
         assert!(
             client
@@ -5116,6 +5183,26 @@ mod tests {
         // Verify new file is accessible
         let ino_file3 = client.resolve_path("/dira/file3.txt").await.unwrap();
         assert_eq!(ino_file3, _file3);
+    }
+
+    #[tokio::test]
+    async fn rename_exchange_does_not_restore_stale_child_cache_entries() {
+        let client = create_test_client().await;
+        let root = client.root.load(std::sync::atomic::Ordering::Relaxed);
+        let a = client.create_file(root, "a".into()).await.unwrap();
+        let b = client.create_file(root, "b".into()).await.unwrap();
+        assert_eq!(client.lookup(root, "a").await.unwrap(), Some(a));
+        assert_eq!(client.lookup(root, "b").await.unwrap(), Some(b));
+
+        client
+            .store
+            .rename_exchange(root, "a", root, "b")
+            .await
+            .unwrap();
+        client.rename_exchange(root, "a", root, "b").await.unwrap();
+
+        assert_eq!(client.lookup(root, "a").await.unwrap(), Some(a));
+        assert_eq!(client.lookup(root, "b").await.unwrap(), Some(b));
     }
 
     #[tokio::test]
