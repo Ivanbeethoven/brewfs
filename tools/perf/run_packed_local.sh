@@ -14,6 +14,11 @@ MODE="${PACKED_LOCAL_MODE:-stat}"
 EPOCHS="${PACKED_LOCAL_EPOCHS:-2}"
 TIMEOUT_SECONDS="${PACKED_LOCAL_TIMEOUT_SECONDS:-240}"
 SCANNER_SEED="${PACKED_LOCAL_SCANNER_SEED:-20261001}"
+FRAME_POLICY="${PACKED_LOCAL_FRAME_POLICY:-size-only}"
+INLINE_DATA="${PACKED_LOCAL_INLINE_DATA:-on}"
+METADATA_CODEC="${PACKED_LOCAL_METADATA_CODEC:-zstd}"
+DATA_CODEC="${PACKED_LOCAL_DATA_CODEC:-zstd}"
+ACCESS_PROFILE="${PACKED_LOCAL_ACCESS_PROFILE:-random-small-file}"
 BINARY="${PACKED_LOCAL_BINARY:-$ROOT/target/debug/brewfs}"
 FIXTURE="${PACKED_LOCAL_FIXTURE:-$ROOT/target/debug/packed_v3_snapshot_fixture}"
 COMPOSE="$ROOT/docker/compose-xfstests/docker-compose.juicefs-perf.yml"
@@ -21,8 +26,13 @@ for value in "$FILES" "$FILE_BYTES" "$METADATA_BYTES" "$WORKERS" "$EPOCHS" "$TIM
     [[ "$value" =~ ^[0-9]+$ ]] || { printf 'Expected integer control parameter\n' >&2; exit 2; }
 done
 (( FILES >= 100 && FILES <= 10000 && FILES % 100 == 0 )) || { printf 'Use 100..10000 files divisible by 100\n' >&2; exit 2; }
-(( FILE_BYTES > 0 && FILE_BYTES <= 4194304 && WORKERS > 0 && WORKERS <= 64 && EPOCHS > 0 && EPOCHS <= 3 && TIMEOUT_SECONDS > 0 && TIMEOUT_SECONDS <= 1800 )) || exit 2
+(( FILE_BYTES > 0 && FILE_BYTES <= 67108864 && WORKERS > 0 && WORKERS <= 64 && EPOCHS > 0 && EPOCHS <= 3 && TIMEOUT_SECONDS > 0 && TIMEOUT_SECONDS <= 1800 )) || exit 2
 case "$MODE" in stat|tree|full) ;; *) exit 2 ;; esac
+case "$FRAME_POLICY" in size-only|static-256kib|static-1mib|static-4mib) ;; *) exit 2 ;; esac
+case "$INLINE_DATA" in on|off) ;; *) exit 2 ;; esac
+case "$METADATA_CODEC" in raw|zstd) ;; *) exit 2 ;; esac
+case "$DATA_CODEC" in raw|zstd) ;; *) exit 2 ;; esac
+case "$ACCESS_PROFILE" in random-small-file|sequential-small-file|mixed) ;; *) exit 2 ;; esac
 [[ "$WIRE_VERSION" == 5 ]] || { printf 'Use the current packed-v3 encoding 005\n' >&2; exit 2; }
 case "$COLD_CORPUS" in true|false) ;; *) exit 2 ;; esac
 case "$HARDLINK_CORPUS" in true|false) ;; *) exit 2 ;; esac
@@ -78,7 +88,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-python3 "$ROOT/tools/perf/packed_run_manifest.py" init --artifact "$ARTIFACT" --run-id "$RUN_ID" --wire-version "$WIRE_VERSION" --files "$FILES" --file-bytes "$FILE_BYTES" --metadata-bytes "$METADATA_BYTES" --workers "$WORKERS" --epochs "$EPOCHS" --mode "$MODE" --scanner-seed "$SCANNER_SEED" --fixture-prefix "$FIXTURE_PREFIX"
+python3 "$ROOT/tools/perf/packed_run_manifest.py" init --artifact "$ARTIFACT" --run-id "$RUN_ID" --wire-version "$WIRE_VERSION" --files "$FILES" --file-bytes "$FILE_BYTES" --metadata-bytes "$METADATA_BYTES" --workers "$WORKERS" --epochs "$EPOCHS" --mode "$MODE" --scanner-seed "$SCANNER_SEED" --fixture-prefix "$FIXTURE_PREFIX" --frame-policy "$FRAME_POLICY" --inline-data "$INLINE_DATA" --metadata-codec "$METADATA_CODEC" --data-codec "$DATA_CODEC" --access-profile "$ACCESS_PROFILE"
 # Scope this to this local invocation. Do not change operator settings or cloud
 # transport. Some SDK connectors route loopback ranges through an inherited proxy.
 export HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= http_proxy= https_proxy= all_proxy=
@@ -104,10 +114,10 @@ paths=sorted(set(p.decode() for p in (tracked+untracked).split(b'\0') if p))
 hashes={p:hashlib.sha256((root/p).read_bytes()).hexdigest() for p in paths if (root/p).is_file()}
 pathlib.Path(sys.argv[2]).write_text(json.dumps(hashes,sort_keys=True,indent=2)+'\n')
 PYSOURCES
-FIXTURE_ARGS=(--wire-version 5)
+FIXTURE_ARGS=(--wire-version 5 --frame-policy "$FRAME_POLICY" --inline-data "$INLINE_DATA" --metadata-codec "$METADATA_CODEC" --data-codec "$DATA_CODEC" --access-profile "$ACCESS_PROFILE")
 [[ "$COLD_CORPUS" == true ]] && FIXTURE_ARGS+=(--cold-corpus true)
 [[ "$HARDLINK_CORPUS" == true ]] && FIXTURE_ARGS+=(--hardlink-corpus true)
-"$FIXTURE" "${FIXTURE_ARGS[@]}" --bucket brewfs-data --endpoint http://127.0.0.1:19000 --region us-east-1 --force-path-style true --prefix "$FIXTURE_PREFIX" --manifest-output "$ARTIFACT/manifest-key.txt" --dir-levels 2 --dirs-per-level 10 --files-per-dir "$((FILES / 100))" --small-file-size "$FILE_BYTES" --small-file-min-size "$FILE_BYTES" --small-file-max-size "$FILE_BYTES" --access-profile random-small-file >"$ARTIFACT/fixture.log" 2>&1
+"$FIXTURE" "${FIXTURE_ARGS[@]}" --bucket brewfs-data --endpoint http://127.0.0.1:19000 --region us-east-1 --force-path-style true --prefix "$FIXTURE_PREFIX" --manifest-output "$ARTIFACT/manifest-key.txt" --dir-levels 2 --dirs-per-level 10 --files-per-dir "$((FILES / 100))" --small-file-size "$FILE_BYTES" --small-file-min-size "$FILE_BYTES" --small-file-max-size "$FILE_BYTES" --access-profile "$ACCESS_PROFILE" >"$ARTIFACT/fixture.log" 2>&1
 python3 - "$WORK" "$ARTIFACT/manifest-key.txt" <<'PYCONFIG'
 import pathlib,sys
 work=pathlib.Path(sys.argv[1]); key=pathlib.Path(sys.argv[2]).read_text().strip()
@@ -145,10 +155,15 @@ window=0
 decoded=0
 metadata_prefetch=%s
 wire_version=%s
+frame_policy=%s
+inline_data=%s
+metadata_codec=%s
+data_codec=%s
+access_profile=%s
 fuse_ttl_ms=0
 direct_io=1
 keep_cache=0
-loopback_proxy=disabled\ncold_corpus=%s\nhardlink_corpus=%s\n' "$FILES" "$FILE_BYTES" "$METADATA_BYTES" "$WORKERS" "$EPOCHS" "$MODE" "$METADATA_PREFETCH" "$WIRE_VERSION" "$COLD_CORPUS" "$HARDLINK_CORPUS" >"$ARTIFACT/profile.env"
+loopback_proxy=disabled\ncold_corpus=%s\nhardlink_corpus=%s\n' "$FILES" "$FILE_BYTES" "$METADATA_BYTES" "$WORKERS" "$EPOCHS" "$MODE" "$METADATA_PREFETCH" "$WIRE_VERSION" "$FRAME_POLICY" "$INLINE_DATA" "$METADATA_CODEC" "$DATA_CODEC" "$ACCESS_PROFILE" "$COLD_CORPUS" "$HARDLINK_CORPUS" >"$ARTIFACT/profile.env"
 printf 'packed_version=v3\nscanner_seed=%s\nfixture_prefix=%s\nmanifest_schema=packed-v3-run-manifest-v1\n' "$SCANNER_SEED" "$FIXTURE_PREFIX" >>"$ARTIFACT/profile.env"
 sync
 sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'

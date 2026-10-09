@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::{Context as _, anyhow, bail};
 use async_trait::async_trait;
 use brewfs::workspace_overlay::catalog::{
     CreateSnapshot, CreateVolumeRoot, CreateWorkspace, MarkDeleting, WorkspaceStore,
@@ -13,8 +13,8 @@ use brewfs::workspace_overlay::lifecycle::{
     NoopDurableRemoteBarrier, WorkspaceLifecycle, WorkspaceMountSession,
 };
 use brewfs::workspace_overlay::model::{
-    BaseRevision, LayerState, LeaseState, SnapshotLease, VolumeHeader, WorkspaceRecord,
-    WorkspaceState, WORKSPACE_SCHEMA_VERSION,
+    BaseRevision, LayerState, LeaseState, SnapshotLease, VolumeHeader, WORKSPACE_SCHEMA_VERSION,
+    WorkspaceRecord, WorkspaceState,
 };
 use brewfs::workspace_overlay::stores::kv_store::KvWorkspaceStore;
 use uuid::Uuid;
@@ -199,7 +199,7 @@ pub trait WorkspaceAdmin: Send + Sync {
     async fn inspect_workspace(&self, id: WorkspaceId) -> anyhow::Result<WorkspaceView>;
     async fn verify_revision(&self, revision: &BaseRevision) -> anyhow::Result<()>;
     async fn ensure_snapshot(&self, request: EnsureSnapshotRequest)
-        -> anyhow::Result<SnapshotView>;
+    -> anyhow::Result<SnapshotView>;
     async fn load_snapshot(&self, id: SnapshotId) -> anyhow::Result<SnapshotView>;
     async fn seal_and_snapshot(
         &self,
@@ -453,8 +453,10 @@ where
     }
 
     async fn delete_snapshot(&self, id: SnapshotId) -> anyhow::Result<()> {
-        self.store.delete_snapshot(id).await?;
-        Ok(())
+        match self.store.delete_snapshot(id).await {
+            Ok(()) | Err(WorkspaceError::SnapshotNotFound(_)) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn mark_workspace_deleting(&self, id: WorkspaceId, force: bool) -> anyhow::Result<()> {
@@ -467,7 +469,15 @@ where
             .await
         {
             Ok(()) => Ok(()),
-            Err(WorkspaceError::InvalidStateTransition { .. }) => {
+            // Backends use different conflict errors for an already durable
+            // Deleting marker (the KV path reports WorkspaceNotFound while
+            // SQLite reports InvalidStateTransition). Reconciliation is
+            // retried after every API-server write, so both forms must be
+            // treated as an idempotent success only after re-reading the
+            // authoritative record. A missing record or another state still
+            // fails closed and keeps the Kubernetes finalizer in place.
+            Err(WorkspaceError::InvalidStateTransition { .. })
+            | Err(WorkspaceError::WorkspaceNotFound(_)) => {
                 let workspace = self.store.load_workspace(id).await?;
                 if workspace.state == WorkspaceState::Deleting {
                     Ok(())
@@ -668,6 +678,52 @@ mod tests {
         );
         assert_eq!(admin.store.list_workspaces().await.unwrap().len(), 1);
         assert_eq!(admin.store.list_snapshots().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deletion_finalizer_operations_are_idempotent_after_backend_marker() {
+        use brewfs::workspace_overlay::stores::database::SqliteWorkspaceStore;
+
+        let admin = StoreWorkspaceAdmin::new(
+            SqliteWorkspaceStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let identity = VolumeIdentity {
+            volume_id: Uuid::from_u128(101),
+            root_workspace_id: WorkspaceId::from_uuid(Uuid::from_u128(102)),
+            root_layer_id: LayerId::from_uuid(Uuid::from_u128(103)),
+            writable_layer_id: LayerId::from_uuid(Uuid::from_u128(104)),
+            root_snapshot_id: SnapshotId::from_uuid(Uuid::from_u128(105)),
+            owner_id: "k8s-cluster/test/idempotent".into(),
+        };
+        let volume = admin.ensure_volume(identity.clone()).await.unwrap();
+
+        admin
+            .mark_workspace_deleting(identity.root_workspace_id, false)
+            .await
+            .unwrap();
+        // SQLite reports InvalidStateTransition on the second call; the KV
+        // backends report WorkspaceNotFound. Both are accepted only after the
+        // authoritative record confirms the durable Deleting marker.
+        admin
+            .mark_workspace_deleting(identity.root_workspace_id, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            admin
+                .store
+                .load_workspace(identity.root_workspace_id)
+                .await
+                .unwrap()
+                .state,
+            WorkspaceState::Deleting
+        );
+
+        admin.delete_snapshot(volume.root_snapshot_id).await.unwrap();
+        // A retried Kubernetes finalizer may observe a previously deleted
+        // snapshot. Missing is terminal success; backend errors still fail.
+        admin.delete_snapshot(volume.root_snapshot_id).await.unwrap();
     }
 
     #[test]
