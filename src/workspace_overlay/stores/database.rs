@@ -1,12 +1,12 @@
 //! SQLite implementation of the workspace catalog.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 
 use async_trait::async_trait;
 use sea_orm::sqlx::sqlite::{
@@ -21,21 +21,63 @@ use crate::workspace_overlay::catalog::{
     CompactionResult, CreateSnapshot, CreateVolumeRoot, CreateWorkspace, DataMutation,
     DataMutationResult, DeleteLayerMetadata, DentryQuery, ExtentQuery, FastForwardCommit,
     GcSnapshot, HeadGuard, InodeMutation, InodeQuery, InstallCompaction, MarkDeleting,
-    MutationResult, NamespaceMutation, RecordOrphanSlice, ReleaseLease, RenewLease, SliceReference,
-    WorkspaceStore, WorkspaceStoreCapabilities, XattrMutation, XattrQuery,
+    MutationResult, NamespaceMutation, PermissionMutation, PermissionSnapshot,
+    PermissionSnapshotQuery, RecordOrphanSlice, ReleaseLease, RenewLease, SliceReference,
+    VersionedMutation, WorkspaceStore, WorkspaceStoreCapabilities, XattrMutation, XattrQuery,
 };
 use crate::workspace_overlay::digest::{CanonicalLayerDelta, delta_digest, root_hash};
 use crate::workspace_overlay::error::WorkspaceError;
-use crate::workspace_overlay::ids::{JournalId, LayerId, SnapshotId, WorkspaceId};
+use crate::workspace_overlay::ids::{JournalId, LayerId, LeaseId, SnapshotId, WorkspaceId};
 use crate::workspace_overlay::model::{
     AclDelta, BaseRevision, CommitResult, DataExtentDelta, DentryDelta, DentryOp, ExtentKind,
     InodeDelta, InodeState, LayerRecord, LayerState, LeaseState, SealJournal, SealPhase,
     SealResult, SnapshotLease, SnapshotRecord, ValueOp, VolumeHeader, WORKSPACE_SCHEMA_VERSION,
     WorkspaceRecord, WorkspaceState, XattrDelta,
 };
+use crate::workspace_overlay::publish::binding::{
+    InstallPackedLowerBinding, PackedLowerBindingRecord, PublishPackedLowerBinding,
+};
 use crate::workspace_overlay::resolver::validate_layer_chain;
 
 const VOLUME_FORMAT: &str = "workspace-v1";
+
+/// State persisted by the v3 SQLite open sidecar. This record governs only
+/// the sidecar APIs; it is not yet a mount or seal-recovery ownership gate.
+/// Ordinary snapshot leases remain the mutation fence used by data writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i64)]
+pub enum V3OpenState {
+    Recovering = 0,
+    Ready = 1,
+}
+
+impl TryFrom<i64> for V3OpenState {
+    type Error = WorkspaceError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Recovering),
+            1 => Ok(Self::Ready),
+            other => Err(WorkspaceError::CorruptMetadata(format!(
+                "unknown v3 open state {other}"
+            ))),
+        }
+    }
+}
+
+/// A fencing token returned by [`SqliteWorkspaceStore::open_workspace_v3`].
+/// Every sidecar mutation must present the owner and generation returned by
+/// open. A later takeover fences old tokens in the sidecar APIs only; mount,
+/// mutation and seal recovery have not yet been connected to this token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct V3OpenToken {
+    pub workspace_id: WorkspaceId,
+    pub owner_id: String,
+    pub generation: u64,
+    pub expires_at_ns: i64,
+    pub state: V3OpenState,
+    pub recovery_required: bool,
+}
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS ws_v1_volume_header (
@@ -54,6 +96,7 @@ CREATE TABLE IF NOT EXISTS ws_v1_workspaces (
     fork_base_root_hash BLOB,
     owner_id TEXT,
     state INTEGER NOT NULL,
+    active_lease BLOB,
     created_at_ns INTEGER NOT NULL,
     updated_at_ns INTEGER NOT NULL
 );
@@ -189,6 +232,29 @@ CREATE TABLE IF NOT EXISTS ws_v1_allocators (
     name TEXT PRIMARY KEY,
     next_value INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ws_v3_packed_bindings (
+    workspace_id BLOB NOT NULL,
+    binding_version INTEGER NOT NULL CHECK(binding_version > 0),
+    record BLOB NOT NULL CHECK(length(record) <= 8192),
+    PRIMARY KEY(workspace_id, binding_version)
+);
+CREATE TABLE IF NOT EXISTS ws_v3_packed_current (
+    workspace_id BLOB PRIMARY KEY,
+    binding_version INTEGER NOT NULL,
+    FOREIGN KEY(workspace_id, binding_version)
+        REFERENCES ws_v3_packed_bindings(workspace_id, binding_version)
+);
+CREATE TABLE IF NOT EXISTS ws_v3_workspace_open (
+    workspace_id BLOB PRIMARY KEY,
+    owner_id TEXT NOT NULL CHECK(length(CAST(owner_id AS BLOB)) BETWEEN 1 AND 256),
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    expires_at_ns INTEGER NOT NULL,
+    state INTEGER NOT NULL CHECK(state IN (0, 1)),
+    recovery_required INTEGER NOT NULL CHECK(recovery_required IN (0, 1)),
+    opened_at_ns INTEGER NOT NULL,
+    updated_at_ns INTEGER NOT NULL,
+    FOREIGN KEY(workspace_id) REFERENCES ws_v1_workspaces(workspace_id)
+);
 "#;
 
 #[cfg(test)]
@@ -197,6 +263,7 @@ CREATE TABLE IF NOT EXISTS ws_v1_allocators (
 pub enum StoreFailpoint {
     Disabled = 0,
     BeforeCommit = 1,
+    AfterPublicationCommit = 2,
 }
 
 pub struct SqliteWorkspaceStore {
@@ -204,6 +271,10 @@ pub struct SqliteWorkspaceStore {
     write_gate: Arc<Mutex<()>>,
     #[cfg(test)]
     failpoint: AtomicU8,
+    #[cfg(test)]
+    sidecar_clock_ns: AtomicI64,
+    #[cfg(test)]
+    sidecar_commit_clock_ns: AtomicI64,
 }
 
 impl SqliteWorkspaceStore {
@@ -230,7 +301,578 @@ impl SqliteWorkspaceStore {
             write_gate: Arc::new(Mutex::new(())),
             #[cfg(test)]
             failpoint: AtomicU8::new(StoreFailpoint::Disabled as u8),
+            #[cfg(test)]
+            sidecar_clock_ns: AtomicI64::new(-1),
+            #[cfg(test)]
+            sidecar_commit_clock_ns: AtomicI64::new(-1),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) async fn rewrite_packed_binding_for_test(
+        &self,
+        workspace_id: WorkspaceId,
+        record: &PackedLowerBindingRecord,
+        drop_initial: bool,
+    ) -> Result<(), WorkspaceError> {
+        let bytes = record.encode()?;
+        let _guard = self.write_gate.lock().await;
+        let mut tx = self.begin_write().await?;
+        sea_orm::sqlx::query(
+            "INSERT OR REPLACE INTO ws_v3_packed_bindings(workspace_id, binding_version, record)
+             VALUES (?, ?, ?)",
+        )
+        .bind(workspace_id.as_bytes().as_slice())
+        .bind(to_i64(
+            record.binding.binding_version,
+            "packed binding version",
+        )?)
+        .bind(bytes)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        sea_orm::sqlx::query(
+            "UPDATE ws_v3_packed_current SET binding_version = ? WHERE workspace_id = ?",
+        )
+        .bind(to_i64(
+            record.binding.binding_version,
+            "packed binding version",
+        )?)
+        .bind(workspace_id.as_bytes().as_slice())
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        if drop_initial {
+            sea_orm::sqlx::query(
+                "DELETE FROM ws_v3_packed_bindings
+                 WHERE workspace_id = ? AND binding_version = 1",
+            )
+            .bind(workspace_id.as_bytes().as_slice())
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        }
+        tx.commit().await.map_err(backend)
+    }
+
+    fn sidecar_now_ns(&self) -> Result<i64, WorkspaceError> {
+        #[cfg(test)]
+        {
+            let controlled = self.sidecar_clock_ns.load(Ordering::SeqCst);
+            if controlled >= 0 {
+                return Ok(controlled);
+            }
+        }
+        now_ns()
+    }
+
+    fn sidecar_before_commit_ns(&self) -> Result<i64, WorkspaceError> {
+        #[cfg(test)]
+        {
+            let advanced = self.sidecar_commit_clock_ns.swap(-1, Ordering::SeqCst);
+            if advanced >= 0 {
+                self.sidecar_clock_ns.store(advanced, Ordering::SeqCst);
+            }
+        }
+        self.sidecar_now_ns()
+    }
+
+    /// Reject processing that crossed the sampled expiry after SQL staging.
+    /// This is the last application check before requesting SQLite commit;
+    /// SQLite does not atomically compare the wall clock with the eventual
+    /// commit visibility point, which can occur after this check.
+    fn recheck_sidecar_deadline(&self, deadline_ns: i64) -> Result<(), WorkspaceError> {
+        if self.sidecar_before_commit_ns()? >= deadline_ns {
+            return Err(WorkspaceError::Fenced);
+        }
+        Ok(())
+    }
+
+    async fn commit_sidecar_tx(
+        &self,
+        tx: Transaction<'_, Sqlite>,
+        deadline_ns: i64,
+    ) -> Result<(), WorkspaceError> {
+        if let Err(error) = self.recheck_sidecar_deadline(deadline_ns) {
+            tx.rollback().await.map_err(backend)?;
+            return Err(error);
+        }
+        tx.commit().await.map_err(backend)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_sidecar_time_ns(&self, now: i64) {
+        assert!(now >= 0);
+        self.sidecar_clock_ns.store(now, Ordering::SeqCst);
+    }
+
+    /// Advance only this store's sidecar clock after staging SQL writes and
+    /// immediately before its next sidecar commit boundary. No sleeps or
+    /// global clock state are shared between concurrently running tests.
+    #[cfg(test)]
+    pub(super) fn set_sidecar_commit_time_ns(&self, now: i64) {
+        assert!(now >= 0);
+        self.sidecar_commit_clock_ns.store(now, Ordering::SeqCst);
+    }
+
+    /// Claim the v3 open sidecar record for an already initialized workspace.
+    ///
+    /// The record is deliberately separate from the mutation lease.  It
+    /// lets a new process take over after the old process's expiry. A takeover
+    /// increments the persisted generation and fences delayed sidecar calls.
+    /// Mount and seal-recovery ownership remain separate until they are wired
+    /// to this token.
+    pub async fn open_workspace_v3(
+        &self,
+        workspace_id: WorkspaceId,
+        owner_id: impl Into<String>,
+        ttl: Duration,
+    ) -> Result<V3OpenToken, WorkspaceError> {
+        let owner_id = owner_id.into();
+        if owner_id.trim().is_empty() || owner_id.len() > 256 {
+            return Err(WorkspaceError::CorruptMetadata(
+                "v3 open owner id must contain 1..=256 bytes".into(),
+            ));
+        }
+        let ttl_ns = duration_ns(ttl)?;
+        if ttl_ns <= 0 {
+            return Err(WorkspaceError::CorruptMetadata(
+                "v3 open ttl must be positive".into(),
+            ));
+        }
+
+        let _writer = self.write_gate.lock().await;
+        let mut tx = self.begin_write().await?;
+        Self::validate_v3_schema_tx(&mut tx).await?;
+        let recovery_required = Self::workspace_recovery_required_tx(&mut tx, workspace_id).await?;
+        Self::validate_v3_open_view_tx(&mut tx, workspace_id, recovery_required).await?;
+
+        let now = self.sidecar_now_ns()?;
+        let expires_at_ns = now
+            .checked_add(ttl_ns)
+            .ok_or_else(|| WorkspaceError::Backend("v3 open expiry overflow".into()))?;
+        let row = sea_orm::sqlx::query(
+            "SELECT owner_id, generation, expires_at_ns, state, recovery_required,
+                    opened_at_ns, updated_at_ns
+             FROM ws_v3_workspace_open WHERE workspace_id = ?",
+        )
+        .bind(workspace_id.as_bytes().as_slice())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?;
+
+        let mut commit_deadline_ns = expires_at_ns;
+        let token = if let Some(row) = row {
+            let current = Self::decode_open_token(&row, workspace_id)?;
+            if current.expires_at_ns > now && current.owner_id != owner_id {
+                return Err(WorkspaceError::Busy);
+            }
+            let generation = if current.expires_at_ns > now {
+                // A live-owner retry is also a renewal. It must finish before
+                // both the old ownership expiry and the proposed new expiry.
+                commit_deadline_ns = commit_deadline_ns.min(current.expires_at_ns);
+                current.generation
+            } else {
+                current.generation.checked_add(1).ok_or_else(|| {
+                    WorkspaceError::CorruptMetadata("v3 open generation overflow".into())
+                })?
+            };
+            let state = if recovery_required {
+                V3OpenState::Recovering
+            } else {
+                V3OpenState::Ready
+            };
+            sea_orm::sqlx::query(
+                "UPDATE ws_v3_workspace_open
+                 SET owner_id = ?, generation = ?, expires_at_ns = ?, state = ?,
+                     recovery_required = ?, updated_at_ns = ?
+                 WHERE workspace_id = ?",
+            )
+            .bind(&owner_id)
+            .bind(to_i64(generation, "v3 open generation")?)
+            .bind(expires_at_ns)
+            .bind(state as i64)
+            .bind(if recovery_required { 1_i64 } else { 0_i64 })
+            .bind(now)
+            .bind(workspace_id.as_bytes().as_slice())
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+            V3OpenToken {
+                workspace_id,
+                owner_id: owner_id.clone(),
+                generation,
+                expires_at_ns,
+                state,
+                recovery_required,
+            }
+        } else {
+            let state = if recovery_required {
+                V3OpenState::Recovering
+            } else {
+                V3OpenState::Ready
+            };
+            sea_orm::sqlx::query(
+                "INSERT INTO ws_v3_workspace_open
+                 (workspace_id, owner_id, generation, expires_at_ns, state,
+                  recovery_required, opened_at_ns, updated_at_ns)
+                 VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+            )
+            .bind(workspace_id.as_bytes().as_slice())
+            .bind(&owner_id)
+            .bind(expires_at_ns)
+            .bind(state as i64)
+            .bind(if recovery_required { 1_i64 } else { 0_i64 })
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+            V3OpenToken {
+                workspace_id,
+                owner_id: owner_id.clone(),
+                generation: 1,
+                expires_at_ns,
+                state,
+                recovery_required,
+            }
+        };
+        self.commit_sidecar_tx(tx, commit_deadline_ns).await?;
+        Ok(token)
+    }
+
+    /// Mark a v3 open as ready after the caller has completed seal/binding
+    /// recovery.  The check is performed in the same transaction as the state
+    /// transition, so a new incomplete seal cannot be hidden by a stale owner.
+    pub async fn mark_workspace_v3_ready(
+        &self,
+        token: &V3OpenToken,
+    ) -> Result<V3OpenToken, WorkspaceError> {
+        let _writer = self.write_gate.lock().await;
+        let mut tx = self.begin_write().await?;
+        Self::validate_v3_schema_tx(&mut tx).await?;
+        let current = Self::load_open_token_tx(&mut tx, token.workspace_id).await?;
+        Self::check_open_token(&current, token, self.sidecar_now_ns()?)?;
+        if Self::workspace_recovery_required_tx(&mut tx, token.workspace_id).await? {
+            return Err(WorkspaceError::Busy);
+        }
+        Self::validate_v3_open_view_tx(&mut tx, token.workspace_id, false).await?;
+        let now = self.sidecar_now_ns()?;
+        sea_orm::sqlx::query(
+            "UPDATE ws_v3_workspace_open
+             SET state = ?, recovery_required = 0, updated_at_ns = ?
+             WHERE workspace_id = ? AND owner_id = ? AND generation = ?",
+        )
+        .bind(V3OpenState::Ready as i64)
+        .bind(now)
+        .bind(token.workspace_id.as_bytes().as_slice())
+        .bind(&token.owner_id)
+        .bind(to_i64(token.generation, "v3 open generation")?)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let mut ready = current;
+        ready.state = V3OpenState::Ready;
+        ready.recovery_required = false;
+        self.commit_sidecar_tx(tx, ready.expires_at_ns).await?;
+        Ok(ready)
+    }
+
+    /// Extend an open token while preserving the same generation.
+    pub async fn renew_workspace_v3(
+        &self,
+        token: &V3OpenToken,
+        ttl: Duration,
+    ) -> Result<V3OpenToken, WorkspaceError> {
+        let ttl_ns = duration_ns(ttl)?;
+        if ttl_ns <= 0 {
+            return Err(WorkspaceError::CorruptMetadata(
+                "v3 open ttl must be positive".into(),
+            ));
+        }
+        let _writer = self.write_gate.lock().await;
+        let mut tx = self.begin_write().await?;
+        let current = Self::load_open_token_tx(&mut tx, token.workspace_id).await?;
+        let now = self.sidecar_now_ns()?;
+        Self::check_open_token(&current, token, now)?;
+        let expires_at_ns = now
+            .checked_add(ttl_ns)
+            .ok_or_else(|| WorkspaceError::Backend("v3 open expiry overflow".into()))?;
+        let commit_deadline_ns = current.expires_at_ns.min(expires_at_ns);
+        sea_orm::sqlx::query(
+            "UPDATE ws_v3_workspace_open SET expires_at_ns = ?, updated_at_ns = ?
+             WHERE workspace_id = ? AND owner_id = ? AND generation = ?",
+        )
+        .bind(expires_at_ns)
+        .bind(now)
+        .bind(token.workspace_id.as_bytes().as_slice())
+        .bind(&token.owner_id)
+        .bind(to_i64(token.generation, "v3 open generation")?)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let mut renewed = current;
+        renewed.expires_at_ns = expires_at_ns;
+        self.commit_sidecar_tx(tx, commit_deadline_ns).await?;
+        Ok(renewed)
+    }
+
+    /// Release an open token without deleting its generation history.  The
+    /// expiry timestamp is advanced to the current authoritative time so a
+    /// subsequent owner must perform a generation takeover.
+    pub async fn close_workspace_v3(&self, token: &V3OpenToken) -> Result<(), WorkspaceError> {
+        let _writer = self.write_gate.lock().await;
+        let mut tx = self.begin_write().await?;
+        let current = Self::load_open_token_tx(&mut tx, token.workspace_id).await?;
+        Self::check_open_token(&current, token, self.sidecar_now_ns()?)?;
+        let now = self.sidecar_now_ns()?;
+        sea_orm::sqlx::query(
+            "UPDATE ws_v3_workspace_open SET expires_at_ns = ?, updated_at_ns = ?
+             WHERE workspace_id = ? AND owner_id = ? AND generation = ?",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(token.workspace_id.as_bytes().as_slice())
+        .bind(&token.owner_id)
+        .bind(to_i64(token.generation, "v3 open generation")?)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        self.commit_sidecar_tx(tx, current.expires_at_ns).await
+    }
+
+    async fn load_open_token_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        workspace_id: WorkspaceId,
+    ) -> Result<V3OpenToken, WorkspaceError> {
+        let row = sea_orm::sqlx::query(
+            "SELECT owner_id, generation, expires_at_ns, state, recovery_required
+             FROM ws_v3_workspace_open WHERE workspace_id = ?",
+        )
+        .bind(workspace_id.as_bytes().as_slice())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(backend)?
+        .ok_or(WorkspaceError::WorkspaceNotFound(workspace_id))?;
+        Self::decode_open_token(&row, workspace_id)
+    }
+
+    fn decode_open_token(
+        row: &SqliteRow,
+        workspace_id: WorkspaceId,
+    ) -> Result<V3OpenToken, WorkspaceError> {
+        let owner_id: String = row.try_get("owner_id").map_err(backend)?;
+        if owner_id.trim().is_empty() || owner_id.len() > 256 {
+            return Err(WorkspaceError::CorruptMetadata(
+                "persisted v3 open owner id must contain 1..=256 bytes".into(),
+            ));
+        }
+        let generation_raw: i64 = row.try_get("generation").map_err(backend)?;
+        if generation_raw <= 0 {
+            return Err(WorkspaceError::CorruptMetadata(
+                "persisted v3 open generation must be positive".into(),
+            ));
+        }
+        let state_raw: i64 = row.try_get("state").map_err(backend)?;
+        let state = V3OpenState::try_from(state_raw)?;
+        let recovery_raw: i64 = row.try_get("recovery_required").map_err(backend)?;
+        let recovery_required = match recovery_raw {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(WorkspaceError::CorruptMetadata(
+                    "persisted v3 recovery flag must be 0 or 1".into(),
+                ));
+            }
+        };
+        if (state == V3OpenState::Recovering) != recovery_required {
+            return Err(WorkspaceError::CorruptMetadata(
+                "persisted v3 open state/recovery flag disagree".into(),
+            ));
+        }
+        Ok(V3OpenToken {
+            workspace_id,
+            owner_id,
+            generation: generation_raw as u64,
+            expires_at_ns: row.try_get("expires_at_ns").map_err(backend)?,
+            state,
+            recovery_required,
+        })
+    }
+
+    fn check_open_token(
+        current: &V3OpenToken,
+        expected: &V3OpenToken,
+        now: i64,
+    ) -> Result<(), WorkspaceError> {
+        if current.owner_id != expected.owner_id
+            || current.generation != expected.generation
+            || current.expires_at_ns <= now
+        {
+            return Err(WorkspaceError::Fenced);
+        }
+        Ok(())
+    }
+
+    async fn workspace_recovery_required_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        workspace_id: WorkspaceId,
+    ) -> Result<bool, WorkspaceError> {
+        let incomplete: i64 = sea_orm::sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ws_v1_seal_journal
+             WHERE workspace_id = ? AND phase NOT IN (?, ?)",
+        )
+        .bind(workspace_id.as_bytes().as_slice())
+        .bind(SealPhase::Completed.discriminant() as i64)
+        .bind(SealPhase::Aborted.discriminant() as i64)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(backend)?;
+        if incomplete != 0 {
+            return Ok(true);
+        }
+        // Historical binding versions are normal. Only a current pointer
+        // whose target is absent is dangling; the view validator also checks
+        // record decoding and a claimed namespace with no current pointer.
+        let dangling_binding: i64 = sea_orm::sqlx::query_scalar(
+            "SELECT CASE WHEN EXISTS (
+                 SELECT 1 FROM ws_v3_packed_current c
+                 WHERE c.workspace_id = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM ws_v3_packed_bindings b
+                       WHERE b.workspace_id = c.workspace_id
+                         AND b.binding_version = c.binding_version))
+             THEN 1 ELSE 0 END",
+        )
+        .bind(workspace_id.as_bytes().as_slice())
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(backend)?;
+        Ok(dangling_binding != 0)
+    }
+
+    /// Opening never initializes or repairs a catalog. A missing table in an
+    /// already marked volume is corruption, not an empty table to recreate.
+    /// This checks table presence, not complete column/index signatures; it
+    /// provides no schema migration path. Open decodes the fields it consumes.
+    async fn validate_v3_schema_tx(tx: &mut Transaction<'_, Sqlite>) -> Result<(), WorkspaceError> {
+        for table in [
+            "ws_v1_volume_header",
+            "ws_v1_workspaces",
+            "ws_v1_layers",
+            "ws_v1_dentry_delta",
+            "ws_v1_inode_delta",
+            "ws_v1_xattr_delta",
+            "ws_v1_acl_delta",
+            "ws_v1_data_extent_delta",
+            "ws_v1_snapshot_leases",
+            "ws_v1_snapshots",
+            "ws_v1_seal_journal",
+            "ws_v1_allocators",
+            "ws_v3_packed_bindings",
+            "ws_v3_packed_current",
+            "ws_v3_workspace_open",
+        ] {
+            let exists: i64 = sea_orm::sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)",
+            )
+            .bind(table)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(backend)?;
+            if exists == 0 {
+                return Err(WorkspaceError::CorruptMetadata(format!(
+                    "v3 open requires initialized table {table}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_v3_open_view_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        workspace_id: WorkspaceId,
+        recovery_required: bool,
+    ) -> Result<(), WorkspaceError> {
+        let header = sea_orm::sqlx::query(
+            "SELECT volume_format, schema_version, volume_id, created_at_ns
+             FROM ws_v1_volume_header WHERE singleton_id = 1",
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(backend)?
+        .ok_or_else(|| {
+            WorkspaceError::CorruptMetadata("v3 open requires an initialized volume header".into())
+        })?;
+        decode_volume_header(header)?;
+        let workspace = load_workspace_tx(tx, workspace_id).await?;
+        let expected_head_state = match workspace.state {
+            WorkspaceState::Active => LayerState::Writable,
+            WorkspaceState::Sealing if recovery_required => LayerState::Sealing,
+            state => {
+                return Err(WorkspaceError::CorruptMetadata(format!(
+                    "v3 open rejects workspace state {state:?}"
+                )));
+            }
+        };
+        let head = permission_layer_tx(tx, workspace.head_layer_id).await?;
+        if head.state != expected_head_state || head.owner_workspace_id != Some(workspace_id) {
+            return Err(WorkspaceError::CorruptMetadata(
+                "v3 open head state or workspace ownership mismatch".into(),
+            ));
+        }
+        if head.sealed_version.is_some() || head.delta_digest.is_some() || head.root_hash.is_some()
+        {
+            return Err(WorkspaceError::CorruptMetadata(
+                "v3 open mutable head contains sealed revision fields".into(),
+            ));
+        }
+
+        // A journal can temporarily leave the workspace with a Sealing head
+        // or a deeper chain before recovery compacts it. Validate that chain
+        // within this transaction, and require the fixed pair for Ready.
+        let mut validated_head = head.clone();
+        validated_head.state = LayerState::Writable;
+        let mut chain = vec![validated_head];
+        let mut parent = head.parent_layer_id;
+        while let Some(layer_id) = parent {
+            if chain.len() >= crate::workspace_overlay::model::LAYER_CHAIN_HARD_LIMIT as usize {
+                return Err(WorkspaceError::LayerDepthLimit {
+                    depth: chain.len() as u32 + 1,
+                    hard_limit: crate::workspace_overlay::model::LAYER_CHAIN_HARD_LIMIT,
+                });
+            }
+            let layer = permission_layer_tx(tx, layer_id).await?;
+            if layer.owner_workspace_id.is_some() {
+                return Err(WorkspaceError::CorruptMetadata(
+                    "v3 open sealed base has a workspace owner".into(),
+                ));
+            }
+            parent = layer.parent_layer_id;
+            chain.push(layer);
+        }
+        validate_layer_chain(workspace.head_layer_id, &chain)?;
+        if chain.len() < 2 || (!recovery_required && chain.len() != 2) {
+            return Err(WorkspaceError::CorruptMetadata(
+                "v3 open requires a writable head and a flat sealed base before Ready".into(),
+            ));
+        }
+
+        if let Some(record) = packed_binding_current_tx(tx, workspace_id).await? {
+            let base = &chain[1];
+            if !recovery_required
+                && (record.head_layer_id != workspace.head_layer_id
+                    || record.head_epoch != workspace.head_epoch
+                    || record.base_revision.layer_id != base.layer_id
+                    || Some(record.base_revision.sealed_version) != base.sealed_version
+                    || Some(record.base_revision.root_hash) != base.root_hash)
+            {
+                return Err(WorkspaceError::CorruptMetadata(
+                    "v3 open current PWB3 binding disagrees with head/base".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Start a write transaction while holding SQLite's reserved write lock.
@@ -246,9 +888,47 @@ impl SqliteWorkspaceStore {
             .map_err(backend)
     }
 
+    /// 为已有目录增加 `active_lease`，并在同一事务内恢复当前租约指针。
+    async fn migrate_workspace_columns(pool: &SqlitePool) -> Result<(), WorkspaceError> {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(backend)?;
+        let columns = sea_orm::sqlx::query("PRAGMA table_info(ws_v1_workspaces)")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(backend)?;
+        let names = columns
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").map_err(backend))
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_active_lease = names.iter().any(|name| name == "active_lease");
+        if !has_active_lease {
+            sea_orm::sqlx::query("ALTER TABLE ws_v1_workspaces ADD COLUMN active_lease BLOB")
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            // 根据有效可写租约恢复旧目录的租约指针。
+            let now = now_ns()?;
+            sea_orm::sqlx::query(
+                "UPDATE ws_v1_workspaces SET active_lease = (
+                     SELECT l.lease_id FROM ws_v1_snapshot_leases l
+                     WHERE l.workspace_id = ws_v1_workspaces.workspace_id
+                       AND l.writable = 1 AND l.state = ? AND l.expires_at_ns > ?
+                     ORDER BY l.updated_at_ns DESC, l.lease_id DESC
+                     LIMIT 1
+                 )",
+            )
+            .bind(LeaseState::Active.discriminant() as i64)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        }
+        tx.commit().await.map_err(backend)?;
+        Ok(())
+    }
+
     pub async fn schema_table_names(&self) -> Result<Vec<String>, WorkspaceError> {
         let rows = sea_orm::sqlx::query(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'ws_v1_%' ORDER BY name",
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND (name LIKE 'ws_v1_%' OR name LIKE 'ws_v3_%') ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await
@@ -345,6 +1025,352 @@ impl SqliteWorkspaceStore {
 
 #[async_trait]
 impl WorkspaceStore for SqliteWorkspaceStore {
+    async fn load_packed_lower_binding(
+        &self,
+        guard: HeadGuard,
+    ) -> Result<Option<crate::workspace_overlay::catalog::PackedLowerBinding>, WorkspaceError> {
+        Ok(self
+            .load_packed_binding_record(guard)
+            .await?
+            .map(|record| record.binding))
+    }
+
+    async fn load_packed_binding_record(
+        &self,
+        guard: HeadGuard,
+    ) -> Result<Option<PackedLowerBindingRecord>, WorkspaceError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        Self::checked_guard(&mut tx, &guard).await?;
+        let record = packed_binding_current_tx(&mut tx, guard.workspace_id).await?;
+        if let Some(record) = &record {
+            let initial_bytes: Option<Vec<u8>> = sea_orm::sqlx::query_scalar(
+                "SELECT record FROM ws_v3_packed_bindings
+                 WHERE workspace_id = ? AND binding_version = 1",
+            )
+            .bind(guard.workspace_id.as_bytes().as_slice())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?;
+            let initial =
+                PackedLowerBindingRecord::decode(initial_bytes.as_deref().ok_or_else(|| {
+                    WorkspaceError::CorruptMetadata("PWB3 initial history is missing".into())
+                })?)?;
+            if initial.workspace_id != guard.workspace_id || initial.binding.binding_version != 1 {
+                return Err(WorkspaceError::CorruptMetadata(
+                    "PWB3 initial history key/record disagree".into(),
+                ));
+            }
+            let head = permission_layer_tx(&mut tx, guard.expected_head_layer_id).await?;
+            let base_id = head.parent_layer_id.ok_or(WorkspaceError::Fenced)?;
+            let base = permission_layer_tx(&mut tx, base_id).await?;
+            record.validate_for_guard(&guard, &base)?;
+        }
+        Self::checked_guard(&mut tx, &guard).await?;
+        tx.commit().await.map_err(backend)?;
+        Ok(record)
+    }
+
+    async fn load_packed_binding_version(
+        &self,
+        workspace_id: WorkspaceId,
+        version: u64,
+    ) -> Result<Option<PackedLowerBindingRecord>, WorkspaceError> {
+        let bytes: Option<Vec<u8>> = sea_orm::sqlx::query_scalar("SELECT record FROM ws_v3_packed_bindings WHERE workspace_id = ? AND binding_version = ?")
+            .bind(workspace_id.as_bytes().as_slice()).bind(to_i64(version, "packed binding version")?)
+            .fetch_optional(&self.pool).await.map_err(backend)?;
+        let record = bytes
+            .as_deref()
+            .map(PackedLowerBindingRecord::decode)
+            .transpose()?;
+        if record.as_ref().is_some_and(|record| {
+            record.workspace_id != workspace_id || record.binding.binding_version != version
+        }) {
+            return Err(WorkspaceError::CorruptMetadata(
+                "PWB3 history key/record disagree".into(),
+            ));
+        }
+        Ok(record)
+    }
+
+    async fn install_packed_lower_binding(
+        &self,
+        request: InstallPackedLowerBinding,
+    ) -> Result<PackedLowerBindingRecord, WorkspaceError> {
+        let record = request.record()?;
+        let bytes = record.encode()?;
+        let _writer = self.write_gate.lock().await;
+        let mut tx = self.begin_write().await?;
+        Self::checked_guard(&mut tx, &request.guard).await?;
+        for expected in &request.expected_layers {
+            if permission_layer_tx(&mut tx, expected.layer_id).await? != *expected {
+                return Err(WorkspaceError::Busy);
+            }
+        }
+        if load_revision_tx(&mut tx, request.expected_base.layer_id).await? != request.expected_base
+        {
+            return Err(WorkspaceError::Busy);
+        }
+        if packed_binding_current_tx(&mut tx, request.guard.workspace_id).await?
+            != request.expected_binding
+        {
+            return Err(WorkspaceError::Busy);
+        }
+        let root =
+            sea_orm::sqlx::query("SELECT * FROM ws_v1_inode_delta WHERE layer_id = ? AND ino = 1")
+                .bind(request.expected_base.layer_id.as_bytes().as_slice())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?
+                .ok_or_else(|| {
+                    WorkspaceError::CorruptMetadata("initial native base root missing".into())
+                })?;
+        request.validate_native_root(&decode_inode(&root)?)?;
+        let allocator: Option<i64> = sea_orm::sqlx::query_scalar(
+            "SELECT next_value FROM ws_v1_allocators WHERE name = 'inode'",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?;
+        if allocator != Some(2) {
+            return Err(WorkspaceError::UnsupportedCapability(
+                "first packed binding requires unissued native inode IDs",
+            ));
+        }
+        sea_orm::sqlx::query("INSERT INTO ws_v3_packed_bindings(workspace_id, binding_version, record) VALUES (?, ?, ?)")
+            .bind(record.workspace_id.as_bytes().as_slice()).bind(to_i64(record.binding.binding_version, "packed binding version")?).bind(bytes)
+            .execute(&mut *tx).await.map_err(backend)?;
+        sea_orm::sqlx::query(
+            "INSERT INTO ws_v3_packed_current(workspace_id, binding_version) VALUES (?, ?)",
+        )
+        .bind(record.workspace_id.as_bytes().as_slice())
+        .bind(to_i64(
+            record.binding.binding_version,
+            "packed binding version",
+        )?)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let changed = sea_orm::sqlx::query("UPDATE ws_v1_workspaces SET head_epoch = ?, updated_at_ns = ? WHERE workspace_id = ? AND head_layer_id = ? AND head_epoch = ?")
+            .bind(to_i64(record.head_epoch, "packed binding head epoch")?).bind(now_ns()?)
+            .bind(record.workspace_id.as_bytes().as_slice()).bind(record.head_layer_id.as_bytes().as_slice()).bind(to_i64(request.guard.expected_head_epoch, "old head epoch")?)
+            .execute(&mut *tx).await.map_err(backend)?;
+        if changed.rows_affected() != 1 {
+            return Err(WorkspaceError::Fenced);
+        }
+        Self::allocate_sequences(&mut tx, record.head_layer_id, 1).await?;
+        let reserved = sea_orm::sqlx::query(
+            "UPDATE ws_v1_allocators SET next_value = ? WHERE name = 'inode' AND next_value = 2",
+        )
+        .bind(
+            record
+                .highest_inode
+                .checked_add(1)
+                .ok_or_else(|| {
+                    WorkspaceError::CorruptMetadata("packed inode floor overflow".into())
+                })?
+                .max(2),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        if reserved.rows_affected() != 1 {
+            return Err(WorkspaceError::Fenced);
+        }
+        let new_guard = HeadGuard {
+            expected_head_epoch: record.head_epoch,
+            ..request.guard
+        };
+        // Recheck expiry after staging every change. Failure rolls back binding,
+        // epoch, sequence and allocator together; no lease is reacquired.
+        Self::checked_guard(&mut tx, &new_guard).await?;
+        #[cfg(test)]
+        if self.failpoint.load(Ordering::SeqCst) == StoreFailpoint::BeforeCommit as u8 {
+            return Err(WorkspaceError::Backend(
+                "injected failure before packed binding commit".into(),
+            ));
+        }
+        tx.commit().await.map_err(backend)?;
+        Ok(record)
+    }
+
+    async fn publish_packed_lower_binding(
+        &self,
+        request: PublishPackedLowerBinding,
+    ) -> Result<PackedLowerBindingRecord, WorkspaceError> {
+        let record = request.record()?;
+        let bytes = record.encode()?;
+        let _writer = self.write_gate.lock().await;
+        let mut tx = self.begin_write().await?;
+        let current = packed_binding_current_tx(&mut tx, request.guard.workspace_id).await?;
+        if current.as_ref() == Some(&record) {
+            let target_guard = HeadGuard {
+                expected_head_epoch: record.head_epoch,
+                ..request.guard.clone()
+            };
+            Self::checked_guard(&mut tx, &target_guard).await?;
+            let previous_bytes: Option<Vec<u8>> = sea_orm::sqlx::query_scalar(
+                "SELECT record FROM ws_v3_packed_bindings
+                 WHERE workspace_id = ? AND binding_version = ?",
+            )
+            .bind(request.guard.workspace_id.as_bytes().as_slice())
+            .bind(to_i64(
+                request.expected_binding.binding.binding_version,
+                "previous packed binding version",
+            )?)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?;
+            let previous =
+                PackedLowerBindingRecord::decode(previous_bytes.as_deref().ok_or_else(|| {
+                    WorkspaceError::CorruptMetadata("PWB3 predecessor history is missing".into())
+                })?)?;
+            if previous != request.expected_binding {
+                return Err(WorkspaceError::Busy);
+            }
+            let committed_layers = [
+                permission_layer_tx(&mut tx, request.expected_layers[0].layer_id).await?,
+                permission_layer_tx(&mut tx, request.expected_layers[1].layer_id).await?,
+            ];
+            let base_revision = load_revision_tx(&mut tx, request.expected_base.layer_id).await?;
+            let next_inode: Option<i64> = sea_orm::sqlx::query_scalar(
+                "SELECT next_value FROM ws_v1_allocators WHERE name = 'inode'",
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?;
+            let next_inode = next_inode.ok_or_else(|| {
+                WorkspaceError::CorruptMetadata(
+                    "inode allocator is missing during publication retry".into(),
+                )
+            })?;
+            let target_guard = request.validate_committed_state(
+                &record,
+                &committed_layers,
+                &base_revision,
+                next_inode,
+            )?;
+            // A matching history row is insufficient after head rotation,
+            // mutation, lease expiry or holder replacement. Validate the
+            // publication's exact target epoch without weakening fencing.
+            Self::checked_guard(&mut tx, &target_guard).await?;
+            tx.commit().await.map_err(backend)?;
+            return Ok(record);
+        }
+        Self::checked_guard(&mut tx, &request.guard).await?;
+        for expected in &request.expected_layers {
+            if permission_layer_tx(&mut tx, expected.layer_id).await? != *expected {
+                return Err(WorkspaceError::Busy);
+            }
+        }
+        if load_revision_tx(&mut tx, request.expected_base.layer_id).await? != request.expected_base
+        {
+            return Err(WorkspaceError::Busy);
+        }
+        if current.as_ref() != Some(&request.expected_binding) {
+            return Err(WorkspaceError::Busy);
+        }
+        let old_version = to_i64(
+            request.expected_binding.binding.binding_version,
+            "packed binding version",
+        )?;
+        sea_orm::sqlx::query(
+            "INSERT INTO ws_v3_packed_bindings(workspace_id, binding_version, record)
+             VALUES (?, ?, ?)",
+        )
+        .bind(record.workspace_id.as_bytes().as_slice())
+        .bind(to_i64(
+            record.binding.binding_version,
+            "packed binding version",
+        )?)
+        .bind(bytes)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let current_changed = sea_orm::sqlx::query(
+            "UPDATE ws_v3_packed_current
+             SET binding_version = ?
+             WHERE workspace_id = ? AND binding_version = ?",
+        )
+        .bind(to_i64(
+            record.binding.binding_version,
+            "packed binding version",
+        )?)
+        .bind(record.workspace_id.as_bytes().as_slice())
+        .bind(old_version)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        if current_changed.rows_affected() != 1 {
+            return Err(WorkspaceError::Fenced);
+        }
+        let changed = sea_orm::sqlx::query(
+            "UPDATE ws_v1_workspaces
+             SET head_epoch = ?, updated_at_ns = ?
+             WHERE workspace_id = ? AND head_layer_id = ? AND head_epoch = ?",
+        )
+        .bind(to_i64(record.head_epoch, "packed binding head epoch")?)
+        .bind(now_ns()?)
+        .bind(record.workspace_id.as_bytes().as_slice())
+        .bind(record.head_layer_id.as_bytes().as_slice())
+        .bind(to_i64(request.guard.expected_head_epoch, "old head epoch")?)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        if changed.rows_affected() != 1 {
+            return Err(WorkspaceError::Fenced);
+        }
+        Self::allocate_sequences(&mut tx, record.head_layer_id, 1).await?;
+
+        let floor = record
+            .highest_inode
+            .checked_add(1)
+            .ok_or_else(|| WorkspaceError::CorruptMetadata("packed inode floor overflow".into()))?
+            .max(2);
+        let allocator: Option<i64> = sea_orm::sqlx::query_scalar(
+            "SELECT next_value FROM ws_v1_allocators WHERE name = 'inode'",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let allocator = allocator.ok_or_else(|| {
+            WorkspaceError::CorruptMetadata("inode allocator is missing during publication".into())
+        })?;
+        request.validate_first_publication_allocator(allocator)?;
+        if allocator < floor {
+            let reserved = sea_orm::sqlx::query(
+                "UPDATE ws_v1_allocators SET next_value = ?
+                 WHERE name = 'inode' AND next_value = ?",
+            )
+            .bind(floor)
+            .bind(allocator)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+            if reserved.rows_affected() != 1 {
+                return Err(WorkspaceError::Fenced);
+            }
+        }
+        let new_guard = HeadGuard {
+            expected_head_epoch: record.head_epoch,
+            ..request.guard
+        };
+        Self::checked_guard(&mut tx, &new_guard).await?;
+        #[cfg(test)]
+        if self.failpoint.load(Ordering::SeqCst) == StoreFailpoint::BeforeCommit as u8 {
+            return Err(WorkspaceError::Backend(
+                "injected failure before packed binding publication commit".into(),
+            ));
+        }
+        tx.commit().await.map_err(backend)?;
+        #[cfg(test)]
+        if self.failpoint.load(Ordering::SeqCst) == StoreFailpoint::AfterPublicationCommit as u8 {
+            return Err(WorkspaceError::Backend(
+                "injected response loss after packed binding publication commit".into(),
+            ));
+        }
+        Ok(record)
+    }
+
     fn name(&self) -> &'static str {
         "workspace-sqlite"
     }
@@ -365,10 +1391,24 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             .execute(&self.pool)
             .await
             .map_err(backend)?;
+        Self::migrate_workspace_columns(&self.pool).await?;
         Ok(())
     }
 
     async fn load_volume_header(&self) -> Result<Option<VolumeHeader>, WorkspaceError> {
+        // init-volume probes the header before migration so an existing
+        // catalog is never implicitly upgraded. A new SQL catalog has no
+        // tables yet and must report the same absence as an empty KV store.
+        let exists: i64 = sea_orm::sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'ws_v1_volume_header'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(backend)?;
+        if exists == 0 {
+            return Ok(None);
+        }
         let row = sea_orm::sqlx::query(
             "SELECT volume_format, schema_version, volume_id, created_at_ns
              FROM ws_v1_volume_header WHERE singleton_id = 1",
@@ -383,7 +1423,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         let row = sea_orm::sqlx::query(
             "SELECT workspace_id, head_layer_id, head_epoch,
                     fork_base_layer_id, fork_base_version, fork_base_root_hash,
-                    owner_id, state, created_at_ns, updated_at_ns
+                    owner_id, state, active_lease, created_at_ns, updated_at_ns
              FROM ws_v1_workspaces WHERE workspace_id = ?",
         )
         .bind(id.as_bytes().as_slice())
@@ -603,6 +1643,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             }),
             owner_id: request.owner_id,
             state: WorkspaceState::Active,
+            active_lease: None,
             created_at_ns: now,
             updated_at_ns: now,
         })
@@ -695,6 +1736,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             fork_base: Some(request.base_revision),
             owner_id: request.owner_id,
             state: WorkspaceState::Active,
+            active_lease: None,
             created_at_ns: now,
             updated_at_ns: now,
         })
@@ -704,7 +1746,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         let rows = sea_orm::sqlx::query(
             "SELECT workspace_id, head_layer_id, head_epoch,
                     fork_base_layer_id, fork_base_version, fork_base_root_hash,
-                    owner_id, state, created_at_ns, updated_at_ns
+                    owner_id, state, active_lease, created_at_ns, updated_at_ns
              FROM ws_v1_workspaces ORDER BY created_at_ns, workspace_id",
         )
         .fetch_all(&self.pool)
@@ -811,8 +1853,8 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         let _guard = self.write_gate.lock().await;
         let mut tx = self.begin_write().await?;
         let row = sea_orm::sqlx::query(
-            "SELECT w.state AS workspace_state, l.parent_layer_id,
-                    p.sealed_version, p.root_hash
+            "SELECT w.state AS workspace_state, w.active_lease,
+                    l.parent_layer_id, p.sealed_version, p.root_hash
              FROM ws_v1_workspaces w
              JOIN ws_v1_layers l ON l.layer_id = w.head_layer_id
              JOIN ws_v1_layers p ON p.layer_id = l.parent_layer_id
@@ -847,6 +1889,52 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             )?,
         };
         let now = now_ns()?;
+        if let Some(existing) = row
+            .try_get::<Option<Vec<u8>>, _>("active_lease")
+            .map_err(backend)?
+            .map(|bytes| uuid_from_blob(bytes, "workspace active lease").map(LeaseId::from_uuid))
+            .transpose()?
+        {
+            let still_active = sea_orm::sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM ws_v1_snapshot_leases
+                 WHERE lease_id = ? AND workspace_id = ? AND writable = 1
+                   AND state = ? AND expires_at_ns > ?",
+            )
+            .bind(existing.as_bytes().as_slice())
+            .bind(request.workspace_id.as_bytes().as_slice())
+            .bind(LeaseState::Active.discriminant() as i64)
+            .bind(now)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(backend)?;
+            if still_active != 0 {
+                return Err(WorkspaceError::Busy);
+            }
+            // 清除已经失效的租约指针，允许重新获取租约。
+            sea_orm::sqlx::query(
+                "UPDATE ws_v1_snapshot_leases SET state = ?, updated_at_ns = ?
+                 WHERE lease_id = ? AND workspace_id = ? AND state = ? AND expires_at_ns <= ?",
+            )
+            .bind(LeaseState::Expired.discriminant() as i64)
+            .bind(now)
+            .bind(existing.as_bytes().as_slice())
+            .bind(request.workspace_id.as_bytes().as_slice())
+            .bind(LeaseState::Active.discriminant() as i64)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+            sea_orm::sqlx::query(
+                "UPDATE ws_v1_workspaces SET active_lease = NULL, updated_at_ns = ?
+                 WHERE workspace_id = ? AND active_lease = ?",
+            )
+            .bind(now)
+            .bind(request.workspace_id.as_bytes().as_slice())
+            .bind(existing.as_bytes().as_slice())
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        }
         sea_orm::sqlx::query(
             "UPDATE ws_v1_snapshot_leases SET state = ?, updated_at_ns = ?
              WHERE workspace_id = ? AND state = ? AND expires_at_ns <= ?",
@@ -885,6 +1973,20 @@ impl WorkspaceStore for SqliteWorkspaceStore {
                 return Err(WorkspaceError::Busy);
             }
             return Err(backend(error));
+        }
+        let pointed = sea_orm::sqlx::query(
+            "UPDATE ws_v1_workspaces SET active_lease = ?, updated_at_ns = ?
+             WHERE workspace_id = ? AND state = ? AND active_lease IS NULL",
+        )
+        .bind(request.lease_id.as_bytes().as_slice())
+        .bind(now)
+        .bind(request.workspace_id.as_bytes().as_slice())
+        .bind(WorkspaceState::Active.discriminant() as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        if pointed.rows_affected() != 1 {
+            return Err(WorkspaceError::Busy);
         }
         tx.commit().await.map_err(backend)?;
         Ok(SnapshotLease {
@@ -938,6 +2040,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
 
     async fn release_lease(&self, request: ReleaseLease) -> Result<(), WorkspaceError> {
         let _guard = self.write_gate.lock().await;
+        let mut tx = self.begin_write().await?;
         let now = now_ns()?;
         let updated = sea_orm::sqlx::query(
             "UPDATE ws_v1_snapshot_leases SET state = ?, updated_at_ns = ?
@@ -948,18 +2051,42 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         .bind(request.lease_id.as_bytes().as_slice())
         .bind(to_i64(request.holder_generation, "holder generation")?)
         .bind(LeaseState::Active.discriminant() as i64)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(backend)?;
         if updated.rows_affected() != 1 {
             return Err(WorkspaceError::Fenced);
         }
+        sea_orm::sqlx::query(
+            "UPDATE ws_v1_workspaces SET active_lease = NULL, updated_at_ns = ?
+             WHERE active_lease = ?",
+        )
+        .bind(now)
+        .bind(request.lease_id.as_bytes().as_slice())
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
         Ok(())
     }
 
     async fn reap_expired_leases(&self) -> Result<u64, WorkspaceError> {
         let _guard = self.write_gate.lock().await;
+        let mut tx = self.begin_write().await?;
         let now = now_ns()?;
+        sea_orm::sqlx::query(
+            "UPDATE ws_v1_workspaces SET active_lease = NULL, updated_at_ns = ?
+             WHERE active_lease IN (
+                 SELECT lease_id FROM ws_v1_snapshot_leases
+                 WHERE state = ? AND expires_at_ns <= ?
+             )",
+        )
+        .bind(now)
+        .bind(LeaseState::Active.discriminant() as i64)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
         let updated = sea_orm::sqlx::query(
             "UPDATE ws_v1_snapshot_leases SET state = ?, updated_at_ns = ?
              WHERE state = ? AND expires_at_ns <= ?",
@@ -968,10 +2095,69 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         .bind(now)
         .bind(LeaseState::Active.discriminant() as i64)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
         Ok(updated.rows_affected())
+    }
+
+    async fn prune_terminal_records(
+        &self,
+        now_ns: i64,
+        grace_ns: u64,
+    ) -> Result<(), WorkspaceError> {
+        let cutoff = now_ns.saturating_sub(to_i64(grace_ns, "terminal record grace")?);
+        let _guard = self.write_gate.lock().await;
+        let mut tx = self.begin_write().await?;
+        sea_orm::sqlx::query(
+            "DELETE FROM ws_v1_snapshot_leases
+             WHERE state IN (?, ?) AND updated_at_ns <= ?",
+        )
+        .bind(LeaseState::Released.discriminant() as i64)
+        .bind(LeaseState::Expired.discriminant() as i64)
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        sea_orm::sqlx::query(
+            "DELETE FROM ws_v1_seal_journal
+             WHERE phase IN (?, ?) AND updated_at_ns <= ?
+               AND journal_id NOT IN (
+                   SELECT journal_id FROM (
+                       SELECT journal_id,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY workspace_id
+                                  ORDER BY updated_at_ns DESC, journal_id DESC
+                              ) AS rank
+                       FROM ws_v1_seal_journal
+                       WHERE phase IN (?, ?)
+                   ) WHERE rank = 1
+               )",
+        )
+        .bind(SealPhase::Completed.discriminant() as i64)
+        .bind(SealPhase::Aborted.discriminant() as i64)
+        .bind(cutoff)
+        .bind(SealPhase::Completed.discriminant() as i64)
+        .bind(SealPhase::Aborted.discriminant() as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        sea_orm::sqlx::query(
+            "UPDATE ws_v1_workspaces SET active_lease = NULL
+             WHERE active_lease IS NOT NULL
+               AND active_lease NOT IN (
+                   SELECT lease_id FROM ws_v1_snapshot_leases
+                   WHERE state = ? AND expires_at_ns > ?
+               )",
+        )
+        .bind(LeaseState::Active.discriminant() as i64)
+        .bind(now_ns)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(())
     }
 
     async fn list_leases(
@@ -1051,6 +2237,259 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             .map_err(backend)?
             {
                 rows.push(decode_inode(&row)?);
+            }
+        }
+        Ok(rows)
+    }
+
+    fn supports_versioned_permissions(&self) -> bool {
+        true
+    }
+
+    async fn read_permission_snapshot(
+        &self,
+        request: PermissionSnapshotQuery,
+    ) -> Result<PermissionSnapshot, WorkspaceError> {
+        use crate::meta::posix_acl::{ACCESS_XATTR, DEFAULT_XATTR};
+        if request.inodes.is_empty()
+            || request.inodes.len() > 2
+            || request.inodes.iter().any(|ino| *ino <= 0)
+            || (request.inodes.len() == 2 && request.inodes[0] == request.inodes[1])
+            || request.layer_ids[0] == request.layer_ids[1]
+        {
+            return Err(WorkspaceError::CorruptMetadata(
+                "invalid bounded permission query".into(),
+            ));
+        }
+        if let Some((parent, name)) = &request.dentry {
+            DentryDelta::put(request.layer_ids[0], *parent, name.clone(), 1, 0, 0).validate()?;
+        }
+        // One SQLite snapshot spans every row, including absent ACL/dentry
+        // rows. Independent readers cannot combine mode and ACL commits.
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let head = permission_layer_tx(&mut tx, request.layer_ids[0]).await?;
+        let base = permission_layer_tx(&mut tx, request.layer_ids[1]).await?;
+        let mut snapshot = PermissionSnapshot {
+            layers: [head, base],
+            inodes: Vec::new(),
+            xattrs: Vec::new(),
+            dentries: Vec::new(),
+        };
+        validate_layer_chain(request.layer_ids[0], &snapshot.layers)?;
+        if snapshot.layers[0].state != LayerState::Writable
+            || snapshot.layers[0].depth != 2
+            || snapshot.layers[0].parent_layer_id != Some(request.layer_ids[1])
+            || snapshot.layers[1].state != LayerState::Sealed
+            || snapshot.layers[1].depth != 1
+            || snapshot.layers[1].parent_layer_id.is_some()
+        {
+            return Err(WorkspaceError::Fenced);
+        }
+        for ino in request.inodes {
+            for layer in request.layer_ids {
+                if let Some(row) = sea_orm::sqlx::query(
+                    "SELECT layer_id, ino, state, kind, size, mode, uid, gid, rdev, nlink,
+                            atime_ns, mtime_ns, ctime_ns, symlink_target, parent_hint, data_version, sequence
+                     FROM ws_v1_inode_delta WHERE layer_id = ? AND ino = ?")
+                    .bind(layer.as_bytes().as_slice()).bind(ino).fetch_optional(&mut *tx).await.map_err(backend)? {
+                    snapshot.inodes.push(decode_inode(&row)?);
+                }
+                for name in [ACCESS_XATTR, DEFAULT_XATTR, b"system.brewfs.acl".as_slice()] {
+                    if let Some(row) = sea_orm::sqlx::query(
+                        "SELECT layer_id, ino, name, op, value, sequence FROM ws_v1_xattr_delta
+                         WHERE layer_id = ? AND ino = ? AND name = ?",
+                    )
+                    .bind(layer.as_bytes().as_slice())
+                    .bind(ino)
+                    .bind(name)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(backend)?
+                    {
+                        snapshot.xattrs.push(decode_xattr(&row)?);
+                    }
+                }
+            }
+        }
+        if let Some((parent, name)) = request.dentry {
+            for layer in request.layer_ids {
+                if let Some(row) = sea_orm::sqlx::query(
+                    "SELECT layer_id, parent_ino, name, op, ino, entry_type, sequence
+                     FROM ws_v1_dentry_delta WHERE layer_id = ? AND parent_ino = ? AND name = ?",
+                )
+                .bind(layer.as_bytes().as_slice())
+                .bind(parent)
+                .bind(&name)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?
+                {
+                    snapshot.dentries.push(decode_dentry(row)?);
+                }
+            }
+        }
+        tx.commit().await.map_err(backend)?;
+        Ok(snapshot)
+    }
+
+    async fn apply_permission_mutation(
+        &self,
+        request: PermissionMutation,
+    ) -> Result<MutationResult, WorkspaceError> {
+        self.apply_versioned_mutation(VersionedMutation {
+            guard: request.guard,
+            expected_layers: request.expected_layers,
+            dentries: request.dentries,
+            inodes: request.inodes,
+            xattrs: request.xattrs,
+            acls: Vec::new(),
+            extents: Vec::new(),
+            chunk_size: 1,
+        })
+        .await
+    }
+
+    async fn apply_versioned_mutation(
+        &self,
+        request: VersionedMutation,
+    ) -> Result<MutationResult, WorkspaceError> {
+        let count = request.validate()?;
+        let _local_gate = self.write_gate.lock().await;
+        let mut tx = self.begin_write().await?;
+        Self::checked_guard(&mut tx, &request.guard).await?;
+        let head = request.guard.expected_head_layer_id;
+        for expected in &request.expected_layers {
+            if permission_layer_tx(&mut tx, expected.layer_id).await? != *expected {
+                return Err(WorkspaceError::Busy);
+            }
+        }
+        let Some((first, last)) = Self::allocate_sequences(&mut tx, head, count).await? else {
+            tx.commit().await.map_err(backend)?;
+            return Ok(MutationResult {
+                first_sequence: None,
+                last_sequence: None,
+            });
+        };
+        let mut sequence = first;
+        for mut row in request.dentries {
+            row.sequence = sequence;
+            sequence += 1;
+            upsert_dentry(&mut tx, &row).await?;
+        }
+        for mut row in request.xattrs {
+            row.sequence = sequence;
+            sequence += 1;
+            upsert_xattr(&mut tx, &row).await?;
+        }
+        for mut row in request.acls {
+            row.sequence = sequence;
+            sequence += 1;
+            upsert_acl(&mut tx, &row).await?;
+        }
+        for mut row in request.inodes {
+            row.sequence = sequence;
+            sequence += 1;
+            upsert_inode(&mut tx, &row).await?;
+        }
+        let mut owned_count = 0u64;
+        let mut owned_bytes = 0u64;
+        for mut row in request.extents {
+            row.sequence = sequence;
+            sequence += 1;
+            if matches!(row.kind, ExtentKind::Data { .. }) {
+                owned_count = owned_count
+                    .checked_add(1)
+                    .ok_or_else(|| WorkspaceError::Backend("owned count overflows".into()))?;
+                owned_bytes = owned_bytes
+                    .checked_add(row.length)
+                    .ok_or_else(|| WorkspaceError::Backend("owned bytes overflow".into()))?;
+            }
+            insert_extent(&mut tx, &row).await?;
+        }
+        if owned_count > 0 {
+            sea_orm::sqlx::query("UPDATE ws_v1_layers SET owned_slice_count = owned_slice_count + ?, owned_bytes = owned_bytes + ? WHERE layer_id = ?")
+                .bind(to_i64(owned_count, "owned count")?).bind(to_i64(owned_bytes, "owned bytes")?)
+                .bind(head.as_bytes().as_slice()).execute(&mut *tx).await.map_err(backend)?;
+        }
+        #[cfg(test)]
+        if self.failpoint.load(Ordering::SeqCst) == StoreFailpoint::BeforeCommit as u8 {
+            return Err(WorkspaceError::Backend(
+                "injected failure before transaction commit".into(),
+            ));
+        }
+        tx.commit().await.map_err(backend)?;
+        Ok(MutationResult {
+            first_sequence: Some(first),
+            last_sequence: Some(last),
+        })
+    }
+
+    async fn validate_read_fence(
+        &self,
+        guard: HeadGuard,
+        expected_layers: [LayerRecord; 2],
+    ) -> Result<(), WorkspaceError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        Self::checked_guard(&mut tx, &guard).await?;
+        for expected in &expected_layers {
+            if permission_layer_tx(&mut tx, expected.layer_id).await? != *expected {
+                return Err(WorkspaceError::Busy);
+            }
+        }
+        tx.commit().await.map_err(backend)
+    }
+
+    async fn get_extent_deltas_bounded(
+        &self,
+        request: ExtentQuery,
+        max_rows: usize,
+    ) -> Result<Vec<DataExtentDelta>, WorkspaceError> {
+        if max_rows == 0 || max_rows > 1024 || request.layer_ids.len() != 2 {
+            return Err(WorkspaceError::InvalidReadPlan(
+                "invalid bounded extent query".into(),
+            ));
+        }
+        if request.range_start > request.range_end {
+            return Err(WorkspaceError::InvalidReadPlan(
+                "extent query starts after its end".into(),
+            ));
+        }
+        if request.range_start == request.range_end {
+            return Ok(Vec::new());
+        }
+        let chunk_index = to_i64(request.chunk_index, "chunk index")?;
+        let range_start = to_i64(request.range_start, "range start")?;
+        let range_end = to_i64(request.range_end, "range end")?;
+        let mut rows = Vec::with_capacity(max_rows);
+        for layer_id in request.layer_ids {
+            // Fetch at most remaining+1 fixed-width rows to detect overflow.
+            // The sentinel is charged by the caller before this query.
+            let limit = i64::try_from(max_rows - rows.len() + 1)
+                .map_err(|_| WorkspaceError::InvalidReadPlan("extent limit overflows".into()))?;
+            let found = sea_orm::sqlx::query(
+                "SELECT layer_id, ino, chunk_index, logical_offset, length, kind,
+                        slice_id, slice_offset, sequence
+                 FROM ws_v1_data_extent_delta
+                 WHERE layer_id = ? AND ino = ? AND chunk_index = ?
+                   AND logical_offset < ? AND logical_offset + length > ?
+                 ORDER BY sequence DESC LIMIT ?",
+            )
+            .bind(layer_id.as_bytes().as_slice())
+            .bind(request.ino)
+            .bind(chunk_index)
+            .bind(range_end)
+            .bind(range_start)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(backend)?;
+            if found.len() > max_rows - rows.len() {
+                return Err(WorkspaceError::InvalidReadPlan(
+                    "upper extent row limit exceeded".into(),
+                ));
+            }
+            for row in &found {
+                rows.push(decode_extent(row)?);
             }
         }
         Ok(rows)
@@ -1833,6 +3272,24 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         rows.iter().map(decode_seal_journal).collect()
     }
 
+    async fn list_seal_journals(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<SealJournal>, WorkspaceError> {
+        let rows = sea_orm::sqlx::query(
+            "SELECT journal_id, workspace_id, old_head_layer_id, expected_head_epoch,
+                    phase, pending_bytes, delta_digest, root_hash, new_head_layer_id,
+                    last_error, created_at_ns, updated_at_ns
+             FROM ws_v1_seal_journal WHERE workspace_id = ?
+             ORDER BY created_at_ns, journal_id",
+        )
+        .bind(workspace_id.as_bytes().as_slice())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter().map(decode_seal_journal).collect()
+    }
+
     async fn fast_forward_commit(
         &self,
         request: FastForwardCommit,
@@ -1990,7 +3447,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             .map_err(backend)?;
         }
         let row = sea_orm::sqlx::query(
-            "UPDATE ws_v1_workspaces SET state = ?, updated_at_ns = ?
+            "UPDATE ws_v1_workspaces SET state = ?, active_lease = NULL, updated_at_ns = ?
              WHERE workspace_id = ? AND state = ? RETURNING head_layer_id",
         )
         .bind(WorkspaceState::Deleting.discriminant() as i64)
@@ -2082,10 +3539,11 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         }
         let lease_roots = sea_orm::sqlx::query(
             "SELECT base_layer_id FROM ws_v1_snapshot_leases
-             WHERE state IN (?, ?) AND expires_at_ns > ?",
+             WHERE state IN (?, ?, ?) AND expires_at_ns > ?",
         )
         .bind(LeaseState::Active.discriminant() as i64)
         .bind(LeaseState::Releasing.discriminant() as i64)
+        .bind(LeaseState::Expired.discriminant() as i64)
         .bind(lease_cutoff)
         .fetch_all(&self.pool)
         .await
@@ -2129,6 +3587,20 @@ impl WorkspaceStore for SqliteWorkspaceStore {
                     "journal new-head GC root",
                 )?));
             }
+        }
+        // PWB3 binding history is an independent catalog root. A workspace
+        // can enter Deleting before its binding records are retired; dropping
+        // the native base/head here would leave a durable binding dangling.
+        let packed_bindings = sea_orm::sqlx::query("SELECT record FROM ws_v3_packed_bindings")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(backend)?;
+        for row in packed_bindings {
+            let record = PackedLowerBindingRecord::decode(
+                &row.try_get::<Vec<u8>, _>("record").map_err(backend)?,
+            )?;
+            roots.insert(record.base_revision.layer_id);
+            roots.insert(record.head_layer_id);
         }
         let layer_rows = sea_orm::sqlx::query(
             "SELECT layer_id, parent_layer_id, state, schema_version, sealed_version,
@@ -2187,13 +3659,62 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         let lease_cutoff = request
             .now_ns
             .saturating_sub(to_i64(request.lease_grace_ns, "lease grace")?);
+        // PWB3 binding history is an independent catalog root. The regular
+        // workspace/snapshot/lease/journal roots below are not sufficient
+        // after a workspace enters Deleting: a binding can still reference
+        // its sealed base and writable head. Read and authenticate every
+        // persisted history record inside this same transaction so the
+        // destructive recheck cannot race a stale gc_snapshot result.
+        let packed_binding_rows = sea_orm::sqlx::query("SELECT record FROM ws_v3_packed_bindings")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(backend)?;
+        let mut packed_binding_roots = BTreeSet::new();
+        for row in packed_binding_rows {
+            let record = PackedLowerBindingRecord::decode(
+                &row.try_get::<Vec<u8>, _>("record").map_err(backend)?,
+            )?;
+            packed_binding_roots.insert(record.base_revision.layer_id);
+            packed_binding_roots.insert(record.head_layer_id);
+        }
+        let layer_rows = sea_orm::sqlx::query("SELECT layer_id, parent_layer_id FROM ws_v1_layers")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(backend)?;
+        let mut layer_parents = BTreeMap::new();
+        for row in layer_rows {
+            let layer_id = LayerId::from_uuid(uuid_from_blob(
+                row.try_get::<Vec<u8>, _>("layer_id").map_err(backend)?,
+                "packed binding layer root",
+            )?);
+            let parent = row
+                .try_get::<Option<Vec<u8>>, _>("parent_layer_id")
+                .map_err(backend)?
+                .map(|bytes| uuid_from_blob(bytes, "packed binding parent"))
+                .transpose()?
+                .map(LayerId::from_uuid);
+            layer_parents.insert(layer_id, parent);
+        }
+        let mut packed_binding_reachable = BTreeSet::new();
+        let mut pending = packed_binding_roots.iter().copied().collect::<Vec<_>>();
+        while let Some(layer_id) = pending.pop() {
+            if !packed_binding_reachable.insert(layer_id) {
+                continue;
+            }
+            if let Some(Some(parent)) = layer_parents.get(&layer_id) {
+                pending.push(*parent);
+            }
+        }
         for layer_id in &request.layer_ids {
+            if packed_binding_reachable.contains(layer_id) {
+                return Err(WorkspaceError::Busy);
+            }
             let reachable = sea_orm::sqlx::query_scalar::<_, i64>(
                 "WITH RECURSIVE roots(layer_id) AS (
                      SELECT head_layer_id FROM ws_v1_workspaces WHERE state != ?
                      UNION SELECT layer_id FROM ws_v1_snapshots
                      UNION SELECT base_layer_id FROM ws_v1_snapshot_leases
-                       WHERE state IN (?, ?) AND expires_at_ns > ?
+                       WHERE state IN (?, ?, ?) AND expires_at_ns > ?
                      UNION SELECT old_head_layer_id FROM ws_v1_seal_journal
                        WHERE phase NOT IN (?, ?)
                      UNION SELECT new_head_layer_id FROM ws_v1_seal_journal
@@ -2209,6 +3730,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             .bind(WorkspaceState::Deleting.discriminant() as i64)
             .bind(LeaseState::Active.discriminant() as i64)
             .bind(LeaseState::Releasing.discriminant() as i64)
+            .bind(LeaseState::Expired.discriminant() as i64)
             .bind(lease_cutoff)
             .bind(SealPhase::Completed.discriminant() as i64)
             .bind(SealPhase::Aborted.discriminant() as i64)
@@ -2237,12 +3759,54 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         Ok(())
     }
 
+    async fn reserve_gc_slice_deletion(
+        &self,
+        _slice_id: u64,
+        _retained_slice_end: u64,
+        _deleted_layers: &[LayerId],
+    ) -> Result<(), WorkspaceError> {
+        // SQLite is not a production packed-v3 deletion-fence implementation.
+        // Explicit compatibility is limited to existing legacy unit fixtures.
+        #[cfg(test)]
+        {
+            let header = self
+                .load_volume_header()
+                .await?
+                .ok_or(WorkspaceError::Fenced)?;
+            let packed: i64 =
+                sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM ws_v3_packed_bindings")
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(backend)?;
+            if header.volume_format == VOLUME_FORMAT && packed == 0 {
+                return Ok(());
+            }
+        }
+        Err(WorkspaceError::UnsupportedCapability(
+            "SQLite durable SID deletion fence",
+        ))
+    }
+
     async fn finalize_layer_metadata_deletion(
         &self,
         layer_ids: Vec<LayerId>,
     ) -> Result<(), WorkspaceError> {
+        if layer_ids.is_empty() {
+            return Ok(());
+        }
         let _guard = self.write_gate.lock().await;
         let mut tx = self.begin_write().await?;
+        // Deleting is a lifecycle state, not proof that the layer is orphaned:
+        // deleting a workspace can leave its head in this state while durable
+        // PWB3 history still owns it. Repeat the binding-root/ancestry check
+        // under the same write transaction as the irreversible finalization.
+        let packed_reachable = packed_binding_reachable_tx(&mut tx).await?;
+        if layer_ids
+            .iter()
+            .any(|layer| packed_reachable.contains(layer))
+        {
+            return Err(WorkspaceError::Busy);
+        }
         for layer_id in &layer_ids {
             let state = sea_orm::sqlx::query_scalar::<_, i64>(
                 "SELECT state FROM ws_v1_layers WHERE layer_id = ?",
@@ -2461,6 +4025,118 @@ impl WorkspaceStore for SqliteWorkspaceStore {
     }
 }
 
+async fn packed_binding_reachable_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<BTreeSet<LayerId>, WorkspaceError> {
+    let records: Vec<Vec<u8>> =
+        sea_orm::sqlx::query_scalar("SELECT record FROM ws_v3_packed_bindings")
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(backend)?;
+    let mut pending = Vec::new();
+    for bytes in records {
+        let record = PackedLowerBindingRecord::decode(&bytes)?;
+        pending.push(record.base_revision.layer_id);
+        pending.push(record.head_layer_id);
+    }
+    if pending.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let rows = sea_orm::sqlx::query("SELECT layer_id, parent_layer_id FROM ws_v1_layers")
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(backend)?;
+    let mut parents = BTreeMap::new();
+    for row in rows {
+        let layer = LayerId::from_uuid(uuid_from_blob(
+            row.try_get::<Vec<u8>, _>("layer_id").map_err(backend)?,
+            "packed binding layer root",
+        )?);
+        let parent = row
+            .try_get::<Option<Vec<u8>>, _>("parent_layer_id")
+            .map_err(backend)?
+            .map(|bytes| uuid_from_blob(bytes, "packed binding parent"))
+            .transpose()?
+            .map(LayerId::from_uuid);
+        parents.insert(layer, parent);
+    }
+    let mut reachable = BTreeSet::new();
+    while let Some(layer) = pending.pop() {
+        if !reachable.insert(layer) {
+            continue;
+        }
+        if let Some(Some(parent)) = parents.get(&layer) {
+            pending.push(*parent);
+        }
+    }
+    Ok(reachable)
+}
+
+async fn packed_binding_current_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    workspace_id: WorkspaceId,
+) -> Result<Option<PackedLowerBindingRecord>, WorkspaceError> {
+    let version: Option<i64> = sea_orm::sqlx::query_scalar(
+        "SELECT binding_version FROM ws_v3_packed_current WHERE workspace_id = ?",
+    )
+    .bind(workspace_id.as_bytes().as_slice())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(backend)?;
+    let Some(version) = version else {
+        let claimed: i64 = sea_orm::sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ws_v3_packed_bindings WHERE workspace_id = ?)",
+        )
+        .bind(workspace_id.as_bytes().as_slice())
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(backend)?;
+        if claimed != 0 {
+            return Err(WorkspaceError::CorruptMetadata(
+                "PWB3 claim has no current pointer".into(),
+            ));
+        }
+        return Ok(None);
+    };
+    let bytes: Vec<u8> = sea_orm::sqlx::query_scalar(
+        "SELECT record FROM ws_v3_packed_bindings WHERE workspace_id = ? AND binding_version = ?",
+    )
+    .bind(workspace_id.as_bytes().as_slice())
+    .bind(version)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(backend)?
+    .ok_or_else(|| WorkspaceError::CorruptMetadata("PWB3 current history missing".into()))?;
+    let record = PackedLowerBindingRecord::decode(&bytes)?;
+    if record.workspace_id != workspace_id
+        || record.binding.binding_version != to_u64(version, "packed binding version")?
+    {
+        return Err(WorkspaceError::CorruptMetadata(
+            "PWB3 current key/record disagree".into(),
+        ));
+    }
+    // The version-1 history row is the durable lineage anchor. Every reader,
+    // including v3 open/remount recovery, must reject a current pointer that
+    // outlived that anchor instead of treating the torn state as Ready.
+    let initial_bytes: Option<Vec<u8>> = sea_orm::sqlx::query_scalar(
+        "SELECT record FROM ws_v3_packed_bindings
+         WHERE workspace_id = ? AND binding_version = 1",
+    )
+    .bind(workspace_id.as_bytes().as_slice())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(backend)?;
+    let initial = PackedLowerBindingRecord::decode(initial_bytes.as_deref().ok_or_else(|| {
+        WorkspaceError::CorruptMetadata("PWB3 initial history is missing".into())
+    })?)?;
+    if initial.workspace_id != workspace_id || initial.binding.binding_version != 1 {
+        return Err(WorkspaceError::CorruptMetadata(
+            "PWB3 initial history key/record disagree".into(),
+        ));
+    }
+    Ok(Some(record))
+}
+
 async fn insert_writable_layer(
     tx: &mut Transaction<'_, Sqlite>,
     layer_id: LayerId,
@@ -2556,7 +4232,7 @@ async fn load_workspace_tx(
     let row = sea_orm::sqlx::query(
         "SELECT workspace_id, head_layer_id, head_epoch,
                 fork_base_layer_id, fork_base_version, fork_base_root_hash,
-                owner_id, state, created_at_ns, updated_at_ns
+                owner_id, state, active_lease, created_at_ns, updated_at_ns
          FROM ws_v1_workspaces WHERE workspace_id = ?",
     )
     .bind(workspace_id.as_bytes().as_slice())
@@ -2917,6 +4593,11 @@ fn decode_workspace(row: &SqliteRow) -> Result<WorkspaceRecord, WorkspaceError> 
             row.try_get("state").map_err(backend)?,
             "workspace state",
         )?)?,
+        active_lease: row
+            .try_get::<Option<Vec<u8>>, _>("active_lease")
+            .map_err(backend)?
+            .map(|bytes| uuid_from_blob(bytes, "workspace active lease").map(LeaseId::from_uuid))
+            .transpose()?,
         created_at_ns: row.try_get("created_at_ns").map_err(backend)?,
         updated_at_ns: row.try_get("updated_at_ns").map_err(backend)?,
     })
@@ -3235,6 +4916,18 @@ fn decode_lease(row: &SqliteRow) -> Result<SnapshotLease, WorkspaceError> {
     })
 }
 
+async fn permission_layer_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    layer: LayerId,
+) -> Result<LayerRecord, WorkspaceError> {
+    let row = sea_orm::sqlx::query("SELECT layer_id, parent_layer_id, state, schema_version, sealed_version, delta_digest, root_hash,
+        depth, owner_workspace_id, next_sequence, owned_slice_count, owned_bytes, created_at_ns, sealed_at_ns
+        FROM ws_v1_layers WHERE layer_id = ?")
+        .bind(layer.as_bytes().as_slice()).fetch_optional(&mut **tx).await.map_err(backend)?
+        .ok_or(WorkspaceError::LayerNotFound(layer))?;
+    decode_layer(&row)
+}
+
 fn validate_value(op: ValueOp, value: Option<&[u8]>, kind: &str) -> Result<(), WorkspaceError> {
     match (op, value) {
         (ValueOp::Put, Some(_)) | (ValueOp::Whiteout, None) => Ok(()),
@@ -3250,6 +4943,11 @@ fn now_ns() -> Result<i64, WorkspaceError> {
         .map_err(|error| WorkspaceError::Backend(format!("system clock before epoch: {error}")))?;
     i64::try_from(duration.as_nanos())
         .map_err(|_| WorkspaceError::Backend("system time exceeds SQLite range".into()))
+}
+
+fn duration_ns(duration: Duration) -> Result<i64, WorkspaceError> {
+    i64::try_from(duration.as_nanos())
+        .map_err(|_| WorkspaceError::Backend("duration exceeds SQLite range".into()))
 }
 
 fn to_i64(value: u64, field: &str) -> Result<i64, WorkspaceError> {

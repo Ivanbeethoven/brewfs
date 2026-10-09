@@ -836,7 +836,7 @@ mod tests {
                 local_node_id: 23,
             }
         );
-        let bytes = MergeRouteIndex::encode(&[record.clone()]).unwrap();
+        let bytes = MergeRouteIndex::encode(std::slice::from_ref(&record)).unwrap();
         assert_eq!(MergeRouteIndex::decode(&bytes).unwrap(), vec![record]);
     }
 }

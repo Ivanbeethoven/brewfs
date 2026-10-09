@@ -16,13 +16,21 @@ param(
     [string]$Backend = 'none',
     [ValidateSet('s3')]
     [string]$DataBackend = 's3',
-    [ValidateSet('packed-metadata-v1', 'packed-metadata-v2', 'packed-metadata-v3')]
-    [string]$VolumeFormat = 'packed-metadata-v1',
-    [string]$PerfTools = 'packed-tree packed-smallfiles fio-seqread fio-randread',
+    [ValidateSet('packed-metadata-v3')]
+    [string]$VolumeFormat = 'packed-metadata-v3',
+    [ValidateScript({
+        $tools = @($_ -split '\s+' | Where-Object { $_ })
+        if ($tools.Count -eq 0 -or @($tools | Where-Object { $_ -notin @('packed-tree', 'packed-stat', 'packed-smallfiles', 'packed-gpu-smallfiles') }).Count -ne 0) {
+            throw 'Unsupported packed-v3 tool; tree/stat/smallfiles are supported, fio/POSIX fixture layout remains OPEN.'
+        }
+        $true
+    })]
+    [string]$PerfTools = 'packed-tree packed-smallfiles',
     [int64]$PackedSmallFileCount = 1000000,
     [int64]$PackedSmallFileSizeBytes = 102400,
     [int64]$PackedSmallFileMinSizeBytes = 0,
     [int64]$PackedSmallFileMaxSizeBytes = 0,
+    [ValidateRange(0, 8)]
     [int]$PackedDirLevels = 3,
     [int64]$PackedDirsPerLevel = 10,
     [int64]$PackedFilesPerDir = 1000,
@@ -178,11 +186,7 @@ function Get-ConfiguredCredentials {
 function Build-LocalBinaries {
     $root = Get-LocalRepoRoot
     if (-not $BinaryPath) { $script:BinaryPath = Join-Path $root 'target\release\brewfs' }
-    $fixtureName = switch ($VolumeFormat) {
-        'packed-metadata-v2' { 'packed_v2_snapshot_fixture'; break }
-        'packed-metadata-v3' { 'packed_v3_snapshot_fixture'; break }
-        default { 'packed_snapshot_fixture' }
-    }
+    $fixtureName = 'packed_v3_snapshot_fixture'
     if (-not $FixtureBinaryPath) { $script:FixtureBinaryPath = Join-Path $root "target\release\$fixtureName" }
     if ($SkipBuild) {
         if (-not (Test-Path -LiteralPath $BinaryPath) -or -not (Test-Path -LiteralPath $FixtureBinaryPath)) {
@@ -278,11 +282,7 @@ function New-EcsInstance {
 }
 
 function Get-RemoteCommand([string]$BinaryUrl, [string]$FixtureUrl, [string]$RunnerUrl, [string]$ScannerUrl, [string]$CredentialUrl) {
-    $fixtureName = switch ($VolumeFormat) {
-        'packed-metadata-v2' { 'packed_v2_snapshot_fixture'; break }
-        'packed-metadata-v3' { 'packed_v3_snapshot_fixture'; break }
-        default { 'packed_snapshot_fixture' }
-    }
+    $fixtureName = 'packed_v3_snapshot_fixture'
     $remote = @'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -521,8 +521,8 @@ try {
     }
     if ($Action -eq 'create') { New-EcsInstance; return }
 
-    if ($VolumeFormat -notin @('packed-metadata-v1', 'packed-metadata-v2', 'packed-metadata-v3') -or $DataBackend -ne 's3') {
-        throw '原生 ECS runner 只接受 packed-metadata-v1/v2/v3 + Aliyun S3/OSS。'
+    if ($VolumeFormat -ne 'packed-metadata-v3' -or $DataBackend -ne 's3') {
+        throw '原生 ECS runner 只接受 packed-metadata-v3 + Aliyun S3/OSS。'
     }
     if (-not $S3Bucket) { throw 'run 必须指定 -S3Bucket（Aliyun OSS bucket）。' }
     $expected = [int64]1
@@ -554,11 +554,7 @@ try {
     }
     $ScannerPath = (Resolve-Path -LiteralPath $ScannerPath).ProviderPath
     Publish-OssObject $BinaryPath "$ObjectPrefix/bin/brewfs"
-    $fixtureName = switch ($VolumeFormat) {
-        'packed-metadata-v2' { 'packed_v2_snapshot_fixture'; break }
-        'packed-metadata-v3' { 'packed_v3_snapshot_fixture'; break }
-        default { 'packed_snapshot_fixture' }
-    }
+    $fixtureName = 'packed_v3_snapshot_fixture'
     Publish-OssObject $FixtureBinaryPath "$ObjectPrefix/bin/$fixtureName"
     $nativeScriptPath = Join-Path $PSScriptRoot 'run_aliyun_packed_native.sh'
     Publish-OssObject $nativeScriptPath "$ObjectPrefix/bin/run_aliyun_packed_native.sh"

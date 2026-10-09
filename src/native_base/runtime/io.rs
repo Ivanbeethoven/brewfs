@@ -1203,13 +1203,13 @@ mod tests {
             }
             let rows = self.inner.scan(prefix).await?;
             let bump = self.bump_inode_on_scan.lock().await.clone();
-            if let Some(key) = bump {
-                if let Some(bytes) = self.inner.get(&key).await? {
-                    let mut data = crate::native_base::write::records::InodeData::decode(&bytes)
-                        .map_err(|error| StoreError::Backend(error.to_string()))?;
-                    data.data_version += 1;
-                    self.inner.run(Txn::new().put(key, data.encode())).await?;
-                }
+            if let Some(key) = bump
+                && let Some(bytes) = self.inner.get(&key).await?
+            {
+                let mut data = crate::native_base::write::records::InodeData::decode(&bytes)
+                    .map_err(|error| StoreError::Backend(error.to_string()))?;
+                data.data_version += 1;
+                self.inner.run(Txn::new().put(key, data.encode())).await?;
             }
             Ok(rows)
         }
@@ -1945,7 +1945,7 @@ mod tests {
 
         let attempts = runtime.capture_attempt_count();
         let captured = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            runtime.write(9, 0, &vec![0xaa; 64]).await.unwrap();
+            runtime.write(9, 0, &[0xaa; 64]).await.unwrap();
             runtime.read(9, 0, 64).await.unwrap()
         })
         .await
@@ -1984,7 +1984,7 @@ mod tests {
         let runtime = runtime_with_policy(store.clone(), sink, base.clone(), policy).await;
 
         // Create the inode row, then make every extent scan move it.
-        runtime.write(9, 0, &vec![1u8; 64]).await.unwrap();
+        runtime.write(9, 0, &[1u8; 64]).await.unwrap();
         runtime.fsync(9).await.unwrap();
         store
             .bump_inode_row_on_scan(runtime64_key(&runtime, 9))

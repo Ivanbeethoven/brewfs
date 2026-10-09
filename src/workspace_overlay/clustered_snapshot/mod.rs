@@ -36,13 +36,14 @@ mod snapshot_manifest;
 
 pub use attribute::{AttributeBatch, AttributeGroup, XattrRecord, attribute_index_key};
 pub use batch::{
-    BATCH_HEADER_LEN, BATCH_MAGIC, BATCH_VERSION, BatchCodec, BatchHeader, BatchKind, EncodedBatch,
-    MAX_BATCH_RAW, MAX_BATCH_STORED, NAME_RESTART_INTERVAL, NamespaceBatch, NamespaceEntry,
-    NamespaceSegment, NodeRecord, SEGMENT_CONTINUATION, SEGMENT_END, SEGMENT_START, encode_batch,
+    BATCH_HEADER_LEN, BATCH_MAGIC, BATCH_VERSION, BatchCodec, BatchEncodingContext, BatchHeader,
+    BatchKind, EncodedBatch, MAX_BATCH_RAW, MAX_BATCH_STORED, NAME_RESTART_INTERVAL,
+    NamespaceBatch, NamespaceEntry, NamespaceSegment, NodeRecord, SEGMENT_CONTINUATION,
+    SEGMENT_END, SEGMENT_START, encode_batch,
 };
 pub use budget::{BudgetError, BudgetReservation, MetadataBudget, MetadataBudgetSnapshot};
 pub use cluster_builder::{
-    BuiltCluster, NamespaceSegmentInput, build_namespace_segments_cluster,
+    BuiltCluster, ClusterIdentity, NamespaceSegmentInput, build_namespace_segments_cluster,
     build_namespace_segments_cluster_with_metadata, build_single_directory_cluster,
     build_single_directory_cluster_with_metadata,
 };

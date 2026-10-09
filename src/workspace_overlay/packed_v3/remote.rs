@@ -101,10 +101,7 @@ where
         .await
         .map_err(|error| PackedWireError::Backend(error.to_string()))?;
     let mut consumed = 0u64;
-    while consumed < length {
-        let Some(chunk) = stream.next().await else {
-            break;
-        };
+    while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| PackedWireError::Backend(error.to_string()))?;
         let chunk_len = u64::try_from(chunk.len()).map_err(|_| {
             PackedWireError::LimitExceeded("packed stream chunk exceeds u64".into())
@@ -642,7 +639,6 @@ impl<B: ObjectBackend + Clone> RemotePackedObject<B> {
 
         let mut buffers: Vec<(PackedFrameDescriptor, BytesMut)> = descriptors
             .iter()
-            .cloned()
             .map(|frame| {
                 (
                     frame.clone(),
@@ -875,12 +871,12 @@ fn validate_descriptor_order(frames: &[PackedFrameDescriptor]) -> PackedResult<(
             .object_offset
             .checked_add(u64::from(frame.stored_len))
             .ok_or_else(|| PackedWireError::LimitExceeded("frame range overflows".into()))?;
-        if let Some(previous_end) = previous {
-            if frame.object_offset < previous_end {
-                return Err(PackedWireError::Invalid(
-                    "frame payload ranges overlap or are not canonical".into(),
-                ));
-            }
+        if let Some(previous_end) = previous
+            && frame.object_offset < previous_end
+        {
+            return Err(PackedWireError::Invalid(
+                "frame payload ranges overlap or are not canonical".into(),
+            ));
         }
         previous = Some(end);
     }
@@ -1271,6 +1267,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_range_rejects_trailing_chunks_after_exact_length() {
+        let client = ObjectClient::new(ScriptedStreamBackend {
+            chunks: Arc::new(vec![b"abcdef".to_vec(), b"g".to_vec()]),
+            error_after_chunks: None,
+        });
+
+        assert!(matches!(
+            read_exact_range(&client, "object", 0, 6).await,
+            Err(PackedWireError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_range_rejects_a_failure_after_exact_length() {
+        let client = ObjectClient::new(ScriptedStreamBackend {
+            chunks: Arc::new(vec![b"abcdef".to_vec()]),
+            error_after_chunks: Some(1),
+        });
+
+        assert!(matches!(
+            read_exact_range(&client, "object", 0, 6).await,
+            Err(PackedWireError::Backend(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_range_rejects_short_streams() {
+        let client = ObjectClient::new(ScriptedStreamBackend {
+            chunks: Arc::new(vec![b"abc".to_vec()]),
+            error_after_chunks: None,
+        });
+
+        assert!(matches!(
+            read_exact_range(&client, "object", 0, 6).await,
+            Err(PackedWireError::Truncated { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn streamed_frame_range_delivers_each_frame_without_a_range_buffer() {
         let temp = tempdir().unwrap();
         let client = ObjectClient::new(LocalFsBackend::new(temp.path()));
@@ -1372,12 +1407,13 @@ mod tests {
 
         remote.read_frame(frame).await.unwrap();
 
-        let recorded = ranges.lock().unwrap();
-        assert_eq!(
-            recorded.last().copied(),
-            Some((frame.object_offset, u64::from(frame.stored_len),))
-        );
-        drop(recorded);
+        {
+            let recorded = ranges.lock().unwrap();
+            assert_eq!(
+                recorded.last().copied(),
+                Some((frame.object_offset, u64::from(frame.stored_len),))
+            );
+        }
 
         // A zero-budget cache may still be supplied by shared mount plumbing,
         // but it must not switch the strict reader to whole-container GETs.
@@ -1402,12 +1438,13 @@ mod tests {
         .unwrap();
         ranges.lock().unwrap().clear();
         cached_remote.read_frame(frame).await.unwrap();
-        let recorded = ranges.lock().unwrap();
-        assert_eq!(
-            recorded.last().copied(),
-            Some((frame.object_offset, u64::from(frame.stored_len),))
-        );
-        drop(recorded);
+        {
+            let recorded = ranges.lock().unwrap();
+            assert_eq!(
+                recorded.last().copied(),
+                Some((frame.object_offset, u64::from(frame.stored_len),))
+            );
+        }
 
         let tiny_cache = Arc::new(
             ChunksCache::new_with_config(ChunksCacheConfig::with_budgets(

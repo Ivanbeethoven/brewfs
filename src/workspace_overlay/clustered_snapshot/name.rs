@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn raw_names_are_sorted_by_bytes_without_utf8_conversion() {
-        let mut names = vec![
+        let mut names = [
             NameBytes::new(vec![0xff]).unwrap(),
             NameBytes::new(vec![0x80]).unwrap(),
             NameBytes::new(b"z".to_vec()).unwrap(),

@@ -137,14 +137,14 @@ impl<B: ObjectBackend + Clone> RemoteDataPack<B> {
             .object_offset
             .checked_add(frame_span)
             .ok_or_else(|| WireError::LimitExceeded("data pack frame end overflows".into()))?;
-        let footer_offset =
-            self.object_len
-                .checked_sub(64)
-                .ok_or_else(|| WireError::Truncated {
-                    what: "remote data pack footer",
-                    need: 64,
-                    have: self.object_len as usize,
-                })?;
+        let footer_offset = self
+            .object_len
+            .checked_sub(64)
+            .ok_or(WireError::Truncated {
+                what: "remote data pack footer",
+                need: 64,
+                have: self.object_len as usize,
+            })?;
         if descriptor.object_offset < 64 || end > footer_offset {
             return Err(WireError::Truncated {
                 what: "remote data pack frame",

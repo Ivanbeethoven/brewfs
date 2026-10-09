@@ -23,7 +23,7 @@ use crate::native_base::wire::error::{WireError, WireResult};
 use super::attribute::{AttributeBatch, AttributeGroup};
 use super::batch::{BatchHeader, NamespaceEntry, NodeRecord};
 use super::cluster_builder::{
-    BuiltCluster, NamespaceSegmentInput, build_namespace_segments_cluster,
+    BuiltCluster, ClusterIdentity, NamespaceSegmentInput, build_namespace_segments_cluster,
     build_namespace_segments_cluster_with_metadata,
 };
 use super::data_pack::{DataPackBuilder, DataPackSnapshot};
@@ -384,9 +384,11 @@ pub fn build_source_cluster<S: IngestSource>(
     source.revalidate(&entries)?;
 
     built.cluster = build_namespace_segments_cluster_with_metadata(
-        cluster_id,
-        volume_id,
-        built.root_dir_key,
+        ClusterIdentity {
+            cluster_id,
+            volume_id,
+            mount_dir_key: built.root_dir_key,
+        },
         built.cluster.superblock.node_count,
         built.cluster.superblock.directory_contribution_count,
         &built.namespace_segments,

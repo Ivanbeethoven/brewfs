@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, Semaphore, oneshot};
 

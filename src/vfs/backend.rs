@@ -44,6 +44,10 @@ where
         &self.store
     }
 
+    pub(crate) fn store_arc(&self) -> Arc<B> {
+        self.store.clone()
+    }
+
     #[cfg(feature = "workspace-overlay")]
     pub(crate) fn workspace_read_plan(
         &self,

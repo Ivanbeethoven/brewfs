@@ -11,6 +11,11 @@ use crate::chunk::store::persistent_slice_cache_path;
 
 use super::keys::{DirtySliceKey, DirtySliceState};
 
+#[cfg(feature = "workspace-overlay")]
+mod packed_recovery;
+#[cfg(feature = "workspace-overlay")]
+pub(crate) use packed_recovery::MAX_PACKED_RECOVERY_SLICE_BYTES;
+
 /// Record describing a dirty slice persisted to local SSD.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DirtySliceRecord {
@@ -93,6 +98,27 @@ pub struct FsWriteBackCache {
 }
 
 impl FsWriteBackCache {
+    #[cfg(feature = "workspace-overlay")]
+    pub(crate) fn has_recoverable_for_inode(
+        &self,
+        ino: i64,
+        max_rows: usize,
+    ) -> anyhow::Result<bool> {
+        let mut found = false;
+        for (index, key) in self.recoverable_keys.iter().enumerate() {
+            if index >= max_rows {
+                return Err(
+                    crate::workspace_overlay::packed_v3::PackedWireError::LimitExceeded(
+                        "recovery overlay probe row cap".into(),
+                    )
+                    .into(),
+                );
+            }
+            found |= key.ino == ino;
+        }
+        Ok(found)
+    }
+
     pub fn new(root: PathBuf) -> Self {
         Self::new_with_sync(root, true)
     }

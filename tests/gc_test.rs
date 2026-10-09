@@ -50,6 +50,7 @@ mod tests {
             batch_size: 100,
             block_size: 4 * 1024 * 1024,
             orphan_cleanup_age_secs: 60,
+            volume_format: None,
         };
 
         // Should complete without error even with no delayed slices
@@ -76,7 +77,8 @@ mod tests {
             min_age_secs: 3600, // 1 hour - very high
             batch_size: 100,
             block_size: 4 * 1024 * 1024,
-            orphan_cleanup_age_secs: 3600, // Also high
+            orphan_cleanup_age_secs: 3600,
+            volume_format: None, // Also high
         };
 
         // Run GC - should not clean up because of high age requirement
@@ -123,6 +125,7 @@ mod tests {
             batch_size: 5, // Only process 5 at a time
             block_size: 4 * 1024 * 1024,
             orphan_cleanup_age_secs: 0,
+            volume_format: None,
         };
 
         // First cycle should process batch_size
@@ -151,6 +154,7 @@ mod tests {
             batch_size: 100,
             block_size: 4 * 1024 * 1024,
             orphan_cleanup_age_secs: 0,
+            volume_format: None,
         };
 
         // Should handle edge cases gracefully
@@ -191,6 +195,7 @@ mod tests {
             batch_size: 100,
             block_size: 4 * 1024 * 1024,
             orphan_cleanup_age_secs: 0,
+            volume_format: None,
         };
 
         let result = gc.run_gc_cycle(&config).await;

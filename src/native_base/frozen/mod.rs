@@ -39,6 +39,9 @@ pub const MAX_DIRECTORY_COOKIE_SPOOL: usize = 64 * 1024 * 1024;
 /// spool is evictable, so it is bounded on its own (IDX-005).
 pub const MAX_DIRECTORY_COOKIES: usize = 1 << 20;
 
+/// One authenticated key/value row from a frozen metadata index.
+pub type FrozenKeyValueRow = (Vec<u8>, Vec<u8>);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrozenInodeRecord {
     pub kind: u8,
@@ -827,7 +830,7 @@ impl<'a, S: ObjectSource> FixedRevisionReader<'a, S> {
     pub fn scan_namespace_prefix(
         &self,
         prefix: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FrozenReadError> {
+    ) -> Result<Vec<FrozenKeyValueRow>, FrozenReadError> {
         let Some(root) = self.manifest.namespace_root.as_ref() else {
             return Ok(Vec::new());
         };
@@ -1070,7 +1073,7 @@ impl<'a, S: ObjectSource> FixedRevisionReader<'a, S> {
         Ok((page, object.clone()))
     }
 
-    fn lower_bound_data(&self, key: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>, FrozenReadError> {
+    fn lower_bound_data(&self, key: &[u8]) -> Result<Option<FrozenKeyValueRow>, FrozenReadError> {
         self.lower_bound_root(&self.manifest.data_root, key)
     }
 
@@ -1078,7 +1081,7 @@ impl<'a, S: ObjectSource> FixedRevisionReader<'a, S> {
         &self,
         root: &RootRef,
         key: &[u8],
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, FrozenReadError> {
+    ) -> Result<Option<FrozenKeyValueRow>, FrozenReadError> {
         let mut child = ChildRef::External(root.clone());
         let mut current_object = root.object.clone();
         for _ in 0..=MAX_INDEX_LEVEL {
@@ -2095,8 +2098,8 @@ mod tests {
 
     /// Build a SnapshotManifest container object.
     fn build_manifest_object(
-        object_id: [u8; 16],
-        key: &[u8],
+        _object_id: [u8; 16],
+        _key: &[u8],
         manifest: &SnapshotManifest,
     ) -> Vec<u8> {
         let raw = manifest.encode().unwrap();
@@ -2272,7 +2275,7 @@ mod tests {
         // 150 entries with a tiny leaf target forces ≥ 2 internal levels.
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..150u32)
             .map(|i| {
-                let mut k = i.to_be_bytes().to_vec();
+                let k = i.to_be_bytes().to_vec();
                 let mut v = vec![0u8; 32];
                 v[0..4].copy_from_slice(&i.to_be_bytes());
                 (k, v)
@@ -2284,13 +2287,12 @@ mod tests {
             build_frozen_metadata_object(data_id, b"frozen/data-big", &entries);
 
         // Verify the tree actually has multiple levels.
-        match &data_root.address {
-            addr => assert!(
-                addr.level >= 2,
-                "expected multi-level tree, got level {}",
-                addr.level
-            ),
-        }
+        let addr = &data_root.address;
+        assert!(
+            addr.level >= 2,
+            "expected multi-level tree, got level {}",
+            addr.level
+        );
 
         let inv_id = [6u8; 16];
         let (inv_obj, inv_root) = build_frozen_metadata_object(

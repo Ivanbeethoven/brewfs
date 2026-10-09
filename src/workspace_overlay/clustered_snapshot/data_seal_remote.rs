@@ -192,10 +192,10 @@ impl<B: ObjectBackend + Clone> RemoteDataSeal<B> {
 
     /// Fetch, authenticate, and decode the complete slice table on first use.
     pub async fn read_slices(&self) -> WireResult<Arc<[SliceDescriptor]>> {
-        if let Some(index) = self.slice_index.get() {
-            if let RemoteSliceIndex::Legacy(slices) = index.as_ref() {
-                return Ok(slices.clone());
-            }
+        if let Some(index) = self.slice_index.get()
+            && let RemoteSliceIndex::Legacy(slices) = index.as_ref()
+        {
+            return Ok(slices.clone());
         }
         self.slices
             .get_or_try_init(|| async {

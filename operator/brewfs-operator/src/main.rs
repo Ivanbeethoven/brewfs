@@ -165,7 +165,7 @@ async fn run_controller() -> anyhow::Result<()> {
         });
 
         let workspace_snapshot_controller = Controller::new(
-            Api::<BrewFSWorkspaceSnapshot>::all(client),
+            Api::<BrewFSWorkspaceSnapshot>::all(client.clone()),
             watcher::Config::default(),
         )
         .run(
@@ -182,17 +182,51 @@ async fn run_controller() -> anyhow::Result<()> {
             }
         });
 
-        tokio::join!(
-            cluster_controller,
-            mount_controller,
-            workspace_controller,
-            workspace_mount_controller,
-            workspace_snapshot_controller
-        );
+        let stop = tokio_util::sync::CancellationToken::new();
+        let gc_worker = workspace::gc::run(client, stop.clone());
+        tokio::pin!(gc_worker);
+        let controllers = async {
+            tokio::join!(
+                cluster_controller,
+                mount_controller,
+                workspace_controller,
+                workspace_mount_controller,
+                workspace_snapshot_controller
+            );
+        };
+        tokio::pin!(controllers);
+        tokio::select! {
+            result = &mut gc_worker => { stop.cancel(); result?; }
+            _ = &mut controllers => { stop.cancel(); gc_worker.await?; }
+            result = shutdown_signal() => {
+                stop.cancel();
+                // No detached GC task: its owned tick/backend scopes drain
+                // before the process reports successful termination.
+                let drained = gc_worker.await;
+                result?;
+                drained?;
+            }
+        }
     }
 
     #[cfg(not(feature = "workspace-operator"))]
     tokio::join!(cluster_controller, mount_controller);
 
     Ok(())
+}
+
+#[cfg(feature = "workspace-operator")]
+async fn shutdown_signal() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("install SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("wait for Ctrl-C"),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await.context("wait for Ctrl-C")
 }

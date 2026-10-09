@@ -284,9 +284,6 @@ impl<B: ObjectBackend + Clone> RemoteCluster<B> {
         let node = self
             .load_index(
                 key,
-                root.object_offset,
-                root.stored_len,
-                root.digest,
                 root.level,
                 kind,
                 (root.level == 0).then_some(root.entry_count),
@@ -324,16 +321,8 @@ impl<B: ObjectBackend + Clone> RemoteCluster<B> {
         expected_level: u8,
     ) -> WireResult<Arc<IndexNode>> {
         let key = IndexCacheKey::child(child);
-        self.load_index(
-            key,
-            child.object_offset,
-            child.stored_len,
-            child.digest,
-            expected_level,
-            expected_kind,
-            Some(child.entry_count),
-        )
-        .await
+        self.load_index(key, expected_level, expected_kind, Some(child.entry_count))
+            .await
     }
 
     /// Fetch and validate one independently decodable metadata batch of any
@@ -881,13 +870,13 @@ impl<B: ObjectBackend + Clone> RemoteCluster<B> {
     async fn load_index(
         &self,
         key: IndexCacheKey,
-        object_offset: u64,
-        stored_len: u32,
-        digest: [u8; 32],
         expected_level: u8,
         expected_kind: BatchKind,
         expected_entry_count: Option<u32>,
     ) -> WireResult<Arc<IndexNode>> {
+        let object_offset = key.object_offset;
+        let stored_len = key.stored_len;
+        let digest = key.digest;
         if let Some(cached) = self.index_cache.get(&key) {
             self.touch_index(&key);
             return Ok(cached.clone());
@@ -1230,9 +1219,9 @@ mod tests {
     };
     use crate::workspace_overlay::clustered_snapshot::name::NameBytes;
     use crate::workspace_overlay::clustered_snapshot::{
-        AttributeBatch, AttributeGroup, ClusterDescriptor, ExtentBatch, ExtentRecord,
-        ExtentSegment, ManifestObjectRef, XattrRecord, build_single_directory_cluster,
-        build_single_directory_cluster_with_metadata,
+        AttributeBatch, AttributeGroup, ClusterDescriptor, ClusterIdentity, ExtentBatch,
+        ExtentRecord, ExtentSegment, ManifestObjectRef, XattrRecord,
+        build_single_directory_cluster, build_single_directory_cluster_with_metadata,
     };
 
     #[test]
@@ -1426,9 +1415,11 @@ mod tests {
             }],
         };
         let built = build_single_directory_cluster_with_metadata(
-            [25; 16],
-            [26; 16],
-            dir_key,
+            ClusterIdentity {
+                cluster_id: [25; 16],
+                volume_id: [26; 16],
+                mount_dir_key: dir_key,
+            },
             &plan,
             1,
             dir_key,
@@ -1491,9 +1482,11 @@ mod tests {
             }],
         };
         let built = build_single_directory_cluster_with_metadata(
-            [35; 16],
-            [36; 16],
-            dir_key,
+            ClusterIdentity {
+                cluster_id: [35; 16],
+                volume_id: [36; 16],
+                mount_dir_key: dir_key,
+            },
             &plan,
             1,
             dir_key,

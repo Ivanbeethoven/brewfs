@@ -213,13 +213,13 @@ fn validate_leaf_entries(kind: BatchKind, entries: &[IndexLeafEntry]) -> WireRes
                 "leaf first key exceeds last key",
             ));
         }
-        if let Some(last) = previous_last {
-            if entry.first_key.as_slice() <= last {
-                return Err(WireError::invalid(
-                    "index builder",
-                    "leaf ranges are not strictly ordered",
-                ));
-            }
+        if let Some(last) = previous_last
+            && entry.first_key.as_slice() <= last
+        {
+            return Err(WireError::invalid(
+                "index builder",
+                "leaf ranges are not strictly ordered",
+            ));
         }
         if entry.locator.kind != kind {
             return Err(WireError::invalid(

@@ -20,6 +20,7 @@ pub(crate) mod cache;
 pub(crate) mod config;
 pub mod error;
 pub mod fs;
+pub(crate) mod fuse_read_cancel;
 pub(crate) mod handles;
 pub(crate) mod inode;
 pub(crate) mod io;

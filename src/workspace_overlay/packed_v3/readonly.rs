@@ -1,6 +1,6 @@
 //! Read-only VFS adapters for the packed-v3 snapshot.
 //!
-//! The packed catalog owns namespace and frame resolution.  These adapters
+//! The authenticated current snapshot owns namespace and frame resolution. These adapters
 //! deliberately keep the existing VFS contract: metadata exposes immutable
 //! `SliceDesc` rows and the block store translates those synthetic rows back
 //! into a bounded packed frame read.  No Redis/TiKV metadata client or loose
@@ -24,14 +24,308 @@ use crate::meta::store::{
 use crate::vfs::handles::{DirHandle, DirectoryPageSource, RawDirEntry};
 use crate::vfs::{chunk_id_for, extract_ino_and_chunk_index};
 
-use super::catalog::{RemoteGroupCatalog, directory_key};
+use super::catalog::directory_key;
 use super::index::PackedInodeIndexEntry;
 use super::meta::GroupMetaEntry;
-use super::wire::{PackedSnapshotManifest, PackedWireError};
+use super::wire::PackedWireError;
 
 const READ_ONLY_ERROR: &str = "packed metadata v3 snapshot is read-only";
 
+mod transport;
+
+#[derive(Debug, Default)]
+pub(crate) struct V3ReadonlyMetrics {
+    range_gets: std::sync::atomic::AtomicU64,
+    requested_bytes: std::sync::atomic::AtomicU64,
+    received_bytes: std::sync::atomic::AtomicU64,
+    failures: std::sync::atomic::AtomicU64,
+    logical_bytes: std::sync::atomic::AtomicU64,
+    pub(crate) transport: Arc<transport::ReadonlyTransport>,
+}
+impl V3ReadonlyMetrics {
+    pub(crate) fn logical_success(&self, bytes: u64) {
+        self.logical_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct V3ReadonlyBackend<B: ObjectBackend + Clone + 'static> {
+    client: crate::cadapter::client::ObjectClient<B>,
+    metrics: Arc<V3ReadonlyMetrics>,
+    budget: Arc<super::wire005::V3MountBudget>,
+}
+
+#[async_trait]
+impl<B: ObjectBackend + Clone + 'static> ObjectBackend for V3ReadonlyBackend<B> {
+    async fn put_object(&self, _key: &str, _bytes: &[u8]) -> anyhow::Result<()> {
+        anyhow::bail!(READ_ONLY_ERROR)
+    }
+    async fn get_object(&self, _key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        anyhow::bail!("wire 005 readonly path forbids whole-object GET")
+    }
+    async fn get_object_range(
+        &self,
+        key: &str,
+        offset: u64,
+        bytes: &mut [u8],
+    ) -> anyhow::Result<usize> {
+        self.metrics.range_gets.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .requested_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let length = bytes.len();
+        let result = self
+            .metrics
+            .transport
+            .run(&self.budget, key.len(), length as u64, || {
+                let client = self.client.clone();
+                let key = key.to_owned();
+                async move {
+                    let mut output = vec![0; length];
+                    let actual = client.get_object_range(&key, offset, &mut output).await?;
+                    anyhow::ensure!(actual <= output.len(), "readonly backend range overflow");
+                    output.truncate(actual);
+                    Ok(output)
+                }
+            })
+            .await;
+        match result {
+            Ok(output) => {
+                let length = output.value.len();
+                bytes[..length].copy_from_slice(&output.value);
+                self.metrics
+                    .received_bytes
+                    .fetch_add(length as u64, Ordering::Relaxed);
+                Ok(length)
+            }
+            Err(error) => {
+                self.metrics.failures.fetch_add(1, Ordering::Relaxed);
+                Err(error)
+            }
+        }
+    }
+    async fn get_object_range_stream(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> anyhow::Result<crate::cadapter::client::ObjectByteStream> {
+        use futures_util::StreamExt;
+        self.metrics.range_gets.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .requested_bytes
+            .fetch_add(length, Ordering::Relaxed);
+        let stream = match self
+            .metrics
+            .transport
+            .open_body(&self.budget, key.len(), || {
+                let client = self.client.clone();
+                let key = key.to_owned();
+                async move { client.get_object_range_stream(&key, offset, length).await }
+            })
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.metrics.failures.fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        let metrics = Arc::clone(&self.metrics);
+        Ok(Box::pin(stream.map(move |result| {
+            match &result {
+                Ok(bytes) => {
+                    metrics
+                        .received_bytes
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    metrics.failures.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            result
+        })))
+    }
+    async fn get_object_range_stream_observed(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+        context: crate::cadapter::read_observer::ReadContext,
+        observer: Arc<crate::cadapter::read_observer::ReadObserver>,
+    ) -> anyhow::Result<crate::cadapter::client::ObjectByteStream> {
+        use futures_util::StreamExt;
+        self.metrics.range_gets.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .requested_bytes
+            .fetch_add(length, Ordering::Relaxed);
+        let stream = match self
+            .metrics
+            .transport
+            .open_body(&self.budget, key.len(), || {
+                let client = self.client.clone();
+                let key = key.to_owned();
+                async move {
+                    client
+                        .backend_range_stream_observed(&key, offset, length, context, observer)
+                        .await
+                }
+            })
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.metrics.failures.fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        let metrics = Arc::clone(&self.metrics);
+        Ok(Box::pin(stream.map(move |result| {
+            match &result {
+                Ok(bytes) => {
+                    metrics
+                        .received_bytes
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    metrics.failures.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            result
+        })))
+    }
+    async fn get_etag(&self, key: &str) -> anyhow::Result<String> {
+        let result = self
+            .metrics
+            .transport
+            .run(&self.budget, key.len(), 0, || {
+                let client = self.client.clone();
+                let key = key.to_owned();
+                async move { client.get_etag(&key).await }
+            })
+            .await?;
+        Ok(result.value.clone())
+    }
+    async fn delete_object(&self, _key: &str) -> anyhow::Result<()> {
+        anyhow::bail!(READ_ONLY_ERROR)
+    }
+}
+
+pub(crate) fn shared_v3_readonly_client<B: ObjectBackend + Clone + 'static>(
+    client: crate::cadapter::client::ObjectClient<B>,
+    observer: Arc<crate::cadapter::read_observer::ReadObserver>,
+    engine: crate::cadapter::read_observer::Engine,
+    phase: crate::cadapter::read_observer::Phase,
+    budget: Arc<super::wire005::V3MountBudget>,
+) -> (
+    crate::cadapter::client::ObjectClient<V3ReadonlyBackend<B>>,
+    Arc<V3ReadonlyMetrics>,
+) {
+    let metrics = Arc::new(V3ReadonlyMetrics::default());
+    let client = crate::cadapter::client::ObjectClient::new(V3ReadonlyBackend {
+        client: client.without_read_observer(),
+        metrics: metrics.clone(),
+        budget,
+    })
+    .with_read_observer(
+        observer,
+        engine,
+        phase,
+        crate::cadapter::read_observer::Origin::Demand,
+    );
+    (client, metrics)
+}
+
+#[derive(Debug)]
+struct V3StatsExtension {
+    metrics: Arc<V3ReadonlyMetrics>,
+    budget: Arc<super::wire005::V3MountBudget>,
+    observer: Arc<crate::cadapter::read_observer::ReadObserver>,
+    index: super::wire005::V3IndexCacheStats,
+}
+impl crate::vfs::stats::FsStatsExtension for V3StatsExtension {
+    fn render_max_bytes(&self) -> usize {
+        super::wire005::V3MountBudget::STATS_EXTENSION_RENDER_MAX_BYTES
+            .saturating_add(self.observer.render_max_bytes())
+    }
+    fn begin_stats_observation(&self) -> Option<crate::cadapter::read_observer::TerminalGuard> {
+        Some(self.observer.start(
+            crate::cadapter::read_observer::Ledger::LogicalOperation,
+            crate::cadapter::read_observer::ReadContext {
+                engine: crate::cadapter::read_observer::Engine::PackedV3,
+                phase: crate::cadapter::read_observer::Phase::Runtime,
+                class: crate::cadapter::read_observer::ReadClass::StatsSnapshot,
+                origin: crate::cadapter::read_observer::Origin::StatsObserver,
+            },
+            0,
+        ))
+    }
+    fn render_into(&self, output: &mut dyn std::fmt::Write) {
+        // Runtime backend calls/response-body bytes, including metadata and
+        // payload. Initial manifest/probe and SDK-internal retries are excluded.
+        for (name, counter) in [
+            ("runtime_backend_range_gets_total", &self.metrics.range_gets),
+            (
+                "runtime_backend_requested_bytes_total",
+                &self.metrics.requested_bytes,
+            ),
+            (
+                "runtime_backend_received_bytes_total",
+                &self.metrics.received_bytes,
+            ),
+            ("runtime_backend_failures_total", &self.metrics.failures),
+            ("logical_bytes_total", &self.metrics.logical_bytes),
+        ] {
+            let _ = writeln!(
+                output,
+                "brewfs_packed_v3_{name} {}",
+                counter.load(Ordering::Relaxed)
+            );
+        }
+        self.budget.render_into(output);
+        self.index.render_into(output);
+        self.observer.render_into(output);
+    }
+}
+
+struct V3ReadonlyContext<B: ObjectBackend + Clone + 'static> {
+    client: crate::cadapter::client::ObjectClient<V3ReadonlyBackend<B>>,
+    snapshot: super::wire005::AuthenticatedV3Snapshot,
+    reader: super::wire005::V3IndexReader<V3ReadonlyBackend<B>>,
+    metrics: Arc<V3ReadonlyMetrics>,
+    budget: Arc<super::wire005::V3MountBudget>,
+    _roots: super::wire005::V3OwnedPermit,
+}
+
+// The context retains the actual authenticated snapshot, index reader and
+// Roots admission independently of the adapter and its final path consumer.
+struct ReadonlyPathsOwner<B: ObjectBackend + Clone + 'static> {
+    _permit: super::wire005::V3OwnedPermit,
+    _context: Arc<V3ReadonlyContext<B>>,
+}
+impl<B: ObjectBackend + Clone + 'static> std::fmt::Debug for ReadonlyPathsOwner<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadonlyPathsOwner").finish_non_exhaustive()
+    }
+}
+
 fn map_error(error: PackedWireError) -> MetaError {
+    if matches!(error, PackedWireError::LimitExceeded(_)) {
+        return MetaError::Io(std::io::Error::from_raw_os_error(libc::ENOMEM));
+    }
+    match &error {
+        PackedWireError::Backend(message) => {
+            if message.starts_with("S3 range service failure:")
+                || message.starts_with("S3 range request failure:")
+                || message.starts_with("S3 range stream failure:")
+            {
+                tracing::warn!(error = %message, "packed readonly metadata backend read failed");
+            } else {
+                tracing::warn!("packed readonly metadata backend read failed");
+            }
+        }
+        _ => tracing::warn!(error = %error, "packed readonly metadata validation failed"),
+    }
     MetaError::Internal(error.to_string())
 }
 
@@ -82,17 +376,41 @@ fn attr_from_inode_index(index: &PackedInodeIndexEntry) -> FileAttr {
     }
 }
 
-/// A block-store facade over immutable packed frames.
-#[derive(Clone)]
-pub struct PackedV3BlockStore<B: ObjectBackend + Clone> {
-    catalog: Arc<RemoteGroupCatalog<B>>,
-    chunk_size: u64,
-    block_size: u64,
+fn attr_from_root(root: &super::wire005::V3RootAttributes) -> FileAttr {
+    FileAttr {
+        ino: root.inode as i64,
+        size: root.size,
+        blocks: root.blocks,
+        kind: FileType::Dir,
+        mode: root.mode,
+        rdev: 0,
+        uid: root.uid,
+        gid: root.gid,
+        atime: root.atime_ns,
+        mtime: root.mtime_ns,
+        ctime: root.ctime_ns,
+        nlink: root.nlink,
+    }
 }
 
-impl<B: ObjectBackend + Clone> PackedV3BlockStore<B> {
-    pub fn new(
-        catalog: Arc<RemoteGroupCatalog<B>>,
+/// A block-store facade over immutable packed frames.
+///
+/// Legacy catalogs cannot create a readonly block store:
+/// ```compile_fail
+/// use brewfs::cadapter::localfs::LocalFsBackend;
+/// use brewfs::workspace_overlay::packed_v3::PackedV3BlockStore;
+/// let _ = PackedV3BlockStore::<LocalFsBackend>::new;
+/// ```
+#[derive(Clone)]
+pub struct PackedV3BlockStore<B: ObjectBackend + Clone + 'static> {
+    chunk_size: u64,
+    block_size: u64,
+    context: Arc<V3ReadonlyContext<B>>,
+}
+
+impl<B: ObjectBackend + Clone + 'static> PackedV3BlockStore<B> {
+    fn from_context(
+        context: Arc<V3ReadonlyContext<B>>,
         chunk_size: u64,
         block_size: u32,
     ) -> Result<Self, MetaError> {
@@ -100,7 +418,7 @@ impl<B: ObjectBackend + Clone> PackedV3BlockStore<B> {
             return Err(MetaError::Internal("invalid packed v3 block layout".into()));
         }
         Ok(Self {
-            catalog,
+            context,
             chunk_size,
             block_size: u64::from(block_size),
         })
@@ -151,10 +469,24 @@ where
         }
         let (inode, end) = self.range_for(key, offset, buf.len())?;
         let start = end - u64::try_from(buf.len())?;
-        self.catalog
-            .read_inode_range(inode, start, buf)
+        let context = &self.context;
+        context
+            .snapshot
+            .read_inode_range(
+                &context.client,
+                &context.reader,
+                inode,
+                start,
+                buf,
+                32 * 1024 * 1024,
+            )
             .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        context
+            .metrics
+            .logical_bytes
+            .fetch_add(buf.len() as u64, Ordering::Relaxed);
+        Ok(())
     }
 
     async fn delete_range(&self, _key: BlockKey, _block_count: u64) -> anyhow::Result<()> {
@@ -162,9 +494,8 @@ where
     }
 }
 
-struct PackedDirectoryPageSource<B: ObjectBackend + Clone> {
-    catalog: Arc<RemoteGroupCatalog<B>>,
-    manifest: Arc<PackedSnapshotManifest>,
+struct PackedDirectoryPageSource<B: ObjectBackend + Clone + 'static> {
+    context: Arc<V3ReadonlyContext<B>>,
 }
 
 #[async_trait]
@@ -172,6 +503,26 @@ impl<B> DirectoryPageSource for PackedDirectoryPageSource<B>
 where
     B: ObjectBackend + Clone + Send + Sync + 'static,
 {
+    async fn read_page_owned(
+        &self,
+        ino: i64,
+        offset: u64,
+        max_entries: usize,
+    ) -> Result<crate::vfs::handles::OwnedDirectoryPage, MetaError> {
+        let guard = self
+            .context
+            .budget
+            .admit(&[
+                (super::wire005::V3BudgetPool::Output, 1 << 20),
+                (super::wire005::V3BudgetPool::Control, 4096),
+            ])
+            .map_err(map_error)?;
+        let entries = self.read_page(ino, offset, max_entries).await?;
+        Ok(crate::vfs::handles::OwnedDirectoryPage {
+            entries,
+            guard: Some(Arc::new(guard)),
+        })
+    }
     async fn read_page(
         &self,
         ino: i64,
@@ -179,18 +530,22 @@ where
         max_entries: usize,
     ) -> Result<Vec<RawDirEntry>, MetaError> {
         let parent = u64::try_from(ino).map_err(|_| MetaError::NotFound(ino))?;
-        let key = if parent == self.manifest.root_inode {
-            self.manifest.root_dir_key
+        let context = &self.context;
+        let manifest = context.snapshot.manifest();
+        let key = if parent == manifest.root_inode {
+            manifest.root_dir_key
         } else {
-            directory_key(self.manifest.snapshot_id, parent)
+            directory_key(manifest.snapshot_id, parent)
         };
-        let entries = self
-            .catalog
+        let entries = context
+            .snapshot
             .readdir_page(
+                &context.client,
+                &context.reader,
                 key,
-                usize::try_from(child_offset)
-                    .map_err(|_| MetaError::Internal("directory offset exceeds usize".into()))?,
+                child_offset,
                 max_entries,
+                512 * 1024,
             )
             .await
             .map_err(map_error)?;
@@ -209,26 +564,299 @@ where
 }
 
 /// Immutable metadata facade for a packed-v3 manifest.
-pub struct PackedV3ReadonlyMeta<B: ObjectBackend + Clone> {
-    catalog: Arc<RemoteGroupCatalog<B>>,
-    manifest: Arc<PackedSnapshotManifest>,
+///
+/// Only authenticated current v3 snapshots can construct this adapter:
+/// ```compile_fail
+/// use brewfs::cadapter::localfs::LocalFsBackend;
+/// use brewfs::workspace_overlay::packed_v3::PackedV3ReadonlyMeta;
+/// let _ = PackedV3ReadonlyMeta::<LocalFsBackend>::new;
+/// ```
+/// ```compile_fail
+/// use brewfs::cadapter::localfs::LocalFsBackend;
+/// use brewfs::workspace_overlay::packed_v3::PackedV3ReadonlyMeta;
+/// let _ = PackedV3ReadonlyMeta::<LocalFsBackend>::catalog;
+/// ```
+pub struct PackedV3ReadonlyMeta<B: ObjectBackend + Clone + 'static> {
     root: AtomicI64,
     chunk_size: u64,
+    context: Arc<V3ReadonlyContext<B>>,
+}
+
+/// One authenticated reverse-index page and its memory owner.
+pub(crate) struct PackedLowerReverseNames {
+    pub rows: Vec<(i64, Vec<u8>)>,
+    pub after: Option<Vec<u8>>,
+    _permit: super::wire005::V3OwnedPermit,
+}
+
+/// Metadata-only template with its actual authenticated index/root owner.
+pub(crate) struct PackedLowerInodeMetadata {
+    pub attr: FileAttr,
+    pub parent_hint: Option<i64>,
+    _permit: super::wire005::V3OwnedPermit,
 }
 
 impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
-    pub fn new(catalog: Arc<RemoteGroupCatalog<B>>, chunk_size: u64) -> Self {
-        let manifest = Arc::new(catalog.manifest().clone());
-        Self {
-            root: AtomicI64::new(manifest.root_inode as i64),
-            catalog,
-            manifest,
+    pub fn from_v3(
+        client: crate::cadapter::client::ObjectClient<B>,
+        snapshot: super::wire005::AuthenticatedV3Snapshot,
+        chunk_size: u64,
+        metadata_bytes: u64,
+    ) -> Self {
+        Self::from_v3_budget(
+            client,
+            snapshot,
             chunk_size,
-        }
+            metadata_bytes,
+            super::wire005::V3MountBudget::defaults(),
+        )
+        .expect("default budgets admit a valid profile frame")
     }
 
-    pub fn catalog(&self) -> &Arc<RemoteGroupCatalog<B>> {
-        &self.catalog
+    pub fn from_v3_budget(
+        client: crate::cadapter::client::ObjectClient<B>,
+        snapshot: super::wire005::AuthenticatedV3Snapshot,
+        chunk_size: u64,
+        metadata_bytes: u64,
+        budget: Arc<super::wire005::V3MountBudget>,
+    ) -> Result<Self, PackedWireError> {
+        let source = snapshot.manifest();
+        budget.validate_frame_capability(
+            source
+                .size_classes
+                .max_random_frame_raw_bytes
+                .max(source.size_classes.max_sequential_frame_raw_bytes) as usize,
+        )?;
+        let roots = budget.admit(&[(super::wire005::V3BudgetPool::Roots, 128 << 10)])?;
+        let root = AtomicI64::new(source.root_inode as i64);
+        let observer = budget.read_observer(client.read_observer())?;
+        let (client, metrics) = shared_v3_readonly_client(
+            client,
+            observer,
+            crate::cadapter::read_observer::Engine::PackedV3,
+            crate::cadapter::read_observer::Phase::Runtime,
+            budget.clone(),
+        );
+        let context = Arc::new(V3ReadonlyContext {
+            reader: super::wire005::V3IndexReader::with_budget(
+                client.clone(),
+                metadata_bytes,
+                budget.clone(),
+            ),
+            client,
+            snapshot,
+            metrics,
+            budget,
+            _roots: roots,
+        });
+        Ok(Self {
+            root,
+            chunk_size,
+            context,
+        })
+    }
+
+    pub fn install_v3_stats(&self, stats: &crate::vfs::stats::FsStats) -> bool {
+        stats.set_extension(Arc::new(V3StatsExtension {
+            metrics: Arc::clone(&self.context.metrics),
+            budget: Arc::clone(&self.context.budget),
+            index: self.context.reader.cache_stats(),
+            observer: self
+                .context
+                .client
+                .read_observer()
+                .expect("v3 context carries its observer"),
+        }))
+    }
+
+    pub fn block_store(&self, block_size: u32) -> Result<PackedV3BlockStore<B>, MetaError> {
+        PackedV3BlockStore::from_context(self.context.clone(), self.chunk_size, block_size)
+    }
+
+    pub fn manifest_reference(&self) -> &super::wire005::V3ObjectRef {
+        self.context.snapshot.manifest_reference()
+    }
+
+    pub fn mount_budget(&self) -> Arc<super::wire005::V3MountBudget> {
+        Arc::clone(&self.context.budget)
+    }
+
+    pub(crate) async fn frozen_cold_attributes_owned(
+        &self,
+        inode: i64,
+    ) -> Result<Option<super::wire005::V3Owned<super::wire005::V3ColdAttributes>>, MetaError> {
+        self.context
+            .snapshot
+            .cold_attributes_owned(
+                &self.context.client,
+                &self.context.reader,
+                Self::inode(inode)?,
+            )
+            .await
+            .map_err(map_error)
+    }
+
+    pub(crate) async fn frozen_reverse_names_page_owned(
+        &self,
+        inode: i64,
+        after: Option<&[u8]>,
+    ) -> Result<PackedLowerReverseNames, MetaError> {
+        let permit = self
+            .context
+            .budget
+            .admit(&[(super::wire005::V3BudgetPool::Metadata, 128 << 10)])
+            .map_err(map_error)?;
+        let page = self
+            .context
+            .snapshot
+            .reverse_names_page(&self.context.reader, Self::inode(inode)?, after, 32)
+            .await
+            .map_err(map_error)?;
+        let mut rows = Vec::with_capacity(page.len());
+        let mut cursor = after.map(ToOwned::to_owned);
+        for location in page {
+            let key = location.reverse_key();
+            let parent = i64::try_from(location.hot.parent_inode)
+                .map_err(|_| MetaError::Internal("packed reverse parent exceeds i64".into()))?;
+            let name = location.hot.name;
+            if parent <= 0
+                || name.is_empty()
+                || name.len() > 255
+                || name == b"."
+                || name == b".."
+                || name.contains(&0)
+                || name.contains(&b'/')
+                || cursor.as_ref().is_some_and(|previous| key <= *previous)
+            {
+                return Err(MetaError::Internal(
+                    "invalid authenticated reverse-name page".into(),
+                ));
+            }
+            cursor = Some(key);
+            rows.push((parent, name));
+        }
+        Ok(PackedLowerReverseNames {
+            rows,
+            after: cursor,
+            _permit: permit,
+        })
+    }
+
+    pub(crate) async fn frozen_inode_metadata_owned(
+        &self,
+        inode: i64,
+    ) -> Result<Option<PackedLowerInodeMetadata>, MetaError> {
+        let permit = self
+            .context
+            .budget
+            .admit(&[(super::wire005::V3BudgetPool::Metadata, 4096)])
+            .map_err(map_error)?;
+        let number = Self::inode(inode)?;
+        if number == self.context.snapshot.manifest().root_inode {
+            return Ok(Some(PackedLowerInodeMetadata {
+                attr: attr_from_root(
+                    &self
+                        .context
+                        .snapshot
+                        .manifest()
+                        .source
+                        .as_ref()
+                        .ok_or_else(|| {
+                            MetaError::Internal("packed root attributes missing".into())
+                        })?
+                        .root,
+                ),
+                parent_hint: None,
+                _permit: permit,
+            }));
+        }
+        let Some(hot) = self.index_entry(number).await? else {
+            return Ok(None);
+        };
+        if hot.rdev > u64::from(u32::MAX) {
+            return Err(MetaError::Internal(
+                "packed inode rdev exceeds native metadata".into(),
+            ));
+        }
+        let parent = i64::try_from(hot.parent_inode).map_err(|_| {
+            MetaError::Internal("packed inode parent exceeds native identity".into())
+        })?;
+        Ok(Some(PackedLowerInodeMetadata {
+            attr: attr_from_inode_index(&hot),
+            parent_hint: Some(parent),
+            _permit: permit,
+        }))
+    }
+
+    /// Stop backend admission, join the real frame worker and wait every
+    /// started response driver/body. The caller owns pin/budget retirement.
+    pub(crate) async fn drain_packed_transport(&self) -> Result<(), MetaError> {
+        self.context.metrics.transport.stop_admission();
+        self.context.reader.close().await;
+        self.context
+            .metrics
+            .transport
+            .drain()
+            .await
+            .map_err(MetaError::Anyhow)
+    }
+
+    pub fn chunk_size(&self) -> u64 {
+        self.chunk_size
+    }
+
+    pub(crate) fn bind_reader_session(
+        &self,
+        reader: Arc<dyn crate::workspace_overlay::packed_reader_lifecycle::PackedReaderSession>,
+    ) -> Result<(), MetaError> {
+        if !Arc::ptr_eq(&self.context.budget, &reader.mount_budget())
+            || &reader.binding().manifest != self.manifest_reference()
+        {
+            return Err(MetaError::Internal(
+                "packed lower transport reader identity mismatch".into(),
+            ));
+        }
+        self.context
+            .metrics
+            .transport
+            .bind_reader(reader)
+            .map_err(MetaError::Anyhow)
+    }
+
+    async fn index_entry(&self, inode: u64) -> Result<Option<PackedInodeIndexEntry>, MetaError> {
+        let context = &self.context;
+        context
+            .snapshot
+            .lookup_inode(&context.reader, inode)
+            .await
+            .map(|value| value.map(|location| location.hot))
+            .map_err(map_error)
+    }
+
+    async fn with_source_blocks(&self, mut attributes: FileAttr) -> Result<FileAttr, MetaError> {
+        let context = &self.context;
+        if let Some(blocks) = context
+            .snapshot
+            .source_blocks(&context.reader, attributes.ino as u64)
+            .await
+            .map_err(map_error)?
+        {
+            attributes.blocks = blocks;
+        }
+        Ok(attributes)
+    }
+
+    async fn lookup_entry(
+        &self,
+        parent: [u8; 32],
+        name: &[u8],
+    ) -> Result<Option<GroupMetaEntry>, MetaError> {
+        let context = &self.context;
+        context
+            .snapshot
+            .lookup_dentry(&context.client, &context.reader, parent, name, 512 * 1024)
+            .await
+            .map_err(map_error)
     }
 
     fn inode(ino: i64) -> Result<u64, MetaError> {
@@ -236,25 +864,27 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
     }
 
     fn parent_key(&self, inode: u64) -> [u8; 32] {
-        if inode == self.manifest.root_inode {
-            self.manifest.root_dir_key
+        let manifest = self.context.snapshot.manifest();
+        if inode == manifest.root_inode {
+            manifest.root_dir_key
         } else {
-            directory_key(self.manifest.snapshot_id, inode)
+            directory_key(manifest.snapshot_id, inode)
         }
     }
 
-    async fn entry(
-        &self,
-        inode: u64,
-    ) -> Result<Option<(super::wire::PackedGroupRef, GroupMetaEntry)>, MetaError> {
-        self.catalog
-            .lookup_inode_entry(inode)
+    async fn entry(&self, inode: u64) -> Result<Option<GroupMetaEntry>, MetaError> {
+        let context = &self.context;
+        context
+            .snapshot
+            .inode_entry(&context.client, &context.reader, inode, 512 * 1024)
             .await
             .map_err(map_error)
     }
 
     async fn readonly<T>() -> Result<T, MetaError> {
-        Err(MetaError::NotSupported(READ_ONLY_ERROR.into()))
+        Err(MetaError::Io(std::io::Error::from_raw_os_error(
+            libc::EROFS,
+        )))
     }
 
     fn chunk_slices(
@@ -269,7 +899,7 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
         let chunk_end = chunk_start.saturating_add(self.chunk_size);
 
         // Inline bytes live in GroupMeta rather than in a frame extent.  The
-        // legacy DataFetcher still asks MetaLayer for visible slices, so expose
+        // DataFetcher still asks MetaLayer for visible slices, so expose
         // the inline range as a logical slice.  PackedV3BlockStore resolves
         // the resulting block read back to the inode and serves it from the
         // already-decoded GroupMeta payload without issuing a frame request.
@@ -308,229 +938,83 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cadapter::client::ObjectClient;
-    use crate::cadapter::localfs::LocalFsBackend;
-    use crate::workspace_overlay::packed_v3::{
-        AccessProfile, GroupMeta, GroupMetaExtent, PackedContainerRef, PackedFrameInput,
-        PackedGroupContainer, PackedGroupIndexPage, PackedGroupIndexPageRef, PackedGroupInput,
-        PackedGroupRef, PackedInodeIndexEntry, PackedInodeIndexPage, PackedInodeIndexPageRef,
-        PackedSnapshotManifest, SizeClass, SizeClassTable,
-    };
-    use sha2::{Digest, Sha256};
-    use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn readonly_meta_and_block_store_read_one_packed_file() {
-        let temp = tempdir().unwrap();
-        let client = ObjectClient::new(LocalFsBackend::new(temp.path()));
-        let root_key = [7; 32];
-        let metadata = GroupMeta::new(vec![GroupMetaEntry {
-            name: b"file".to_vec(),
-            inode: 2,
-            kind: 1,
-            mode: 0o100644,
-            uid: 1,
-            gid: 2,
-            rdev: 0,
-            nlink: 1,
-            atime_ns: 0,
-            mtime_ns: 0,
-            ctime_ns: 0,
-            size: 5,
-            flags: 0,
-            inline_data: Arc::from([]),
-            extents: vec![GroupMetaExtent {
-                file_offset: 0,
-                logical_len: 5,
-                frame_ordinal: 0,
-                raw_offset: 0,
-                raw_len: 5,
-            }],
-        }])
-        .unwrap();
-        let container = PackedGroupContainer::build(
-            1,
-            AccessProfile::RandomSmallFile,
-            vec![PackedGroupInput {
-                group_id: 1,
-                parent_dir_key: root_key,
-                metadata: metadata.encode().unwrap(),
-                frame_ordinals: vec![0],
-                entry_count: 1,
-                file_count: 1,
-                layout_profile: AccessProfile::RandomSmallFile,
-            }],
-            vec![PackedFrameInput {
-                raw: b"hello".to_vec(),
-                size_class: SizeClass::Tiny,
-                codec: 0,
-                first_file_slot: 0,
-                last_file_slot: 0,
-            }],
-        )
-        .unwrap();
-        client.put_object("container", &container).await.unwrap();
-        let opened = PackedGroupContainer::open(container.clone()).unwrap();
-        let descriptor = &opened.groups()[0];
-        let group = PackedGroupRef {
-            group_id: 1,
-            container_ordinal: 0,
-            parent_dir_key: root_key,
-            first_name: b"file".to_vec(),
-            last_name: b"file".to_vec(),
-            meta_offset: descriptor.metadata_offset,
-            meta_len: descriptor.metadata_len,
-            data_offset: descriptor.data_offset,
-            data_len: descriptor.data_len,
-            entry_count: descriptor.entry_count,
-            file_count: descriptor.file_count,
-            frame_count: 1,
-            layout_profile: descriptor.layout_profile,
-            metadata_digest: descriptor.metadata_digest,
-            data_digest: descriptor.data_digest,
-        };
-        let group_page = PackedGroupIndexPage {
-            snapshot_id: [9; 32],
-            page_ordinal: 0,
-            total_pages: 1,
-            groups: vec![group.clone()],
-        }
-        .encode()
-        .unwrap();
-        client.put_object("group-index", &group_page).await.unwrap();
-        let inode_page = PackedInodeIndexPage {
-            snapshot_id: [9; 32],
-            page_ordinal: 0,
-            total_pages: 1,
-            entries: vec![PackedInodeIndexEntry {
-                inode: 2,
-                parent_inode: 1,
-                parent_dir_key: root_key,
-                group_id: 1,
-                entry_ordinal: 0,
-                name: b"file".to_vec(),
-                kind: 1,
-                mode: 0o100644,
-                uid: 1,
-                gid: 2,
-                rdev: 0,
-                nlink: 1,
-                atime_ns: 0,
-                mtime_ns: 0,
-                ctime_ns: 0,
-                size: 5,
-            }],
-        }
-        .encode()
-        .unwrap();
-        client.put_object("inode-index", &inode_page).await.unwrap();
-        let manifest = PackedSnapshotManifest {
-            snapshot_id: [9; 32],
-            root_dir_key: root_key,
-            root_inode: 1,
-            layout_profile: AccessProfile::RandomSmallFile,
-            size_classes: SizeClassTable::default(),
-            groups: Vec::new(),
-            containers: vec![PackedContainerRef {
-                object_key: b"container".to_vec(),
-                object_len: opened.object_len(),
-                object_digest: opened.object_digest(),
-            }],
-            group_index_pages: vec![PackedGroupIndexPageRef {
-                object: PackedContainerRef {
-                    object_key: b"group-index".to_vec(),
-                    object_len: group_page.len() as u64,
-                    object_digest: Sha256::digest(&group_page).into(),
-                },
-                first_parent_dir_key: root_key,
-                first_name: b"file".to_vec(),
-                last_parent_dir_key: root_key,
-                last_name: b"file".to_vec(),
-            }],
-            inode_index_pages: vec![PackedInodeIndexPageRef {
-                object: PackedContainerRef {
-                    object_key: b"inode-index".to_vec(),
-                    object_len: inode_page.len() as u64,
-                    object_digest: Sha256::digest(&inode_page).into(),
-                },
-                first_inode: 2,
-                last_inode: 2,
-            }],
-        };
-        let catalog = Arc::new(RemoteGroupCatalog::new(client, manifest));
-        let meta = PackedV3ReadonlyMeta::new(Arc::clone(&catalog), 4096);
-        assert_eq!(meta.lookup(1, "file").await.unwrap(), Some(2));
-        assert_eq!(meta.stat(2).await.unwrap().unwrap().size, 5);
-        assert_eq!(
-            meta.get_paths(2).await.unwrap(),
-            vec![String::from("/file")]
-        );
-        let store = PackedV3BlockStore::new(catalog, 4096, 4096).unwrap();
-        let key = (chunk_id_for(2, 0).unwrap(), 0);
-        let mut output = [0; 5];
-        store.read_range(key, 0, &mut output).await.unwrap();
-        assert_eq!(&output, b"hello");
-    }
-
-    #[test]
-    fn inline_meta_exposes_a_logical_slice_to_the_legacy_reader() {
-        let temp = tempdir().unwrap();
-        let client = ObjectClient::new(LocalFsBackend::new(temp.path()));
-        let catalog = Arc::new(RemoteGroupCatalog::new(
-            client,
-            PackedSnapshotManifest {
-                snapshot_id: [1; 32],
-                root_dir_key: [2; 32],
-                root_inode: 1,
-                layout_profile: AccessProfile::RandomSmallFile,
-                size_classes: SizeClassTable::default(),
-                groups: Vec::new(),
-                containers: Vec::new(),
-                group_index_pages: Vec::new(),
-                inode_index_pages: Vec::new(),
-            },
-        ));
-        let meta = PackedV3ReadonlyMeta::new(catalog, 4096);
-        let entry = GroupMetaEntry {
-            name: b"inline.bin".to_vec(),
-            inode: 8,
-            kind: 1,
-            mode: 0o100644,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-            nlink: 1,
-            atime_ns: 0,
-            mtime_ns: 0,
-            ctime_ns: 0,
-            size: 7,
-            flags: super::super::meta::INLINE_DATA_FLAG,
-            inline_data: Arc::from(b"payload".as_slice()),
-            extents: Vec::new(),
-        };
-        let chunk_id = chunk_id_for(8, 0).unwrap();
-        assert_eq!(
-            meta.chunk_slices(chunk_id, &entry, 0).unwrap(),
-            vec![SliceDesc {
-                slice_id: chunk_id,
-                chunk_id,
-                offset: 0,
-                length: 7,
-            }]
-        );
-        assert!(meta.chunk_slices(chunk_id, &entry, 1).unwrap().is_empty());
-    }
-}
+#[path = "readonly/tests.rs"]
+mod tests;
 
 #[async_trait]
 impl<B> MetaLayer for PackedV3ReadonlyMeta<B>
 where
     B: ObjectBackend + Clone + Send + Sync + 'static,
 {
+    fn reserve_inline_roots(
+        &self,
+        bytes: u64,
+    ) -> Result<Option<asyncfuse::raw::reply::InlineRootPermit>, MetaError> {
+        let permit = self
+            .context
+            .budget
+            .admit(&[(super::wire005::V3BudgetPool::Roots, bytes)])
+            .map_err(map_error)?;
+        let permit = asyncfuse::raw::reply::InlineRootPermit::try_new(permit).map_err(|_| {
+            map_error(PackedWireError::LimitExceeded(
+                "inline Roots permit layout".into(),
+            ))
+        })?;
+        Ok(Some(permit))
+    }
+    fn reserve_memory(
+        &self,
+        kind: crate::meta::layer::MetadataMemoryKind,
+        bytes: u64,
+    ) -> Result<Option<crate::meta::layer::MetadataMemoryGuard>, MetaError> {
+        use super::wire005::V3BudgetPool;
+        use crate::meta::layer::MetadataMemoryKind;
+        let context = &self.context;
+        let checked = |extra| {
+            bytes.checked_add(extra).ok_or_else(|| {
+                map_error(PackedWireError::LimitExceeded(
+                    "FUSE memory size overflow".into(),
+                ))
+            })
+        };
+        if matches!(kind, MetadataMemoryKind::Roots) {
+            let permit = context
+                .budget
+                .admit(&[(V3BudgetPool::Roots, bytes)])
+                .map_err(map_error)?;
+            return Ok(Some(Arc::new(permit)));
+        }
+        let charges = match kind {
+            MetadataMemoryKind::Roots => vec![(V3BudgetPool::Roots, bytes)],
+            MetadataMemoryKind::Request => vec![
+                (V3BudgetPool::Control, 8192),
+                (V3BudgetPool::Metadata, checked(2 << 20)?),
+            ],
+            MetadataMemoryKind::Reply => vec![
+                (
+                    V3BudgetPool::Output,
+                    checked(super::wire005::V3MountBudget::REPLY_ALLOCATION_ALLOWANCE_BYTES)?,
+                ),
+                (V3BudgetPool::Control, 4096),
+            ],
+            // Attributes, reader state and immutable stats handles persist
+            // beyond a request. Preserve their full bound and final guard,
+            // independently of transient request/queue/cancellation controls.
+            MetadataMemoryKind::Handle => vec![(V3BudgetPool::Metadata, bytes.max(8192))],
+            MetadataMemoryKind::Control => vec![(V3BudgetPool::Control, bytes)],
+        };
+        Ok(Some(Arc::new(
+            context.budget.admit(&charges).map_err(map_error)?,
+        )))
+    }
     fn name(&self) -> &'static str {
         "packed-metadata-v3-readonly"
+    }
+    fn supports_fuse_read_cancellation(&self) -> bool {
+        true
+    }
+    fn posix_acl_capability(&self) -> crate::meta::layer::PosixAclCapability {
+        crate::meta::layer::PosixAclCapability::ReadOnly
     }
     fn metrics(&self) -> Option<Arc<MetaClientMetrics>> {
         None
@@ -546,7 +1030,7 @@ where
     }
 
     async fn stat_fs(&self) -> Result<StatFsSnapshot, MetaError> {
-        // PM06 keeps aggregate usage out of the hot manifest so opening a
+        // PM10 keeps aggregate usage out of the hot manifest so opening a
         // mount never requires scanning every inode page. Report the stable
         // default capacity until a future manifest adds authenticated totals.
         Ok(stat_fs_snapshot_from_usage(0, 0))
@@ -557,7 +1041,11 @@ where
     }
     async fn stat_fresh(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
         let inode = Self::inode(ino)?;
-        if inode == self.manifest.root_inode {
+        let manifest = self.context.snapshot.manifest();
+        if inode == manifest.root_inode {
+            if let Some(source) = &manifest.source {
+                return Ok(Some(attr_from_root(&source.root)));
+            }
             return Ok(Some(FileAttr {
                 ino,
                 size: 0,
@@ -576,21 +1064,22 @@ where
         // II05 carries the complete hot attribute set.  Use it directly for
         // getattr/open so a metadata-only operation does not fetch or clone a
         // GroupMeta page merely to reconstruct FileAttr.
-        if let Some(index) = self.catalog.inode_paged(inode).await.map_err(map_error)? {
-            return Ok(Some(attr_from_inode_index(&index)));
+        if let Some(index) = self.index_entry(inode).await? {
+            return Ok(Some(
+                self.with_source_blocks(attr_from_inode_index(&index))
+                    .await?,
+            ));
         }
-        Ok(self
-            .entry(inode)
-            .await?
-            .map(|(_, entry)| attr(inode, &entry)))
+        match self.entry(inode).await? {
+            Some(entry) => Ok(Some(self.with_source_blocks(attr(inode, &entry)).await?)),
+            None => Ok(None),
+        }
     }
     async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
         let parent = Self::inode(parent)?;
         let entry = self
-            .catalog
-            .lookup_entry_paged(self.parent_key(parent), name.as_bytes())
-            .await
-            .map_err(map_error)?;
+            .lookup_entry(self.parent_key(parent), name.as_bytes())
+            .await?;
         entry
             .map(|entry| {
                 i64::try_from(entry.inode)
@@ -605,16 +1094,17 @@ where
     ) -> Result<Option<(i64, FileAttr)>, MetaError> {
         let parent = Self::inode(parent)?;
         let Some(entry) = self
-            .catalog
-            .lookup_entry_paged(self.parent_key(parent), name.as_bytes())
-            .await
-            .map_err(map_error)?
+            .lookup_entry(self.parent_key(parent), name.as_bytes())
+            .await?
         else {
             return Ok(None);
         };
         let inode = i64::try_from(entry.inode)
             .map_err(|_| MetaError::Internal("packed inode exceeds i64".into()))?;
-        Ok(Some((inode, attr(entry.inode, &entry))))
+        Ok(Some((
+            inode,
+            self.with_source_blocks(attr(entry.inode, &entry)).await?,
+        )))
     }
     async fn lookup_with_attr_bytes(
         &self,
@@ -622,17 +1112,15 @@ where
         name: &[u8],
     ) -> Result<Option<(i64, FileAttr)>, MetaError> {
         let parent = Self::inode(parent)?;
-        let Some(entry) = self
-            .catalog
-            .lookup_entry_paged(self.parent_key(parent), name)
-            .await
-            .map_err(map_error)?
-        else {
+        let Some(entry) = self.lookup_entry(self.parent_key(parent), name).await? else {
             return Ok(None);
         };
         let inode = i64::try_from(entry.inode)
             .map_err(|_| MetaError::Internal("packed inode exceeds i64".into()))?;
-        Ok(Some((inode, attr(entry.inode, &entry))))
+        Ok(Some((
+            inode,
+            self.with_source_blocks(attr(entry.inode, &entry)).await?,
+        )))
     }
     async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError> {
         if path.is_empty() || !path.starts_with('/') {
@@ -679,12 +1167,12 @@ where
     }
     async fn opendir(&self, ino: i64) -> Result<DirHandle, MetaError> {
         let inode = Self::inode(ino)?;
-        let is_dir = if inode == self.manifest.root_inode {
+        let is_dir = if inode == self.context.snapshot.manifest().root_inode {
             true
         } else {
             self.entry(inode)
                 .await?
-                .map(|(_, entry)| file_type(entry.kind, entry.mode).is_dir())
+                .map(|entry| file_type(entry.kind, entry.mode).is_dir())
                 .ok_or(MetaError::NotFound(ino))?
         };
         if !is_dir {
@@ -693,8 +1181,7 @@ where
         Ok(DirHandle::new_paged(
             ino,
             Arc::new(PackedDirectoryPageSource {
-                catalog: Arc::clone(&self.catalog),
-                manifest: Arc::clone(&self.manifest),
+                context: Arc::clone(&self.context),
             }),
         ))
     }
@@ -778,13 +1265,34 @@ where
     }
     async fn get_names(&self, ino: i64) -> Result<Vec<(Option<i64>, String)>, MetaError> {
         let inode = Self::inode(ino)?;
-        let Some(index) = self.catalog.inode_paged(inode).await.map_err(map_error)? else {
-            return Ok(Vec::new());
-        };
-        Ok(vec![(
-            Some(index.parent_inode as i64),
-            String::from_utf8(index.name).map_err(|_| MetaError::InvalidFilename)?,
-        )])
+        let context = &self.context;
+        let mut result = Vec::new();
+        let mut after = None;
+        let mut bytes = 0usize;
+        loop {
+            let page = context
+                .snapshot
+                .reverse_names_page(&context.reader, inode, after.as_deref(), 256)
+                .await
+                .map_err(map_error)?;
+            if page.is_empty() {
+                break;
+            }
+            for location in page {
+                after = Some(location.reverse_key());
+                bytes = bytes.saturating_add(location.hot.name.len() + 32);
+                if result.len() >= 4096 || bytes > 256 * 1024 {
+                    return Err(MetaError::Internal(
+                        "use paged reverse index for large hardlink sets".into(),
+                    ));
+                }
+                result.push((
+                    Some(location.hot.parent_inode as i64),
+                    String::from_utf8(location.hot.name).map_err(|_| MetaError::InvalidFilename)?,
+                ));
+            }
+        }
+        Ok(result)
     }
     async fn get_dentries(&self, ino: i64) -> Result<Vec<(i64, String)>, MetaError> {
         Ok(self
@@ -797,62 +1305,142 @@ where
     async fn get_dir_parent(&self, dir_ino: i64) -> Result<Option<i64>, MetaError> {
         let inode = Self::inode(dir_ino)?;
         Ok(self
-            .catalog
-            .inode_paged(inode)
-            .await
-            .map_err(map_error)?
+            .index_entry(inode)
+            .await?
             .map(|entry| entry.parent_inode as i64))
     }
     async fn get_paths(&self, ino: i64) -> Result<Vec<String>, MetaError> {
-        let inode = Self::inode(ino)?;
-        if inode == self.manifest.root_inode {
-            return Ok(vec![String::from("/")]);
-        }
-
-        // The inode index already carries the parent and raw dentry name.
-        // Walk only this inode's ancestor chain; do not scan directory groups
-        // or materialize a reverse path table for the whole snapshot.
-        let mut components = Vec::new();
-        let mut current = inode;
-        let mut depth = 0usize;
-        while current != self.manifest.root_inode {
-            depth = depth.saturating_add(1);
-            if depth > 1024 {
-                return Err(MetaError::Internal(
-                    "packed v3 inode path exceeds maximum depth".into(),
-                ));
-            }
-            let Some(entry) = self.catalog.inode_paged(current).await.map_err(map_error)? else {
-                return Ok(Vec::new());
-            };
-            if entry.name.is_empty()
-                || entry.name == b"."
-                || entry.name == b".."
-                || entry.name.contains(&b'/')
-            {
-                return Err(MetaError::InvalidFilename);
-            }
-            components.push(entry.name);
-            current = entry.parent_inode;
-        }
-
-        components.reverse();
-        let mut path = String::new();
-        for component in components {
-            let component = String::from_utf8(component).map_err(|_| MetaError::InvalidFilename)?;
-            path.push('/');
-            path.push_str(&component);
-        }
-        Ok(vec![if path.is_empty() {
-            String::from("/")
-        } else {
-            path
-        }])
+        self.get_paths_bytes(ino)
+            .await?
+            .into_iter()
+            .map(|path| String::from_utf8(path).map_err(|_| MetaError::InvalidFilename))
+            .collect()
     }
-    async fn read_symlink(&self, _ino: i64) -> Result<String, MetaError> {
-        Err(MetaError::NotSupported(
-            "packed v3 symlink targets are not present in GM06; BRFCA004 is not published".into(),
-        ))
+    async fn get_paths_bytes(&self, ino: i64) -> Result<Vec<Vec<u8>>, MetaError> {
+        Ok(self.get_paths_bytes_owned(ino).await?.paths)
+    }
+    async fn get_paths_bytes_owned(
+        &self,
+        ino: i64,
+    ) -> Result<crate::meta::layer::OwnedPaths, MetaError> {
+        let context = &self.context;
+        // <=256 KiB path bytes, <=4096 Vec headers and the consumer's ancestor
+        // component vector remain charged until the returned guard is dropped.
+        let permit = context
+            .budget
+            .admit(&[(super::wire005::V3BudgetPool::Output, 1 << 20)])
+            .map_err(map_error)?;
+        let guard: crate::meta::layer::MetadataMemoryGuard = Arc::new(ReadonlyPathsOwner {
+            _permit: permit,
+            _context: self.context.clone(),
+        });
+        let inode = Self::inode(ino)?;
+        let root_inode = context.snapshot.manifest().root_inode;
+        if inode == root_inode {
+            context.budget.admit(&[]).map_err(map_error)?;
+            return Ok(crate::meta::layer::OwnedPaths {
+                paths: vec![b"/".to_vec()],
+                guard: Some(guard),
+            });
+        }
+        let mut paths = Vec::new();
+        let mut bytes = 0usize;
+        let mut after = None;
+        loop {
+            let page = context
+                .snapshot
+                .reverse_names_page(&context.reader, inode, after.as_deref(), 256)
+                .await
+                .map_err(map_error)?;
+            if page.is_empty() {
+                break;
+            }
+            for location in page {
+                after = Some(location.reverse_key());
+                if paths.len() >= 4096 {
+                    return Err(MetaError::Internal(
+                        "use paged reverse index for large hardlink sets".into(),
+                    ));
+                }
+                let mut components = vec![location.hot.name];
+                let mut path_bytes = components[0].len() + 1;
+                let mut current = location.hot.parent_inode;
+                let mut depth = 0;
+                while current != root_inode {
+                    depth += 1;
+                    if depth > 1024 {
+                        return Err(MetaError::Internal(
+                            "packed inode ancestor chain is cyclic/overlong".into(),
+                        ));
+                    }
+                    let entry = self.index_entry(current).await?.ok_or_else(|| {
+                        MetaError::Internal("packed ancestor inode is missing".into())
+                    })?;
+                    path_bytes = path_bytes.saturating_add(entry.name.len() + 1);
+                    if bytes.saturating_add(path_bytes) > 256 * 1024 {
+                        return Err(MetaError::Internal(
+                            "packed reverse paths exceed bounded compatibility output".into(),
+                        ));
+                    }
+                    components.push(entry.name);
+                    current = entry.parent_inode;
+                }
+                bytes = bytes.saturating_add(path_bytes);
+                if bytes > 256 * 1024 {
+                    return Err(MetaError::Internal(
+                        "packed reverse paths exceed bounded compatibility output".into(),
+                    ));
+                }
+                let mut path = Vec::with_capacity(path_bytes);
+                for component in components.into_iter().rev() {
+                    path.push(b'/');
+                    path.extend_from_slice(&component);
+                }
+                paths.push(path);
+            }
+        }
+        context.budget.admit(&[]).map_err(map_error)?;
+        Ok(crate::meta::layer::OwnedPaths {
+            paths,
+            guard: Some(guard),
+        })
+    }
+    async fn read_symlink(&self, ino: i64) -> Result<String, MetaError> {
+        String::from_utf8(self.read_symlink_bytes(ino).await?)
+            .map_err(|_| MetaError::InvalidFilename)
+    }
+    async fn read_symlink_bytes(&self, ino: i64) -> Result<Vec<u8>, MetaError> {
+        let context = &self.context;
+        let inode = Self::inode(ino)?;
+        let location = context
+            .snapshot
+            .lookup_inode(&context.reader, inode)
+            .await
+            .map_err(map_error)?
+            .ok_or(MetaError::NotFound(ino))?;
+        if location.hot.kind != 3 {
+            return Err(MetaError::NotSupported(
+                "readlink requires a symlink".into(),
+            ));
+        }
+        let attrs = context
+            .snapshot
+            .cold_attributes_owned(&context.client, &context.reader, inode)
+            .await
+            .map_err(map_error)?
+            .ok_or_else(|| {
+                MetaError::Internal("symlink has no authenticated cold attributes".into())
+            })?;
+        let target = attrs
+            .symlink_target
+            .as_ref()
+            .ok_or_else(|| MetaError::Internal("symlink cold object has no target".into()))?;
+        if target.len() as u64 != location.hot.size {
+            return Err(MetaError::Internal(
+                "symlink cold target length disagrees with inode".into(),
+            ));
+        }
+        Ok(target.clone())
     }
     async fn set_attr(
         &self,
@@ -875,6 +1463,21 @@ where
         self.stat_fresh(ino).await?.ok_or(MetaError::NotFound(ino))
     }
     async fn close(&self, _ino: i64) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn record_open(
+        &self,
+        _ino: i64,
+        _attr: FileAttr,
+        _read: bool,
+        write: bool,
+        append: bool,
+    ) -> Result<(), MetaError> {
+        // VFS fresh/cached opens bypass MetaLayer::open. Reject them before
+        // allocating a writable handle or activating writeback state.
+        if write || append {
+            return Self::readonly().await;
+        }
         Ok(())
     }
     async fn write(
@@ -901,15 +1504,23 @@ where
         {
             return Err(MetaError::Internal("invalid packed v3 chunk id".into()));
         }
-        let Some(locator) = self
-            .catalog
-            .lookup_inode_locator(ino as u64)
-            .await
-            .map_err(map_error)?
-        else {
+        let Some(entry) = self.entry(ino as u64).await? else {
             return Err(MetaError::NotFound(ino));
         };
-        self.chunk_slices(chunk_id, &locator.entry, chunk_index)
+        let context = &self.context;
+        if matches!(
+            context
+                .snapshot
+                .placement(&context.reader, ino as u64, entry.size)
+                .await
+                .map_err(map_error)?,
+            Some(super::wire005::V3Placement::External { .. })
+        ) {
+            return Err(MetaError::Internal(
+                "external packed data requires the unified read provider".into(),
+            ));
+        }
+        self.chunk_slices(chunk_id, &entry, chunk_index)
     }
     async fn append_slice(&self, _chunk_id: u64, _slice: SliceDesc) -> Result<(), MetaError> {
         Self::readonly().await
@@ -921,6 +1532,8 @@ where
         Ok(())
     }
     async fn shutdown_session(&self) -> Result<(), MetaError> {
+        self.drain_packed_transport().await?;
+        self.context.budget.close();
         Ok(())
     }
     async fn get_plock(
@@ -962,13 +1575,84 @@ where
     ) -> Result<(), MetaError> {
         Self::readonly().await
     }
-    async fn get_xattr(&self, _inode: i64, _name: &str) -> Result<Option<Vec<u8>>, MetaError> {
-        Ok(None)
+    async fn get_xattr(&self, inode: i64, name: &str) -> Result<Option<Vec<u8>>, MetaError> {
+        self.get_xattr_bytes(inode, name.as_bytes()).await
     }
-    async fn list_xattr(&self, _inode: i64) -> Result<Vec<String>, MetaError> {
-        Ok(Vec::new())
+    async fn get_xattr_bytes(&self, inode: i64, name: &[u8]) -> Result<Option<Vec<u8>>, MetaError> {
+        let context = &self.context;
+        let Some(attrs) = context
+            .snapshot
+            .cold_attributes_owned(&context.client, &context.reader, Self::inode(inode)?)
+            .await
+            .map_err(map_error)?
+        else {
+            return Ok(None);
+        };
+        Ok(attrs
+            .xattrs
+            .iter()
+            .find(|attr| attr.name == name)
+            .map(|attr| attr.value.clone()))
+    }
+    async fn list_xattr(&self, inode: i64) -> Result<Vec<String>, MetaError> {
+        self.list_xattr_bytes(inode)
+            .await?
+            .into_iter()
+            .map(|name| String::from_utf8(name).map_err(|_| MetaError::InvalidFilename))
+            .collect()
+    }
+    async fn list_xattr_bytes(&self, inode: i64) -> Result<Vec<Vec<u8>>, MetaError> {
+        Ok(self.list_xattr_bytes_owned(inode).await?.names)
+    }
+    async fn list_xattr_bytes_owned(
+        &self,
+        inode: i64,
+    ) -> Result<crate::meta::layer::OwnedXattrNames, MetaError> {
+        let context = &self.context;
+        let permit = context
+            .budget
+            .admit(&[(super::wire005::V3BudgetPool::Output, 2 << 20)])
+            .map_err(map_error)?;
+        let Some(attrs) = context
+            .snapshot
+            .cold_attributes_owned(&context.client, &context.reader, Self::inode(inode)?)
+            .await
+            .map_err(map_error)?
+        else {
+            return Ok(crate::meta::layer::OwnedXattrNames {
+                names: Vec::new(),
+                guard: Some(Arc::new(permit)),
+            });
+        };
+        if attrs
+            .xattrs
+            .iter()
+            .map(|attr| attr.name.len() + 1)
+            .sum::<usize>()
+            > 65536
+        {
+            return Err(MetaError::Io(std::io::Error::from_raw_os_error(
+                libc::E2BIG,
+            )));
+        }
+        Ok(crate::meta::layer::OwnedXattrNames {
+            names: attrs.xattrs.iter().map(|attr| attr.name.clone()).collect(),
+            guard: Some(Arc::new(permit)),
+        })
     }
     async fn remove_xattr(&self, _inode: i64, _name: &str) -> Result<(), MetaError> {
+        Self::readonly().await
+    }
+    async fn set_xattr_bytes(
+        &self,
+        _inode: i64,
+        _name: &[u8],
+        _value: &[u8],
+        _flags: u32,
+    ) -> Result<(), MetaError> {
+        Self::readonly().await
+    }
+    async fn remove_xattr_bytes(&self, _inode: i64, _name: &[u8]) -> Result<(), MetaError> {
         Self::readonly().await
     }
     async fn set_acl(&self, _inode: i64, _rule: AclRule) -> Result<(), MetaError> {
@@ -976,11 +1660,24 @@ where
     }
     async fn get_acl(
         &self,
-        _inode: i64,
-        _acl_type: u8,
-        _acl_id: u32,
+        inode: i64,
+        acl_type: u8,
+        acl_id: u32,
     ) -> Result<Option<AclRule>, MetaError> {
-        Ok(None)
+        let context = &self.context;
+        let Some(attrs) = context
+            .snapshot
+            .cold_attributes_owned(&context.client, &context.reader, Self::inode(inode)?)
+            .await
+            .map_err(map_error)?
+        else {
+            return Ok(None);
+        };
+        Ok(attrs
+            .acl
+            .iter()
+            .find(|rule| rule.acl_type == acl_type && rule.qualifier == acl_id)
+            .cloned())
     }
 }
 
@@ -992,9 +1689,147 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
         limit: usize,
     ) -> Result<Vec<GroupMetaEntry>, MetaError> {
         let parent = Self::inode(ino)?;
-        self.catalog
-            .readdir_page(self.parent_key(parent), child_offset, limit)
+        let context = &self.context;
+        context
+            .snapshot
+            .readdir_page(
+                &context.client,
+                &context.reader,
+                self.parent_key(parent),
+                child_offset as u64,
+                limit,
+                512 * 1024,
+            )
             .await
             .map_err(map_error)
+    }
+}
+
+#[async_trait]
+impl<B: ObjectBackend + Clone + 'static> crate::chunk::read_plan::WorkspaceReadPlanProvider
+    for PackedV3ReadonlyMeta<B>
+{
+    fn max_read_bytes(&self) -> Option<usize> {
+        Some(self.context.budget.max_read_bytes())
+    }
+    fn reserve_read_output(
+        &self,
+        length: usize,
+    ) -> Result<Option<Box<dyn Send + Sync>>, MetaError> {
+        self.context
+            .budget
+            .output(length)
+            .map(|permit| Some(Box::new(permit) as Box<dyn Send + Sync>))
+            .map_err(map_error)
+    }
+    async fn read_plan(
+        &self,
+        _ino: i64,
+        _chunk_index: u64,
+        _offset: u64,
+        _len: u64,
+    ) -> Result<crate::chunk::read_plan::ResolvedReadPlan, MetaError> {
+        Err(MetaError::NotSupported(
+            "packed readonly uses prepared unified plans, not synthetic slices".into(),
+        ))
+    }
+    fn supports_prepared_unified_read(&self) -> bool {
+        true
+    }
+    async fn prepare_unified_read(
+        &self,
+        ino: i64,
+        chunk_index: u64,
+        offset: u64,
+        len: u64,
+    ) -> Result<Option<crate::chunk::read_plan::PreparedUnifiedRead>, MetaError> {
+        self.prepare_unified_read_observed(ino, chunk_index, offset, len, None)
+            .await
+    }
+
+    async fn prepare_unified_read_observed(
+        &self,
+        ino: i64,
+        chunk_index: u64,
+        offset: u64,
+        len: u64,
+        delivery: Option<Arc<crate::cadapter::read_observer::OperationDelivery>>,
+    ) -> Result<Option<crate::chunk::read_plan::PreparedUnifiedRead>, MetaError> {
+        let context = &self.context;
+        let base = chunk_index
+            .checked_mul(self.chunk_size)
+            .ok_or_else(|| MetaError::Internal("packed chunk base overflows".into()))?;
+        let absolute = base
+            .checked_add(offset)
+            .ok_or_else(|| MetaError::Internal("packed read offset overflows".into()))?;
+        let length = usize::try_from(len)
+            .map_err(|_| MetaError::Internal("packed read length exceeds usize".into()))?;
+        let mut prepared = context
+            .snapshot
+            .prepare_inode_read_observed(
+                &context.client,
+                &context.reader,
+                Self::inode(ino)?,
+                super::wire005::V3ReadRange {
+                    offset: absolute,
+                    length,
+                },
+                32 * 1024 * 1024,
+                delivery,
+            )
+            .await
+            .map_err(map_error)?;
+        for segment in &mut prepared.plan.segments {
+            segment.logical_offset = segment
+                .logical_offset
+                .checked_sub(base)
+                .ok_or_else(|| MetaError::Internal("packed plan precedes chunk base".into()))?;
+        }
+        prepared.plan.logical_size = prepared
+            .plan
+            .logical_size
+            .saturating_sub(base)
+            .min(self.chunk_size);
+        prepared
+            .plan
+            .validate(offset, len)
+            .map_err(|error| MetaError::Internal(error.to_string()))?;
+        Ok(Some(prepared))
+    }
+    fn record_unified_read_success(&self, bytes: u64) {
+        self.context
+            .metrics
+            .logical_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+    fn begin_unified_read_operation(
+        &self,
+        requested: u64,
+    ) -> Option<crate::cadapter::read_observer::TerminalGuard> {
+        let context = &self.context;
+        let observer = context.client.read_observer()?;
+        Some(
+            observer.start(
+                crate::cadapter::read_observer::Ledger::LogicalOperation,
+                context
+                    .client
+                    .read_context(crate::cadapter::read_observer::ReadClass::LogicalRead)?,
+                requested,
+            ),
+        )
+    }
+    async fn range_has_data(&self, ino: i64, offset: u64, len: u64) -> Result<bool, MetaError> {
+        let Some(entry) = self.entry(Self::inode(ino)?).await? else {
+            return Err(MetaError::NotFound(ino));
+        };
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| MetaError::Internal("packed range end overflows".into()))?;
+        if !entry.inline_data.is_empty() {
+            return Ok(len > 0 && offset < entry.size);
+        }
+        Ok(entry.extents.iter().any(|extent| {
+            extent.file_offset < end && extent.file_offset + u64::from(extent.logical_len) > offset
+        }))
     }
 }

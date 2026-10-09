@@ -8,20 +8,21 @@ use brewfs::workspace_overlay::catalog::{
     CreateSnapshot, CreateVolumeRoot, CreateWorkspace, MarkDeleting, WorkspaceStore,
 };
 use brewfs::workspace_overlay::error::WorkspaceError;
-use brewfs::workspace_overlay::ids::{LayerId, SnapshotId, WorkspaceId};
+use brewfs::workspace_overlay::ids::{LayerId, LeaseId, SnapshotId, WorkspaceId};
 use brewfs::workspace_overlay::lifecycle::{
     NoopDurableRemoteBarrier, WorkspaceLifecycle, WorkspaceMountSession,
 };
 use brewfs::workspace_overlay::model::{
-    BaseRevision, LayerState, LeaseState, SnapshotLease, WorkspaceRecord, WorkspaceState,
-    WORKSPACE_SCHEMA_VERSION,
+    BaseRevision, LayerState, LeaseState, SnapshotLease, VolumeHeader, WorkspaceRecord,
+    WorkspaceState, WORKSPACE_SCHEMA_VERSION,
 };
 use brewfs::workspace_overlay::stores::kv_store::KvWorkspaceStore;
-use brewfs::workspace_overlay::stores::redis::RedisWorkspaceBackend;
-use brewfs::workspace_overlay::stores::tikv::TiKvWorkspaceBackend;
 use uuid::Uuid;
 
-use super::crd::{WorkspaceCatalogBackend, WorkspaceClusterSpec, WorkspaceRevision};
+use super::crd::{WorkspaceClusterSpec, WorkspaceRevision};
+
+// This facade bootstraps the native catalog; it does not advertise packed lower support.
+const OPERATOR_VOLUME_FORMAT: &str = "workspace-v1";
 
 #[derive(Clone, Debug)]
 pub struct VolumeIdentity {
@@ -38,6 +39,8 @@ pub struct VolumeView {
     pub volume_id: Uuid,
     pub root_snapshot_id: SnapshotId,
     pub root_revision: BaseRevision,
+    pub packed_binding:
+        Option<brewfs::workspace_overlay::publish::binding::PackedLowerBindingRecord>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +75,122 @@ pub struct SnapshotView {
 
 #[async_trait]
 pub trait WorkspaceAdmin: Send + Sync {
+    /// Transfer this administrator's owned authenticated scope into a GC owner.
+    async fn packed_gc_admin(
+        self: Arc<Self>,
+    ) -> anyhow::Result<Arc<dyn brewfs::workspace_overlay::packed_admin::PackedGcAdmin>> {
+        bail!("this workspace administrator has no packed-v3 GC capability")
+    }
+    async fn packed_binding(
+        &self,
+        _id: WorkspaceId,
+    ) -> anyhow::Result<Option<brewfs::workspace_overlay::publish::binding::PackedLowerBindingRecord>>
+    {
+        Ok(None)
+    }
+    async fn ensure_packed_workspace(
+        &self,
+        _request: EnsureWorkspaceRequest,
+    ) -> anyhow::Result<WorkspaceView> {
+        bail!("packed-v3 carrier fork is unsupported")
+    }
+    async fn verify_clean_packed_mount(
+        &self,
+        _reference: brewfs::workspace_overlay::packed_admin::PackedReleasedMountReference,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    async fn clean_released_packed_mount(
+        &self,
+        _workspace: WorkspaceId,
+    ) -> anyhow::Result<Option<brewfs::workspace_overlay::packed_admin::PackedReleasedMountReference>>
+    {
+        Ok(None)
+    }
+    async fn recovered_packed_mount(
+        &self,
+        _workspace: WorkspaceId,
+    ) -> anyhow::Result<Option<brewfs::workspace_overlay::packed_admin::PackedRecoveredMountReport>>
+    {
+        Ok(None)
+    }
+    /// Routing report only; the recovery driver must acquire the next owner
+    /// with the actual Redis/TiKV same-snapshot expiry/CAS protocol.
+    async fn expired_packed_mount_recovery(
+        &self,
+        _original: brewfs::workspace_overlay::packed_admin::PackedReleasedMountReference,
+    ) -> anyhow::Result<
+        Option<(
+            brewfs::workspace_overlay::packed_admin::PackedReleasedMountReference,
+            u64,
+        )>,
+    > {
+        Ok(None)
+    }
+    /// Facts-only retry hint for an attempt whose lease never acquired authority.
+    async fn unstarted_packed_mount_recovery(
+        &self,
+        _original: brewfs::workspace_overlay::packed_admin::PackedReleasedMountReference,
+        _failed_lease: LeaseId,
+        _next_lease: LeaseId,
+    ) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
+    /// Cleanup-only original PCR verification, including a consumed source.
+    async fn original_packed_mount_for_cleanup(
+        &self,
+        _original: brewfs::workspace_overlay::packed_admin::PackedReleasedMountReference,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    /// Cleanup-only proof for this exact original mounted session. This report
+    /// does not grant snapshot publication or mutable recovery authority.
+    async fn packed_mount_recovery_for_cleanup(
+        &self,
+        _original: brewfs::workspace_overlay::packed_admin::PackedReleasedMountReference,
+    ) -> anyhow::Result<Option<brewfs::workspace_overlay::packed_admin::PackedRecoveredMountReport>>
+    {
+        Ok(None)
+    }
+    async fn clean_published_view(
+        &self,
+        _workspace: WorkspaceId,
+    ) -> anyhow::Result<Option<brewfs::workspace_overlay::packed_admin::PackedPublishedViewReport>>
+    {
+        Ok(None)
+    }
+    async fn clean_unmounted_packed_epoch(
+        &self,
+        _workspace: WorkspaceId,
+    ) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
+    async fn pin_clean_packed_snapshot(
+        &self,
+        _workspace: WorkspaceId,
+        _request: EnsureSnapshotRequest,
+    ) -> anyhow::Result<SnapshotView> {
+        bail!("verified packed-v3 source pin is unsupported")
+    }
+    async fn verify_packed_revision(&self, _revision: &BaseRevision) -> anyhow::Result<()> {
+        bail!("packed-v3 carrier inspection is unsupported")
+    }
+    async fn publish_packed_snapshot(
+        &self,
+        _reference: brewfs::workspace_overlay::packed_admin::PackedReleasedMountReference,
+        _request: EnsureSnapshotRequest,
+        _ttl_seconds: u32,
+    ) -> anyhow::Result<SnapshotView> {
+        bail!("packed-v3 snapshot is unsupported")
+    }
+    async fn recover_packed_snapshot(
+        &self,
+        _workspace: WorkspaceId,
+        _request: EnsureSnapshotRequest,
+        _ttl_seconds: u32,
+    ) -> anyhow::Result<SnapshotView> {
+        bail!("packed-v3 snapshot recovery is unsupported")
+    }
     async fn ensure_volume(&self, identity: VolumeIdentity) -> anyhow::Result<VolumeView>;
     async fn ensure_workspace(
         &self,
@@ -93,46 +212,9 @@ pub trait WorkspaceAdmin: Send + Sync {
     ) -> anyhow::Result<(WorkspaceView, SnapshotView)>;
     async fn delete_snapshot(&self, id: SnapshotId) -> anyhow::Result<()>;
     async fn mark_workspace_deleting(&self, id: WorkspaceId, force: bool) -> anyhow::Result<()>;
-    async fn recover_incomplete_seals(&self) -> anyhow::Result<()>;
     async fn reap_expired_leases(&self) -> anyhow::Result<u64>;
     async fn list_workspaces(&self) -> anyhow::Result<Vec<WorkspaceRecord>>;
     async fn list_snapshots(&self) -> anyhow::Result<Vec<SnapshotView>>;
-}
-
-pub async fn connect_workspace_admin(
-    cluster_name: &str,
-    kubernetes_namespace: &str,
-    redis_port: i32,
-    spec: &WorkspaceClusterSpec,
-    redis_password: Option<&str>,
-) -> anyhow::Result<Arc<dyn WorkspaceAdmin>> {
-    spec.validate().map_err(|error| anyhow!(error))?;
-    let catalog_namespace = catalog_namespace(cluster_name, kubernetes_namespace, spec);
-    match spec.catalog_backend {
-        WorkspaceCatalogBackend::Redis => {
-            let password = redis_password
-                .filter(|password| !password.is_empty())
-                .ok_or_else(|| anyhow!("Redis workspace catalog password is missing"))?;
-            let url = format!(
-                "redis://:{password}@{cluster_name}-workspace-redis.{kubernetes_namespace}.svc.cluster.local:{redis_port}/"
-            );
-            let backend = RedisWorkspaceBackend::connect(&url, &catalog_namespace)
-                .await
-                .context("connect authenticated Redis workspace catalog")?;
-            Ok(Arc::new(StoreWorkspaceAdmin::new(KvWorkspaceStore::new(
-                backend,
-            ))))
-        }
-        WorkspaceCatalogBackend::TiKv => {
-            let backend =
-                TiKvWorkspaceBackend::connect(spec.tikv_pd_endpoints.clone(), &catalog_namespace)
-                    .await
-                    .context("connect TiKV workspace catalog")?;
-            Ok(Arc::new(StoreWorkspaceAdmin::new(KvWorkspaceStore::new(
-                backend,
-            ))))
-        }
-    }
 }
 
 pub fn catalog_namespace(
@@ -165,27 +247,12 @@ where
     async fn ensure_volume(&self, identity: VolumeIdentity) -> anyhow::Result<VolumeView> {
         self.store.initialize_workspace_schema().await?;
         match self.store.load_volume_header().await? {
-            Some(header) => {
-                if header.volume_id != identity.volume_id {
-                    bail!(
-                        "workspace catalog is owned by volume {}, expected {}",
-                        header.volume_id,
-                        identity.volume_id
-                    );
-                }
-                if header.volume_format != "workspace-v1"
-                    || header.schema_version != WORKSPACE_SCHEMA_VERSION
-                {
-                    bail!(
-                        "workspace volume format mismatch: format={} schemaVersion={}",
-                        header.volume_format,
-                        header.schema_version
-                    );
-                }
-            }
+            Some(header) => validate_operator_volume_header(&header, identity.volume_id)?,
             None => {
                 self.store
                     .create_volume_root(CreateVolumeRoot {
+                        volume_format: OPERATOR_VOLUME_FORMAT.into(),
+                        schema_version: WORKSPACE_SCHEMA_VERSION,
                         volume_id: identity.volume_id,
                         workspace_id: identity.root_workspace_id,
                         root_layer_id: identity.root_layer_id,
@@ -211,6 +278,7 @@ where
             volume_id: identity.volume_id,
             root_snapshot_id: identity.root_snapshot_id,
             root_revision: root.base_revision,
+            packed_binding: None,
         })
     }
 
@@ -411,13 +479,6 @@ where
         }
     }
 
-    async fn recover_incomplete_seals(&self) -> anyhow::Result<()> {
-        WorkspaceLifecycle::new(self.store.clone())
-            .recover_incomplete_seals()
-            .await?;
-        Ok(())
-    }
-
     async fn reap_expired_leases(&self) -> anyhow::Result<u64> {
         Ok(self.store.reap_expired_leases().await?)
     }
@@ -438,6 +499,29 @@ where
             })
             .collect())
     }
+}
+
+fn validate_operator_volume_header(
+    header: &VolumeHeader,
+    expected_volume_id: Uuid,
+) -> anyhow::Result<()> {
+    if header.volume_id != expected_volume_id {
+        bail!(
+            "workspace catalog is owned by volume {}, expected {}",
+            header.volume_id,
+            expected_volume_id
+        );
+    }
+    if header.volume_format != OPERATOR_VOLUME_FORMAT
+        || header.schema_version != WORKSPACE_SCHEMA_VERSION
+    {
+        bail!(
+            "workspace volume format mismatch: format={} schemaVersion={}",
+            header.volume_format,
+            header.schema_version
+        );
+    }
+    Ok(())
 }
 
 fn revision_from_layer(
@@ -495,6 +579,122 @@ pub fn deterministic_uuid(scope: Uuid, value: &str) -> Uuid {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn native_volume_bootstrap_preserves_header_root_and_snapshot_on_retry() {
+        use brewfs::workspace_overlay::stores::database::SqliteWorkspaceStore;
+
+        let admin = StoreWorkspaceAdmin::new(
+            SqliteWorkspaceStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let identity = VolumeIdentity {
+            volume_id: Uuid::from_u128(1),
+            root_workspace_id: WorkspaceId::from_uuid(Uuid::from_u128(2)),
+            root_layer_id: LayerId::from_uuid(Uuid::from_u128(3)),
+            writable_layer_id: LayerId::from_uuid(Uuid::from_u128(4)),
+            root_snapshot_id: SnapshotId::from_uuid(Uuid::from_u128(5)),
+            owner_id: "k8s-cluster/test/native".into(),
+        };
+        let first = admin.ensure_volume(identity.clone()).await.unwrap();
+        let header = admin.store.load_volume_header().await.unwrap().unwrap();
+        let workspace = admin
+            .store
+            .load_workspace(identity.root_workspace_id)
+            .await
+            .unwrap();
+        let root = admin
+            .store
+            .load_layer(identity.root_layer_id)
+            .await
+            .unwrap();
+        let snapshot = admin
+            .store
+            .load_snapshot(identity.root_snapshot_id)
+            .await
+            .unwrap();
+
+        assert_eq!(header.volume_format, OPERATOR_VOLUME_FORMAT);
+        assert_eq!(header.schema_version, WORKSPACE_SCHEMA_VERSION);
+        assert_eq!(header.volume_id, identity.volume_id);
+        assert_eq!(workspace.head_layer_id, identity.writable_layer_id);
+        assert_eq!(
+            workspace.owner_id.as_deref(),
+            Some(identity.owner_id.as_str())
+        );
+        assert_eq!(root.state, LayerState::Sealed);
+        assert_eq!(root.schema_version, WORKSPACE_SCHEMA_VERSION);
+        assert_eq!(root.owner_workspace_id, None);
+        assert_eq!(root.parent_layer_id, None);
+        assert_eq!(root.depth, 1);
+        assert_eq!(first.root_revision.layer_id, identity.root_layer_id);
+        assert_eq!(snapshot.revision, first.root_revision);
+        assert_eq!(
+            snapshot.owner_id.as_deref(),
+            Some(identity.owner_id.as_str())
+        );
+
+        let retry = admin.ensure_volume(identity.clone()).await.unwrap();
+        assert_eq!(retry.volume_id, first.volume_id);
+        assert_eq!(retry.root_snapshot_id, first.root_snapshot_id);
+        assert_eq!(retry.root_revision, first.root_revision);
+        assert_eq!(
+            admin.store.load_volume_header().await.unwrap(),
+            Some(header)
+        );
+        assert_eq!(
+            admin
+                .store
+                .load_workspace(identity.root_workspace_id)
+                .await
+                .unwrap(),
+            workspace
+        );
+        assert_eq!(
+            admin
+                .store
+                .load_layer(identity.root_layer_id)
+                .await
+                .unwrap(),
+            root
+        );
+        assert_eq!(
+            admin
+                .store
+                .load_snapshot(identity.root_snapshot_id)
+                .await
+                .unwrap(),
+            snapshot
+        );
+        assert_eq!(admin.store.list_workspaces().await.unwrap().len(), 1);
+        assert_eq!(admin.store.list_snapshots().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn operator_header_guard_rejects_unsupported_formats_schema_and_owner() {
+        let expected_volume_id = Uuid::from_u128(1);
+        let header = VolumeHeader {
+            volume_format: OPERATOR_VOLUME_FORMAT.into(),
+            schema_version: WORKSPACE_SCHEMA_VERSION,
+            volume_id: expected_volume_id,
+            created_at_ns: 0,
+        };
+        validate_operator_volume_header(&header, expected_volume_id).unwrap();
+        for volume_format in ["packed-metadata-v3", "workspace-native-v2"] {
+            let unsupported = VolumeHeader {
+                volume_format: volume_format.into(),
+                ..header.clone()
+            };
+            assert!(validate_operator_volume_header(&unsupported, expected_volume_id).is_err());
+        }
+        let unsupported_schema = VolumeHeader {
+            schema_version: WORKSPACE_SCHEMA_VERSION + 1,
+            ..header.clone()
+        };
+        assert!(validate_operator_volume_header(&unsupported_schema, expected_volume_id).is_err());
+        assert!(validate_operator_volume_header(&header, Uuid::from_u128(99)).is_err());
+    }
+
     #[test]
     fn revision_status_round_trips_exact_identity() {
         let revision = BaseRevision {
@@ -519,3 +719,7 @@ mod tests {
         );
     }
 }
+
+#[path = "packed_admin.rs"]
+mod packed_admin;
+pub use packed_admin::connect_workspace_admin_for_cluster;

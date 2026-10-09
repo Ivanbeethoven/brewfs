@@ -337,9 +337,11 @@ impl DataSealBuilder {
             self.cluster_id,
             self.volume_id,
             object_len,
-            self.slices.len() as u64,
-            self.frames.len() as u64,
-            self.objects.len() as u64,
+            [
+                self.slices.len() as u64,
+                self.frames.len() as u64,
+                self.objects.len() as u64,
+            ],
             semantic_hash,
             &sections,
         )?;
@@ -559,16 +561,15 @@ fn validate_tables(
                     "raw_len must be non-zero",
                 ));
             }
-            if let Some((previous_frame, previous_end)) = previous {
-                if span.frame_ordinal < previous_frame
+            if let Some((previous_frame, previous_end)) = previous
+                && (span.frame_ordinal < previous_frame
                     || (span.frame_ordinal == previous_frame
-                        && span.raw_offset_in_frame < previous_end)
-                {
-                    return Err(WireError::invalid(
-                        "data seal span",
-                        "spans are not ordered",
-                    ));
-                }
+                        && span.raw_offset_in_frame < previous_end))
+            {
+                return Err(WireError::invalid(
+                    "data seal span",
+                    "spans are not ordered",
+                ));
             }
             let frame = frames.get(&span.frame_ordinal).ok_or_else(|| {
                 WireError::invalid(
@@ -1590,12 +1591,11 @@ fn encode_header(
     cluster_id: [u8; 16],
     volume_id: [u8; 16],
     object_len: u64,
-    slice_count: u64,
-    frame_count: u64,
-    object_count: u64,
+    counts: [u64; 3],
     semantic_hash: [u8; 32],
     sections: &[SectionRef; SECTION_COUNT],
 ) -> WireResult<()> {
+    let [slice_count, frame_count, object_count] = counts;
     if out.len() != DATA_SEAL_HEADER_LEN {
         return Err(WireError::invalid(
             "data seal header",
@@ -1620,16 +1620,16 @@ fn encode_header(
     Ok(())
 }
 
-pub(crate) fn decode_header(
-    bytes: &[u8],
-) -> WireResult<(
+pub(crate) type DecodedDataSealHeader = (
     [u8; 16],
     [u8; 16],
     u64,
     [u64; 3],
     [u8; 32],
     [SectionRef; SECTION_COUNT],
-)> {
+);
+
+pub(crate) fn decode_header(bytes: &[u8]) -> WireResult<DecodedDataSealHeader> {
     if bytes.len() != DATA_SEAL_HEADER_LEN || &bytes[..8] != DATA_SEAL_MAGIC {
         return Err(WireError::UnsupportedFormat("not a BRFDS002 header".into()));
     }

@@ -1524,7 +1524,7 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
         let length = u64::try_from(output.len())
             .map_err(|_| PackedWireError::LimitExceeded("packed read length exceeds u64".into()))?;
         let plan = self
-            .read_unified_plan_for_entry(&group, &entry, offset, length)
+            .read_unified_plan_for_entry(group, entry, offset, length)
             .await?;
         let container_ordinal = plan.segments.iter().find_map(|segment| {
             if let ReadSource::PackedFrame {
@@ -1867,7 +1867,7 @@ impl<B: ObjectBackend + Clone + 'static> RemoteGroupCatalog<B> {
                     .fetch_add(u64::from(group.meta_len), Ordering::Relaxed);
                 let remote = catalog.open_container(group.container_ordinal).await?;
                 let bytes = remote
-                    .read_range(u64::from(group.meta_offset), u64::from(group.meta_len))
+                    .read_range(group.meta_offset, u64::from(group.meta_len))
                     .await?;
                 let digest: [u8; 32] = Sha256::digest(&bytes).into();
                 if digest != group.metadata_digest {
@@ -3022,7 +3022,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dynamic_size_class_corpus_reads_inline_and_split_frames_through_catalog() {
+    async fn dynamic_size_class_corpus_reads_inline_and_split_frames_and_rejects_unproven_p90() {
         use super::super::{
             PackedFileInput, SizeClassTable, choose_frame_layout, pack_group_files,
         };
@@ -3078,8 +3078,19 @@ mod tests {
                 }
                 let table = SizeClassTable::default();
                 let decision = choose_frame_layout(size as u64, hint, profile, table).unwrap();
-                let (input, frames) =
-                    pack_group_files(1, [4; 32], files, profile, table, hint).unwrap();
+                let packed = pack_group_files(1, [4; 32], files, profile, table, hint);
+                if hint.is_some() {
+                    // A caller-supplied hint has no authenticated histogram
+                    // provenance and must fail before publishing any object.
+                    assert!(matches!(
+                        packed,
+                        Err(PackedWireError::UnsupportedFormat(message))
+                            if message.contains("authenticated histogram provenance")
+                    ));
+                    assert!(ranges.lock().unwrap().is_empty());
+                    continue;
+                }
+                let (input, frames) = packed.unwrap();
                 let meta = GroupMeta::decode(&input.metadata).unwrap();
                 let object = PackedGroupContainer::build(1, profile, vec![input], frames).unwrap();
                 let opened = PackedGroupContainer::open(object.clone()).unwrap();

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use super::layout::{AccessProfile, SizeClass, SizeClassTable, choose_frame_layout};
+use super::layout::{AccessProfile, SizeClass, SizeClassTable};
 use super::meta::{
     GROUP_META_HEADER_LEN, GroupMeta, GroupMetaEntry, GroupMetaExtent, INLINE_DATA_FLAG,
     INLINE_FILE_MAX_BYTES, INLINE_GROUP_DATA_BUDGET_BYTES, MAX_GROUP_META_BYTES,
@@ -118,7 +118,7 @@ pub fn parse_frame_directory(
     parse_frame_descriptor_range(
         directory
             .get(table_offset..table_end)
-            .ok_or_else(|| PackedWireError::Truncated {
+            .ok_or(PackedWireError::Truncated {
                 what: "packed group frame directory",
                 need: table_end,
                 have: directory.len(),
@@ -136,7 +136,7 @@ pub fn parse_frame_descriptor_range(
     object_len: u64,
     first_ordinal: u32,
 ) -> PackedResult<Vec<PackedFrameDescriptor>> {
-    if records.len() % FRAME_RECORD_LEN != 0 {
+    if !records.len().is_multiple_of(FRAME_RECORD_LEN) {
         return Err(PackedWireError::Truncated {
             what: "packed group frame descriptor range",
             need: records.len() + (FRAME_RECORD_LEN - records.len() % FRAME_RECORD_LEN),
@@ -199,12 +199,12 @@ pub fn parse_frame_descriptor_range(
                 "frame payload range is outside object body".into(),
             ));
         }
-        if let Some(previous_end) = previous_end {
-            if object_offset < previous_end {
-                return Err(PackedWireError::Invalid(
-                    "frame payload ranges are not canonical or overlap".into(),
-                ));
-            }
+        if let Some(previous_end) = previous_end
+            && object_offset < previous_end
+        {
+            return Err(PackedWireError::Invalid(
+                "frame payload ranges are not canonical or overlap".into(),
+            ));
         }
         previous_end = Some(end);
         frames.push(PackedFrameDescriptor {
@@ -459,7 +459,7 @@ pub fn pack_group_file_shards(
                     &file,
                     profile,
                     size_classes,
-                    p90_requested_range,
+                    super::wire005::V3BuildPolicy::default(),
                     limits.max_metadata_bytes,
                 ));
         if should_flush {
@@ -649,7 +649,7 @@ fn metadata_budget_allows(
     next: &PackedFileInput,
     profile: AccessProfile,
     size_classes: SizeClassTable,
-    p90_requested_range: Option<u64>,
+    policy: super::wire005::V3BuildPolicy,
     max_metadata_bytes: usize,
 ) -> bool {
     let fixed_bytes = GROUP_META_HEADER_LEN.saturating_add(
@@ -672,17 +672,18 @@ fn metadata_budget_allows(
     let mut extent_bytes = 0usize;
     for file in current.iter().chain(std::iter::once(next)) {
         let size = file.data.len();
-        let inline = size != 0
+        let inline = policy.inline_data
+            && size != 0
             && file.kind == 1
             && size < INLINE_FILE_MAX_BYTES
             && inline_bytes.saturating_add(size) <= inline_budget;
         if inline {
             inline_bytes = inline_bytes.saturating_add(size);
         } else if size != 0 {
-            let frame_bytes =
-                choose_frame_layout(size as u64, p90_requested_range, profile, size_classes)
-                    .map(|decision| decision.frame_raw_bytes.max(1) as usize)
-                    .unwrap_or(1);
+            let frame_bytes = policy
+                .select(size as u64, profile, size_classes)
+                .map(|decision| decision.frame_raw_bytes.max(1) as usize)
+                .unwrap_or(1);
             extent_bytes =
                 extent_bytes.saturating_add(size.div_ceil(frame_bytes).saturating_mul(24));
         }
@@ -734,11 +735,56 @@ struct FrameBuilder {
 pub fn pack_group_files(
     group_id: u64,
     parent_dir_key: [u8; 32],
-    mut files: Vec<PackedFileInput>,
+    files: Vec<PackedFileInput>,
     profile: AccessProfile,
     size_classes: SizeClassTable,
     p90_requested_range: Option<u64>,
 ) -> PackedResult<(PackedGroupInput, Vec<PackedFrameInput>)> {
+    pack_group_files_policy_inner(
+        group_id,
+        parent_dir_key,
+        files,
+        profile,
+        size_classes,
+        p90_requested_range,
+        super::wire005::V3BuildPolicy::default(),
+    )
+}
+
+/// Build deterministic v3 frames with explicit inline admission.
+pub fn pack_group_files_with_policy(
+    group_id: u64,
+    parent_dir_key: [u8; 32],
+    files: Vec<PackedFileInput>,
+    profile: AccessProfile,
+    size_classes: SizeClassTable,
+    policy: super::wire005::V3BuildPolicy,
+) -> PackedResult<(PackedGroupInput, Vec<PackedFrameInput>)> {
+    pack_group_files_policy_inner(
+        group_id,
+        parent_dir_key,
+        files,
+        profile,
+        size_classes,
+        None,
+        policy,
+    )
+}
+
+fn pack_group_files_policy_inner(
+    group_id: u64,
+    parent_dir_key: [u8; 32],
+    mut files: Vec<PackedFileInput>,
+    profile: AccessProfile,
+    size_classes: SizeClassTable,
+    p90_requested_range: Option<u64>,
+    policy: super::wire005::V3BuildPolicy,
+) -> PackedResult<(PackedGroupInput, Vec<PackedFrameInput>)> {
+    if p90_requested_range.is_some() {
+        return Err(PackedWireError::UnsupportedFormat(
+            "packed p90 policy requires authenticated histogram provenance".into(),
+        ));
+    }
     files.sort_by(|left, right| left.name.cmp(&right.name));
     let mut entries = Vec::with_capacity(files.len());
     let mut frames = Vec::new();
@@ -767,11 +813,11 @@ pub fn pack_group_files(
         let data = file.data;
         let size = u64::try_from(data.len())
             .map_err(|_| PackedWireError::LimitExceeded("file size exceeds u64".into()))?;
-        let decision = choose_frame_layout(size, p90_requested_range, profile, size_classes)
-            .map_err(|error| PackedWireError::Invalid(error.to_string()))?;
+        let decision = policy.select(size, profile, size_classes)?;
         let mut drafts = Vec::new();
 
-        let inline = size != 0
+        let inline = policy.inline_data
+            && size != 0
             && file.kind == 1
             && data.len() < INLINE_FILE_MAX_BYTES
             && inline_bytes.saturating_add(data.len()) <= inline_budget;
@@ -1710,7 +1756,7 @@ mod tests {
             200,
             vec![(first_group, first_frames), (second_group, second_frames)],
             ContainerPackingLimits {
-                target_body_bytes: 1 * 1024 * 1024,
+                target_body_bytes: 1024 * 1024,
                 ..Default::default()
             },
         )

@@ -11,6 +11,7 @@ param(
     [int64]$SmallFileSizeBytes = 102400,
     [int64]$SmallFileMinSizeBytes = 102400,
     [int64]$SmallFileMaxSizeBytes = 1048576,
+    [ValidateRange(0, 8)]
     [int]$DirLevels = 2,
     [int64]$DirsPerLevel = 10,
     [int64]$FilesPerLeaf = 1000,
@@ -32,7 +33,14 @@ param(
     [ValidateSet('', 'redis', 'tikv')][string]$MetadataBackend = '',
     [ValidateSet('redis', 'tikv')][string[]]$MetadataBackends = @('redis', 'tikv'),
     [string]$TikvVersion = 'v6.5.3',
-    [string]$PerfTools = 'packed-smallfiles packed-posix',
+    [ValidateScript({
+        $tools = @($_ -split '\s+' | Where-Object { $_ })
+        if ($tools.Count -eq 0 -or @($tools | Where-Object { $_ -notin @('packed-tree', 'packed-stat', 'packed-smallfiles', 'packed-gpu-smallfiles') }).Count -ne 0) {
+            throw 'Unsupported packed-v3 tool; tree/stat/smallfiles are supported, fio/POSIX fixture layout remains OPEN.'
+        }
+        $true
+    })]
+    [string]$PerfTools = 'packed-tree packed-smallfiles',
     [string]$JuiceFsPerfTools = 'juicefs-tree juicefs-smallfiles',
     [UInt64]$PackedFrameWindowCacheBytes = 0,
     [bool]$PackedFrameWindowPrefetch = $false,

@@ -546,15 +546,14 @@ fn merge_window_page(
             if let Some((_, _, end)) = source_indices
                 .iter()
                 .find(|(source_index, _, _)| *source_index == item.source)
+                && item.position + 1 < *end
             {
-                if item.position + 1 < *end {
-                    let source = &sources[item.source];
-                    heap.push(HeapItem {
-                        name: source.entries[item.position + 1].entry.name.clone(),
-                        source: item.source,
-                        position: item.position + 1,
-                    });
-                }
+                let source = &sources[item.source];
+                heap.push(HeapItem {
+                    name: source.entries[item.position + 1].entry.name.clone(),
+                    source: item.source,
+                    position: item.position + 1,
+                });
             }
         }
 

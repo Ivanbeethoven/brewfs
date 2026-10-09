@@ -312,6 +312,16 @@ pub struct WorkspaceArgs {
     #[arg(long, global = true, value_name = "URLS", value_delimiter = ',')]
     pub meta_tikv_pd_endpoints: Vec<String>,
 
+    /// CA PEM for an authenticated TiKV workspace connection.
+    #[arg(long, global = true, requires_all = ["meta_tikv_cert_path", "meta_tikv_key_path"])]
+    pub meta_tikv_ca_path: Option<PathBuf>,
+    /// Client certificate PEM for an authenticated TiKV workspace connection.
+    #[arg(long, global = true, requires_all = ["meta_tikv_ca_path", "meta_tikv_key_path"])]
+    pub meta_tikv_cert_path: Option<PathBuf>,
+    /// Client private key PEM for an authenticated TiKV workspace connection.
+    #[arg(long, global = true, requires_all = ["meta_tikv_ca_path", "meta_tikv_cert_path"])]
+    pub meta_tikv_key_path: Option<PathBuf>,
+
     /// Key namespace for the workspace overlay catalog.
     #[arg(long, global = true, default_value = "brewfs")]
     pub workspace_namespace: String,
@@ -321,8 +331,62 @@ pub struct WorkspaceArgs {
 }
 
 #[cfg(feature = "workspace-overlay")]
+#[derive(Args, Debug, Clone)]
+pub struct PackedMountRecoveryArgs {
+    /// The original mount configuration, using its same persistent cache PVC.
+    #[arg(long)]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub workspace: crate::workspace_overlay::ids::WorkspaceId,
+    #[arg(long)]
+    pub head_layer: crate::workspace_overlay::ids::LayerId,
+    #[arg(long)]
+    pub head_epoch: u64,
+    #[arg(long)]
+    pub original_lease: crate::workspace_overlay::ids::LeaseId,
+    #[arg(long)]
+    pub original_generation: u64,
+    #[arg(long)]
+    pub mount_uid: uuid::Uuid,
+    #[arg(long)]
+    pub original_pod_uid: uuid::Uuid,
+    #[arg(long)]
+    pub recovery_lease: crate::workspace_overlay::ids::LeaseId,
+    #[arg(long)]
+    pub recovery_generation: u64,
+    #[arg(long)]
+    pub recovery_pod_uid: uuid::Uuid,
+    #[arg(long, default_value_t = 30)]
+    pub ttl_seconds: u64,
+}
+
+#[cfg(feature = "workspace-overlay")]
+#[derive(Args, Debug, Clone)]
+pub struct NativeReverseIndexArgs {
+    /// Private JSON file containing independent administrator/runtime identities.
+    #[arg(long)]
+    pub admin_credentials: PathBuf,
+    #[arg(long)]
+    pub layer: crate::workspace_overlay::ids::LayerId,
+    /// Start a new build, replacing any earlier build's progress.
+    #[arg(long, conflicts_with = "initialize_gc_incarnation")]
+    pub start: bool,
+    /// Give an old Deleting layer a GC identity without claiming index readiness.
+    #[arg(long, conflicts_with = "start")]
+    pub initialize_gc_incarnation: bool,
+    /// Maximum 16-row pages to persist in this invocation; rerun to resume.
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=256))]
+    pub max_pages: u16,
+}
+
+#[cfg(feature = "workspace-overlay")]
 #[derive(Subcommand, Debug, Clone)]
 pub enum WorkspaceCommand {
+    /// Build or resume the bounded native reverse index for a packed-v3 layer.
+    IndexNativeReverse(Box<NativeReverseIndexArgs>),
+    /// Recover an expired packed mount from its original persistent cache.
+    /// Metadata and PVC checks authorize replay; arguments only route it.
+    RecoverPackedMount(Box<PackedMountRecoveryArgs>),
     /// Initialize a new workspace-v1 volume and its default workspace.
     InitVolume {
         #[arg(long)]
@@ -332,6 +396,8 @@ pub enum WorkspaceCommand {
     /// catalog. This never rewrites the catalog header or migrates data.
     #[cfg(feature = "native-packed-base")]
     InitNative,
+    /// Migrate an existing workspace catalog to the current entity format.
+    Migrate,
     /// Create a workspace from an exact sealed revision.
     Create {
         #[arg(long = "from", value_name = "REVISION")]
@@ -840,6 +906,29 @@ pub struct EtcdMetaFileConfig {
 pub struct TiKvMetaFileConfig {
     pub pd_endpoints: Option<Vec<String>>,
     pub namespace: Option<String>,
+    pub tls: Option<TiKvTlsFileConfig>,
+}
+
+/// TLS is all-or-none. A missing or misspelled field cannot silently select a
+/// plaintext TiKV connection.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TiKvTlsFileConfig {
+    pub ca_path: PathBuf,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
+impl TiKvTlsFileConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if [&self.ca_path, &self.cert_path, &self.key_path]
+            .iter()
+            .any(|path| path.as_os_str().is_empty())
+        {
+            anyhow::bail!("TiKV TLS requires nonempty ca_path, cert_path and key_path");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -912,6 +1001,7 @@ pub struct MountConfig {
     pub meta_etcd_urls: Vec<String>,
     pub meta_tikv_pd_endpoints: Vec<String>,
     pub meta_tikv_namespace: String,
+    pub meta_tikv_tls: Option<TiKvTlsFileConfig>,
     pub meta_open_file_cache_ttl_ms: Option<u64>,
     pub meta_open_file_cache_capacity: Option<u64>,
     pub meta_read_plan_cache_max_weight: Option<u64>,
@@ -979,16 +1069,16 @@ impl MountConfig {
             .packed_manifest_key
             .or(file_cfg.packed_manifest_key)
             .filter(|key| !key.is_empty());
-        if let (Some(legacy), Some(nested)) = (file_cfg.volume_format, volume_cfg.format) {
-            if legacy != nested {
-                anyhow::bail!("volume_format conflicts with volume.format");
-            }
+        if let (Some(legacy), Some(nested)) = (file_cfg.volume_format, volume_cfg.format)
+            && legacy != nested
+        {
+            anyhow::bail!("volume_format conflicts with volume.format");
         }
         let file_volume_format = volume_cfg.format.or(file_cfg.volume_format);
-        if let (Some(cli), Some(nested)) = (args.volume_format, volume_cfg.format) {
-            if cli != nested {
-                anyhow::bail!("--volume-format conflicts with config volume.format");
-            }
+        if let (Some(cli), Some(nested)) = (args.volume_format, volume_cfg.format)
+            && cli != nested
+        {
+            anyhow::bail!("--volume-format conflicts with config volume.format");
         }
         let volume_format = args
             .volume_format
@@ -1008,37 +1098,11 @@ impl MountConfig {
         }
         #[cfg(feature = "native-packed-base")]
         if volume_format == VolumeFormat::PackedMetadataV1 {
-            if workspace.is_some() {
-                anyhow::bail!("packed-metadata-v1 is a standalone read-only volume");
-            }
-            if packed_manifest_key.is_none() {
-                anyhow::bail!(
-                    "packed-metadata-v1 requires --packed-manifest-key or packed_manifest_key"
-                );
-            }
-            if native_base.is_some()
-                || volume_cfg.schema_version.is_some()
-                || volume_cfg.native_control_version.is_some()
-            {
-                anyhow::bail!("native workspace controls cannot be used with packed-metadata-v1");
-            }
+            anyhow::bail!("packed-metadata-v1 is unsupported; use packed-metadata-v3");
         }
         #[cfg(feature = "workspace-overlay")]
         if volume_format == VolumeFormat::PackedMetadataV2 {
-            if workspace.is_some() {
-                anyhow::bail!("packed-metadata-v2 is a standalone read-only volume");
-            }
-            if packed_manifest_key.is_none() {
-                anyhow::bail!(
-                    "packed-metadata-v2 requires --packed-manifest-key or packed_manifest_key"
-                );
-            }
-            if native_base.is_some()
-                || volume_cfg.schema_version.is_some()
-                || volume_cfg.native_control_version.is_some()
-            {
-                anyhow::bail!("native workspace controls cannot be used with packed-metadata-v2");
-            }
+            anyhow::bail!("packed-metadata-v2 is unsupported; use packed-metadata-v3");
         }
         #[cfg(feature = "workspace-overlay")]
         if volume_format == VolumeFormat::PackedMetadataV3 {
@@ -1143,6 +1207,15 @@ impl MountConfig {
             anyhow::bail!("chunk_size must be a non-zero multiple of block_size");
         }
 
+        if let Some(tls) = tikv_cfg.tls.as_ref() {
+            tls.validate()?;
+            if !matches!(meta_backend, MetaBackendKind::TiKv)
+                || volume_format != VolumeFormat::WorkspaceV1
+            {
+                anyhow::bail!("meta.tikv.tls is supported only by the TiKV workspace catalog");
+            }
+        }
+
         Ok(Self {
             mount_point,
             volume_format,
@@ -1192,6 +1265,7 @@ impl MountConfig {
                 .meta_tikv_namespace
                 .or(tikv_cfg.namespace)
                 .unwrap_or_else(crate::meta::config::default_tikv_namespace),
+            meta_tikv_tls: tikv_cfg.tls,
             meta_open_file_cache_ttl_ms: meta_cfg.open_file_cache_ttl_ms,
             meta_open_file_cache_capacity: meta_cfg.open_file_cache_capacity,
             meta_read_plan_cache_max_weight: meta_cfg.read_plan_cache_max_weight,
@@ -1494,6 +1568,20 @@ fn parse_writeback_mode(value: &str) -> anyhow::Result<WriteBackMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tikv_tls_schema_rejects_partial_or_misspelled_configuration() {
+        let tls: TiKvTlsFileConfig = serde_yaml::from_str(
+            "ca_path: /run/brewfs/metadata/ca.crt\ncert_path: /run/brewfs/metadata/tls.crt\nkey_path: /run/brewfs/metadata/tls.key\n",
+        ).unwrap();
+        tls.validate().unwrap();
+        for source in [
+            "ca_path: ca\ncert_path: cert\n",
+            "ca_path: ca\ncert_path: cert\nkey_path: key\nkeypath: ignored\n",
+        ] {
+            assert!(serde_yaml::from_str::<TiKvTlsFileConfig>(source).is_err());
+        }
+    }
+
     use clap::CommandFactory;
     use clap::Parser;
     use clap::error::ErrorKind;
@@ -1527,6 +1615,26 @@ mod tests {
             fuse_max_background: None,
             privileged: false,
         }
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[test]
+    fn workspace_migrate_parses_catalog_configuration() {
+        let cli = Cli::parse_from([
+            "brewfs",
+            "workspace",
+            "--meta-backend",
+            "redis",
+            "--meta-url",
+            "redis://localhost:6379/0",
+            "migrate",
+        ]);
+        let Command::Workspace(args) = cli.cmd else {
+            panic!("expected workspace command");
+        };
+        assert_eq!(args.meta_backend, WorkspaceMetaBackendKind::Redis);
+        assert_eq!(args.meta_url, "redis://localhost:6379/0");
+        assert!(matches!(args.command, WorkspaceCommand::Migrate));
     }
 
     #[test]
@@ -1798,60 +1906,107 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "native-packed-base")]
-    #[test]
-    fn packed_metadata_format_requires_manifest_key_and_is_standalone() {
+    #[cfg(any(feature = "native-packed-base", feature = "workspace-overlay"))]
+    fn assert_legacy_packed_mount_rejected(format: &str, volume_format: VolumeFormat) {
         let cli = Cli::parse_from([
             "brewfs",
             "mount",
-            "/mnt/packed",
+            "/mnt/legacy-packed",
             "--volume-format",
-            "packed-metadata-v1",
+            format,
             "--packed-manifest-key",
-            "volumes/v1/manifest",
+            "snapshots/legacy-manifest",
         ]);
         let Command::Mount(args) = cli.cmd else {
             panic!("expected mount command");
         };
-        let config = MountConfig::from_sources(*args).unwrap();
-        assert_eq!(config.volume_format, VolumeFormat::PackedMetadataV1);
-        assert_eq!(
-            config.packed_manifest_key.as_deref(),
-            Some("volumes/v1/manifest")
+        let error = MountConfig::from_sources(*args).unwrap_err().to_string();
+        assert!(
+            error.contains("unsupported") && error.contains("packed-metadata-v3"),
+            "{error}"
         );
-        assert!(config.workspace.is_none());
 
-        let mut missing = empty_mount_args(None, Some(PathBuf::from("/mnt/packed")));
-        missing.volume_format = Some(VolumeFormat::PackedMetadataV1);
-        assert!(MountConfig::from_sources(missing).is_err());
+        for selector in [
+            format!("volume_format: {format}\n"),
+            format!("volume:\n  format: {format}\n"),
+        ] {
+            let yaml = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(
+                yaml.path(),
+                format!(
+                    "mount_point: /mnt/legacy-packed\n{selector}packed_manifest_key: snapshots/legacy-manifest\n"
+                ),
+            )
+            .unwrap();
+            let error =
+                MountConfig::from_sources(empty_mount_args(Some(yaml.path().to_owned()), None))
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains("unsupported") && error.contains("packed-metadata-v3"),
+                "{error}"
+            );
+        }
+
+        // Rejection must not depend on an old manifest or object backend.
+        let mut args = empty_mount_args(None, Some(PathBuf::from("/mnt/legacy-packed")));
+        args.volume_format = Some(volume_format);
+        let error = MountConfig::from_sources(args).unwrap_err().to_string();
+        assert!(
+            error.contains("unsupported") && error.contains("packed-metadata-v3"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "native-packed-base")]
+    #[test]
+    fn legacy_packed_v1_mount_is_rejected_from_cli_and_yaml() {
+        assert_legacy_packed_mount_rejected("packed-metadata-v1", VolumeFormat::PackedMetadataV1);
     }
 
     #[cfg(feature = "workspace-overlay")]
     #[test]
-    fn packed_metadata_v2_format_requires_manifest_key_and_is_standalone() {
+    fn legacy_packed_v2_mount_is_rejected_from_cli_and_yaml() {
+        assert_legacy_packed_mount_rejected("packed-metadata-v2", VolumeFormat::PackedMetadataV2);
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[test]
+    fn packed_metadata_v3_mount_remains_supported_from_cli_and_yaml() {
         let cli = Cli::parse_from([
             "brewfs",
             "mount",
-            "/mnt/packed-v2",
+            "/mnt/packed-v3",
             "--volume-format",
-            "packed-metadata-v2",
+            "packed-metadata-v3",
             "--packed-manifest-key",
-            "snapshots/v2.brfsm",
+            "snapshots/v3-manifest",
         ]);
         let Command::Mount(args) = cli.cmd else {
             panic!("expected mount command");
         };
         let config = MountConfig::from_sources(*args).unwrap();
-        assert_eq!(config.volume_format, VolumeFormat::PackedMetadataV2);
+        assert_eq!(config.volume_format, VolumeFormat::PackedMetadataV3);
         assert_eq!(
             config.packed_manifest_key.as_deref(),
-            Some("snapshots/v2.brfsm")
+            Some("snapshots/v3-manifest")
         );
         assert!(config.workspace.is_none());
 
-        let mut missing = empty_mount_args(None, Some(PathBuf::from("/mnt/packed-v2")));
-        missing.volume_format = Some(VolumeFormat::PackedMetadataV2);
-        assert!(MountConfig::from_sources(missing).is_err());
+        let yaml = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            yaml.path(),
+            "mount_point: /mnt/packed-v3\nvolume:\n  format: packed-metadata-v3\npacked_manifest_key: snapshots/v3-manifest\n",
+        )
+        .unwrap();
+        let config =
+            MountConfig::from_sources(empty_mount_args(Some(yaml.path().to_owned()), None))
+                .unwrap();
+        assert_eq!(config.volume_format, VolumeFormat::PackedMetadataV3);
+        assert_eq!(
+            config.packed_manifest_key.as_deref(),
+            Some("snapshots/v3-manifest")
+        );
     }
 
     #[test]

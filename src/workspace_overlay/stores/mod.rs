@@ -6,3 +6,12 @@ pub mod tikv;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod binding_tests;
+
+#[cfg(test)]
+mod clock_cas_tests;
+
+#[cfg(test)]
+mod g13_gc_contract_tests;

@@ -1,4 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+
+use super::catalog::RemoteGroupCatalog;
+use crate::cadapter::client::ObjectBackend;
 
 pub const SIZE_CLASS_COUNT: usize = 4;
 
@@ -167,6 +171,161 @@ impl PackedRuntimeMetrics {
             overscan_by_size_class: std::array::from_fn(|index| {
                 load(&self.size_class_overscan_bytes[index])
             }),
+        }
+    }
+}
+
+/// A weak reference keeps `.stats` from extending the catalog's lifetime or
+/// retaining a second copy of its metadata/payload caches.
+pub struct PackedStatsExtension<B: ObjectBackend + Clone> {
+    catalog: Weak<RemoteGroupCatalog<B>>,
+}
+
+impl<B: ObjectBackend + Clone> std::fmt::Debug for PackedStatsExtension<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PackedStatsExtension")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<B: ObjectBackend + Clone> PackedStatsExtension<B> {
+    pub fn new(catalog: &Arc<RemoteGroupCatalog<B>>) -> Self {
+        Self {
+            catalog: Arc::downgrade(catalog),
+        }
+    }
+}
+
+impl<B: ObjectBackend + Clone + 'static> crate::vfs::stats::FsStatsExtension
+    for PackedStatsExtension<B>
+{
+    fn render_into(&self, output: &mut dyn std::fmt::Write) {
+        let Some(catalog) = self.catalog.upgrade() else {
+            return;
+        };
+        let metadata = catalog.metadata_cache_stats();
+        let runtime = catalog.packed_runtime_metrics();
+        macro_rules! metric {
+            ($name:literal, $value:expr) => {
+                let _ = writeln!(output, concat!("brewfs_packed_v3_", $name, " {}"), $value);
+            };
+        }
+        metric!("group_index_gets_total", metadata.group_index_remote_gets);
+        metric!("inode_index_gets_total", metadata.inode_index_remote_gets);
+        metric!("group_meta_gets_total", metadata.group_meta_remote_gets);
+        // These legacy metadata counters measure declared range bytes, not
+        // partially received failure bodies. Name them explicitly until the
+        // transport observation supplies actual consumed-byte counters.
+        metric!(
+            "group_index_requested_bytes_total",
+            metadata.group_index_remote_bytes
+        );
+        metric!(
+            "inode_index_requested_bytes_total",
+            metadata.inode_index_remote_bytes
+        );
+        metric!(
+            "group_meta_requested_bytes_total",
+            metadata.group_meta_remote_bytes
+        );
+        metric!(
+            "frame_directory_gets_total",
+            metadata.frame_directory_remote_gets
+        );
+        metric!(
+            "frame_directory_requested_bytes_total",
+            metadata.frame_directory_remote_bytes
+        );
+        metric!(
+            "frame_descriptor_gets_total",
+            metadata.frame_descriptor_remote_gets
+        );
+        metric!(
+            "frame_descriptor_requested_bytes_total",
+            metadata.frame_descriptor_remote_bytes
+        );
+        metric!("metadata_cache_hit_total", metadata.hits);
+        metric!("metadata_cache_miss_total", metadata.misses);
+        metric!("metadata_index_cache_hit_total", metadata.index_hits);
+        metric!("metadata_index_cache_miss_total", metadata.index_misses);
+        metric!("metadata_group_cache_hit_total", metadata.group_meta_hits);
+        metric!(
+            "metadata_group_cache_miss_total",
+            metadata.group_meta_misses
+        );
+        metric!("metadata_locator_cache_hit_total", metadata.locator_hits);
+        metric!("metadata_locator_cache_miss_total", metadata.locator_misses);
+        metric!("metadata_inode_cache_hit_total", metadata.inode_entry_hits);
+        metric!(
+            "metadata_inode_cache_miss_total",
+            metadata.inode_entry_misses
+        );
+        metric!("group_index_resident_bytes", metadata.group_index_bytes);
+        metric!("inode_index_resident_bytes", metadata.inode_index_bytes);
+        metric!("group_meta_resident_bytes", metadata.group_meta_bytes);
+        metric!("inode_entry_resident_bytes", metadata.inode_entry_bytes);
+        metric!("file_locator_resident_bytes", metadata.file_locator_bytes);
+        metric!(
+            "frame_directory_resident_bytes",
+            metadata.frame_directory_bytes
+        );
+        metric!(
+            "frame_descriptor_resident_bytes",
+            metadata.frame_descriptor_bytes
+        );
+        metric!("data_range_gets_total", runtime.data_range_gets);
+        metric!("data_range_requested_bytes_total", runtime.data_range_bytes);
+        metric!("logical_bytes_total", runtime.logical_bytes);
+        metric!("overscan_bytes_total", runtime.overscan_bytes);
+        metric!("frames_decoded_total", runtime.frames_decoded);
+        metric!("coalesced_ranges_total", runtime.coalesced_ranges);
+        metric!("inflight_singleflight_total", runtime.inflight_singleflight);
+        metric!("pipeline_bytes_current", runtime.pipeline_bytes_current);
+        metric!("pipeline_bytes_peak", runtime.pipeline_bytes_peak);
+        metric!(
+            "prefetched_logical_bytes_total",
+            runtime.prefetched_logical_bytes
+        );
+        metric!("data_cache_hit_total", runtime.data_cache_hits);
+        metric!(
+            "decoded_frame_cache_configured_bytes",
+            runtime.decoded_frame_cache_configured_bytes
+        );
+        metric!(
+            "decoded_frame_cache_resident_bytes",
+            runtime.decoded_frame_cache_resident_bytes
+        );
+        metric!(
+            "decoded_frame_cache_hit_total",
+            runtime.decoded_frame_cache_hits
+        );
+        metric!(
+            "decoded_frame_cache_miss_total",
+            runtime.decoded_frame_cache_misses
+        );
+        metric!(
+            "decoded_frame_cache_evictions_total",
+            runtime.decoded_frame_cache_evictions
+        );
+        metric!("window_cache_hit_total", runtime.window_cache_hits);
+        metric!("window_cache_miss_total", runtime.window_cache_misses);
+        metric!("window_remote_fetches_total", runtime.window_remote_fetches);
+        for class in 0..SIZE_CLASS_COUNT {
+            let _ = writeln!(
+                output,
+                "brewfs_packed_v3_frames_by_size_class_total{{class=\"{class}\"}} {}",
+                runtime.frames_by_size_class[class]
+            );
+            let _ = writeln!(
+                output,
+                "brewfs_packed_v3_frame_raw_bytes_by_size_class_total{{class=\"{class}\"}} {}",
+                runtime.frame_raw_bytes_by_size_class[class]
+            );
+            let _ = writeln!(
+                output,
+                "brewfs_packed_v3_overscan_by_size_class_total{{class=\"{class}\"}} {}",
+                runtime.overscan_by_size_class[class]
+            );
         }
     }
 }

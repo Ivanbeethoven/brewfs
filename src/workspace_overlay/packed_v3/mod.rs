@@ -5,6 +5,7 @@
 //! consumed by the workspace lower-layer resolver.
 
 mod catalog;
+mod codec;
 mod coordinator;
 mod group;
 mod index;
@@ -12,8 +13,10 @@ mod layout;
 mod meta;
 mod metrics;
 mod readonly;
+pub(crate) use readonly::{PackedLowerInodeMetadata, PackedLowerReverseNames};
 mod remote;
 mod wire;
+pub mod wire005;
 
 pub use catalog::{
     PackedMetadataCacheStats, PackedMetadataWarmupStats, RemoteGroupCatalog, directory_key,
@@ -26,8 +29,8 @@ pub use group::{
     ContainerPackingLimits, GroupPackingLimits, PackedContainerInput, PackedFileInput,
     PackedFrameDescriptor, PackedFrameInput, PackedGroupContainer, PackedGroupDescriptor,
     PackedGroupInput, frame_directory_body_len, frame_table_body_offset, group_container_counts,
-    pack_group_file_shards, pack_group_files, pack_group_shard_containers,
-    parse_frame_descriptor_range, parse_frame_directory,
+    pack_group_file_shards, pack_group_files, pack_group_files_with_policy,
+    pack_group_shard_containers, parse_frame_descriptor_range, parse_frame_directory,
 };
 pub use index::{PackedGroupIndexPage, PackedInodeIndexEntry, PackedInodeIndexPage};
 pub use layout::{
@@ -36,7 +39,7 @@ pub use layout::{
 pub use meta::{
     GroupMeta, GroupMetaEntry, GroupMetaExtent, INLINE_DATA_FLAG, INLINE_FILE_MAX_BYTES,
 };
-pub use metrics::{PackedRuntimeMetrics, PackedRuntimeMetricsSnapshot};
+pub use metrics::{PackedRuntimeMetrics, PackedRuntimeMetricsSnapshot, PackedStatsExtension};
 pub use readonly::{PackedV3BlockStore, PackedV3ReadonlyMeta};
 pub use remote::{
     MAX_PACKED_STREAM_RANGE_BYTES, PackedFrameSourceFetcher, PackedWindowCacheStats,
@@ -48,3 +51,5 @@ pub use wire::{
     PackedEnvelope, PackedGroupIndexPageRef, PackedGroupRef, PackedHeader, PackedInodeIndexPageRef,
     PackedObjectKind, PackedResult, PackedSnapshotManifest, PackedWireError,
 };
+
+pub use codec::{PackedCodec, decode_block, encode_block};

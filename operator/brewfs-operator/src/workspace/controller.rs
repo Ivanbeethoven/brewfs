@@ -19,18 +19,17 @@ use crate::crd::BrewFSCluster;
 use crate::reconciler::OperatorContext;
 
 use super::admin::{
-    catalog_namespace, connect_workspace_admin, deterministic_uuid, revision_from_status,
-    revision_to_status, EnsureSnapshotRequest, EnsureWorkspaceRequest, VolumeIdentity,
-    WorkspaceAdmin,
+    catalog_namespace, connect_workspace_admin_for_cluster, deterministic_uuid,
+    revision_from_status, revision_to_status, EnsureSnapshotRequest, EnsureWorkspaceRequest,
+    VolumeIdentity, WorkspaceAdmin,
 };
 use super::crd::{
     BrewFSWorkspace, BrewFSWorkspaceMount, BrewFSWorkspaceSnapshot, BrewFSWorkspaceSnapshotStatus,
-    BrewFSWorkspaceStatus, WorkspaceCondition, WorkspaceDeletionPolicy, WorkspaceDesiredState,
-    WorkspaceRevision, WorkspaceSourceKind,
+    BrewFSWorkspaceStatus, WorkspaceCapabilityStatus, WorkspaceCondition, WorkspaceDeletionPolicy,
+    WorkspaceDesiredState, WorkspaceRevision, WorkspaceSourceKind,
 };
 use super::workload::{
-    delete_workspace_mount_workload, load_workspace_catalog_password, patch_mount_backend_status,
-    reconcile_workspace_catalog, reconcile_workspace_mount_workload,
+    patch_mount_backend_status, reconcile_workspace_catalog, reconcile_workspace_mount_workload,
 };
 
 const WORKSPACE_FINALIZER: &str = "storage.brewfs.io/workspace-protection";
@@ -134,16 +133,7 @@ pub async fn guard_cluster_workspace_lifecycle(
             .workspace
             .as_ref()
             .ok_or_else(|| anyhow!("restore spec.workspace to complete protected deletion"))?;
-        let redis_password =
-            load_workspace_catalog_password(client, namespace, cluster, spec).await?;
-        let admin = connect_workspace_admin(
-            &cluster.name_any(),
-            namespace,
-            cluster.spec.redis.port,
-            spec,
-            redis_password.as_deref(),
-        )
-        .await?;
+        let admin = connect_workspace_admin_for_cluster(client, cluster, namespace, spec).await?;
         let root_workspace_id = WorkspaceId::from_uuid(deterministic_uuid(
             resource_uuid(&resource_uid(cluster)?),
             "root-workspace",
@@ -196,16 +186,8 @@ pub async fn reconcile_cluster_workspace(
     let scope = resource_uuid(&uid);
     let volume_id = deterministic_uuid(scope, "volume");
     reconcile_workspace_catalog(client, kubernetes_namespace, cluster, spec).await?;
-    let redis_password =
-        load_workspace_catalog_password(client, kubernetes_namespace, cluster, spec).await?;
-    let admin = connect_workspace_admin(
-        &cluster.name_any(),
-        kubernetes_namespace,
-        cluster.spec.redis.port,
-        spec,
-        redis_password.as_deref(),
-    )
-    .await?;
+    let admin =
+        connect_workspace_admin_for_cluster(client, cluster, kubernetes_namespace, spec).await?;
     let volume = admin
         .ensure_volume(VolumeIdentity {
             volume_id,
@@ -216,6 +198,34 @@ pub async fn reconcile_cluster_workspace(
             owner_id: format!("k8s-cluster/{kubernetes_namespace}/{}", cluster.name_any()),
         })
         .await?;
+    let capabilities = match volume.packed_binding.as_ref() {
+        Some(binding) => super::crd::WorkspaceCapabilityStatus {
+            volume_format: "workspace-v1".into(),
+            packed_v3: super::crd::PackedV3Capability::Readonly,
+            packed_binding: super::crd::PackedBindingStatus::Present {
+                version: binding.binding.binding_version,
+                manifest_digest: hex::encode(binding.binding.manifest.digest),
+            },
+        },
+        None => bail!("packed-v3 root carrier binding is not initialized"),
+    };
+    let mut conditions = vec![
+        condition(
+            "WorkspaceCatalogReady",
+            "True",
+            "PackedCatalogReady",
+            "packed-v3 workspace catalog and carrier root snapshot are ready",
+            cluster.metadata.generation,
+        ),
+        capabilities.packed_lower_condition(cluster.metadata.generation),
+    ];
+    if let Some(previous) = cluster
+        .status
+        .as_ref()
+        .and_then(|status| status.workspace.as_ref())
+    {
+        preserve_condition_transition_times(&previous.conditions, &mut conditions);
+    }
     let workspace_status = super::crd::WorkspaceClusterStatus {
         volume_id: volume.volume_id.to_string(),
         schema_version: brewfs::workspace_overlay::model::WORKSPACE_SCHEMA_VERSION,
@@ -223,6 +233,8 @@ pub async fn reconcile_cluster_workspace(
         catalog_namespace: catalog_namespace(&cluster.name_any(), kubernetes_namespace, spec),
         root_snapshot_id: volume.root_snapshot_id.to_string(),
         root_revision: revision_to_status(&volume.root_revision),
+        capabilities: capabilities.clone(),
+        conditions,
     };
     patch_cluster_workspace_status(
         client,
@@ -282,17 +294,11 @@ pub async fn reconcile_workspace(
         return Ok(Action::requeue(Duration::from_secs(10)));
     };
     let cluster_spec = enabled_cluster_workspace_spec(&cluster)?;
-    let redis_password =
-        load_workspace_catalog_password(&ctx.client, &namespace, &cluster, cluster_spec).await?;
-    let admin = connect_workspace_admin(
-        &cluster.name_any(),
-        &namespace,
-        cluster.spec.redis.port,
-        cluster_spec,
-        redis_password.as_deref(),
-    )
-    .await?;
-    admin.recover_incomplete_seals().await?;
+    let admin =
+        connect_workspace_admin_for_cluster(&ctx.client, &cluster, &namespace, cluster_spec)
+            .await?;
+    // Packed-v3 recovery is performed by its recorded bootstrap/snapshot operation.
+    // Bounded source checks below keep unrelated incomplete workspaces RecoveryRequired.
 
     let source = resolve_workspace_source(
         &ctx.client,
@@ -325,18 +331,22 @@ pub async fn reconcile_workspace(
     {
         return Err(anyhow!("clusterRef is immutable after workspace creation").into());
     }
-    let view = admin
-        .ensure_workspace(EnsureWorkspaceRequest {
-            workspace_id,
-            head_layer_id: LayerId::from_uuid(deterministic_uuid(workspace_uuid, "head/0")),
-            base_revision: source.clone(),
-            owner_id: workspace
-                .spec
-                .owner_id
-                .clone()
-                .or_else(|| Some(format!("k8s-workspace/{namespace}/{name}"))),
-        })
-        .await?;
+    let workspace_request = EnsureWorkspaceRequest {
+        workspace_id,
+        head_layer_id: LayerId::from_uuid(deterministic_uuid(workspace_uuid, "head/0")),
+        base_revision: source.clone(),
+        owner_id: workspace
+            .spec
+            .owner_id
+            .clone()
+            .or_else(|| Some(format!("k8s-workspace/{namespace}/{name}"))),
+    };
+    let view = if cluster_workspace.capabilities.packed_v3_ready() {
+        admin.ensure_packed_workspace(workspace_request).await?
+    } else {
+        admin.ensure_workspace(workspace_request).await?
+    };
+
     if view.layer_depth != 2 {
         return Err(anyhow!("workspace backend returned a non-canonical layer depth").into());
     }
@@ -345,13 +355,50 @@ pub async fn reconcile_workspace(
         .leases
         .iter()
         .any(|lease| lease.state == LeaseState::Active);
+    let packed_binding = admin.packed_binding(workspace_id).await?;
+    if cluster_workspace.capabilities.packed_v3_ready() && packed_binding.is_none() {
+        return Err(anyhow!("packed-v3 workspace is missing its mandatory binding").into());
+    }
+    let clean_epoch = if packed_binding.is_some() && !active_lease {
+        match admin.clean_published_view(workspace_id).await? {
+            Some(report) => Some(report.head_epoch),
+            None => match admin.recovered_packed_mount(workspace_id).await? {
+                Some(report) => {
+                    if report.released.guard.expected_head_layer_id != view.record.head_layer_id
+                        || report.released.guard.expected_head_epoch != view.record.head_epoch
+                    {
+                        return Err(anyhow!("recovered packed-v3 workspace view changed").into());
+                    }
+                    Some(report.released.guard.expected_head_epoch)
+                }
+                None => match admin.clean_unmounted_packed_epoch(workspace_id).await? {
+                    Some(epoch) => Some(epoch),
+                    None => clean_reference::verified_clean_mount_reference(
+                        &ctx.client,
+                        &namespace,
+                        &workspace,
+                        &view,
+                        admin.as_ref(),
+                    )
+                    .await?
+                    .map(|reference| reference.guard.expected_head_epoch),
+                },
+            },
+        }
+    } else {
+        None
+    };
     let (phase, message) = match workspace.spec.desired_state {
         WorkspaceDesiredState::Active => ("Active", "workspace is available for mounting"),
         WorkspaceDesiredState::Suspended if active_lease => (
             "Quiescing",
             "waiting for the writable mount lease to be released",
         ),
-        WorkspaceDesiredState::Suspended => ("Suspended", "workspace has no active writer"),
+        WorkspaceDesiredState::Suspended if packed_binding.is_some() && clean_epoch.is_none() => (
+            "RecoveryRequired",
+            "packed-v3 clean source proof is unavailable",
+        ),
+        WorkspaceDesiredState::Suspended => ("Suspended", "workspace clean source was verified"),
     };
     let mut status = workspace_status(
         &workspace,
@@ -360,6 +407,17 @@ pub async fn reconcile_workspace(
         Some(workspace_id.to_string()),
         Some(revision_to_status(&view.base_revision)),
     );
+    status.capabilities = match &packed_binding {
+        Some(binding) => super::crd::WorkspaceCapabilityStatus {
+            volume_format: "workspace-v1".into(),
+            packed_v3: super::crd::PackedV3Capability::Readonly,
+            packed_binding: super::crd::PackedBindingStatus::Present {
+                version: binding.binding.binding_version,
+                manifest_digest: hex::encode(binding.binding.manifest.digest),
+            },
+        },
+        None => super::crd::WorkspaceCapabilityStatus::native_only(),
+    };
     status.origin_revision = workspace
         .status
         .as_ref()
@@ -372,9 +430,13 @@ pub async fn reconcile_workspace(
     } else {
         None
     };
-    if !active_lease {
-        status.last_clean_release_epoch = Some(view.record.head_epoch);
-    }
+    status.last_clean_release_epoch = if packed_binding.is_some() {
+        clean_epoch
+    } else if !active_lease {
+        Some(view.record.head_epoch)
+    } else {
+        None
+    };
     let mut base_verified = condition(
         "BaseVerified",
         "True",
@@ -392,7 +454,20 @@ pub async fn reconcile_workspace(
     }) {
         base_verified.last_transition_time = existing.last_transition_time;
     }
-    status.conditions = vec![base_verified];
+    let mut packed_lower = status
+        .capabilities
+        .packed_lower_condition(workspace.metadata.generation);
+    if let Some(existing) = workspace.status.as_ref().and_then(|status| {
+        status.conditions.iter().find(|condition| {
+            condition.condition_type == packed_lower.condition_type
+                && condition.status == packed_lower.status
+                && condition.reason == packed_lower.reason
+                && condition.message == packed_lower.message
+        })
+    }) {
+        packed_lower.last_transition_time = existing.last_transition_time;
+    }
+    status.conditions = vec![base_verified, packed_lower];
     patch_workspace_status(&api, &workspace, status).await?;
     Ok(Action::requeue(Duration::from_secs(30)))
 }
@@ -407,7 +482,7 @@ pub async fn reconcile_workspace_mount(
     let api: Api<BrewFSWorkspaceMount> = Api::namespaced(ctx.client.clone(), &namespace);
     let name = mount.name_any();
     if mount.meta().deletion_timestamp.is_some() {
-        delete_workspace_mount_workload(&ctx.client, &namespace, &mount).await?;
+        super::packed_recovery::finish_mount_workload(&ctx.client, &namespace, &mount).await?;
         verify_mount_lease_released(&ctx.client, &namespace, &mount).await?;
         remove_finalizer(&api, &name, &mount, MOUNT_FINALIZER).await?;
         return Ok(Action::await_change());
@@ -432,8 +507,22 @@ pub async fn reconcile_workspace_mount(
         .await?;
         return Ok(Action::requeue(Duration::from_secs(10)));
     };
+    if let Err(error) = validate_mount_cluster_ref(
+        &mount.spec.cluster_ref.name,
+        &workspace.spec.cluster_ref.name,
+    ) {
+        super::workload::patch_mount_status(
+            &api,
+            &mount,
+            "Failed",
+            error,
+            workspace.status.as_ref(),
+        )
+        .await?;
+        return Ok(Action::await_change());
+    }
     if workspace.meta().deletion_timestamp.is_some() {
-        delete_workspace_mount_workload(&ctx.client, &namespace, &mount).await?;
+        super::packed_recovery::finish_mount_workload(&ctx.client, &namespace, &mount).await?;
         super::workload::patch_mount_status(
             &api,
             &mount,
@@ -451,7 +540,7 @@ pub async fn reconcile_workspace_mount(
         return Ok(Action::await_change());
     }
     if workspace.spec.desired_state == WorkspaceDesiredState::Suspended {
-        delete_workspace_mount_workload(&ctx.client, &namespace, &mount).await?;
+        super::packed_recovery::finish_mount_workload(&ctx.client, &namespace, &mount).await?;
         super::workload::patch_mount_status(
             &api,
             &mount,
@@ -461,6 +550,25 @@ pub async fn reconcile_workspace_mount(
         )
         .await?;
         return Ok(Action::requeue(Duration::from_secs(10)));
+    }
+    if super::packed_recovery::recovery_is_held(&mount) {
+        if mount
+            .status
+            .as_ref()
+            .is_some_and(|status| status.phase == "RecoveryCompleted")
+        {
+            return Ok(Action::await_change());
+        }
+        super::packed_recovery::finish_mount_workload(&ctx.client, &namespace, &mount).await?;
+        super::workload::patch_mount_status(
+            &api,
+            &mount,
+            "RecoveryCompleted",
+            "original same-PVC recovery completed; suspend the workspace before publication",
+            workspace.status.as_ref(),
+        )
+        .await?;
+        return Ok(Action::await_change());
     }
     if workspace
         .status
@@ -488,16 +596,9 @@ pub async fn reconcile_workspace_mount(
         cluster_spec,
     )
     .await?;
-    let redis_password =
-        load_workspace_catalog_password(&ctx.client, &namespace, &cluster, cluster_spec).await?;
-    let admin = connect_workspace_admin(
-        &cluster.name_any(),
-        &namespace,
-        cluster.spec.redis.port,
-        cluster_spec,
-        redis_password.as_deref(),
-    )
-    .await?;
+    let admin =
+        connect_workspace_admin_for_cluster(&ctx.client, &cluster, &namespace, cluster_spec)
+            .await?;
     admin.reap_expired_leases().await?;
     let workspace_id: WorkspaceId = workspace
         .status
@@ -507,7 +608,7 @@ pub async fn reconcile_workspace_mount(
         .parse()
         .context("parse active workspace backend ID")?;
     let backend = admin.inspect_workspace(workspace_id).await?;
-    patch_mount_backend_status(&api, &mount, &backend).await?;
+    patch_mount_backend_status(&ctx.client, &api, &mount, &backend).await?;
     Ok(Action::requeue(Duration::from_secs(15)))
 }
 
@@ -563,10 +664,14 @@ pub async fn reconcile_workspace_snapshot(
     }
     if workspace.meta().deletion_timestamp.is_none()
         && (workspace.spec.desired_state != WorkspaceDesiredState::Suspended
-            || workspace
-                .status
-                .as_ref()
-                .is_none_or(|status| status.phase != "Suspended"))
+            || workspace.status.as_ref().is_none_or(|status| {
+                status.phase != "Suspended"
+                    && !(status.phase == "RecoveryRequired"
+                        && snapshot.status.as_ref().is_some_and(|intent| {
+                            intent.source_workspace_id.is_some()
+                                && intent.source_head_epoch.is_some()
+                        }))
+            }))
     {
         patch_snapshot_status(
             &api,
@@ -594,17 +699,11 @@ pub async fn reconcile_workspace_snapshot(
         .ok_or_else(|| anyhow!("source workspace has no backend identity"))?
         .parse()
         .context("parse source workspace ID")?;
-    let redis_password =
-        load_workspace_catalog_password(&ctx.client, &namespace, &cluster, cluster_spec).await?;
-    let admin = connect_workspace_admin(
-        &cluster.name_any(),
-        &namespace,
-        cluster.spec.redis.port,
-        cluster_spec,
-        redis_password.as_deref(),
-    )
-    .await?;
-    admin.recover_incomplete_seals().await?;
+    let admin =
+        connect_workspace_admin_for_cluster(&ctx.client, &cluster, &namespace, cluster_spec)
+            .await?;
+    // Packed-v3 recovery is performed by its recorded bootstrap/snapshot operation.
+    // Bounded source checks below keep unrelated incomplete workspaces RecoveryRequired.
     let volume_id = Uuid::parse_str(&cluster_workspace.volume_id)
         .context("parse cluster workspace volume ID")?;
     let snapshot_uid = resource_uid(&*snapshot)?;
@@ -636,6 +735,9 @@ pub async fn reconcile_workspace_snapshot(
     }
     match admin.load_snapshot(snapshot_id).await {
         Ok(existing) => {
+            if admin.packed_binding(workspace_id).await?.is_some() {
+                admin.verify_packed_revision(&existing.revision).await?;
+            }
             let source = recorded_source.or_else(|| {
                 current
                     .record
@@ -681,23 +783,60 @@ pub async fn reconcile_workspace_snapshot(
         revision: current.base_revision.clone(),
         owner_id: workspace.spec.owner_id.clone(),
     };
-    let pinned = match snapshot_resume_action(source_head_epoch, current.record.head_epoch) {
-        SnapshotResumeAction::Seal => {
+    let pinned = if admin.packed_binding(workspace_id).await?.is_some() {
+        if admin
+            .clean_unmounted_packed_epoch(workspace_id)
+            .await?
+            .is_some()
+            || admin.clean_published_view(workspace_id).await?.is_some()
+        {
             admin
-                .seal_and_snapshot(
-                    workspace_id,
-                    source_head_epoch,
-                    generation,
-                    cluster_spec.lease_ttl_seconds,
-                    cluster_spec.heartbeat_seconds,
-                    request,
-                )
+                .pin_clean_packed_snapshot(workspace_id, request)
                 .await?
-                .1
+        } else {
+            match clean_reference::verified_clean_mount_reference(
+                &ctx.client,
+                &namespace,
+                &workspace,
+                &current,
+                admin.as_ref(),
+            )
+            .await?
+            {
+                Some(reference) => {
+                    admin
+                        .publish_packed_snapshot(reference, request, cluster_spec.lease_ttl_seconds)
+                        .await?
+                }
+                None => {
+                    admin
+                        .recover_packed_snapshot(
+                            workspace_id,
+                            request,
+                            cluster_spec.lease_ttl_seconds,
+                        )
+                        .await?
+                }
+            }
         }
-        SnapshotResumeAction::PinRecoveredRevision => admin.ensure_snapshot(request).await?,
-        SnapshotResumeAction::Conflict => {
-            patch_snapshot_status(
+    } else {
+        match snapshot_resume_action(source_head_epoch, current.record.head_epoch) {
+            SnapshotResumeAction::Seal => {
+                admin
+                    .seal_and_snapshot(
+                        workspace_id,
+                        source_head_epoch,
+                        generation,
+                        cluster_spec.lease_ttl_seconds,
+                        cluster_spec.heartbeat_seconds,
+                        request,
+                    )
+                    .await?
+                    .1
+            }
+            SnapshotResumeAction::PinRecoveredRevision => admin.ensure_snapshot(request).await?,
+            SnapshotResumeAction::Conflict => {
+                patch_snapshot_status(
                 &api,
                 &snapshot,
                 "Failed",
@@ -710,7 +849,8 @@ pub async fn reconcile_workspace_snapshot(
                 Some((workspace_id.to_string(), source_head_epoch)),
             )
             .await?;
-            return Ok(Action::await_change());
+                return Ok(Action::await_change());
+            }
         }
     };
     patch_snapshot_status(
@@ -829,16 +969,8 @@ async fn cleanup_workspace(
     }
     let cluster = load_cluster(client, namespace, &workspace.spec.cluster_ref.name).await?;
     let cluster_spec = enabled_cluster_workspace_spec(&cluster)?;
-    let redis_password =
-        load_workspace_catalog_password(client, namespace, &cluster, cluster_spec).await?;
-    let admin = connect_workspace_admin(
-        &cluster.name_any(),
-        namespace,
-        cluster.spec.redis.port,
-        cluster_spec,
-        redis_password.as_deref(),
-    )
-    .await?;
+    let admin =
+        connect_workspace_admin_for_cluster(client, &cluster, namespace, cluster_spec).await?;
     let workspace_id: WorkspaceId = workspace
         .status
         .as_ref()
@@ -914,16 +1046,8 @@ async fn verify_mount_lease_released(
         .context("load workspace while releasing mount")?;
     let cluster = load_cluster(client, namespace, &workspace.spec.cluster_ref.name).await?;
     let cluster_spec = enabled_cluster_workspace_spec(&cluster)?;
-    let redis_password =
-        load_workspace_catalog_password(client, namespace, &cluster, cluster_spec).await?;
-    let admin = connect_workspace_admin(
-        &cluster.name_any(),
-        namespace,
-        cluster.spec.redis.port,
-        cluster_spec,
-        redis_password.as_deref(),
-    )
-    .await?;
+    let admin =
+        connect_workspace_admin_for_cluster(client, &cluster, namespace, cluster_spec).await?;
     admin.reap_expired_leases().await?;
     let workspace_id: WorkspaceId = workspace
         .status
@@ -968,16 +1092,8 @@ async fn cleanup_snapshot(
     };
     let cluster = load_cluster(client, namespace, &snapshot.spec.cluster_ref.name).await?;
     let cluster_spec = enabled_cluster_workspace_spec(&cluster)?;
-    let redis_password =
-        load_workspace_catalog_password(client, namespace, &cluster, cluster_spec).await?;
-    let admin = connect_workspace_admin(
-        &cluster.name_any(),
-        namespace,
-        cluster.spec.redis.port,
-        cluster_spec,
-        redis_password.as_deref(),
-    )
-    .await?;
+    let admin =
+        connect_workspace_admin_for_cluster(client, &cluster, namespace, cluster_spec).await?;
     admin.delete_snapshot(snapshot_id.parse()?).await
 }
 
@@ -1034,6 +1150,7 @@ fn workspace_status(
 ) -> BrewFSWorkspaceStatus {
     BrewFSWorkspaceStatus {
         observed_generation: workspace.metadata.generation,
+        capabilities: WorkspaceCapabilityStatus::native_only(),
         phase: phase.into(),
         message: message.into(),
         workspace_id,
@@ -1061,6 +1178,22 @@ fn condition(
         message: message.into(),
         observed_generation,
         last_transition_time: Utc::now(),
+    }
+}
+
+fn preserve_condition_transition_times(
+    previous: &[WorkspaceCondition],
+    next: &mut [WorkspaceCondition],
+) {
+    for candidate in next {
+        if let Some(existing) = previous.iter().find(|existing| {
+            existing.condition_type == candidate.condition_type
+                && existing.status == candidate.status
+                && existing.reason == candidate.reason
+                && existing.message == candidate.message
+        }) {
+            candidate.last_transition_time = existing.last_transition_time;
+        }
     }
 }
 
@@ -1228,6 +1361,22 @@ fn holder_generation(id: Uuid) -> u64 {
     (u64::from_be_bytes(bytes) & i64::MAX as u64).max(1)
 }
 
+fn validate_mount_cluster_ref(
+    mount_cluster: &str,
+    workspace_cluster: &str,
+) -> Result<(), &'static str> {
+    if mount_cluster.trim().is_empty() {
+        return Err("clusterRef.name must not be empty");
+    }
+    if workspace_cluster.trim().is_empty() {
+        return Err("referenced workspace has an empty clusterRef.name");
+    }
+    if mount_cluster != workspace_cluster {
+        return Err("clusterRef must match the referenced workspace cluster");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,6 +1407,19 @@ mod tests {
     }
 
     #[test]
+    fn mount_cluster_reference_is_fail_closed() {
+        assert!(validate_mount_cluster_ref("demo", "demo").is_ok());
+        assert_eq!(
+            validate_mount_cluster_ref("other", "demo"),
+            Err("clusterRef must match the referenced workspace cluster")
+        );
+        assert_eq!(
+            validate_mount_cluster_ref("", "demo"),
+            Err("clusterRef.name must not be empty")
+        );
+    }
+
+    #[test]
     fn force_delete_requires_an_audit_reason() {
         let mut workspace = BrewFSWorkspace::new(
             "test",
@@ -1282,3 +1444,6 @@ mod tests {
         assert!(force_delete_requested(&workspace).is_err());
     }
 }
+
+#[path = "clean_reference.rs"]
+mod clean_reference;

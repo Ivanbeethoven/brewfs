@@ -4,7 +4,7 @@
 //! publishes pageable group/inode indexes, matching the read path used by
 //! large snapshots.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -15,11 +15,7 @@ use brewfs::cadapter::client::{ObjectBackend, ObjectClient};
 use brewfs::cadapter::localfs::LocalFsBackend;
 use brewfs::cadapter::s3::{S3Backend, S3Config};
 use brewfs::workspace_overlay::packed_v3::{
-    AccessProfile, ContainerPackingLimits, GroupMeta, GroupPackingLimits, PackedContainerRef,
-    PackedFileInput, PackedFrameInput, PackedGroupContainer, PackedGroupIndexPage,
-    PackedGroupIndexPageRef, PackedGroupInput, PackedGroupRef, PackedInodeIndexEntry,
-    PackedInodeIndexPage, PackedInodeIndexPageRef, PackedSnapshotManifest, SizeClassTable,
-    directory_key, pack_group_file_shards, pack_group_shard_containers,
+    AccessProfile, GroupMeta, PackedFileInput, PackedGroupInput, SizeClassTable, directory_key,
 };
 
 #[derive(Debug, Parser)]
@@ -27,6 +23,40 @@ use brewfs::workspace_overlay::packed_v3::{
 struct Args {
     #[arg(long, default_value = "packed-v3-objects")]
     output_dir: PathBuf,
+    /// Capture one Linux regular-file dentry, preserving SEEK_DATA/SEEK_HOLE
+    /// placement and cold xattrs. Visible nlink is one; directory/root inventory
+    /// and atomic source-snapshot guarantees are separate production work.
+    #[arg(long, conflicts_with = "source_directory")]
+    source_file: Option<PathBuf>,
+    /// Inventory a complete Linux directory with disk-backed raw-name sorting.
+    #[arg(long, conflicts_with = "source_file")]
+    source_directory: Option<PathBuf>,
+    /// Select stat detection, or a verified existing readonly Btrfs snapshot.
+    #[arg(long, value_parser = ["best-effort-detected", "snapshot-backed"], requires = "source_directory")]
+    source_consistency: Option<String>,
+    /// Preserve snapshot-visible nlink, or refuse any alias outside this tree.
+    #[arg(long, value_parser = ["visible-links", "reject-external"], requires = "source_directory")]
+    source_hardlink_policy: Option<String>,
+    /// Current v3 contract: wire 005 with PM11/IP06 counted directory routing.
+    #[arg(long,hide=true,default_value_t=5,value_parser=clap::value_parser!(u8).range(5..=5))]
+    wire_version: u8,
+    /// Packed-v3 metadata codec; omitted preserves zstd.
+    #[arg(long,value_parser=["raw","zstd"])]
+    metadata_codec: Option<String>,
+    /// Packed-v3 data codec; omitted preserves zstd.
+    #[arg(long,value_parser=["raw","zstd"])]
+    data_codec: Option<String>,
+    /// Fixed targets or deterministic size-only selection, applied at build time.
+    #[arg(long, default_value = "size-only", value_parser = ["size-only", "static-256kib", "static-1mib", "static-4mib"])]
+    frame_policy: String,
+    /// Off keeps every nonempty payload out of metadata, including tiny files.
+    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
+    inline_data: String,
+    #[arg(long,default_value_t=false,action=clap::ArgAction::Set)]
+    cold_corpus: bool,
+    #[arg(long,default_value_t=false,action=clap::ArgAction::Set)]
+    hardlink_corpus: bool,
+
     #[arg(long, default_value_t = 2)]
     dir_levels: u32,
     #[arg(long, default_value_t = 10)]
@@ -101,6 +131,43 @@ fn file_size_range(args: &Args) -> Result<(u64, u64)> {
     Ok((min_size, max_size))
 }
 
+fn fixture_codec(value: Option<&str>) -> Result<brewfs::workspace_overlay::packed_v3::PackedCodec> {
+    use brewfs::workspace_overlay::packed_v3::PackedCodec;
+    match value.unwrap_or("zstd") {
+        "raw" => Ok(PackedCodec::Raw),
+        "zstd" => Ok(PackedCodec::Zstd),
+        _ => bail!("unsupported fixture codec"),
+    }
+}
+
+fn fixture_build_policy(
+    args: &Args,
+) -> Result<brewfs::workspace_overlay::packed_v3::wire005::V3BuildPolicy> {
+    use brewfs::workspace_overlay::packed_v3::wire005::{V3BuildPolicy, V3FramePolicy};
+    let frames = match args.frame_policy.as_str() {
+        "size-only" => V3FramePolicy::SizeOnly,
+        "static-256kib" => V3FramePolicy::Static256Kib,
+        "static-1mib" => V3FramePolicy::Static1Mib,
+        "static-4mib" => V3FramePolicy::Static4Mib,
+        _ => bail!("unsupported frame policy"),
+    };
+    Ok(V3BuildPolicy {
+        frames,
+        inline_data: args.inline_data == "on",
+    })
+}
+
+async fn authenticated_build<B: ObjectBackend + Clone>(
+    client: &ObjectClient<B>,
+    reference: &brewfs::workspace_overlay::packed_v3::wire005::V3ObjectRef,
+) -> Result<brewfs::workspace_overlay::packed_v3::wire005::V3BuildProvenance> {
+    let snapshot = brewfs::workspace_overlay::packed_v3::wire005::AuthenticatedV3Snapshot::open(
+        client, reference,
+    )
+    .await?;
+    Ok(snapshot.manifest().build.clone())
+}
+
 fn access_profile(value: &str) -> Result<AccessProfile> {
     match value.trim().to_ascii_lowercase().as_str() {
         "random" | "random-small-file" | "random_small_file" => Ok(AccessProfile::RandomSmallFile),
@@ -123,14 +190,6 @@ fn leaf_path(leaf_index: u64, levels: u32, fanout: u64) -> String {
     }
     components.reverse();
     components.join("/")
-}
-
-fn page_ref(object_key: Vec<u8>, object: &[u8]) -> PackedContainerRef {
-    PackedContainerRef {
-        object_key,
-        object_len: object.len() as u64,
-        object_digest: Sha256::digest(object).into(),
-    }
 }
 
 fn build_tree(
@@ -163,138 +222,6 @@ fn object_key(prefix: &str, relative: &str) -> String {
     } else {
         format!("{prefix}/{relative}")
     }
-}
-
-/// Publish a bounded batch of group shards before the next directory is built.
-///
-/// The fixture is also used for 100k+ file cloud tests. Holding every frame in
-/// `pending_groups` until the manifest is assembled would make the builder's
-/// memory usage proportional to the entire logical dataset. Container packing
-/// is intentionally incremental so the live payload stays near one container.
-async fn publish_container_batch<B>(
-    client: &ObjectClient<B>,
-    prefix: &str,
-    pending_groups: &mut Vec<(PackedGroupInput, Vec<PackedFrameInput>)>,
-    next_container_id: &mut u64,
-    groups: &mut Vec<PackedGroupRef>,
-    containers: &mut Vec<PackedContainerRef>,
-    inode_entries: &mut Vec<PackedInodeIndexEntry>,
-    group_parent_inodes: &HashMap<u64, u64>,
-    profile: AccessProfile,
-) -> Result<()>
-where
-    B: ObjectBackend + Clone + Send + Sync + 'static,
-{
-    if pending_groups.is_empty() {
-        return Ok(());
-    }
-    let packed_containers = pack_group_shard_containers(
-        *next_container_id,
-        std::mem::take(pending_groups),
-        ContainerPackingLimits::for_profile(profile),
-    )?;
-    let batch_count = packed_containers.len() as u64;
-    let upload_limit = Arc::new(Semaphore::new(4));
-    let mut uploads = JoinSet::new();
-    for container in packed_containers {
-        let container_key = object_key(
-            prefix,
-            &format!("containers/{:016x}.brfgc", container.container_id),
-        );
-        let container_bytes = PackedGroupContainer::build(
-            container.container_id,
-            profile,
-            container.groups.clone(),
-            container.frames,
-        )?;
-        let opened = PackedGroupContainer::open(container_bytes.clone())?;
-        let container_ordinal = containers.len() as u32;
-        for (group_input, descriptor) in container.groups.iter().zip(opened.groups()) {
-            let group_id = group_input.group_id;
-            let metadata = GroupMeta::decode(&group_input.metadata)?;
-            let first_name = metadata
-                .entries()
-                .first()
-                .map(|entry| entry.name.clone())
-                .unwrap_or_default();
-            let last_name = metadata
-                .entries()
-                .last()
-                .map(|entry| entry.name.clone())
-                .unwrap_or_default();
-            let parent_dir_inode = *group_parent_inodes
-                .get(&group_id)
-                .context("packed group parent inode is missing")?;
-            groups.push(PackedGroupRef {
-                group_id,
-                container_ordinal,
-                parent_dir_key: descriptor.parent_dir_key,
-                first_name,
-                last_name,
-                meta_offset: descriptor.metadata_offset,
-                meta_len: descriptor.metadata_len,
-                data_offset: descriptor.data_offset,
-                data_len: descriptor.data_len,
-                entry_count: descriptor.entry_count,
-                file_count: descriptor.file_count,
-                frame_count: descriptor.frame_ordinals.len() as u32,
-                layout_profile: descriptor.layout_profile,
-                metadata_digest: descriptor.metadata_digest,
-                data_digest: descriptor.data_digest,
-            });
-            for (entry_ordinal, entry) in metadata.entries().iter().enumerate() {
-                inode_entries.push(PackedInodeIndexEntry {
-                    inode: entry.inode,
-                    parent_inode: parent_dir_inode,
-                    parent_dir_key: descriptor.parent_dir_key,
-                    group_id,
-                    entry_ordinal: entry_ordinal as u32,
-                    name: entry.name.clone(),
-                    kind: entry.kind,
-                    mode: entry.mode,
-                    uid: entry.uid,
-                    gid: entry.gid,
-                    rdev: entry.rdev,
-                    nlink: entry.nlink,
-                    atime_ns: entry.atime_ns,
-                    mtime_ns: entry.mtime_ns,
-                    ctime_ns: entry.ctime_ns,
-                    size: entry.size,
-                });
-            }
-        }
-        containers.push(page_ref(
-            container_key.clone().into_bytes(),
-            &container_bytes,
-        ));
-
-        let permit = upload_limit
-            .clone()
-            .acquire_owned()
-            .await
-            .context("packed container upload semaphore closed")?;
-        let upload_client = client.clone();
-        uploads.spawn(async move {
-            let _permit = permit;
-            upload_client
-                .put_object(&container_key, &container_bytes)
-                .await
-                .with_context(|| format!("upload packed container {container_key}"))
-        });
-        if uploads.len() >= 4 {
-            let _ = uploads
-                .join_next()
-                .await
-                .context("packed container upload task disappeared")??;
-        }
-    }
-    while let Some(result) = uploads.join_next().await {
-        result??;
-    }
-    *next_container_id = (*next_container_id)
-        .checked_add(batch_count)
-        .ok_or_else(|| anyhow::anyhow!("packed container id exceeds u64"))?;
-    Ok(())
 }
 
 /// Upload the same deterministic tree as one object per file. The bounded
@@ -356,49 +283,286 @@ where
     Ok(())
 }
 
-async fn build_fixture<B>(args: &Args, client: ObjectClient<B>, prefix: &str) -> Result<()>
-where
-    B: ObjectBackend + Clone + Send + Sync + 'static,
-{
-    let (min_file_size, max_file_size) = file_size_range(args)?;
+fn apply_cold_targets(
+    group: &mut PackedGroupInput,
+    attributes: &[brewfs::workspace_overlay::packed_v3::wire005::V3ColdAttributes],
+) -> Result<()> {
+    if attributes.is_empty() {
+        return Ok(());
+    }
+    let metadata = GroupMeta::decode(&group.metadata)?;
+    let mut entries = metadata.entries().to_vec();
+    for entry in &mut entries {
+        if let Some(target) = attributes
+            .iter()
+            .find(|attrs| attrs.inode == entry.inode)
+            .and_then(|attrs| attrs.symlink_target.as_ref())
+        {
+            entry.size = target.len() as u64;
+        }
+    }
+    group.metadata = GroupMeta::new(entries)?.encode()?;
+    Ok(())
+}
+
+async fn build_v3_fixture<B: ObjectBackend + Clone + Send + Sync + 'static>(
+    args: &Args,
+    client: ObjectClient<B>,
+    prefix: &str,
+) -> Result<()> {
+    use brewfs::workspace_overlay::packed_v3::wire005::{V3ProducerOptions, V3SnapshotProducer};
+    let provenance_client = client.clone();
+    let build_policy = fixture_build_policy(args)?;
+    let (minimum, maximum) = file_size_range(args)?;
     let profile = access_profile(&args.access_profile)?;
     let snapshot_id: [u8; 32] = Sha256::digest(b"brewfs-packed-v3-fixture").into();
     let root_key = directory_key(snapshot_id, 1);
-    let root = Directory {
-        inode: 1,
-        parent_inode: 0,
-        name: Vec::new(),
+    let options = V3ProducerOptions {
+        snapshot_id,
+        root_dir_key: root_key,
+        root_inode: 1,
+        profile,
+        size_classes: SizeClassTable::default(),
+        build_policy,
+        metadata_codec: fixture_codec(args.metadata_codec.as_deref())?,
+        data_codec: fixture_codec(args.data_codec.as_deref())?,
     };
-    let mut next_inode = 2u64;
+    let prefix = if prefix.is_empty() {
+        "packed-wire005-fixture"
+    } else {
+        prefix
+    };
+    if let Some(source) = &args.source_directory {
+        #[cfg(target_os = "linux")]
+        {
+            use brewfs::workspace_overlay::packed_v3::wire005::{
+                V3SourceConsistency, V3SourceFileLimits, V3SourceHardlinkPolicy,
+                V3SourceNamespaceInventory, V3SourceNamespaceOptions,
+            };
+            let policy = match args.source_hardlink_policy.as_deref() {
+                Some("visible-links") => V3SourceHardlinkPolicy::VisibleLinks,
+                Some("reject-external") => V3SourceHardlinkPolicy::RejectExternal,
+                _ => bail!("source-directory requires an explicit source-hardlink-policy"),
+            };
+            let consistency = match args.source_consistency.as_deref() {
+                Some("best-effort-detected") => V3SourceConsistency::BestEffortDetected,
+                Some("snapshot-backed") => V3SourceConsistency::SnapshotBacked,
+                _ => bail!("source-directory requires an explicit source-consistency"),
+            };
+            let inventory = V3SourceNamespaceInventory::capture(
+                source,
+                &std::env::temp_dir(),
+                V3SourceNamespaceOptions {
+                    root_inode: 1,
+                    consistency,
+                    hardlink_policy: policy,
+                    file_limits: V3SourceFileLimits::default(),
+                },
+            )
+            .await?;
+            let snapshot = inventory
+                .build_snapshot(client, prefix.into(), options)
+                .await?;
+            let build = authenticated_build(&provenance_client, &snapshot.reference).await?;
+            let provenance = serde_json::json!({
+                "build_provenance": build,
+                "capture_scope": "complete-directory-inventory",
+                "source_consistency": snapshot.provenance.consistency,
+                "source_view": snapshot.provenance,
+                "source_hardlink_policy": policy.as_str(),
+                "manifest_payload": "PM11", "index_payload": "IP06",
+                "st_blocks_wire_preserved": true, "root_source_attributes_preserved": true,
+                "posix_acl_scope": "linux-access-readonly-default-preserved",
+                "source_report": snapshot.report,
+                "group_logical_limit": 64 * 1024 * 1024,
+                "group_data_limit": 16 * 1024 * 1024, "group_extent_limit": 256,
+                "external_logical_limit": i64::MAX as u64,
+                "manifest_key": snapshot.reference.key,
+                "manifest_digest": hex::encode(snapshot.reference.digest),
+            });
+            std::fs::write(
+                args.manifest_output.with_extension("source.json"),
+                serde_json::to_vec_pretty(&provenance)?,
+            )?;
+            std::fs::write(
+                &args.manifest_output,
+                format!("{}\n", snapshot.reference.key),
+            )?;
+            println!(
+                "packed_version=v3 source_entries={} unique_inodes={} groups={} frames={}",
+                snapshot.report.source_entries,
+                snapshot.report.unique_inodes,
+                snapshot.report.groups,
+                snapshot.report.frames
+            );
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!("source-directory capture requires Linux");
+    }
+    let mut producer =
+        V3SnapshotProducer::new(client, &std::env::temp_dir(), prefix.into(), options).await?;
+    if let Some(path) = &args.source_file {
+        #[cfg(target_os = "linux")]
+        {
+            use brewfs::workspace_overlay::packed_v3::wire005::{
+                CapturedV3Source, CapturedV3SourceRoot, V3SourceFileLimits,
+            };
+            // Capture disk I/O off the runtime. Its buffers are bounded and
+            // cancellation cannot publish a partial source group.
+            let path = path.clone();
+            let root_path_for_capture = path.clone();
+            let source_root = tokio::task::spawn_blocking(move || {
+                let path = root_path_for_capture;
+                let root_path = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(std::path::Path::new("."));
+                CapturedV3SourceRoot::capture(root_path, 1)
+            })
+            .await??;
+            let mut captured = CapturedV3Source::capture_with_policy(
+                &path,
+                &std::env::temp_dir(),
+                2,
+                profile,
+                SizeClassTable::default(),
+                V3SourceFileLimits::default(),
+                build_policy,
+            )
+            .await?;
+            producer.set_root_attributes(source_root.attributes().clone())?;
+            producer
+                .set_inode_blocks(2, captured.source_blocks())
+                .await?;
+            let group = captured.group(1, root_key, profile)?;
+            let external_chunks = match &mut captured {
+                CapturedV3Source::External(source) => producer.add_external_source(source).await?,
+                CapturedV3Source::Group(_) => 0,
+            };
+            let frames = match &captured {
+                CapturedV3Source::Group(source) => source.frames(),
+                CapturedV3Source::External(_) => &[],
+            };
+            producer.add_container(1, &[group], frames, &[1]).await?;
+            producer
+                .add_cold_attributes(captured.cold_attributes())
+                .await?;
+            producer
+                .add_cold_attributes(source_root.cold_attributes())
+                .await?;
+            captured.validate_unchanged()?;
+            source_root.validate_unchanged()?;
+            let reference = producer.finish().await?;
+            let build = authenticated_build(&provenance_client, &reference).await?;
+            // A late mutation never yields a published manifest-output file.
+            // Uploaded unreachable objects remain the caller's cleanup domain.
+            captured.validate_unchanged()?;
+            source_root.validate_unchanged()?;
+            let provenance = serde_json::json!({
+                "build_provenance": build,
+                "capture_scope": "single-regular-file-dentry",
+                "source_consistency": "stat-revalidated-not-atomic-directory-snapshot",
+                "visible_nlink": captured.entry().nlink,
+                "source_nlink": captured.source_nlink(),
+                "source_blocks": captured.source_blocks(),
+                "size": captured.entry().size,
+                "mode": captured.entry().mode,
+                "uid": captured.entry().uid, "gid": captured.entry().gid,
+                "mtime_ns": captured.entry().mtime_ns, "ctime_ns": captured.entry().ctime_ns,
+                "data_bytes": captured.data_bytes(),
+                "extent_count": captured.extent_count(),
+                "external_chunks": external_chunks,
+                "xattr_count": captured.cold_attributes().xattrs.len(),
+                "manifest_payload": "PM11", "index_payload": "IP06",
+                "root_capture_scope": "source-parent-attributes-only-not-full-inventory",
+                "st_blocks_wire_preserved": true,
+                "root_source_attributes_preserved": true,
+                "root_size": source_root.attributes().size,
+                "root_blocks": source_root.attributes().blocks,
+                "root_mode": source_root.attributes().mode,
+                "root_uid": source_root.attributes().uid, "root_gid": source_root.attributes().gid,
+                "root_nlink": source_root.attributes().nlink,
+                "manifest_key": reference.key, "manifest_digest": hex::encode(reference.digest),
+            });
+            let provenance_path = args.manifest_output.with_extension("source.json");
+            std::fs::write(provenance_path, serde_json::to_vec_pretty(&provenance)?)?;
+            std::fs::write(&args.manifest_output, format!("{}\n", reference.key))?;
+            println!(
+                "packed_version=v3 files=1 logical_bytes={} source_data_bytes={} extents={}",
+                captured.entry().size,
+                provenance["data_bytes"],
+                captured.extent_count()
+            );
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!("source-file capture requires Linux");
+    }
+    let mut next_inode = 2;
     let mut directories = Vec::new();
     build_tree(
         args.dir_levels,
         args.dirs_per_level,
         &mut next_inode,
-        root,
+        Directory {
+            inode: 1,
+            parent_inode: 0,
+            name: Vec::new(),
+        },
         &mut directories,
     );
-
-    let mut groups = Vec::with_capacity(directories.len());
-    let mut containers = Vec::with_capacity(directories.len());
-    let mut inode_entries = Vec::new();
-    let mut pending_groups = Vec::new();
-    let mut group_parent_inodes = HashMap::new();
-    let container_limits = ContainerPackingLimits::for_profile(profile);
-    // Accumulate several target-sized containers so the bounded uploader can
-    // keep multiple OSS requests in flight without retaining the full fixture.
-    let publish_target_bytes = container_limits.target_body_bytes.saturating_mul(4);
-    let mut next_container_id = 1u64;
-    let mut pending_bytes = 0usize;
+    let mut cold_attributes = Vec::new();
+    if args.cold_corpus {
+        use brewfs::workspace_overlay::packed_v3::wire005::{V3ColdAttributes, V3Xattr};
+        let inode = next_inode;
+        next_inode += 1;
+        cold_attributes.push(V3ColdAttributes {
+            inode,
+            symlink_target: Some(b"raw-\xff-target".to_vec()),
+            xattrs: Vec::new(),
+            acl: Vec::new(),
+        });
+        let inode = next_inode;
+        next_inode += 1;
+        cold_attributes.push(V3ColdAttributes {
+            inode,
+            symlink_target: None,
+            xattrs: vec![V3Xattr {
+                name: b"user.brewfs.test".to_vec(),
+                value: b"\0\xffcold".to_vec(),
+            }],
+            acl: vec![brewfs::meta::store::AclRule {
+                acl_type: 1,
+                qualifier: 0,
+                permissions: 7,
+            }],
+        });
+    }
+    let hardlink_inode = if args.hardlink_corpus {
+        let inode = next_inode;
+        next_inode += 1;
+        Some(inode)
+    } else {
+        None
+    };
+    let hardlink_parent = directories
+        .iter()
+        .find(|directory| directory.parent_inode == 1)
+        .map(|directory| directory.inode)
+        .unwrap_or(1);
     let mut file_index = 0u64;
-
+    let mut group_count = 0u64;
+    let mut logical_bytes = 0u64;
     for directory in &directories {
-        let group_parent_key = if directory.inode == 1 {
+        let key = if directory.inode == 1 {
             root_key
         } else {
             directory_key(snapshot_id, directory.inode)
         };
-        let mut files = Vec::with_capacity(args.files_per_dir as usize + 8);
+        let mut files = Vec::new();
+        let mut pending_bytes = 0usize;
+        let mut shard = 0u64;
         for child in directories
             .iter()
             .filter(|child| child.parent_inode == directory.inode)
@@ -419,12 +583,68 @@ where
                 data: Vec::new(),
             });
         }
-        let is_leaf = !directories
+        if directory.inode == 1 && args.cold_corpus {
+            for attributes in &cold_attributes {
+                let symlink = attributes.symlink_target.is_some();
+                files.push(PackedFileInput {
+                    name: if symlink {
+                        b".cold-link".to_vec()
+                    } else {
+                        b".cold-file".to_vec()
+                    },
+                    inode: attributes.inode,
+                    kind: if symlink { 3 } else { 1 },
+                    // Writable permission bits let the diagnostic reach the
+                    // readonly filesystem instead of stopping at DAC denial.
+                    mode: if symlink { 0o120777 } else { 0o100666 },
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    nlink: 1,
+                    atime_ns: 0,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                    flags: 0,
+                    data: if symlink {
+                        Vec::new()
+                    } else {
+                        b"cold\n".to_vec()
+                    },
+                });
+            }
+        }
+        if let Some(inode) = hardlink_inode {
+            let mut names = Vec::new();
+            if directory.inode == 1 {
+                names.push(b".hardlink-a".to_vec());
+            }
+            if directory.inode == hardlink_parent {
+                names.push(b".hardlink-b".to_vec());
+            }
+            for name in names {
+                files.push(PackedFileInput {
+                    name,
+                    inode,
+                    kind: 1,
+                    mode: 0o100644,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    nlink: 2,
+                    atime_ns: 0,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                    flags: 0,
+                    data: b"hardlink\n".to_vec(),
+                });
+            }
+        }
+        if !directories
             .iter()
-            .any(|child| child.parent_inode == directory.inode);
-        if is_leaf {
+            .any(|child| child.parent_inode == directory.inode)
+        {
             for index in 0..args.files_per_dir {
-                let size = file_size_for_index(file_index, min_file_size, max_file_size);
+                let size = file_size_for_index(file_index, minimum, maximum);
                 files.push(PackedFileInput {
                     name: format!("f{index:06}").into_bytes(),
                     inode: next_inode,
@@ -442,145 +662,124 @@ where
                 });
                 next_inode += 1;
                 file_index += 1;
+                logical_bytes += size as u64;
+                pending_bytes += size;
+                if pending_bytes >= 8 * 1024 * 1024 || files.len() >= 256 {
+                    let id = (directory.inode << 32) | shard;
+                    let (mut group, frames) =
+                        brewfs::workspace_overlay::packed_v3::pack_group_files_with_policy(
+                            id,
+                            key,
+                            std::mem::take(&mut files),
+                            profile,
+                            SizeClassTable::default(),
+                            build_policy,
+                        )?;
+                    apply_cold_targets(&mut group, &cold_attributes)?;
+                    producer
+                        .add_container(id, &[group], &frames, &[directory.inode])
+                        .await?;
+                    pending_bytes = 0;
+                    shard += 1;
+                    group_count += 1;
+                }
             }
         }
-        // Keep the high bits tied to the directory and use the low bits for
-        // its lexicographic shard ordinal. This preserves stable, collision-
-        // free group ids when a large directory is split.
-        let group_id_base = directory
-            .inode
-            .checked_shl(32)
-            .context("directory inode cannot be encoded as a group id")?;
-        let shards = pack_group_file_shards(
-            group_id_base,
-            group_parent_key,
-            files,
-            profile,
-            SizeClassTable::default(),
-            None,
-            GroupPackingLimits::for_profile(profile),
-        )?;
-        for (group_input, frames) in shards {
-            group_parent_inodes.insert(group_input.group_id, directory.inode);
-            pending_bytes = pending_bytes.saturating_add(
-                group_input.metadata.len()
-                    + frames.iter().map(|frame| frame.raw.len()).sum::<usize>(),
-            );
-            pending_groups.push((group_input, frames));
-            if pending_bytes >= publish_target_bytes {
-                publish_container_batch(
-                    &client,
-                    prefix,
-                    &mut pending_groups,
-                    &mut next_container_id,
-                    &mut groups,
-                    &mut containers,
-                    &mut inode_entries,
-                    &group_parent_inodes,
+        if !files.is_empty() {
+            let id = (directory.inode << 32) | shard;
+            let (mut group, frames) =
+                brewfs::workspace_overlay::packed_v3::pack_group_files_with_policy(
+                    id,
+                    key,
+                    files,
                     profile,
-                )
+                    SizeClassTable::default(),
+                    build_policy,
+                )?;
+            apply_cold_targets(&mut group, &cold_attributes)?;
+            producer
+                .add_container(id, &[group], &frames, &[directory.inode])
                 .await?;
-                pending_bytes = 0;
-            }
+            group_count += 1;
         }
     }
-    publish_container_batch(
-        &client,
-        prefix,
-        &mut pending_groups,
-        &mut next_container_id,
-        &mut groups,
-        &mut containers,
-        &mut inode_entries,
-        &group_parent_inodes,
-        profile,
-    )
-    .await?;
-
-    groups.sort_by(|left, right| {
-        left.parent_dir_key
-            .cmp(&right.parent_dir_key)
-            .then_with(|| left.first_name.cmp(&right.first_name))
+    for attrs in &cold_attributes {
+        producer.add_cold_attributes(attrs).await?;
+    }
+    let reference = producer.finish().await?;
+    let build = authenticated_build(&provenance_client, &reference).await?;
+    let provenance = serde_json::json!({
+        "capture_scope": "generated-deterministic-corpus",
+        "manifest_payload": "PM11", "index_payload": "IP06",
+        "manifest_key": reference.key, "manifest_digest": hex::encode(reference.digest),
+        "build_provenance": build, "logical_bytes": logical_bytes, "files": file_index,
     });
-    inode_entries.sort_by_key(|entry| entry.inode);
-
-    let mut group_pages = Vec::new();
-    for (page_ordinal, chunk) in groups.chunks(4096).enumerate() {
-        let page = PackedGroupIndexPage {
-            snapshot_id,
-            page_ordinal: page_ordinal as u32,
-            total_pages: groups.len().div_ceil(4096) as u32,
-            groups: chunk.to_vec(),
-        };
-        let bytes = page.encode()?;
-        let key = object_key(prefix, &format!("indexes/groups-{page_ordinal:08}.brfgi"));
-        client.put_object(&key, &bytes).await?;
-        let first = chunk.first().context("empty group index page")?;
-        let last = chunk.last().context("empty group index page")?;
-        group_pages.push(PackedGroupIndexPageRef {
-            object: page_ref(key.into_bytes(), &bytes),
-            first_parent_dir_key: first.parent_dir_key,
-            first_name: first.first_name.clone(),
-            last_parent_dir_key: last.parent_dir_key,
-            last_name: last.last_name.clone(),
-        });
-    }
-
-    let mut inode_pages = Vec::new();
-    for (page_ordinal, chunk) in inode_entries.chunks(4096).enumerate() {
-        let page = PackedInodeIndexPage {
-            snapshot_id,
-            page_ordinal: page_ordinal as u32,
-            total_pages: inode_entries.len().div_ceil(4096) as u32,
-            entries: chunk.to_vec(),
-        };
-        let bytes = page.encode()?;
-        let key = object_key(prefix, &format!("indexes/inodes-{page_ordinal:08}.brfii"));
-        client.put_object(&key, &bytes).await?;
-        let first = chunk.first().context("empty inode index page")?;
-        let last = chunk.last().context("empty inode index page")?;
-        inode_pages.push(PackedInodeIndexPageRef {
-            object: page_ref(key.into_bytes(), &bytes),
-            first_inode: first.inode,
-            last_inode: last.inode,
-        });
-    }
-
-    let group_count = groups.len();
-    let container_count = containers.len();
-    let manifest = PackedSnapshotManifest {
-        snapshot_id,
-        root_dir_key: root_key,
-        root_inode: 1,
-        layout_profile: profile,
-        size_classes: SizeClassTable::default(),
-        groups: Vec::new(),
-        containers,
-        group_index_pages: group_pages,
-        inode_index_pages: inode_pages,
-    };
-    let manifest_bytes = manifest.encode()?;
-    let manifest_key = object_key(prefix, "manifest.brpm");
-    client.put_object(&manifest_key, &manifest_bytes).await?;
-    std::fs::write(&args.manifest_output, format!("{manifest_key}\n"))?;
-    let logical_bytes: u64 = inode_entries.iter().map(|entry| entry.size).sum();
+    std::fs::write(
+        args.manifest_output.with_extension("source.json"),
+        serde_json::to_vec_pretty(&provenance)?,
+    )?;
+    std::fs::write(&args.manifest_output, format!("{}\n", reference.key))?;
     println!(
-        "manifest_key={manifest_key} directories={} groups={} containers={} files={} min_file_size={} max_file_size={} logical_bytes={} manifest_bytes={} prefix={prefix}",
-        directories.len(),
-        group_count,
-        container_count,
+        "packed_version=v3 manifest_key={} manifest_digest={} files={} groups={} logical_bytes={}",
+        reference.key,
+        hex::encode(reference.digest),
         file_index,
-        min_file_size,
-        max_file_size,
-        logical_bytes,
-        manifest_bytes.len()
+        group_count,
+        logical_bytes
     );
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if args.raw_only && (args.frame_policy != "size-only" || args.inline_data != "on") {
+        bail!("packed frame/inline controls require a packed v3 corpus");
+    }
+    if (args.source_file.is_some() || args.source_directory.is_some())
+        && (args.wire_version != 5 || args.raw_only || args.cold_corpus || args.hardlink_corpus)
+    {
+        bail!(
+            "source capture requires the current packed-v3 encoding and cannot combine generated/raw corpora"
+        );
+    }
+    if let Some(source) = &args.source_directory {
+        if !matches!(
+            args.source_consistency.as_deref(),
+            Some("best-effort-detected" | "snapshot-backed")
+        ) || args.source_hardlink_policy.is_none()
+        {
+            bail!(
+                "source-directory requires explicit source-consistency and source-hardlink-policy"
+            );
+        }
+        let output = resolve_destination(&args.output_dir)?;
+        let prefix = args.prefix.trim_matches('/');
+        let objects = resolve_destination(&output.join(if prefix.is_empty() {
+            "packed-wire005-fixture"
+        } else {
+            prefix
+        }))?;
+        let manifest = resolve_destination(&args.manifest_output)?;
+        let provenance = resolve_destination(&manifest.with_extension("source.json"))?;
+        #[cfg(target_os = "linux")]
+        {
+            let mut destinations = vec![manifest.clone(), provenance];
+            if args.bucket.is_none() {
+                destinations.extend([output.clone(), objects]);
+            }
+            brewfs::workspace_overlay::packed_v3::wire005::V3SourceNamespaceInventory::validate_output_paths(source, &destinations)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!("source namespace import requires Linux");
+        // Use the resolved destination, so a missing component followed by ..
+        // cannot create a scratch directory inside the read-only source.
+        args.output_dir = output;
+        args.manifest_output = manifest;
+    }
+    if (args.cold_corpus || args.hardlink_corpus) && (args.wire_version != 5 || args.raw_only) {
+        bail!("cold-corpus requires the current packed-v3 encoding");
+    }
     if args.dir_levels > 8 || args.dirs_per_level == 0 || args.files_per_dir == 0 {
         bail!("dir-levels must be <= 8 and fanout/files-per-dir must be non-zero");
     }
@@ -606,7 +805,7 @@ async fn main() -> Result<()> {
         if args.raw_only {
             build_raw_fixture(&args, client, prefix).await
         } else {
-            build_fixture(&args, client, prefix).await
+            build_v3_fixture(&args, client, prefix).await
         }
     } else {
         std::fs::create_dir_all(&args.output_dir)?;
@@ -615,7 +814,187 @@ async fn main() -> Result<()> {
         if args.raw_only {
             build_raw_fixture(&args, client, prefix).await
         } else {
-            build_fixture(&args, client, prefix).await
+            build_v3_fixture(&args, client, prefix).await
+        }
+    }
+}
+
+fn resolve_destination(path: &std::path::Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut result = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::RootDir => result.push("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            Component::Normal(part) => {
+                result.push(part);
+                match std::fs::symlink_metadata(&result) {
+                    Ok(_) => {
+                        result = std::fs::canonicalize(&result)
+                            .context("resolve destination component")?
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Component::Prefix(_) => bail!("unsupported destination prefix"),
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod codec_control_tests {
+    #[test]
+    fn g15_cli_accepts_actual_static_and_inline_off_controls() {
+        assert!(
+            Args::try_parse_from([
+                "fixture",
+                "--frame-policy",
+                "static-1mib",
+                "--inline-data",
+                "off",
+                "--metadata-codec",
+                "raw",
+                "--data-codec",
+                "zstd",
+            ])
+            .is_ok(),
+            "required actual layout controls are unavailable"
+        );
+    }
+
+    use super::*;
+    #[test]
+    fn namespace_cli_accepts_explicit_snapshot_provider_selection() {
+        let args = Args::try_parse_from([
+            "fixture",
+            "--source-directory",
+            "readonly-snapshot",
+            "--source-consistency",
+            "snapshot-backed",
+            "--source-hardlink-policy",
+            "visible-links",
+        ])
+        .unwrap();
+        assert_eq!(args.source_consistency.as_deref(), Some("snapshot-backed"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn destination_preflight_rejects_existing_final_source_file_symlink() {
+        use brewfs::workspace_overlay::packed_v3::wire005::V3SourceNamespaceInventory;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let original = source.join("original");
+        std::fs::write(&original, b"source-must-not-change").unwrap();
+        let destination = root.path().join("outside-manifest");
+        std::os::unix::fs::symlink(&original, &destination).unwrap();
+        // This is the actual fixture preflight sequence: the final link is
+        // resolved first, then containment checks the resulting source path.
+        let resolved = resolve_destination(&destination).unwrap();
+        assert_eq!(resolved, original);
+        assert!(V3SourceNamespaceInventory::validate_output_paths(&source, &[resolved]).is_err());
+        assert_eq!(std::fs::read(&original).unwrap(), b"source-must-not-change");
+        assert_eq!(std::fs::read_dir(&source).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn destination_preflight_rejects_dangling_final_source_file_symlink() {
+        use brewfs::workspace_overlay::packed_v3::wire005::V3SourceNamespaceInventory;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let absent = source.join("must-not-be-created");
+        let destination = root.path().join("outside-manifest");
+        std::os::unix::fs::symlink(&absent, &destination).unwrap();
+        let accepted = resolve_destination(&destination).and_then(|resolved| {
+            V3SourceNamespaceInventory::validate_output_paths(&source, &[resolved])
+                .map_err(anyhow::Error::from)
+        });
+        assert!(accepted.is_err());
+        assert!(!absent.exists());
+        assert_eq!(std::fs::read_dir(&source).unwrap().count(), 0);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn destination_guard_resolves_aliases_and_missing_tail_without_creating_source_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        assert_eq!(
+            resolve_destination(&alias.join("objects")).unwrap(),
+            source.join("objects")
+        );
+        assert_eq!(
+            resolve_destination(&source.join("missing/../../objects")).unwrap(),
+            root.path().join("objects")
+        );
+        assert_eq!(std::fs::read_dir(&source).unwrap().count(), 0);
+        std::os::unix::fs::symlink(root.path().join("absent"), root.path().join("dangling"))
+            .unwrap();
+        assert!(resolve_destination(&root.path().join("dangling/objects")).is_err());
+    }
+
+    #[test]
+    fn namespace_cli_requires_directory_for_source_policies_and_rejects_mixed_sources() {
+        assert!(
+            Args::try_parse_from(["fixture", "--source-hardlink-policy", "visible-links"]).is_err()
+        );
+        assert!(
+            Args::try_parse_from(["fixture", "--source-consistency", "best-effort-detected"])
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "fixture",
+                "--source-file",
+                "one",
+                "--source-directory",
+                "tree"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn wire005_codec_controls_preserve_defaults_and_reject_unknown_codecs() {
+        use brewfs::workspace_overlay::packed_v3::PackedCodec;
+        assert_eq!(fixture_codec(None).unwrap(), PackedCodec::Zstd);
+        assert_eq!(fixture_codec(Some("raw")).unwrap(), PackedCodec::Raw);
+        assert!(fixture_codec(Some("invalid")).is_err());
+        assert!(Args::try_parse_from(["fixture", "--data-codec", "invalid"]).is_err());
+        let args = Args::try_parse_from([
+            "fixture",
+            "--wire-version",
+            "5",
+            "--data-codec",
+            "raw",
+            "--metadata-codec",
+            "raw",
+        ])
+        .unwrap();
+        assert_eq!(args.data_codec.as_deref(), Some("raw"));
+        assert_eq!(args.metadata_codec.as_deref(), Some("raw"));
+    }
+
+    #[test]
+    fn fixture_defaults_to_current_v3_contract_and_rejects_legacy_writer() {
+        assert_eq!(Args::try_parse_from(["fixture"]).unwrap().wire_version, 5);
+        for version in ["4", "6"] {
+            assert!(Args::try_parse_from(["fixture", "--wire-version", version]).is_err());
         }
     }
 }

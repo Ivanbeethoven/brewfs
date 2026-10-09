@@ -294,13 +294,13 @@ impl IndexNode {
             let last_key = reader.bytes("index entry")?.to_vec();
 
             // Range ordering check
-            if let Some(prev_last) = &previous_last_key {
-                if &first_key[..] <= &prev_last[..] {
-                    return Err(WireError::invalid(
-                        "index node",
-                        "entries are not strictly sorted",
-                    ));
-                }
+            if let Some(prev_last) = &previous_last_key
+                && first_key[..] <= prev_last[..]
+            {
+                return Err(WireError::invalid(
+                    "index node",
+                    "entries are not strictly sorted",
+                ));
             }
             if first_key > last_key {
                 return Err(WireError::invalid(

@@ -136,6 +136,7 @@ READ_THROUGHPUT_PROFILE=false
 METADATA_THROUGHPUT_PROFILE=false
 WRITEBACK_THROUGHPUT_PROFILE=false
 PERF_TOOLS_VALUE="fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
+PERF_TOOLS_EXPLICIT=false
 BENCH_ARGS_VALUE=""
 BREWFS_WRITEBACK_MODE_VALUE="${BREWFS_WRITEBACK_MODE:-}"
 
@@ -180,6 +181,7 @@ while [[ $# -gt 0 ]]; do
         --tools)
             require_value "$1" "${2:-}"
             PERF_TOOLS_VALUE="${2:-}"
+            PERF_TOOLS_EXPLICIT=true
             shift 2
             ;;
         --brewfs-bench)
@@ -264,15 +266,62 @@ if [[ "$WRITEBACK_THROUGHPUT_PROFILE" == true ]]; then
     enable_writeback_throughput_profile
 fi
 
+validate_packed_fixture() {
+    if [[ -n "${PERF_PACKED_DIRS:-}" || -n "${PERF_PACKED_FIO_FILE_SIZE:-}" ]]; then
+        err "packed-v3 fixture does not support PERF_PACKED_DIRS or PERF_PACKED_FIO_FILE_SIZE; use directory levels/fanout/files-per-leaf"
+        return 1
+    fi
+    export PERF_PACKED_DIR_LEVELS="${PERF_PACKED_DIR_LEVELS:-1}"
+    export PERF_PACKED_DIRS_PER_LEVEL="${PERF_PACKED_DIRS_PER_LEVEL:-8}"
+    export PERF_PACKED_FILES_PER_DIR="${PERF_PACKED_FILES_PER_DIR:-4500}"
+    export PERF_PACKED_SMALLFILE_SIZE="${PERF_PACKED_SMALLFILE_SIZE:-4096}"
+    local expected
+    expected="$(python3 - "$PERF_PACKED_DIR_LEVELS" "$PERF_PACKED_DIRS_PER_LEVEL" "$PERF_PACKED_FILES_PER_DIR" "$PERF_PACKED_SMALLFILE_SIZE" "${PERF_PACKED_SMALLFILE_COUNT:-}" <<'PY'
+import re
+import sys
+
+values = sys.argv[1:]
+if any(not re.fullmatch(r"[0-9]+", value) for value in values[:4]):
+    raise SystemExit("packed-v3 fixture dimensions and size must be unsigned integers")
+levels, fanout, per_leaf, size = map(int, values[:4])
+maximum = (1 << 64) - 1
+if levels > 8 or not 0 < fanout <= maximum or not 0 < per_leaf <= maximum or not 0 < size <= 4 * 1024 * 1024:
+    raise SystemExit("packed-v3 requires levels 0..8, nonzero u64 fanout/files-per-leaf and file size 1..4 MiB")
+count = fanout ** levels * per_leaf
+if count > maximum:
+    raise SystemExit("packed-v3 fixture file count overflows u64")
+if values[4] and (not re.fullmatch(r"[0-9]+", values[4]) or int(values[4]) != count):
+    raise SystemExit(f"packed-v3 fixture count mismatch: expected={count} configured={values[4]}")
+print(count)
+PY
+)" || return 1
+    export PERF_PACKED_SMALLFILE_COUNT="$expected"
+}
+
 PACKED_MODE=false
-if [[ "${BREWFS_VOLUME_FORMAT:-}" == "packed-metadata-v1" ]]; then
-    PACKED_MODE=true
+case "${BREWFS_VOLUME_FORMAT:-}" in
+    packed-metadata-v3) PACKED_MODE=true ;;
+    packed-*) err "unsupported packed volume format: $BREWFS_VOLUME_FORMAT (only packed-metadata-v3)"; exit 1 ;;
+esac
+if [[ "$PACKED_MODE" == true ]]; then
+    if [[ "$PERF_TOOLS_EXPLICIT" == false ]]; then
+        PERF_TOOLS_VALUE="packed-tree packed-smallfiles"
+    fi
+    read -r -a packed_tools <<<"$PERF_TOOLS_VALUE"
+    [[ "${#packed_tools[@]}" -gt 0 ]] || { err "packed-v3 PERF_TOOLS cannot be empty"; exit 1; }
+    for tool in "${packed_tools[@]}"; do
+        case "$tool" in
+            packed-tree|packed-smallfiles) ;;
+            *) err "unsupported packed-v3 tool: $tool; tree/smallfiles are supported, fio/POSIX fixture layout remains OPEN"; exit 1 ;;
+        esac
+    done
+    validate_packed_fixture || exit 1
     if [[ "$STORAGE_BACKEND" == "local-fs" ]]; then
-        err "packed-metadata-v1 requires --s3 or --minio because its fixture is published to object storage"
+        err "packed-metadata-v3 requires --s3 or --minio because its fixture is published to object storage"
         exit 1
     fi
     if [[ "$RUN_BREWFS_BENCH" == true ]]; then
-        err "--brewfs-bench is a Redis metadata benchmark and cannot run in packed-metadata-v1 mode"
+        err "--brewfs-bench is a Redis metadata benchmark and cannot run in packed-metadata-v3 mode"
         exit 1
     fi
     export BREWFS_META_BACKEND="${BREWFS_META_BACKEND:-none}"
@@ -441,7 +490,7 @@ esac
 publish_packed_fixture() {
     local fixture_log="$host_artifact_dir/packed-fixture.log"
     local manifest_output="$host_artifact_dir/packed-manifest-key.txt"
-    local fixture_bin="$PROJECT_DIR/target/release/packed_snapshot_fixture"
+    local fixture_bin="$PROJECT_DIR/target/release/packed_v3_snapshot_fixture"
     if [[ -n "${BREWFS_PACKED_MANIFEST_KEY:-}" ]]; then
         printf '%s\n' "$BREWFS_PACKED_MANIFEST_KEY" >"$manifest_output"
         info "复用 packed manifest key: $BREWFS_PACKED_MANIFEST_KEY"
@@ -451,20 +500,12 @@ publish_packed_fixture() {
     info "构建并发布 packed metadata fixture（无 Redis）"
     cargo build --release \
         --features native-packed-base,frozen-base-metadata \
-        --bin packed_snapshot_fixture
+        --bin packed_v3_snapshot_fixture
     if [[ ! -x "$fixture_bin" ]]; then
         err "fixture binary not found: $fixture_bin"
         return 1
     fi
     local prefix="${BREWFS_PACKED_FIXTURE_PREFIX:-packed-fixture-${ts}}"
-    local fio_file_size="${PERF_PACKED_FIO_FILE_SIZE:-67108864}"
-    if ! fio_file_size="$(size_to_bytes "$fio_file_size")"; then
-        err "PERF_PACKED_FIO_FILE_SIZE 不是有效容量: ${PERF_PACKED_FIO_FILE_SIZE:-<empty>}"
-        return 2
-    fi
-    # The in-container scanner and POSIX checks use this value as an integer;
-    # normalize human-friendly input once before publishing and passing env on.
-    export PERF_PACKED_FIO_FILE_SIZE="$fio_file_size"
     set +e
     env \
         AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
@@ -475,12 +516,12 @@ publish_packed_fixture() {
         --endpoint "http://127.0.0.1:${S3_HOST_PORT}" \
         --region "${BREWFS_S3_REGION:-us-east-1}" \
         --prefix "$prefix" \
-        --dirs "${PERF_PACKED_DIRS:-8}" \
-        --dir-levels "${PERF_PACKED_DIR_LEVELS:-0}" \
-        --dirs-per-level "${PERF_PACKED_DIRS_PER_LEVEL:-10}" \
+        --wire-version 5 \
+        --dir-levels "$PERF_PACKED_DIR_LEVELS" \
+        --dirs-per-level "$PERF_PACKED_DIRS_PER_LEVEL" \
         --files-per-dir "${PERF_PACKED_FILES_PER_DIR:-4500}" \
         --small-file-size "${PERF_PACKED_SMALLFILE_SIZE:-4096}" \
-        --fio-file-size "$fio_file_size" \
+        --force-path-style true \
         --manifest-output "$manifest_output" \
         >"$fixture_log" 2>&1
     local fixture_status=$?
@@ -510,7 +551,7 @@ info "启动依赖服务: ${services[*]}"
 docker compose -f "$COMPOSE_FILE" up -d "${services[@]}"
 docker compose -f "$COMPOSE_FILE" ps >"$host_artifact_dir/compose-services-before-perf.txt" 2>&1 || true
 if [[ "$PACKED_MODE" == true ]] && grep -q 'redis-brewfs-perf' "$host_artifact_dir/compose-services-before-perf.txt"; then
-    err "packed-metadata-v1 unexpectedly started Redis; refusing to run"
+    err "packed-metadata-v3 unexpectedly started Redis; refusing to run"
     exit 1
 fi
 
@@ -530,14 +571,12 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e BREWFS_META_BACKEND \
     -e BREWFS_META_URL \
     -e BREWFS_PACKED_MANIFEST_KEY \
-    -e PERF_PACKED_DIRS \
     -e PERF_PACKED_DIR_LEVELS \
     -e PERF_PACKED_DIRS_PER_LEVEL \
     -e PERF_PACKED_FILES_PER_DIR \
     -e PERF_PACKED_SMALLFILE_COUNT \
     -e PERF_PACKED_SMALLFILE_SIZE \
     -e PERF_PACKED_SMALLFILE_READ_BYTES \
-    -e PERF_PACKED_FIO_FILE_SIZE \
     -e PERF_DIRSTRESS_ARGS \
     -e PERF_DIRPERF_ARGS \
     -e PERF_METAPERF_ARGS \

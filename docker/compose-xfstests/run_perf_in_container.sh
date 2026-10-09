@@ -25,7 +25,11 @@ log_file="${BREWFS_LOG_FILE:-/artifacts/brewfs.log}"
 xfstests_dir="${XFSTESTS_DIR:-/opt/xfstests-dev}"
 artifact_root="${BREWFS_ARTIFACT_ROOT:-/artifacts}"
 artifact_dir="${BREWFS_ARTIFACT_DIR:-}"
-perf_tools="${PERF_TOOLS:-fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest}"
+if [[ "${BREWFS_VOLUME_FORMAT:-}" == "packed-metadata-v3" ]]; then
+    perf_tools="${PERF_TOOLS:-packed-tree packed-smallfiles}"
+else
+    perf_tools="${PERF_TOOLS:-fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest}"
+fi
 nofile_limit="${BREWFS_NOFILE_LIMIT:-1048576}"
 
 env_or_default() {
@@ -179,9 +183,9 @@ write_config() {
         echo
         if [[ -n "${BREWFS_VOLUME_FORMAT:-}" ]]; then
             echo "volume_format: ${BREWFS_VOLUME_FORMAT}"
-            if [[ "$BREWFS_VOLUME_FORMAT" == "packed-metadata-v1" ]]; then
+            if [[ "$BREWFS_VOLUME_FORMAT" == "packed-metadata-v3" ]]; then
                 if [[ -z "${BREWFS_PACKED_MANIFEST_KEY:-}" ]]; then
-                    err "BREWFS_PACKED_MANIFEST_KEY 不能为空 (packed-metadata-v1)"
+                    err "BREWFS_PACKED_MANIFEST_KEY 不能为空 (packed-metadata-v3)"
                     exit 1
                 fi
                 echo "packed_manifest_key: ${BREWFS_PACKED_MANIFEST_KEY}"
@@ -309,7 +313,7 @@ EOF
         esac
         echo
 
-        if [[ "${BREWFS_VOLUME_FORMAT:-}" != "packed-metadata-v1" ]]; then
+        if [[ "${BREWFS_VOLUME_FORMAT:-}" != "packed-metadata-v3" ]]; then
         case "$meta_backend" in
             sqlite)
                 mkdir -p "$(dirname "$sqlite_path")"
@@ -631,9 +635,9 @@ prepare_artifacts() {
     printf 'ts\ttool\telapsed_s\tbuffer_dirty_bytes\tlive_dirty_bytes\tlive_slices\trecent_pending_upload_bytes\trecent_uploaded_bytes\tstage_inflight_bytes\tremote_upload_inflight_bytes\ts3_put_ops\ts3_put_bytes\tbuffer_soft_sleep_ops\tbuffer_moderate_sleep_ops\tbuffer_hard_sleep_ops\tfuse_write_bytes\tupload_batch_ops\n' \
         >"$artifact_dir/writeback-samples.tsv"
     write_perf_profile
-    if [[ "${BREWFS_VOLUME_FORMAT:-}" == "packed-metadata-v1" ]]; then
+    if [[ "${BREWFS_VOLUME_FORMAT:-}" == "packed-metadata-v3" ]]; then
         cat >"$artifact_dir/packed-runtime-proof.env" <<EOF
-volume_format=packed-metadata-v1
+volume_format=packed-metadata-v3
 metadata_store=immutable-object-snapshot
 metadata_client=none
 metadata_config=omitted
@@ -1241,29 +1245,27 @@ run_dirperf() {
 }
 
 run_packed_smallfiles() {
-    if [[ "${BREWFS_VOLUME_FORMAT:-}" != "packed-metadata-v1" ]]; then
-        err "packed-smallfiles requires BREWFS_VOLUME_FORMAT=packed-metadata-v1"
+    local scan_mode="${1:-full}"
+    local tool=packed-smallfiles
+    if [[ "$scan_mode" == tree ]]; then tool=packed-tree; fi
+    if [[ "${BREWFS_VOLUME_FORMAT:-}" != "packed-metadata-v3" ]]; then
+        err "packed-smallfiles requires BREWFS_VOLUME_FORMAT=packed-metadata-v3"
         return 1
     fi
     local root="$mount_dir"
     local expected="${PERF_PACKED_SMALLFILE_COUNT:-36000}"
     local file_size="${PERF_PACKED_SMALLFILE_SIZE:-4096}"
     local read_bytes="${PERF_PACKED_SMALLFILE_READ_BYTES:-1}"
-    local dir_levels="${PERF_PACKED_DIR_LEVELS:-0}"
-    local dirs_per_level
-    if (( dir_levels > 0 )); then
-        dirs_per_level="${PERF_PACKED_DIRS_PER_LEVEL:-10}"
-    else
-        dirs_per_level="${PERF_PACKED_DIRS:-8}"
-    fi
+    local dir_levels="${PERF_PACKED_DIR_LEVELS:-1}"
+    local dirs_per_level="${PERF_PACKED_DIRS_PER_LEVEL:-8}"
     local files_per_dir="${PERF_PACKED_FILES_PER_DIR:-4500}"
     if truthy_env "${PERF_FIO_COLD_READ:-false}" \
         || truthy_env "${PERF_FIO_COLD_READ_CLEAR_CACHE:-false}"; then
-        remount_brewfs_for_fio_profile packed-smallfiles || return $?
+        remount_brewfs_for_fio_profile "$tool" || return $?
     fi
     info "扫描 packed metadata 小文件: root=$root expected=$expected"
     packed_smallfiles_scan() {
-        python3 - "$root" "$expected" "$file_size" "$read_bytes" "$dir_levels" "$dirs_per_level" "$files_per_dir" <<'PY'
+        python3 - "$root" "$expected" "$file_size" "$read_bytes" "$dir_levels" "$dirs_per_level" "$files_per_dir" "$scan_mode" <<'PY'
 import os
 import pathlib
 import sys
@@ -1276,8 +1278,7 @@ read_bytes = int(sys.argv[4])
 dir_levels = int(sys.argv[5])
 dirs_per_level = int(sys.argv[6])
 files_per_dir = int(sys.argv[7])
-if dir_levels <= 0:
-    dir_levels = 1
+scan_mode = sys.argv[8]
 expected_leaf_dirs = dirs_per_level ** dir_levels
 if expected % expected_leaf_dirs:
     raise SystemExit(f"file count {expected} is not divisible by leaf directory count {expected_leaf_dirs}")
@@ -1297,8 +1298,8 @@ for directory, dirs, names in os.walk(root):
     dirs.sort()
     relative = pathlib.Path(directory).relative_to(root)
     depth = len(relative.parts)
-    child_dirs = [name for name in dirs if name.startswith("d")]
-    dirs[:] = child_dirs
+    child_dirs = dirs
+    names = [name for name in names if not name.startswith(".")]
     if depth:
         tree_dirs += 1
     expected_children = dirs_per_level if depth < dir_levels else 0
@@ -1313,6 +1314,9 @@ for directory, dirs, names in os.walk(root):
     leaf_dirs += 1
     if len(names) != files_per_dir:
         raise SystemExit(f"leaf file count mismatch path={directory} actual={len(names)} expected={files_per_dir}")
+    if scan_mode == "tree":
+        files += len(names)
+        continue
     for name in sorted(names):
         path = pathlib.Path(directory) / name
         try:
@@ -1331,104 +1335,18 @@ for directory, dirs, names in os.walk(root):
             errors += 1
             print(f"error path={path} error={error}")
 elapsed = time.monotonic() - started
-mode = "full" if read_bytes <= 0 else f"prefix:{read_bytes}"
+mode = "tree" if scan_mode == "tree" else "full" if read_bytes <= 0 else f"prefix:{read_bytes}"
 print(f"packed_smallfiles_summary files={files} expected={expected} directories={tree_dirs} expected_directories={expected_tree_dirs} leaf_directories={leaf_dirs} expected_leaf_directories={expected_leaf_dirs} levels={dir_levels} dirs_per_level={dirs_per_level} files_per_leaf={files_per_dir} file_size={file_size} read_mode={mode} logical_bytes={logical_bytes} payload_bytes={payload_bytes} errors={errors} checksum={checksum} seconds={elapsed:.6f} files_per_sec={files / elapsed if elapsed else 0:.2f}")
 if files != expected or tree_dirs != expected_tree_dirs or leaf_dirs != expected_leaf_dirs or errors:
     raise SystemExit(1)
 PY
     }
-    run_logged_tool packed-smallfiles packed_smallfiles_scan
+    run_logged_tool "$tool" packed_smallfiles_scan
 }
 
 run_packed_posix() {
-    if [[ "${BREWFS_VOLUME_FORMAT:-}" != "packed-metadata-v1" ]]; then
-        err "packed-posix requires BREWFS_VOLUME_FORMAT=packed-metadata-v1"
-        return 1
-    fi
-    local small_size="${PERF_PACKED_SMALLFILE_SIZE:-4096}"
-    local fio_size="${PERF_PACKED_FIO_FILE_SIZE:-67108864}"
-    local files_per_dir="${PERF_PACKED_FILES_PER_DIR:-4500}"
-    local dir_levels="${PERF_PACKED_DIR_LEVELS:-0}"
-    local dirs_per_level="${PERF_PACKED_DIRS_PER_LEVEL:-10}"
-    packed_posix_scan() {
-        python3 - "$mount_dir" "$small_size" "$fio_size" "$files_per_dir" "$dir_levels" "$dirs_per_level" <<'PY'
-import os
-import pathlib
-import stat
-import sys
-
-root = pathlib.Path(sys.argv[1])
-small_size = int(sys.argv[2])
-fio_size = int(sys.argv[3])
-files_per_dir = int(sys.argv[4])
-dir_levels = int(sys.argv[5])
-dirs_per_level = int(sys.argv[6])
-if dir_levels <= 0:
-    dir_levels = 1
-    dirs_per_level = 8
-leaf_components = ["d000"] * dir_levels
-leaf = root.joinpath(*leaf_components)
-symlink_target = "../" + "/".join(leaf_components) + "/f00000"
-read_path = leaf / "f00000"
-bench_path = root / "bench" / "read.bin"
-verify_dir = root / "verify"
-hardlink_path = verify_dir / "hardlink"
-symlink_path = verify_dir / "symlink"
-checks = 0
-mutations_rejected = 0
-data = read_path.read_bytes()
-bench_size = bench_path.stat().st_size
-if len(data) != small_size or bench_size != fio_size:
-    raise SystemExit(f"unexpected fixture sizes small={len(data)} bench={bench_size}")
-
-def check(condition, message):
-    global checks
-    checks += 1
-    if not condition:
-        raise SystemExit(f"semantic check failed: {message}")
-
-check(read_path.stat().st_ino == hardlink_path.stat().st_ino, "hardlink inode")
-check(read_path.stat().st_nlink == 2, "hardlink nlink")
-check(os.readlink(symlink_path) == symlink_target, "symlink target")
-check(symlink_path.stat().st_ino == read_path.stat().st_ino, "symlink follow")
-check(len(list(leaf.iterdir())) == files_per_dir, "readdir count")
-check(stat.S_ISFIFO((verify_dir / "fifo").lstat().st_mode), "fifo type")
-check(stat.S_ISSOCK((verify_dir / "socket").lstat().st_mode), "socket type")
-check(stat.S_ISCHR((verify_dir / "char").lstat().st_mode), "char type")
-check(stat.S_ISBLK((verify_dir / "block").lstat().st_mode), "block type")
-check(stat.S_IMODE(read_path.stat().st_mode) == 0o644, "regular mode")
-check(stat.S_IMODE(bench_path.stat().st_mode) == 0o644, "benchmark mode")
-
-def rejected(label, operation):
-    global mutations_rejected
-    try:
-        result = operation()
-        if isinstance(result, int):
-            os.close(result)
-        print(f"mutation unexpectedly succeeded label={label}")
-    except OSError as error:
-        mutations_rejected += 1
-        print(f"mutation rejected label={label} errno={error.errno} text={error}")
-
-for operation in (
-    ("open-write", lambda: os.open(root / "write-attempt", os.O_WRONLY | os.O_CREAT, 0o644)),
-    ("mkdir", lambda: os.mkdir(root / "mkdir-attempt")),
-    ("unlink", lambda: os.unlink(read_path)),
-    ("rename", lambda: os.rename(read_path, root / "rename-attempt")),
-    ("truncate", lambda: os.truncate(bench_path, 0)),
-    ("chmod", lambda: os.chmod(read_path, 0o600)),
-    ("link", lambda: os.link(read_path, root / "link-attempt")),
-    ("symlink", lambda: os.symlink("d000/f00000", root / "symlink-attempt")),
-    ("rmdir", lambda: os.rmdir(root / "d000")),
-    ("setxattr", lambda: os.setxattr(read_path, "user.packed", b"deny")),
-):
-    rejected(*operation)
-if mutations_rejected != 10:
-    raise SystemExit(f"mutation rejection mismatch rejected={mutations_rejected} expected=10")
-print(f"packed_posix_summary read_bytes={len(data)} bench_bytes={bench_size} semantic_checks={checks} mutation_checks=10 mutations_rejected={mutations_rejected}")
-PY
-    }
-    run_logged_tool packed-posix packed_posix_scan
+    err "packed POSIX fixture layout remains OPEN for packed-v3; use the dedicated SPEC correctness gates"
+    return 1
 }
 
 run_metaperf() {
@@ -1626,6 +1544,10 @@ prepare_fio_dataset() {
 }
 
 run_fio_custom() {
+    if [[ "${BREWFS_VOLUME_FORMAT:-}" == "packed-metadata-v3" ]]; then
+        err "packed-v3 fio fixture/trace layout remains OPEN"
+        return 1
+    fi
     local work_dir="$mount_dir/.perf-fio"
     local json_path="$artifact_dir/results/fio.json"
     local -a args=()
@@ -1814,6 +1736,10 @@ PY
 }
 
 run_fio_profile() {
+    if [[ "${BREWFS_VOLUME_FORMAT:-}" == "packed-metadata-v3" ]]; then
+        err "packed-v3 fio fixture/trace layout remains OPEN"
+        return 1
+    fi
     local tool="$1"
     local mode="$2"
     local direct_override="${3:-}"
@@ -1841,8 +1767,6 @@ run_fio_profile() {
     local repeat_count=1
     local repeat_cooldown_secs=10
     local warmup_count=0
-    local packed_read=false
-    local packed_fio_path=""
     local -a args=()
 
     if [[ -n "$profile_key_override" ]]; then
@@ -1879,20 +1803,6 @@ run_fio_profile() {
         return "$matrix_status"
     fi
 
-    if [[ "${BREWFS_VOLUME_FORMAT:-}" == "packed-metadata-v1" ]]; then
-        # Packed snapshots are immutable. Default read profiles use the
-        # fixture's real read-only file; custom fio args remain caller-owned.
-        work_dir="/tmp/brewfs-perf-${tool}"
-        if [[ -z "${!profile_args_var:-}" ]] \
-            && [[ "$mode" == "seqread" || "$mode" == "randread" || "$mode" == "bigread" ]]; then
-            packed_read=true
-            packed_fio_path="$mount_dir/bench/read.bin"
-            if [[ ! -f "$packed_fio_path" ]]; then
-                err "packed fio fixture 不存在或不可读: $packed_fio_path"
-                return 1
-            fi
-        fi
-    fi
     rm -rf "$work_dir"
     mkdir -p "$work_dir"
 
@@ -2009,36 +1919,17 @@ run_fio_profile() {
                 ;;
         esac
 
-        if [[ "$packed_read" == true ]]; then
-            size="$(stat -c '%s' "$packed_fio_path")"
-            needs_prefill=false
-        fi
-
-        if [[ "$packed_read" == true ]]; then
-            args=(
-                --name="$name"
-                --filename="$packed_fio_path"
-                --rw="$rw"
-                --bs="$bs"
-                --size="$size"
-                --numjobs="$numjobs"
-                --ioengine="$ioengine"
-                --iodepth="$iodepth"
-                --direct="$direct"
-            )
-        else
-            args=(
-                --name="$name"
-                --directory="$work_dir"
-                --rw="$rw"
-                --bs="$bs"
-                --size="$size"
-                --numjobs="$numjobs"
-                --ioengine="$ioengine"
-                --iodepth="$iodepth"
-                --direct="$direct"
-            )
-        fi
+        args=(
+            --name="$name"
+            --directory="$work_dir"
+            --rw="$rw"
+            --bs="$bs"
+            --size="$size"
+            --numjobs="$numjobs"
+            --ioengine="$ioengine"
+            --iodepth="$iodepth"
+            --direct="$direct"
+        )
 
         if [[ "${use_time_based:-true}" == true ]]; then
             args+=(--runtime="$runtime" --time_based)
@@ -2067,13 +1958,6 @@ run_fio_profile() {
         if truthy_env "${PERF_FIO_COLD_READ:-false}" || truthy_env "${PERF_FIO_PREFILL_REMOUNT:-false}"; then
             remount_brewfs_for_fio_profile "$tool" || return $?
         fi
-    fi
-
-    # Packed read profiles use the immutable fixture and skip writable prefill,
-    # but still perform the same cold-read boundary before measuring.
-    if [[ "$packed_read" == true ]] \
-        && (truthy_env "${PERF_FIO_COLD_READ:-false}" || truthy_env "${PERF_FIO_COLD_READ_CLEAR_CACHE:-false}"); then
-        remount_brewfs_for_fio_profile "$tool" || return $?
     fi
 
     if [[ "$mode" == "bigread" ]]; then
@@ -2988,6 +2872,9 @@ run_perf_suite() {
             dirperf)
                 run_dirperf || status=1
                 ;;
+            packed-tree)
+                run_packed_smallfiles tree || status=1
+                ;;
             packed-smallfiles)
                 run_packed_smallfiles || status=1
                 ;;
@@ -3040,7 +2927,55 @@ run_perf_suite() {
     return "$status"
 }
 
+validate_packed_request() {
+    case "${BREWFS_VOLUME_FORMAT:-}" in
+        packed-metadata-v3) ;;
+        packed-*) err "unsupported packed volume format: $BREWFS_VOLUME_FORMAT (only packed-metadata-v3)"; return 1 ;;
+        *) return 0 ;;
+    esac
+    local -a tools=()
+    local tool
+    read -r -a tools <<<"$perf_tools"
+    [[ "${#tools[@]}" -gt 0 ]] || { err "packed-v3 PERF_TOOLS cannot be empty"; return 1; }
+    for tool in "${tools[@]}"; do
+        case "$tool" in
+            packed-tree|packed-smallfiles) ;;
+            *) err "unsupported packed-v3 tool: $tool; tree/smallfiles are supported, fio/POSIX fixture layout remains OPEN"; return 1 ;;
+        esac
+    done
+    if [[ -n "${PERF_PACKED_DIRS:-}" || -n "${PERF_PACKED_FIO_FILE_SIZE:-}" ]]; then
+        err "packed-v3 fixture does not support PERF_PACKED_DIRS or PERF_PACKED_FIO_FILE_SIZE; use directory levels/fanout/files-per-leaf"
+        return 1
+    fi
+    export PERF_PACKED_DIR_LEVELS="${PERF_PACKED_DIR_LEVELS:-1}"
+    export PERF_PACKED_DIRS_PER_LEVEL="${PERF_PACKED_DIRS_PER_LEVEL:-8}"
+    export PERF_PACKED_FILES_PER_DIR="${PERF_PACKED_FILES_PER_DIR:-4500}"
+    export PERF_PACKED_SMALLFILE_SIZE="${PERF_PACKED_SMALLFILE_SIZE:-4096}"
+    local expected
+    expected="$(python3 - "$PERF_PACKED_DIR_LEVELS" "$PERF_PACKED_DIRS_PER_LEVEL" "$PERF_PACKED_FILES_PER_DIR" "$PERF_PACKED_SMALLFILE_SIZE" "${PERF_PACKED_SMALLFILE_COUNT:-}" <<'PY'
+import re
+import sys
+
+values = sys.argv[1:]
+if any(not re.fullmatch(r"[0-9]+", value) for value in values[:4]):
+    raise SystemExit("packed-v3 fixture dimensions and size must be unsigned integers")
+levels, fanout, per_leaf, size = map(int, values[:4])
+maximum = (1 << 64) - 1
+if levels > 8 or not 0 < fanout <= maximum or not 0 < per_leaf <= maximum or not 0 < size <= 4 * 1024 * 1024:
+    raise SystemExit("packed-v3 requires levels 0..8, nonzero u64 fanout/files-per-leaf and file size 1..4 MiB")
+count = fanout ** levels * per_leaf
+if count > maximum:
+    raise SystemExit("packed-v3 fixture file count overflows u64")
+if values[4] and (not re.fullmatch(r"[0-9]+", values[4]) or int(values[4]) != count):
+    raise SystemExit(f"packed-v3 fixture count mismatch: expected={count} configured={values[4]}")
+print(count)
+PY
+)" || return 1
+    export PERF_PACKED_SMALLFILE_COUNT="$expected"
+}
+
 main() {
+    validate_packed_request || return 1
     if [[ -z "$artifact_dir" ]]; then
         local ts
         ts="$(date +%s)-$RANDOM"
@@ -3092,8 +3027,8 @@ main() {
 
     mount_brewfs
 
-    if [[ "${BREWFS_VOLUME_FORMAT:-}" == "packed-metadata-v1" ]]; then
-        info "跳过写入型预检: packed-metadata-v1 是只读挂载"
+    if [[ "${BREWFS_VOLUME_FORMAT:-}" == "packed-metadata-v3" ]]; then
+        info "跳过写入型预检: packed-metadata-v3 是只读挂载"
     else
         # Pre-flight sanity check: verify the filesystem can create, write, and read files.
         info "执行挂载点预检: $mount_dir"

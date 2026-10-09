@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from array import array
+import hashlib
 import json
 import math
 import os
@@ -52,6 +53,13 @@ def expected_payload_chunk(pattern: bytes, offset: int, length: int) -> bytes:
     start = offset % len(pattern)
     repetitions = math.ceil((start + length) / len(pattern))
     return (pattern * repetitions)[start : start + length]
+
+
+def trace_sha256(specs: list[FileSpec]) -> str:
+    hasher = hashlib.sha256()
+    for spec in specs:
+        hasher.update(f"{spec.file_number}:{spec.expected_size}\n".encode())
+    return hasher.hexdigest()
 
 
 def percentile_ns(values: list[int], percentile: float) -> int:
@@ -247,7 +255,7 @@ def main() -> int:
         args.expected_files < 0
         or args.min_size <= 0
         or args.min_size > args.max_size
-        or args.dir_levels <= 0
+        or args.dir_levels < 0
         or args.dirs_per_level <= 0
         or args.files_per_leaf <= 0
         or args.workers <= 0
@@ -284,6 +292,7 @@ def main() -> int:
             "label": args.label,
             "mode": args.mode,
             "order": args.order,
+            "shuffle_seed": args.shuffle_seed if args.order == "shuffle" else 0,
             "epoch": 1,
             "epochs": 1,
             "files": len(specs),
@@ -299,6 +308,7 @@ def main() -> int:
             "payload_bytes": 0,
             "errors": 0,
             "checksum": 0,
+            "trace_sha256": trace_sha256(specs),
             "discovery_seconds": discovery_finished - started,
             "seconds": discovery_finished - started,
             "files_per_sec": len(specs) / (discovery_finished - started),
@@ -356,6 +366,7 @@ def main() -> int:
                 "payload_bytes": payload_bytes,
                 "errors": len(errors),
                 "checksum": checksum,
+                "trace_sha256": trace_sha256(epoch_specs),
                 "discovery_seconds": discovery_finished - started,
                 "seconds": elapsed,
                 "files_per_sec": successful / elapsed if elapsed else 0.0,

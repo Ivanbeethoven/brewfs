@@ -1,5 +1,10 @@
 # BrewFS Packed Metadata: Large-Directory And Training-Data-Informed Design
 
+Active-task scope override (2026-10-04): only v3 is required. The old v2
+publication/archive/compatibility contract below is historical; v3 retains the
+bounded-page, deep-cookie, eviction/refetch and memory/performance requirements,
+with implementation tracked by [G05 and the v3 gates](../plans/2026-10-04-brewfs-all-spec-completion.md).
+
 Status: **superseded working note; see `2026-08-24-brewfs-clustered-frozen-metadata-v2.md`**
 
 This document refines the clustered frozen metadata v2 RFC for the workload
@@ -12,6 +17,18 @@ cluster union, `DirKey`, `LocalNodeId`, data seals, and crash-safe upload. This
 document records workload motivation and examples only. Where its example
 targets differ, the revised v2 SPEC wins; this note must not be used to infer
 an implemented format or a performance result.
+
+### Version scope clarification (2026-10-03)
+
+The v2 precedence above applies to **v2**. The later
+[packed-v3 specification](2026-09-27-brewfs-packed-metadata-v3-readonly-smallfiles.md)
+is the independent contract for wire 004/005, dynamic frames and the staged
+packed lower integration; it does not silently replace v2 objects. Batch/shard
+sizes, in-memory estimates, training-format examples and publication sketches in
+this working note are not current v3 field definitions, cache guarantees or
+performance acceptance evidence. In particular, pageable data structures alone
+do not prove mount-wide allocation bounds, logarithmic deep-cookie routing or a
+complete authenticated descriptor chain.
 
 ## 1. Design decision
 
@@ -382,15 +399,14 @@ Performance tests:
 - random lookup: one index path plus one batch fetch;
 - sequential readdir: bounded active windows and coalesced adjacent ranges;
 - 36,000, 1,000,000, and synthetic 100,000,000-entry scans;
-- cold read with packed v2, ordinary BrewFS + Redis, and JuiceFS under the
+- cold read with packed-v3, ordinary BrewFS + Redis, and JuiceFS under the
   same S3, block, compression, cache, FUSE, and fio settings;
 - record metadata GET count, data GET count, range bytes, cache hits, peak
   decoded bytes, and p50/p99 lookup/readdir latency separately.
 
 ## 11. Implementation order
 
-1. Introduce `ReadDirCursor`/`readdir_page` in the frozen facade without
-   changing v1 semantics.
+1. Introduce `ReadDirCursor`/`readdir_page` in the packed-v3 frozen facade.
 2. Implement the 4 KiB Merkle index node and independently decodable batch
    header/codec with golden fixtures.
 3. Implement one-cluster directory descriptors, range segments, and targeted

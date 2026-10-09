@@ -25,14 +25,12 @@ CONFIG_PATH="$WORK/mount.yaml"
 CACHE_ROOT="${BREWFS_CACHE_ROOT:-$WORK/cache}"
 FIXTURE_PREFIX="${PACKED_FIXTURE_PREFIX:-brewfs-packed-native-$(date +%s)}"
 FIXTURE_MANIFEST="$WORK/manifest-key.txt"
-FIO_FILE_SIZE="${PERF_PACKED_FIO_FILE_SIZE:-67108864}"
 READ_BYTES="${PERF_PACKED_SMALLFILE_READ_BYTES:-0}"
 SMALLFILE_WORKERS="${PERF_PACKED_SMALLFILE_WORKERS:-16}"
 SMALLFILE_MIN_SIZE="${PACKED_SMALLFILE_MIN_SIZE:-$PACKED_SMALLFILE_SIZE}"
 SMALLFILE_MAX_SIZE="${PACKED_SMALLFILE_MAX_SIZE:-$PACKED_SMALLFILE_SIZE}"
 PACKED_ACCESS_PROFILE="${PACKED_ACCESS_PROFILE:-random-small-file}"
-TOOLS="${PERF_TOOLS:-packed-tree packed-smallfiles fio-seqread fio-randread}"
-FIO_RUNTIME="${PERF_FIO_RUNTIME:-20}"
+TOOLS="${PERF_TOOLS:-packed-tree packed-smallfiles}"
 FORCE_PATH_STYLE="${BREWFS_S3_FORCE_PATH_STYLE:-false}"
 READ_MEMORY_BYTES="${BREWFS_READ_MEMORY_BYTES:-0}"
 READ_SSD_BYTES="${BREWFS_READ_SSD_BYTES:-0}"
@@ -50,15 +48,6 @@ METADATA_CACHE_TTL_MS="${BREWFS_METADATA_CACHE_TTL_MS:-1000}"
 TOOL_TIMEOUT_SECONDS="${PERF_TOOL_TIMEOUT_SECONDS:-900}"
 
 case "$PACKED_VOLUME_FORMAT" in
-    packed-metadata-v1)
-        MOUNT_CHUNK_SIZE=67108864
-        MOUNT_BLOCK_SIZE=4194304
-        ;;
-    packed-metadata-v2)
-        # v2 cluster superblocks currently carry a fixed 1 MiB chunk size.
-        MOUNT_CHUNK_SIZE=1048576
-        MOUNT_BLOCK_SIZE=1048576
-        ;;
     packed-metadata-v3)
         MOUNT_CHUNK_SIZE=67108864
         MOUNT_BLOCK_SIZE=4194304
@@ -67,6 +56,15 @@ case "$PACKED_VOLUME_FORMAT" in
         die "unsupported packed volume format: $PACKED_VOLUME_FORMAT"
         ;;
 esac
+
+read -r -a selected_tools <<<"$TOOLS"
+[[ "${#selected_tools[@]}" -gt 0 ]] || die "packed-v3 PERF_TOOLS cannot be empty"
+for tool in "${selected_tools[@]}"; do
+    case "$tool" in
+        packed-tree|packed-stat|packed-smallfiles|packed-gpu-smallfiles) ;;
+        *) die "unsupported packed-v3 tool: $tool; fio/POSIX fixture layout remains OPEN" ;;
+    esac
+done
 
 mkdir -p "$WORK" "$ARTIFACT_DIR/tools" "$MOUNT_DIR"
 chmod 0755 "$BREWFS_BIN" "$PACKED_FIXTURE_BIN" "$PACKED_SMALLFILES_SCANNER"
@@ -234,6 +232,7 @@ EOF
 publish_fixture() {
     log "publishing immutable packed metadata fixture to OSS"
     local fixture_args=(
+        --wire-version 5 \
         --bucket "$BREWFS_S3_BUCKET" \
         --endpoint "$BREWFS_S3_ENDPOINT" \
         --region "$BREWFS_S3_REGION" \
@@ -447,71 +446,6 @@ run_gpu_smallfiles_scan() {
         --json-output "$ARTIFACT_DIR/tools/packed-gpu-smallfiles-summary.json"
 }
 
-packed_posix_scan() {
-    python3 - "$MOUNT_DIR" "$SMALLFILE_MIN_SIZE" "$SMALLFILE_MAX_SIZE" "$FIO_FILE_SIZE" "$PACKED_FILES_PER_DIR" "$PACKED_DIR_LEVELS" <<'PY'
-import os
-import pathlib
-import stat
-import sys
-
-root = pathlib.Path(sys.argv[1])
-min_size = int(sys.argv[2])
-max_size = int(sys.argv[3])
-fio_size = int(sys.argv[4])
-files_per_dir = int(sys.argv[5])
-levels = int(sys.argv[6])
-leaf = root.joinpath(*(["d000"] * levels))
-read_path = leaf / "f00000"
-bench_path = root / "bench" / "read.bin"
-verify = root / "verify"
-data = read_path.read_bytes()
-span = max_size - min_size + 1
-mixed = 1442695040888963407 & ((1 << 64) - 1)
-expected_small_size = min_size + (mixed % span if span else 0)
-if len(data) != expected_small_size or bench_path.stat().st_size != fio_size:
-    raise SystemExit("fixture sizes do not match")
-if len(list(leaf.iterdir())) != files_per_dir:
-    raise SystemExit("readdir count mismatch")
-if read_path.stat().st_ino != (verify / "hardlink").stat().st_ino:
-    raise SystemExit("hardlink inode mismatch")
-if os.readlink(verify / "symlink") != "../" + "/".join(["d000"] * levels) + "/f00000":
-    raise SystemExit("symlink target mismatch")
-for name, predicate in (("fifo", stat.S_ISFIFO), ("socket", stat.S_ISSOCK), ("char", stat.S_ISCHR), ("block", stat.S_ISBLK)):
-    if not predicate((verify / name).lstat().st_mode):
-        raise SystemExit(f"special inode mismatch: {name}")
-rejected = 0
-for operation in (
-    lambda: os.open(root / "write-attempt", os.O_WRONLY | os.O_CREAT, 0o644),
-    lambda: os.mkdir(root / "mkdir-attempt"),
-    lambda: os.unlink(read_path),
-    lambda: os.rename(read_path, root / "rename-attempt"),
-    lambda: os.truncate(bench_path, 0),
-    lambda: os.chmod(read_path, 0o600),
-    lambda: os.link(read_path, root / "link-attempt"),
-    lambda: os.symlink("d000/f00000", root / "symlink-attempt"),
-    lambda: os.rmdir(root / "d000"),
-    lambda: os.setxattr(read_path, "user.packed", b"deny"),
-):
-    try:
-        result = operation()
-        if isinstance(result, int):
-            os.close(result)
-    except OSError:
-        rejected += 1
-if rejected != 10:
-    raise SystemExit(f"mutation rejection mismatch: {rejected}")
-print(f"packed_posix_summary read_bytes={len(data)} bench_bytes={bench_path.stat().st_size} mutation_checks={rejected}")
-PY
-}
-
-fio_read() {
-    local rw="$1"
-    fio --name="packed-$rw" --filename="$MOUNT_DIR/bench/read.bin" \
-        --rw="$rw" --ioengine=sync --direct=1 --iodepth=1 --numjobs=4 \
-        --size="$FIO_FILE_SIZE" --runtime="$FIO_RUNTIME" --time_based=1 \
-        --group_reporting=1 --output-format=normal
-}
-
 printf 'tool\tstatus\tactive_seconds\tdrain_seconds\tactive_plus_drain_seconds\tlog\n' >"$ARTIFACT_DIR/perf-summary.tsv"
 if [[ "${PACKED_SKIP_FIXTURE:-false}" == "true" ]]; then
     : "${PACKED_EXISTING_MANIFEST_KEY:?PACKED_EXISTING_MANIFEST_KEY is required when PACKED_SKIP_FIXTURE=true}"
@@ -528,9 +462,6 @@ for tool in $TOOLS; do
         packed-gpu-smallfiles) run_tool "$tool" run_gpu_smallfiles_scan || status=1 ;;
         packed-stat) run_tool "$tool" run_shared_smallfiles_scan stat packed-stat || status=1 ;;
         packed-tree) run_tool "$tool" run_shared_smallfiles_scan tree packed-tree || status=1 ;;
-        packed-posix) run_tool "$tool" packed_posix_scan || status=1 ;;
-        fio-seqread) run_tool "$tool" fio_read read || status=1 ;;
-        fio-randread) run_tool "$tool" fio_read randread || status=1 ;;
         *) die "unsupported native packed tool: $tool" ;;
     esac
 done

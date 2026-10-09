@@ -22,6 +22,10 @@ impl ReadUnit {
         self.end.saturating_sub(self.start)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// The identity a per-frame cache or singleflight must key on. The
     /// namespace is part of it: the same object id under two namespaces is a
     /// different unit and shares neither a fetch, a decoded buffer nor a

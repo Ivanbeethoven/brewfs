@@ -17,15 +17,22 @@ param(
     [int64]$SmallFileSizeBytes = 102400,
     [int64]$SmallFileMinSizeBytes = 0,
     [int64]$SmallFileMaxSizeBytes = 0,
-    [ValidateRange(1, 32)]
+    [ValidateRange(0, 8)]
     [int]$DirLevels = 3,
     [int64]$DirsPerLevel = 10,
     [int64]$FilesPerLeaf = 1000,
     [ValidateSet('random-small-file', 'sequential-small-file', 'mixed')]
     [string]$PackedAccessProfile = 'random-small-file',
     [int64]$FioFileSizeBytes = 67108864,
-    [string]$PerfTools = 'packed-tree packed-smallfiles fio-seqread fio-randread',
-    [ValidateSet('packed-metadata-v1', 'packed-metadata-v2', 'packed-metadata-v3')]
+    [ValidateScript({
+        $tools = @($_ -split '\s+' | Where-Object { $_ })
+        if ($tools.Count -eq 0 -or @($tools | Where-Object { $_ -notin @('packed-tree', 'packed-stat', 'packed-smallfiles', 'packed-gpu-smallfiles') }).Count -ne 0) {
+            throw 'Unsupported packed-v3 tool; tree/stat/smallfiles are supported, fio/POSIX fixture layout remains OPEN.'
+        }
+        $true
+    })]
+    [string]$PerfTools = 'packed-tree packed-smallfiles',
+    [ValidateSet('packed-metadata-v3')]
     [string]$VolumeFormat = 'packed-metadata-v3',
     [int]$FioRuntimeSeconds = 20,
     [UInt64]$PackedFrameWindowCacheBytes = 0,

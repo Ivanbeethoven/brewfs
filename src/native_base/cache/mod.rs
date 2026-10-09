@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn different_namespace_keys_do_not_collide() {
         let cache = InProcessFrameCache::new(16);
-        let mut k1 = key(1);
+        let k1 = key(1);
         let mut k2 = key(1);
         k2.namespace_id = [9; 16];
         cache.insert(k1.clone(), vec![1; 16]);

@@ -291,19 +291,33 @@ impl EncodedBatch {
     }
 }
 
+/// Identity and stream position of an independently encoded metadata batch.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchEncodingContext {
+    pub kind: BatchKind,
+    pub flags: u32,
+    pub cluster_id: [u8; 16],
+    pub batch_id: u32,
+    pub stream_ordinal: u32,
+    pub predecessor_ordinal: u32,
+}
+
 pub fn encode_batch(
-    kind: BatchKind,
-    flags: u32,
-    cluster_id: [u8; 16],
-    batch_id: u32,
-    stream_ordinal: u32,
-    predecessor_ordinal: u32,
+    context: BatchEncodingContext,
     record_count: u32,
     first_new_node_id: u32,
     new_node_count: u32,
     first_key: &[u8],
     raw_payload: &[u8],
 ) -> WireResult<EncodedBatch> {
+    let BatchEncodingContext {
+        kind,
+        flags,
+        cluster_id,
+        batch_id,
+        stream_ordinal,
+        predecessor_ordinal,
+    } = context;
     if raw_payload.len() > MAX_BATCH_RAW {
         return Err(WireError::LimitExceeded(format!(
             "metadata batch raw payload {} exceeds {MAX_BATCH_RAW}",
@@ -466,12 +480,14 @@ impl NamespaceBatch {
             }
         }
         encode_batch(
-            BatchKind::Namespace,
-            0,
-            self.cluster_id,
-            self.batch_id,
-            self.stream_ordinal,
-            self.predecessor_ordinal,
+            BatchEncodingContext {
+                kind: BatchKind::Namespace,
+                flags: 0,
+                cluster_id: self.cluster_id,
+                batch_id: self.batch_id,
+                stream_ordinal: self.stream_ordinal,
+                predecessor_ordinal: self.predecessor_ordinal,
+            },
             record_count,
             first_new_node_id,
             new_node_count,
@@ -1097,12 +1113,14 @@ mod tests {
         payload.bytes(b"test"); // name suffix
         payload.u8(0xFE); // unknown entry tag
         let encoded = encode_batch(
-            BatchKind::Namespace,
-            0,
-            [3; 16],
-            1,
-            1,
-            BatchHeader::NO_PREDECESSOR,
+            BatchEncodingContext {
+                kind: BatchKind::Namespace,
+                flags: 0,
+                cluster_id: [3; 16],
+                batch_id: 1,
+                stream_ordinal: 1,
+                predecessor_ordinal: BatchHeader::NO_PREDECESSOR,
+            },
             1,
             0,
             0,
@@ -1129,12 +1147,14 @@ mod tests {
         payload.u8(1); // existing node
         payload.uvarint(5);
         let encoded = encode_batch(
-            BatchKind::Namespace,
-            0,
-            [3; 16],
-            1,
-            1,
-            BatchHeader::NO_PREDECESSOR,
+            BatchEncodingContext {
+                kind: BatchKind::Namespace,
+                flags: 0,
+                cluster_id: [3; 16],
+                batch_id: 1,
+                stream_ordinal: 1,
+                predecessor_ordinal: BatchHeader::NO_PREDECESSOR,
+            },
             1,
             0,
             0,

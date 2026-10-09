@@ -8,7 +8,7 @@
 use crate::native_base::wire::error::{WireError, WireResult};
 use crate::native_base::wire::uvarint::{Reader, Writer};
 
-use super::batch::{BatchKind, EncodedBatch, encode_batch};
+use super::batch::{BatchEncodingContext, BatchKind, EncodedBatch, encode_batch};
 
 const MAX_SEGMENTS: usize = 1 << 20;
 const MAX_EXTENTS_PER_SEGMENT: usize = 1 << 20;
@@ -156,12 +156,14 @@ impl ExtentBatch {
             .map(|segment| extent_index_key(segment.local_node_id, segment.first_file_offset))
             .unwrap_or([0; 12]);
         encode_batch(
-            BatchKind::Extent,
-            0,
-            self.cluster_id,
-            self.batch_id,
-            self.stream_ordinal,
-            self.predecessor_ordinal,
+            BatchEncodingContext {
+                kind: BatchKind::Extent,
+                flags: 0,
+                cluster_id: self.cluster_id,
+                batch_id: self.batch_id,
+                stream_ordinal: self.stream_ordinal,
+                predecessor_ordinal: self.predecessor_ordinal,
+            },
             record_count,
             0,
             0,

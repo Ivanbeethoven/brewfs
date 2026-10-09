@@ -850,7 +850,7 @@ mod tests {
             .unwrap();
         backend.inject_complete_fault(InjectedCompleteFault::ResponseLost);
         let err = backend
-            .multipart_complete(&upload, &[receipt.clone()])
+            .multipart_complete(&upload, std::slice::from_ref(&receipt))
             .await
             .unwrap_err();
         assert_eq!(err, UploadError::Timeout);

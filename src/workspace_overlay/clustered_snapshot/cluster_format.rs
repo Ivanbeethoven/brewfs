@@ -640,7 +640,7 @@ mod tests {
         let mut last_names: Vec<Vec<u8>> = Vec::new();
         let mut total_nodes = 0u32;
 
-        for (idx, (first_char, last_char, _fc, _fn, range)) in batch_specs.iter().enumerate() {
+        for (idx, (_first_char, _last_char, _fc, _fn, range)) in batch_specs.iter().enumerate() {
             let batch_id = idx as u32;
             let entries: Vec<NamespaceEntry> = range
                 .clone()
@@ -753,7 +753,7 @@ mod tests {
             level: 0,
             kind: BatchKind::Namespace as u8,
             entry_count: 3,
-            digest: leaf_digest.as_bytes().clone(),
+            digest: *leaf_digest.as_bytes(),
             key_fingerprint: first_fingerprint,
         };
 

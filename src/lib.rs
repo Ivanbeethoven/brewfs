@@ -4,6 +4,9 @@
 
 pub mod cadapter;
 pub mod chunk;
+pub mod cli;
+pub mod config;
+pub(crate) mod console;
 pub(crate) mod control;
 pub mod daemon;
 pub(crate) mod fs;

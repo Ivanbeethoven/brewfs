@@ -118,6 +118,12 @@ fn place_page_with_codec(
 
 type ChildSummary = (Vec<u8>, Vec<u8>, ChildRef, u64);
 
+#[derive(Clone, Copy)]
+struct InternalPageParams {
+    level: u8,
+    with_subtree_counts: bool,
+}
+
 fn flush_leaf(
     entries: &mut Vec<LeafEntry>,
     children: &mut Vec<ChildSummary>,
@@ -141,12 +147,15 @@ fn flush_internal(
     entries: &mut Vec<InternalEntry>,
     first: &mut Option<Vec<u8>>,
     last: Vec<u8>,
-    level: u8,
+    internal_params: InternalPageParams,
     children: &mut Vec<ChildSummary>,
     body: &mut Vec<u8>,
     params: &IndexTreeParams,
-    with_subtree_counts: bool,
 ) -> WireResult<()> {
+    let InternalPageParams {
+        level,
+        with_subtree_counts,
+    } = internal_params;
     let first = first.take().unwrap();
     let visible_count = entries.iter().try_fold(0u64, |total, entry| {
         total
@@ -249,11 +258,13 @@ fn build_index_tree_impl(
                     &mut current_internal,
                     &mut first_key,
                     std::mem::take(&mut last_key),
-                    level,
+                    InternalPageParams {
+                        level,
+                        with_subtree_counts,
+                    },
                     &mut next,
                     body,
                     params,
-                    with_subtree_counts,
                 )?;
                 current_est = 0;
             }
@@ -274,11 +285,13 @@ fn build_index_tree_impl(
                 &mut current_internal,
                 &mut first_key,
                 last_key,
-                level,
+                InternalPageParams {
+                    level,
+                    with_subtree_counts,
+                },
                 &mut next,
                 body,
                 params,
-                with_subtree_counts,
             )?;
         }
         children = next;

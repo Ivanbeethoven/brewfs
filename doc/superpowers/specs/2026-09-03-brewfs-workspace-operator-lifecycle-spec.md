@@ -1,5 +1,9 @@
 # BrewFS Workspace Operator 生命周期实现规范
 
+2026-10-04当前任务仅v3及其workspace生命周期。v3 capability/binding、lease/fence、
+finalizer/recovery/GC和真实后端验收仍必需；旧flat/CR/存储格式兼容移出出口。以
+[当前v3目标](../plans/2026-10-04-brewfs-all-spec-completion.md)为范围依据。
+
 - 状态：Draft
 - 日期：2026-09-03
 - 目标版本：`storage.brewfs.io/v1alpha1`
@@ -47,6 +51,22 @@
 - 不支持 etcd workspace catalog；
 - 不改变 flat-volume 的 metadata、mount 或 GC 路径；
 - 不防御拥有 Redis/TiKV/S3 管理员权限的基础设施管理员。这里的不可变保证覆盖 Kubernetes tenant、agent workload 和正常 BrewFS runtime；基础设施管理员属于信任边界之外。
+
+### 2.3 Packed lower 的后续能力边界（2026-10-03 review）
+
+本文baseline仍是 `workspace-v1` 与精确sealed `BaseRevision`；新增
+[packed-v3 SPEC](2026-09-27-brewfs-packed-metadata-v3-readonly-smallfiles.md)
+的readonly mount不代表operator已有packed lower support。当前binding/head-CAS/
+recovery/GC尚未接通，不能只把manifest key塞进现有revision字段就置Ready。
+
+未来集成需明确capability和独立版本化binding，比较固定manifest content digest与
+head/generation，保留旧BaseRevision/CR外部编码兼容；unsupported/missing/corrupt binding
+返回失败condition，不回退native/KV语义。Kubernetes Ready/Pod Ready不构成对象graph
+closure、source一致性、durable publish或read fence证据。finalizer/leases/journals/GC
+须保护全部可达index/container/descriptor/cold/large objects和仍被pin的旧manifest。
+
+本期“不暴露commit/publish为Kubernetes API”仍有效；packed原子发布属于单独后续扩展，
+不能通过修改本规范把未实现控制面默认为已支持。
 
 ## 3. 核心设计决策
 
@@ -278,8 +298,8 @@ Snapshot source 必须与目标 Workspace 引用同一个 `BrewFSCluster`，禁�
 `workspace_id` 不由每次 reconcile 随机生成：
 
 ```text
-workspace_id = UUIDv5(cluster volume_id, BrewFSWorkspace.metadata.uid)
-initial_head_layer_id = UUIDv5(workspace_id, "head/0")
+workspace_id = UUIDv3(cluster volume_id, BrewFSWorkspace.metadata.uid)
+initial_head_layer_id = UUIDv3(workspace_id, "head/0")
 ```
 
 后端需要新增幂等 `ensure_workspace` primitive：

@@ -4,7 +4,7 @@ use crate::workspace_overlay::error::WorkspaceError;
 use crate::workspace_overlay::ids::LayerId;
 use crate::workspace_overlay::model::{DentryDelta, DentryOp, LayerRecord};
 
-use super::validate_layer_chain;
+use super::{Resolution, validate_layer_chain};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedDentry {
@@ -29,10 +29,10 @@ fn newest_in_layer<'a>(
     Ok(winner)
 }
 
-fn materialize(delta: &DentryDelta) -> Result<Option<ResolvedDentry>, WorkspaceError> {
+fn materialize(delta: &DentryDelta) -> Result<Resolution<ResolvedDentry>, WorkspaceError> {
     match delta.op {
-        DentryOp::Whiteout => Ok(None),
-        DentryOp::Put => Ok(Some(ResolvedDentry {
+        DentryOp::Whiteout => Ok(Resolution::Masked),
+        DentryOp::Put => Ok(Resolution::Present(ResolvedDentry {
             layer_id: delta.layer_id,
             parent_ino: delta.parent_ino,
             name: delta.name.clone(),
@@ -53,6 +53,15 @@ pub fn resolve_dentry(
     parent_ino: i64,
     name: &[u8],
 ) -> Result<Option<ResolvedDentry>, WorkspaceError> {
+    resolve_dentry_state(chain, deltas, parent_ino, name).map(Resolution::into_option)
+}
+
+pub fn resolve_dentry_state(
+    chain: &[LayerRecord],
+    deltas: &[DentryDelta],
+    parent_ino: i64,
+    name: &[u8],
+) -> Result<Resolution<ResolvedDentry>, WorkspaceError> {
     let head = chain
         .first()
         .ok_or_else(|| WorkspaceError::CorruptMetadata("empty layer chain".into()))?;
@@ -65,7 +74,7 @@ pub fn resolve_dentry(
             return materialize(winner);
         }
     }
-    Ok(None)
+    Ok(Resolution::Absent)
 }
 
 pub fn resolve_directory(
@@ -73,11 +82,24 @@ pub fn resolve_directory(
     deltas: &[DentryDelta],
     parent_ino: i64,
 ) -> Result<Vec<ResolvedDentry>, WorkspaceError> {
+    Ok(resolve_directory_state(chain, deltas, parent_ino)?
+        .into_values()
+        .filter_map(Resolution::into_option)
+        .collect())
+}
+
+/// Preserve every winning name, including masks, when merging a packed lower
+/// directory. A name absent from this map has no upper winner.
+pub fn resolve_directory_state(
+    chain: &[LayerRecord],
+    deltas: &[DentryDelta],
+    parent_ino: i64,
+) -> Result<BTreeMap<Vec<u8>, Resolution<ResolvedDentry>>, WorkspaceError> {
     let head = chain
         .first()
         .ok_or_else(|| WorkspaceError::CorruptMetadata("empty layer chain".into()))?;
     validate_layer_chain(head.layer_id, chain)?;
-    let mut winners: BTreeMap<Vec<u8>, Option<ResolvedDentry>> = BTreeMap::new();
+    let mut winners = BTreeMap::new();
     for layer in chain {
         let mut layer_rows: BTreeMap<Vec<u8>, &DentryDelta> = BTreeMap::new();
         for delta in deltas
@@ -98,5 +120,5 @@ pub fn resolve_directory(
             }
         }
     }
-    Ok(winners.into_values().flatten().collect())
+    Ok(winners)
 }

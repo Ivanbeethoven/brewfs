@@ -15,6 +15,14 @@ spec:
     enabled: true
     catalogBackend: Redis
     namespace: demo-workspaces
+    metadataRuntimeSecretRef:
+      name: demo-runtime-metadata
+    metadataAdminSecretRef:
+      name: demo-admin-metadata
+    objectRuntimeSecretRef:
+      name: demo-runtime-objects
+    objectAdminSecretRef:
+      name: demo-admin-objects
     leaseTtlSeconds: 30
     heartbeatSeconds: 10
     gcGraceSeconds: 60

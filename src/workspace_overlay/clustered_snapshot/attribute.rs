@@ -7,7 +7,7 @@
 use crate::native_base::wire::error::{WireError, WireResult};
 use crate::native_base::wire::uvarint::{Reader, Writer};
 
-use super::batch::{BatchKind, EncodedBatch, encode_batch};
+use super::batch::{BatchEncodingContext, BatchKind, EncodedBatch, encode_batch};
 
 const MAX_GROUPS: usize = 1 << 20;
 const MAX_XATTRS_PER_GROUP: usize = 1 << 16;
@@ -57,12 +57,14 @@ impl AttributeBatch {
             .map(|group| attribute_index_key(group.local_node_id))
             .unwrap_or([0; 4]);
         encode_batch(
-            BatchKind::Attribute,
-            0,
-            self.cluster_id,
-            self.batch_id,
-            self.stream_ordinal,
-            self.predecessor_ordinal,
+            BatchEncodingContext {
+                kind: BatchKind::Attribute,
+                flags: 0,
+                cluster_id: self.cluster_id,
+                batch_id: self.batch_id,
+                stream_ordinal: self.stream_ordinal,
+                predecessor_ordinal: self.predecessor_ordinal,
+            },
             self.groups.len() as u32,
             0,
             0,

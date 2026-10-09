@@ -1068,7 +1068,9 @@ mod tests {
     use super::*;
     use crate::native_base::ingest::ConsistencyPolicy;
     use crate::native_base::wire::datapack::PackFrame;
-    use crate::workspace_overlay::clustered_snapshot::cluster_builder::build_single_directory_cluster_with_metadata;
+    use crate::workspace_overlay::clustered_snapshot::cluster_builder::{
+        ClusterIdentity, build_single_directory_cluster_with_metadata,
+    };
     use crate::workspace_overlay::clustered_snapshot::cluster_format::{
         IndexRootRef, SnapshotSuperblock,
     };
@@ -1230,9 +1232,11 @@ mod tests {
             }],
         };
         let cluster = build_single_directory_cluster_with_metadata(
-            cluster_id,
-            volume_id,
-            dir_key,
+            ClusterIdentity {
+                cluster_id,
+                volume_id,
+                mount_dir_key: dir_key,
+            },
             &plan,
             1,
             dir_key,
@@ -1402,11 +1406,12 @@ mod tests {
         assert_eq!(head.get().await, None);
 
         let (backend, manifest_ref) = fixture();
-        let mut objects = backend.objects.lock().unwrap();
-        let data = objects.get_mut("data/cluster.brfdp").unwrap();
-        let footer_byte = data.len() - FOOTER_LEN + 16;
-        data[footer_byte] ^= 1;
-        drop(objects);
+        {
+            let mut objects = backend.objects.lock().unwrap();
+            let data = objects.get_mut("data/cluster.brfdp").unwrap();
+            let footer_byte = data.len() - FOOTER_LEN + 16;
+            data[footer_byte] ^= 1;
+        }
         let head = MemoryWorkspaceHeadStore::default();
         let publisher = SnapshotPublisher::new(ObjectClient::new(backend), head.clone());
         assert!(publisher.publish(&manifest_ref, None).await.is_err());
@@ -1432,12 +1437,13 @@ mod tests {
         let metadata_key = String::from_utf8(descriptor.metadata_ref.key.clone()).unwrap();
         let seal_key = String::from_utf8(descriptor.data_seal_ref.key.clone()).unwrap();
         let manifest_key = String::from_utf8(bundle.manifest_ref.key.clone()).unwrap();
-        let mut objects = backend.objects.lock().unwrap();
-        objects.insert(metadata_key, built.cluster.bytes.clone());
-        objects.insert(seal_key, data.data_seal);
-        objects.insert(data.object_key, data.data_pack);
-        objects.insert(manifest_key, bundle.bytes.clone());
-        drop(objects);
+        {
+            let mut objects = backend.objects.lock().unwrap();
+            objects.insert(metadata_key, built.cluster.bytes.clone());
+            objects.insert(seal_key, data.data_seal);
+            objects.insert(data.object_key, data.data_pack);
+            objects.insert(manifest_key, bundle.bytes.clone());
+        }
 
         let head = MemoryWorkspaceHeadStore::default();
         let publisher = SnapshotPublisher::new(ObjectClient::new(backend), head.clone());
@@ -1457,8 +1463,8 @@ mod tests {
                 raw_len: 8,
             }],
         };
-        assert!(verify_extent_slice_refs(&[(1, 0, 8)], &[slice.clone()], 1).is_err());
-        assert!(verify_extent_slice_refs(&[(2, 4, 8)], &[slice.clone()], 1).is_err());
+        assert!(verify_extent_slice_refs(&[(1, 0, 8)], std::slice::from_ref(&slice), 1).is_err());
+        assert!(verify_extent_slice_refs(&[(2, 4, 8)], std::slice::from_ref(&slice), 1).is_err());
         assert!(verify_extent_slice_refs(&[(2, 0, 8)], &[slice], 1).is_ok());
     }
 }

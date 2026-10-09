@@ -350,7 +350,7 @@ fn retention_keeps_the_manifest_and_every_transitive_container_permanently() {
         );
     }
     assert_eq!(plan.metrics.new_retained_objects, 5);
-    assert!(plan.by_domain.get(&workspace).is_none());
+    assert!(!plan.by_domain.contains_key(&workspace));
 
     let mut undeclared = closure.clone();
     undeclared.transitive_containers = vec![meta_page.clone()];
@@ -563,7 +563,7 @@ async fn bounded_drain_rejects_forgery_and_noop_write_barrier_then_recovers() {
             operation,
             1,
             6,
-            &[entry.clone()],
+            std::slice::from_ref(&entry),
             false,
             [13; 32]
         )
@@ -576,7 +576,7 @@ async fn bounded_drain_rejects_forgery_and_noop_write_barrier_then_recovers() {
         operation,
         1,
         6,
-        &[entry.clone()],
+        std::slice::from_ref(&entry),
         true,
         [13; 32],
     )
@@ -584,7 +584,7 @@ async fn bounded_drain_rejects_forgery_and_noop_write_barrier_then_recovers() {
     .unwrap();
     assert_eq!(
         committed.plan_digest,
-        drain_plan_digest(&[entry.clone()]).unwrap()
+        drain_plan_digest(std::slice::from_ref(&entry)).unwrap()
     );
     assert_eq!(
         commit_drain_batch(&store, &keys, operation, 1, 6, &[entry], true, [13; 32])

@@ -1,5 +1,9 @@
 # BrewFS Clustered Frozen Metadata v2
 
+Historical v2 specification. The user narrowed the active task to v3 on
+2026-10-04; this independent v2 product and its compatibility gates are outside
+the current completion goal. See the [v3 scope](../plans/2026-10-04-brewfs-all-spec-completion.md).
+
 Status: **v2 final specification / implementation in progress**
 
 Scope: immutable committed base metadata, file-cluster ingestion, S3 persistence, progressive loading,
@@ -18,6 +22,23 @@ producer, multi-cluster reader, Data Seal, or performance comparison is finished
 > the existing VFS `BlockStore` contract. The end-to-end upload session,
 > crash-resume protocol, and mount-level FUSE fixture are still pending. These
 > changes do not make the legacy v1 object format a v2 format.
+
+## Specification scope clarification (2026-10-03)
+
+This document is normative **only for packed-metadata-v2**. Its cluster ids,
+DirKey derivation, Data Seal, budgets and upload state machine do not define
+packed-v3 wire 004/005. The separate
+[v3 specification](2026-09-27-brewfs-packed-metadata-v3-readonly-smallfiles.md)
+owns PM06/PM07, GroupMeta/GroupContainer, independently authenticated descriptors
+and its staged workspace integration. Neither format reinterprets the other's
+magic, payload or publication record; reuse of a neutral backend/executor does
+not establish wire or lifecycle compatibility.
+
+The implementation ledger below describes v2 evidence. New v3 readonly/FUSE,
+codec or hardlink tests cannot mark missing v2 upload/union/recovery gates complete;
+conversely a v2 verifier/CAS API does not establish a packed-v3 workspace binding.
+Any migration is explicit offline repacking with independent source/namespace/
+payload checks, not mount-time fallback to another decoder or lower KV.
 
 ## Final revision 2026-09-22
 
@@ -757,7 +778,7 @@ and cannot leak across head changes.
 
 ### 15.2 Readdir
 
-`readdir_page` is the only packed-v2 directory API. It accepts a `ReadDirCursor` and a
+`readdir_page` is the only packed-v3 directory API. It accepts a `ReadDirCursor` and a
 `ReadDirLimit { max_entries, max_owned_bytes }`, and returns a bounded `ReadDirPage`. It MUST NOT
 call legacy `readdir()->Vec` and truncate it.
 

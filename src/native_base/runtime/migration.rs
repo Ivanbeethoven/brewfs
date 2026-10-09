@@ -177,7 +177,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::native_base::runtime::{NativeDataRuntime, ZeroBaseDataSource, initialize_volume};
+    #[cfg(feature = "native-packed-base")]
+    use crate::native_base::runtime::initialize_volume;
+    use crate::native_base::runtime::{NativeDataRuntime, ZeroBaseDataSource};
     use crate::native_base::write::memory::MemoryControlStore;
     use crate::native_base::write::overlay::{OverlayParams, WriteOverlay};
     use crate::native_base::write::receipts::MemorySink;

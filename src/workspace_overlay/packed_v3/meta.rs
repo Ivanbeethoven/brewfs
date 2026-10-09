@@ -11,14 +11,10 @@ use std::sync::Arc;
 
 use super::wire::{PackedResult, PackedWireError, Reader, Writer};
 
-// GM06 is the current packed-v3 metadata format. GM04 was used by the
-// development codec when each entry carried one extent; accepting it here
-// would make the decoder interpret the old trailing fields as an extent
-// count and could silently produce a wrong read plan. Keep the version
-// marker strict until an explicit migration decoder exists. GM05 remains a
-// read-only compatibility format because it has no inline-payload field.
+// GM06 is the current intermediate record-run format embedded in GM07.
+// Producer inputs and GM07 restarts share this exact layout, including the
+// inline-payload length. Historical GM04/GM05 layouts are unsupported.
 const GROUP_META_MAGIC: &[u8; 4] = b"GM06";
-const LEGACY_GROUP_META_MAGIC: &[u8; 4] = b"GM05";
 pub(crate) const GROUP_META_HEADER_LEN: usize = 12;
 // Prefix/suffix lengths, kind/flags, mode, inode, size, POSIX hot
 // attributes, and extent count.  Keeping this lower bound explicit lets the
@@ -75,6 +71,27 @@ pub struct GroupMetaEntry {
 }
 
 impl GroupMetaEntry {
+    /// Shared validation for a physical placement supplied by either namespace.
+    pub(crate) fn validate_placement(&self) -> PackedResult<()> {
+        self.validate_restart()?;
+        self.validate()
+    }
+
+    fn validate_restart(&self) -> PackedResult<()> {
+        validate_v3_hot_attributes(self.inode, self.kind, self.mode, self.nlink, self.rdev)?;
+        if self.flags & !INLINE_DATA_FLAG != 0 {
+            return Err(PackedWireError::UnsupportedFormat(
+                "GM07 entry has unknown flags".into(),
+            ));
+        }
+        if self.kind != 1 && !self.extents.is_empty() {
+            return Err(PackedWireError::Invalid(
+                "GM07 data extents require a regular file".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> PackedResult<()> {
         validate_name(&self.name)?;
         if self.extents.len() > MAX_ENTRY_EXTENTS {
@@ -163,6 +180,21 @@ impl GroupMeta {
     pub fn entries(&self) -> &[GroupMetaEntry] {
         &self.entries
     }
+    pub(crate) fn owned_memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + 256
+            + self.entries.capacity() * std::mem::size_of::<GroupMetaEntry>()
+            + self
+                .entries
+                .iter()
+                .map(|entry| {
+                    entry.name.capacity()
+                        + entry.extents.capacity() * std::mem::size_of::<GroupMetaExtent>()
+                        + entry.inline_data.len()
+                        + 32
+                })
+                .sum::<usize>()
+    }
 
     pub(crate) fn entries_mut(&mut self) -> &mut [GroupMetaEntry] {
         &mut self.entries
@@ -204,6 +236,123 @@ impl GroupMeta {
             .binary_search_by(|entry| entry.name.as_slice().cmp(name))
             .ok()
             .map(|index| &self.entries[index])
+    }
+
+    /// GM07 stores bounded, independently front-coded 32-entry runs. The
+    /// directory binds every restart to its exact record range. This codec is
+    /// explicit: intermediate GM06 decoding never accepts GM07 by accident.
+    pub fn encode_restart(&self) -> PackedResult<Vec<u8>> {
+        self.validate()?;
+        for entry in &self.entries {
+            entry.validate_restart()?;
+        }
+        let runs = self.entries.len().div_ceil(32);
+        let mut writer = Writer::default();
+        writer.bytes(b"GM07");
+        writer.u32(self.entries.len() as u32);
+        writer.u32(32);
+        writer.u32(runs as u32);
+        let mut offset = 16usize
+            .checked_add(runs.checked_mul(8).ok_or_else(|| {
+                PackedWireError::LimitExceeded("GM07 restart table size overflows".into())
+            })?)
+            .ok_or_else(|| PackedWireError::LimitExceeded("GM07 run offset overflows".into()))?;
+        let mut encoded_runs = Vec::with_capacity(runs);
+        for entries in self.entries.chunks(32) {
+            if entries.iter().any(|entry| entry.extents.len() > 256) {
+                return Err(PackedWireError::LimitExceeded(
+                    "GM07 requires external placement beyond 256 extents".into(),
+                ));
+            }
+            let bytes = Self::new(entries.to_vec())?.encode()?;
+            writer.u32(u32::try_from(offset).map_err(|_| {
+                PackedWireError::LimitExceeded("GM07 restart offset exceeds u32".into())
+            })?);
+            writer.u32(bytes.len() as u32);
+            offset = offset.checked_add(bytes.len()).ok_or_else(|| {
+                PackedWireError::LimitExceeded("GM07 run offset overflows".into())
+            })?;
+            if offset > MAX_GROUP_META_BYTES {
+                return Err(PackedWireError::LimitExceeded(
+                    "GM07 page exceeds 256 KiB".into(),
+                ));
+            }
+            encoded_runs.push(bytes);
+        }
+        for bytes in &encoded_runs {
+            writer.bytes(bytes);
+        }
+        Ok(writer.finish())
+    }
+
+    pub fn decode_restart(bytes: &[u8]) -> PackedResult<Self> {
+        if bytes.len() > MAX_GROUP_META_BYTES {
+            return Err(PackedWireError::LimitExceeded(
+                "GM07 page exceeds 256 KiB".into(),
+            ));
+        }
+        let mut reader = Reader::new(bytes);
+        if reader.take(4)? != b"GM07" {
+            return Err(PackedWireError::UnsupportedFormat(
+                "expected GM07 restart metadata".into(),
+            ));
+        }
+        let count = reader.u32()? as usize;
+        if reader.u32()? != 32 {
+            return Err(PackedWireError::Invalid(
+                "GM07 restart interval must be 32".into(),
+            ));
+        }
+        let runs = reader.u32()? as usize;
+        if count > MAX_GROUP_META_BYTES / GROUP_META_MIN_ENTRY_BYTES || runs != count.div_ceil(32) {
+            return Err(PackedWireError::Invalid(
+                "GM07 count exceeds payload or restart budget".into(),
+            ));
+        }
+        let table_end = 16 + runs * 8;
+        let mut previous_end = table_end;
+        let mut references = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let offset = reader.u32()? as usize;
+            let length = reader.u32()? as usize;
+            let end = offset.checked_add(length).ok_or_else(|| {
+                PackedWireError::LimitExceeded("GM07 restart range overflows".into())
+            })?;
+            if offset != previous_end || length < GROUP_META_HEADER_LEN || end > bytes.len() {
+                return Err(PackedWireError::Invalid(
+                    "GM07 restart ranges are not canonical".into(),
+                ));
+            }
+            references.push((offset, end));
+            previous_end = end;
+        }
+        if previous_end != bytes.len() {
+            return Err(PackedWireError::Invalid(
+                "GM07 page has trailing bytes".into(),
+            ));
+        }
+        let mut entries = Vec::with_capacity(count);
+        for (run, (start, end)) in references.into_iter().enumerate() {
+            let bytes = &bytes[start..end];
+            if bytes.get(..4) != Some(GROUP_META_MAGIC.as_slice()) {
+                return Err(PackedWireError::Invalid(
+                    "GM07 restart must contain a GM06 record run".into(),
+                ));
+            }
+            let meta = Self::decode(bytes)?;
+            for entry in &meta.entries {
+                entry.validate_restart()?;
+            }
+            let expected = (count - run * 32).min(32);
+            if meta.len() != expected || meta.entries.iter().any(|entry| entry.extents.len() > 256)
+            {
+                return Err(PackedWireError::Invalid(
+                    "GM07 restart record count or extent limit mismatch".into(),
+                ));
+            }
+            entries.extend(meta.entries);
+        }
+        Self::new(entries)
     }
 
     pub fn encode(&self) -> PackedResult<Vec<u8>> {
@@ -278,15 +427,11 @@ impl GroupMeta {
         }
         let mut reader = Reader::new(bytes);
         let magic = reader.take(4)?;
-        let has_inline_payload = if magic == GROUP_META_MAGIC {
-            true
-        } else if magic == LEGACY_GROUP_META_MAGIC {
-            false
-        } else {
+        if magic != GROUP_META_MAGIC {
             return Err(PackedWireError::UnsupportedFormat(
                 "group metadata payload version mismatch".into(),
             ));
-        };
+        }
         let count = reader.u32()?;
         if count > MAX_GROUP_META_ENTRIES {
             return Err(PackedWireError::LimitExceeded(
@@ -294,13 +439,7 @@ impl GroupMeta {
             ));
         }
         let available = bytes.len().saturating_sub(GROUP_META_HEADER_LEN);
-        let min_entry_bytes = if has_inline_payload {
-            GROUP_META_MIN_ENTRY_BYTES
-        } else {
-            // GM05 did not carry the inline-length field.
-            GROUP_META_MIN_ENTRY_BYTES - 4
-        };
-        if count as usize > available / min_entry_bytes {
+        if count as usize > available / GROUP_META_MIN_ENTRY_BYTES {
             return Err(PackedWireError::Invalid(
                 "group metadata entry count exceeds the payload budget".into(),
             ));
@@ -353,21 +492,15 @@ impl GroupMeta {
                     raw_len: reader.u32()?,
                 });
             }
-            let inline_data = if has_inline_payload {
-                let length = usize::try_from(reader.u32()?).map_err(|_| {
-                    PackedWireError::LimitExceeded(
-                        "inline group metadata length exceeds usize".into(),
-                    )
-                })?;
-                if length >= INLINE_FILE_MAX_BYTES {
-                    return Err(PackedWireError::LimitExceeded(
-                        "inline group metadata file exceeds 256 KiB".into(),
-                    ));
-                }
-                Arc::from(reader.bytes(length)?)
-            } else {
-                Arc::from([])
-            };
+            let length = usize::try_from(reader.u32()?).map_err(|_| {
+                PackedWireError::LimitExceeded("inline group metadata length exceeds usize".into())
+            })?;
+            if length >= INLINE_FILE_MAX_BYTES {
+                return Err(PackedWireError::LimitExceeded(
+                    "inline group metadata file exceeds 256 KiB".into(),
+                ));
+            }
+            let inline_data = Arc::from(reader.bytes(length)?);
             let entry = GroupMetaEntry {
                 name,
                 kind,
@@ -411,12 +544,12 @@ impl GroupMeta {
         let mut previous: Option<&[u8]> = None;
         for entry in &self.entries {
             entry.validate()?;
-            if let Some(previous) = previous {
-                if previous >= entry.name.as_slice() {
-                    return Err(PackedWireError::Invalid(
-                        "group metadata names must be strictly sorted".into(),
-                    ));
-                }
+            if let Some(previous) = previous
+                && previous >= entry.name.as_slice()
+            {
+                return Err(PackedWireError::Invalid(
+                    "group metadata names must be strictly sorted".into(),
+                ));
             }
             previous = Some(&entry.name);
         }
@@ -431,7 +564,45 @@ fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
         .count()
 }
 
-fn validate_name(name: &[u8]) -> PackedResult<()> {
+/// Wire-005 hot attributes must mean the same thing in GM07 and IL05.
+/// Intermediate GM06 runs receive these stricter semantics at GM07 publication.
+pub(crate) fn validate_v3_hot_attributes(
+    inode: u64,
+    kind: u8,
+    mode: u32,
+    nlink: u32,
+    rdev: u64,
+) -> PackedResult<()> {
+    let expected_type = match kind {
+        1 => 0o100000,
+        2 => 0o040000,
+        3 => 0o120000,
+        4 => 0o010000,
+        5 => 0o140000,
+        6 => 0o020000,
+        7 => 0o060000,
+        _ => {
+            return Err(PackedWireError::UnsupportedFormat(
+                "wire 005 inode kind is unknown".into(),
+            ));
+        }
+    };
+    if inode == 0
+        || inode > i64::MAX as u64
+        || nlink == 0
+        || mode & 0o170000 != expected_type
+        || mode & !0o177777 != 0
+        || rdev > u64::from(u32::MAX)
+        || (!matches!(kind, 6 | 7) && rdev != 0)
+    {
+        return Err(PackedWireError::Invalid(
+            "wire 005 inode identity, mode or device attributes are invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_name(name: &[u8]) -> PackedResult<()> {
     if name.is_empty() || name.len() > MAX_NAME_LEN || name.contains(&0) || name.contains(&b'/') {
         return Err(PackedWireError::Invalid(
             "group metadata name is empty, too long, or contains NUL/slash".into(),
@@ -476,6 +647,211 @@ mod tests {
     }
 
     #[test]
+    fn restarted_metadata_roundtrips_across_32_entry_boundaries() {
+        let meta = GroupMeta::new(
+            (0..70)
+                .map(|i| entry(format!("prefix-{i:04}").as_bytes(), i + 1))
+                .collect(),
+        )
+        .unwrap();
+        let encoded = meta.encode_restart().unwrap();
+        assert_eq!(&encoded[..4], b"GM07");
+        assert_eq!(GroupMeta::decode_restart(&encoded).unwrap(), meta);
+        assert!(GroupMeta::decode(&encoded).is_err());
+        assert_eq!(&meta.encode().unwrap()[..4], b"GM06");
+    }
+
+    fn legacy_restart(value: GroupMetaEntry) -> (GroupMeta, Vec<u8>) {
+        let meta = GroupMeta::new(vec![value]).unwrap();
+        let legacy = meta.encode().unwrap();
+        assert_eq!(GroupMeta::decode(&legacy).unwrap(), meta);
+        let mut w = Writer::default();
+        w.bytes(b"GM07");
+        w.u32(1);
+        w.u32(32);
+        w.u32(1);
+        w.u32(24);
+        w.u32(legacy.len() as u32);
+        w.bytes(&legacy);
+        (meta, w.finish())
+    }
+
+    fn unknown_restart_entries() -> Vec<GroupMetaEntry> {
+        let mut values = Vec::new();
+        for kind in [0, 8, 255] {
+            let mut value = entry(b"file", 7);
+            value.kind = kind;
+            values.push(value);
+        }
+        for bit in 1..8 {
+            let mut value = entry(b"file", 7);
+            value.flags = 1 << bit;
+            values.push(value);
+        }
+        values
+    }
+
+    fn invalid_restart_entries() -> Vec<GroupMetaEntry> {
+        let mut values = Vec::new();
+        for inode in [0, i64::MAX as u64 + 1, u64::MAX] {
+            values.push(entry(b"file", inode));
+        }
+        let mut value = entry(b"file", 7);
+        value.nlink = 0;
+        values.push(value);
+        for kind in 2..=7 {
+            let mut value = entry(b"file", 7);
+            value.kind = kind;
+            value.mode = match kind {
+                2 => 0o040755,
+                3 => 0o120777,
+                4 => 0o010644,
+                5 => 0o140644,
+                6 => 0o020644,
+                _ => 0o060644,
+            };
+            values.push(value);
+        }
+        for mode in [0o040644, 0o644, 0o100644 | (1 << 20)] {
+            let mut value = entry(b"file", 7);
+            value.mode = mode;
+            values.push(value);
+        }
+        let mut value = entry(b"file", 7);
+        value.rdev = 1;
+        values.push(value);
+        let mut value = entry(b"file", 7);
+        value.kind = 6;
+        value.mode = 0o020644;
+        value.extents.clear();
+        value.rdev = u64::from(u32::MAX) + 1;
+        values.push(value);
+        values
+    }
+
+    #[test]
+    fn gm07_encoder_rejects_every_unknown_kind_and_flag() {
+        let failures: Vec<_> = unknown_restart_entries()
+            .into_iter()
+            .filter(|value| {
+                !matches!(
+                    legacy_restart(value.clone()).0.encode_restart(),
+                    Err(PackedWireError::UnsupportedFormat(_))
+                )
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "accepted unknown semantics: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn gm07_decoder_rejects_every_unknown_kind_and_flag() {
+        let failures: Vec<_> = unknown_restart_entries()
+            .into_iter()
+            .filter(|value| {
+                !matches!(
+                    GroupMeta::decode_restart(&legacy_restart(value.clone()).1),
+                    Err(PackedWireError::UnsupportedFormat(_))
+                )
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "decoded unknown semantics: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn gm07_encoder_rejects_invalid_hot_attributes_and_nonfile_extents() {
+        let failures: Vec<_> = invalid_restart_entries()
+            .into_iter()
+            .filter(|value| {
+                !matches!(
+                    legacy_restart(value.clone()).0.encode_restart(),
+                    Err(PackedWireError::Invalid(_))
+                )
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "accepted invalid records: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn gm07_decoder_rejects_invalid_hot_attributes_and_nonfile_extents() {
+        let failures: Vec<_> = invalid_restart_entries()
+            .into_iter()
+            .filter(|value| {
+                !matches!(
+                    GroupMeta::decode_restart(&legacy_restart(value.clone()).1),
+                    Err(PackedWireError::Invalid(_))
+                )
+            })
+            .collect();
+        assert!(failures.is_empty(), "decoded invalid records: {failures:?}");
+    }
+
+    #[test]
+    fn gm07_roundtrips_all_supported_posix_kinds_sparse_and_inline() {
+        let modes = [
+            0o100644, 0o040755, 0o120777, 0o010644, 0o140644, 0o020644, 0o060644,
+        ];
+        let mut values = Vec::new();
+        for (index, mode) in modes.into_iter().enumerate() {
+            let mut value = entry(format!("kind-{index}").as_bytes(), index as u64 + 1);
+            value.kind = index as u8 + 1;
+            value.mode = mode;
+            if value.kind != 1 {
+                value.extents.clear();
+            }
+            if matches!(value.kind, 6 | 7) {
+                value.rdev = 37;
+            }
+            values.push(value);
+        }
+        let mut sparse = entry(b"sparse", 8);
+        sparse.extents.clear();
+        values.push(sparse);
+        let mut inline = entry(b"tiny", 9);
+        inline.flags = INLINE_DATA_FLAG;
+        inline.extents.clear();
+        inline.inline_data = Arc::from(b"payload".as_slice());
+        values.push(inline);
+        let meta = GroupMeta::new(values).unwrap();
+        assert_eq!(
+            GroupMeta::decode_restart(&meta.encode_restart().unwrap()).unwrap(),
+            meta
+        );
+    }
+
+    #[test]
+    fn restarted_metadata_rejects_corrupt_restart_offsets_and_counts() {
+        let meta = GroupMeta::new(
+            (0..65)
+                .map(|i| entry(format!("prefix-{i:04}").as_bytes(), i + 1))
+                .collect(),
+        )
+        .unwrap();
+        let encoded = meta.encode_restart().unwrap();
+        for offset in [8usize, 12, 16, 24, 32] {
+            let mut bad = encoded.clone();
+            bad[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(GroupMeta::decode_restart(&bad).is_err(), "offset {offset}");
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(GroupMeta::decode_restart(&trailing).is_err());
+        let empty = GroupMeta::new(Vec::new()).unwrap();
+        assert_eq!(
+            GroupMeta::decode_restart(&empty.encode_restart().unwrap()).unwrap(),
+            empty
+        );
+    }
+
+    #[test]
     fn front_coded_metadata_round_trips_and_pages() {
         let meta = GroupMeta::new(vec![entry(b"alpha", 1), entry(b"alphabet", 2)]).unwrap();
         let encoded = meta.encode().unwrap();
@@ -516,9 +892,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_gm05_payload_remains_readable() {
+    fn legacy_gm05_payload_is_rejected() {
         let mut writer = Writer::default();
-        writer.bytes(LEGACY_GROUP_META_MAGIC);
+        writer.bytes(b"GM05");
         writer.u32(1);
         writer.u32(0);
         writer.u16(0);
@@ -543,10 +919,10 @@ mod tests {
         writer.u32(0);
         writer.u32(7);
 
-        let decoded = GroupMeta::decode(&writer.finish()).unwrap();
-        assert_eq!(decoded.entries()[0].name, b"a");
-        assert!(decoded.entries()[0].inline_data.is_empty());
-        assert_eq!(decoded.entries()[0].extents[0].logical_len, 7);
+        assert!(matches!(
+            GroupMeta::decode(&writer.finish()),
+            Err(PackedWireError::UnsupportedFormat(_))
+        ));
     }
 
     #[test]

@@ -15,9 +15,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::{
-    BudgetReservation, DecodedPageKey, FixedRevisionReader, FrozenInodeRecord, FrozenReadError,
-    MetadataBudget, MetadataBudgetSnapshot, ReaderPageCache, SnapshotManifest, decoded_page_key,
-    dentry_prefix, inode_key,
+    BudgetReservation, DecodedPageKey, FixedRevisionReader, FrozenInodeRecord, FrozenKeyValueRow,
+    FrozenReadError, MetadataBudget, MetadataBudgetSnapshot, ReaderPageCache, SnapshotManifest,
+    decoded_page_key, dentry_prefix, inode_key,
 };
 use crate::cadapter::client::{ObjectBackend, ObjectClient};
 use crate::native_base::seal::source::{ObjectSource, ObjectSourceError};
@@ -274,7 +274,7 @@ impl FrozenMetadataCatalog {
     pub fn scan_namespace_prefix(
         &self,
         prefix: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FrozenReadError> {
+    ) -> Result<Vec<FrozenKeyValueRow>, FrozenReadError> {
         self.reader()?.scan_namespace_prefix(prefix)
     }
 
@@ -385,7 +385,7 @@ impl FrozenMetadataCatalog {
             let parent = u64::from_be_bytes(key[1..9].try_into().unwrap());
             names.push((parent, key[prefix_len..].to_vec()));
         }
-        names.sort_by(|a, b| a.cmp(b));
+        names.sort();
         Ok(names)
     }
 
@@ -1009,11 +1009,11 @@ where
                 }
                 PageBody::Internal(entries) => {
                     if prefetch_siblings {
-                        self.prefetch_internal_children(&current_object, &entries)
+                        self.prefetch_internal_children(&current_object, entries)
                             .await?;
                     }
                     child = entries
-                        .into_iter()
+                        .iter()
                         .find(|entry| {
                             entry.min_key.as_slice() <= key && key <= entry.max_key.as_slice()
                         })
@@ -1034,7 +1034,7 @@ where
     async fn scan_namespace_prefix(
         &self,
         prefix: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FrozenReadError> {
+    ) -> Result<Vec<FrozenKeyValueRow>, FrozenReadError> {
         let Some(root) = self.manifest.namespace_root.as_ref() else {
             return Ok(Vec::new());
         };
@@ -1221,7 +1221,7 @@ where
         prefix: &[u8],
         child_offset: u64,
         limit: usize,
-    ) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>, FrozenReadError> {
+    ) -> Result<Option<Vec<FrozenKeyValueRow>>, FrozenReadError> {
         if limit == 0 {
             return Ok(Some(Vec::new()));
         }
@@ -1301,7 +1301,7 @@ where
         prefix: &[u8],
         child_offset: u64,
         limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FrozenReadError> {
+    ) -> Result<Vec<FrozenKeyValueRow>, FrozenReadError> {
         if let Some(rows) = self
             .scan_namespace_page_ranked(prefix, child_offset, limit)
             .await?
@@ -1318,7 +1318,7 @@ where
         prefix: &[u8],
         child_offset: u64,
         limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FrozenReadError> {
+    ) -> Result<Vec<FrozenKeyValueRow>, FrozenReadError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1393,7 +1393,7 @@ where
     async fn scan_data_prefix(
         &self,
         prefix: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FrozenReadError> {
+    ) -> Result<Vec<FrozenKeyValueRow>, FrozenReadError> {
         let mut rows = Vec::new();
         let mut current_object = self.manifest.data_root.object.clone();
         let mut child = ChildRef::External(self.manifest.data_root.clone());
@@ -1839,7 +1839,7 @@ fn verify_object_bytes(object: &ObjectRef, bytes: &[u8]) -> Result<(), FrozenRea
         }
         .into());
     }
-    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
     if digest != object.full_hash {
         return Err(FrozenReadError::Wire(
             crate::native_base::wire::error::WireError::HashMismatch {

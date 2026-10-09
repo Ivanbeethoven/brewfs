@@ -91,6 +91,10 @@ impl ResolvedReadPlan {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ReadGeneration {
     pub workspace_head_epoch: u64,
+    /// Monotonic visible mutation fence for the writable upper layer. The
+    /// layer allocator advances this even when the workspace head epoch does
+    /// not change, so same-epoch plans cannot be mistaken for one view.
+    pub workspace_mutation_sequence: u64,
     pub lower_snapshot: [u8; 32],
 }
 
@@ -101,6 +105,7 @@ impl ReadGeneration {
     pub const fn readonly(lower_snapshot: [u8; 32]) -> Self {
         Self {
             workspace_head_epoch: 0,
+            workspace_mutation_sequence: 0,
             lower_snapshot,
         }
     }
@@ -157,6 +162,125 @@ pub struct OverlayUpperSegment {
     pub length: u64,
     pub key: BlockKey,
     pub block_offset: u64,
+}
+
+/// Upper-first composition protocol. Covered Data/Hole intervals are terminal;
+/// only the remaining gaps may request an immutable lower plan. This value
+/// carries no backend or mount binding and does not establish a mutation fence.
+#[derive(Debug)]
+pub struct OverlayPlanPreparation {
+    upper: UnifiedReadPlan,
+    requested_offset: u64,
+    requested_len: u64,
+    gaps: Vec<std::ops::Range<u64>>,
+}
+
+pub fn prepare_overlay_plan(
+    generation: ReadGeneration,
+    logical_size: u64,
+    requested_offset: u64,
+    requested_len: u64,
+    upper: impl IntoIterator<Item = LogicalSegment>,
+) -> Result<OverlayPlanPreparation, ReadPlanError> {
+    let end = requested_offset
+        .checked_add(requested_len)
+        .ok_or_else(|| ReadPlanError::Invalid("overlay request range overflows".into()))?;
+    let mut segments: Vec<_> = upper.into_iter().collect();
+    segments.sort_by_key(|segment| segment.logical_offset);
+    if segments.iter().any(|segment| {
+        matches!(
+            segment.source,
+            ReadSource::PackedFrame { .. } | ReadSource::PackedInline { .. }
+        )
+    }) {
+        return Err(ReadPlanError::Invalid(
+            "upper coverage contains an immutable packed source".into(),
+        ));
+    }
+    let upper = UnifiedReadPlan {
+        generation,
+        logical_size,
+        segments,
+    };
+    upper.validate(requested_offset, requested_len)?;
+    let mut gaps = Vec::new();
+    let mut cursor = requested_offset;
+    for segment in &upper.segments {
+        if cursor < segment.logical_offset {
+            gaps.push(cursor..segment.logical_offset);
+        }
+        cursor = segment.end()?;
+    }
+    if cursor < end {
+        gaps.push(cursor..end);
+    }
+    Ok(OverlayPlanPreparation {
+        upper,
+        requested_offset,
+        requested_len,
+        gaps,
+    })
+}
+
+impl OverlayPlanPreparation {
+    pub fn lower_gaps(&self) -> &[std::ops::Range<u64>] {
+        &self.gaps
+    }
+
+    /// Supply one separately prepared lower plan per gap, in the given order.
+    /// Full Data/Hole coverage accepts no lower plans at all. Backend owners
+    /// and a common generation-checking fetcher must be retained by the caller
+    /// when it assembles PreparedUnifiedRead for the existing executor.
+    pub fn finish(
+        self,
+        lower_gaps: impl IntoIterator<Item = UnifiedReadPlan>,
+    ) -> Result<UnifiedReadPlan, ReadPlanError> {
+        let mut lower_gaps = lower_gaps.into_iter();
+        let mut segments = self.upper.segments;
+        for gap in self.gaps {
+            let lower = lower_gaps.next().ok_or_else(|| {
+                ReadPlanError::Invalid("an absent upper interval has no lower plan".into())
+            })?;
+            if lower.generation != self.upper.generation {
+                return Err(ReadPlanError::Invalid(
+                    "overlay and lower gap belong to different generations".into(),
+                ));
+            }
+            lower.validate(gap.start, gap.end - gap.start)?;
+            let mut cursor = gap.start;
+            for segment in lower.segments {
+                if cursor < segment.logical_offset {
+                    segments.push(LogicalSegment {
+                        logical_offset: cursor,
+                        length: segment.logical_offset - cursor,
+                        source: ReadSource::Hole,
+                    });
+                }
+                cursor = segment.end()?;
+                segments.push(segment);
+            }
+            if cursor < gap.end {
+                segments.push(LogicalSegment {
+                    logical_offset: cursor,
+                    length: gap.end - cursor,
+                    source: ReadSource::Hole,
+                });
+            }
+        }
+        if lower_gaps.next().is_some() {
+            return Err(ReadPlanError::Invalid(
+                "lower plan was supplied outside an absent upper interval".into(),
+            ));
+        }
+        segments.sort_by_key(|segment| segment.logical_offset);
+        let plan = UnifiedReadPlan {
+            generation: self.upper.generation,
+            logical_size: self.upper.logical_size,
+            segments,
+        };
+        plan.validate(self.requested_offset, self.requested_len)?;
+        Ok(plan)
+    }
 }
 
 impl LogicalSegment {
@@ -469,7 +593,7 @@ pub async fn execute_unified_into<F: UnifiedReadSourceFetcher + ?Sized>(
     fetcher
         .ensure_generation(plan.generation)
         .await
-        .map_err(ReadPlanError::Backend)?;
+        .map_err(ReadPlanError::from_source)?;
     output.fill(0);
     for segment in &plan.segments {
         if matches!(&segment.source, ReadSource::Hole) {
@@ -485,17 +609,76 @@ pub async fn execute_unified_into<F: UnifiedReadSourceFetcher + ?Sized>(
         fetcher
             .read_source(&segment.source, &mut output[output_start..output_end])
             .await
-            .map_err(ReadPlanError::Backend)?;
+            .map_err(ReadPlanError::from_source)?;
     }
     fetcher
         .ensure_generation(plan.generation)
         .await
-        .map_err(ReadPlanError::Backend)?;
+        .map_err(ReadPlanError::from_source)?;
     Ok(())
+}
+
+pub struct PreparedUnifiedRead {
+    pub plan: UnifiedReadPlan,
+    pub fetcher: std::sync::Arc<dyn UnifiedReadSourceFetcher>,
+}
+
+/// A mutable view changed without losing ownership. Only this typed error
+/// permits re-resolving the entire caller-visible read; transport failures
+/// and expired/replaced ownership must remain failures.
+#[derive(Debug, thiserror::Error)]
+#[error("read view changed")]
+pub struct ReadViewChanged;
+
+pub fn is_read_view_changed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<ReadViewChanged>())
+}
+
+/// A chunk observed a shorter effective file than the caller's captured view.
+/// The caller may retry only after its original fence proves a view change.
+#[derive(Debug, thiserror::Error)]
+#[error("read range exceeds effective EOF")]
+pub struct ReadRequestBeyondView;
+
+pub fn is_read_request_beyond_view(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<ReadRequestBeyondView>())
+}
+
+/// Pins the metadata version used by every chunk of one caller-visible read.
+/// A successful final check proves all prepared spans share this view, even
+/// when a same-epoch mutation occurred between their individual checks.
+#[async_trait]
+pub trait UnifiedReadRequestFence: Send + Sync {
+    fn file_size(&self) -> u64;
+    async fn ensure_current(&self) -> anyhow::Result<()>;
 }
 
 #[async_trait]
 pub trait WorkspaceReadPlanProvider: Send + Sync {
+    /// Mutable packed views must include the local dirty overlay in the same
+    /// caller-visible request fence. This capability never captures a view.
+    fn requires_unified_read_request_fence(&self) -> bool {
+        false
+    }
+    /// Immutable providers need no additional request fence. Mutable packed
+    /// workspace providers must capture one before preparing any chunk.
+    async fn begin_unified_read_request(
+        &self,
+        _ino: i64,
+    ) -> anyhow::Result<Option<Arc<dyn UnifiedReadRequestFence>>> {
+        Ok(None)
+    }
+    fn max_read_bytes(&self) -> Option<usize> {
+        None
+    }
+    fn reserve_read_output(
+        &self,
+        _length: usize,
+    ) -> Result<Option<Box<dyn Send + Sync>>, MetaError> {
+        Ok(None)
+    }
     async fn read_plan(
         &self,
         ino: i64,
@@ -503,6 +686,43 @@ pub trait WorkspaceReadPlanProvider: Send + Sync {
         offset: u64,
         len: u64,
     ) -> Result<ResolvedReadPlan, MetaError>;
+
+    fn supports_prepared_unified_read(&self) -> bool {
+        false
+    }
+
+    async fn prepare_unified_read(
+        &self,
+        _ino: i64,
+        _chunk_index: u64,
+        _offset: u64,
+        _len: u64,
+    ) -> Result<Option<PreparedUnifiedRead>, MetaError> {
+        Ok(None)
+    }
+
+    fn record_unified_read_success(&self, _bytes: u64) {}
+
+    /// Carries the complete caller-visible read lifetime into every chunk.
+    /// Providers that do not observe raw decode unions keep the existing path.
+    async fn prepare_unified_read_observed(
+        &self,
+        ino: i64,
+        chunk_index: u64,
+        offset: u64,
+        len: u64,
+        _delivery: Option<std::sync::Arc<crate::cadapter::read_observer::OperationDelivery>>,
+    ) -> Result<Option<PreparedUnifiedRead>, MetaError> {
+        self.prepare_unified_read(ino, chunk_index, offset, len)
+            .await
+    }
+
+    fn begin_unified_read_operation(
+        &self,
+        _requested: u64,
+    ) -> Option<crate::cadapter::read_observer::TerminalGuard> {
+        None
+    }
 
     /// Generation-aware adapter used by the v3 overlay path. Existing
     /// providers can migrate incrementally: their legacy slices and holes are
@@ -553,8 +773,20 @@ pub trait WorkspaceReadPlanProvider: Send + Sync {
 pub enum ReadPlanError {
     #[error("invalid read plan: {0}")]
     Invalid(String),
+    #[error("read view changed")]
+    StaleView(#[source] ReadViewChanged),
     #[error(transparent)]
     Backend(#[from] anyhow::Error),
+}
+
+impl ReadPlanError {
+    fn from_source(error: anyhow::Error) -> Self {
+        if is_read_view_changed(&error) {
+            Self::StaleView(ReadViewChanged)
+        } else {
+            Self::Backend(error)
+        }
+    }
 }
 
 struct SendBuf {
@@ -811,6 +1043,7 @@ mod tests {
         let plan = UnifiedReadPlan {
             generation: ReadGeneration {
                 workspace_head_epoch: 9,
+                workspace_mutation_sequence: 0,
                 lower_snapshot: [7; 32],
             },
             logical_size: 16,
@@ -898,6 +1131,7 @@ mod tests {
     fn compose_overlay_plan_covers_upper_hole_and_lower_fallback() {
         let generation = ReadGeneration {
             workspace_head_epoch: 4,
+            workspace_mutation_sequence: 0,
             lower_snapshot: [6; 32],
         };
         let lower = UnifiedReadPlan {
@@ -1010,6 +1244,178 @@ mod tests {
     }
 
     struct UnifiedTestFetcher;
+
+    #[tokio::test]
+    async fn upper_first_full_data_and_hole_coverage_needs_no_lower_plan() {
+        let generation = ReadGeneration {
+            workspace_head_epoch: 8,
+            workspace_mutation_sequence: 0,
+            lower_snapshot: [5; 32],
+        };
+        let preparation = prepare_overlay_plan(
+            generation,
+            8,
+            0,
+            8,
+            [
+                LogicalSegment {
+                    logical_offset: 0,
+                    length: 4,
+                    source: ReadSource::UpperBlock {
+                        key: (7, 0),
+                        block_offset: 3,
+                    },
+                },
+                LogicalSegment {
+                    logical_offset: 4,
+                    length: 4,
+                    source: ReadSource::Hole,
+                },
+            ],
+        )
+        .unwrap();
+        assert!(preparation.lower_gaps().is_empty());
+        let plan = preparation.finish(std::iter::empty()).unwrap();
+        let mut output = [0xff; 8];
+        execute_unified_into(&UnifiedTestFetcher, 0, &plan, &mut output)
+            .await
+            .unwrap();
+        assert_eq!(&output, b"UUUU\0\0\0\0");
+    }
+
+    #[test]
+    fn upper_first_partial_plan_requests_only_absence_and_keeps_source_offsets() {
+        let generation = ReadGeneration::readonly([5; 32]);
+        let preparation = prepare_overlay_plan(
+            generation,
+            20,
+            4,
+            12,
+            [
+                LogicalSegment {
+                    logical_offset: 6,
+                    length: 4,
+                    source: ReadSource::Hole,
+                },
+                LogicalSegment {
+                    logical_offset: 12,
+                    length: 2,
+                    source: ReadSource::UpperBlock {
+                        key: (7, 0),
+                        block_offset: 3,
+                    },
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(preparation.lower_gaps(), &[4..6, 10..12, 14..16]);
+        let packed = |logical_offset, raw_offset| LogicalSegment {
+            logical_offset,
+            length: 2,
+            source: ReadSource::PackedFrame {
+                group_id: 3,
+                container_ordinal: 1,
+                frame_ordinal: 2,
+                object_offset: 4096,
+                stored_len: 64,
+                raw_offset,
+                raw_len: 64,
+                size_class: 0,
+                codec: 0,
+                frame_digest: [7; 16],
+            },
+        };
+        let plans = [
+            UnifiedReadPlan {
+                generation,
+                logical_size: 20,
+                segments: vec![packed(4, 7)],
+            },
+            UnifiedReadPlan {
+                generation,
+                logical_size: 20,
+                segments: vec![],
+            },
+            UnifiedReadPlan {
+                generation,
+                logical_size: 20,
+                segments: vec![packed(14, 20)],
+            },
+        ];
+        let plan = preparation.finish(plans).unwrap();
+        assert_eq!(plan.segments.len(), 5);
+        assert!(matches!(
+            plan.segments[0].source,
+            ReadSource::PackedFrame { raw_offset: 7, .. }
+        ));
+        assert_eq!(plan.segments[1].source, ReadSource::Hole);
+        assert_eq!(
+            (plan.segments[1].logical_offset, plan.segments[1].length),
+            (6, 4)
+        );
+        assert_eq!(plan.segments[2].source, ReadSource::Hole);
+        assert_eq!(
+            (plan.segments[2].logical_offset, plan.segments[2].length),
+            (10, 2)
+        );
+        assert!(matches!(
+            plan.segments[4].source,
+            ReadSource::PackedFrame { raw_offset: 20, .. }
+        ));
+    }
+
+    #[test]
+    fn upper_first_refuses_missing_extra_misbound_and_outside_gap_lower_plans() {
+        let generation = ReadGeneration::readonly([5; 32]);
+        let prepare = || prepare_overlay_plan(generation, 8, 0, 8, std::iter::empty()).unwrap();
+        assert!(prepare().finish(std::iter::empty()).is_err());
+        let wrong = UnifiedReadPlan {
+            generation: ReadGeneration::readonly([6; 32]),
+            logical_size: 8,
+            segments: vec![],
+        };
+        assert!(prepare().finish([wrong]).is_err());
+        let full = prepare_overlay_plan(
+            generation,
+            8,
+            0,
+            8,
+            [LogicalSegment {
+                logical_offset: 0,
+                length: 8,
+                source: ReadSource::Hole,
+            }],
+        )
+        .unwrap();
+        let extra = UnifiedReadPlan {
+            generation,
+            logical_size: 8,
+            segments: vec![],
+        };
+        assert!(full.finish([extra]).is_err());
+        let partial = prepare_overlay_plan(
+            generation,
+            8,
+            0,
+            8,
+            [LogicalSegment {
+                logical_offset: 0,
+                length: 4,
+                source: ReadSource::Hole,
+            }],
+        )
+        .unwrap();
+        let outside = UnifiedReadPlan {
+            generation,
+            logical_size: 8,
+            segments: vec![LogicalSegment {
+                logical_offset: 0,
+                length: 8,
+                source: ReadSource::Hole,
+            }],
+        };
+        assert!(partial.finish([outside]).is_err());
+    }
 
     #[test]
     fn shifting_packed_inline_sources_shares_payload_storage() {

@@ -5,12 +5,13 @@ use std::ops::Range;
 use brewfs::workspace_overlay::digest::{CanonicalLayerDelta, canonical_delta_bytes, delta_digest};
 use brewfs::workspace_overlay::ids::{LayerId, WorkspaceId};
 use brewfs::workspace_overlay::model::{
-    DataExtentDelta, DentryDelta, ExtentKind, InodeDelta, InodeState, LayerRecord, LayerState,
-    ValueOp, XattrDelta,
+    AclDelta, DataExtentDelta, DentryDelta, ExtentKind, InodeDelta, InodeState, LayerRecord,
+    LayerState, ValueOp, XattrDelta,
 };
 use brewfs::workspace_overlay::resolver::{
-    resolve_dentry, resolve_directory, resolve_extents, resolve_inode, resolve_xattr,
-    validate_layer_chain,
+    Resolution, resolve_acl_state, resolve_dentry, resolve_dentry_state, resolve_directory,
+    resolve_directory_state, resolve_extent_coverage, resolve_extents, resolve_inode,
+    resolve_inode_state, resolve_xattr, resolve_xattr_state, validate_layer_chain,
 };
 use uuid::Uuid;
 
@@ -154,6 +155,198 @@ fn uncovered_ranges_are_zero_and_invalid_extents_fail_closed() {
 
     let overflow = DataExtentDelta::data(layer_id(2), 7, 0, u64::MAX, 2, 1, 0, 1);
     assert!(resolve_extents(&layers, &[overflow], 7, 0, 0..8).is_err());
+}
+
+#[test]
+fn duplicate_extent_sequence_is_rejected_even_after_newer_full_coverage() {
+    for duplicate_layer in [layer_id(1), layer_id(2)] {
+        let rows = [
+            DataExtentDelta::data(layer_id(2), 7, 0, 0, 16, 9, 0, 9),
+            DataExtentDelta::data(duplicate_layer, 7, 0, 0, 4, 1, 0, 1),
+            DataExtentDelta::hole(duplicate_layer, 7, 0, 4, 4, 1),
+        ];
+        assert!(matches!(
+            resolve_extents(&chain(), &rows, 7, 0, 0..16),
+            Err(brewfs::workspace_overlay::error::WorkspaceError::CorruptMetadata(_))
+        ));
+    }
+}
+
+#[test]
+fn extent_coverage_retains_absence_and_explicit_holes_with_clipped_data() {
+    let layers = chain();
+    let empty = resolve_extent_coverage(&layers, &[], 7, 0, 4..20).unwrap();
+    assert!(empty.covered.is_empty());
+    assert_eq!(empty.absent.as_slice(), std::slice::from_ref(&(4..20)));
+    let rows = [
+        DataExtentDelta::hole(layer_id(2), 7, 0, 8, 4, 1),
+        DataExtentDelta::data(layer_id(2), 7, 0, 14, 6, 99, 5, 2),
+    ];
+    let coverage = resolve_extent_coverage(&layers, &rows, 7, 0, 4..18).unwrap();
+    assert_eq!(coverage.absent, [4..8, 12..14]);
+    assert_eq!(coverage.covered.len(), 2);
+    assert_eq!(coverage.covered[0].kind, ExtentKind::Hole);
+    assert_eq!(
+        (
+            coverage.covered[0].logical_offset,
+            coverage.covered[0].length
+        ),
+        (8, 4)
+    );
+    assert_eq!(
+        coverage.covered[1].kind,
+        ExtentKind::Data {
+            slice_id: 99,
+            slice_offset: 5
+        }
+    );
+    assert_eq!(
+        (
+            coverage.covered[1].logical_offset,
+            coverage.covered[1].length
+        ),
+        (14, 4)
+    );
+    let clipped = resolve_extent_coverage(&layers, &rows, 7, 0, 16..18).unwrap();
+    assert!(clipped.absent.is_empty());
+    assert_eq!(
+        clipped.covered[0].kind,
+        ExtentKind::Data {
+            slice_id: 99,
+            slice_offset: 7
+        }
+    );
+    // The native terminal outlet still fills absence with zero extents.
+    let native = resolve_extents(&layers, &rows, 7, 0, 4..18).unwrap();
+    assert_eq!(native[0].kind, ExtentKind::Hole);
+    assert_eq!((native[0].logical_offset, native[0].length), (4, 10));
+}
+
+#[test]
+fn coverage_keeps_chunk_identity_and_truncate_masks_nonzero_lower_after_extend() {
+    let layers = chain();
+    let rows = [
+        DataExtentDelta::data(layer_id(1), 7, 0, 0, 32, 77, 0, 1),
+        DataExtentDelta::hole(layer_id(2), 7, 0, 8, 24, 2),
+        DataExtentDelta::data(layer_id(2), 7, 1, 8, 8, 88, 3, 3),
+    ];
+    let masked = resolve_extent_coverage(&layers, &rows, 7, 0, 8..16).unwrap();
+    assert!(masked.absent.is_empty());
+    assert_eq!(masked.covered.len(), 1);
+    assert_eq!(masked.covered[0].kind, ExtentKind::Hole);
+    let other_chunk = resolve_extent_coverage(&layers, &rows, 7, 1, 8..16).unwrap();
+    assert!(other_chunk.absent.is_empty());
+    assert_eq!(
+        other_chunk.covered[0].kind,
+        ExtentKind::Data {
+            slice_id: 88,
+            slice_offset: 3
+        }
+    );
+    let untouched = resolve_extent_coverage(&layers, &rows, 7, 2, 8..16).unwrap();
+    assert!(untouched.covered.is_empty());
+    assert_eq!(untouched.absent.as_slice(), std::slice::from_ref(&(8..16)));
+    // This models existing hole records; it does not claim that a future
+    // packed-backed truncate API already writes them under a request fence.
+}
+
+#[test]
+fn dentry_state_and_directory_winners_keep_masks_until_lower_merge() {
+    let layers = chain();
+    let lower = DentryDelta::put(layer_id(1), 1, b"gone".to_vec(), 10, 1, 1);
+    let mask = DentryDelta::whiteout(layer_id(2), 1, b"gone".to_vec(), 2);
+    let rows = [lower.clone(), mask.clone()];
+    assert_eq!(
+        resolve_dentry_state(&layers, &rows, 1, b"gone").unwrap(),
+        Resolution::Masked
+    );
+    assert_eq!(
+        resolve_dentry_state(&layers, &rows, 1, b"missing").unwrap(),
+        Resolution::Absent
+    );
+    let winners = resolve_directory_state(&layers, &rows, 1).unwrap();
+    assert_eq!(winners.get(b"gone".as_slice()), Some(&Resolution::Masked));
+    assert!(!winners.contains_key(b"missing".as_slice()));
+    assert!(resolve_directory(&layers, &rows, 1).unwrap().is_empty());
+    let recreated = DentryDelta::put(layer_id(2), 1, b"gone".to_vec(), 11, 1, 3);
+    let Resolution::Present(entry) =
+        resolve_dentry_state(&layers, &[lower, mask, recreated], 1, b"gone").unwrap()
+    else {
+        panic!("newest same-layer recreation must win");
+    };
+    assert_eq!(entry.ino, 11);
+}
+
+#[test]
+fn inode_xattr_and_acl_distinguish_terminal_masks_from_absence() {
+    let layers = chain();
+    let lower_inode = inode(layer_id(1), 42, InodeState::Present, 1);
+    let deleted = inode(layer_id(2), 42, InodeState::Deleted, 2);
+    assert_eq!(
+        resolve_inode_state(&layers, &[lower_inode.clone(), deleted.clone()], 42).unwrap(),
+        Resolution::Masked
+    );
+    assert_eq!(
+        resolve_inode_state(&layers, &[], 42).unwrap(),
+        Resolution::Absent
+    );
+    assert_eq!(
+        resolve_inode(&layers, &[lower_inode, deleted], 42).unwrap(),
+        None
+    );
+    let lower_xattr = XattrDelta {
+        layer_id: layer_id(1),
+        ino: 42,
+        name: b"user.nonzero".to_vec(),
+        op: ValueOp::Put,
+        value: Some(b"lower".to_vec()),
+        sequence: 1,
+    };
+    let mut mask = lower_xattr.clone();
+    mask.layer_id = layer_id(2);
+    mask.op = ValueOp::Whiteout;
+    mask.value = None;
+    mask.sequence = 2;
+    assert_eq!(
+        resolve_xattr_state(
+            &layers,
+            &[lower_xattr.clone(), mask.clone()],
+            42,
+            b"user.nonzero"
+        )
+        .unwrap(),
+        Resolution::Masked
+    );
+    assert_eq!(
+        resolve_xattr_state(&layers, &[], 42, b"user.nonzero").unwrap(),
+        Resolution::Absent
+    );
+    assert_eq!(
+        resolve_xattr(&layers, &[lower_xattr, mask], 42, b"user.nonzero").unwrap(),
+        None
+    );
+    let lower_acl = AclDelta {
+        layer_id: layer_id(1),
+        ino: 42,
+        acl_type: 1,
+        acl_id: 1000,
+        op: ValueOp::Put,
+        value: Some(7u32.to_be_bytes().to_vec()),
+        sequence: 1,
+    };
+    let mut mask = lower_acl.clone();
+    mask.layer_id = layer_id(2);
+    mask.op = ValueOp::Whiteout;
+    mask.value = None;
+    mask.sequence = 2;
+    assert_eq!(
+        resolve_acl_state(&layers, &[lower_acl, mask], 42, 1, 1000).unwrap(),
+        Resolution::Masked
+    );
+    assert_eq!(
+        resolve_acl_state(&layers, &[], 42, 1, 1000).unwrap(),
+        Resolution::Absent
+    );
 }
 
 #[test]

@@ -6,6 +6,8 @@ use super::model::{
 
 const MAGIC: &[u8; 8] = b"BWSDELTA";
 
+pub(crate) mod native_stream;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CanonicalLayerDelta {
     pub dentries: Vec<DentryDelta>,

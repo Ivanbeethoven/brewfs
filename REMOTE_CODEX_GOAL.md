@@ -5,6 +5,16 @@ The checkout was migrated from the validated local branch; do not reset or
 discard existing work.  The personal GitHub remote is `origin` and the public
 repository is `upstream`.
 
+## Current user scope (2026-10-07)
+
+Complete the required SPEC implementation and small correctness gates before
+planning performance experiments. Packed metadata supports packed-v3 only;
+wire005 is its encoding identifier. Public modules, APIs, metrics and budget
+configuration use V3/v3, and old 004/v1/v2 compatibility is not required.
+Prioritize Redis/TiKV metadata publication, recovery, reader retention and GC.
+The local SQLite scratch inventory is disposable graph-validation storage.
+These instructions supersede older goal text that requested compatibility.
+
 ## Objective
 
 Make the v3 read-only packed-metadata path measurably faster than the current
@@ -28,8 +38,8 @@ overlay workspace.  Prefer small, evidence-backed changes over broad rewrites.
    Do not hide work in teardown or close, and do not use a shared data block for
    unrelated files merely to improve a benchmark.
 4. For files below 256 KiB, evaluate the existing MinIO-style inline
-   metadata+data/object layout.  Keep the format versioned and backwards
-   compatible with the current fixtures.
+   metadata+data/object layout. The current user scope is v3 only: reject old
+   versions explicitly; historical fixture compatibility is not required.
 
 ## Experiment rules
 

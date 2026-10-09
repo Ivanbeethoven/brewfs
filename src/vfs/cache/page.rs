@@ -119,6 +119,11 @@ impl CacheSlice {
             .any(|&(start, stop)| start < end && stop > offset)
     }
 
+    #[cfg(feature = "workspace-overlay")]
+    pub(crate) fn written_ranges(&self) -> &[(u64, u64)] {
+        &self.written_ranges
+    }
+
     pub(crate) fn copy_written_into(
         &self,
         offset: u64,

@@ -110,7 +110,7 @@ impl OrphanReceipt {
             return Ok(None);
         }
         let mut objects: Vec<ObjectRef> = objects.into_iter().collect();
-        objects.sort_by(|a, b| a.object_id.cmp(&b.object_id));
+        objects.sort_by_key(|object| object.object_id);
         // Two identical blocks are one object (content dedup), so the record
         // lists it once instead of refusing a legitimate upload.
         objects.dedup_by(|a, b| a.object_id == b.object_id);
@@ -167,16 +167,15 @@ impl OrphanReceipt {
                 ));
             }
         }
-        if let Some(receipts) = &self.receipts {
-            if !self
+        if let Some(receipts) = &self.receipts
+            && !self
                 .objects
                 .iter()
                 .any(|object| object.object_id == receipts.object.object_id)
-            {
-                return Err(WriteError::Record(
-                    "the receipts container must itself be protected".into(),
-                ));
-            }
+        {
+            return Err(WriteError::Record(
+                "the receipts container must itself be protected".into(),
+            ));
         }
         Ok(())
     }
@@ -495,7 +494,7 @@ mod tests {
             .is_none(),
             "nothing was uploaded, so there is nothing to protect"
         );
-        assert!(KvStep::Registration.upload_is_durable() == false);
+        assert!(!KvStep::Registration.upload_is_durable());
         assert!(KvStep::DataUploaded.upload_is_durable());
         assert!(KvStep::ReceiptsUploaded > KvStep::DataUploaded);
 

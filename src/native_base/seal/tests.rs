@@ -121,11 +121,13 @@ impl ObjectSource for CountingSource {
         if self.short_reads && !out.is_empty() {
             out.pop();
         }
-        if let Some((id, at)) = *self.corrupt_at.borrow() {
-            if id == *object_id && at >= start && at < end {
-                let pos = (at - start) as usize;
-                out[pos] ^= 0xff;
-            }
+        if let Some((id, at)) = *self.corrupt_at.borrow()
+            && id == *object_id
+            && at >= start
+            && at < end
+        {
+            let pos = (at - start) as usize;
+            out[pos] ^= 0xff;
         }
         *self.bytes_fetched.borrow_mut() += out.len() as u64;
         Ok(out)
@@ -911,7 +913,7 @@ fn plain_bytes_starting_with_the_sf_magic_stay_raw() {
     // not a content sniff.
     let block: Vec<u8> = [0x53u8, 0x46, 0x00, 0x00]
         .into_iter()
-        .chain(std::iter::repeat(b'\xAB').take(60))
+        .chain(std::iter::repeat_n(b'\xAB', 60))
         .collect();
     let (pack_bytes, scrubbed) = build_pack(vec![PackFrame::plain_bytes(&block).unwrap()]);
 

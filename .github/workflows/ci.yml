@@ -87,6 +87,16 @@ jobs:
           bash docker/compose-xfstests/test_juicefs_perf_report.sh
           bash tools/perf/test_packed_runner_ttl.sh
           python3 -m unittest discover -s tools/perf -p test_smallfiles_scan.py
+          bash -n tools/perf/run_packed_local.sh
+          python3 -m unittest discover -s tools/perf -p test_packed_local_runner.py
+
+      - name: Check patched FUSE transport
+        run: |
+          rustfmt --edition 2021 --check vendor/asyncfuse/src/raw/session/mod.rs vendor/asyncfuse/src/raw/session/handlers.rs vendor/asyncfuse/src/raw/session/xattr_reply.rs
+          cargo test --manifest-path vendor/asyncfuse/Cargo.toml --lib --no-default-features --features tokio-runtime
+          cargo check --manifest-path vendor/asyncfuse/Cargo.toml --no-default-features --features tokio-runtime
+          cargo check --manifest-path vendor/asyncfuse/Cargo.toml --no-default-features --features io-uring-runtime
+          cargo check --manifest-path vendor/asyncfuse/Cargo.toml --no-default-features --features async-io-runtime
 
       - name: Build workspace
         run: cargo build --workspace

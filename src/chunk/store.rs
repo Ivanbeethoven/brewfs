@@ -1,5 +1,8 @@
 //! Storage backends: asynchronous block-level IO traits and in-memory implementations.
 
+use crate::cadapter::read_observer::{
+    FailureClass, Ledger, Origin, ReadClass, ReadEvent, ReadWork, TerminalGuard,
+};
 use crate::chunk::bandwidth::BandwidthLimiter;
 use crate::chunk::compress::{
     Compression, PERSISTED_HEADER_LEN, PersistedHeader, decompress_bytes, decompress_framed_bytes,
@@ -77,11 +80,36 @@ pub trait BlockStore {
     /// Delete `block_count` blocks starting from `key.1` (block_index) for slice `key.0`.
     async fn delete_range(&self, key: BlockKey, block_count: u64) -> anyhow::Result<()>;
 
+    /// Preserve a native slice's complete range before targeted GC removes a
+    /// layer that still shares it with another layer. This is a durable range
+    /// bound, never a reachability or deletion authorization proof.
+    async fn retain_gc_slice_upper_bound(
+        &self,
+        _slice_id: u64,
+        _slice_end: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("block store has no durable targeted-GC range ledger")
+    }
+
+    /// Read the persisted monotonic range bound. Unsupported block stores
+    /// refuse targeted GC rather than silently losing a larger former extent.
+    async fn gc_slice_upper_bound(
+        &self,
+        _slice_id: u64,
+        _observed_end: u64,
+    ) -> anyhow::Result<u64> {
+        anyhow::bail!("block store has no durable targeted-GC range ledger")
+    }
+
     /// Proactively insert a block into the read cache after upload.
     /// Default is a no-op; ObjectBlockStore overrides to populate ChunksCache.
     #[allow(dead_code)]
     async fn cache_block(&self, _key: BlockKey, _data: &[u8]) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    fn begin_read_operation(&self, _requested: u64) -> Option<TerminalGuard> {
+        None
     }
 
     /// Returns shared cache hit/miss counters for diagnostics (.stats file).
@@ -609,6 +637,77 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         self
     }
 
+    async fn observed_range(
+        client: &ObjectClient<B>,
+        class: ReadClass,
+        key: &str,
+        offset: u64,
+        target: &mut [u8],
+    ) -> anyhow::Result<usize> {
+        if client.read_observer().is_none() {
+            return client.get_object_range(key, offset, target).await;
+        }
+        let bytes = client
+            .typed_bounded_range(class, key, offset, target.len() as u64)
+            .await?;
+        target[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len())
+    }
+
+    async fn observed_full(
+        client: &ObjectClient<B>,
+        key: &str,
+        layout: ObjectLayout,
+        compression: Compression,
+        block_size: usize,
+    ) -> anyhow::Result<Option<(usize, Bytes)>> {
+        Self::observed_full_from(client, key, layout, compression, block_size, Origin::Demand).await
+    }
+
+    async fn observed_full_from(
+        client: &ObjectClient<B>,
+        key: &str,
+        layout: ObjectLayout,
+        compression: Compression,
+        block_size: usize,
+        origin: Origin,
+    ) -> anyhow::Result<Option<(usize, Bytes)>> {
+        // Framed LZ4/Zstd can be slightly larger than raw. Two raw blocks plus
+        // 1 MiB admits valid writer output and prevents unbounded full bodies.
+        let limit = (block_size as u64)
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(1 << 20))
+            .ok_or_else(|| anyhow::anyhow!("native block stored bound overflows"))?;
+        client
+            .typed_full_with_origin(
+                ReadClass::NativePayload,
+                origin,
+                key,
+                None,
+                limit,
+                |bytes| {
+                    let stored = bytes.len();
+                    let _decode = client.measure_read_work_with_origin(
+                        ReadClass::NativePayload,
+                        origin,
+                        ReadWork::Decode,
+                    );
+                    let decoded = Self::decode_object(layout, compression, Bytes::from(bytes))
+                        .map_err(|error| (FailureClass::Decode, error))?;
+                    if decoded.len() > block_size {
+                        return Err((
+                            FailureClass::Schema,
+                            anyhow::anyhow!(
+                                "native block decoded length exceeds metadata block size"
+                            ),
+                        ));
+                    }
+                    Ok((stored, decoded))
+                },
+            )
+            .await
+    }
+
     fn key_for(key: BlockKey) -> String {
         let (chunk_id, block_index) = key;
         format!("chunks/{chunk_id}/{block_index}")
@@ -634,6 +733,8 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
     /// malformed frames as raw data.
     async fn resolve_object_layout(&self, key: BlockKey) -> anyhow::Result<ObjectLayout> {
         if let Some(layout) = self.format_cache.get(&key).await {
+            self.client
+                .read_event(ReadClass::NativeIndex, ReadEvent::CacheHit);
             return Ok(layout);
         }
 
@@ -656,6 +757,8 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             return Ok(layout);
         }
 
+        self.client
+            .read_event(ReadClass::NativeIndex, ReadEvent::CacheLookupMiss);
         let versioned_key = Self::versioned_key_for(key);
         let client = self.client.clone();
         let bandwidth = self.bandwidth.clone();
@@ -664,6 +767,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         let layout = self
             .format_flight
             .execute(key, || async move {
+                client.read_event(ReadClass::NativeIndex, ReadEvent::FetchLeader);
                 let mut header = [0u8; PERSISTED_HEADER_LEN];
                 let mut read = 0;
 
@@ -672,8 +776,8 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                         .acquire_download(PERSISTED_HEADER_LEN.saturating_sub(read))
                         .await;
                     let started = Instant::now();
-                    let read_len = client
-                        .get_object_range(&versioned_key, read as u64, &mut header[read..])
+                    let read_len = Self::observed_range(&client, ReadClass::NativeIndex,
+                        &versioned_key, read as u64, &mut header[read..])
                         .await
                         .map_err(|error| {
                             anyhow::anyhow!(
@@ -699,16 +803,20 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                     }
                 }
 
+                let validation = client.begin_validation(ReadClass::NativeIndex);
                 let compression = match parse_persisted_header(&header) {
                     PersistedHeader::Framed(compression) => compression,
                     PersistedHeader::Incomplete => unreachable!("header buffer is complete"),
                     PersistedHeader::NotFramed => {
+                        if let Some(validation) = validation { validation.fail(FailureClass::Schema); }
                         anyhow::bail!("missing versioned block header for {versioned_key}")
                     }
                     PersistedHeader::Invalid => {
+                        if let Some(validation) = validation { validation.fail(FailureClass::Schema); }
                         anyhow::bail!("unsupported versioned block header for {versioned_key}")
                     }
                 };
+                if let Some(validation) = validation { validation.succeed(); }
                 let layout = ObjectLayout::Versioned(compression);
                 format_cache.insert(key, layout).await;
                 Ok(layout)
@@ -848,22 +956,30 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                 .execute(key, || async move {
                     bandwidth.acquire_download(block_size).await;
                     let started = Instant::now();
-                    let raw = client.get_object(&object_key).await.map_err(|e| {
-                        anyhow::anyhow!("object store get failed: {object_key}, {e:?}")
-                    })?;
-                    let raw_bytes = match raw {
-                        Some(data) => {
-                            object_metrics.record_get(data.len() as u64, started.elapsed());
-                            Bytes::from(data)
+                    client.read_event_with_origin(
+                        ReadClass::NativePayload,
+                        Origin::Prefetch,
+                        ReadEvent::FetchLeader,
+                    );
+                    let fetched = Self::observed_full_from(
+                        &client,
+                        &object_key,
+                        layout,
+                        compression,
+                        block_size,
+                        Origin::Prefetch,
+                    )
+                    .await?;
+                    match fetched {
+                        Some((stored, data)) => {
+                            object_metrics.record_get(stored as u64, started.elapsed());
+                            Ok::<_, anyhow::Error>(data)
                         }
                         None => {
                             object_metrics.record_get(0, started.elapsed());
-                            return Ok(Bytes::new());
+                            Ok(Bytes::new())
                         }
-                    };
-                    let decompressed = Self::decode_object(layout, compression, raw_bytes)
-                        .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))?;
-                    Ok::<_, anyhow::Error>(decompressed)
+                    }
                 })
                 .await;
 
@@ -1015,6 +1131,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             tracing::trace!(key = %key_str, len = read_len, "block_cache range HIT");
             tracing::Span::current().record("strategy", "cache_range_hit");
             tracing::Span::current().record("read_len", read_len);
+            self.client
+                .read_event(ReadClass::NativePayload, ReadEvent::CacheHit);
             self.object_metrics.record_read_block_cache_hit();
             return Ok(());
         }
@@ -1025,6 +1143,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                 tracing::trace!(key = %key_str, len = cached.len(), "block_cache HIT");
                 tracing::Span::current().record("strategy", "cache_hit");
                 tracing::Span::current().record("read_len", len);
+                self.client
+                    .read_event(ReadClass::NativePayload, ReadEvent::CacheHit);
                 self.object_metrics.record_read_block_cache_hit();
                 buf.copy_from_slice(&cached[offset_usize..offset_usize + len]);
                 return Ok(());
@@ -1042,6 +1162,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             tracing::trace!(key = %key_str, len = read_len, "persistent writeback slice HIT");
             tracing::Span::current().record("strategy", "writeback_slice_hit");
             tracing::Span::current().record("read_len", read_len);
+            self.client
+                .read_event(ReadClass::NativePayload, ReadEvent::CacheHit);
             self.object_metrics.record_read_block_cache_hit();
             if full_block_read {
                 self.block_cache
@@ -1054,6 +1176,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             return Ok(());
         }
 
+        self.client
+            .read_event(ReadClass::NativePayload, ReadEvent::CacheLookupMiss);
         let range_size_threshold = self.config.range_size_threshold();
         // Uncompressed objects are byte-addressable from their first payload
         // byte as well.  Requiring offset > 0 made every small-file read at
@@ -1065,6 +1189,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             && let Some(block_data) = self.read_flight.try_piggyback(&key).await
         {
             tracing::Span::current().record("strategy", "piggyback_full");
+            self.client
+                .read_event(ReadClass::NativePayload, ReadEvent::SharedResultAfterMiss);
             self.object_metrics.record_read_piggyback_full();
             let block_data = block_data
                 .map_err(|e| anyhow::anyhow!("SingleFlight piggyback read failed: {e}"))?;
@@ -1195,8 +1321,13 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                             let range_offset = range_base + offset;
                             bandwidth.acquire_download(len).await;
                             let started = Instant::now();
-                            let read_len = client
-                            .get_object_range(&object_key_for_read, range_offset, target)
+                            let read_len = Self::observed_range(
+                                client,
+                                ReadClass::NativePayload,
+                                &object_key_for_read,
+                                range_offset,
+                                target,
+                            )
                             .await
                             .map_err(|e| {
                                 anyhow::anyhow!(
@@ -1226,6 +1357,14 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                 let fetched = fetched
                     .map_err(|e| anyhow::anyhow!("SingleFlight direct range read failed: {e}"))?;
 
+                self.client.read_event(
+                    ReadClass::NativePayload,
+                    if is_leader {
+                        ReadEvent::FetchLeader
+                    } else {
+                        ReadEvent::SharedResultAfterMiss
+                    },
+                );
                 let total_read = if is_leader {
                     fetched.len()
                 } else {
@@ -1273,14 +1412,17 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
 
                         bandwidth.acquire_download(range_len).await;
                         let started = Instant::now();
-                        let read_len = client
-                            .get_object_range(&object_key, range_offset, &mut range_buf)
-                            .await
-                            .map_err(|e| {
-                                anyhow::anyhow!(
-                                    "object store range read failed: {object_key}, {e:?}"
-                                )
-                            })?;
+                        let read_len = Self::observed_range(
+                            client,
+                            ReadClass::NativePayload,
+                            &object_key,
+                            range_offset,
+                            &mut range_buf,
+                        )
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("object store range read failed: {object_key}, {e:?}")
+                        })?;
                         object_metrics.record_get(read_len as u64, started.elapsed());
                         range_buf.truncate(read_len);
                         let fetched = Bytes::from(range_buf);
@@ -1380,38 +1522,41 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         let object_metrics = self.object_metrics.clone();
         let compression = self.config.compression;
 
-        let block_data =
-            self.read_flight
-                .execute(key, || async move {
-                    let layout = match layout {
-                        Some(layout) => layout,
-                        None => self.resolve_object_layout(key).await?,
-                    };
-                    let object_key = Self::object_key_for(key, layout);
-                    self.bandwidth
-                        .acquire_download(self.config.block_size)
-                        .await;
-                    let started = Instant::now();
-                    let raw = client.get_object(&object_key).await.map_err(|e| {
-                        anyhow::anyhow!("object store get failed: {object_key}, {e:?}")
-                    })?;
-                    object_metrics.record_read_full_get();
-                    let raw_bytes = match raw {
-                        Some(data) => {
-                            object_metrics.record_get(data.len() as u64, started.elapsed());
-                            Bytes::from(data)
-                        }
-                        None => {
-                            object_metrics.record_get(0, started.elapsed());
-                            return Ok(Bytes::new());
-                        }
-                    };
-                    let decompressed = Self::decode_object(layout, compression, raw_bytes)
-                        .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))?;
-                    Ok::<_, anyhow::Error>(decompressed)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("SingleFlight read failed: {e}"))?;
+        let block_data = self
+            .read_flight
+            .execute(key, || async move {
+                let layout = match layout {
+                    Some(layout) => layout,
+                    None => self.resolve_object_layout(key).await?,
+                };
+                let object_key = Self::object_key_for(key, layout);
+                self.bandwidth
+                    .acquire_download(self.config.block_size)
+                    .await;
+                let started = Instant::now();
+                client.read_event(ReadClass::NativePayload, ReadEvent::FetchLeader);
+                let fetched = Self::observed_full(
+                    client,
+                    &object_key,
+                    layout,
+                    compression,
+                    self.config.block_size,
+                )
+                .await?;
+                object_metrics.record_read_full_get();
+                match fetched {
+                    Some((stored, data)) => {
+                        object_metrics.record_get(stored as u64, started.elapsed());
+                        Ok::<_, anyhow::Error>(data)
+                    }
+                    None => {
+                        object_metrics.record_get(0, started.elapsed());
+                        Ok(Bytes::new())
+                    }
+                }
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("SingleFlight read failed: {e}"))?;
 
         // Copy data to caller's buffer first — minimize read latency.
         let offset_usize = offset as usize;
@@ -1479,6 +1624,14 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         )
     }
 
+    fn begin_read_operation(&self, requested: u64) -> Option<TerminalGuard> {
+        Some(self.client.read_observer()?.start(
+            Ledger::LogicalOperation,
+            self.client.read_context(ReadClass::LogicalRead)?,
+            requested,
+        ))
+    }
+
     fn object_store_metrics(&self) -> Option<Arc<ObjectStoreMetrics>> {
         Some(self.object_metrics.clone())
     }
@@ -1519,6 +1672,94 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn native_object_store_full_and_partial_reads_export_real_nonzero_traffic() {
+        use crate::cadapter::read_observer::{
+            Engine, Ledger, Origin, Phase, ReadContext, ReadObserver,
+        };
+        let object_dir = tempfile::tempdir().unwrap();
+        let writer_cache = tempfile::tempdir().unwrap();
+        let raw: Vec<u8> = (0..65536).map(|i| (i % 251) as u8).collect();
+        for (index, compression) in [Compression::None, Compression::Zstd(3)]
+            .into_iter()
+            .enumerate()
+        {
+            let config = BlockStoreConfig {
+                block_size: raw.len(),
+                page_cache_capacity: 0,
+                range_background_prefetch: false,
+                populate_write_cache_after_upload: false,
+                compression,
+                ..BlockStoreConfig::default()
+            };
+            let writer = ObjectBlockStore::new_with_configs_async(
+                ObjectClient::new(LocalFsBackend::new(object_dir.path())),
+                ChunksCacheConfig::with_budgets(0, 0, writer_cache.path().to_path_buf()),
+                config.clone(),
+            )
+            .await
+            .unwrap();
+            writer
+                .write_fresh_range((index as u64 + 1, 0), 0, &raw)
+                .await
+                .unwrap();
+            for (offset, length) in [(13u64, 71usize), (0, raw.len())] {
+                let reader_cache = tempfile::tempdir().unwrap();
+                let observer = Arc::new(ReadObserver::default());
+                let client = ObjectClient::new(LocalFsBackend::new(object_dir.path()))
+                    .with_read_observer(
+                        observer.clone(),
+                        Engine::Native,
+                        Phase::Runtime,
+                        Origin::Demand,
+                    );
+                let reader = ObjectBlockStore::new_with_configs_async(
+                    client,
+                    ChunksCacheConfig::with_budgets(0, 0, reader_cache.path().to_path_buf()),
+                    config.clone(),
+                )
+                .await
+                .unwrap();
+                let operation = reader.begin_read_operation(length as u64).unwrap();
+                let mut output = vec![0; length];
+                reader
+                    .read_range((index as u64 + 1, 0), offset, &mut output)
+                    .await
+                    .unwrap();
+                assert_eq!(&output, &raw[offset as usize..offset as usize + length]);
+                operation.deliver(length as u64);
+                let snapshot = observer.snapshot();
+                for class in [ReadClass::NativeIndex, ReadClass::NativePayload] {
+                    let context = ReadContext {
+                        engine: Engine::Native,
+                        phase: Phase::Runtime,
+                        class,
+                        origin: Origin::Demand,
+                    };
+                    let row = &snapshot.rows[&(Ledger::BackendBody, context)];
+                    assert!(
+                        row.received > 0,
+                        "native {class:?} traffic was silently zero"
+                    );
+                    assert!(row.conserved());
+                }
+                let context = ReadContext {
+                    engine: Engine::Native,
+                    phase: Phase::Runtime,
+                    class: ReadClass::LogicalRead,
+                    origin: Origin::Demand,
+                };
+                let logical = &snapshot.rows[&(Ledger::LogicalOperation, context)];
+                assert_eq!(logical.logical_delivered, length as u64);
+                assert_eq!(
+                    (logical.success, logical.failed, logical.cancelled),
+                    (1, 0, 0)
+                );
+                assert!(logical.conserved());
+            }
+        }
+    }
+
     #[test]
     fn block_store_config_allows_disabled_page_cache() {
         let mut config = BlockStoreConfig::default();
@@ -1526,6 +1767,51 @@ mod tests {
         assert_eq!(config.page_cache_capacity, DEFAULT_PAGE_CAPACITY);
         config.page_cache_capacity = 0;
         config.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_prefetch_full_fetch_and_decode_keep_prefetch_origin() {
+        use crate::cadapter::read_observer::{Engine, Ledger, Phase, ReadContext, ReadObserver};
+        let directory = tempfile::tempdir().unwrap();
+        let backend = LocalFsBackend::new(directory.path());
+        let raw = b"native prefetch origin";
+        let bytes = encode_persisted_block(raw, Compression::Zstd(3));
+        backend.put_object("prefetch", &bytes).await.unwrap();
+        let observer = Arc::new(ReadObserver::default());
+        let client = ObjectClient::new(backend).with_read_observer(
+            observer.clone(),
+            Engine::Native,
+            Phase::Runtime,
+            Origin::Demand,
+        );
+        let (_, decoded) = ObjectBlockStore::<LocalFsBackend>::observed_full_from(
+            &client,
+            "prefetch",
+            ObjectLayout::Versioned(Compression::Zstd(3)),
+            Compression::Zstd(3),
+            4096,
+            Origin::Prefetch,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(decoded.as_ref(), raw);
+        let context = ReadContext {
+            engine: Engine::Native,
+            phase: Phase::Runtime,
+            class: ReadClass::NativePayload,
+            origin: Origin::Prefetch,
+        };
+        let snapshot = observer.snapshot();
+        assert_eq!(snapshot.rows[&(Ledger::BackendBody, context)].success, 1);
+        assert_eq!(snapshot.rows[&(Ledger::ValidatedFetch, context)].success, 1);
+        assert!(snapshot.work.contains_key(&(context, ReadWork::Decode)));
+        let demand = ReadContext {
+            origin: Origin::Demand,
+            ..context
+        };
+        assert!(!snapshot.rows.contains_key(&(Ledger::BackendBody, demand)));
+        assert!(!snapshot.work.contains_key(&(demand, ReadWork::Decode)));
     }
 
     fn assert_incomplete_read(

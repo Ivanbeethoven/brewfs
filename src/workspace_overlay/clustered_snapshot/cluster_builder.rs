@@ -36,6 +36,22 @@ pub struct BuiltCluster {
     pub dentry_count: u64,
 }
 
+/// Stable cluster identity shared by every encoded metadata section.
+#[derive(Clone, Copy, Debug)]
+pub struct ClusterIdentity {
+    pub cluster_id: [u8; 16],
+    pub volume_id: [u8; 16],
+    pub mount_dir_key: DirKey,
+}
+
+struct ClusterCounts {
+    node_count: u32,
+    directory_contribution_count: u32,
+    dentry_count: u64,
+    extent_count: u64,
+    slice_count: u64,
+}
+
 /// One parent-directory namespace segment supplied by an offline producer.
 ///
 /// The segment already carries stable local node ids.  Keeping this input
@@ -67,14 +83,18 @@ pub fn build_namespace_segments_cluster(
         .try_fold(0u64, |sum, count| sum.checked_add(count))
         .ok_or_else(|| WireError::LimitExceeded("cluster dentry count overflows u64".into()))?;
     assemble_cluster(
-        cluster_id,
-        volume_id,
-        mount_dir_key,
-        node_count,
-        directory_contribution_count,
-        dentry_count,
-        0,
-        0,
+        ClusterIdentity {
+            cluster_id,
+            volume_id,
+            mount_dir_key,
+        },
+        ClusterCounts {
+            node_count,
+            directory_contribution_count,
+            dentry_count,
+            extent_count: 0,
+            slice_count: 0,
+        },
         namespace_batches,
         Vec::new(),
         Vec::new(),
@@ -89,15 +109,18 @@ pub fn build_namespace_segments_cluster(
 /// and indexed independently, so a reader can fetch file ranges or cold
 /// attributes without loading namespace predecessors.
 pub fn build_namespace_segments_cluster_with_metadata(
-    cluster_id: [u8; 16],
-    volume_id: [u8; 16],
-    mount_dir_key: DirKey,
+    identity: ClusterIdentity,
     node_count: u32,
     directory_contribution_count: u32,
     segments: &[NamespaceSegmentInput],
     extent_batches: &[ExtentBatch],
     attribute_batches: &[AttributeBatch],
 ) -> WireResult<BuiltCluster> {
+    let ClusterIdentity {
+        cluster_id,
+        volume_id,
+        mount_dir_key,
+    } = identity;
     let namespace_batches = encode_namespace_segment_batches(cluster_id, segments)?;
     let extent_batches = extent_batches
         .iter()
@@ -143,14 +166,18 @@ pub fn build_namespace_segments_cluster_with_metadata(
         }
     }
     assemble_cluster(
-        cluster_id,
-        volume_id,
-        mount_dir_key,
-        node_count,
-        directory_contribution_count,
-        dentry_count,
-        extent_count,
-        slice_ids.len() as u64,
+        ClusterIdentity {
+            cluster_id,
+            volume_id,
+            mount_dir_key,
+        },
+        ClusterCounts {
+            node_count,
+            directory_contribution_count,
+            dentry_count,
+            extent_count,
+            slice_count: slice_ids.len() as u64,
+        },
         namespace_batches,
         extent_batches,
         attribute_batches,
@@ -281,15 +308,18 @@ pub fn build_single_directory_cluster(
 /// cold-attribute batches. Each batch kind gets its own Merkle index section;
 /// no kind requires replaying or loading a preceding kind.
 pub fn build_single_directory_cluster_with_metadata(
-    cluster_id: [u8; 16],
-    volume_id: [u8; 16],
-    mount_dir_key: DirKey,
+    identity: ClusterIdentity,
     plan: &PlannedDirectory,
     parent_local_node_id: u32,
     parent_dir_key: DirKey,
     extent_batches: &[ExtentBatch],
     attribute_batches: &[AttributeBatch],
 ) -> WireResult<BuiltCluster> {
+    let ClusterIdentity {
+        cluster_id,
+        volume_id,
+        mount_dir_key,
+    } = identity;
     let (namespace_batches, node_id_counter, dentry_count) =
         encode_namespace_batches(cluster_id, plan, parent_local_node_id, parent_dir_key)?;
     let extent_batches = extent_batches
@@ -331,14 +361,18 @@ pub fn build_single_directory_cluster_with_metadata(
         }
     }
     assemble_cluster(
-        cluster_id,
-        volume_id,
-        mount_dir_key,
-        node_id_counter.saturating_sub(1),
-        plan.sources.len() as u32,
-        dentry_count,
-        extent_count,
-        slice_ids.len() as u64,
+        ClusterIdentity {
+            cluster_id,
+            volume_id,
+            mount_dir_key,
+        },
+        ClusterCounts {
+            node_count: node_id_counter.saturating_sub(1),
+            directory_contribution_count: plan.sources.len() as u32,
+            dentry_count,
+            extent_count,
+            slice_count: slice_ids.len() as u64,
+        },
         namespace_batches,
         extent_batches,
         attribute_batches,
@@ -346,18 +380,24 @@ pub fn build_single_directory_cluster_with_metadata(
 }
 
 fn assemble_cluster(
-    cluster_id: [u8; 16],
-    volume_id: [u8; 16],
-    mount_dir_key: DirKey,
-    node_count: u32,
-    directory_contribution_count: u32,
-    dentry_count: u64,
-    extent_count: u64,
-    slice_count: u64,
+    identity: ClusterIdentity,
+    counts: ClusterCounts,
     namespace_batches: Vec<EncodedBatch>,
     extent_batches: Vec<EncodedBatch>,
     attribute_batches: Vec<EncodedBatch>,
 ) -> WireResult<BuiltCluster> {
+    let ClusterIdentity {
+        cluster_id,
+        volume_id,
+        mount_dir_key,
+    } = identity;
+    let ClusterCounts {
+        node_count,
+        directory_contribution_count,
+        dentry_count,
+        extent_count,
+        slice_count,
+    } = counts;
     let mut index_roots = [empty_root(), empty_root(), empty_root(), empty_root()];
     let mut sections = Vec::new();
     let mut next_offset = SUPERBLOCK_LEN as u64;
@@ -658,14 +698,15 @@ fn encode_namespace_segment_batches(
             let mut take = remaining.min(4096);
             let encoded = loop {
                 let end = cursor + take;
-                let flags = (cursor == 0)
-                    .then_some(SEGMENT_START)
-                    .unwrap_or(SEGMENT_CONTINUATION)
-                    | if end == segment.entries.len() {
-                        SEGMENT_END
-                    } else {
-                        0
-                    };
+                let flags = (if cursor == 0 {
+                    SEGMENT_START
+                } else {
+                    SEGMENT_CONTINUATION
+                }) | if end == segment.entries.len() {
+                    SEGMENT_END
+                } else {
+                    0
+                };
                 let namespace = NamespaceBatch {
                     cluster_id,
                     batch_id: next_batch_id,
@@ -1122,9 +1163,11 @@ mod tests {
             }],
         };
         let built = build_single_directory_cluster_with_metadata(
-            cluster_id,
-            [0x74; 16],
-            dir_key,
+            ClusterIdentity {
+                cluster_id,
+                volume_id: [0x74; 16],
+                mount_dir_key: dir_key,
+            },
             &plan,
             1,
             dir_key,

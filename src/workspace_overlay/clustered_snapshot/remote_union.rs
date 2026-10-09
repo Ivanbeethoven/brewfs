@@ -982,7 +982,7 @@ mod tests {
                 }],
             }],
         };
-        let encoded = MergeRouteIndex::encode(&[route.clone()]).unwrap();
+        let encoded = MergeRouteIndex::encode(std::slice::from_ref(&route)).unwrap();
         let decoded = MergeRouteIndex::decode(&encoded).unwrap().remove(0);
         let found = union.lookup_route(&decoded, b"target").await.unwrap();
         assert!(matches!(
