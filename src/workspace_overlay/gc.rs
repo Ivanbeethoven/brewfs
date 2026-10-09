@@ -110,7 +110,7 @@ where
         }
 
         let layer_cutoff = now_ns.saturating_sub(to_i64(duration_ns(self.layer_grace)?)?);
-        let deletable = snapshot
+        let candidates = snapshot
             .layers
             .iter()
             .filter(|layer| {
@@ -120,25 +120,31 @@ where
             })
             .map(|layer| layer.layer_id)
             .collect::<BTreeSet<_>>();
+        // A bounded native finalizer authenticates every target incarnation in
+        // one durable reservation. Select one deterministic batch before
+        // computing slice reachability so candidates left for a later tick
+        // protect their shared slices from physical deletion.
+        let deleted_layers = select_gc_targets(candidates, self.store.gc_target_limit());
+        let deleted_layer_set = deleted_layers.iter().copied().collect::<BTreeSet<_>>();
         let protected_slices = snapshot
             .slice_references
             .iter()
             .filter(|reference| {
                 reachable.contains(&reference.layer_id)
-                    || (selected_layer.is_some() && !deletable.contains(&reference.layer_id))
+                    || !deleted_layer_set.contains(&reference.layer_id)
             })
             .map(|reference| reference.slice_id)
             .collect::<BTreeSet<_>>();
         let mut orphan_slices = BTreeMap::<u64, u64>::new();
         let mut selected_slice_bounds = BTreeMap::<u64, u64>::new();
         for reference in &snapshot.slice_references {
-            if deletable.contains(&reference.layer_id) {
+            if deleted_layer_set.contains(&reference.layer_id) {
                 selected_slice_bounds
                     .entry(reference.slice_id)
                     .and_modify(|end| *end = (*end).max(reference.slice_end))
                     .or_insert(reference.slice_end);
             }
-            if deletable.contains(&reference.layer_id)
+            if deleted_layer_set.contains(&reference.layer_id)
                 && !protected_slices.contains(&reference.slice_id)
             {
                 orphan_slices
@@ -148,7 +154,6 @@ where
             }
         }
 
-        let deleted_layers = deletable.into_iter().collect::<Vec<_>>();
         // 候选集合允许过期；存储后端在标记 Deleting 时复核根引用并执行 CAS。
         self.store
             .delete_layer_metadata(DeleteLayerMetadata {
@@ -204,6 +209,13 @@ where
         super::metrics::global_workspace_metrics()
             .set_gc(report.reachable_layers as u64, report.orphan_bytes);
         Ok(report)
+    }
+}
+
+fn select_gc_targets(candidates: BTreeSet<LayerId>, limit: Option<usize>) -> Vec<LayerId> {
+    match limit.filter(|limit| *limit > 0) {
+        Some(limit) => candidates.into_iter().take(limit).collect(),
+        None => candidates.into_iter().collect(),
     }
 }
 
@@ -479,6 +491,20 @@ mod tests {
         assert!(error.downcast_ref::<IncompleteBlockRead>().is_some());
         assert_eq!(output, [9; 6]);
         session.release().await.unwrap();
+    }
+
+    #[test]
+    fn bounded_gc_targets_leave_later_candidates_for_the_next_tick() {
+        let candidates = (0..99)
+            .map(|index| LayerId::from_uuid(Uuid::from_u128(10_000 + index)))
+            .collect::<BTreeSet<_>>();
+        let batch = select_gc_targets(candidates.clone(), Some(4));
+        assert_eq!(batch.len(), 4);
+        assert_eq!(
+            batch,
+            candidates.iter().copied().take(4).collect::<Vec<_>>()
+        );
+        assert_eq!(select_gc_targets(candidates, None).len(), 99);
     }
 
     #[tokio::test]

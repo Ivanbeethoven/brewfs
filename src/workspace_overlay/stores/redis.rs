@@ -565,6 +565,12 @@ impl WorkspaceKvBackend for RedisWorkspaceBackend {
     fn name(&self) -> &'static str {
         "workspace-redis"
     }
+    fn native_gc_metadata_page_quota(&self) -> Option<usize> {
+        // Redis has the same bounded keyset-page contract as the operator
+        // adapter. Opt into the durable cursor so layer finalization never
+        // falls back to materializing every native metadata family at once.
+        Some(32)
+    }
 
     async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, WorkspaceError> {
         let mut connection = self.connection.clone();

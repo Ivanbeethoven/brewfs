@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 const STATE_PREFIX: &[u8] = b"packed/v3/native-finalization/";
 const STATE_BYTES: usize = 4096;
-const MAX_TARGETS: usize = 4;
+pub(super) const MAX_TARGETS: usize = 4;
 const MAX_QUOTA: usize = 32;
 const FAMILIES: usize = 6;
 
