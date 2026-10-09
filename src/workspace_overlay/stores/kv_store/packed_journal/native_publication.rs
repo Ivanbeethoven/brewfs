@@ -383,10 +383,32 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
             hot_allocator_key("inode"),
         ];
         keys.extend_from_slice(extra_keys);
-        let (values, now) = self
-            .backend
-            .get_many_consistent_with_time_bounded(&keys, journal_point_limits())
-            .await?;
+        // A native publication authority may include the source handoff and
+        // native hold sidecars in addition to the ordinary journal keys.  The
+        // ordinary bounded point-read driver is deliberately capped at 32
+        // keys; routing a complete authority packet through it made a real
+        // TiKV fork fail before publication even though the packet contract
+        // permits the fixed 64-key envelope.  Keep ordinary reads on their
+        // smaller tier and use the dedicated packet API only when the full
+        // authority crosses that boundary.  The packet API keeps one TSO and
+        // one deadline while splitting the data gets into bounded windows.
+        let (values, now) = if keys.len() <= journal_point_limits().max_records {
+            self.backend
+                .get_many_consistent_with_time_bounded(&keys, journal_point_limits())
+                .await?
+        } else {
+            let limits = KvReadLimits {
+                max_records: keys.len(),
+                max_key_bytes: 1024,
+                max_value_bytes: RECORD_LIMIT,
+                max_total_bytes: 2 << 20,
+                max_response_bytes: 2 << 20,
+                max_data_requests: keys.len().saturating_add(2).min(64),
+            };
+            self.backend
+                .get_publication_packet_consistent_with_time_bounded(&keys, limits)
+                .await?
+        };
         if values.len() != keys.len() {
             return Err(journal_error("short native staged authority read"));
         }
