@@ -2101,23 +2101,33 @@ where
             ))),
         );
     }
-    let mut packed_drain_result = if let Some(fs) = &packed_vfs {
-        fs.quiesce_packed_vfs()
-            .await
-            .map(Some)
-            .map_err(anyhow::Error::from)
+    // Stop the joint lease/open heartbeat before taking the VFS drain fence.
+    // The heartbeat mutates the same workspace authority packet that native
+    // Prepare/Quiesced uses for its exact CAS. If it remains active while the
+    // drain is captured, a slower TiKV round trip can repeatedly observe a
+    // fresh lease generation and exhaust the native-begin retry budget.
+    // Physical workers have already joined and the kernel cutoff is verified,
+    // so closing renewal admission here leaves the bounded drain window
+    // protected by the existing lease deadline.
+    let renewal_shutdown_result = session
+        .as_ref()
+        .expect("mount session retained")
+        .close_packed_renewals_for_shutdown()
+        .await
+        .map_err(anyhow::Error::from);
+    let mut packed_drain_result = if renewal_shutdown_result.is_ok() {
+        if let Some(fs) = &packed_vfs {
+            fs.quiesce_packed_vfs()
+                .await
+                .map(Some)
+                .map_err(anyhow::Error::from)
+        } else {
+            Ok(None)
+        }
     } else {
-        Ok(None)
-    };
-    let renewal_shutdown_result = if packed_drain_result.is_ok() {
-        session
-            .as_ref()
-            .expect("mount session retained")
-            .close_packed_renewals_for_shutdown()
-            .await
-            .map_err(anyhow::Error::from)
-    } else {
-        Err(anyhow::anyhow!("packed drain has no terminal witness"))
+        Err(anyhow::anyhow!(
+            "packed renewal shutdown has no terminal witness"
+        ))
     };
     let mut metadata_shutdown_result = if packed_drain_result.is_ok()
         && renewal_shutdown_result.is_ok()
