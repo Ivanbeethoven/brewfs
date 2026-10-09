@@ -110,6 +110,48 @@ const OPEN_V3_MAX_TOTAL_BYTES: usize = 256 << 10;
 const OPEN_V3_MAX_RESPONSE_BYTES: usize = 128 << 10;
 const OPEN_V3_MAX_DATA_REQUESTS: usize = 32;
 
+// Native delta reads are part of the Redis/TiKV metadata path. Keep each
+// backend response small and retain a finite aggregate admission while still
+// allowing a normal inode's complete xattr/ACL/extent history to span pages.
+const DELTA_SCAN_PAGE_RECORDS: usize = 32;
+const DELTA_SCAN_MAX_ROWS: usize = 4096;
+const DELTA_SCAN_MAX_BYTES: usize = 32 << 20;
+
+fn delta_scan_limits() -> KvReadLimits {
+    KvReadLimits {
+        max_records: DELTA_SCAN_PAGE_RECORDS,
+        max_key_bytes: 1024,
+        max_value_bytes: 48 << 10,
+        max_total_bytes: 2 << 20,
+        max_response_bytes: 2 << 20,
+        max_data_requests: 32,
+    }
+}
+
+fn validate_delta_scan_page(
+    page: &[KvEntry],
+    prefix: &[u8],
+    after: Option<&[u8]>,
+) -> Result<usize, WorkspaceError> {
+    if page.len() > DELTA_SCAN_PAGE_RECORDS {
+        return Err(WorkspaceError::Fenced);
+    }
+    let mut bytes = 0usize;
+    let mut previous = after;
+    for entry in page {
+        if !entry.key.starts_with(prefix) || previous.is_some_and(|key| entry.key.as_slice() <= key)
+        {
+            return Err(WorkspaceError::Fenced);
+        }
+        bytes = bytes
+            .checked_add(entry.key.len())
+            .and_then(|sum| sum.checked_add(entry.value.len()))
+            .ok_or(WorkspaceError::Fenced)?;
+        previous = Some(&entry.key);
+    }
+    Ok(bytes)
+}
+
 fn v3_open_read_limits() -> KvReadLimits {
     KvReadLimits {
         max_records: OPEN_V3_MAX_RECORDS,
@@ -3419,17 +3461,57 @@ where
             return Ok(Vec::new());
         }
         let mut rows = Vec::new();
+        let mut scanned_rows_total = 0usize;
+        let mut scanned_bytes_total = 0usize;
         for layer in request.layer_ids {
-            let mut found: Vec<DataExtentDelta> = self
-                .scan(extent_chunk_prefix(layer, request.ino, request.chunk_index))
-                .await?;
-            found.retain(|row| {
-                row.logical_offset < request.range_end
-                    && row
-                        .logical_offset
-                        .saturating_add(row.length)
-                        .gt(&request.range_start)
-            });
+            let prefix = extent_chunk_prefix(layer, request.ino, request.chunk_index);
+            let mut after = None;
+            let mut found = Vec::new();
+            loop {
+                let page = self
+                    .backend
+                    .scan_prefix_page_with_byte_limits(
+                        &prefix,
+                        after.as_deref(),
+                        delta_scan_limits(),
+                    )
+                    .await?;
+                if page.is_empty() {
+                    break;
+                }
+                let next = page.last().map(|entry| entry.key.clone());
+                scanned_rows_total = scanned_rows_total
+                    .checked_add(page.len())
+                    .ok_or(WorkspaceError::Fenced)?;
+                scanned_bytes_total = scanned_bytes_total
+                    .checked_add(validate_delta_scan_page(&page, &prefix, after.as_deref())?)
+                    .ok_or(WorkspaceError::Fenced)?;
+                if scanned_rows_total > DELTA_SCAN_MAX_ROWS
+                    || scanned_bytes_total > DELTA_SCAN_MAX_BYTES
+                {
+                    return Err(WorkspaceError::InvalidReadPlan(
+                        "extent delta scan exceeds bounded metadata budget".into(),
+                    ));
+                }
+                for entry in page {
+                    let row: DataExtentDelta = decode(&entry.value)?;
+                    row.validate()?;
+                    if row.layer_id != layer
+                        || row.ino != request.ino
+                        || row.chunk_index != request.chunk_index
+                        || entry.key != extent_key(&row)
+                    {
+                        return Err(WorkspaceError::CorruptMetadata(
+                            "extent key/record identity mismatch".into(),
+                        ));
+                    }
+                    let row_end = row.logical_offset.saturating_add(row.length);
+                    if row.logical_offset < request.range_end && row_end > request.range_start {
+                        found.push(row);
+                    }
+                }
+                after = next;
+            }
             found.sort_by_key(|row| std::cmp::Reverse(row.sequence));
             rows.extend(found);
         }
@@ -3446,19 +3528,70 @@ where
                 .iter()
                 .map(|layer| xattr_identity_key(*layer, request.ino, &name))
                 .collect::<Vec<_>>();
-            return self
-                .backend
-                .get_many(&keys)
-                .await?
-                .into_iter()
-                .flatten()
-                .map(|value| decode(&value))
-                .collect();
+            let values = self.backend.get_many(&keys).await?;
+            if values.len() != keys.len() {
+                return Err(WorkspaceError::Fenced);
+            }
+            let mut rows = Vec::new();
+            for (key, value) in keys.into_iter().zip(values) {
+                let Some(value) = value else { continue };
+                let row: XattrDelta = decode(&value)?;
+                if xattr_key(&row) != key {
+                    return Err(WorkspaceError::CorruptMetadata(
+                        "xattr key/record identity mismatch".into(),
+                    ));
+                }
+                rows.push(row);
+            }
+            return Ok(rows);
         }
         let mut rows = Vec::new();
+        let mut scanned_rows_total = 0usize;
+        let mut scanned_bytes_total = 0usize;
         for layer in request.layer_ids {
-            let mut found: Vec<XattrDelta> =
-                self.scan(xattr_inode_prefix(layer, request.ino)).await?;
+            let prefix = xattr_inode_prefix(layer, request.ino);
+            let mut after = None;
+            let mut found = Vec::new();
+            loop {
+                let page = self
+                    .backend
+                    .scan_prefix_page_with_byte_limits(
+                        &prefix,
+                        after.as_deref(),
+                        delta_scan_limits(),
+                    )
+                    .await?;
+                if page.is_empty() {
+                    break;
+                }
+                let next = page.last().map(|entry| entry.key.clone());
+                scanned_rows_total = scanned_rows_total
+                    .checked_add(page.len())
+                    .ok_or(WorkspaceError::Fenced)?;
+                scanned_bytes_total = scanned_bytes_total
+                    .checked_add(validate_delta_scan_page(&page, &prefix, after.as_deref())?)
+                    .ok_or(WorkspaceError::Fenced)?;
+                if scanned_rows_total > DELTA_SCAN_MAX_ROWS
+                    || scanned_bytes_total > DELTA_SCAN_MAX_BYTES
+                {
+                    return Err(WorkspaceError::InvalidReadPlan(
+                        "xattr delta scan exceeds bounded metadata budget".into(),
+                    ));
+                }
+                for entry in page {
+                    let row: XattrDelta = decode(&entry.value)?;
+                    if row.layer_id != layer
+                        || row.ino != request.ino
+                        || entry.key != xattr_key(&row)
+                    {
+                        return Err(WorkspaceError::CorruptMetadata(
+                            "xattr key/record identity mismatch".into(),
+                        ));
+                    }
+                    found.push(row);
+                }
+                after = next;
+            }
             found.sort_by(|left, right| left.name.cmp(&right.name));
             rows.extend(found);
         }
@@ -3488,18 +3621,68 @@ where
                 .iter()
                 .map(|layer| acl_identity_key(*layer, request.ino, acl_type, acl_id))
                 .collect::<Vec<_>>();
-            return self
-                .backend
-                .get_many(&keys)
-                .await?
-                .into_iter()
-                .flatten()
-                .map(|value| decode(&value))
-                .collect();
+            let values = self.backend.get_many(&keys).await?;
+            if values.len() != keys.len() {
+                return Err(WorkspaceError::Fenced);
+            }
+            let mut rows = Vec::new();
+            for (key, value) in keys.into_iter().zip(values) {
+                let Some(value) = value else { continue };
+                let row: AclDelta = decode(&value)?;
+                if acl_key(&row) != key {
+                    return Err(WorkspaceError::CorruptMetadata(
+                        "ACL key/record identity mismatch".into(),
+                    ));
+                }
+                rows.push(row);
+            }
+            return Ok(rows);
         }
         let mut rows = Vec::new();
+        let mut scanned_rows_total = 0usize;
+        let mut scanned_bytes_total = 0usize;
         for layer in request.layer_ids {
-            let mut found: Vec<AclDelta> = self.scan(acl_inode_prefix(layer, request.ino)).await?;
+            let prefix = acl_inode_prefix(layer, request.ino);
+            let mut after = None;
+            let mut found = Vec::new();
+            loop {
+                let page = self
+                    .backend
+                    .scan_prefix_page_with_byte_limits(
+                        &prefix,
+                        after.as_deref(),
+                        delta_scan_limits(),
+                    )
+                    .await?;
+                if page.is_empty() {
+                    break;
+                }
+                let next = page.last().map(|entry| entry.key.clone());
+                scanned_rows_total = scanned_rows_total
+                    .checked_add(page.len())
+                    .ok_or(WorkspaceError::Fenced)?;
+                scanned_bytes_total = scanned_bytes_total
+                    .checked_add(validate_delta_scan_page(&page, &prefix, after.as_deref())?)
+                    .ok_or(WorkspaceError::Fenced)?;
+                if scanned_rows_total > DELTA_SCAN_MAX_ROWS
+                    || scanned_bytes_total > DELTA_SCAN_MAX_BYTES
+                {
+                    return Err(WorkspaceError::InvalidReadPlan(
+                        "ACL delta scan exceeds bounded metadata budget".into(),
+                    ));
+                }
+                for entry in page {
+                    let row: AclDelta = decode(&entry.value)?;
+                    if row.layer_id != layer || row.ino != request.ino || entry.key != acl_key(&row)
+                    {
+                        return Err(WorkspaceError::CorruptMetadata(
+                            "ACL key/record identity mismatch".into(),
+                        ));
+                    }
+                    found.push(row);
+                }
+                after = next;
+            }
             found.sort_by_key(|row| (row.acl_type, row.acl_id));
             rows.extend(found);
         }
@@ -6909,6 +7092,39 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(store.backend.scans.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn delta_reads_use_bounded_keyset_pages() {
+        let (store, workspace, _lease, _guard) = initialized().await;
+        {
+            let mut records = store.backend.records.lock().await;
+            for index in 0..(DELTA_SCAN_PAGE_RECORDS + 8) {
+                let row = XattrDelta {
+                    layer_id: workspace.head_layer_id,
+                    ino: 2,
+                    name: format!("user.page-{index:02}").into_bytes(),
+                    op: ValueOp::Put,
+                    value: Some(vec![index as u8]),
+                    sequence: index as u64,
+                };
+                records.insert(xattr_key(&row), encode(&row).unwrap());
+            }
+        }
+        store.backend.scans.store(0, Ordering::Relaxed);
+        let rows = store
+            .get_xattr_deltas(XattrQuery {
+                layer_ids: vec![workspace.head_layer_id],
+                ino: 2,
+                name: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), DELTA_SCAN_PAGE_RECORDS + 8);
+        assert!(
+            store.backend.scans.load(Ordering::Relaxed) >= 2,
+            "the result must cross a bounded page boundary"
+        );
     }
 
     #[tokio::test]
