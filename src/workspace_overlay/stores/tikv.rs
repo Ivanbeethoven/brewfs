@@ -674,6 +674,11 @@ impl WorkspaceKvBackend for TiKvWorkspaceBackend {
     fn name(&self) -> &'static str {
         "workspace-tikv"
     }
+    fn native_gc_metadata_page_quota(&self) -> Option<usize> {
+        // TiKV scan pages are bounded before values are materialized, so use
+        // the same durable cursor finalization as the operator adapter.
+        Some(32)
+    }
 
     async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, WorkspaceError> {
         let _operation = self.operations.enter()?;

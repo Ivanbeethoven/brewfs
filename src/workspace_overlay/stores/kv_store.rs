@@ -2584,6 +2584,12 @@ where
         }
     }
 
+    fn gc_target_limit(&self) -> Option<usize> {
+        self.backend
+            .native_gc_metadata_page_quota()
+            .map(|_| native_finalization::MAX_TARGETS)
+    }
+
     async fn initialize_workspace_schema(&self) -> Result<(), WorkspaceError> {
         self.require_admin_access()?;
         self.migrate().await

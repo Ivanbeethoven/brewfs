@@ -864,6 +864,12 @@ pub trait WorkspaceStore: Send + Sync {
             "durable GC slice deletion reservation",
         ))
     }
+    /// Limit one collector tick when metadata finalization uses a bounded
+    /// target proof. The remaining candidates stay protected until a later
+    /// tick; this keeps a slice reservation's target identities complete.
+    fn gc_target_limit(&self) -> Option<usize> {
+        None
+    }
     async fn finalize_layer_metadata_deletion(
         &self,
         layer_ids: Vec<LayerId>,
