@@ -766,7 +766,7 @@ fn redis_time_ns(seconds: i64, micros: i64) -> Result<i64, WorkspaceError> {
         .ok_or_else(|| WorkspaceError::Backend("Redis TIME overflows i64 nanos".into()))
 }
 
-fn timed_mget_pipeline(scoped: Vec<String>) -> redis::Pipeline {
+fn timed_mget_pipeline(scoped: Vec<Vec<u8>>) -> redis::Pipeline {
     let mut pipeline = redis::pipe();
     pipeline.atomic().cmd("TIME").cmd("MGET").arg(scoped);
     pipeline
@@ -828,7 +828,8 @@ fn backend(error: impl std::fmt::Display) -> WorkspaceError {
 mod tests {
     #[test]
     fn timed_metadata_reads_are_transactional() {
-        let packed = super::timed_mget_pipeline(vec!["brewfs:test".into()]).get_packed_pipeline();
+        let packed =
+            super::timed_mget_pipeline(vec![b"brewfs:test".to_vec()]).get_packed_pipeline();
         let wire = String::from_utf8_lossy(&packed);
         assert!(
             wire.starts_with("*1\r\n$5\r\nMULTI\r\n"),

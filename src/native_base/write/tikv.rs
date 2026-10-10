@@ -73,6 +73,21 @@ fn prefix_range_end(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Keep the prefix invariant even when a prefix has no finite exclusive upper
+/// bound (for example, a binary key ending in 0xff). TiKV scans are ordered,
+/// so the first key outside the prefix terminates the useful range.
+fn take_prefix_batch(prefix: &[u8], batch: Vec<KvPair>) -> (Vec<KvPair>, bool) {
+    let mut accepted = Vec::with_capacity(batch.len());
+    for pair in batch {
+        let key: Vec<u8> = pair.key().clone().into();
+        if !key.starts_with(prefix) {
+            return (accepted, true);
+        }
+        accepted.push(pair);
+    }
+    (accepted, false)
+}
+
 #[async_trait]
 impl ControlStore for TiKvControlStore {
     async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
@@ -183,13 +198,14 @@ impl ControlStore for TiKvControlStore {
                     return Err(backend(error));
                 }
             };
+            let (batch, exhausted) = take_prefix_batch(prefix, batch);
             let batch_len = batch.len();
             for pair in batch {
                 let key: Vec<u8> = pair.key().clone().into();
                 lower = Bound::Excluded(Key::from(key.clone()));
                 out.push((key, pair.value().to_vec()));
             }
-            if batch_len < SCAN_BATCH_LIMIT as usize {
+            if exhausted || batch_len < SCAN_BATCH_LIMIT as usize {
                 break;
             }
         }
@@ -212,5 +228,23 @@ mod tests {
         assert_eq!(prefix_range_end(b"\xff\xff"), None);
         assert_eq!(prefix_range_end(b"\xa0\xff\xff"), Some(b"\xa1".to_vec()));
         assert_eq!(prefix_range_end(b""), None);
+    }
+
+    #[test]
+    fn prefix_scan_stops_at_the_first_nonmatching_key() {
+        let prefix = b"abc";
+        let batch = vec![
+            KvPair::new(b"abc\x00".to_vec(), b"inside".to_vec()),
+            KvPair::new(b"abc\xff".to_vec(), b"inside".to_vec()),
+            KvPair::new(b"abd".to_vec(), b"outside".to_vec()),
+        ];
+        let (accepted, exhausted) = take_prefix_batch(prefix, batch);
+        assert!(exhausted);
+        assert_eq!(accepted.len(), 2);
+        assert!(
+            accepted
+                .iter()
+                .all(|pair| Vec::<u8>::from(pair.key().clone()).starts_with(prefix))
+        );
     }
 }
