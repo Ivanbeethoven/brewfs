@@ -611,14 +611,11 @@ impl WorkspaceKvBackend for RedisWorkspaceBackend {
         }
         let scoped = keys.iter().map(|key| self.scoped(key)).collect::<Vec<_>>();
         let mut connection = self.connection.clone();
-        let ((seconds, micros), values): ((i64, i64), Vec<Option<Vec<u8>>>) = redis::pipe()
-            .atomic()
-            .cmd("TIME")
-            .cmd("MGET")
-            .arg(scoped)
-            .query_async(&mut connection)
-            .await
-            .map_err(backend)?;
+        let ((seconds, micros), values): ((i64, i64), Vec<Option<Vec<u8>>>) =
+            timed_mget_pipeline(scoped)
+                .query_async(&mut connection)
+                .await
+                .map_err(backend)?;
         Ok((values, redis_time_ns(seconds, micros)?))
     }
 
@@ -655,13 +652,15 @@ impl WorkspaceKvBackend for RedisWorkspaceBackend {
     ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
         let scoped = keys.iter().map(|key| self.scoped(key)).collect::<Vec<_>>();
         let mut connection = self.connection.clone();
-        let ((seconds, micros), values): ((i64, i64), Vec<Option<Vec<u8>>>) = redis::pipe()
-            .cmd("TIME")
-            .cmd("MGET")
-            .arg(scoped)
-            .query_async(&mut connection)
-            .await
-            .map_err(backend)?;
+        // TIME and MGET form one metadata read snapshot. Without MULTI/EXEC,
+        // another workspace mutation can run between the two pipelined
+        // commands, leaving the lease timestamp detached from the values used
+        // to authorize an ACL/mode mutation.
+        let ((seconds, micros), values): ((i64, i64), Vec<Option<Vec<u8>>>) =
+            timed_mget_pipeline(scoped)
+                .query_async(&mut connection)
+                .await
+                .map_err(backend)?;
         let now = redis_time_ns(seconds, micros)?;
         Ok((values, now))
     }
@@ -767,6 +766,12 @@ fn redis_time_ns(seconds: i64, micros: i64) -> Result<i64, WorkspaceError> {
         .ok_or_else(|| WorkspaceError::Backend("Redis TIME overflows i64 nanos".into()))
 }
 
+fn timed_mget_pipeline(scoped: Vec<String>) -> redis::Pipeline {
+    let mut pipeline = redis::pipe();
+    pipeline.atomic().cmd("TIME").cmd("MGET").arg(scoped);
+    pipeline
+}
+
 fn validate_namespace(namespace: &str) -> Result<(), WorkspaceError> {
     if namespace.is_empty()
         || !namespace
@@ -821,6 +826,17 @@ fn backend(error: impl std::fmt::Display) -> WorkspaceError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timed_metadata_reads_are_transactional() {
+        let packed = super::timed_mget_pipeline(vec!["brewfs:test".into()]).get_packed_pipeline();
+        let wire = String::from_utf8_lossy(&packed);
+        assert!(
+            wire.starts_with("*1\r\n$5\r\nMULTI\r\n"),
+            "TIME/MGET metadata reads must enter MULTI/EXEC"
+        );
+        assert!(wire.ends_with("*1\r\n$4\r\nEXEC\r\n"));
+    }
+
     #[test]
     fn operator_principals_reject_shared_default_or_unbounded_identity() {
         assert!(super::validate_operator_principals("operator", "runtime").is_ok());
