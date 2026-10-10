@@ -484,9 +484,16 @@ pub(crate) fn observer_validation_error(
         PackedWireError::Truncated { .. } => FailureClass::ShortBody,
         PackedWireError::LimitExceeded(_) => FailureClass::Admission,
         PackedWireError::Backend(_) => FailureClass::Backend,
+        PackedWireError::ReadViewChanged => FailureClass::Generation,
         PackedWireError::UnsupportedFormat(_) | PackedWireError::Invalid(_) => FailureClass::Schema,
     };
-    (class, error.into())
+    let error = match error {
+        PackedWireError::ReadViewChanged => {
+            anyhow::Error::new(crate::chunk::read_plan::ReadViewChanged)
+        }
+        error => error.into(),
+    };
+    (class, error)
 }
 
 pub(crate) fn observer_backend_error(error: anyhow::Error) -> PackedWireError {

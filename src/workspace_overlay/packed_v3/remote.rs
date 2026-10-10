@@ -1668,7 +1668,10 @@ mod tests {
         let error = crate::chunk::read_plan::execute_unified_into(&fetcher, 0, &plan, &mut output)
             .await
             .expect_err("a source bound to another generation must fence the read");
-        assert!(crate::chunk::read_plan::is_read_view_changed(&error));
+        assert!(matches!(
+            error,
+            crate::chunk::read_plan::ReadPlanError::StaleView(_)
+        ));
         assert_eq!(
             output, [0xa5; 4],
             "fenced reads must not partially write output"
