@@ -127,9 +127,10 @@ def _validate_profile(manifest: dict[str, Any], path: pathlib.Path) -> None:
         "metadata_codec": "metadata_codec",
         "data_codec": "data_codec",
         "access_profile": "access_profile",
+        "p90_training_trace_sha256": "p90_training_trace_sha256",
     }
     for profile_name, control_name in control_bindings.items():
-        if control_name in controls:
+        if control_name in controls and controls[control_name] is not None:
             expected[profile_name] = controls[control_name]
     for name, value in expected.items():
         if value is None or profile.get(name) != str(value):
@@ -172,7 +173,7 @@ def init_manifest(
 
 def _validate_layout_controls(controls: dict[str, Any]) -> None:
     allowed = {
-        "frame_policy": {"size-only", "static-256kib", "static-1mib", "static-4mib"},
+        "frame_policy": {"size-only", "static-256kib", "static-1mib", "static-4mib", "p90-training"},
         "inline_data": {"on", "off"},
         "metadata_codec": {"raw", "zstd"},
         "data_codec": {"raw", "zstd"},
@@ -182,6 +183,10 @@ def _validate_layout_controls(controls: dict[str, Any]) -> None:
         value = controls.get(name)
         if value is not None and value not in values:
             raise ArtifactError(f"invalid {name} control")
+    if controls.get("frame_policy") == "p90-training":
+        trace = controls.get("p90_training_trace_sha256")
+        if not isinstance(trace, str) or not _HEX64.fullmatch(trace.lower()):
+            raise ArtifactError("p90-training requires a training trace SHA-256")
 
 
 def _summary_rows(path: pathlib.Path) -> list[dict[str, Any]]:
@@ -274,6 +279,27 @@ def finalize_manifest(artifact: pathlib.Path, *, status: int) -> dict[str, Any]:
             raise ArtifactError("source hash inventory is missing or malformed")
         _validate_toolchain(artifact / "toolchain.json")
         _validate_profile(manifest, artifact / "profile.env")
+        controls = manifest.get("controls")
+        if isinstance(controls, dict) and controls.get("frame_policy") == "p90-training":
+            policy_path = _require_file(artifact, "p90-policy.json", success=True)
+            assert policy_path is not None
+            try:
+                from .packed_p90_policy import P90PolicyError, validate_policy
+            except ImportError:  # direct execution from tools/perf
+                from packed_p90_policy import P90PolicyError, validate_policy
+            try:
+                policy = validate_policy(
+                    json.loads(policy_path.read_text()),
+                    expected_trace_sha256=controls["p90_training_trace_sha256"],
+                )
+            except (OSError, json.JSONDecodeError, P90PolicyError) as error:
+                raise ArtifactError(f"invalid p90 policy: {error}") from error
+            files[policy_path.name] = {"bytes": policy_path.stat().st_size, "sha256": _digest(policy_path)}
+            manifest["p90_policy"] = {
+                "p90_bytes": policy["p90_bytes"],
+                "trace_sha256": policy["trace_sha256"],
+                "policy_sha256": policy["policy_sha256"],
+            }
         summary_path = _require_file(artifact, "summary.json", success=True)
         timing_path = _require_file(artifact, "timing.json", success=True)
         assert summary_path is not None and timing_path is not None
@@ -308,11 +334,12 @@ def main() -> int:
     init.add_argument("--mode", required=True)
     init.add_argument("--scanner-seed", type=int, required=True)
     init.add_argument("--fixture-prefix", required=True)
-    init.add_argument("--frame-policy", choices=["size-only", "static-256kib", "static-1mib", "static-4mib"], default="size-only")
+    init.add_argument("--frame-policy", choices=["size-only", "static-256kib", "static-1mib", "static-4mib", "p90-training"], default="size-only")
     init.add_argument("--inline-data", choices=["on", "off"], default="on")
     init.add_argument("--metadata-codec", choices=["raw", "zstd"], default="zstd")
     init.add_argument("--data-codec", choices=["raw", "zstd"], default="zstd")
     init.add_argument("--access-profile", choices=["random-small-file", "sequential-small-file", "mixed"], default="random-small-file")
+    init.add_argument("--p90-training-trace-sha256", default=None)
     finish = subparsers.add_parser("finalize")
     finish.add_argument("--artifact", type=pathlib.Path, required=True)
     finish.add_argument("--status", type=int, required=True)
@@ -337,6 +364,7 @@ def main() -> int:
                     "metadata_codec": args.metadata_codec,
                     "data_codec": args.data_codec,
                     "access_profile": args.access_profile,
+                    "p90_training_trace_sha256": args.p90_training_trace_sha256,
                 },
                 fixture_prefix=args.fixture_prefix,
             )

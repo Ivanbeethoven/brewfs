@@ -505,12 +505,18 @@ impl<W: WorkspaceStore + 'static> UnifiedReadSourceFetcher for CompositeFetcher<
             ReadSource::PackedFrame { .. } | ReadSource::PackedInline { .. } => {
                 // Dispatch only a source in an actually retained authenticated
                 // child. Never reconstruct a recipe from container offsets.
+                // Overlay composition may split one lower frame at an upper
+                // boundary. `shift_source` then advances only `raw_offset`,
+                // so comparing the complete source value would reject a
+                // valid child-owned subrange. Match the immutable frame
+                // identity and validate that the requested subrange remains
+                // inside the retained child segment instead.
                 let child = self
                     .children
                     .iter()
                     .find(|child| {
                         child.plan.segments.iter().any(|segment| {
-                            &segment.source == source && segment.length == output.len() as u64
+                            packed_source_covered_by(&segment.source, source, output.len() as u64)
                         })
                     })
                     .ok_or_else(|| {
@@ -523,6 +529,72 @@ impl<W: WorkspaceStore + 'static> UnifiedReadSourceFetcher for CompositeFetcher<
                 child.fetcher.read_source(source, output).await
             }
         }
+    }
+}
+
+fn packed_source_covered_by(
+    owner: &ReadSource,
+    requested: &ReadSource,
+    requested_len: u64,
+) -> bool {
+    match (owner, requested) {
+        (
+            ReadSource::PackedFrame {
+                group_id: owner_group,
+                container_ordinal: owner_container,
+                frame_ordinal: owner_frame,
+                object_offset: owner_object,
+                stored_len: owner_stored,
+                raw_offset: owner_raw,
+                raw_len: owner_raw_len,
+                size_class: owner_class,
+                codec: owner_codec,
+                frame_digest: owner_digest,
+            },
+            ReadSource::PackedFrame {
+                group_id: requested_group,
+                container_ordinal: requested_container,
+                frame_ordinal: requested_frame,
+                object_offset: requested_object,
+                stored_len: requested_stored,
+                raw_len: requested_raw_len,
+                size_class: requested_class,
+                codec: requested_codec,
+                frame_digest: requested_digest,
+                raw_offset: requested_raw,
+            },
+        ) => {
+            owner_group == requested_group
+                && owner_container == requested_container
+                && owner_frame == requested_frame
+                && owner_object == requested_object
+                && owner_stored == requested_stored
+                && owner_raw_len == requested_raw_len
+                && owner_class == requested_class
+                && owner_codec == requested_codec
+                && owner_digest == requested_digest
+                && u64::from(*requested_raw) >= u64::from(*owner_raw)
+                && u64::from(*requested_raw)
+                    .checked_add(requested_len)
+                    .is_some_and(|end| end <= u64::from(*owner_raw) + u64::from(*owner_raw_len))
+        }
+        (
+            ReadSource::PackedInline {
+                data: owner_data,
+                raw_offset: owner_raw,
+            },
+            ReadSource::PackedInline {
+                data: requested_data,
+                raw_offset: requested_raw,
+            },
+        ) => {
+            std::sync::Arc::ptr_eq(owner_data, requested_data)
+                && u64::from(*requested_raw) >= u64::from(*owner_raw)
+                && u64::from(*requested_raw)
+                    .checked_add(requested_len)
+                    .is_some_and(|end| end <= u64::from(*owner_raw) + owner_data.len() as u64)
+        }
+        _ => false,
     }
 }
 
@@ -737,4 +809,66 @@ pub(super) async fn prepare<W: WorkspaceStore + 'static>(
         .await
         .map_err(fetch_to_meta)?;
     Ok(PreparedUnifiedRead { plan, fetcher })
+}
+
+#[cfg(test)]
+mod packed_source_owner_tests {
+    use std::sync::Arc;
+
+    use super::packed_source_covered_by;
+    use crate::chunk::read_plan::ReadSource;
+
+    fn frame(raw_offset: u32, digest: [u8; 16]) -> ReadSource {
+        ReadSource::PackedFrame {
+            group_id: 7,
+            container_ordinal: 2,
+            frame_ordinal: 3,
+            object_offset: 4096,
+            stored_len: 512,
+            raw_offset,
+            raw_len: 1024,
+            size_class: 1,
+            codec: 0,
+            frame_digest: digest,
+        }
+    }
+
+    #[test]
+    fn split_frame_subrange_keeps_authenticated_owner() {
+        assert!(packed_source_covered_by(
+            &frame(0, [9; 16]),
+            &frame(512, [9; 16]),
+            128
+        ));
+        assert!(!packed_source_covered_by(
+            &frame(0, [9; 16]),
+            &frame(960, [9; 16]),
+            128
+        ));
+        assert!(!packed_source_covered_by(
+            &frame(0, [9; 16]),
+            &frame(512, [8; 16]),
+            128
+        ));
+    }
+
+    #[test]
+    fn inline_owner_requires_the_same_retained_payload() {
+        let payload: Arc<[u8]> = Arc::from(vec![1u8; 1024]);
+        let owner = ReadSource::PackedInline {
+            data: payload.clone(),
+            raw_offset: 0,
+        };
+        let split = ReadSource::PackedInline {
+            data: payload,
+            raw_offset: 512,
+        };
+        assert!(packed_source_covered_by(&owner, &split, 128));
+
+        let copied = ReadSource::PackedInline {
+            data: Arc::from(vec![1u8; 1024]),
+            raw_offset: 512,
+        };
+        assert!(!packed_source_covered_by(&owner, &copied, 128));
+    }
 }
