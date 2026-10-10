@@ -1052,6 +1052,68 @@ async fn packed_journal_commit_atomicity_with_test_only_seal_and_response_loss()
             .await
             .is_err()
     );
+
+    // A terminal journal retry must reject a retained root that still carries
+    // an outstanding PUT hold. This simulates a crash-visible partial root
+    // and prevents recovery from acknowledging incomplete publication.
+    other
+        .test_set_registry_root_pending_puts(journal.source.staging_id, 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        other
+            .commit_packed_journal(&journal, &publish, &seal, &budget)
+            .await,
+        Err(WorkspaceError::Busy)
+    ));
+}
+
+#[tokio::test]
+async fn packed_journal_abort_retry_allows_dispatched_pending_put() {
+    let backend = Arc::new(JournalMemoryBackend::default());
+    let budget = V3MountBudget::defaults();
+    let store =
+        KvWorkspaceStore::from_arc(backend.clone()).with_packed_reader_pin_budget(budget.clone());
+    let (_directory, publish) = setup(&store).await;
+    let journal = begin(&store, &publish, &budget).await;
+    let (reserved, guard) = store
+        .reserve_packed_upload(
+            &journal,
+            publish.lower.manifest_reference().clone(),
+            &budget,
+        )
+        .await
+        .unwrap();
+
+    // Dispatch is a durable single-use transition. A lost reply leaves the
+    // PUT marked dispatched while retaining its pending hold.
+    backend.lose_reply.store(true, Ordering::SeqCst);
+    assert!(
+        store
+            .dispatch_packed_upload(&reserved, &guard, &budget)
+            .await
+            .is_err()
+    );
+    let dispatched = store
+        .reopen_packed_journal(reserved.journal_id, &reserved.source, &budget)
+        .await
+        .unwrap();
+
+    // Aborting after that crash retains the pending hold. The abort CAS may
+    // also lose its reply; retry must acknowledge the exact AbortedRetained
+    // root without requiring pending_puts to reach zero.
+    backend.lose_reply.store(true, Ordering::SeqCst);
+    assert!(
+        store
+            .abort_packed_journal(&dispatched, "dispatch reply lost".into(), &budget)
+            .await
+            .is_err()
+    );
+    let aborted = store
+        .abort_packed_journal(&dispatched, "dispatch reply lost".into(), &budget)
+        .await
+        .unwrap();
+    assert_eq!(aborted.phase, PackedJournalPhase::Aborted);
 }
 
 #[tokio::test]

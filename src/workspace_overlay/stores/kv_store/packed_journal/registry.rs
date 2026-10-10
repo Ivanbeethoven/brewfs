@@ -511,6 +511,37 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
         Ok(true)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn test_set_registry_root_pending_puts(
+        &self,
+        incarnation: Uuid,
+        pending_puts: u64,
+    ) -> Result<(), WorkspaceError> {
+        let key = registry_root_key(incarnation);
+        let raw = self
+            .backend
+            .get(&key)
+            .await?
+            .ok_or_else(|| journal_error("retained graph root missing"))?;
+        let mut root = RootRow::decode(&raw)?;
+        root.pending_puts = pending_puts;
+        let next = root.encode()?;
+        if !self
+            .backend
+            .compare_and_swap(
+                &[KvCheck {
+                    key: key.clone(),
+                    expected: Some(raw),
+                }],
+                &[KvWrite::Put { key, value: next }],
+            )
+            .await?
+        {
+            return Err(WorkspaceError::Busy);
+        }
+        Ok(())
+    }
+
     pub(super) async fn registry_transition_root(
         &self,
         expected: &PackedJournalRecord,
@@ -550,6 +581,7 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             && root.incarnation == expected.source.staging_id
             && root.journal_id == expected.journal_id
             && root.members == expected.object_count
+            && (!commit || root.pending_puts == 0)
             && (!commit || root.binding == expected.commit_target)
         {
             return Ok((key, Some(raw.clone()), Some(raw)));
