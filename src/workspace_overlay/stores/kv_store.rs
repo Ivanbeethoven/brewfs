@@ -128,7 +128,10 @@ const GENERIC_SCAN_MAX_BYTES: usize = 64 << 20;
 fn generic_scan_limits() -> KvReadLimits {
     KvReadLimits {
         max_records: GENERIC_SCAN_PAGE_RECORDS,
-        max_key_bytes: 2048,
+        // All backends share the 1024-byte logical key schema for bounded
+        // keyset pages. Larger values are rejected before reaching a
+        // backend, so keep generic scans within that contract.
+        max_key_bytes: 1024,
         max_value_bytes: 256 << 10,
         max_total_bytes: 4 << 20,
         max_response_bytes: 4 << 20,

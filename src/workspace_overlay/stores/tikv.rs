@@ -31,6 +31,10 @@ pub const BOUNDED_JOURNAL_MESSAGE_BYTES: usize = 64 << 10;
 /// A full Linux xattr plus its native delta envelope exceeds 64 KiB.
 pub const BOUNDED_XATTR_VALUE_BYTES: usize = 96 << 10;
 pub const BOUNDED_XATTR_MESSAGE_BYTES: usize = 128 << 10;
+/// Generic catalog pages admit larger records than native delta pages while
+/// remaining within a fixed decoder envelope.
+pub const BOUNDED_GENERIC_VALUE_BYTES: usize = 256 << 10;
+pub const BOUNDED_GENERIC_MESSAGE_BYTES: usize = 512 << 10;
 pub const BOUNDED_READ_MAX_POINT_KEYS: usize = 32;
 pub const BOUNDED_READ_MAX_SCAN_PAGES: usize = 1024;
 const CLIENT_RESIDENT_METADATA_BYTES: u64 = 4 << 20;
@@ -73,6 +77,7 @@ struct ClientSlots {
     small: Option<TransactionClient>,
     journal: Option<TransactionClient>,
     xattr: Option<TransactionClient>,
+    generic: Option<TransactionClient>,
 }
 
 impl Drop for ClientSlots {
@@ -86,6 +91,7 @@ impl Drop for ClientSlots {
             &self.small,
             &self.journal,
             &self.xattr,
+            &self.generic,
         ]
         .into_iter()
         .flatten()
@@ -156,9 +162,11 @@ fn bounded_read_message_bytes(limits: KvReadLimits) -> Result<usize, WorkspaceEr
         BOUNDED_JOURNAL_MESSAGE_BYTES
     } else if limits.max_value_bytes <= BOUNDED_XATTR_VALUE_BYTES {
         BOUNDED_XATTR_MESSAGE_BYTES
+    } else if limits.max_value_bytes <= BOUNDED_GENERIC_VALUE_BYTES {
+        BOUNDED_GENERIC_MESSAGE_BYTES
     } else {
         return Err(WorkspaceError::UnsupportedCapability(
-            "TiKV bounded read record schema larger than 96 KiB",
+            "TiKV bounded read record schema larger than 256 KiB",
         ));
     };
     if limits.max_response_bytes < message_bytes {
@@ -197,6 +205,7 @@ fn client_config_with_tls(
                 | BOUNDED_READ_MESSAGE_BYTES
                 | BOUNDED_JOURNAL_MESSAGE_BYTES
                 | BOUNDED_XATTR_MESSAGE_BYTES
+                | BOUNDED_GENERIC_MESSAGE_BYTES
         ))
         .with_bounded_read_lock_conflicts(
             if matches!(
@@ -205,6 +214,7 @@ fn client_config_with_tls(
                     | BOUNDED_READ_MESSAGE_BYTES
                     | BOUNDED_JOURNAL_MESSAGE_BYTES
                     | BOUNDED_XATTR_MESSAGE_BYTES
+                    | BOUNDED_GENERIC_MESSAGE_BYTES
             ) {
                 4096
             } else {
@@ -356,6 +366,7 @@ impl TiKvWorkspaceBackend {
                 small: None,
                 journal: None,
                 xattr: None,
+                generic: None,
             })),
             prefix,
             pd_endpoints: std::sync::Arc::new(pd_endpoints),
@@ -395,6 +406,7 @@ impl TiKvWorkspaceBackend {
             &clients.small,
             &clients.journal,
             &clients.xattr,
+            &clients.generic,
         ]
         .into_iter()
         .flatten()
@@ -406,6 +418,7 @@ impl TiKvWorkspaceBackend {
         clients.small.take();
         clients.journal.take();
         clients.xattr.take();
+        clients.generic.take();
         Ok(())
     }
 
@@ -464,8 +477,10 @@ impl TiKvWorkspaceBackend {
             &mut clients.small
         } else if message_bytes == BOUNDED_JOURNAL_MESSAGE_BYTES {
             &mut clients.journal
-        } else {
+        } else if message_bytes == BOUNDED_XATTR_MESSAGE_BYTES {
             &mut clients.xattr
+        } else {
+            &mut clients.generic
         };
         if slot.is_none() {
             let config =
@@ -1848,5 +1863,13 @@ mod receipt_read_plan_tests {
             bounded_read_message_bytes(limits(96 << 10, 128 << 10)).unwrap(),
             128 << 10
         );
+        assert_eq!(
+            bounded_read_message_bytes(limits(256 << 10, 512 << 10)).unwrap(),
+            512 << 10
+        );
+        assert!(matches!(
+            bounded_read_message_bytes(limits((256 << 10) + 1, 512 << 10)),
+            Err(WorkspaceError::UnsupportedCapability(_))
+        ));
     }
 }
