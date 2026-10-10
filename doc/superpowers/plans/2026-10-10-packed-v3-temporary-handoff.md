@@ -19,7 +19,7 @@ PR：[brewfs/brewfs#160](https://github.com/brewfs/brewfs/pull/160)
 
 ## 2. 当前提交与本轮修改
 
-本轮主要实现基线是提交 706b6c5（feat(packed-v3): close generation and runner audit gaps）；随后补充了临时交接文档、稳定 Rust API 修复和 CI 资源约束。最终提交后应以 git log 和 PR 页面记录实际的本地/远端 head SHA。
+本轮主要实现基线是提交 706b6c5（feat(packed-v3): close generation and runner audit gaps）；随后补充了临时交接文档、稳定 Rust API 修复和 CI 资源约束；本轮最终代码提交为 e194cd3。推送后应以 git log 和 PR 页面记录实际的本地/远端 head SHA。
 
 本轮实现内容：
 
