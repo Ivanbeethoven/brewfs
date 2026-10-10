@@ -527,6 +527,40 @@ impl S3Backend {
         }
     }
 
+    async fn etag_with_observer(
+        &self,
+        key: &str,
+        observed: Option<(
+            crate::cadapter::read_observer::ReadContext,
+            Arc<crate::cadapter::read_observer::ReadObserver>,
+        )>,
+    ) -> Result<String> {
+        let operation = self
+            .client
+            .head_object()
+            .bucket(&self.config.bucket)
+            .key(key);
+        let response = match observed {
+            Some((context, observer)) => {
+                let delegate = self
+                    .client
+                    .config()
+                    .http_client()
+                    .ok_or_else(|| anyhow!("typed S3 HEAD HTTP client unavailable"))?;
+                let observed = crate::cadapter::read_observer::http::ObservedHttpClient::new(
+                    delegate, observer, context, 0,
+                );
+                operation
+                    .customize()
+                    .config_override(aws_sdk_s3::config::Builder::new().http_client(observed))
+                    .send()
+                    .await
+            }
+            None => operation.send().await,
+        }?;
+        Ok(response.e_tag().unwrap_or_default().to_string())
+    }
+
     fn safe_stream_error_kind(kind: std::io::ErrorKind) -> &'static str {
         match kind {
             std::io::ErrorKind::TimedOut => "timeout",
@@ -1183,14 +1217,17 @@ impl ObjectBackend for S3Backend {
     }
 
     async fn get_etag(&self, key: &str) -> Result<String> {
-        let resp = self
-            .client
-            .head_object()
-            .bucket(&self.config.bucket)
-            .key(key)
-            .send()
-            .await?;
-        Ok(resp.e_tag().unwrap_or_default().to_string())
+        self.etag_with_observer(key, None).await
+    }
+
+    async fn get_etag_observed(
+        &self,
+        key: &str,
+        context: crate::cadapter::read_observer::ReadContext,
+        observer: Arc<crate::cadapter::read_observer::ReadObserver>,
+    ) -> Result<String> {
+        self.etag_with_observer(key, Some((context, observer)))
+            .await
     }
 
     #[tracing::instrument(level = "debug", skip(self), fields(key))]
@@ -1291,6 +1328,63 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct EtagOnlyHttpClient {
+        status: u16,
+        etag: Option<&'static str>,
+    }
+
+    impl HttpClient for EtagOnlyHttpClient {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+
+    impl HttpConnector for EtagOnlyHttpClient {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            assert_eq!(request.method(), "HEAD", "ETag validation must use HEAD");
+            assert!(request.headers().get("range").is_none());
+            let status = self.status;
+            let etag = self.etag;
+            HttpConnectorFuture::new(async move {
+                let mut response =
+                    HttpResponse::new(StatusCode::try_from(status).unwrap(), SdkBody::empty());
+                if let Some(etag) = etag {
+                    response.headers_mut().insert("etag", etag);
+                }
+                Ok(response)
+            })
+        }
+    }
+
+    fn etag_head_backend(status: u16, etag: Option<&'static str>) -> S3Backend {
+        let config = Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new(
+                "test-key",
+                "test-secret",
+                None,
+                None,
+                "etag-head-test",
+            ))
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+            .http_client(EtagOnlyHttpClient { status, etag })
+            .build();
+        S3Backend {
+            client: Client::from_conf(config),
+            mutation_replay_forbidden: false,
+            config: S3Config {
+                bucket: "test-bucket".into(),
+                ..S3Config::default()
+            },
+        }
+    }
+
     #[tokio::test]
     async fn bounded_head_uses_sdk_head_and_conserves_terminal_observation() {
         use std::io::ErrorKind;
@@ -1357,6 +1451,80 @@ mod tests {
                 assert_eq!((row.success, row.failed), (1 - failed, failed));
                 assert!(row.conserved());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_etag_uses_observed_head_and_rejects_unclassified_route() {
+        let observer = Arc::new(ReadObserver::default());
+        let client = ObjectClient::new(etag_head_backend(200, Some("\"etag-123\"")))
+            .with_read_observer(
+                Arc::clone(&observer),
+                Engine::PackedV3,
+                Phase::Startup,
+                Origin::Demand,
+            );
+        let context = client.read_context(ReadClass::ContainerIndex).unwrap();
+        assert!(client.get_etag("private-object-key").await.is_err());
+        assert_eq!(
+            client
+                .typed_etag(ReadClass::ContainerIndex, "private-object-key")
+                .await
+                .unwrap(),
+            "\"etag-123\""
+        );
+
+        let snapshot = observer.snapshot();
+        assert!(snapshot.http_observed);
+        assert!(!snapshot.overflowed);
+        for ledger in [
+            Ledger::HttpAttempt,
+            Ledger::BackendBody,
+            Ledger::ValidatedFetch,
+        ] {
+            let row = &snapshot.rows[&(ledger, context)];
+            assert_eq!(
+                (
+                    row.started,
+                    row.cancelled,
+                    row.inflight,
+                    row.requested,
+                    row.received
+                ),
+                (1, 0, 0, 0, 0)
+            );
+            assert_eq!((row.success, row.failed), (1, 0));
+            assert!(row.conserved());
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_etag_records_head_http_failure_in_each_observed_ledger() {
+        let observer = Arc::new(ReadObserver::default());
+        let client = ObjectClient::new(etag_head_backend(403, None)).with_read_observer(
+            Arc::clone(&observer),
+            Engine::PackedV3,
+            Phase::Runtime,
+            Origin::Demand,
+        );
+        let context = client.read_context(ReadClass::ContainerIndex).unwrap();
+        assert!(
+            client
+                .typed_etag(ReadClass::ContainerIndex, "private-object-key")
+                .await
+                .is_err()
+        );
+
+        let snapshot = observer.snapshot();
+        for ledger in [
+            Ledger::HttpAttempt,
+            Ledger::BackendBody,
+            Ledger::ValidatedFetch,
+        ] {
+            let row = &snapshot.rows[&(ledger, context)];
+            assert_eq!((row.started, row.cancelled, row.inflight), (1, 0, 0));
+            assert_eq!((row.success, row.failed), (0, 1));
+            assert!(row.conserved());
         }
     }
 

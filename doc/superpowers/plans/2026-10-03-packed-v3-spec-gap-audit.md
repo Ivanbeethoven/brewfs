@@ -314,3 +314,5 @@ runner/manifest suite passes 19 tests (and 7 direct-invocation tests).
 This closes only the local build-provenance sub-contract. It does not certify a
 release build, cloud dispatch, Redis/TiKV lifecycle, resource journals, cleanup
 proof, or G17 paired acceptance.
+
+2026-10-10 incremental: G06 typed ETag HEAD observation is wired through ObjectClient, S3 ObservedHttpClient, and packed-v3 readonly transport; scripted success/403 ledger tests are included. fmt, cargo check --tests, and diff check passed; full focused test-binary codegen was stopped after exceeding the resource window, so its runtime result is not claimed. Remaining startup/retry/union/raw/decoded and FUSE evidence stays open.
