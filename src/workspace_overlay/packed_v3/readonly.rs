@@ -212,6 +212,24 @@ impl<B: ObjectBackend + Clone + 'static> ObjectBackend for V3ReadonlyBackend<B> 
             .await?;
         Ok(result.value.clone())
     }
+
+    async fn get_etag_observed(
+        &self,
+        key: &str,
+        context: crate::cadapter::read_observer::ReadContext,
+        observer: Arc<crate::cadapter::read_observer::ReadObserver>,
+    ) -> anyhow::Result<String> {
+        let result = self
+            .metrics
+            .transport
+            .run(&self.budget, key.len(), 0, || {
+                let client = self.client.clone();
+                let key = key.to_owned();
+                async move { client.backend_etag_observed(&key, context, observer).await }
+            })
+            .await?;
+        Ok(result.value.clone())
+    }
     async fn delete_object(&self, _key: &str) -> anyhow::Result<()> {
         anyhow::bail!(READ_ONLY_ERROR)
     }
