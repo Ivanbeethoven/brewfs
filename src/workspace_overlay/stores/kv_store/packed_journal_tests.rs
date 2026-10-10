@@ -1052,6 +1052,20 @@ async fn packed_journal_commit_atomicity_with_test_only_seal_and_response_loss()
             .await
             .is_err()
     );
+
+    // A terminal journal retry must reject a retained root that still carries
+    // an outstanding PUT hold. This simulates a crash-visible partial root
+    // and prevents recovery from acknowledging incomplete publication.
+    other
+        .test_set_registry_root_pending_puts(journal.source.staging_id, 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        other
+            .commit_packed_journal(&journal, &publish, &seal, &budget)
+            .await,
+        Err(WorkspaceError::Busy)
+    ));
 }
 
 #[tokio::test]
