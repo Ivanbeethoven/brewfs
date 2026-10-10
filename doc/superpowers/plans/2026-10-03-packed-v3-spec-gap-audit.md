@@ -301,3 +301,16 @@ See G06 HTTP evidence in the performance directory.
 ## 2026-10-10 delta: G16 runner module invocation
 
 The bounded Python performance helpers now support both package-qualified invocation from the repository root and direct invocation from tools/perf. tools/perf/__init__.py marks the helper directory as a package; packed_partial_scan.py and its focused tests use relative imports with a direct-execution fallback. The repository-root suite (python3 -m unittest tools.perf.test_packed_local_runner tools.perf.test_packed_run_manifest tools.perf.test_packed_partial_scan tools.perf.test_smallfiles_scan) passes 18 tests, and the direct tools/perf runner-manifest/partial-scan suite passes 9 tests. This closes only the import/reproducibility sub-contract; cloud dispatch, release/toolchain provenance, resource journals, cleanup proof, and G17 paired acceptance remain open.
+
+## 2026-10-10 delta: G16 local toolchain provenance
+
+The packed-v3 local RustFS runner now emits `toolchain.json` and the manifest
+requires it for a successful run. The record binds `rustc -Vv`, Cargo version,
+host target, binary profile, Git revision, and the SHA-256 of the complete dirty
+diff. Malformed or incomplete provenance fails manifest finalization, while
+failed runs remain recordable without claiming measurements. The focused Python
+runner/manifest suite passes 19 tests (and 7 direct-invocation tests).
+
+This closes only the local build-provenance sub-contract. It does not certify a
+release build, cloud dispatch, Redis/TiKV lifecycle, resource journals, cleanup
+proof, or G17 paired acceptance.

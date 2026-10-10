@@ -48,6 +48,11 @@ class PackedLocalRunnerTests(unittest.TestCase):
         self.assertIn("--scanner-seed \"$SCANNER_SEED\"", script)
         self.assertIn("fixture_prefix=", script)
         self.assertIn("manifest_schema=packed-v3-run-manifest-v1", script)
+        self.assertIn('"$ARTIFACT/toolchain.json"', script)
+        self.assertIn('rustc", "-Vv"', script)
+        self.assertIn('"git", "-C", str(root), "diff", "HEAD", "--binary"', script)
+        self.assertIn('"ls-files", "--others", "--exclude-standard", "-z"', script)
+        self.assertIn('"dirty_diff_sha256"', script)
 
     def test_layout_controls_are_forwarded_and_recorded(self):
         script = RUNNER.read_text()

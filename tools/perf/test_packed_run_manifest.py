@@ -10,6 +10,21 @@ except ImportError:  # direct execution from tools/perf
 
 
 class PackedRunManifestTests(unittest.TestCase):
+    @staticmethod
+    def _write_toolchain(artifact: pathlib.Path) -> None:
+        (artifact / "toolchain.json").write_text(
+            json.dumps(
+                {
+                    "rustc_verbose": "rustc 1.90.0 (fixture)",
+                    "cargo_version": "cargo 1.90.0 (fixture)",
+                    "host": "x86_64-unknown-linux-gnu",
+                    "binary_profile": "release",
+                    "revision": "d" * 40,
+                    "dirty_diff_sha256": "e" * 64,
+                }
+            )
+        )
+
     def test_old_encoding_is_rejected_before_creating_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             artifact = pathlib.Path(directory) / "rejected"
@@ -44,6 +59,7 @@ class PackedRunManifestTests(unittest.TestCase):
             (artifact / "manifest-key.txt").write_text("local-validation/manifest\n")
             (artifact / "binary-sha256.txt").write_text("a" * 64 + "  brewfs\n")
             (artifact / "source-sha256.json").write_text(json.dumps({"src/lib.rs": "b" * 64}))
+            self._write_toolchain(artifact)
             (artifact / "profile.env").write_text(
                 "\n".join(
                     [
@@ -118,6 +134,7 @@ class PackedRunManifestTests(unittest.TestCase):
             (artifact / "manifest-key.txt").write_text("local-validation/manifest\n")
             (artifact / "binary-sha256.txt").write_text("a" * 64 + "  brewfs\n")
             (artifact / "source-sha256.json").write_text(json.dumps({"src/lib.rs": "b" * 64}))
+            self._write_toolchain(artifact)
             (artifact / "profile.env").write_text(
                 "packed_version=v3\nwire_version=5\nscanner_seed=2\n"
                 "fixture_prefix=local-validation\nmanifest_schema=packed-v3-run-manifest-v1\n"
@@ -151,6 +168,31 @@ class PackedRunManifestTests(unittest.TestCase):
                     }
                 )
             )
+            with self.assertRaises(ArtifactError):
+                finalize_manifest(artifact, status=0)
+
+    def test_success_manifest_rejects_invalid_toolchain_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = pathlib.Path(directory)
+            init_manifest(
+                artifact,
+                run_id="invalid-toolchain",
+                wire_version=5,
+                controls={"mode": "stat", "scanner_seed": 1},
+                fixture_prefix="local-validation",
+            )
+            (artifact / "manifest-key.txt").write_text("local-validation/manifest\n")
+            (artifact / "binary-sha256.txt").write_text("a" * 64 + "  brewfs\n")
+            (artifact / "source-sha256.json").write_text(json.dumps({"src/lib.rs": "b" * 64}))
+            (artifact / "toolchain.json").write_text(
+                json.dumps({"rustc_verbose": "rustc fixture"})
+            )
+            (artifact / "profile.env").write_text(
+                "packed_version=v3\nwire_version=5\nscanner_seed=1\n"
+                "fixture_prefix=local-validation\nmanifest_schema=packed-v3-run-manifest-v1\n"
+                "order=shuffle\nmode=stat\n"
+            )
+            (artifact / "cache-proof.env").write_text("page_cache=dropped\n")
             with self.assertRaises(ArtifactError):
                 finalize_manifest(artifact, status=0)
 
