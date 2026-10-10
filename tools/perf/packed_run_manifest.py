@@ -214,7 +214,11 @@ def _validate_layout_controls(controls: dict[str, Any]) -> None:
 
 def _summary_rows(path: pathlib.Path) -> list[dict[str, Any]]:
     payload = _read_json(path)
-    rows = payload.get("epochs") if isinstance(payload, dict) else None
+    rows = None
+    if isinstance(payload, dict):
+        candidate = payload.get("epochs")
+        if isinstance(candidate, list):
+            rows = candidate
     if rows is None:
         rows = [payload]
     if not isinstance(rows, list) or not rows or not all(isinstance(row, dict) for row in rows):

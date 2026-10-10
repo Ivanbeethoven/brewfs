@@ -35,6 +35,13 @@ class PackedLocalRunnerTests(unittest.TestCase):
             self.assertEqual(result["active_bw_mib_s"], 1)
             self.assertAlmostEqual(result["effective_active_plus_drain_bw_mib_s"], 2 / 3)
             self.assertEqual(result["effective_wall_bw_mib_s"], 0.5)
+            stat_summary = dict(files=100, expected_files=100, errors=0, payload_bytes=0)
+            (path / "summary.json").write_text(json.dumps(stat_summary))
+            with patch("sys.argv", ["timing", directory, "0", "1000000000", "3000000000", "4000000000"]):
+                exec(compile(body, "PYTIMING", "exec"), {})
+            stat_result = json.loads((path / "timing.json").read_text())
+            self.assertIsNone(stat_result["active_bw_mib_s"])
+            self.assertIsNone(stat_result["effective_wall_bw_mib_s"])
             rows[0] = dict(rows[0], errors=1)
             (path / "summary.json").write_text(json.dumps(dict(epochs=rows)))
             with patch("sys.argv", ["timing", directory, "0", "1000000000", "3000000000", "4000000000"]):

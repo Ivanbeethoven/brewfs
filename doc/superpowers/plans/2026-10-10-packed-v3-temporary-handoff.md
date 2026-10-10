@@ -102,3 +102,9 @@ PR #160 最新 run 38061849001 已完成：Rust all-features job 以 exit 143 �
 - `doc/superpowers/plans/2026-10-03-packed-v3-spec-gap-audit.md`
 - `doc/superpowers/plans/2026-10-04-brewfs-system-readiness.md`
 - `doc/superpowers/plans/2026-10-10-packed-v3-temporary-handoff.md`
+
+## 7. 2026-10-11 性能 smoke 结果
+
+详细记录见 doc/superpowers/plans/2026-10-11-packed-v3-performance-smoke.md。当前 feature-enabled debug runner 已在真实 RustFS Compose + FUSE 完成两个可复现 control smoke：full 100×1KiB（100/100、0 errors、manifest/journal passed、mount 0.3235s、active 5.4079s、drain 0.1379s、wall 5.8693s）和 metadata stat 100 files（100/100、0 errors、p50 10.20353ms、p95 11.946053ms、manifest/journal passed）。两者 cleanup 均证明 mount/process/compose/work 不存活。
+
+本轮修复了 runner fixture 重复 access-profile、单 epoch summary 验证和 stat/tree 零 payload 除零，并保留失败 artifacts 作为证据。上述结果是 debug/tiny/single-run correctness/control smoke，不能关闭 G17 或填写 acceptance table；Redis/TiKV metadata 生命周期、native/packed paired、release 多次重复、RustFS/S3 完整 journal/rotation/pins/GC、operator/recovery 仍开放。
