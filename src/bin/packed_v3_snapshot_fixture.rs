@@ -178,6 +178,8 @@ fn fixture_build_policy(
 fn read_p90_policy(
     path: &std::path::Path,
 ) -> Result<brewfs::workspace_overlay::packed_v3::wire005::V3P90Policy> {
+    const MAX_P90_SAMPLES: u64 = 10_000_000;
+    const MAX_REQUESTED_RANGE: u64 = 1 << 63;
     use brewfs::workspace_overlay::packed_v3::wire005::V3P90Policy;
     let value: serde_json::Value = serde_json::from_slice(
         &std::fs::read(path).with_context(|| format!("read p90 policy {}", path.display()))?,
@@ -217,7 +219,7 @@ fn read_p90_policy(
     let sample_count = object
         .get("sample_count")
         .and_then(serde_json::Value::as_u64)
-        .filter(|count| *count > 0)
+        .filter(|count| *count > 0 && *count <= MAX_P90_SAMPLES)
         .ok_or_else(|| anyhow::anyhow!("p90 sample_count is invalid"))?;
     let histogram = object
         .get("histogram")
@@ -226,7 +228,11 @@ fn read_p90_policy(
         .ok_or_else(|| anyhow::anyhow!("p90 histogram is empty"))?;
     let mut total = 0u64;
     let mut previous = 0u64;
-    let rank = (90 * sample_count + 99) / 100;
+    let rank = sample_count
+        .checked_mul(90)
+        .and_then(|value| value.checked_add(99))
+        .map(|value| value / 100)
+        .ok_or_else(|| anyhow::anyhow!("p90 sample_count rank overflows"))?;
     let mut p90_from_histogram = None;
     for entry in histogram {
         let item = entry
@@ -235,7 +241,7 @@ fn read_p90_policy(
         let range = item
             .get("range_bytes")
             .and_then(serde_json::Value::as_u64)
-            .filter(|range| *range > previous)
+            .filter(|range| *range > previous && *range <= MAX_REQUESTED_RANGE)
             .ok_or_else(|| anyhow::anyhow!("p90 histogram is not strictly ordered"))?;
         let count = item
             .get("count")
@@ -245,6 +251,9 @@ fn read_p90_policy(
         total = total
             .checked_add(count)
             .ok_or_else(|| anyhow::anyhow!("p90 histogram count overflows"))?;
+        if total > MAX_P90_SAMPLES {
+            bail!("p90 histogram exceeds the bounded sample limit");
+        }
         if p90_from_histogram.is_none() && total >= rank {
             p90_from_histogram = Some(range);
         }
@@ -967,6 +976,28 @@ fn resolve_destination(path: &std::path::Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod codec_control_tests {
+    #[test]
+    fn p90_policy_rejects_sample_count_above_bound_before_rank_calculation() {
+        let mut policy = serde_json::json!({
+            "schema": "packed-v3-p90-policy-v1",
+            "trace_sha256": "00".repeat(32),
+            "source": "fixture-trace",
+            "captured_at_utc": "2026-10-10T00:00:00Z",
+            "sample_count": 10_000_001u64,
+            "histogram": [{"range_bytes": 1u64, "count": 1u64}],
+            "p90_bytes": 1u64,
+        });
+        let digest = Sha256::digest(serde_json::to_vec(&policy).unwrap());
+        policy["policy_sha256"] = serde_json::Value::String(hex::encode(digest));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("p90-policy.json");
+        std::fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
+
+        let error =
+            read_p90_policy(&path).expect_err("oversized p90 sample count must fail closed");
+        assert!(error.to_string().contains("p90 sample_count is invalid"));
+    }
+
     #[test]
     fn g15_cli_accepts_actual_static_and_inline_off_controls() {
         assert!(
