@@ -2,7 +2,7 @@
 
 mod budget;
 mod build_policy;
-pub use build_policy::{V3BuildPolicy, V3BuildProvenance, V3FramePolicy};
+pub use build_policy::{V3BuildPolicy, V3BuildProvenance, V3FramePolicy, V3P90Policy};
 mod cold;
 pub(crate) use budget::V3Owned;
 pub use budget::{V3BudgetLimits, V3BudgetPool, V3MountBudget, V3OwnedBytes, V3OwnedPermit};

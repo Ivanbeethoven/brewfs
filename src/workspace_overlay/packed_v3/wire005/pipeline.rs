@@ -96,6 +96,7 @@ impl V3FrameDemand {
         super::V3BuildPolicy {
             frames: self.frame_policy,
             inline_data: false,
+            p90: None,
         }
         .select(1, self.profile, self.size_classes)?;
         let maximum = self
