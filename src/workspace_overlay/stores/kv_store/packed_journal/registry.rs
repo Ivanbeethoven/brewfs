@@ -581,7 +581,7 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             && root.incarnation == expected.source.staging_id
             && root.journal_id == expected.journal_id
             && root.members == expected.object_count
-            && root.pending_puts == 0
+            && (!commit || root.pending_puts == 0)
             && (!commit || root.binding == expected.commit_target)
         {
             return Ok((key, Some(raw.clone()), Some(raw)));
