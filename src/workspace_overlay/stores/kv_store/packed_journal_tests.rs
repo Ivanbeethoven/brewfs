@@ -119,7 +119,7 @@ impl JournalMemoryBackend {
             0
         } else {
             self.lose_nth_write_reply
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     (remaining > 0).then_some(remaining - 1)
                 })
                 .unwrap_or(0)
