@@ -104,7 +104,39 @@ docker compose -p "$PROJECT" -f "$COMPOSE" up -d rustfs >"$ARTIFACT/services.log
 docker compose -p "$PROJECT" -f "$COMPOSE" run --rm rustfs-init >>"$ARTIFACT/services.log" 2>&1
 sha256sum "$BINARY" "$FIXTURE" >"$ARTIFACT/binary-sha256.txt"
 git -C "$ROOT" rev-parse HEAD >"$ARTIFACT/revision.txt"
-git -C "$ROOT" diff --binary | sha256sum >"$ARTIFACT/dirty-diff-sha256.txt"
+python3 - "$ROOT" "$ARTIFACT/dirty-diff-sha256.txt" <<'PYDIRTY'
+import hashlib
+import pathlib
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+digest = hashlib.sha256()
+tracked = subprocess.Popen(
+    ["git", "-C", str(root), "diff", "HEAD", "--binary"],
+    stdout=subprocess.PIPE,
+)
+assert tracked.stdout is not None
+for block in iter(lambda: tracked.stdout.read(1024 * 1024), b""):
+    digest.update(block)
+if tracked.wait() != 0:
+    raise RuntimeError("git diff failed while capturing dirty-tree provenance")
+untracked = subprocess.check_output(
+    ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"]
+)
+for raw_path in untracked.split(b"\0"):
+    if not raw_path:
+        continue
+    relative = raw_path.decode()
+    digest.update(b"\0UNTRACKED\0")
+    digest.update(raw_path)
+    digest.update(b"\0")
+    with (root / relative).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+destination.write_text(f"{digest.hexdigest()}  dirty-tree\n")
+PYDIRTY
 python3 - "$ROOT" "$ARTIFACT/source-sha256.json" <<'PYSOURCES'
 import pathlib,subprocess,hashlib,json,sys
 root=pathlib.Path(sys.argv[1])
@@ -114,6 +146,44 @@ paths=sorted(set(p.decode() for p in (tracked+untracked).split(b'\0') if p))
 hashes={p:hashlib.sha256((root/p).read_bytes()).hexdigest() for p in paths if (root/p).is_file()}
 pathlib.Path(sys.argv[2]).write_text(json.dumps(hashes,sort_keys=True,indent=2)+'\n')
 PYSOURCES
+python3 - "$ROOT" "$BINARY" "$ARTIFACT/dirty-diff-sha256.txt" "$ARTIFACT/toolchain.json" <<'PYTOOLCHAIN'
+import json
+import pathlib
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1])
+binary = pathlib.Path(sys.argv[2])
+dirty_digest_path = pathlib.Path(sys.argv[3])
+destination = pathlib.Path(sys.argv[4])
+
+def output(*command):
+    return subprocess.check_output(command, text=True).strip()
+
+rustc_verbose = output("rustc", "-Vv")
+host = next(
+    (line.split(":", 1)[1].strip() for line in rustc_verbose.splitlines() if line.startswith("host:")),
+    "",
+)
+revision = output("git", "-C", str(root), "rev-parse", "HEAD")
+dirty_diff_sha256 = dirty_digest_path.read_text().split()[0]
+profile = "release" if "/release/" in binary.as_posix() else "debug"
+destination.write_text(
+    json.dumps(
+        {
+            "rustc_verbose": rustc_verbose,
+            "cargo_version": output("cargo", "-V"),
+            "host": host,
+            "binary_profile": profile,
+            "revision": revision,
+            "dirty_diff_sha256": dirty_diff_sha256,
+        },
+        sort_keys=True,
+        indent=2,
+    )
+    + "\n"
+)
+PYTOOLCHAIN
 FIXTURE_ARGS=(--wire-version 5 --frame-policy "$FRAME_POLICY" --inline-data "$INLINE_DATA" --metadata-codec "$METADATA_CODEC" --data-codec "$DATA_CODEC" --access-profile "$ACCESS_PROFILE")
 [[ "$COLD_CORPUS" == true ]] && FIXTURE_ARGS+=(--cold-corpus true)
 [[ "$HARDLINK_CORPUS" == true ]] && FIXTURE_ARGS+=(--hardlink-corpus true)

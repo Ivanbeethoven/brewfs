@@ -14,6 +14,7 @@ from typing import Any
 
 SCHEMA = "packed-v3-run-manifest-v1"
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_HEX40 = re.compile(r"^[0-9a-f]{40}$")
 
 
 class ArtifactError(ValueError):
@@ -62,6 +63,23 @@ def _validate_digest_file(path: pathlib.Path) -> int:
     if not count:
         raise ArtifactError(f"empty digest inventory: {path.name}")
     return count
+
+
+def _validate_toolchain(path: pathlib.Path) -> None:
+    """Validate the immutable build provenance captured by the runner."""
+    value = _read_json(path)
+    if not isinstance(value, dict):
+        raise ArtifactError("toolchain provenance is not an object")
+    for name in ("rustc_verbose", "cargo_version", "host", "binary_profile"):
+        field = value.get(name)
+        if not isinstance(field, str) or not field.strip():
+            raise ArtifactError(f"toolchain provenance is missing {name}")
+    revision = value.get("revision")
+    if not isinstance(revision, str) or not _HEX40.fullmatch(revision.lower()):
+        raise ArtifactError("toolchain provenance has an invalid revision")
+    dirty_diff = value.get("dirty_diff_sha256")
+    if not isinstance(dirty_diff, str) or not _HEX64.fullmatch(dirty_diff.lower()):
+        raise ArtifactError("toolchain provenance has an invalid dirty diff digest")
 
 
 def _read_profile(path: pathlib.Path) -> dict[str, str]:
@@ -230,7 +248,14 @@ def finalize_manifest(artifact: pathlib.Path, *, status: int) -> dict[str, Any]:
     if manifest.get("packed_version") != "v3" or manifest.get("wire_version") != 5:
         raise ArtifactError("run manifest does not identify the current packed-v3 encoding")
     success = status == 0
-    required = ["manifest-key.txt", "binary-sha256.txt", "source-sha256.json", "profile.env", "cache-proof.env"]
+    required = [
+        "manifest-key.txt",
+        "binary-sha256.txt",
+        "source-sha256.json",
+        "profile.env",
+        "cache-proof.env",
+        "toolchain.json",
+    ]
     files: dict[str, Any] = {}
     for name in required:
         required_path = _require_file(artifact, name, success=success)
@@ -247,6 +272,7 @@ def finalize_manifest(artifact: pathlib.Path, *, status: int) -> dict[str, Any]:
         source = _read_json(artifact / "source-sha256.json")
         if not isinstance(source, dict) or not source or any(not isinstance(value, str) or not _HEX64.fullmatch(value) for value in source.values()):
             raise ArtifactError("source hash inventory is missing or malformed")
+        _validate_toolchain(artifact / "toolchain.json")
         _validate_profile(manifest, artifact / "profile.env")
         summary_path = _require_file(artifact, "summary.json", success=True)
         timing_path = _require_file(artifact, "timing.json", success=True)
