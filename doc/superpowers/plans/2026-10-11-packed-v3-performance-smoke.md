@@ -3,9 +3,9 @@
 更新时间：2026-10-11
 工作区：/home/hxy/brewfs
 分支：codex/packed-metadata-aliyun-20260930
-HEAD：d5921a3d
+HEAD：188dda3（工作树含本轮未提交修复）
 
-本记录只覆盖 packed-v3/005 的可复现小规模 control smoke，不把 debug 单次结果升级为性能验收。Redis/TiKV 元数据生命周期、RustFS/S3 完整 paired campaign、operator 和大规模 release/FUSE 仍按临时交接文档开放。
+本记录覆盖 packed-v3/005 的小规模 control smoke，并记录本轮 Redis/TiKV 后端结果。debug 单次结果不升级为性能验收；Redis/TiKV 完整元数据生命周期、RustFS/S3 paired campaign、operator 和大规模 release/FUSE 仍按临时交接文档开放。
 
 ## 控制变量
 
@@ -47,14 +47,47 @@ Artifact：docker/compose-xfstests/artifacts/packed-local-20261010T224740Z-15513
 
 本轮代码修复：删除 fixture 命令重复的 --access-profile；manifest validator 仅在 epochs 为列表时展开，否则把顶层 summary 当作单 epoch；stat/tree timing 在没有 payload bytes 时输出空吞吐值；新增对应 runner 回归断言。
 
+## PR #161 Redis/TiKV 并发 fork 失败记录（2026-10-11）
+
+本轮将 workspace-overlay control smoke 从 PR #160 收敛到 PR #161，真实后端仍是 Redis/TiKV 元数据路径。CI run `38092955788` 暴露了两类可复现失败，不能按“runner 不稳定”关闭：
+
+- Redis concurrent fork：8 个并发操作仅 4 个成功，4 个返回 `Error: workspace is busy`。根因是共享 `layer-inventory-generation` 的 CAS 竞争在 64 次快速重试内耗尽；原实现 CAS 失败只 `yield_now()`，没有使用已有退避策略。
+- TiKV concurrent fork：8 个操作 7 个成功，1 个返回 `FailedPrecondition: bounded read returned a key or region error`。details 为 `[66,82,69,1,2,1,0]`，对应 bounded Get 的 key-level lock 诊断；未知/未认证 key error 仍必须 fail-closed。
+
+当前未提交的修复只针对上述根因：`borrowed_alias.rs` 在 carrier expectation CAS 失败时复用 `retry_backoff(attempt)`；TiKV bounded-read 增加固定形状的 `BRE + location=1 + family=key + subtype=locked + shape=complete` 识别，并设置独立、受预算限制的同一时间戳只读重试预算。重试保持固定 timestamp、原始 request budget 和总 deadline，不做锁解析、锁解决或写入重放。
+
+相关失败 artifact 保留在：
+
+- Redis：`C:/Users/HXY/AppData/Local/Temp/brewfs-overlay-redis-161`
+- TiKV：`C:/Users/HXY/AppData/Local/Temp/brewfs-overlay-tikv-161-raw`
+
+这些修复尚未完成 release 编译、定向 Rust 测试和 Redis/TiKV `--control-only` 重跑；在这些验证、CI 新 run 以及 cleanup 证据全部通过前，PR #161 禁止合并。Rust job 的 exit 143 仍按 runner shutdown 基础设施故障记录，不能替代后端并发验证。
+
+## 2026-10-11 Redis/TiKV control-only 结果
+
+本轮使用新 release binary（`target/docker/brewfs`，SHA-256 `b2236a51822197abc3d95375b39baa6d8ccc64ae02701bed89a8c50a98a3b3ab`）和重建的 `brewfs-workspace-xfstests:local` 镜像。
+
+### Redis：通过
+
+Artifact：`docker/compose-xfstests/artifacts/live-control-redis-20261011-sealfix/`。真实 FUSE dual-mount 隔离通过，mounted writers=2；并发 fork 8/8 成功，批量耗时 0.047734134 s（167.595 ops/s）；并发 seal 8/8 成功，批量耗时 0.885777314 s（9.032 ops/s）。脚本正常退出，artifact 保留 fork/seal JSON、mount/writer 日志和 `brewfs.log`。这验证了本轮 seal 阶段 `TopologyTxn::commit()` 遇 `Busy` 时的有限退避重试。
+
+### TiKV：环境阻断及后续诊断
+
+官方 runner 在 `curlimages/curl:8.10.1` 拉取时被配置 registry mirror 的 TLS handshake timeout 阻断，原始证据保留在 `docker/compose-xfstests/artifacts/live-control-tikv-20261011-sealfix/compose-up.log`。使用本机已有 `pingcap/tikv:v8.5.0` 作为临时 readiness 镜像后，PD/TiKV、init/seed/fork/isolation 均通过，但 concurrent-fork 在 8 个操作中第 7 个返回固定诊断 `FailedPrecondition: bounded read returned a key or region error`, details `[66,82,69,1,2,1,0]`；诊断 artifact 保留在 `docker/compose-xfstests/artifacts/live-control-tikv-20261011-sealfix-local-ready/`。本轮新增代码现将该确定的只读 key-lock 冲突在无剩余 batch slot 时映射为 `WorkspaceError::Busy`，让外层 topology/CAS 操作重建事务；需要新 binary 重建后重跑 TiKV C8 才能验证修复。该结果不能计为 TiKV 通过。
+
+本轮新增 seal Busy focused Rust test 在最终链接阶段使 WSL 实例失去响应，未返回断言结果；该测试不记为通过。`cargo check --no-default-features --features fuse-tokio-runtime,workspace-overlay` 已通过（本轮修复后的代码需再次复核）。
+
 ## 验证门禁
 
 - python3 -m unittest discover -s tools/perf -p test_*.py：39 passed。
 - cargo fmt --all --check、相关 shell bash -n、git diff --check：通过。
-- cargo test --workspace --lib --bins：1177 passed、0 failed、225 ignored。
+- 历史基线 cargo test --workspace --lib --bins：1177 passed、0 failed、225 ignored；本轮新增 focused test 因 WSL 链接阶段实例失去响应，未形成通过证据。
+- 本轮 release build：成功，binary SHA-256 `b2236a51822197abc3d95375b39baa6d8ccc64ae02701bed89a8c50a98a3b3ab`。
+- 本轮 Redis control-only C8：fork 8/8、seal 8/8、dual-mount isolation PASS。
+- 本轮 TiKV control-only：官方 readiness 镜像被 registry TLS timeout 阻断；本地 readiness workaround 暴露 1/8 bounded-read key-lock 失败，仍未通过。
 
 ## 不能由本记录关闭的门禁
 
 - 不能用上述 debug/tiny/single-run 结果填写 native/packed acceptance table 或声明 G08/G10/G11/G12/G13/G14/G17 完成。
 - 仍需固定 trace 的 native/packed paired runs、static/dynamic/inline-off/p90 消融、release build、多次重复和 p90/CI 规则。
-- Redis/TiKV 元数据需真实 fork→mutation→durable drain→seal/repack→remount→GC；RustFS/S3 需 parent context、namespace/codec、journal/rotation/pins/GC；operator/FUSE 故障与 recovery 仍开放。
+- Redis/TiKV 元数据仍需真实 fork→mutation→durable drain→seal/repack→remount→GC；本轮只关闭 Redis control-only smoke，TiKV 仍待新 binary 重跑。RustFS/S3 需 parent context、namespace/codec、journal/rotation/pins/GC；operator/FUSE 故障与 recovery 仍开放。

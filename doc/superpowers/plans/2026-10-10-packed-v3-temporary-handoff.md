@@ -1,9 +1,9 @@
 # BrewFS packed-v3 临时交接文档
 
-更新时间：2026-10-10
+更新时间：2026-10-11
 工作区：`/home/hxy/brewfs`
 本地分支：`codex/packed-metadata-aliyun-20260930`
-PR：[brewfs/brewfs#160](https://github.com/brewfs/brewfs/pull/160)
+PR：[brewfs/brewfs#161](https://github.com/brewfs/brewfs/pull/161)（当前 OPEN；Redis control smoke 已通过，TiKV 仍待重跑，未满足合并门禁）
 
 ## 1. 交接范围和三项创新
 
@@ -19,7 +19,7 @@ PR：[brewfs/brewfs#160](https://github.com/brewfs/brewfs/pull/160)
 
 ## 2. 当前提交与本轮修改
 
-本轮主要实现基线是提交 706b6c5（feat(packed-v3): close generation and runner audit gaps）；随后补充了临时交接文档、稳定 Rust API 修复和 CI 资源约束；本轮最终代码提交为 e194cd3。推送后应以 git log 和 PR 页面记录实际的本地/远端 head SHA。
+本轮主要实现基线是提交 706b6c5（feat(packed-v3): close generation and runner audit gaps）；随后补充了临时交接文档、稳定 Rust API 修复和 CI 资源约束；当前基线 HEAD 为 188dda3；本轮工作树仍有未提交的 Redis/TiKV retry、seal Busy retry、CLI 错误上下文和文档修复。提交后应以 git log 和 PR 页面记录实际的本地/远端 head SHA。
 
 本轮实现内容：
 
@@ -78,16 +78,40 @@ RustFS/S3 有窄的真实证据：12 objects、55,228 bytes、48 HTTP attempts/2
 PR #160 最新 run 38061849001 已完成：Rust all-features job 以 exit 143 结束，Redis/TiKV overlay jobs 分别在 control smoke 阶段被 cancelled；日志明确为 The runner has received a shutdown signal/Terminated，没有测试断言、编译错误、OOM 或磁盘不足证据。stress-ng、pjdfstest、Results web 已通过。该 run 的失败应记录为 GitHub runner/service 基础设施中止，不归因于本轮代码回归；最终提交后仍需重跑 CI，若出现真实编译或断言失败再修复。
 
 
-## 6. S/X 实验进入条件和下一步
+## 6. PR #161 当前未完成项与合并门禁
+
+当前工作树基线 HEAD 为 `188dda3`，本轮源码和文档修改尚未推送到 PR #161：
+
+- `src/workspace_overlay/stores/kv_store.rs`：compaction/control 与 begin/advance/hash/commit seal 的 pre-submit `Busy` 退避重试，并增加 MemoryBackend 回归覆盖。
+- `src/cli.rs`：seal acquire/execute/release 阶段错误上下文。
+- `src/workspace_overlay/stores/kv_store/packed_journal/registry/borrowed_alias.rs`：carrier expectation CAS 失败复用 `retry_backoff(attempt)`。
+- `src/workspace_overlay/stores/tikv_bounded_read.rs`：固定 timestamp 的 key-lock retry budget；无剩余 batch slot 时返回 `WorkspaceError::Busy`，让外层 topology/CAS 重建只读事务。
+- `vendor/tikv-client/src/bounded_codec.rs` 与 `vendor/tikv-client/src/common/errors.rs`：只识别固定形状的 key-level lock diagnostic，并暴露受限只读重试判定。
+- `src/workspace_overlay/stores/kv_backend.rs`：明确 `Busy` 仅表示后端已证明未提交。
+- `doc/superpowers/plans/2026-10-10-packed-v3-temporary-handoff.md`、`doc/superpowers/plans/2026-10-11-packed-v3-performance-smoke.md`：记录本轮证据和开放门禁。
+
+PR #161 CI run `38092955788` 的真实失败必须先修复并重跑：Redis 8-way concurrent fork 为 4/8，4 个返回 `workspace is busy`；TiKV 为 7/8，1 个返回 `FailedPrecondition: bounded read returned a key or region error`，diagnostic details `[66,82,69,1,2,1,0]`。对应 artifact 保留于 `C:/Users/HXY/AppData/Local/Temp/brewfs-overlay-redis-161` 和 `C:/Users/HXY/AppData/Local/Temp/brewfs-overlay-tikv-161-raw`。Rust job 的 exit 143 是 runner shutdown，不能视为后端通过。
+
+合并前的顺序固定为：
+
+1. 完成 no-default-features release build，并复制启用 `workspace-overlay` 的 binary；不要复用未启用该 feature 的旧 binary。
+2. 运行 `tikv_bounded_read::batch_tests` 与 `pr141_entity_cas_tests::concurrent_forks_from_one_revision_have_distinct_heads` 定向测试；若 WSL 链接阶段再次失去响应，记录为环境阻断，不宣称通过。
+3. 使用 `BREWFS_WORKSPACE_CONCURRENCY=8` 运行 Redis、TiKV `--control-only --reuse-images`，确认 concurrent-fork/concurrent-seal 为 8/8、cleanup 完整，并检查 metrics/logs 中无新的 key diagnostic。Redis 已完成 8/8；TiKV 官方 readiness 镜像被 TLS timeout 阻断，本地 readiness workaround 暴露 1/8 key-lock 失败，已加入 Busy 外层重试修复，需新 binary 重跑。
+4. 只提交上述修复并 push PR #161，重跑 run `38092955788` 的失败 job；记录新 CI run。
+5. 仅当 Redis、TiKV、Rust 及必需检查全部通过后，才可按用户授权 merge；在此之前禁止合并。
+
+修复后的 retry count 当前没有独立 metrics；`successful_operations_per_second` 已包含重试成本，不能解释为原始 backend 吞吐。
+
+## 7. S/X 实验进入条件和下一步
 
 系统 S 必须先证明：一致 S0→fork A/B→A mutation→durable drain→seal/repack→S1 原子发布→remount/next-fork→GC；源、权限、数据、namespace、恢复、资源均正确。实验 X 之后才能冻结：native/packed 同 placement/executor、static/dynamic/inline-off/p90 控制、release/provenance、固定请求 trace、Redis/TiKV/RustFS/S3 端到端、active/drain/unmount/GC 分段计时、paired 对照和接受/拒绝规则。
 
 下一位 agent 的顺序：
 
-1. 将本轮最终提交推送到 PR #160，触发并记录新的 CI run；纯 runner shutdown/exit 143 作为基础设施故障保留证据。
+1. 提交并推送 PR #161 的 retry 修复，触发并记录新的 CI run；纯 runner shutdown/exit 143 作为基础设施故障保留证据，但不能替代 Redis/TiKV 8/8 control smoke。
 2. 在 Redis、TiKV、RustFS/S3 三条 campaign 入口执行小规模 control smoke，再扩展真实 FUSE、operator 和 paired experiment。
 3. 只有外部证据齐全才更新 G08/G10/G11/G12/G13/G14/G17 的验收状态；不要用文档或合成数值关闭开放项。
-4. 用户已授权合并；PR 检查结论和合并 commit 需要追加到本文件或 PR 记录。
+4. 用户已授权合并；只有 Redis/TiKV/Rust 及必需检查通过后才执行 merge，并把 PR 检查结论和合并 commit 追加到本文件或 PR 记录。
 
 关键文件：
 
@@ -107,4 +131,4 @@ PR #160 最新 run 38061849001 已完成：Rust all-features job 以 exit 143 �
 
 详细记录见 doc/superpowers/plans/2026-10-11-packed-v3-performance-smoke.md。当前 feature-enabled debug runner 已在真实 RustFS Compose + FUSE 完成两个可复现 control smoke：full 100×1KiB（100/100、0 errors、manifest/journal passed、mount 0.3235s、active 5.4079s、drain 0.1379s、wall 5.8693s）和 metadata stat 100 files（100/100、0 errors、p50 10.20353ms、p95 11.946053ms、manifest/journal passed）。两者 cleanup 均证明 mount/process/compose/work 不存活。
 
-本轮修复了 runner fixture 重复 access-profile、单 epoch summary 验证和 stat/tree 零 payload 除零，并保留失败 artifacts 作为证据。上述结果是 debug/tiny/single-run correctness/control smoke，不能关闭 G17 或填写 acceptance table；Redis/TiKV metadata 生命周期、native/packed paired、release 多次重复、RustFS/S3 完整 journal/rotation/pins/GC、operator/recovery 仍开放。
+本轮修复了 runner fixture 重复 access-profile、单 epoch summary 验证和 stat/tree 零 payload 除零，并保留失败 artifacts 作为证据。新 release binary SHA-256 为 `b2236a51822197abc3d95375b39baa6d8ccc64ae02701bed89a8c50a98a3b3ab`；Redis control-only C8 fork/seal 均 8/8，artifact 为 `docker/compose-xfstests/artifacts/live-control-redis-20261011-sealfix/`。TiKV 官方 readiness 拉取失败 artifact 为 `docker/compose-xfstests/artifacts/live-control-tikv-20261011-sealfix/compose-up.log`；本地 readiness workaround 的 1/8 key-lock 失败 artifact 为 `docker/compose-xfstests/artifacts/live-control-tikv-20261011-sealfix-local-ready/`。上述结果是 release control smoke，不能关闭 G17 或填写 acceptance table；Redis/TiKV metadata 完整生命周期、native/packed paired、release 多次重复、RustFS/S3 完整 journal/rotation/pins/GC、operator/recovery 仍开放。

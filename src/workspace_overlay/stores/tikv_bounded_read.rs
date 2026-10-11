@@ -18,6 +18,7 @@ pub(super) struct BoundedPointReadContext {
     remaining_attempts: usize,
     remaining_originals: usize,
     remaining_lock_continuations: u8,
+    remaining_key_lock_retries: u8,
 }
 
 impl BoundedPointReadContext {
@@ -76,6 +77,7 @@ impl BoundedPointReadContext {
             remaining_attempts: attempts,
             remaining_originals: original_keys,
             remaining_lock_continuations: LOCK_CONTINUATIONS,
+            remaining_key_lock_retries: LOCK_CONTINUATIONS,
         })
     }
 
@@ -144,6 +146,29 @@ impl BoundedPointReadContext {
         self.reserve_lock_continuation_at(Instant::now())
     }
 
+    /// Spend a separate, bounded continuation for a key-level lock diagnostic
+    /// that was structurally classified by the TiKV client. This does not
+    /// resolve the lock or replenish the original read-attempt budget.
+    pub(super) fn reserve_key_lock_retry(&mut self) -> Option<Instant> {
+        self.reserve_key_lock_retry_at(Instant::now())
+    }
+
+    fn reserve_key_lock_retry_at(&mut self, now: Instant) -> Option<Instant> {
+        if self.remaining_originals == 0
+            || self.remaining_attempts < self.remaining_originals
+            || self.remaining_key_lock_retries == 0
+            || now >= self.deadline
+        {
+            return None;
+        }
+        let wake = now.checked_add(LOCK_BACKOFF)?;
+        if wake >= self.deadline {
+            return None;
+        }
+        self.remaining_key_lock_retries -= 1;
+        Some(wake)
+    }
+
     fn reserve_lock_continuation_at(&mut self, now: Instant) -> Option<Instant> {
         if self.remaining_originals == 0
             || self.remaining_attempts < self.remaining_originals
@@ -172,6 +197,7 @@ impl BoundedPointReadContext {
 struct PointReadFailure {
     cause: WorkspaceError,
     verified_local_lock: bool,
+    retryable_key_lock: bool,
 }
 
 /// An existing read-only transaction, not a factory for fresh transactions.
@@ -197,9 +223,11 @@ impl BoundedPointReader for tikv_client::Transaction {
                 // Classification precedes Display mapping; remote diagnostics,
                 // malformed/unknown/mixed errors never mint the local marker.
                 let verified_local_lock = error.is_bounded_read_lock_conflict();
+                let retryable_key_lock = error.is_bounded_read_retryable_key_lock();
                 PointReadFailure {
                     cause: backend(error),
                     verified_local_lock,
+                    retryable_key_lock,
                 }
             })
     }
@@ -306,18 +334,33 @@ async fn read_window_with_reader(
                     #[cfg(test)]
                     if std::env::var_os("BREWFS_TEST_NATIVE_CAS_DIAGNOSTICS").is_some() {
                         eprintln!(
-                            "native-point-get error verified_lock={} remaining_attempts={} remaining_originals={} remaining_continuations={}",
+                            "native-point-get error verified_lock={} retryable_key_lock={} remaining_attempts={} remaining_originals={} remaining_continuations={} remaining_key_retries={}",
                             failure.verified_local_lock,
+                            failure.retryable_key_lock,
                             context.remaining_attempts,
                             context.remaining_originals,
                             context.remaining_lock_continuations,
+                            context.remaining_key_lock_retries,
                         );
                     }
-                    if !failure.verified_local_lock {
-                        return Err(failure.cause);
-                    }
-                    let Some(wake) = context.reserve_lock_continuation() else {
-                        return Err(failure.cause);
+                    let wake = if failure.verified_local_lock {
+                        context.reserve_lock_continuation()
+                    } else if failure.retryable_key_lock {
+                        context.reserve_key_lock_retry()
+                    } else {
+                        None
+                    };
+                    let Some(wake) = wake else {
+                        // A fixed key-lock diagnostic is a pre-submit read
+                        // conflict. If this batch has no spare data-attempt
+                        // slot, return Busy so the enclosing topology/CAS
+                        // operation can rebuild its read transaction. Keep
+                        // unrelated and locally certified lock errors intact.
+                        return if failure.retryable_key_lock {
+                            Err(WorkspaceError::Busy)
+                        } else {
+                            Err(failure.cause)
+                        };
                     };
                     tokio::time::sleep_until(wake).await;
                 }
@@ -490,6 +533,7 @@ mod batch_tests {
     enum Answer {
         Value(Option<Vec<u8>>),
         VerifiedLock,
+        RetryableKeyLock,
         UnverifiedDiagnostic,
         Other,
         Held,
@@ -550,14 +594,22 @@ mod batch_tests {
                 Answer::VerifiedLock => Err(PointReadFailure {
                     cause: WorkspaceError::Backend("test local verified lock".into()),
                     verified_local_lock: true,
+                    retryable_key_lock: false,
+                }),
+                Answer::RetryableKeyLock => Err(PointReadFailure {
+                    cause: WorkspaceError::Backend("test retryable key lock".into()),
+                    verified_local_lock: false,
+                    retryable_key_lock: true,
                 }),
                 Answer::UnverifiedDiagnostic => Err(PointReadFailure {
                     cause: WorkspaceError::Backend("test local verified lock".into()),
                     verified_local_lock: false,
+                    retryable_key_lock: false,
                 }),
                 Answer::Other => Err(PointReadFailure {
                     cause: WorkspaceError::Backend("original unrelated error".into()),
                     verified_local_lock: false,
+                    retryable_key_lock: false,
                 }),
                 Answer::Held => {
                     let _receipt = DropReceipt(self.dropped.clone());
@@ -851,6 +903,39 @@ mod batch_tests {
                 .iter()
                 .all(|call| call.deadline == reader.calls[0].deadline)
         );
+    }
+
+    #[tokio::test]
+    async fn retryable_key_lock_retries_at_the_same_timestamp_with_spare_budget() {
+        let mut reader = Reader::new([
+            Answer::RetryableKeyLock,
+            Answer::Value(Some(vec![1])),
+            Answer::Value(None),
+        ]);
+        assert_eq!(
+            run(&mut reader, &keys(), 3).await.unwrap(),
+            vec![Some(vec![1]), None]
+        );
+        assert_eq!(
+            reader
+                .calls
+                .iter()
+                .map(|call| call.key.as_slice())
+                .collect::<Vec<_>>(),
+            vec![
+                b"scope/a".as_slice(),
+                b"scope/a".as_slice(),
+                b"scope/b".as_slice()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retryable_key_lock_without_spare_budget_returns_busy_for_outer_retry() {
+        let mut reader = Reader::new([Answer::RetryableKeyLock]);
+        let error = run(&mut reader, &keys()[..1], 1).await.unwrap_err();
+        assert!(matches!(error, WorkspaceError::Busy));
+        assert_eq!(reader.calls.len(), 1);
     }
 
     #[tokio::test]

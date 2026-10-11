@@ -17,6 +17,12 @@ use crate::workspace_overlay::packed_v3::wire005::{V3BudgetPool, V3MountBudget};
 
 const SCAN_BATCH_LIMIT: u32 = 1024;
 const TXN_MAX_RETRIES: usize = 10;
+// A scan response may carry a lock error in one KvPair while the transaction
+// remains read-only and safe to retry at its fixed timestamp. Keep this
+// continuation budget separate from region/page admission: exhausting it
+// returns Busy so the caller can rebuild the bounded read transaction.
+const BOUNDED_SCAN_LOCK_RETRIES: usize = 2;
+const BOUNDED_SCAN_LOCK_BACKOFF: Duration = Duration::from_millis(20);
 // This same configured timeout derives the fixed data Get-batch deadline.
 const BOUNDED_CLIENT_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 #[path = "tikv_bounded_read.rs"]
@@ -532,15 +538,36 @@ impl TiKvWorkspaceBackend {
             .unwrap_or(Bound::Unbounded);
         let mut entries: Vec<KvEntry> = Vec::new();
         let mut total = 0usize;
-        for _ in 0..limits.max_data_requests {
+        let mut lock_retries = 0usize;
+        let mut data_requests = 0usize;
+        while data_requests < limits.max_data_requests {
             let range = BoundRange::new(Bound::Included(start.clone()), upper.clone());
             // Exactly one region and one row per data RPC. Empty regions count
             // against max_data_requests too; no unbounded seek through sparse PD
             // maps. The SDK's ordinary scan(limit) is intentionally not used.
-            let (page, continuation) = transaction
-                .scan_single_region_page(range, 1)
-                .await
-                .map_err(backend)?;
+            data_requests += 1;
+            let (page, continuation) = match transaction.scan_single_region_page(range, 1).await {
+                Ok(result) => result,
+                Err(error) if error.is_bounded_read_retryable_key_lock() => {
+                    // Scan errors can be embedded in a returned KvPair, so they
+                    // use the same fixed [BRE,3,2,1,0] certificate as a point
+                    // read. The transaction is read-only: retrying the same
+                    // range at its fixed timestamp is safe, while the explicit
+                    // budget prevents an unbounded lock wait.
+                    if lock_retries >= BOUNDED_SCAN_LOCK_RETRIES
+                        || data_requests >= limits.max_data_requests
+                    {
+                        // A failed row cannot be treated as a short page: doing
+                        // so could advance the caller cursor past the locked
+                        // key and silently omit it.
+                        return Err(WorkspaceError::Busy);
+                    }
+                    lock_retries += 1;
+                    tokio::time::sleep(BOUNDED_SCAN_LOCK_BACKOFF).await;
+                    continue;
+                }
+                Err(error) => return Err(backend(error)),
+            };
             for pair in page {
                 let (key, value): (Key, Vec<u8>) = pair.into();
                 let key: Vec<u8> = key.into();

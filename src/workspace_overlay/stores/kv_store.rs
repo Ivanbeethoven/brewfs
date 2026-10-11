@@ -413,11 +413,28 @@ impl<'a, B: WorkspaceKvBackend> TopologyTxn<'a, B> {
         }
         let mut values = Vec::new();
         for part in unread.chunks(32) {
-            let (rows, _) = self
-                .store
-                .backend
-                .get_many_consistent_with_time_bounded(part, topology_point_limits(part.len()))
-                .await?;
+            // A bounded TiKV point read may report a pre-submit key-lock
+            // conflict after it has exhausted its per-request data slots.
+            // The backend maps that case to Busy and guarantees that no write
+            // was submitted. Rebuild this read packet before the surrounding
+            // topology CAS continues; otherwise seal/fork callers would
+            // surface a transient lock as a terminal operation failure.
+            let mut attempt = 0;
+            let (rows, _) = loop {
+                let result = self
+                    .store
+                    .backend
+                    .get_many_consistent_with_time_bounded(part, topology_point_limits(part.len()))
+                    .await;
+                match result {
+                    Err(WorkspaceError::Busy) if attempt + 1 < CAS_MAX_RETRIES => {
+                        retry_backoff(attempt).await;
+                        attempt += 1;
+                    }
+                    Err(WorkspaceError::Busy) => return Err(WorkspaceError::Busy),
+                    other => break other?,
+                }
+            };
             values.extend(rows);
         }
         if values.len() != unread.len() {
@@ -981,7 +998,7 @@ where
             &mut Vec<KvWrite>,
         ) -> Result<R, WorkspaceError>,
     {
-        for _ in 0..CAS_MAX_RETRIES {
+        for attempt in 0..CAS_MAX_RETRIES {
             // Capture before hydration. Layer creation/removal advances this
             // durable fence in the same CAS, even if CONTROL later byte-ABAs.
             let inventory_generation = self.backend.get(LAYER_INVENTORY_GENERATION_KEY).await?;
@@ -992,7 +1009,17 @@ where
                 } else {
                     (BTreeSet::new(), Vec::new(), Vec::new())
                 };
-            let (raw, mut state, hot) = self.load_control_raw().await?;
+            let (raw, mut state, hot) = match self.load_control_raw().await {
+                Ok(census) => census,
+                Err(WorkspaceError::Busy) if native_grant_workspace.is_none() => {
+                    // No mutation has been submitted. A concurrent topology
+                    // change invalidated the census authentication; rebuild it
+                    // before evaluating the operation and retained authorities.
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             // Finalization must retain both the pre-scan authorities and
             // their inventory incarnation across every retry. Raw layer
             // bytes alone cannot distinguish deletion and identical recreation.
@@ -1102,7 +1129,17 @@ where
                     });
                 }
             }
-            let packet = self.prepare_topology_packet(checks, writes, None).await?;
+            let packet = match self.prepare_topology_packet(checks, writes, None).await {
+                Ok(packet) => packet,
+                Err(WorkspaceError::Busy) if native_grant_workspace.is_none() => {
+                    // Native derived-index preparation can lose its read-side
+                    // epoch overlap. Only this pre-submission Busy rebuilds;
+                    // an uncertain mutation response must propagate unchanged.
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if self.commit_prepared_topology_packet(&packet).await? {
                 return Ok(result);
             }
@@ -1111,7 +1148,11 @@ where
                 // native call grants nothing and never retries across its birth.
                 return Err(WorkspaceError::Busy);
             }
-            tokio::task::yield_now().await;
+            // Layer membership updates contend on the shared inventory and
+            // topology generations. A bare yield retries all concurrent
+            // compactions in lockstep and can exhaust the bounded CAS budget
+            // before Redis/TiKV has a chance to serialize the writers.
+            retry_backoff(attempt).await;
         }
         Err(WorkspaceError::Busy)
     }
@@ -4073,7 +4114,19 @@ where
                 journal_index_key(request.journal_id),
                 &request.guard.workspace_id,
             )?;
-            if txn.commit().await? {
+            let committed = match txn.commit().await {
+                Ok(committed) => committed,
+                Err(WorkspaceError::Busy) => {
+                    // Native owner preparation can observe a concurrent mount
+                    // advancing the shared root/inventory epoch. No mutation
+                    // was submitted; rebuild the seal packet under the same
+                    // bounded retry budget.
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if committed {
                 return Ok(journal);
             }
             retry_backoff(attempt).await;
@@ -4118,7 +4171,15 @@ where
             journal.last_error = request.last_error.clone();
             journal.updated_at_ns = now;
             txn.put_journal(&journal)?;
-            if txn.commit().await? {
+            let committed = match txn.commit().await {
+                Ok(committed) => committed,
+                Err(WorkspaceError::Busy) => {
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if committed {
                 return Ok(journal);
             }
             retry_backoff(attempt).await;
@@ -4132,9 +4193,23 @@ where
         if initial.phase != SealPhase::DataDrained {
             return Err(invalid_transition(initial.phase, SealPhase::Hashed));
         }
-        let delta = self
-            .layer_delta_unchecked(initial.old_head_layer_id)
-            .await?;
+        // A bounded TiKV scan can report a certified per-key lock while a
+        // concurrent commit is finishing its secondary records. Rebuild the
+        // read-only scan transaction a finite number of times; no seal write
+        // has been submitted yet, so retrying this materialization is safe.
+        let delta = {
+            let mut attempt = 0;
+            loop {
+                match self.layer_delta_unchecked(initial.old_head_layer_id).await {
+                    Ok(delta) => break delta,
+                    Err(WorkspaceError::Busy) if attempt + 1 < CAS_MAX_RETRIES => {
+                        retry_backoff(attempt).await;
+                        attempt += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
         let digest = delta_digest(&delta)?;
         let old = self.load_layer(initial.old_head_layer_id).await?;
         let parent_hash = match old.parent_layer_id {
@@ -4172,7 +4247,15 @@ where
             journal.root_hash = Some(root);
             journal.updated_at_ns = now;
             txn.put_journal(&journal)?;
-            if txn.commit().await? {
+            let committed = match txn.commit().await {
+                Ok(committed) => committed,
+                Err(WorkspaceError::Busy) => {
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if committed {
                 return Ok(journal);
             }
             retry_backoff(attempt).await;
@@ -4209,7 +4292,15 @@ where
                     journal.phase = SealPhase::Completed;
                     journal.updated_at_ns = now;
                     txn.put_journal(&journal)?;
-                    if !txn.commit().await? {
+                    let committed = match txn.commit().await {
+                        Ok(committed) => committed,
+                        Err(WorkspaceError::Busy) => {
+                            retry_backoff(attempt).await;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if !committed {
                         retry_backoff(attempt).await;
                         continue;
                     }
@@ -4295,7 +4386,15 @@ where
             journal.phase = SealPhase::Completed;
             journal.updated_at_ns = now;
             txn.put_journal(&journal)?;
-            if txn.commit().await? {
+            let committed = match txn.commit().await {
+                Ok(committed) => committed,
+                Err(WorkspaceError::Busy) => {
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if committed {
                 return Ok(SealResult {
                     revision,
                     new_head_layer_id: new_head,
@@ -6128,6 +6227,7 @@ mod tests {
         cas_write_keys: Arc<Mutex<Vec<Vec<Vec<u8>>>>>,
         scans: Arc<AtomicU64>,
         fail_cas_once: Arc<std::sync::atomic::AtomicBool>,
+        fail_busy_once: Arc<std::sync::atomic::AtomicBool>,
         clock: Arc<AtomicI64>,
         advance_on_cas_ns: Arc<AtomicI64>,
         mutate_on_cas: Arc<Mutex<Vec<KvWrite>>>,
@@ -6235,6 +6335,9 @@ mod tests {
                 .any(|check| records.get(&check.key) != check.expected.as_ref())
             {
                 return Ok(false);
+            }
+            if self.fail_busy_once.swap(false, Ordering::SeqCst) {
+                return Err(WorkspaceError::Busy);
             }
             let advance = self.advance_on_cas_ns.swap(0, Ordering::SeqCst);
             if advance != 0 {
@@ -7555,6 +7658,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seal_retries_busy_returned_by_topology_commit() {
+        let (store, workspace, _lease, guard) = initialized().await;
+        store.backend.fail_busy_once.store(true, Ordering::SeqCst);
+
+        let journal = store
+            .begin_seal(BeginSeal {
+                guard,
+                journal_id: JournalId::from_uuid(id(601)),
+                new_head_layer_id: LayerId::from_uuid(id(602)),
+            })
+            .await
+            .expect("transient topology Busy should be retried");
+
+        assert_eq!(journal.phase, SealPhase::Prepare);
+        assert_eq!(
+            store
+                .load_workspace(workspace.workspace_id)
+                .await
+                .unwrap()
+                .state,
+            WorkspaceState::Sealing
+        );
+        assert!(store.backend.cas_checks.lock().await.len() >= 2);
+    }
+
+    #[tokio::test]
     async fn independent_kv_store_instances_use_backend_cas() {
         let backend = MemoryBackend::default();
         let probe = backend.clone();
@@ -8404,6 +8533,50 @@ mod tests {
         assert_eq!(
             after.layers[0].next_sequence,
             before.layers[0].next_sequence + 2
+        );
+    }
+
+    #[tokio::test]
+    async fn update_control_retries_transient_census_busy_before_mutation() {
+        let (store, workspace, _lease, _guard) = initialized().await;
+        let generation_key = LAYER_INVENTORY_GENERATION_KEY.to_vec();
+        let current = store
+            .backend
+            .get(&generation_key)
+            .await
+            .unwrap()
+            .as_deref()
+            .map(decode::<u64>)
+            .transpose()
+            .unwrap()
+            .unwrap();
+        // The first census authentication observes a concurrent inventory
+        // generation change and returns Busy before the operation runs.
+        // Generic control updates must rebuild the census and retry; this
+        // mutation is deliberately outside the operation's write set.
+        store.backend.mutate_on_cas.lock().await.push(KvWrite::Put {
+            key: generation_key,
+            value: encode(&(current + 1)).unwrap(),
+        });
+        let workspace_id = workspace.workspace_id;
+        store
+            .update_control(|state, _writes| {
+                state
+                    .workspaces
+                    .get_mut(&workspace_id)
+                    .ok_or(WorkspaceError::WorkspaceNotFound(workspace_id))?
+                    .updated_at_ns += 1;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_workspace(workspace_id)
+                .await
+                .unwrap()
+                .updated_at_ns,
+            workspace.updated_at_ns + 1
         );
     }
 
