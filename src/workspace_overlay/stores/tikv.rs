@@ -1497,6 +1497,7 @@ mod tests {
         let config =
             super::client_config_with_tls(&budget, super::BOUNDED_READ_MESSAGE_BYTES, None)
                 .unwrap();
+        assert_eq!(config.max_cached_kv_clients, 1);
         assert_eq!(
             budget.state().used[V3BudgetPool::Metadata as usize],
             super::CLIENT_RESIDENT_METADATA_BYTES
