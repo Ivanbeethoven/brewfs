@@ -579,11 +579,7 @@ impl TiKvWorkspaceBackend {
                         // so could advance the caller cursor past the locked
                         // key and silently omit it. Preserve region errors once
                         // their finite refresh budget is spent.
-                        return if error.is_bounded_read_retryable_key_lock() {
-                            Err(WorkspaceError::Busy)
-                        } else {
-                            Err(backend(error))
-                        };
+                        return Err(WorkspaceError::Busy);
                     }
                     lock_retries += 1;
                     tokio::time::sleep(BOUNDED_SCAN_LOCK_BACKOFF).await;
@@ -687,12 +683,14 @@ impl TiKvWorkspaceBackend {
                 let batch: Vec<KvPair> = match transaction.scan(range, batch_limit).await {
                     Ok(batch) => batch.collect(),
                     Err(error)
-                        if (error.is_bounded_read_retryable_key_lock()
-                            || error.is_bounded_read_retryable_region())
-                            && lock_attempt < BOUNDED_SCAN_LOCK_RETRIES =>
+                        if error.is_bounded_read_retryable_key_lock()
+                            || error.is_bounded_read_retryable_region() =>
                     {
-                        retry = true;
-                        break;
+                        if lock_attempt < BOUNDED_SCAN_LOCK_RETRIES {
+                            retry = true;
+                            break;
+                        }
+                        return Err(WorkspaceError::Busy);
                     }
                     Err(error) => return Err(backend(error)),
                 };

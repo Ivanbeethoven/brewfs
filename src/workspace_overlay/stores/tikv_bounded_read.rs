@@ -383,7 +383,7 @@ async fn read_window_with_reader(
                         // slot, return Busy so the enclosing topology/CAS
                         // operation can rebuild its read transaction. Keep
                         // unrelated and locally certified lock errors intact.
-                        return if failure.retryable_key_lock {
+                        return if failure.retryable_key_lock || failure.retryable_region {
                             Err(WorkspaceError::Busy)
                         } else {
                             Err(failure.cause)
