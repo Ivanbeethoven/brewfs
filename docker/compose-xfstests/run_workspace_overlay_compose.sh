@@ -33,7 +33,7 @@ Options:
   --control-only             run init/seed/fork/isolation/concurrency verification
   --ltp-skip-tests "NAMES"   extra LTP test names to skip
   --ltp-extra-args "ARGS"    extra arguments passed to runltp
-  --reuse-images             reuse existing images and target/docker/brewfs
+  --reuse-images             reuse existing images (does not rebuild current HEAD)
   --keep                     keep Compose services and volumes after the run
   -h, --help                 show this help
 EOF

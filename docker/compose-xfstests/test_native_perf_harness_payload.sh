@@ -1,91 +1,45 @@
 #!/usr/bin/env bash
-# Contract guard between the perf runners and the Aliyun native harness payload.
+# Contract guard for the packed-v3-only Aliyun payload.
 #
-# The 2026-09-19 re-run of the current main died on the freshly provisioned ECS
-# with:
-#   python3: can't open file '/usr/local/bin/perf_manifest.py': [Errno 2] ...
-# The runner had been taught to write run-manifest.json, but the helper only
-# existed in the checkout that introduced it. The VM image bake and the per-run
-# harness refresh shipped run_perf_in_container.sh and left the helper behind,
-# so a full ECS + Tair + OSS round was paid for before the leg failed.
-#
-# Every /usr/local/bin/*.py helper a perf runner invokes must therefore:
-#   1. have a source file in this repository,
-#   2. ride along with the Aliyun binary upload,
-#   3. be installed by the image bake and by the per-run refresh,
-#   4. be copied into the container image used by the compose runners.
+# The cloud runner intentionally does not use the historical generic FIO/metadata
+# fallback harness.  It ships only the packed-v3 fixture, runner, scanner, and
+# release binary, and it places artifacts on the disposable data disk.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ALIYUN="$SCRIPT_DIR/aliyun"
-
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-runners=(
-    "$SCRIPT_DIR/run_perf_in_container.sh"
-    "$SCRIPT_DIR/run_juicefs_perf_in_container.sh"
-)
-for runner in "${runners[@]}"; do
-    [[ -f "$runner" ]] || fail "missing perf runner: $runner"
-    grep -qF 'repeat_count="${PERF_FIO_BIGREAD_REPEATS:-3}"' "$runner" \
-        || fail "$(basename "$runner") reports three bigread repeats but does not execute three by default"
-    grep -qF 'warmup_count="${PERF_FIO_BIGREAD_WARMUP_PASSES:-1}"' "$runner" \
-        || fail "$(basename "$runner") reports one bigread warmup but does not execute one by default"
-done
-echo "OK bigread     : reported and executed repeat defaults agree"
+runner="$ALIYUN/run_aliyun_packed_native.sh"
+ps1="$ALIYUN/run_aliyun_perf.ps1"
+[[ -f "$runner" ]] || fail "missing packed runner: $runner"
+[[ -f "$ps1" ]] || fail "missing Aliyun launcher: $ps1"
 
-helpers="$(grep -rhoE '/usr/local/bin/[A-Za-z0-9_.-]+\.py' "${runners[@]}" | sort -u)"
-[[ -n "$helpers" ]] || fail 'no /usr/local/bin/*.py helper references found in the perf runners'
+grep -qF 'packed-tree|packed-stat|packed-smallfiles|packed-gpu-smallfiles' "$runner" \
+  || fail 'packed runner does not enforce the packed-v3 tool allowlist'
+grep -qF 'PACKED_VOLUME_FORMAT' "$runner" \
+  || fail 'packed runner does not require PACKED_VOLUME_FORMAT'
+grep -qF 'perf-summary.tsv' "$runner" \
+  || fail 'packed runner does not emit a performance summary'
+grep -qF 'run_packed_native.sh' "$ps1" \
+  || fail 'Aliyun launcher does not upload the packed runner'
+grep -qF 'smallfiles_scan.py' "$ps1" \
+  || fail 'Aliyun launcher does not upload the packed scanner'
+grep -qF 'DATA_MOUNT=/mnt/brewfs-data' "$ps1" \
+  || fail 'Aliyun launcher does not use the disposable data disk'
+grep -qF 'BREWFS_NATIVE_ARTIFACT_DIR' "$ps1" \
+  || fail 'Aliyun launcher does not bind the artifact directory'
+grep -qF 'Normalize text payloads' "$ps1" \
+  || fail 'Aliyun launcher does not normalize text payload line endings'
+grep -qF '[char]13' "$ps1" \
+  || fail 'Aliyun launcher line-ending normalization is incomplete'
 
-echo "helper references discovered:"
-printf '  %s\n' $helpers
+# Keep this guard explicit: the obsolete generic helper must not silently become
+# part of the packed-only cloud campaign again.
+if grep -qE 'perf_metadata_fallback|run_perf_in_container|run_juicefs_perf_in_container' "$ps1"; then
+  fail 'packed-only Aliyun launcher still references the historical generic harness'
+fi
 
-while IFS= read -r ref; do
-    [[ -n "$ref" ]] || continue
-    name="${ref##*/}"
+bash -n "$runner"
 
-    src=''
-    for candidate in "$SCRIPT_DIR/$name" "$REPO_ROOT/tools/perf/$name"; do
-        if [[ -f "$candidate" ]]; then
-            src="$candidate"
-            break
-        fi
-    done
-    [[ -n "$src" ]] || fail "$name is invoked as $ref but has no source file in this repository"
-    echo "OK source      : $name <- ${src#"$REPO_ROOT"/}"
-
-    grep -q "'$name'" "$ALIYUN/run_aliyun_perf.ps1" \
-        || fail "$name is missing from the Aliyun binary-upload harness list (run_aliyun_perf.ps1)"
-    grep -q "refresh_harness $name " "$ALIYUN/run_aliyun_perf.ps1" \
-        || fail "$name is not refreshed on the VM on every run (run_aliyun_perf.ps1)"
-    echo "OK upload      : $name is shipped and refreshed per run"
-
-    grep -q "/usr/local/bin/$name" "$ALIYUN/prepare_native_perf_vm.sh" \
-        || fail "$name is not installed by the VM image bake (prepare_native_perf_vm.sh)"
-    grep -q "$name" "$ALIYUN/invoke_native_vm_prepare.ps1" \
-        || fail "$name is not staged into the prepare payload (invoke_native_vm_prepare.ps1)"
-    grep -q "/usr/local/bin/$name" "$ALIYUN/maintain_aliyun_perf_image.ps1" \
-        || fail "$name is not installed by the image maintainer (maintain_aliyun_perf_image.ps1)"
-    echo "OK image       : $name is installed by both image paths"
-
-    grep -qE "^COPY .*$name /usr/local/bin/$name" "$SCRIPT_DIR/Dockerfile" \
-        || fail "$name is not copied into the container image (docker/compose-xfstests/Dockerfile)"
-    echo "OK container   : $name is copied into the compose image"
-done <<<"$helpers"
-
-# Line-ending guard. Every payload builder runs on Windows, where a checkout
-# with core.autocrlf=true hands back CRLF text. The 2026-09-19 run11 attempt
-# shipped run_native_perf.sh that way and the VM answered with
-#   /opt/brewfs-perf/native/run_native_perf.sh: line 2: $'\r': command not found
-# so each builder must normalize to LF before the bytes leave the machine.
-for builder in \
-    "$ALIYUN/run_aliyun_perf.ps1" \
-    "$ALIYUN/invoke_native_vm_prepare.ps1" \
-    "$ALIYUN/maintain_aliyun_perf_image.ps1"; do
-    grep -qF '`r`n' "$builder" \
-        || fail "$(basename "$builder") does not normalize CRLF before shipping harness files"
-done
-echo "OK line-endings: every payload builder normalizes CRLF to LF"
-
-echo "PASS: every perf-runner helper is available in every provisioning path"
+echo 'PASS: packed-v3-only Aliyun payload ships fixture, scanner, and data-disk artifacts'

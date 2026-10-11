@@ -502,6 +502,10 @@ pub trait WorkspaceKvBackend: Send + Sync + 'static {
 
     /// Atomically verify every exact-value condition and apply all writes.
     /// Returns `false` when any condition changed and the caller should retry.
+    /// An `Err(WorkspaceError::Busy)` result is reserved for a pre-submit
+    /// conflict where the backend proves that no write was submitted; an
+    /// ambiguous or post-submit transport result must use `Backend` so callers
+    /// never replay an uncertain mutation.
     async fn compare_and_swap(
         &self,
         checks: &[KvCheck],

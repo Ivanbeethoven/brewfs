@@ -11,6 +11,15 @@ param(
     [string]$InstanceType = 'ecs.u1-c1m4.2xlarge',
     [ValidateRange(40, 1000)]
     [int]$SystemDiskSizeGiB = 100,
+    # The native runner always provisions a disposable data disk for the
+    # workload. Keep its shape explicit so StrictMode does not leave the
+    # RunInstances request dependent on undeclared variables.
+    [ValidateSet('cloud_essd', 'cloud_essd_entry', 'cloud_auto')]
+    [string]$DataDiskCategory = 'cloud_essd',
+    [ValidateRange(100, 32768)]
+    [int]$DataDiskSize = 512,
+    [ValidateSet('PL0', 'PL1', 'PL2', 'PL3')]
+    [string]$DataDiskPerformanceLevel = 'PL2',
     [string]$ImageId = 'ubuntu_24_04_x64_20G_alibase_20260916.vhd',
     [ValidateSet('redis', 'none')]
     [string]$Backend = 'none',
@@ -90,6 +99,7 @@ Set-StrictMode -Version Latest
 $script:CreatedInstance = $false
 $script:RunArtifactDirectory = $null
 $script:CredentialBundleKey = $null
+$script:UploadedKeys = @()
 
 function Resolve-Executable([string]$Name, [string[]]$Candidates = @()) {
     $command = Get-Command $Name -ErrorAction SilentlyContinue
@@ -110,7 +120,7 @@ if ($env:LOCALAPPDATA) {
             Select-Object -ExpandProperty FullName
     )
 }
-$script:Aliyun = $null
+$script:Aliyun = Resolve-Executable 'aliyun' $aliyunCandidates
 
 function Invoke-Checked([string]$File, [string[]]$Arguments) {
     $output = & $File @Arguments 2>&1
@@ -255,10 +265,29 @@ file target/release/brewfs target/release/$fixtureName
 
 function Publish-OssObject([string]$Path, [string]$Key) {
     $uri = "oss://$S3Bucket/$Key"
-    Write-Host "上传 OSS 对象: $Key"
-    $output = & $Aliyun oss cp $Path $uri --region $S3Region --force 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "OSS 上传失败 ($Key): $($output -join [Environment]::NewLine)"
+    $uploadPath = $Path
+    $temporaryPath = $null
+    try {
+        # Windows checkouts may contain CRLF. Normalize text payloads before
+        # they leave the host so shell/python entrypoints are executable on ECS.
+        if ([IO.Path]::GetExtension($Path) -in @('.sh', '.py')) {
+            $temporaryPath = Join-Path ([IO.Path]::GetTempPath()) ("brewfs-upload-{0}{1}" -f [Guid]::NewGuid().ToString('N'), [IO.Path]::GetExtension($Path))
+            $text = [IO.File]::ReadAllText($Path)
+            $text = $text.Replace([string][char]13 + [char]10, [string][char]10)
+            [IO.File]::WriteAllText($temporaryPath, $text, [Text.UTF8Encoding]::new($false))
+            $uploadPath = $temporaryPath
+        }
+        Write-Host "上传 OSS 对象: $Key"
+        $output = & $Aliyun oss cp $uploadPath $uri --region $S3Region --force 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "OSS 上传失败 ($Key): $($output -join [Environment]::NewLine)"
+        }
+        $script:UploadedKeys += $Key
+    }
+    finally {
+        if ($temporaryPath) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -329,7 +358,21 @@ function Get-RemoteCommand([string]$BinaryUrl, [string]$FixtureUrl, [string]$Run
 #!/usr/bin/env bash
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
-WORK=/opt/brewfs-packed-native
+DATA_MOUNT=/mnt/brewfs-data
+if [[ -b /dev/vdb ]]; then
+  mkdir -p "$DATA_MOUNT"
+  if ! mountpoint -q "$DATA_MOUNT"; then
+    if ! blkid /dev/vdb >/dev/null 2>&1; then
+      mkfs.ext4 -F /dev/vdb
+    fi
+    mount /dev/vdb "$DATA_MOUNT"
+  fi
+fi
+if mountpoint -q "$DATA_MOUNT"; then
+  WORK="$DATA_MOUNT/brewfs-packed-native"
+else
+  WORK=/opt/brewfs-packed-native
+fi
 ARTIFACT_DIR="$WORK/artifacts"
 mkdir -p "$WORK" "$ARTIFACT_DIR"
 
@@ -548,6 +591,19 @@ function Remove-EcsInstance {
     Write-Host "ECS 删除任务已提交: $script:InstanceId"
 }
 
+function Remove-BinaryUpload {
+    if (-not $S3Bucket -or @($script:UploadedKeys).Count -eq 0) { return }
+    foreach ($key in @($script:UploadedKeys)) {
+        try {
+            Invoke-Checked $script:Aliyun @('oss', 'rm', "oss://$S3Bucket/$key", '--region', $S3Region, '--force') | Out-Null
+        }
+        catch {
+            Write-Warning "临时 OSS 上传清理失败 ($key): $($_.Exception.Message)"
+        }
+    }
+    $script:UploadedKeys = @()
+}
+
 try {
     if ($Action -eq 'status') {
         if (-not $InstanceId) { throw 'status 需要 -InstanceId。' }
@@ -622,6 +678,7 @@ finally {
         } catch {
             Write-Warning "临时 OSS 凭据对象清理失败，限时签名 URL 仍会在 8 小时后过期: $($_.Exception.Message)"
         }
+        $script:UploadedKeys = @($script:UploadedKeys | Where-Object { $_ -ne $script:CredentialBundleKey })
     }
     if ($Action -eq 'run' -and $script:CreatedInstance -and -not $KeepInstance -and -not $NoCleanup) {
         try { Remove-EcsInstance } catch { Write-Warning "ECS 自动清理失败: $($_.Exception.Message)" }

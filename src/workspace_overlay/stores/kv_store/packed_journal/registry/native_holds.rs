@@ -1336,6 +1336,7 @@ pub(super) fn require_active_native_hold_retirement_gate(
 }
 
 struct HoldChange {
+    source_key: Vec<u8>,
     key: Vec<u8>,
     old: Option<NativeHold>,
     new: Option<NativeHold>,
@@ -1497,6 +1498,7 @@ fn owner_changes(
                 append_hold_change(
                     &mut changes,
                     HoldChange {
+                        source_key: key.clone(),
                         key: identity.key(),
                         old,
                         new,
@@ -1529,6 +1531,7 @@ fn owner_changes(
                     append_hold_change(
                         &mut changes,
                         HoldChange {
+                            source_key: key.clone(),
                             key: identity.key(),
                             old: previous,
                             new: next,
@@ -1989,6 +1992,29 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                 || (observed.is_some() && observed != change.old)
                 || (active && observed != change.old)
             {
+                // A lease heartbeat (or another supported topology writer)
+                // may have advanced the source hot row and its derived hold
+                // after this packet was prepared. Recheck that source row
+                // before classifying the hold mismatch: a changed source is
+                // an epoch overlap and must rebuild, while an unchanged source
+                // with a different hold is genuine authority corruption.
+                let source = checks
+                    .iter()
+                    .find(|check| check.key == change.source_key)
+                    .ok_or(WorkspaceError::Fenced)?;
+                let (source_values, _) = self
+                    .backend
+                    .get_many_consistent_with_time_bounded(
+                        std::slice::from_ref(&change.source_key),
+                        hold_limits(1),
+                    )
+                    .await?;
+                if source_values.len() != 1 {
+                    return Err(journal_error("short native hold source recheck"));
+                }
+                if source_values[0].as_ref() != source.expected.as_ref() {
+                    return Ok(NativeOwnerPreparation::EpochOverlap);
+                }
                 return Err(WorkspaceError::Fenced);
             }
             if active

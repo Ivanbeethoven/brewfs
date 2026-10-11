@@ -266,7 +266,7 @@ FIXTURE_ARGS=(--wire-version 5 --frame-policy "$FRAME_POLICY" --inline-data "$IN
 [[ "$FRAME_POLICY" == p90-training ]] && FIXTURE_ARGS+=(--p90-policy "$ARTIFACT/p90-policy.json")
 [[ "$COLD_CORPUS" == true ]] && FIXTURE_ARGS+=(--cold-corpus true)
 [[ "$HARDLINK_CORPUS" == true ]] && FIXTURE_ARGS+=(--hardlink-corpus true)
-"$FIXTURE" "${FIXTURE_ARGS[@]}" --bucket brewfs-data --endpoint http://127.0.0.1:19000 --region us-east-1 --force-path-style true --prefix "$FIXTURE_PREFIX" --manifest-output "$ARTIFACT/manifest-key.txt" --dir-levels 2 --dirs-per-level 10 --files-per-dir "$((FILES / 100))" --small-file-size "$FILE_BYTES" --small-file-min-size "$FILE_BYTES" --small-file-max-size "$FILE_BYTES" --access-profile "$ACCESS_PROFILE" >"$ARTIFACT/fixture.log" 2>&1
+"$FIXTURE" "${FIXTURE_ARGS[@]}" --bucket brewfs-data --endpoint http://127.0.0.1:19000 --region us-east-1 --force-path-style true --prefix "$FIXTURE_PREFIX" --manifest-output "$ARTIFACT/manifest-key.txt" --dir-levels 2 --dirs-per-level 10 --files-per-dir "$((FILES / 100))" --small-file-size "$FILE_BYTES" --small-file-min-size "$FILE_BYTES" --small-file-max-size "$FILE_BYTES" >"$ARTIFACT/fixture.log" 2>&1
 python3 - "$WORK" "$ARTIFACT/manifest-key.txt" <<'PYCONFIG'
 import pathlib,sys
 work=pathlib.Path(sys.argv[1]); key=pathlib.Path(sys.argv[2]).read_text().strip()
@@ -401,9 +401,16 @@ epochs=s['epochs'] if isinstance(s.get('epochs'),list) else [s]
 assert all(row['files']==row['expected_files'] and row['errors']==0 for row in epochs)
 active=(c-b)/1e9; drain=(d-c)/1e9
 out=dict(mount_seconds=(b-a)/1e9, active_seconds=active, drain_seconds=drain, total_seconds=(d-a)/1e9)
-logical=sum(row.get('payload_bytes',0) for row in epochs)
-out['active_bw_mib_s']=logical/1048576/active
-out['effective_active_plus_drain_bw_mib_s']=logical/1048576/(active+drain)
-out['effective_wall_bw_mib_s']=logical/1048576/((d-a)/1e9)
+logical=sum(row.get("payload_bytes",0) for row in epochs)
+if logical:
+    out["active_bw_mib_s"]=logical/1048576/active
+    out["effective_active_plus_drain_bw_mib_s"]=logical/1048576/(active+drain)
+    out["effective_wall_bw_mib_s"]=logical/1048576/((d-a)/1e9)
+else:
+    # Metadata-only stat/tree runs have no payload bytes; keep timing valid
+    # without fabricating a bandwidth measurement.
+    out["active_bw_mib_s"]=None
+    out["effective_active_plus_drain_bw_mib_s"]=None
+    out["effective_wall_bw_mib_s"]=None
 (p/'timing.json').write_text(json.dumps(out,indent=2)+'\n')
 PYTIMING

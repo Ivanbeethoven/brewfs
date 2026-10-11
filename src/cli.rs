@@ -2673,13 +2673,15 @@ where
         DEFAULT_LEASE_TTL,
         DEFAULT_HEARTBEAT_INTERVAL,
     )
-    .await?;
+    .await
+    .map_err(|error| anyhow::anyhow!("seal acquire {workspace_id}: {error}"))?;
     let result = WorkspaceLifecycle::new(store)
         .seal(&session.view, &NoopDurableRemoteBarrier)
-        .await;
+        .await
+        .map_err(|error| anyhow::anyhow!("seal execute {workspace_id}: {error}"));
     let release_result = session.release().await;
     let revision = result?.revision;
-    release_result?;
+    release_result.map_err(|error| anyhow::anyhow!("seal release {workspace_id}: {error}"))?;
     Ok(revision)
 }
 
