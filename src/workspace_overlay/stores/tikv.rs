@@ -564,19 +564,26 @@ impl TiKvWorkspaceBackend {
             data_requests += 1;
             let (page, continuation) = match transaction.scan_single_region_page(range, 1).await {
                 Ok(result) => result,
-                Err(error) if error.is_bounded_read_retryable_key_lock() => {
-                    // Scan errors can be embedded in a returned KvPair, so they
-                    // use the same fixed [BRE,3,2,1,0] certificate as a point
-                    // read. The transaction is read-only: retrying the same
-                    // range at its fixed timestamp is safe, while the explicit
-                    // budget prevents an unbounded lock wait.
+                Err(error)
+                    if error.is_bounded_read_retryable_key_lock()
+                        || error.is_bounded_read_retryable_region() =>
+                {
+                    // Scan errors can be embedded in a returned KvPair. A
+                    // key lock and an EpochNotMatch region refresh are both
+                    // safe to retry while this transaction remains read-only;
+                    // the explicit budget prevents an unbounded wait.
                     if lock_retries >= BOUNDED_SCAN_LOCK_RETRIES
                         || data_requests >= limits.max_data_requests
                     {
                         // A failed row cannot be treated as a short page: doing
                         // so could advance the caller cursor past the locked
-                        // key and silently omit it.
-                        return Err(WorkspaceError::Busy);
+                        // key and silently omit it. Preserve region errors once
+                        // their finite refresh budget is spent.
+                        return if error.is_bounded_read_retryable_key_lock() {
+                            Err(WorkspaceError::Busy)
+                        } else {
+                            Err(backend(error))
+                        };
                     }
                     lock_retries += 1;
                     tokio::time::sleep(BOUNDED_SCAN_LOCK_BACKOFF).await;
@@ -680,7 +687,8 @@ impl TiKvWorkspaceBackend {
                 let batch: Vec<KvPair> = match transaction.scan(range, batch_limit).await {
                     Ok(batch) => batch.collect(),
                     Err(error)
-                        if error.is_bounded_read_retryable_key_lock()
+                        if (error.is_bounded_read_retryable_key_lock()
+                            || error.is_bounded_read_retryable_region())
                             && lock_attempt < BOUNDED_SCAN_LOCK_RETRIES =>
                     {
                         retry = true;
@@ -1163,7 +1171,10 @@ impl TiKvWorkspaceBackend {
                         // Classify it before mapping to a backend error so a
                         // transient lock cannot escape the CAS retry budget.
                         let retryable_key_lock = error.is_bounded_read_retryable_key_lock();
-                        let retryable = retryable_key_lock || is_retryable(&error.to_string());
+                        let retryable_region = error.is_bounded_read_retryable_region();
+                        let retryable = retryable_key_lock
+                            || retryable_region
+                            || is_retryable(&error.to_string());
                         if let Err(rollback_error) = transaction.rollback().await {
                             return Err(backend(format!(
                                 "{error}; CAS check rollback failed: {rollback_error}"
@@ -1179,11 +1190,11 @@ impl TiKvWorkspaceBackend {
                             // sequence/policy input after sustained contention.
                             return Ok(false);
                         }
-                        if retryable_key_lock {
-                            // The bounded lock certificate is a transient
-                            // pre-submit condition even when TXN_MAX_RETRIES
-                            // is exhausted. Let the topology caller rebuild
-                            // its complete read packet and preserve Busy
+                        if retryable_key_lock || retryable_region {
+                            // These bounded pre-submit read conditions are
+                            // transient even when TXN_MAX_RETRIES is
+                            // exhausted. Let the topology caller rebuild its
+                            // complete read packet and preserve Busy
                             // semantics for the outer CAS retry budget.
                             return Err(WorkspaceError::Busy);
                         }

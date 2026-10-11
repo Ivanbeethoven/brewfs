@@ -36,6 +36,15 @@ pub(crate) fn is_retryable_key_lock(status: &Status) -> bool {
         )
 }
 
+/// Return true only for the fixed bounded-read EpochNotMatch diagnostic.
+/// A region epoch refresh is safe for an unsent read-only request; the caller
+/// still owns a finite retry budget and must never replay a mutation.
+pub(crate) fn is_retryable_region(status: &Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status.message() == "bounded read returned a key or region error"
+        && matches!(status.details(), [b'B', b'R', b'E', 1 | 2, 1, 5, 0])
+}
+
 pub(crate) fn certify_authentication_write_conflict(
     status: &mut Status,
     key: &[u8],

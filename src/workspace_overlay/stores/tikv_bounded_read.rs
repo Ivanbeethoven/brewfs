@@ -19,6 +19,7 @@ pub(super) struct BoundedPointReadContext {
     remaining_originals: usize,
     remaining_lock_continuations: u8,
     remaining_key_lock_retries: u8,
+    remaining_region_retries: u8,
 }
 
 impl BoundedPointReadContext {
@@ -78,6 +79,7 @@ impl BoundedPointReadContext {
             remaining_originals: original_keys,
             remaining_lock_continuations: LOCK_CONTINUATIONS,
             remaining_key_lock_retries: LOCK_CONTINUATIONS,
+            remaining_region_retries: LOCK_CONTINUATIONS,
         })
     }
 
@@ -169,6 +171,26 @@ impl BoundedPointReadContext {
         Some(wake)
     }
 
+    /// Spend a separate, bounded continuation for an EpochNotMatch region
+    /// diagnostic. The client refreshes routing on the next dispatch; this
+    /// never resolves a lock or replays a mutation.
+    pub(super) fn reserve_region_retry(&mut self) -> Option<Instant> {
+        let now = Instant::now();
+        if self.remaining_originals == 0
+            || self.remaining_attempts < self.remaining_originals
+            || self.remaining_region_retries == 0
+            || now >= self.deadline
+        {
+            return None;
+        }
+        let wake = now.checked_add(LOCK_BACKOFF)?;
+        if wake >= self.deadline {
+            return None;
+        }
+        self.remaining_region_retries -= 1;
+        Some(wake)
+    }
+
     fn reserve_lock_continuation_at(&mut self, now: Instant) -> Option<Instant> {
         if self.remaining_originals == 0
             || self.remaining_attempts < self.remaining_originals
@@ -198,6 +220,7 @@ struct PointReadFailure {
     cause: WorkspaceError,
     verified_local_lock: bool,
     retryable_key_lock: bool,
+    retryable_region: bool,
 }
 
 /// An existing read-only transaction, not a factory for fresh transactions.
@@ -224,10 +247,12 @@ impl BoundedPointReader for tikv_client::Transaction {
                 // malformed/unknown/mixed errors never mint the local marker.
                 let verified_local_lock = error.is_bounded_read_lock_conflict();
                 let retryable_key_lock = error.is_bounded_read_retryable_key_lock();
+                let retryable_region = error.is_bounded_read_retryable_region();
                 PointReadFailure {
                     cause: backend(error),
                     verified_local_lock,
                     retryable_key_lock,
+                    retryable_region,
                 }
             })
     }
@@ -347,6 +372,8 @@ async fn read_window_with_reader(
                         context.reserve_lock_continuation()
                     } else if failure.retryable_key_lock {
                         context.reserve_key_lock_retry()
+                    } else if failure.retryable_region {
+                        context.reserve_region_retry()
                     } else {
                         None
                     };
@@ -595,21 +622,25 @@ mod batch_tests {
                     cause: WorkspaceError::Backend("test local verified lock".into()),
                     verified_local_lock: true,
                     retryable_key_lock: false,
+                    retryable_region: false,
                 }),
                 Answer::RetryableKeyLock => Err(PointReadFailure {
                     cause: WorkspaceError::Backend("test retryable key lock".into()),
                     verified_local_lock: false,
                     retryable_key_lock: true,
+                    retryable_region: false,
                 }),
                 Answer::UnverifiedDiagnostic => Err(PointReadFailure {
                     cause: WorkspaceError::Backend("test local verified lock".into()),
                     verified_local_lock: false,
                     retryable_key_lock: false,
+                    retryable_region: false,
                 }),
                 Answer::Other => Err(PointReadFailure {
                     cause: WorkspaceError::Backend("original unrelated error".into()),
                     verified_local_lock: false,
                     retryable_key_lock: false,
+                    retryable_region: false,
                 }),
                 Answer::Held => {
                     let _receipt = DropReceipt(self.dropped.clone());
