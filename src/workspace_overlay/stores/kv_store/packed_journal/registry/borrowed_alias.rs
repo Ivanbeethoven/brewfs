@@ -282,9 +282,20 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
         let workspace_key = hot_workspace_key(request.workspace_id);
         let head_key = hot_layer_key(request.head_layer_id);
         for attempt in 0..CAS_MAX_RETRIES {
-            let packed_fork = self
+            let packed_fork = match self
                 .prepare_borrowed_workspace(&request, require_packed_carrier)
-                .await?;
+                .await
+            {
+                Ok(plan) => plan,
+                Err(WorkspaceError::Busy) => {
+                    // The carrier probe is a bounded, pre-submit read. A
+                    // remote KV lock can transiently reject that read, so
+                    // rebuild the complete fork plan under this retry budget.
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let mut scope = TopologyScope {
                 workspaces: vec![request.workspace_id],
                 layers: vec![request.base_revision.layer_id, request.head_layer_id],

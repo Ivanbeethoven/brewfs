@@ -6228,6 +6228,7 @@ mod tests {
         scans: Arc<AtomicU64>,
         fail_cas_once: Arc<std::sync::atomic::AtomicBool>,
         fail_busy_once: Arc<std::sync::atomic::AtomicBool>,
+        fail_bounded_read_busy_once: Arc<std::sync::atomic::AtomicBool>,
         clock: Arc<AtomicI64>,
         advance_on_cas_ns: Arc<AtomicI64>,
         mutate_on_cas: Arc<Mutex<Vec<KvWrite>>>,
@@ -6428,6 +6429,12 @@ mod tests {
             limits: super::super::kv_backend::KvReadLimits,
         ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
             limits.validate_keys(keys)?;
+            if self
+                .fail_bounded_read_busy_once
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(WorkspaceError::Busy);
+            }
             let mut records = self.records.lock().await;
             let remaining = self.timed_reads_until_mutation.load(Ordering::SeqCst);
             if remaining > 0
