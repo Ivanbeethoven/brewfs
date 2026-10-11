@@ -105,3 +105,7 @@ Artifact：`docker/compose-xfstests/artifacts/live-control-redis-20261011-sealfi
 三项 summary、profile、stats 和 trace 由云端同步到 docker/compose-xfstests/artifacts/aliyun-cloud-smoke-20261011/cloud-proof-summary.txt；原始输出见 remote-output.log，本地重跑归档见 work/aliyun-cloud-rerun-98f292e。packed-stat 和 packed-tree 的 payload_bytes 为 0，因此 mib_per_sec 保持 null 或 0，不能伪造数据带宽。该 smoke 证明 packed-v3/005 在 RustFS/S3 小规模读取路径上有 0 errors，但不证明 Redis/TiKV 元数据生命周期、operator recovery、GC 或 native/packed paired acceptance。
 
 后续性能 campaign 固定使用该 ECS 和数据盘，逐次变更只允许写入独立 OSS prefix 与 metadata namespace。artifact 必须包含云主机规格、磁盘挂载、commit、binary hash、固定 trace、profile、阶段计时、请求账本、cleanup journal 和资源删除证明。TiKV concurrent fork/seal、真实 Redis/TiKV fork 到 GC、native/packed paired、static/dynamic/inline-off/p90 消融、operator recovery 和多次 release 重复均仍开放；任何一项未完成时不得更新 G08、G10、G11、G12、G13、G14 或 G17 为完成。
+
+## 2026-10-12 current HEAD correction
+
+The 2026-10-11 numbers above are historical evidence. Current authoritative status is recorded in ../superpowers/plans/2026-10-12-packed-v3-final-handoff.md. Redis control-only is now 8/8 fork and 8/8 seal on eece983; default TiKV writer-pressure C1/C2/C8 remains a contention failure, while no-writer and throttled-writer diagnostics pass. A fresh RustFS/S3 smoke on eece983 uses binary SHA 805ed09c... and artifact /mnt/brewfs-data/artifacts/eece983-rustfs-smoke-20261011T233500Z. These results do not close full lifecycle, paired performance, ablation, operator, or managed-backend SPEC gates.
