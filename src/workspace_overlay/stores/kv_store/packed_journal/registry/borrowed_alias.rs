@@ -430,7 +430,19 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                 }
                 Err(error) => return Err(error),
             };
-            let packet = self.prepare_topology_envelope(checks, writes, None).await?;
+            // Native derived-index preparation can lose the shared topology
+            // epoch while another fork commits.  The final envelope is still
+            // a pre-submit operation, so rebuild the complete fork plan on
+            // the same bounded retry budget instead of surfacing a transient
+            // Busy to concurrent callers.
+            let packet = match self.prepare_topology_envelope(checks, writes, None).await {
+                Ok(packet) => packet,
+                Err(WorkspaceError::Busy) => {
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if self.commit_prepared_topology_packet(&packet).await? {
                 return Ok(workspace);
             }
