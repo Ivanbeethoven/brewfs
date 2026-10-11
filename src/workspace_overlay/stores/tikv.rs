@@ -577,8 +577,9 @@ impl TiKvWorkspaceBackend {
                     {
                         // A failed row cannot be treated as a short page: doing
                         // so could advance the caller cursor past the locked
-                        // key and silently omit it. Preserve region errors once
-                        // their finite refresh budget is spent.
+                        // key and silently omit it. Surface Busy so the
+                        // enclosing topology operation rebuilds its read
+                        // packet after the finite refresh budget is spent.
                         return Err(WorkspaceError::Busy);
                     }
                     lock_retries += 1;
