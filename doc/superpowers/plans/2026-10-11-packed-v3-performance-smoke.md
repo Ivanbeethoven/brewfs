@@ -3,7 +3,7 @@
 更新时间：2026-10-11
 工作区：/home/hxy/brewfs
 分支：codex/packed-metadata-aliyun-20260930
-HEAD：188dda3（工作树含本轮未提交修复）
+HEAD：98f292e1（工作树干净；云端验证使用此提交构建）
 
 本记录覆盖 packed-v3/005 的小规模 control smoke，并记录本轮 Redis/TiKV 后端结果。debug 单次结果不升级为性能验收；Redis/TiKV 完整元数据生命周期、RustFS/S3 paired campaign、operator 和大规模 release/FUSE 仍按临时交接文档开放。
 
@@ -54,7 +54,7 @@ Artifact：docker/compose-xfstests/artifacts/packed-local-20261010T224740Z-15513
 - Redis concurrent fork：8 个并发操作仅 4 个成功，4 个返回 `Error: workspace is busy`。根因是共享 `layer-inventory-generation` 的 CAS 竞争在 64 次快速重试内耗尽；原实现 CAS 失败只 `yield_now()`，没有使用已有退避策略。
 - TiKV concurrent fork：8 个操作 7 个成功，1 个返回 `FailedPrecondition: bounded read returned a key or region error`。details 为 `[66,82,69,1,2,1,0]`，对应 bounded Get 的 key-level lock 诊断；未知/未认证 key error 仍必须 fail-closed。
 
-当前未提交的修复只针对上述根因：`borrowed_alias.rs` 在 carrier expectation CAS 失败时复用 `retry_backoff(attempt)`；TiKV bounded-read 增加固定形状的 `BRE + location=1 + family=key + subtype=locked + shape=complete` 识别，并设置独立、受预算限制的同一时间戳只读重试预算。重试保持固定 timestamp、原始 request budget 和总 deadline，不做锁解析、锁解决或写入重放。
+已提交的修复只针对上述根因：`borrowed_alias.rs` 在 carrier expectation CAS 失败时复用 `retry_backoff(attempt)`；TiKV bounded-read 增加固定形状的 `BRE + location=1 + family=key + subtype=locked + shape=complete` 识别，并设置独立、受预算限制的同一时间戳只读重试预算。重试保持固定 timestamp、原始 request budget 和总 deadline，不做锁解析、锁解决或写入重放。
 
 相关失败 artifact 保留在：
 
@@ -91,3 +91,17 @@ Artifact：`docker/compose-xfstests/artifacts/live-control-redis-20261011-sealfi
 - 不能用上述 debug/tiny/single-run 结果填写 native/packed acceptance table 或声明 G08/G10/G11/G12/G13/G14/G17 完成。
 - 仍需固定 trace 的 native/packed paired runs、static/dynamic/inline-off/p90 消融、release build、多次重复和 p90/CI 规则。
 - Redis/TiKV 元数据仍需真实 fork→mutation→durable drain→seal/repack→remount→GC；本轮只关闭 Redis control-only smoke，TiKV 仍待新 binary 重跑。RustFS/S3 需 parent context、namespace/codec、journal/rotation/pins/GC；operator/FUSE 故障与 recovery 仍开放。
+
+## 2026-10-11 云端验证更正和后续入口
+
+本节为当前 HEAD 98f292e1 的权威小规模云端记录。用户已要求所有后续测试上云；本地 RustFS/debug 结果保留为历史 correctness/control smoke，不能替代云端结果。执行 ECS 为 i-bp138fribj3vquxxrpe6，8 vCPU、32 GiB、系统盘 100 GiB、数据盘 512 GiB，挂载点 /mnt/brewfs-data；OSS bucket 为 brewfs-tikv-100k-20260928。云端 task 为 t-hz06zpl80x3h9mo，release binary SHA-256 为 b7757759b764bd67468efc607affa3a93b5f3cb6fb8538bd5a1ace99e12c72f2。
+
+| workload | files | payload | errors | latency / rate | trace |
+| --- | ---: | ---: | ---: | --- | --- |
+| packed-tree | 100/100 | 0 bytes | 0 | discovery 5.140589 s；19.453023 files/s | c86a7f80931cce89ad640ae0b222788da402093694c433174ecba369bd2c8662 |
+| packed-stat | 100/100 | 0 bytes | 0 | p50 18.968117 ms；p95 31.102575 ms；13.136240 files/s | c86a7f80931cce89ad640ae0b222788da402093694c433174ecba369bd2c8662 |
+| packed-smallfiles | 100/100 | 102400 bytes | 0 | p50 43.936339 ms；p95 68.252816 ms；9.929362 files/s | c86a7f80931cce89ad640ae0b222788da402093694c433174ecba369bd2c8662 |
+
+三项 summary、profile、stats 和 trace 由云端同步到 docker/compose-xfstests/artifacts/aliyun-cloud-smoke-20261011/cloud-proof-summary.txt；原始输出见 remote-output.log，本地重跑归档见 work/aliyun-cloud-rerun-98f292e。packed-stat 和 packed-tree 的 payload_bytes 为 0，因此 mib_per_sec 保持 null 或 0，不能伪造数据带宽。该 smoke 证明 packed-v3/005 在 RustFS/S3 小规模读取路径上有 0 errors，但不证明 Redis/TiKV 元数据生命周期、operator recovery、GC 或 native/packed paired acceptance。
+
+后续性能 campaign 固定使用该 ECS 和数据盘，逐次变更只允许写入独立 OSS prefix 与 metadata namespace。artifact 必须包含云主机规格、磁盘挂载、commit、binary hash、固定 trace、profile、阶段计时、请求账本、cleanup journal 和资源删除证明。TiKV concurrent fork/seal、真实 Redis/TiKV fork 到 GC、native/packed paired、static/dynamic/inline-off/p90 消融、operator recovery 和多次 release 重复均仍开放；任何一项未完成时不得更新 G08、G10、G11、G12、G13、G14 或 G17 为完成。

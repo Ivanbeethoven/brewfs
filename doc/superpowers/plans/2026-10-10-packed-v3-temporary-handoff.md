@@ -3,7 +3,7 @@
 更新时间：2026-10-11
 工作区：`/home/hxy/brewfs`
 本地分支：`codex/packed-metadata-aliyun-20260930`
-PR：[brewfs/brewfs#161](https://github.com/brewfs/brewfs/pull/161)（当前 OPEN；Redis control smoke 已通过，TiKV 仍待重跑，未满足合并门禁）
+PR：[brewfs/brewfs#161](https://github.com/brewfs/brewfs/pull/161)（当前 OPEN；HEAD 98f292e1 已推送；Redis 云端 smoke 通过，TiKV 云端 C8 仍待新 binary 重跑，未满足合并门禁）
 
 ## 1. 交接范围和三项创新
 
@@ -19,7 +19,7 @@ PR：[brewfs/brewfs#161](https://github.com/brewfs/brewfs/pull/161)（当前 OPE
 
 ## 2. 当前提交与本轮修改
 
-本轮主要实现基线是提交 706b6c5（feat(packed-v3): close generation and runner audit gaps）；随后补充了临时交接文档、稳定 Rust API 修复和 CI 资源约束；当前基线 HEAD 为 188dda3；本轮工作树仍有未提交的 Redis/TiKV retry、seal Busy retry、CLI 错误上下文和文档修复。提交后应以 git log 和 PR 页面记录实际的本地/远端 head SHA。
+本轮主要实现基线是提交 706b6c5（feat(packed-v3): close generation and runner audit gaps）；随后补充了临时交接文档、稳定 Rust API 修复和 CI 资源约束；当前基线 HEAD 为 98f292e1（工作树干净且与 origin 同步）；426c358、6dd8378、98f292e1 已提交并推送。以 git log 和 PR 页面核对远端 head SHA。
 
 本轮实现内容：
 
@@ -80,7 +80,7 @@ PR #160 最新 run 38061849001 已完成：Rust all-features job 以 exit 143 �
 
 ## 6. PR #161 当前未完成项与合并门禁
 
-当前工作树基线 HEAD 为 `188dda3`，本轮源码和文档修改尚未推送到 PR #161：
+当前工作树基线 HEAD 为 98f292e1，源码与文档均已提交并推送到 PR #161。
 
 - `src/workspace_overlay/stores/kv_store.rs`：compaction/control 与 begin/advance/hash/commit seal 的 pre-submit `Busy` 退避重试，并增加 MemoryBackend 回归覆盖。
 - `src/cli.rs`：seal acquire/execute/release 阶段错误上下文。
@@ -97,7 +97,7 @@ PR #161 CI run `38092955788` 的真实失败必须先修复并重跑：Redis 8-w
 1. 完成 no-default-features release build，并复制启用 `workspace-overlay` 的 binary；不要复用未启用该 feature 的旧 binary。
 2. 运行 `tikv_bounded_read::batch_tests` 与 `pr141_entity_cas_tests::concurrent_forks_from_one_revision_have_distinct_heads` 定向测试；若 WSL 链接阶段再次失去响应，记录为环境阻断，不宣称通过。
 3. 使用 `BREWFS_WORKSPACE_CONCURRENCY=8` 运行 Redis、TiKV `--control-only --reuse-images`，确认 concurrent-fork/concurrent-seal 为 8/8、cleanup 完整，并检查 metrics/logs 中无新的 key diagnostic。Redis 已完成 8/8；TiKV 官方 readiness 镜像被 TLS timeout 阻断，本地 readiness workaround 暴露 1/8 key-lock 失败，已加入 Busy 外层重试修复，需新 binary 重跑。
-4. 只提交上述修复并 push PR #161，重跑 run `38092955788` 的失败 job；记录新 CI run。
+4. 上述修复已提交并 push 到 PR #161；等待新 CI run，记录其结果并以 38131837909 作为当前最新门禁依据。
 5. 仅当 Redis、TiKV、Rust 及必需检查全部通过后，才可按用户授权 merge；在此之前禁止合并。
 
 修复后的 retry count 当前没有独立 metrics；`successful_operations_per_second` 已包含重试成本，不能解释为原始 backend 吞吐。
@@ -108,7 +108,7 @@ PR #161 CI run `38092955788` 的真实失败必须先修复并重跑：Redis 8-w
 
 下一位 agent 的顺序：
 
-1. 提交并推送 PR #161 的 retry 修复，触发并记录新的 CI run；纯 runner shutdown/exit 143 作为基础设施故障保留证据，但不能替代 Redis/TiKV 8/8 control smoke。
+1. retry 修复已提交并推送 PR #161；重跑并记录新的 CI run，纯 runner shutdown/exit 143 作为基础设施故障保留证据，但不能替代 Redis/TiKV 8/8 control smoke。
 2. 在 Redis、TiKV、RustFS/S3 三条 campaign 入口执行小规模 control smoke，再扩展真实 FUSE、operator 和 paired experiment。
 3. 只有外部证据齐全才更新 G08/G10/G11/G12/G13/G14/G17 的验收状态；不要用文档或合成数值关闭开放项。
 4. 用户已授权合并；只有 Redis/TiKV/Rust 及必需检查通过后才执行 merge，并把 PR 检查结论和合并 commit 追加到本文件或 PR 记录。
@@ -132,3 +132,15 @@ PR #161 CI run `38092955788` 的真实失败必须先修复并重跑：Redis 8-w
 详细记录见 doc/superpowers/plans/2026-10-11-packed-v3-performance-smoke.md。当前 feature-enabled debug runner 已在真实 RustFS Compose + FUSE 完成两个可复现 control smoke：full 100×1KiB（100/100、0 errors、manifest/journal passed、mount 0.3235s、active 5.4079s、drain 0.1379s、wall 5.8693s）和 metadata stat 100 files（100/100、0 errors、p50 10.20353ms、p95 11.946053ms、manifest/journal passed）。两者 cleanup 均证明 mount/process/compose/work 不存活。
 
 本轮修复了 runner fixture 重复 access-profile、单 epoch summary 验证和 stat/tree 零 payload 除零，并保留失败 artifacts 作为证据。新 release binary SHA-256 为 `b2236a51822197abc3d95375b39baa6d8ccc64ae02701bed89a8c50a98a3b3ab`；Redis control-only C8 fork/seal 均 8/8，artifact 为 `docker/compose-xfstests/artifacts/live-control-redis-20261011-sealfix/`。TiKV 官方 readiness 拉取失败 artifact 为 `docker/compose-xfstests/artifacts/live-control-tikv-20261011-sealfix/compose-up.log`；本地 readiness workaround 的 1/8 key-lock 失败 artifact 为 `docker/compose-xfstests/artifacts/live-control-tikv-20261011-sealfix-local-ready/`。上述结果是 release control smoke，不能关闭 G17 或填写 acceptance table；Redis/TiKV metadata 完整生命周期、native/packed paired、release 多次重复、RustFS/S3 完整 journal/rotation/pins/GC、operator/recovery 仍开放。
+
+## 8. 2026-10-11 当前 HEAD、云端资源和验证更正
+
+本节覆盖本文件前面历史记录中仍引用 188dda3 的部分。当前可复核基线是 HEAD 98f292e1，工作树干净，且与 origin/codex/packed-metadata-aliyun-20260930 同步。连续提交为 426c358、6dd8378、98f292e1：分别收敛 Redis CAS 退避、TiKV bounded scan 的固定时间戳 key-lock 重建，以及云 runner 的 512 GiB 数据盘、LF 上传规范和 packed payload 检查。以下证据不得与旧 HEAD 的历史数字混用。
+
+用户已指定后续性能和集成测试全部在独立云主机执行。当前云端资源为 ECS i-bp138fribj3vquxxrpe6，8 vCPU、32 GiB 内存，系统盘 100 GiB，数据盘 512 GiB，数据盘挂载到 /mnt/brewfs-data；自动释放时间为 2026-10-13T09:56Z。对象测试使用 OSS bucket brewfs-tikv-100k-20260928。云端任务 t-hz06zpl80x3h9mo 使用 HEAD 98f292e1 生成的 release binary，SHA-256 为 b7757759b764bd67468efc607affa3a93b5f3cb6fb8538bd5a1ace99e12c72f2。
+
+RustFS/S3 packed-v3 smoke 已在该云端 runner 完成 100 files × 1 KiB：packed-tree、packed-stat 和 packed-smallfiles 均为 100/100、0 errors；smallfiles payload 为 102400 bytes；三项共享 trace SHA-256 c86a7f80931cce89ad640ae0b222788da402093694c433174ecba369bd2c8662。packed-smallfiles p50/p95 为 43.936339/68.252816 ms，packed-stat p50/p95 为 18.968117/31.102575 ms，packed-tree discovery 为 5.140589 s。完整证明保存在 docker/compose-xfstests/artifacts/aliyun-cloud-smoke-20261011/cloud-proof-summary.txt，远端原始输出保存在同目录 remote-output.log；本地同步结果目录为 work/aliyun-cloud-rerun-98f292e。该批次是 RustFS/S3 correctness/control smoke，不是 Redis/TiKV 完整生命周期或三创新性能接受结论。
+
+同一 ECS 将作为后续云测试的唯一执行入口。每次 run 必须记录 instance id、规格、数据盘挂载、HEAD、binary SHA-256、trace、后端 namespace/prefix、artifact 路径和 cleanup 结果；必须在 artifact 保留后卸载 FUSE、停止 compose 或 runner、删除临时 namespace/prefix，并检查资源无残留。WSL 本地只承担静态审计、文档、源代码检查和构建产物准备，不得把本地 debug smoke 当作性能接受证据。磁盘紧张时优先清理可重建 target、镜像缓存和未绑定临时输出，保留 canonical proof 和失败诊断。
+
+PR #161 的最新 CI run 38131837909 已结束但整体失败：Redis overlay 通过，TiKV overlay 在 concurrent fork 失败，Rust job 也失败且倾向 runner 或基础设施中止；stress-ng、pjdfstest、Results web 通过。该 run 不能视为合并门禁通过。云端 workspace-overlay 镜像构建任务 t-hz06zpoiy2f1h4w 仍属于准备工作，不构成测试结果。下一步必须在上述 32 GiB ECS 上用 98f292e1 binary 重跑 TiKV control-only C8，并保存 concurrent-fork-metrics.json、concurrent-seal-metrics.json 和 cleanup proof；只有 TiKV 8/8、Redis 8/8、Rust 以及必需 CI 检查全部通过后，才可合并 PR。
