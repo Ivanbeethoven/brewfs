@@ -25,6 +25,11 @@ const BOUNDED_SCAN_LOCK_RETRIES: usize = 20;
 const BOUNDED_SCAN_LOCK_BACKOFF: Duration = Duration::from_millis(20);
 // This same configured timeout derives the fixed data Get-batch deadline.
 const BOUNDED_CLIENT_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+// Concurrent mounts can open several PD channels at once.  A transient
+// transport failure while establishing a client is safe to retry because no
+// transaction has been started yet; request deadlines remain unchanged.
+const CLIENT_CONNECT_RETRIES: usize = 6;
+const CLIENT_CONNECT_BACKOFF: Duration = Duration::from_millis(50);
 #[path = "tikv_bounded_read.rs"]
 mod bounded_read;
 #[path = "tikv_tls.rs"]
@@ -237,6 +242,27 @@ fn client_config_with_tls(
     }
 }
 
+async fn connect_transaction_client(
+    pd_endpoints: &[String],
+    config: tikv_client::Config,
+) -> Result<TransactionClient, WorkspaceError> {
+    for attempt in 0..=CLIENT_CONNECT_RETRIES {
+        match TransactionClient::new_with_config(pd_endpoints.to_vec(), config.clone()).await {
+            Ok(client) => return Ok(client),
+            Err(error @ tikv_client::Error::Grpc(_)) if attempt < CLIENT_CONNECT_RETRIES => {
+                tokio::time::sleep(CLIENT_CONNECT_BACKOFF * (attempt as u32 + 1)).await;
+                log::debug!(
+                    "retrying TiKV client connection after transport failure (attempt {})",
+                    attempt + 1
+                );
+                drop(error);
+            }
+            Err(error) => return Err(backend(error)),
+        }
+    }
+    unreachable!("TiKV client connection loop always returns")
+}
+
 #[derive(Clone)]
 pub struct TiKvWorkspaceBackend {
     clients: Arc<tokio::sync::Mutex<ClientSlots>>,
@@ -361,9 +387,7 @@ impl TiKvWorkspaceBackend {
         }
         validate_namespace(namespace)?;
         let config = client_config_with_tls(&mount_budget, 4 << 20, tls.as_ref())?;
-        let client = TransactionClient::new_with_config(pd_endpoints.clone(), config)
-            .await
-            .map_err(backend)?;
+        let client = connect_transaction_client(&pd_endpoints, config).await?;
         let prefix = format!("{namespace}/ws:v1/").into_bytes();
         Ok(Self {
             clients: Arc::new(tokio::sync::Mutex::new(ClientSlots {
@@ -455,11 +479,7 @@ impl TiKvWorkspaceBackend {
                 BOUNDED_JOURNAL_MESSAGE_BYTES,
                 self.tls.as_ref(),
             )?;
-            *slot = Some(
-                TransactionClient::new_with_config(self.pd_endpoints.as_ref().clone(), config)
-                    .await
-                    .map_err(backend)?,
-            );
+            *slot = Some(connect_transaction_client(self.pd_endpoints.as_ref(), config).await?);
         }
         let client = slot.as_ref().unwrap().clone();
         drop(clients);
@@ -491,11 +511,7 @@ impl TiKvWorkspaceBackend {
         if slot.is_none() {
             let config =
                 client_config_with_tls(&self.mount_budget, message_bytes, self.tls.as_ref())?;
-            *slot = Some(
-                TransactionClient::new_with_config(self.pd_endpoints.as_ref().clone(), config)
-                    .await
-                    .map_err(backend)?,
-            );
+            *slot = Some(connect_transaction_client(self.pd_endpoints.as_ref(), config).await?);
         }
         let client = slot.as_ref().unwrap().clone();
         drop(clients);
