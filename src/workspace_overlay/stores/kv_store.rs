@@ -410,7 +410,12 @@ impl<'a, B: WorkspaceKvBackend> TopologyTxn<'a, B> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        if self.checks.len().saturating_add(unread.len()) > 1024 {
+        // Keep scoped compaction and other bounded topology transitions in
+        // the same 4096-record envelope as the administrative census. A
+        // freshly materialized layer may legitimately carry more than one
+        // thousand delta rows; rejecting it at 1024 would make the scoped
+        // path less capable than the legacy full-census path it replaces.
+        if self.checks.len().saturating_add(unread.len()) > 4096 {
             return Err(WorkspaceError::InvalidReadPlan(
                 "topology transaction authority limit".into(),
             ));
@@ -5130,11 +5135,11 @@ where
             .checked_add(1)
             .ok_or_else(|| WorkspaceError::CorruptMetadata("sequence overflows".into()))?;
         let now = self.now_ns().await?;
-        self.update_control(|state, writes| {
-            let workspace = state
-                .workspaces
-                .get(&request.workspace_id)
-                .cloned()
+        for attempt in 0..CAS_MAX_RETRIES {
+            let mut txn = self.topology_txn();
+            let mut workspace = txn
+                .read_workspace(request.workspace_id)
+                .await?
                 .ok_or(WorkspaceError::WorkspaceNotFound(request.workspace_id))?;
             if workspace.head_layer_id != request.expected_head_layer_id
                 || workspace.head_epoch != request.expected_head_epoch
@@ -5142,9 +5147,9 @@ where
             {
                 return Err(WorkspaceError::Fenced);
             }
-            let head = state
-                .layers
-                .get(&request.expected_head_layer_id)
+            let mut head = txn
+                .read_layer(request.expected_head_layer_id)
+                .await?
                 .ok_or(WorkspaceError::Fenced)?;
             if head.state != LayerState::Writable
                 || head.owner_workspace_id != Some(request.workspace_id)
@@ -5153,108 +5158,114 @@ where
             {
                 return Err(WorkspaceError::Fenced);
             }
-            let parent = state
-                .layers
-                .get(&request.expected_parent_layer_id)
+            let parent = txn
+                .read_layer(request.expected_parent_layer_id)
+                .await?
                 .ok_or(WorkspaceError::Fenced)?;
-            revision_from_layer(parent)?;
-            if state.layers.contains_key(&request.compacted_layer_id)
-                || state
-                    .layers
-                    .contains_key(&request.replacement_head_layer_id)
+            revision_from_layer(&parent)?;
+            if txn.read_layer(request.compacted_layer_id).await?.is_some()
+                || txn
+                    .read_layer(request.replacement_head_layer_id)
+                    .await?
+                    .is_some()
             {
                 return Err(conflict("compaction output layer already exists"));
             }
-            let sealed_version = u64::try_from(allocate_id_state(state, "sealed_version")?)
+            let next = txn.read_allocator("sealed_version").await?.ok_or_else(|| {
+                WorkspaceError::CorruptMetadata("sealed version allocator missing".into())
+            })?;
+            let sealed_version = u64::try_from(next)
                 .map_err(|_| WorkspaceError::CorruptMetadata("negative sealed version".into()))?;
-            state.layers.insert(
-                request.compacted_layer_id,
-                LayerRecord {
-                    layer_id: request.compacted_layer_id,
-                    parent_layer_id: None,
-                    state: LayerState::Sealed,
-                    schema_version: WORKSPACE_SCHEMA_VERSION,
-                    sealed_version: Some(sealed_version),
-                    delta_digest: Some(digest),
-                    root_hash: Some(root),
-                    depth: 1,
-                    owner_workspace_id: None,
-                    next_sequence,
-                    owned_slice_count: 0,
-                    owned_bytes: 0,
-                    created_at_ns: now,
-                    sealed_at_ns: Some(now),
-                },
-            );
-            state.layers.insert(
+            txn.put_allocator(
+                "sealed_version",
+                next.checked_add(1)
+                    .ok_or_else(|| WorkspaceError::CorruptMetadata("allocator overflows".into()))?,
+            )?;
+            let compacted = LayerRecord {
+                layer_id: request.compacted_layer_id,
+                parent_layer_id: None,
+                state: LayerState::Sealed,
+                schema_version: WORKSPACE_SCHEMA_VERSION,
+                sealed_version: Some(sealed_version),
+                delta_digest: Some(digest),
+                root_hash: Some(root),
+                depth: 1,
+                owner_workspace_id: None,
+                next_sequence,
+                owned_slice_count: 0,
+                owned_bytes: 0,
+                created_at_ns: now,
+                sealed_at_ns: Some(now),
+            };
+            txn.put_layer(&compacted)?;
+            txn.put_layer(&writable_layer(
                 request.replacement_head_layer_id,
-                writable_layer(
-                    request.replacement_head_layer_id,
-                    request.compacted_layer_id,
-                    2,
-                    request.workspace_id,
-                    now,
-                ),
-            );
+                request.compacted_layer_id,
+                2,
+                request.workspace_id,
+                now,
+            ))?;
             let epoch = workspace
                 .head_epoch
                 .checked_add(1)
                 .ok_or_else(|| WorkspaceError::CorruptMetadata("head epoch overflows".into()))?;
-            let workspace = state
-                .workspaces
-                .get_mut(&request.workspace_id)
-                .expect("workspace exists");
             workspace.head_layer_id = request.replacement_head_layer_id;
             workspace.head_epoch = epoch;
-            workspace.fork_base = Some(BaseRevision {
+            let revision = BaseRevision {
                 layer_id: request.compacted_layer_id,
                 sealed_version,
                 root_hash: root,
-            });
+            };
+            workspace.fork_base = Some(revision.clone());
             workspace.updated_at_ns = now;
-            let revision = workspace
-                .fork_base
-                .clone()
-                .expect("compaction installs a fork base");
-            for lease in state.leases.values_mut() {
-                if lease.workspace_id == request.workspace_id && lease.state == LeaseState::Active {
-                    lease.base_revision = revision.clone();
-                    lease.updated_at_ns = now;
-                }
+            if let Some(id) = workspace.active_lease
+                && let Some(mut lease) = txn.read_lease(request.workspace_id, id).await?
+                && lease.state == LeaseState::Active
+            {
+                lease.base_revision = revision.clone();
+                lease.updated_at_ns = now;
+                txn.put_lease(&lease)?;
             }
-            let old_head = state
-                .layers
-                .get_mut(&request.expected_head_layer_id)
-                .expect("head exists");
-            old_head.state = LayerState::Deleting;
-            old_head.owner_workspace_id = None;
-
+            txn.put_workspace(&workspace)?;
+            head.state = LayerState::Deleting;
+            head.owner_workspace_id = None;
+            txn.put_layer(&head)?;
+            let mut delta_writes = Vec::new();
             for row in &request.delta.dentries {
-                writes.push(put(dentry_key(row), row)?);
+                delta_writes.push(put(dentry_key(row), row)?);
             }
             for row in &request.delta.inodes {
-                writes.push(put(inode_key(row), row)?);
+                delta_writes.push(put(inode_key(row), row)?);
             }
             for row in &request.delta.xattrs {
-                writes.push(put(xattr_key(row), row)?);
+                delta_writes.push(put(xattr_key(row), row)?);
             }
             for row in &request.delta.acls {
-                writes.push(put(acl_key(row), row)?);
+                delta_writes.push(put(acl_key(row), row)?);
             }
             for row in &request.delta.extents {
-                writes.push(put(extent_key(row), row)?);
+                delta_writes.push(put(extent_key(row), row)?);
             }
-            Ok(CompactionResult {
-                revision: BaseRevision {
-                    layer_id: request.compacted_layer_id,
-                    sealed_version,
-                    root_hash: root,
-                },
-                replacement_head_layer_id: request.replacement_head_layer_id,
-                head_epoch: epoch,
-            })
-        })
-        .await
+            let keys = delta_writes
+                .iter()
+                .map(|write| match write {
+                    KvWrite::Put { key, .. } | KvWrite::Delete { key } => key.clone(),
+                })
+                .collect::<Vec<_>>();
+            txn.read_many_raw(&keys).await?;
+            for write in delta_writes {
+                txn.put_checked(write)?;
+            }
+            if txn.commit().await? {
+                return Ok(CompactionResult {
+                    revision,
+                    replacement_head_layer_id: request.replacement_head_layer_id,
+                    head_epoch: epoch,
+                });
+            }
+            retry_backoff(attempt).await;
+        }
+        Err(WorkspaceError::Busy)
     }
 }
 
