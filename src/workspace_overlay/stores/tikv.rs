@@ -21,7 +21,7 @@ const TXN_MAX_RETRIES: usize = 10;
 // remains read-only and safe to retry at its fixed timestamp. Keep this
 // continuation budget separate from region/page admission: exhausting it
 // returns Busy so the caller can rebuild the bounded read transaction.
-const BOUNDED_SCAN_LOCK_RETRIES: usize = 2;
+const BOUNDED_SCAN_LOCK_RETRIES: usize = 20;
 const BOUNDED_SCAN_LOCK_BACKOFF: Duration = Duration::from_millis(20);
 // This same configured timeout derives the fixed data Get-batch deadline.
 const BOUNDED_CLIENT_RPC_TIMEOUT: Duration = Duration::from_secs(2);
@@ -627,65 +627,89 @@ impl TiKvWorkspaceBackend {
                 "bounded prefix scan requires a positive row limit".into(),
             ));
         }
-        let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
-        let mut transaction = self
-            .main_client()
-            .await?
-            .begin_with_options(options)
-            .await
-            .map_err(backend)?;
         let scoped_prefix = self.scoped(prefix);
         let upper = prefix_range_end(&scoped_prefix)
             .map(Key::from)
             .map(Bound::Excluded)
             .unwrap_or(Bound::Unbounded);
-        let mut lower = Bound::Included(Key::from(scoped_prefix));
-        let mut entries = Vec::new();
 
-        loop {
-            if max_records.is_some_and(|limit| entries.len() >= limit) {
-                break;
-            }
-            let batch_limit = max_records
-                .map(|limit| {
-                    let remaining = u32::try_from(limit - entries.len()).unwrap_or(u32::MAX);
-                    SCAN_BATCH_LIMIT.min(remaining)
-                })
-                .unwrap_or(SCAN_BATCH_LIMIT);
-            let range = BoundRange::new(lower.clone(), upper.clone());
-            let batch: Vec<KvPair> = transaction
-                .scan(range, batch_limit)
+        // A full layer scan is used during seal/hash and can observe a
+        // read-only key lock in one returned KvPair.  Restart the complete
+        // read transaction a finite number of times; no mutation has been
+        // submitted, so this is safe and lets the lock's secondary commit
+        // finish.  Exhaustion becomes Busy for the caller's outer CAS retry.
+        for lock_attempt in 0..=BOUNDED_SCAN_LOCK_RETRIES {
+            let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
+            let mut transaction = self
+                .main_client()
+                .await?
+                .begin_with_options(options)
                 .await
-                .map_err(backend)?
-                .collect();
-            let batch_len = batch.len();
-            if batch_len == 0 {
-                break;
-            }
-            for pair in batch {
-                let last_key: Vec<u8> = pair.key().clone().into();
-                lower = Bound::Excluded(Key::from(last_key.clone()));
-                let logical = last_key
-                    .strip_prefix(self.prefix.as_slice())
-                    .ok_or_else(|| {
-                        WorkspaceError::Backend(
-                            "TiKV workspace scan returned an out-of-namespace key".into(),
-                        )
-                    })?;
-                entries.push(KvEntry {
-                    key: logical.to_vec(),
-                    value: pair.value().to_vec(),
-                });
-            }
-            if batch_len < batch_limit as usize {
-                break;
-            }
-        }
+                .map_err(backend)?;
+            let mut lower = Bound::Included(Key::from(scoped_prefix.clone()));
+            let mut entries = Vec::new();
+            let mut retry = false;
 
-        if let Err(error) = transaction.rollback().await {
-            log::debug!("TiKV workspace scan rollback failed: {error}");
+            loop {
+                if max_records.is_some_and(|limit| entries.len() >= limit) {
+                    break;
+                }
+                let batch_limit = max_records
+                    .map(|limit| {
+                        let remaining = u32::try_from(limit - entries.len()).unwrap_or(u32::MAX);
+                        SCAN_BATCH_LIMIT.min(remaining)
+                    })
+                    .unwrap_or(SCAN_BATCH_LIMIT);
+                let range = BoundRange::new(lower.clone(), upper.clone());
+                let batch: Vec<KvPair> = match transaction.scan(range, batch_limit).await {
+                    Ok(batch) => batch.collect(),
+                    Err(error)
+                        if error.is_bounded_read_retryable_key_lock()
+                            && lock_attempt < BOUNDED_SCAN_LOCK_RETRIES =>
+                    {
+                        retry = true;
+                        break;
+                    }
+                    Err(error) => return Err(backend(error)),
+                };
+                let batch_len = batch.len();
+                if batch_len == 0 {
+                    break;
+                }
+                for pair in batch {
+                    let last_key: Vec<u8> = pair.key().clone().into();
+                    lower = Bound::Excluded(Key::from(last_key.clone()));
+                    let logical =
+                        last_key
+                            .strip_prefix(self.prefix.as_slice())
+                            .ok_or_else(|| {
+                                WorkspaceError::Backend(
+                                    "TiKV workspace scan returned an out-of-namespace key".into(),
+                                )
+                            })?;
+                    entries.push(KvEntry {
+                        key: logical.to_vec(),
+                        value: pair.value().to_vec(),
+                    });
+                }
+                if batch_len < batch_limit as usize {
+                    break;
+                }
+            }
+
+            if retry {
+                if let Err(error) = transaction.rollback().await {
+                    log::debug!("TiKV workspace scan retry rollback failed: {error}");
+                }
+                tokio::time::sleep(BOUNDED_SCAN_LOCK_BACKOFF).await;
+                continue;
+            }
+            if let Err(error) = transaction.rollback().await {
+                log::debug!("TiKV workspace scan rollback failed: {error}");
+            }
+            return Ok(entries);
         }
-        Ok(entries)
+        Err(WorkspaceError::Busy)
     }
 }
 
