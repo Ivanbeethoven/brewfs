@@ -1155,7 +1155,15 @@ impl TiKvWorkspaceBackend {
                 let current = match lock_result {
                     Ok(current) => current,
                     Err(error) => {
-                        let retryable = is_retryable(&error.to_string());
+                        // TiKV can return the certified bounded-read key-lock
+                        // envelope from get_for_update as well as from a
+                        // read-only scan. It is pre-submit and safe to retry,
+                        // but its diagnostic does not contain the legacy
+                        // "PessimisticLock" text used by is_retryable().
+                        // Classify it before mapping to a backend error so a
+                        // transient lock cannot escape the CAS retry budget.
+                        let retryable_key_lock = error.is_bounded_read_retryable_key_lock();
+                        let retryable = retryable_key_lock || is_retryable(&error.to_string());
                         if let Err(rollback_error) = transaction.rollback().await {
                             return Err(backend(format!(
                                 "{error}; CAS check rollback failed: {rollback_error}"
@@ -1170,6 +1178,14 @@ impl TiKvWorkspaceBackend {
                             // The catalog must reread its version and rebuild
                             // sequence/policy input after sustained contention.
                             return Ok(false);
+                        }
+                        if retryable_key_lock {
+                            // The bounded lock certificate is a transient
+                            // pre-submit condition even when TXN_MAX_RETRIES
+                            // is exhausted. Let the topology caller rebuild
+                            // its complete read packet and preserve Busy
+                            // semantics for the outer CAS retry budget.
+                            return Err(WorkspaceError::Busy);
                         }
                         return Err(backend(error));
                     }
