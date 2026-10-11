@@ -265,12 +265,30 @@ file target/release/brewfs target/release/$fixtureName
 
 function Publish-OssObject([string]$Path, [string]$Key) {
     $uri = "oss://$S3Bucket/$Key"
-    Write-Host "上传 OSS 对象: $Key"
-    $output = & $Aliyun oss cp $Path $uri --region $S3Region --force 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "OSS 上传失败 ($Key): $($output -join [Environment]::NewLine)"
+    $uploadPath = $Path
+    $temporaryPath = $null
+    try {
+        # Windows checkouts may contain CRLF. Normalize text payloads before
+        # they leave the host so shell/python entrypoints are executable on ECS.
+        if ([IO.Path]::GetExtension($Path) -in @('.sh', '.py')) {
+            $temporaryPath = Join-Path ([IO.Path]::GetTempPath()) ("brewfs-upload-{0}{1}" -f [Guid]::NewGuid().ToString('N'), [IO.Path]::GetExtension($Path))
+            $text = [IO.File]::ReadAllText($Path)
+            $text = $text.Replace([string][char]13 + [char]10, [string][char]10)
+            [IO.File]::WriteAllText($temporaryPath, $text, [Text.UTF8Encoding]::new($false))
+            $uploadPath = $temporaryPath
+        }
+        Write-Host "上传 OSS 对象: $Key"
+        $output = & $Aliyun oss cp $uploadPath $uri --region $S3Region --force 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "OSS 上传失败 ($Key): $($output -join [Environment]::NewLine)"
+        }
+        $script:UploadedKeys += $Key
     }
-    $script:UploadedKeys += $Key
+    finally {
+        if ($temporaryPath) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Get-OssSignedUrl([string]$Key, [int]$TimeoutSeconds = 172800) {
