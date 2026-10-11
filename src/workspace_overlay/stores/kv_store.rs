@@ -75,7 +75,11 @@ const CONTROL_MAGIC: &[u8; 8] = b"BWSCT002";
 const CATALOG_FORMAT: u32 = 2;
 const TOPOLOGY_GENERATION_KEY: &[u8] = b"packed/v3/topology-generation";
 
-const CAS_MAX_RETRIES: usize = 64;
+// TiKV can hold a bounded transaction lock across several scheduler ticks
+// while concurrent mounts are flushing writes. Keep this finite, but give
+// remote backends enough attempts to observe the next generation rather than
+// surfacing a transient Busy to the caller.
+const CAS_MAX_RETRIES: usize = 256;
 const VOLUME_FORMAT: &str = "workspace-v1";
 const PACKED_CLAIM: &[u8] = b"PWC3";
 const PACKED_ROOT_GENERATION_KEY: &[u8] = b"packed/v3/root-generation";
