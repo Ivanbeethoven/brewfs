@@ -248,4 +248,27 @@ before-after stats、scanner JSON、stdout/stderr、error samples、resource jou
 每次资源创建记durable journal、唯一OSS prefix、owned mount/container/volume/Redis/TiKV
 数据域和instance id，设置实例auto-release和外层deadline。正常/失败/超时都只清理本次
 owned资源并独立核验为零；referenced artifacts和operator-owned文件保留。cleanup失败
-也不能接受性能行。此文设计实验，本轮没有创建云资源或执行任何性能接受campaign。
+也不能接受性能行。此文设计实验；本轮仅执行云端校准与小规模诊断，尚未执行完整性能接受campaign。
+
+## 2026-10-12 云端执行冻结（packed-v3/005）
+
+当前执行基线固定为提交 `6cf182770050104c5871f2205780905c92b57b69`；workspace runner 的 Redis/TiKV 范围收紧提交为 `eb0376d`。所有新行必须在 ECS `i-bp138fribj3vquxxrpe6` 的 8 vCPU/32 GiB 环境运行，使用 release binary、wire=005、独立 fixture/namespace/prefix 和新 artifact 根目录。RustFS 镜像可从 `w23geq7ncegg6etqsl.xuanyuan.run/rustfs/rustfs:latest` 拉取，但 `latest` 只能作为来源标签；每行必须保存 `docker image inspect` 得到的 RepoDigest（当前已知 digest 为 `sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c`）。
+
+首轮只执行下列最小矩阵，先校准后扩展：
+
+| ID | 后端/语料 | 阶段与重复 | 预期门禁 |
+| --- | --- | --- | --- |
+| R-ctrl | Redis 7.x；100×100 KiB、固定 seed | init/seed/fork/isolation/concurrent fork+seal；1 次校准，随后 3 次 | fork/seal 全成功、错误为 0、cleanup zero；仅作 metadata control/lifecycle 诊断 |
+| T-nowriter | TiKV+PD 8.5；同一语料 | fork→single seal；1 次 | 操作校准；原始 cleanup 失败的历史行不得复用 |
+| T-writer | TiKV；同一语料 | writer 约 50 writes/s，C1/C2/C8 各 1 次 | 保存 Busy/region-lock 诊断；默认压力失败保持 rejected |
+| T-throttle | TiKV；同一语料 | writer 约 5 writes/s，C1 1 次 | 诊断通过，不替代默认压力出口 |
+| S3-FUSE-cold | RustFS；同一 immutable fixture | fresh mount→tree/stat/full，至少 3 次 paired | 0 error、checksum/trace 相同、fresh unmount、cleanup zero；未具备 native 对照时不得称三创新 acceptance |
+| S3-FUSE-remount | RustFS；同一 key | mount→full→unmount→fresh remount→同 trace | view identity、无残留；记录 remount/recovery 诊断 |
+| S3-ablate | RustFS；同一 fixture | inline-off、static-1MiB 或 metadata-raw，每次只变一个因素，3 次 | 仅作 ablation/diagnostic；缺完整 paired/native arm 时不升级性能验收 |
+| Native-pair | Redis/TiKV；同 placement/executor/trace | native vs packed，至少 3 对 | 当前 G08/G15 bridge 未完成，状态保持 blocked |
+
+每个云端行除现有 `run-manifest-v1` 文件外，必须保存 `environment.json`、`backend.json`、`lifecycle.json`、`cloud-resource-journal.json`、`cleanup-proof.json` 和 `acceptance.json`。云账本要覆盖 ECS/数据盘、Compose 容器/volume/network、RustFS image digest 与 bucket/prefix、Redis namespace 或 TiKV PD/store、FUSE mount/PID，并记录创建与删除时间；任一资源清理失败会使行 invalid。事后推断的 journal 必须命名为 `resource-journal.retrospective-rejected.json`，不能替代 contemporaneous journal。
+
+严格指标口径固定为 `TTL=0`、`direct_io=1`、`keep_cache=0`、decoded/window/payload cache=0、metadata cache 单独记录、workers=16、固定 shuffle seed。每个 full/partial 行保存 logical/payload bytes、checksum、errors、discovery/active/drain/unmount/GC/outer wall、active 与 active+drain 带宽，以及 p50/p95/p99；scanner 未产生的字段写 `null` 并给出 reason。native arm、完整 mutation→drain→seal→S1 publish→remount→pins→retire→GC 生命周期、ACK/operator E2E 和 Aliyun managed backend 仍按 blocked/incomplete 处理，不用 control smoke 填充。
+
+清理规则：测试结束立即删除本 run 的 FUSE mount、进程、Compose project、volume、network、RustFS prefix 和 Redis/TiKV namespace；只保留 manifest、日志、摘要和清理证明。先完成 100-file 零错误与 cleanup zero，再允许扩展到 1k/10k；禁止跨 HEAD 拼接旧的 `eece983`、`d7de84a` 或旧 binary artifact。
