@@ -227,18 +227,28 @@ def finalize_journal(
         raise JournalError("resource journal is already finalized")
     resources = latest_resources(value)
     verified_empty = resources_empty(resources)
+    snapshot_errors = [
+        error
+        for event in value.get("events", [])
+        if isinstance(event, dict) and event.get("name") == "resource-snapshot"
+        for error in (event.get("resources") or {}).get("errors", [])
+    ]
+    effective_status = int(status)
+    if snapshot_errors and effective_status == 0:
+        effective_status = 1
     value["events"].append({"name": "finalize", "at_utc": _now()})
     value["cleanup"] = {
         "compose_down_exit_status": int(down_status),
         "kept": bool(kept),
         "verified_empty": verified_empty,
+        "snapshot_errors": snapshot_errors,
         "remaining": resources,
     }
-    value["exit_status"] = int(status)
-    value["status"] = "passed" if status == 0 else "failed"
+    value["exit_status"] = effective_status
+    value["status"] = "passed" if effective_status == 0 else "failed"
     value["finalized_at_utc"] = _now()
     _atomic_write(path, value)
-    return verified_empty
+    return not snapshot_errors and (bool(kept) or verified_empty)
 
 
 def main() -> int:
@@ -282,17 +292,22 @@ def main() -> int:
         elif args.command == "stage":
             append_stage(args.path, args.stage, args.phase, args.status)
         elif args.command == "snapshot":
-            append_snapshot(args.path, args.stage, args.phase, args.project)
+            resources = append_snapshot(args.path, args.stage, args.phase, args.project)
+            if resources.get("errors"):
+                print("resource snapshot failed: " + "; ".join(resources["errors"]))
+                return 1
         elif args.command == "check-empty":
             if not resources_empty(latest_resources(_read(args.path))):
                 return 1
         else:
-            finalize_journal(
+            verification_ok = finalize_journal(
                 args.path,
                 status=args.status,
                 down_status=args.down_status,
                 kept=args.kept,
             )
+            if not verification_ok:
+                return 1
     except JournalError as error:
         print(f"resource journal error: {error}")
         return 1
