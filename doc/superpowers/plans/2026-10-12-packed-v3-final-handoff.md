@@ -3,9 +3,9 @@
 更新时间：2026-10-12 UTC  
 工作区：/home/hxy/brewfs  
 分支：codex/packed-metadata-aliyun-20260930  
-当前 HEAD：13a45b1
+当前 HEAD：e980d592801388c3c359d7e82b966df84f636e6f
 工作树：干净  
-PR：#161、#162、#164 已合并；#163 已关闭并由 #164 替代；#166 当前包含资源账本 fail-closed 与 RustFS 镜像源配置，等待 CI 后合并。
+PR：历史 PR #161、#162、#164 已合并；当前收尾证据以 e980d592 云端 artifact 为准。
 
 ## 范围和硬约束
 
@@ -77,3 +77,13 @@ RustFS/S3 packed-v3/005 full-read smoke 使用镜像 `w23geq7ncegg6etqsl.xuanyua
 三行均 `errors=0`、checksum `5050`、trace hash `36f0b83bcda0a6dd2e9a56851fb0942f499ecfe314623b5704b78a3418687066`，严格本地 resource journal 均 finalized passed，清理后的 cloud sidecar 明确标记为 retrospective/rejected。scanner 只产生 p50/p95，p99 为 unavailable；三行状态为 `valid-correctness`，不宣称性能接受、native paired 或完整对象生命周期已完成。
 
 本轮新增 `workspace-control-resource-journal-v1` 为 workspace-v1 control runner 的独立资源账本；它记录 build/backend/control/test/cleanup 阶段、Compose resource snapshots、down 退出码和归零核验。该账本不冒充 packed-v3 run-manifest；任何 snapshot 或 Compose cleanup 失败都会使 control run 非零。
+
+## 2026-10-12 current e980 closeout
+
+- 当前权威源码为 `e980d592801388c3c359d7e82b966df84f636e6f`，工作树保持干净；本轮只保留 packed-v3/005 目标。
+- operator v3 云端 artifact：`/mnt/brewfs-data/artifacts/operator-v3-e980d592-20261012T104900Z/`。`cargo test --features workspace-operator` 57 passed，Clippy 以 `-D warnings -A clippy::double_must_use` 通过，CRD 生成和 diff 通过，资源清理通过；Kubernetes API server unavailable，因此 operator E2E/recovery 仍 blocked。
+- 新加坡 ECS SSH 已恢复。`brewfs-singapore` 使用 Windows OpenSSH、公钥 `C:/Users/HXY/.ssh/brewfs-singapore`，远端已验证 `MaxSessions=10`、SFTP、pubkey-only、Git、POSIX shell、home 可写和 `/mnt/brewfs-data`。安全组保留 `188.253.126.208/28` 规则，并补充当前实际出口 `188.253.126.202/32`；临时 `0.0.0.0/0` 诊断规则已删除。修复后已复测公钥 SSH、SFTP 与远端 Claude Code 2.1.296。
+- 本地 Claude Desktop 3P 配置已在 `%LOCALAPPDATA%\\Claude-3p\\configLibrary\\00000000-0000-4000-8000-000000157210.json` 加入 `sshHostAllowlist=["47.237.124.152"]` 和 `sshTransport="system-openssh"`，原文件保留 `.bak-20261012-193118`。本地 `~/.ssh/config` 已创建 `brewfs-singapore` 条目，host key 已写入 `known_hosts`。需要完全退出并重新打开 Claude Desktop 后，Code 环境选择器才会读取新配置。
+- 远端 Claude Code 2.1.296 已安装到 `/home/hxy/.local/bin/claude`，并通过 `/usr/local/bin/claude` 提供 PATH 入口。ccswitch 仍是本地 gateway；当前 `inferenceGatewayBaseUrl=http://127.0.0.1:15721/claude-desktop`，按 Claude 文档远端主机不能访问设备 localhost，因此 SSH session 的推理网关仍是外部门禁，不能宣称远端 Claude session 已完成。
+- ECS 包月仅做了阿里云 `ModifyInstanceChargeType` 的 DryRun：`PrePaid`、`Period=1`、`PeriodUnit=Month`、`IncludeDataDisks=true` 校验通过，当前实例仍未改为包月，也未产生费用。
+- 当前 release 构建使用独立 `/mnt/brewfs-data/target-packed`、单 job、`RUSTFLAGS=-C debuginfo=0`；结果以 `build-packed-e980d592-*` artifact 为准。构建完成后才允许运行 RustFS/S3 严格 smoke；未完成前不更新性能 acceptance。
