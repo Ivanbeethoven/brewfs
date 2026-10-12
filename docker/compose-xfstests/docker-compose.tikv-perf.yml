@@ -69,7 +69,7 @@ services:
       - brewfs-xfstests
 
   rustfs:
-    image: rustfs/rustfs:latest
+    image: ${RUSTFS_IMAGE:-w23geq7ncegg6etqsl.xuanyuan.run/rustfs/rustfs:latest}
     container_name: rustfs-brewfs-perf-tikv
     expose:
       - "9000"
