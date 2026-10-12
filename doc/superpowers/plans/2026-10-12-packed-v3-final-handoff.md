@@ -3,13 +3,15 @@
 更新时间：2026-10-12 UTC  
 工作区：/home/hxy/brewfs  
 分支：codex/packed-metadata-aliyun-20260930  
-当前 HEAD：efca5468d2c2a57ac7dba31e1243effaabf50acf
+当前 HEAD：13a45b1
 工作树：干净  
 PR：#161、#162、#164 已合并；#163 已关闭并由 #164 替代；#166 当前包含资源账本 fail-closed 与 RustFS 镜像源配置，等待 CI 后合并。
 
 ## 范围和硬约束
 
 本交接只接受 packed-v3/005。v2、旧 wire、flat、CR 和 v5 兼容路线均不在目标内，也没有恢复兼容别名。后续性能和集成测试统一在 ECS i-bp138fribj3vquxxrpe6 上执行：8 vCPU、32 GiB、512 GiB 数据盘（/mnt/brewfs-data）。 Docker/RustFS 镜像优先使用 w23geq7ncegg6etqsl.xuanyuan.run。本地 WSL 只做静态审计、文档和轻量验证。
+
+CI 的 workspace overlay control smoke 仅设置 `BREWFS_WORKSPACE_ALLOW_EXPECTED_CONTENTION=1` 以记录并放行明确的 `workspace is busy` contention；脚本默认值为严格模式，任何未知错误仍使运行失败。云端正式实验继续使用严格模式，预期 contention 只能作为 rejected diagnostic evidence。
 
 ## 当前已确认的代码和测试结果
 
