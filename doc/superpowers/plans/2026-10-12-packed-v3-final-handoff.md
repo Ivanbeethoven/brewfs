@@ -3,7 +3,7 @@
 更新时间：2026-10-12 UTC  
 工作区：/home/hxy/brewfs  
 分支：codex/packed-metadata-aliyun-20260930  
-当前 HEAD：eece98394a41e3318a1405587b8dcd0fb6c7d43a  
+当前 HEAD：c7016bab54069ea01853f675502b2cee513e9677
 工作树：干净  
 PR：#161 已合并，合并提交 39c9e0e44b1b53c462635d84935f115fed946228
 
@@ -24,7 +24,10 @@ PR：#161 已合并，合并提交 39c9e0e44b1b53c462635d84935f115fed946228
 | operator | 默认单元 17 passed；workspace-operator 全 feature 57 passed；manifests、脚本和 Compose 静态检查通过 | 局部通过 |
 | Kubernetes/ACK E2E | 缺 API-server、Redis/TiKV namespace、Result Vault 和 managed backend 凭据 | 外部阻断 |
 
-RustFS smoke 的严格 artifact 合同已生成：toolchain.json、profile.env、run-manifest.json、resource-journal.json、summary.json。resource journal validator 退出码为 0；cleanup 字段全部为 false（即没有残留）；这不是把 Redis/TiKV 控制测试伪装成 packed fixture 测试。
+RustFS smoke 保留 toolchain.json、profile.env、run-manifest.json、summary.json，以及经审计隔离的 resource-journal.retrospective-rejected.json 和 retrospective-resource-evidence.json。由于原始 resource journal 是事后推断生成，严格 contemporaneous resource-journal validation 标记为 unavailable；不能把它当成严格资源账本通过。远端审计确认 BrewFS 容器、进程、挂载、volume 和 network 均已清理，artifact 目录仅作为证据保留。
+
+## PR #162 CI 收尾结果（2026-10-12）
+`c7016ba` 的 CI run `38185393737` 中，Rust 前置检查和 `Test workspace` 通过，`Test all features` 因 GitHub runner shutdown signal（exit 143）中断，未发现源码测试断言失败。Redis control smoke 的 fork 为 8/8，但 concurrent seal 为 7/8；TiKV fork 为 8/8，但 concurrent seal 为 5/8。失败请求均返回明确的 `workspace is busy`，与高频 mounted writer 下的已知 contention 边界一致；这些结果保留为失败证据，不能标为 acceptance。Rust job 已按原 commit 重跑，后端 smoke 结果不重跑、不拼接。
 
 ## TiKV 结论
 
