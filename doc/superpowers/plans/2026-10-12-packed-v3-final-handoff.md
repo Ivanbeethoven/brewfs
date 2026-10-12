@@ -3,9 +3,9 @@
 更新时间：2026-10-12 UTC  
 工作区：/home/hxy/brewfs  
 分支：codex/packed-metadata-aliyun-20260930  
-当前 HEAD：c7016bab54069ea01853f675502b2cee513e9677
+当前 HEAD：d7de84ae919ccb761a397b5dafb68f45bdf36578
 工作树：干净  
-PR：#161 已合并，合并提交 39c9e0e44b1b53c462635d84935f115fed946228
+PR：#161 已合并，合并提交 39c9e0e44b1b53c462635d84935f115fed946228；#162 已合并，合并提交 63c3a2cc8462f99110b4d448662641aa3fb451e5
 
 ## 范围和硬约束
 
