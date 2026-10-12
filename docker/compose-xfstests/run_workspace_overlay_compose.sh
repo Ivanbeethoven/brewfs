@@ -168,6 +168,7 @@ cleanup() {
     local status=$?
     local down_status=0
     local clean_status=0
+    local snapshot_status=0
     local cleanup_stage_status=0
     local final_status="$status"
     set +e
@@ -175,7 +176,7 @@ cleanup() {
         --path "$journal_path" --stage cleanup --phase start || true
     python3 "$journal_helper" snapshot \
         --path "$journal_path" --stage cleanup --phase start \
-        --project "$project_name" || clean_status=1
+        --project "$project_name" || snapshot_status=1
     if [[ "$KEEP" == false ]]; then
         log "stopping Compose project $project_name"
         docker compose "${compose_args[@]}" --profile redis --profile tikv \
@@ -189,13 +190,17 @@ cleanup() {
     fi
     python3 "$journal_helper" snapshot \
         --path "$journal_path" --stage cleanup --phase cleanup \
-        --project "$project_name" || clean_status=1
+        --project "$project_name" || snapshot_status=1
     if [[ "$KEEP" == false ]]; then
         python3 "$journal_helper" check-empty --path "$journal_path"
         clean_status=$?
         if (( clean_status != 0 )); then
             log "Compose project resources remain after cleanup; inspect $journal_path"
         fi
+    fi
+    if (( snapshot_status != 0 )); then
+        clean_status=1
+        log "resource cleanup snapshot failed; inspect $journal_path"
     fi
     if (( down_status != 0 && final_status == 0 )); then
         final_status="$down_status"
