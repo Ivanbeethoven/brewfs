@@ -222,7 +222,10 @@ cleanup() {
     if [[ "$KEEP" == true ]]; then
         finalize_args+=(--kept)
     fi
-    "${finalize_args[@]}" || log "resource journal finalization failed"
+    if ! "${finalize_args[@]}"; then
+        log "resource journal finalization failed"
+        final_status=1
+    fi
     set -e
     exit "$final_status"
 }
