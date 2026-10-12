@@ -272,3 +272,6 @@ owned资源并独立核验为零；referenced artifacts和operator-owned文件�
 严格指标口径固定为 `TTL=0`、`direct_io=1`、`keep_cache=0`、decoded/window/payload cache=0、metadata cache 单独记录、workers=16、固定 shuffle seed。每个 full/partial 行保存 logical/payload bytes、checksum、errors、discovery/active/drain/unmount/GC/outer wall、active 与 active+drain 带宽，以及 p50/p95/p99；scanner 未产生的字段写 `null` 并给出 reason。native arm、完整 mutation→drain→seal→S1 publish→remount→pins→retire→GC 生命周期、ACK/operator E2E 和 Aliyun managed backend 仍按 blocked/incomplete 处理，不用 control smoke 填充。
 
 清理规则：测试结束立即删除本 run 的 FUSE mount、进程、Compose project、volume、network、RustFS prefix 和 Redis/TiKV namespace；只保留 manifest、日志、摘要和清理证明。先完成 100-file 零错误与 cleanup zero，再允许扩展到 1k/10k；禁止跨 HEAD 拼接旧的 `eece983`、`d7de84a` 或旧 binary artifact。
+### 2026-10-12 校准结果回填
+
+R-ctrl 的 current release run 已落在 `6cf1827-redis-control-rerun-20261012T020200Z`：fork/isolation/concurrent-fork 为 8/8，concurrent-seal 为 3/8，`workspace is busy` 失败和 cleanup-zero 已保存；该行是 rejected contention evidence。RustFS S3/FUSE 的三次 100×100 KiB full rows 均为 0 errors、相同 checksum/trace，artifact 状态为 valid-correctness，p99、native paired、完整 lifecycle 仍缺失。`workspace-control-resource-journal-v1` 已用于 workspace-v1 control runner，独立于 packed-v3 manifest。不要用这些 smoke 结果填充 R2–R4 acceptance。

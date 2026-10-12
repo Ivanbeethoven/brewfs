@@ -64,6 +64,8 @@ bash k8s/run_xfstests/run_redis_xfstests.sh --image <your-registry>/brewfs-xfste
 ```
 
 当前脚本固定使用 `rustfs` 作为对象存储，也就是固定 `BREWFS_DATA_BACKEND=s3`。
+RustFS 默认镜像为 `w23geq7ncegg6etqsl.xuanyuan.run/rustfs/rustfs:latest`；可通过
+`RUSTFS_IMAGE` 环境变量覆盖（每次云端运行仍应记录最终 RepoDigest）。
 
 常用参数：
 

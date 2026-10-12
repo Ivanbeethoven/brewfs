@@ -53,7 +53,7 @@ require_non_negative_integer() {
 
 K8S_NAMESPACE="brewfs-xfstests"
 XFSTESTS_IMAGE=""
-RUSTFS_IMAGE="rustfs/rustfs:latest"
+RUSTFS_IMAGE="${RUSTFS_IMAGE:-w23geq7ncegg6etqsl.xuanyuan.run/rustfs/rustfs:latest}"
 AWSCLI_IMAGE="amazon/aws-cli:latest"
 XFSTESTS_CASES_VALUE=""
 XFSTESTS_SKIP_CASES_VALUE="0"

@@ -3,13 +3,15 @@
 更新时间：2026-10-12 UTC  
 工作区：/home/hxy/brewfs  
 分支：codex/packed-metadata-aliyun-20260930  
-当前 HEAD：6cf182770050104c5871f2205780905c92b57b69
+当前 HEAD：e980d592801388c3c359d7e82b966df84f636e6f
 工作树：干净  
-PR：#161、#162、#164 已合并；#162 合并提交 63c3a2cc8462f99110b4d448662641aa3fb451e5，#164 合并提交 638ca80。#163 已关闭并由 #164 替代。
+PR：历史 PR #161、#162、#164 已合并；当前收尾证据以 e980d592 云端 artifact 为准。
 
 ## 范围和硬约束
 
 本交接只接受 packed-v3/005。v2、旧 wire、flat、CR 和 v5 兼容路线均不在目标内，也没有恢复兼容别名。后续性能和集成测试统一在 ECS i-bp138fribj3vquxxrpe6 上执行：8 vCPU、32 GiB、512 GiB 数据盘（/mnt/brewfs-data）。 Docker/RustFS 镜像优先使用 w23geq7ncegg6etqsl.xuanyuan.run。本地 WSL 只做静态审计、文档和轻量验证。
+
+CI 的 workspace overlay control smoke 仅设置 `BREWFS_WORKSPACE_ALLOW_EXPECTED_CONTENTION=1` 以记录并放行明确的 `workspace is busy` contention；脚本默认值为严格模式，任何未知错误仍使运行失败。云端正式实验继续使用严格模式，预期 contention 只能作为 rejected diagnostic evidence。
 
 ## 当前已确认的代码和测试结果
 
@@ -60,3 +62,28 @@ RustFS smoke 保留 toolchain.json、profile.env、run-manifest.json、summary.j
 - 当前 HEAD 的 ECS release 构建已重新提交，前一次失败原因是 Cloud Assistant `/bin/sh` 不支持 `pipefail`/process substitution；本次使用 POSIX shell，构建结果必须以 `/mnt/brewfs-data/artifacts/build-6cf1827-workspace-overlay-*/binary.sha256` 为准。
 - 用户提供的镜像源 `w23geq7ncegg6etqsl.xuanyuan.run` 已纳入云实验约束；RustFS 使用已记录 digest，Redis/TiKV 镜像仍需在每行保存 RepoDigest。
 - 本轮只允许把 Redis/TiKV control-only、TiKV contention 诊断和 RustFS/S3 小规模 FUSE smoke 记为对应范围的 correctness/diagnostic 证据；完整生命周期、native paired acceptance、ACK/operator 和 managed backend 继续保持 incomplete/blocked。
+## 2026-10-12 云端校准结果
+
+当前 release binary 已在 ECS 构建成功：`/mnt/brewfs-data/artifacts/build-6cf1827-workspace-overlay-20261012T011449Z/brewfs`，SHA-256 为 `92288b815646edba4db76c768078ce19484fc6754a996cf8831df91a8aa1e47e`。构建日志记录 `Finished release profile`；fixture 源文件在 `eece983` 与当前 `6cf1827` 的 hash 相同（`a88c178da2eb1d584b5700e77852443fca5d6f7981e25e9ee4daa71fdf7b70cc`），但当前 fixture 独立编译在 Cloud Assistant deadline 内未完成，因此 RustFS 行显式记录为 reused-fixture correctness evidence，不作为严格 binary/toolchain paired performance acceptance。
+
+Redis 当前 binary control smoke artifact：`/mnt/brewfs-data/artifacts/6cf1827-redis-control-rerun-20261012T020200Z`。seed、双 workspace isolation 和 concurrent fork 均通过（8/8）；concurrent seal 为 3/8，5 个失败的 stderr 均为 `workspace is busy`。post-run cleanup proof 显示 Compose container/volume/network、主机 BrewFS PID 和 FUSE mount 全部为零；`acceptance.json` 为 `rejected`。该场景同时运行每 20ms writer 和 8 个 seal，8 个 seal 还共享全局 `packed/v3/topology-generation` 与 `alloc/sealed_version`，因此只能记录为联合 contention 压力证据；当前没有 no-writer C8 对照，不能把 writer 认定为唯一根因。
+
+RustFS/S3 packed-v3/005 full-read smoke 使用镜像 `w23geq7ncegg6etqsl.xuanyuan.run/rustfs/rustfs:latest`，RepoDigest 为 `sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c`。三次独立 100×100 KiB、zstd/zstd、size-only、inline-on、TTL0/direct-io/keep-cache0 行分别为：
+
+- `/mnt/brewfs-data/src/brewfs/docker/compose-xfstests/artifacts/packed-local-20261012T023607Z-34773`
+- `/mnt/brewfs-data/src/brewfs/docker/compose-xfstests/artifacts/packed-local-20261012T024319Z-35618`
+- `/mnt/brewfs-data/src/brewfs/docker/compose-xfstests/artifacts/packed-local-20261012T024335Z-36377`
+
+三行均 `errors=0`、checksum `5050`、trace hash `36f0b83bcda0a6dd2e9a56851fb0942f499ecfe314623b5704b78a3418687066`，严格本地 resource journal 均 finalized passed，清理后的 cloud sidecar 明确标记为 retrospective/rejected。scanner 只产生 p50/p95，p99 为 unavailable；三行状态为 `valid-correctness`，不宣称性能接受、native paired 或完整对象生命周期已完成。
+
+本轮新增 `workspace-control-resource-journal-v1` 为 workspace-v1 control runner 的独立资源账本；它记录 build/backend/control/test/cleanup 阶段、Compose resource snapshots、down 退出码和归零核验。该账本不冒充 packed-v3 run-manifest；任何 snapshot 或 Compose cleanup 失败都会使 control run 非零。
+
+## 2026-10-12 current e980 closeout
+
+- 当前权威源码为 `e980d592801388c3c359d7e82b966df84f636e6f`，工作树保持干净；本轮只保留 packed-v3/005 目标。
+- operator v3 云端 artifact：`/mnt/brewfs-data/artifacts/operator-v3-e980d592-20261012T104900Z/`。`cargo test --features workspace-operator` 57 passed，Clippy 以 `-D warnings -A clippy::double_must_use` 通过，CRD 生成和 diff 通过，资源清理通过；Kubernetes API server unavailable，因此 operator E2E/recovery 仍 blocked。
+- 新加坡 ECS SSH 已恢复。`brewfs-singapore` 使用 Windows OpenSSH、公钥 `C:/Users/HXY/.ssh/brewfs-singapore`，远端已验证 `MaxSessions=10`、SFTP、pubkey-only、Git、POSIX shell、home 可写和 `/mnt/brewfs-data`。安全组保留 `188.253.126.208/28` 规则，并补充当前实际出口 `188.253.126.202/32`；临时 `0.0.0.0/0` 诊断规则已删除。修复后已复测公钥 SSH、SFTP 与远端 Claude Code 2.1.296。
+- 本地 Claude Desktop 3P 配置已在 `%LOCALAPPDATA%\\Claude-3p\\configLibrary\\00000000-0000-4000-8000-000000157210.json` 加入 `sshHostAllowlist=["47.237.124.152"]` 和 `sshTransport="system-openssh"`，原文件保留 `.bak-20261012-193118`。本地 `~/.ssh/config` 已创建 `brewfs-singapore` 条目，host key 已写入 `known_hosts`。需要完全退出并重新打开 Claude Desktop 后，Code 环境选择器才会读取新配置。
+- 远端 Claude Code 2.1.296 已安装到 `/home/hxy/.local/bin/claude`，并通过 `/usr/local/bin/claude` 提供 PATH 入口。ccswitch 仍是本地 gateway；当前 `inferenceGatewayBaseUrl=http://127.0.0.1:15721/claude-desktop`，按 Claude 文档远端主机不能访问设备 localhost，因此 SSH session 的推理网关仍是外部门禁，不能宣称远端 Claude session 已完成。
+- ECS 包月仅做了阿里云 `ModifyInstanceChargeType` 的 DryRun：`PrePaid`、`Period=1`、`PeriodUnit=Month`、`IncludeDataDisks=true` 校验通过，当前实例仍未改为包月，也未产生费用。
+- 当前 release 构建使用独立 `/mnt/brewfs-data/target-packed`、单 job、`RUSTFLAGS=-C debuginfo=0`；结果以 `build-packed-e980d592-*` artifact 为准。构建完成后才允许运行 RustFS/S3 严格 smoke；未完成前不更新性能 acceptance。

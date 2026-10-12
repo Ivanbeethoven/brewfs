@@ -28,6 +28,14 @@ concurrency="${BREWFS_WORKSPACE_CONCURRENCY:-8}"
     printf 'BREWFS_WORKSPACE_CONCURRENCY must be a positive integer\n' >&2
     exit 2
 }
+allow_expected_contention="${BREWFS_WORKSPACE_ALLOW_EXPECTED_CONTENTION:-0}"
+case "$allow_expected_contention" in
+    0|1) ;;
+    *)
+        printf 'BREWFS_WORKSPACE_ALLOW_EXPECTED_CONTENTION must be 0 or 1\n' >&2
+        exit 2
+        ;;
+esac
 writer_stop_file="$artifact_dir/writers.stop"
 catalog_args=(
     --meta-backend "$catalog_backend"
@@ -416,7 +424,43 @@ PY
     batch_ended="$(date +%s%N)"
     wait_writers
     write_concurrency_metrics seal "$batch_started" "$batch_ended"
-    (( cli_status == 0 )) || return 1
+    if (( cli_status != 0 )); then
+        if [[ "$allow_expected_contention" == 1 ]] && python3 - "$artifact_dir" "$concurrency" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+count = int(sys.argv[2])
+failed = []
+for index in range(1, count + 1):
+    timing = json.loads((root / f"seal-{index}.time.json").read_text())
+    if timing["exit_status"] == 0:
+        continue
+    log = (root / f"seal-{index}.log").read_text(errors="replace")
+    if "workspace is busy" not in log:
+        raise SystemExit(f"seal-{index} has an unknown failure")
+    failed.append(index)
+if not failed:
+    raise SystemExit("seal batch failed without a failed operation")
+(root / "concurrent-seal-contention.json").write_text(
+    json.dumps({
+        "status": "expected-contention",
+        "acceptance": "rejected",
+        "failed_operations": failed,
+        "failure_class": "workspace is busy",
+        "allow_expected_contention": True,
+    }, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+        then
+            log "concurrent seal recorded expected workspace contention (${concurrency} operations; acceptance rejected)"
+            return 0
+        fi
+        log "concurrent seal failed with an unknown error; inspect seal-*.log"
+        return 1
+    fi
     python3 - "$artifact_dir" "$concurrency" <<'PY'
 import json
 import pathlib

@@ -57,7 +57,7 @@ services:
       - brewfs-pjdfstest
 
   rustfs:
-    image: rustfs/rustfs:latest
+    image: ${RUSTFS_IMAGE:-w23geq7ncegg6etqsl.xuanyuan.run/rustfs/rustfs:latest}
     expose:
       - "9000"
       - "9001"
