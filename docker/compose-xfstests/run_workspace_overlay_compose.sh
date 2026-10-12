@@ -103,35 +103,127 @@ esac
 command -v cargo >/dev/null || die "cargo is required"
 command -v docker >/dev/null || die "docker is required"
 command -v git >/dev/null || die "git is required"
+command -v python3 >/dev/null || die "python3 is required"
 [[ -e /dev/fuse ]] || die "/dev/fuse is required"
 
 mkdir -p "$ARTIFACT_ROOT"
-export BREWFS_WORKSPACE_ARTIFACT_DIR="$ARTIFACT_ROOT"
 export BREWFS_WORKSPACE_META_BACKEND="$BACKEND"
 export BREWFS_WORKSPACE_META_URL="${BREWFS_WORKSPACE_META_URL:-redis://redis:6379/0}"
 export BREWFS_WORKSPACE_TIKV_PD_ENDPOINTS="${BREWFS_WORKSPACE_TIKV_PD_ENDPOINTS:-pd:2379}"
-export BREWFS_WORKSPACE_NAMESPACE="${BREWFS_WORKSPACE_NAMESPACE:-workspace-overlay-$(date +%s)-$RANDOM}"
 export XFSTESTS_CASES="$XFSTESTS_CASES_VALUE"
 
 ts="$(date +%Y%m%d-%H%M%S)-$RANDOM"
 project_name="brewfs-workspace-overlay-$ts"
+run_dir="$ARTIFACT_ROOT/workspace-overlay-$ts"
+mkdir -p "$run_dir"
+export BREWFS_WORKSPACE_ARTIFACT_DIR="$run_dir"
+export BREWFS_WORKSPACE_NAMESPACE="${BREWFS_WORKSPACE_NAMESPACE:-workspace-overlay-$ts}"
 compose_args=(-f "$COMPOSE_FILE" -p "$project_name")
+journal_helper="$PROJECT_DIR/tools/perf/workspace_control_resource_journal.py"
+journal_path="$run_dir/workspace-control-resource-journal.json"
+python3 "$journal_helper" init \
+    --path "$journal_path" \
+    --run-id "$ts" \
+    --artifact "$run_dir" \
+    --project "$project_name" \
+    --backend "$BACKEND" \
+    --namespace "$BREWFS_WORKSPACE_NAMESPACE"
+
+journal_stage_start() {
+    local stage="$1"
+    python3 "$journal_helper" stage \
+        --path "$journal_path" --stage "$stage" --phase start
+    python3 "$journal_helper" snapshot \
+        --path "$journal_path" --stage "$stage" --phase start \
+        --project "$project_name"
+}
+
+journal_stage_end() {
+    local stage="$1"
+    local stage_status="$2"
+    set +e
+    python3 "$journal_helper" snapshot \
+        --path "$journal_path" --stage "$stage" --phase end \
+        --project "$project_name" || log "resource snapshot failed for stage $stage"
+    python3 "$journal_helper" stage \
+        --path "$journal_path" --stage "$stage" --phase end \
+        --status "$stage_status" || log "resource journal stage update failed for $stage"
+    set -e
+}
+
+run_stage() {
+    local stage="$1"
+    shift
+    journal_stage_start "$stage"
+    local stage_status
+    set +e
+    "$@"
+    stage_status=$?
+    journal_stage_end "$stage" "$stage_status"
+    set -e
+    return "$stage_status"
+}
 
 cleanup() {
     local status=$?
+    local down_status=0
+    local clean_status=0
+    local cleanup_stage_status=0
+    local final_status="$status"
     set +e
+    python3 "$journal_helper" stage \
+        --path "$journal_path" --stage cleanup --phase start || true
+    python3 "$journal_helper" snapshot \
+        --path "$journal_path" --stage cleanup --phase start \
+        --project "$project_name" || clean_status=1
     if [[ "$KEEP" == false ]]; then
+        log "stopping Compose project $project_name"
         docker compose "${compose_args[@]}" --profile redis --profile tikv \
-            down -v --remove-orphans >/dev/null 2>&1 || true
+            down -v --remove-orphans >"$run_dir/compose-down.log" 2>&1
+        down_status=$?
+        if (( down_status != 0 )); then
+            log "Compose cleanup failed with status $down_status; see $run_dir/compose-down.log"
+        fi
     else
         log "keeping Compose project $project_name (--keep)"
     fi
-    exit "$status"
+    python3 "$journal_helper" snapshot \
+        --path "$journal_path" --stage cleanup --phase cleanup \
+        --project "$project_name" || clean_status=1
+    if [[ "$KEEP" == false ]]; then
+        python3 "$journal_helper" check-empty --path "$journal_path"
+        clean_status=$?
+        if (( clean_status != 0 )); then
+            log "Compose project resources remain after cleanup; inspect $journal_path"
+        fi
+    fi
+    if (( down_status != 0 && final_status == 0 )); then
+        final_status="$down_status"
+    elif (( clean_status != 0 && final_status == 0 )); then
+        final_status=1
+    fi
+    if (( down_status != 0 || clean_status != 0 )); then
+        cleanup_stage_status=1
+    fi
+    python3 "$journal_helper" stage \
+        --path "$journal_path" --stage cleanup --phase end \
+        --status "$cleanup_stage_status" || true
+    finalize_args=(
+        python3 "$journal_helper" finalize
+        --path "$journal_path"
+        --status "$final_status"
+        --down-status "$down_status"
+    )
+    if [[ "$KEEP" == true ]]; then
+        finalize_args+=(--kept)
+    fi
+    "${finalize_args[@]}" || log "resource journal finalization failed"
+    set -e
+    exit "$final_status"
 }
 trap cleanup EXIT INT TERM
 
-if [[ "$BUILD_IMAGES" == true ]]; then
-    log "building workspace-overlay release binary"
+build_release() {
     (
         cd "$PROJECT_DIR"
         CARGO_PROFILE_RELEASE_DEBUG=0 cargo build --release -p brewfs --bin brewfs \
@@ -139,7 +231,9 @@ if [[ "$BUILD_IMAGES" == true ]]; then
         mkdir -p target/docker
         install -m 755 target/release/brewfs target/docker/brewfs
     )
+}
 
+build_images() {
     log "building xfstests base image"
     docker compose "${compose_args[@]}" build --pull=false xfstests-base
     log "building workspace xfstests image"
@@ -148,19 +242,29 @@ if [[ "$BUILD_IMAGES" == true ]]; then
         log "building LTP image"
         docker compose "${compose_args[@]}" build --pull=false ltp
     fi
+}
+
+if [[ "$BUILD_IMAGES" == true ]]; then
+    log "building workspace-overlay release binary"
+    run_stage build-release build_release
+    run_stage build-images build_images
 fi
 
-case "$BACKEND" in
-    redis)
-        log "starting Redis metadata service"
-        docker compose "${compose_args[@]}" --profile redis up -d --wait redis
-        ;;
-    tikv)
-        log "starting TiKV/PD metadata services"
-        docker compose "${compose_args[@]}" --profile tikv up -d pd tikv
-        docker compose "${compose_args[@]}" --profile tikv run --rm --no-deps tikv-ready
-        ;;
-esac
+start_backend() {
+    case "$BACKEND" in
+        redis)
+            log "starting Redis metadata service"
+            docker compose "${compose_args[@]}" --profile redis up -d --wait redis
+            ;;
+        tikv)
+            log "starting TiKV/PD metadata services"
+            docker compose "${compose_args[@]}" --profile tikv up -d pd tikv
+            docker compose "${compose_args[@]}" --profile tikv run --rm --no-deps tikv-ready
+            ;;
+    esac
+}
+
+run_stage backend-start start_backend
 
 run_control() {
     local mode="$1"
@@ -168,36 +272,38 @@ run_control() {
 }
 
 log "initializing workspace catalog"
-run_control init
+run_stage init run_control init
 log "seeding shared base through a FUSE mount"
-run_control seed
+run_stage seed run_control seed
 log "forking two independent workspaces"
-run_control fork
+run_stage fork run_control fork
 log "verifying simultaneous workspace isolation"
-run_control verify
+run_stage verify run_control verify
 log "verifying concurrent forks with two mounted writers"
-run_control concurrent-fork
+run_stage concurrent-fork run_control concurrent-fork
 log "verifying concurrent seals with two mounted writers"
-run_control concurrent-seal
+run_stage concurrent-seal run_control concurrent-seal
 
 status=0
 if [[ "$RUN_XFSTESTS" == true ]]; then
     log "running xfstests on both workspaces"
-    set +e
-    docker compose "${compose_args[@]}" run --rm --no-deps xfstests
-    xfstests_status=$?
-    set -e
+    if run_stage xfstests docker compose "${compose_args[@]}" run --rm --no-deps xfstests; then
+        xfstests_status=0
+    else
+        xfstests_status=$?
+    fi
     (( xfstests_status == 0 )) || status=1
 fi
 
 if [[ "$RUN_LTP" == true ]]; then
     log "running LTP filesystem tests on both workspaces"
-    set +e
-    docker compose "${compose_args[@]}" run --rm --no-deps ltp
-    ltp_status=$?
-    set -e
+    if run_stage ltp docker compose "${compose_args[@]}" run --rm --no-deps ltp; then
+        ltp_status=0
+    else
+        ltp_status=$?
+    fi
     (( ltp_status == 0 )) || status=1
 fi
 
-log "artifacts: $ARTIFACT_ROOT"
+log "artifacts: $run_dir"
 exit "$status"
