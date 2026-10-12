@@ -48,3 +48,7 @@ canonical proof 为 [cloud-proof-summary.txt](../../../docker/compose-xfstests/a
 ## 资源和证据卫生
 
 canonical proof、失败诊断和当前交接文档必须保留。测试结束后删除临时 ECS、数据盘、Compose/镜像和未绑定上传对象；可重建的 target 与缓存可清理以保证磁盘空间。任何 cleanup 失败都应使 run 失败并保留诊断，不得用成功 workload 结果覆盖资源残留。
+
+## 2026-10-12 当前权威更新
+
+当前权威交接为 [2026-10-12-packed-v3-final-handoff.md](2026-10-12-packed-v3-final-handoff.md)。HEAD 已推进到 eece98394a41e3318a1405587b8dcd0fb6c7d43a，PR #161 已以合并提交 39c9e0e44b1b53c462635d84935f115fed946228 合并。Redis current HEAD control-only 已通过（fork/seal 8/8）；TiKV 无 writer 单 seal 通过，但默认 writer 压力 C1/C2/C8 仍失败，降频诊断通过且资源已清理。RustFS/S3 已用 current HEAD binary SHA 805ed09c... 在镜像 w23geq7ncegg6etqsl.xuanyuan.run/rustfs/rustfs:latest 上完成 100 文件 tree/stat/smallfiles smoke，artifact 为 /mnt/brewfs-data/artifacts/eece983-rustfs-smoke-20261011T233500Z，严格 manifest/journal/summary 已生成。完整生命周期、paired acceptance、消融、operator/ACK E2E 和 managed-backend 条件仍开放，不能标记所有 SPEC 完成。
