@@ -4,8 +4,11 @@ set -euo pipefail
 
 bin="${BREWFS_BIN:-/usr/local/bin/brewfs}"
 state_dir="${BREWFS_WORKSPACE_STATE_DIR:-/var/lib/brewfs}"
-catalog_url="${BREWFS_WORKSPACE_CATALOG_URL:-sqlite:workspace.db}"
-catalog_backend="${BREWFS_WORKSPACE_META_BACKEND:-sqlx}"
+# This harness is part of the packed-v3 Redis/TiKV acceptance path. Keep the
+# historical sqlx/SQLite implementation in the product, but do not let an
+# unset environment silently route an experiment to it.
+catalog_url="${BREWFS_WORKSPACE_CATALOG_URL:-redis://redis:6379/0}"
+catalog_backend="${BREWFS_WORKSPACE_META_BACKEND:-redis}"
 catalog_tikv_endpoints="${BREWFS_WORKSPACE_TIKV_PD_ENDPOINTS:-pd:2379}"
 catalog_namespace="${BREWFS_WORKSPACE_NAMESPACE:-brewfs}"
 data_dir="${BREWFS_DATA_DIR:-$state_dir/data}"
@@ -31,7 +34,7 @@ catalog_args=(
     --workspace-namespace "$catalog_namespace"
 )
 case "$catalog_backend" in
-    sqlx|redis) catalog_args+=(--meta-url "$catalog_url") ;;
+    redis) catalog_args+=(--meta-url "$catalog_url") ;;
     tikv) catalog_args+=(--meta-tikv-pd-endpoints "$catalog_tikv_endpoints") ;;
     *) printf 'unsupported workspace catalog backend: %s\n' "$catalog_backend" >&2; exit 2 ;;
 esac

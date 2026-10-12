@@ -13,7 +13,10 @@ RUN_XFSTESTS=true
 RUN_PJDFSTEST=true
 BUILD_IMAGES=true
 PARALLEL_SUITES=false
-META_BACKEND="${BREWFS_WORKSPACE_META_BACKEND:-sqlite}"
+# Packed-v3 workspace experiments are intentionally scoped to the distributed
+# metadata catalogs. SQLite/sqlx remains available to historical code paths,
+# but must not be selected by this acceptance runner.
+META_BACKEND="${BREWFS_WORKSPACE_META_BACKEND:-redis}"
 WORKSPACE_COUNT=2
 
 log() { printf '[workspace-overlay] %s\n' "$*"; }
@@ -34,7 +37,7 @@ Options:
   --reuse-images            reuse existing feature-enabled images
   --parallel-suites         run workspace A and B suites concurrently
   --single-workspace        run suites only on workspace A
-  --meta-backend BACKEND    workspace catalog: sqlite, redis or tikv
+  --meta-backend BACKEND    workspace catalog: redis or tikv (default: $META_BACKEND)
   -h, --help                show this help
 EOF
 }
@@ -82,8 +85,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$META_BACKEND" in
-    sqlite|redis|tikv) ;;
-    *) die "--meta-backend must be sqlite, redis or tikv" ;;
+    redis|tikv) ;;
+    *) die "--meta-backend must be redis or tikv (sqlite/sqlx is not an acceptance backend)" ;;
 esac
 
 command -v cargo >/dev/null || die "cargo is required"
@@ -100,8 +103,8 @@ mkdir -p "$state_dir" "$run_dir/dual-mount" "$run_dir/xfstests-a" \
 network="brewfs-workspace-$ts"
 dependency_containers=()
 catalog_namespace="workspace-$ts"
-catalog_url="sqlite:///var/lib/brewfs/workspace.db?mode=rwc"
-catalog_cli_backend="sqlx"
+catalog_url="${BREWFS_WORKSPACE_META_URL:-redis://redis:6379}"
+catalog_cli_backend="$META_BACKEND"
 catalog_tikv_endpoints="pd:2379"
 harness_script="$SCRIPT_DIR/run_workspace_overlay_dual_mount_in_container.sh"
 
@@ -118,11 +121,7 @@ trap cleanup_dependencies EXIT INT TERM
 
 docker network create "$network" >/dev/null
 case "$META_BACKEND" in
-    sqlite)
-        ;;
     redis)
-        catalog_cli_backend="redis"
-        catalog_url="redis://redis:6379"
         redis_container="brewfs-workspace-redis-$ts"
         dependency_containers+=("$redis_container")
         log "starting Redis workspace catalog"
@@ -172,7 +171,7 @@ catalog_cli_args=(
     --workspace-namespace "$catalog_namespace"
 )
 case "$catalog_cli_backend" in
-    sqlx|redis) catalog_cli_args+=(--meta-url "$catalog_url") ;;
+    redis) catalog_cli_args+=(--meta-url "$catalog_url") ;;
     tikv) catalog_cli_args+=(--meta-tikv-pd-endpoints "$catalog_tikv_endpoints") ;;
 esac
 
@@ -279,7 +278,6 @@ run_suite() {
         -e BREWFS_META_TIKV_PD_ENDPOINTS="$catalog_tikv_endpoints" \
         -e BREWFS_META_TIKV_NAMESPACE="$catalog_namespace" \
         -e BREWFS_WORKSPACE_NAMESPACE="$catalog_namespace" \
-        -e BREWFS_SQLITE_PATH=/var/lib/brewfs/workspace.db \
         -e BREWFS_DATA_BACKEND=local-fs \
         -e BREWFS_DATA_DIR=/var/lib/brewfs/data \
         -e BREWFS_CACHE_ROOT="/var/lib/brewfs/suite-cache/$workspace" \

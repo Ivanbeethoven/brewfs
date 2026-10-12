@@ -3,13 +3,13 @@
 更新时间：2026-10-12 UTC  
 工作区：/home/hxy/brewfs  
 分支：codex/packed-metadata-aliyun-20260930  
-当前 HEAD：d7de84ae919ccb761a397b5dafb68f45bdf36578
+当前 HEAD：6cf182770050104c5871f2205780905c92b57b69
 工作树：干净  
-PR：#161 已合并，合并提交 39c9e0e44b1b53c462635d84935f115fed946228；#162 已合并，合并提交 63c3a2cc8462f99110b4d448662641aa3fb451e5
+PR：#161、#162、#164 已合并；#162 合并提交 63c3a2cc8462f99110b4d448662641aa3fb451e5，#164 合并提交 638ca80。#163 已关闭并由 #164 替代。
 
 ## 范围和硬约束
 
-本交接只接受 packed-v3/005。v2、旧 wire、flat、CR 和 v5 兼容路线均不在目标内，也没有恢复兼容别名。后续性能和集成测试统一在 ECS i-bp138fribj3vquxxrpe6 上执行：8 vCPU、32 GiB、512 GiB 数据盘（/mnt/brewfs-data）。镜像拉取使用 w23geq7ncegg6etqsl.xuanyuan.run。本地 WSL 只做静态审计、文档和轻量验证。
+本交接只接受 packed-v3/005。v2、旧 wire、flat、CR 和 v5 兼容路线均不在目标内，也没有恢复兼容别名。后续性能和集成测试统一在 ECS i-bp138fribj3vquxxrpe6 上执行：8 vCPU、32 GiB、512 GiB 数据盘（/mnt/brewfs-data）。 Docker/RustFS 镜像优先使用 w23geq7ncegg6etqsl.xuanyuan.run。本地 WSL 只做静态审计、文档和轻量验证。
 
 ## 当前已确认的代码和测试结果
 
@@ -53,3 +53,10 @@ RustFS smoke 保留 toolchain.json、profile.env、run-manifest.json、summary.j
 保留上述云端 artifact、失败诊断和本交接文档。TiKV 慢 writer 诊断的容器、volume、network 已删除；远端当前没有活动容器或本 run 的残留 volume/network。不要删除 canonical proof 和失败 artifact；可回收的本地 target、镜像缓存和未绑定临时输出可继续清理。任何新的云 run 必须使用独立 bucket/prefix/metadata namespace，并生成相同五类 manifest/journal 文件。
 
 
+
+## 2026-10-12 本轮执行记录
+
+- `eb0376d` 将 workspace overlay suite 与 dual-mount harness 的实验入口收紧到 Redis/TiKV，并显式拒绝 sqlite/sqlx；`bash -n`、帮助文本和 sqlite 拒绝路径已验证。
+- 当前 HEAD 的 ECS release 构建已重新提交，前一次失败原因是 Cloud Assistant `/bin/sh` 不支持 `pipefail`/process substitution；本次使用 POSIX shell，构建结果必须以 `/mnt/brewfs-data/artifacts/build-6cf1827-workspace-overlay-*/binary.sha256` 为准。
+- 用户提供的镜像源 `w23geq7ncegg6etqsl.xuanyuan.run` 已纳入云实验约束；RustFS 使用已记录 digest，Redis/TiKV 镜像仍需在每行保存 RepoDigest。
+- 本轮只允许把 Redis/TiKV control-only、TiKV contention 诊断和 RustFS/S3 小规模 FUSE smoke 记为对应范围的 correctness/diagnostic 证据；完整生命周期、native paired acceptance、ACK/operator 和 managed backend 继续保持 incomplete/blocked。
