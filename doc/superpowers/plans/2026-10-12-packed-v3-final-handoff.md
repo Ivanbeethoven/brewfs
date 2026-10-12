@@ -60,3 +60,18 @@ RustFS smoke 保留 toolchain.json、profile.env、run-manifest.json、summary.j
 - 当前 HEAD 的 ECS release 构建已重新提交，前一次失败原因是 Cloud Assistant `/bin/sh` 不支持 `pipefail`/process substitution；本次使用 POSIX shell，构建结果必须以 `/mnt/brewfs-data/artifacts/build-6cf1827-workspace-overlay-*/binary.sha256` 为准。
 - 用户提供的镜像源 `w23geq7ncegg6etqsl.xuanyuan.run` 已纳入云实验约束；RustFS 使用已记录 digest，Redis/TiKV 镜像仍需在每行保存 RepoDigest。
 - 本轮只允许把 Redis/TiKV control-only、TiKV contention 诊断和 RustFS/S3 小规模 FUSE smoke 记为对应范围的 correctness/diagnostic 证据；完整生命周期、native paired acceptance、ACK/operator 和 managed backend 继续保持 incomplete/blocked。
+## 2026-10-12 云端校准结果
+
+当前 release binary 已在 ECS 构建成功：`/mnt/brewfs-data/artifacts/build-6cf1827-workspace-overlay-20261012T011449Z/brewfs`，SHA-256 为 `92288b815646edba4db76c768078ce19484fc6754a996cf8831df91a8aa1e47e`。构建日志记录 `Finished release profile`；fixture 源文件在 `eece983` 与当前 `6cf1827` 的 hash 相同（`a88c178da2eb1d584b5700e77852443fca5d6f7981e25e9ee4daa71fdf7b70cc`），但当前 fixture 独立编译在 Cloud Assistant deadline 内未完成，因此 RustFS 行显式记录为 reused-fixture correctness evidence，不作为严格 binary/toolchain paired performance acceptance。
+
+Redis 当前 binary control smoke artifact：`/mnt/brewfs-data/artifacts/6cf1827-redis-control-rerun-20261012T020200Z`。seed、双 workspace isolation 和 concurrent fork 均通过（8/8）；concurrent seal 为 3/8，5 个失败的 stderr 均为 `workspace is busy`。post-run cleanup proof 显示 Compose container/volume/network、主机 BrewFS PID 和 FUSE mount 全部为零；`acceptance.json` 为 `rejected`。该场景同时运行每 20ms writer 和 8 个 seal，8 个 seal 还共享全局 `packed/v3/topology-generation` 与 `alloc/sealed_version`，因此只能记录为联合 contention 压力证据；当前没有 no-writer C8 对照，不能把 writer 认定为唯一根因。
+
+RustFS/S3 packed-v3/005 full-read smoke 使用镜像 `w23geq7ncegg6etqsl.xuanyuan.run/rustfs/rustfs:latest`，RepoDigest 为 `sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c`。三次独立 100×100 KiB、zstd/zstd、size-only、inline-on、TTL0/direct-io/keep-cache0 行分别为：
+
+- `/mnt/brewfs-data/src/brewfs/docker/compose-xfstests/artifacts/packed-local-20261012T023607Z-34773`
+- `/mnt/brewfs-data/src/brewfs/docker/compose-xfstests/artifacts/packed-local-20261012T024319Z-35618`
+- `/mnt/brewfs-data/src/brewfs/docker/compose-xfstests/artifacts/packed-local-20261012T024335Z-36377`
+
+三行均 `errors=0`、checksum `5050`、trace hash `36f0b83bcda0a6dd2e9a56851fb0942f499ecfe314623b5704b78a3418687066`，严格本地 resource journal 均 finalized passed，清理后的 cloud sidecar 明确标记为 retrospective/rejected。scanner 只产生 p50/p95，p99 为 unavailable；三行状态为 `valid-correctness`，不宣称性能接受、native paired 或完整对象生命周期已完成。
+
+本轮新增 `workspace-control-resource-journal-v1` 为 workspace-v1 control runner 的独立资源账本；它记录 build/backend/control/test/cleanup 阶段、Compose resource snapshots、down 退出码和归零核验。该账本不冒充 packed-v3 run-manifest；任何 snapshot 或 Compose cleanup 失败都会使 control run 非零。
