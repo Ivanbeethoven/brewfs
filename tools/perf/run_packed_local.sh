@@ -21,6 +21,12 @@ DATA_CODEC="${PACKED_LOCAL_DATA_CODEC:-zstd}"
 ACCESS_PROFILE="${PACKED_LOCAL_ACCESS_PROFILE:-random-small-file}"
 P90_TRAINING_TRACE="${PACKED_LOCAL_P90_TRAINING_TRACE:-}"
 BINARY="${PACKED_LOCAL_BINARY:-$ROOT/target/debug/brewfs}"
+# Metadata placement arm. "packed" serves metadata from packed-v3 objects;
+# "native-tikv" imports the same authenticated manifest into an owned TiKV
+# namespace and serves metadata from it. Data, binary, trace, budgets and
+# cleanup are identical; only metadata placement differs.
+ARM="${PACKED_LOCAL_ARM:-packed}"
+TIKV_PD="${PACKED_LOCAL_TIKV_PD:-}"
 FIXTURE="${PACKED_LOCAL_FIXTURE:-$ROOT/target/debug/packed_v3_snapshot_fixture}"
 COMPOSE="$ROOT/docker/compose-xfstests/docker-compose.juicefs-perf.yml"
 for value in "$FILES" "$FILE_BYTES" "$METADATA_BYTES" "$WORKERS" "$EPOCHS" "$TIMEOUT_SECONDS" "$SCANNER_SEED"; do
@@ -37,6 +43,11 @@ case "$ACCESS_PROFILE" in random-small-file|sequential-small-file|mixed) ;; *) e
 [[ "$WIRE_VERSION" == 5 ]] || { printf 'Use the current packed-v3 encoding 005\n' >&2; exit 2; }
 case "$COLD_CORPUS" in true|false) ;; *) exit 2 ;; esac
 case "$HARDLINK_CORPUS" in true|false) ;; *) exit 2 ;; esac
+case "$ARM" in
+    packed) [[ -z "$TIKV_PD" ]] || { printf 'PACKED_LOCAL_TIKV_PD requires the native-tikv arm\n' >&2; exit 2; } ;;
+    native-tikv) [[ "$TIKV_PD" =~ ^127\.0\.0\.1:[0-9]+$ ]] || { printf 'native-tikv requires an owned loopback PACKED_LOCAL_TIKV_PD\n' >&2; exit 2; } ;;
+    *) printf 'PACKED_LOCAL_ARM must be packed or native-tikv\n' >&2; exit 2 ;;
+esac
 METADATA_PREFETCH=off
 [[ -x "$BINARY" && -x "$FIXTURE" && -e /dev/fuse ]] || { printf 'Build brewfs and fixture with workspace-overlay; enable FUSE\n' >&2; exit 2; }
 sudo -n true
@@ -46,7 +57,8 @@ if docker ps -a --format '{{.Names}}' | grep -qx 'rustfs-juicefs-perf'; then
 fi
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 FIXTURE_PREFIX="${PACKED_LOCAL_FIXTURE_PREFIX:-local-validation-$RUN_ID}"
-ARTIFACT="$ROOT/docker/compose-xfstests/artifacts/packed-local-$RUN_ID"
+ARTIFACT="${PACKED_LOCAL_ARTIFACT_ROOT:-$ROOT/docker/compose-xfstests/artifacts}/packed-local-$ARM-$RUN_ID"
+[[ ! -e "$ARTIFACT" ]] || { printf 'artifact already exists\n' >&2; exit 2; }
 PROJECT="packed-local-$$"
 WORK="$(mktemp -d)"
 mkdir -p "$ARTIFACT" "$WORK/mnt" "$WORK/cache"
@@ -267,13 +279,17 @@ FIXTURE_ARGS=(--wire-version 5 --frame-policy "$FRAME_POLICY" --inline-data "$IN
 [[ "$COLD_CORPUS" == true ]] && FIXTURE_ARGS+=(--cold-corpus true)
 [[ "$HARDLINK_CORPUS" == true ]] && FIXTURE_ARGS+=(--hardlink-corpus true)
 "$FIXTURE" "${FIXTURE_ARGS[@]}" --bucket brewfs-data --endpoint http://127.0.0.1:19000 --region us-east-1 --force-path-style true --prefix "$FIXTURE_PREFIX" --manifest-output "$ARTIFACT/manifest-key.txt" --dir-levels 2 --dirs-per-level 10 --files-per-dir "$((FILES / 100))" --small-file-size "$FILE_BYTES" --small-file-min-size "$FILE_BYTES" --small-file-max-size "$FILE_BYTES" >"$ARTIFACT/fixture.log" 2>&1
-python3 - "$WORK" "$ARTIFACT/manifest-key.txt" <<'PYCONFIG'
+TIKV_NAMESPACE="packed-native-$RUN_ID"
+python3 - "$WORK" "$ARTIFACT/manifest-key.txt" "$ARM" "$TIKV_PD" "$TIKV_NAMESPACE" <<'PYCONFIG'
 import pathlib,sys
 work=pathlib.Path(sys.argv[1]); key=pathlib.Path(sys.argv[2]).read_text().strip()
+arm, pd, namespace = sys.argv[3], sys.argv[4], sys.argv[5]
+meta = (f"meta:\n  backend: tikv\n  tikv:\n    pd_endpoints: [\"{pd}\"]\n    namespace: {namespace}\n"
+        if arm == "native-tikv" else "")
 (work/'mount.yaml').write_text(f"""mount_point: {work}/mnt
 volume_format: packed-metadata-v3
 packed_manifest_key: {key}
-data:
+{meta}data:
   backend: s3
   s3:
     bucket: brewfs-data
@@ -316,18 +332,32 @@ keep_cache=0
 loopback_proxy=disabled\ncold_corpus=%s\nhardlink_corpus=%s\n' "$FILES" "$FILE_BYTES" "$METADATA_BYTES" "$WORKERS" "$EPOCHS" "$MODE" "$METADATA_PREFETCH" "$WIRE_VERSION" "$FRAME_POLICY" "$INLINE_DATA" "$METADATA_CODEC" "$DATA_CODEC" "$ACCESS_PROFILE" "$COLD_CORPUS" "$HARDLINK_CORPUS" >"$ARTIFACT/profile.env"
 printf 'packed_version=v3\nscanner_seed=%s\nfixture_prefix=%s\nmanifest_schema=packed-v3-run-manifest-v1\n' "$SCANNER_SEED" "$FIXTURE_PREFIX" >>"$ARTIFACT/profile.env"
 [[ -n "$P90_TRACE_SHA" ]] && printf 'p90_training_trace_sha256=%s\n' "$P90_TRACE_SHA" >>"$ARTIFACT/profile.env"
+printf 'metadata_arm=%s\n' "$ARM" >>"$ARTIFACT/profile.env"
+if [[ "$ARM" == native-tikv ]]; then
+    printf 'tikv_namespace=%s\n' "$TIKV_NAMESPACE" >>"$ARTIFACT/profile.env"
+    # Construction is a separate, unmeasured operation. The mount process
+    # imports the pinned manifest into the owned namespace and exits.
+    IMPORT_START="$(date +%s%N)"
+    BREWFS_PACKED_METADATA_ARM=native-tikv BREWFS_PACKED_NATIVE_IMPORT=1 \
+        BREWFS_PACKED_METADATA_CACHE_BYTES="$METADATA_BYTES" RUST_LOG=warn,brewfs=info \
+        timeout 1200 "$BINARY" mount --config "$WORK/mount.yaml" "$WORK/mnt" >"$ARTIFACT/native-import.log" 2>&1
+    IMPORT_END="$(date +%s%N)"
+    printf '{"native_import_seconds": %s}\n' "$(( (IMPORT_END - IMPORT_START) / 1000000 ))e-3" >"$ARTIFACT/native-import.json"
+fi
 sync
 sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'
 printf 'page_cache=dropped\n' >"$ARTIFACT/cache-proof.env"
 START="$(date +%s%N)"
-BREWFS_PACKED_METADATA_CACHE_BYTES="$METADATA_BYTES" BREWFS_PACKED_METADATA_PREFETCH="$METADATA_PREFETCH" BREWFS_PACKED_DECODED_FRAME_CACHE_BYTES=0 BREWFS_PACKED_FRAME_WINDOW_CACHE_BYTES=0 BREWFS_PACKED_FRAME_WINDOW_PREFETCH=false BREWFS_CACHE_TTL_MS=0 BREWFS_FUSE_READ_DIRECT_IO=1 BREWFS_FUSE_KEEP_CACHE=0 RUST_LOG=warn,brewfs=info "$BINARY" mount --config "$WORK/mount.yaml" "$WORK/mnt" >"$ARTIFACT/brewfs.log" 2>&1 &
+BREWFS_PACKED_METADATA_ARM="$ARM" BREWFS_PACKED_NATIVE_IMPORT=0 \
+BREWFS_PACKED_METADATA_CACHE_BYTES="$METADATA_BYTES" BREWFS_PACKED_METADATA_PREFETCH="$METADATA_PREFETCH" BREWFS_PACKED_DECODED_FRAME_CACHE_BYTES=0 BREWFS_PACKED_FRAME_WINDOW_CACHE_BYTES=0 BREWFS_PACKED_FRAME_WINDOW_PREFETCH=false BREWFS_CACHE_TTL_MS=0 BREWFS_FUSE_READ_DIRECT_IO=1 BREWFS_FUSE_KEEP_CACHE=0 RUST_LOG="${PACKED_LOCAL_RUST_LOG:-warn,brewfs=info}" "$BINARY" mount --config "$WORK/mount.yaml" "$WORK/mnt" >"$ARTIFACT/brewfs.log" 2>&1 &
 PID=$!
-for _ in $(seq 1 600); do
+MOUNT_WAIT_SECONDS="${PACKED_LOCAL_MOUNT_WAIT_SECONDS:-60}"
+for _ in $(seq 1 $((MOUNT_WAIT_SECONDS * 10))); do
     mountpoint -q "$WORK/mnt" && break
     kill -0 "$PID" || { printf 'mount failed\n' >&2; exit 1; }
     sleep .1
 done
-mountpoint -q "$WORK/mnt"
+mountpoint -q "$WORK/mnt" || { printf 'mount not ready within %ss\n' "$MOUNT_WAIT_SECONDS" >&2; exit 1; }
 READY="$(date +%s%N)"
 if python3 "$ROOT/tools/perf/packed_resource_journal.py" event --path "$JOURNAL" --name mount_ready >>"$ARTIFACT/brewfs.log" 2>&1; then
     MOUNT_READY=true
@@ -374,8 +404,15 @@ for line in (p/'smaps_rollup').read_text().splitlines():
     if line.startswith(('Rss:','Pss:')): fields[line.split(':')[0]+'_kib']=int(line.split()[1])
 pathlib.Path(sys.argv[2]).write_text(json.dumps(fields)+'\n')
 PYMEM
-timeout --signal=TERM --kill-after=10 "$TIMEOUT_SECONDS" python3 "$ROOT/tools/perf/smallfiles_scan.py" --root "$WORK/mnt" --label packed-local --mode "$MODE" --expected-files "$FILES" --min-size "$FILE_BYTES" --max-size "$FILE_BYTES" --dir-levels 2 --dirs-per-level 10 --files-per-leaf "$((FILES / 100))" --workers "$WORKERS" --order shuffle --shuffle-seed "$SCANNER_SEED" --epochs "$EPOCHS" --batch-size 256 --max-inflight-batches 2 --json-output "$ARTIFACT/summary.json" >"$ARTIFACT/scanner.log" 2>&1
+scan_status=0
+timeout --signal=TERM --kill-after=10 "$TIMEOUT_SECONDS" python3 "$ROOT/tools/perf/smallfiles_scan.py" --root "$WORK/mnt" --label packed-local --mode "$MODE" --expected-files "$FILES" --min-size "$FILE_BYTES" --max-size "$FILE_BYTES" --dir-levels 2 --dirs-per-level 10 --files-per-leaf "$((FILES / 100))" --workers "$WORKERS" --order shuffle --shuffle-seed "$SCANNER_SEED" --epochs "$EPOCHS" --batch-size 256 --max-inflight-batches 2 --json-output "$ARTIFACT/summary.json" >"$ARTIFACT/scanner.log" 2>&1 || scan_status=$?
 SCAN_END="$(date +%s%N)"
+if (( scan_status != 0 )); then
+    # Preserve the mount's budget/rejection counters as failure evidence
+    # before teardown; the run still fails with the scanner's status.
+    tr -d '\000' <"$WORK/mnt/.stats" >"$ARTIFACT/fuse-stats.txt" 2>/dev/null || true
+    exit "$scan_status"
+fi
 python3 - "$PID" "$ARTIFACT/daemon-memory-after.json" <<'PYMEM'
 import pathlib,json,sys
 p=pathlib.Path('/proc')/sys.argv[1]
