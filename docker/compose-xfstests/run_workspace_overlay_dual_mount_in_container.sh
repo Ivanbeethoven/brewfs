@@ -37,6 +37,25 @@ case "$allow_expected_contention" in
         ;;
 esac
 writer_stop_file="$artifact_dir/writers.stop"
+writer_pause_file="$artifact_dir/writers.pause"
+# Writer pressure controls. Defaults keep the original high-frequency profile
+# (two mounted writers, one file every 20 ms). Reduced frequency, no-writer and
+# quiesced runs are separate diagnostics and are labelled in their metrics.
+writer_count="${BREWFS_WORKSPACE_WRITERS:-2}"
+writer_interval="${BREWFS_WORKSPACE_WRITER_INTERVAL:-0.02}"
+writer_quiesce="${BREWFS_WORKSPACE_WRITER_QUIESCE:-0}"
+[[ "$writer_count" =~ ^[0-2]$ ]] || {
+    printf 'BREWFS_WORKSPACE_WRITERS must be 0, 1 or 2\n' >&2
+    exit 2
+}
+[[ "$writer_interval" =~ ^[0-9]+(\.[0-9]+)?$ ]] || {
+    printf 'BREWFS_WORKSPACE_WRITER_INTERVAL must be a non-negative number of seconds\n' >&2
+    exit 2
+}
+[[ "$writer_quiesce" == 0 || "$writer_quiesce" == 1 ]] || {
+    printf 'BREWFS_WORKSPACE_WRITER_QUIESCE must be 0 or 1\n' >&2
+    exit 2
+}
 catalog_args=(
     --meta-backend "$catalog_backend"
     --workspace-namespace "$catalog_namespace"
@@ -240,31 +259,71 @@ print(f"{revision['layer_id']}:{revision['sealed_version']}:{bytes(revision['roo
 PY
 }
 
+writer_labels() {
+    case "$writer_count" in
+        0) ;;
+        1) printf 'a\n' ;;
+        2) printf 'a\nb\n' ;;
+    esac
+}
+
 start_writers() {
     local label target ready deadline
-    rm -f "$writer_stop_file" "$artifact_dir/writer-a.ready" "$artifact_dir/writer-b.ready"
-    for label in a b; do
+    rm -f "$writer_stop_file" "$writer_pause_file" \
+        "$artifact_dir/writer-a.ready" "$artifact_dir/writer-b.ready" \
+        "$artifact_dir/writer-a.paused" "$artifact_dir/writer-b.paused"
+    for label in $(writer_labels); do
         if [[ "$label" == a ]]; then target="$mount_a"; else target="$mount_b"; fi
         (
             index=0
             while [[ ! -e "$writer_stop_file" ]]; do
+                if [[ -e "$writer_pause_file" ]]; then
+                    # Quiesce: flush this mount's dirty data, acknowledge,
+                    # and issue no further writes until resumed or stopped.
+                    if [[ ! -e "$artifact_dir/writer-$label.paused" ]]; then
+                        sync "$target"
+                        : >"$artifact_dir/writer-$label.paused"
+                    fi
+                    sleep 0.05
+                    continue
+                fi
+                rm -f "$artifact_dir/writer-$label.paused"
                 index=$((index + 1))
                 printf '%s-%s\n' "$label" "$index" >"$target/concurrent-$label-$index.txt"
                 : >"$artifact_dir/writer-$label.ready"
-                sleep 0.02
+                sleep "$writer_interval"
             done
             sync "$target"
+            printf '%s\n' "$index" >"$artifact_dir/writer-$label.count"
         ) >"$artifact_dir/writer-$label.log" 2>&1 &
         writer_pids+=("$!")
     done
     deadline=$((SECONDS + 30))
-    for label in a b; do
+    for label in $(writer_labels); do
         ready="$artifact_dir/writer-$label.ready"
         until [[ -e "$ready" ]]; do
             (( SECONDS < deadline )) || { log "writer $label did not start"; return 1; }
             sleep 0.1
         done
     done
+}
+
+# Writer/seal coordination: pause the mounted writers, wait (bounded) until
+# each has flushed and acknowledged, run the topology batch, then resume. A
+# writer that does not acknowledge within the deadline fails the batch.
+quiesce_writers() {
+    local label deadline=$((SECONDS + 30))
+    : >"$writer_pause_file"
+    for label in $(writer_labels); do
+        until [[ -e "$artifact_dir/writer-$label.paused" ]]; do
+            (( SECONDS < deadline )) || { log "writer $label did not quiesce"; return 1; }
+            sleep 0.05
+        done
+    done
+}
+
+resume_writers() {
+    rm -f "$writer_pause_file"
 }
 
 wait_writers() {
@@ -300,8 +359,12 @@ measure_cli() {
 
 write_concurrency_metrics() {
     local label="$1" started="$2" ended="$3"
+    BREWFS_WORKSPACE_WRITERS="$writer_count" \
+    BREWFS_WORKSPACE_WRITER_INTERVAL="$writer_interval" \
+    BREWFS_WORKSPACE_WRITER_QUIESCE="$writer_quiesce" \
     python3 - "$artifact_dir" "$label" "$concurrency" "$started" "$ended" <<'PY'
 import json
+import os
 import pathlib
 import sys
 
@@ -330,7 +393,21 @@ succeeded = sum(operation["exit_status"] == 0 for operation in operations)
 report = {
     "scenario": f"concurrent-{label}",
     "timed_scope": "parallel CLI operations, excluding workspace setup and writer drain",
-    "mounted_writers": 2,
+    "mounted_writers": int(os.environ.get("BREWFS_WORKSPACE_WRITERS", "2")),
+    "writer_interval_seconds": float(os.environ.get("BREWFS_WORKSPACE_WRITER_INTERVAL", "0.02")),
+    "writer_quiesce": os.environ.get("BREWFS_WORKSPACE_WRITER_QUIESCE", "0") == "1",
+    "writer_files": {
+        label: int((root / f"writer-{label}.count").read_text())
+        for label in ("a", "b")
+        if (root / f"writer-{label}.count").exists()
+    },
+    "profile_class": (
+        "default-pressure"
+        if os.environ.get("BREWFS_WORKSPACE_WRITERS", "2") == "2"
+        and os.environ.get("BREWFS_WORKSPACE_WRITER_INTERVAL", "0.02") == "0.02"
+        and os.environ.get("BREWFS_WORKSPACE_WRITER_QUIESCE", "0") == "0"
+        else "diagnostic"
+    ),
     "operation_count": count,
     "success_count": succeeded,
     "batch_wall_seconds": wall_seconds,
@@ -409,6 +486,9 @@ PY
         return 1
     }
     start_writers
+    if [[ "$writer_quiesce" == 1 ]]; then
+        quiesce_writers || { wait_writers || true; return 1; }
+    fi
     local batch_started batch_ended
     batch_started="$(date +%s%N)"
     index=0
@@ -422,6 +502,7 @@ PY
     local cli_status=0
     wait_cli_jobs "${jobs[@]}" || cli_status=1
     batch_ended="$(date +%s%N)"
+    resume_writers
     wait_writers
     write_concurrency_metrics seal "$batch_started" "$batch_ended"
     if (( cli_status != 0 )); then

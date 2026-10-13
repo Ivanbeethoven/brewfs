@@ -315,6 +315,7 @@ def main() -> int:
             "mib_per_sec": 0.0,
             "latency_p50_ms": 0.0,
             "latency_p95_ms": 0.0,
+            "latency_p99_ms": 0.0,
             "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         }
         summaries = [summary]
@@ -373,6 +374,7 @@ def main() -> int:
                 "mib_per_sec": payload_bytes / elapsed / (1024 * 1024) if elapsed else 0.0,
                 "latency_p50_ms": percentile_ns(latencies, 0.50) / 1_000_000,
                 "latency_p95_ms": percentile_ns(latencies, 0.95) / 1_000_000,
+                "latency_p99_ms": percentile_ns(latencies, 0.99) / 1_000_000,
                 "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
             }
             summaries.append(summary)

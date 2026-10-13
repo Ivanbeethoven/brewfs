@@ -47,6 +47,17 @@ fn read_preparation_limit(allocation_limit: usize, budget: &super::V3MountBudget
         .min(capacity.saturating_sub(RECIPE_HEADROOM))
         .min(MAX_PREPARATION)
 }
+/// Admit one read's preparation arena, waiting while sibling preparations
+/// hold the Plans pool. Each arena is admitted before the read holds any other
+/// Plans charge and shrinks to its actual size before execution, so waiting
+/// never depends on a self-held resource. A bundle larger than the pool, a
+/// closed budget, or exhaustion of another pool still fails immediately.
+async fn admit_preparation(
+    budget: &std::sync::Arc<super::V3MountBudget>,
+    plan_limit: usize,
+) -> PackedResult<super::V3OwnedPermit> {
+    budget.admit_waiting_for_plans(plan_limit as u64).await
+}
 const FEATURE_COUNTED_GROUPS: u32 = 1;
 const FEATURE_SOURCE_ATTRIBUTES: u32 = 2;
 const FEATURE_EXTERNAL_PLACEMENT: u32 = 4;
@@ -924,15 +935,12 @@ impl AuthenticatedV3Snapshot {
         allocation_limit: usize,
         delivery: Option<std::sync::Arc<crate::cadapter::read_observer::OperationDelivery>>,
     ) -> PackedResult<crate::chunk::read_plan::PreparedUnifiedRead> {
-        use super::V3BudgetPool;
         let V3ReadRange { offset, length } = range;
         // Keep bounded preparation room for independent readers and the
         // mount coordinator. Reserving the entire Plans pool for each read
         // prevents a second prepared read from ever joining an in-flight frame.
         let plan_limit = read_preparation_limit(allocation_limit, reader.budget());
-        let plan_permit = reader
-            .budget()
-            .admit(&[(V3BudgetPool::Plans, plan_limit as u64)])?;
+        let plan_permit = admit_preparation(reader.budget(), plan_limit).await?;
         if length > allocation_limit {
             return Err(PackedWireError::LimitExceeded(
                 "PM07 output exceeds allocation budget".into(),
@@ -994,7 +1002,6 @@ impl AuthenticatedV3Snapshot {
         delivery: Option<std::sync::Arc<crate::cadapter::read_observer::OperationDelivery>>,
         input: V3ReadPlacementInput,
     ) -> PackedResult<crate::chunk::read_plan::PreparedUnifiedRead> {
-        use super::V3BudgetPool;
         let V3ReadRange { length, .. } = range;
         if length > allocation_limit {
             return Err(PackedWireError::LimitExceeded(
@@ -1004,9 +1011,7 @@ impl AuthenticatedV3Snapshot {
         // The Native and Packed shared placement entrance must leave the
         // same bounded preparation room as the inode entrance above.
         let plan_limit = read_preparation_limit(allocation_limit, reader.budget());
-        let plan_permit = reader
-            .budget()
-            .admit(&[(V3BudgetPool::Plans, plan_limit as u64)])?;
+        let plan_permit = admit_preparation(reader.budget(), plan_limit).await?;
         self.prepare_placement_with_permit(
             client,
             reader,

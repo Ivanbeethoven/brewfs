@@ -922,6 +922,24 @@ impl NativeInode {
         }
         Ok(body)
     }
+    /// Heap bytes retained by a clone of this record, computed from field
+    /// lengths without re-encoding. The fixed term covers struct headers, the
+    /// placement variant (including an external extent reference key) and
+    /// allocator rounding; variable terms follow `encode`'s layout.
+    fn clone_bytes(&self) -> u64 {
+        let e = &self.entry;
+        let placement = match &self.placement {
+            Some(V3Placement::External { extents, .. }) => 128 + extents.key.len(),
+            Some(V3Placement::Group { .. }) => 32,
+            None => 0,
+        };
+        let variable = e.name.len()
+            + e.inline_data.len()
+            + e.extents.len() * 32
+            + self.cold.as_ref().map_or(0, Vec::len)
+            + placement;
+        (4096 + variable) as u64
+    }
     fn decode(body: &[u8], expected: u64) -> PackedResult<Self> {
         if body.len() > MAX_RECORD {
             return Err(invalid("plain inode exceeds record bound"));
@@ -1354,10 +1372,18 @@ impl<B: ObjectBackend + Clone + 'static> WorkspaceReadPlanProvider
             .ok_or_else(|| meta_error(invalid("read offset overflows")))?;
         let length =
             usize::try_from(len).map_err(|_| meta_error(invalid("read length exceeds usize")))?;
+        // Charge the cloned entry/placement by its actual bounded size, like
+        // the packed path, rather than a flat 1 MiB per read. A flat charge
+        // capped native concurrency at workspace/1MiB in-flight reads and
+        // returned ENOMEM under ordinary 16-worker small-file scans.
+        // Concurrent unprivileged opens can briefly hold path arenas in this
+        // pool; queue for the small clone charge rather than failing the read.
+        let clone_bytes = record.clone_bytes();
         let _clone = self
             .repository
             .budget
-            .admit(&[(V3BudgetPool::Workspace, 1 << 20)])
+            .admit_waiting_for(V3BudgetPool::Workspace, clone_bytes)
+            .await
             .map_err(meta_error)?;
         let input = V3ReadPlacementInput {
             group_id: record.group_id,
@@ -1538,7 +1564,8 @@ impl<B: ObjectBackend + Clone + 'static> NativePackedPlacementProvider<B> {
         let permit = self
             .repository
             .budget
-            .admit(&[(V3BudgetPool::Workspace, 1 << 20)])
+            .admit_waiting_for(V3BudgetPool::Workspace, 1 << 20)
+            .await
             .map_err(meta_error)?;
         self.names_raw_in_workspace(ino, &permit).await
     }
@@ -1916,13 +1943,19 @@ impl<B: ObjectBackend + Clone + 'static> MetaLayer for NativePackedPlacementProv
             _repository: self.repository.clone(),
         });
         self.entry(ino).await?.ok_or(MetaError::NotFound(ino))?;
-        // One 8 MiB arena covers the <=4 MiB pending paths, <=1 MiB results,
-        // reverse-name scratch and bounded Vec/path-copy overhead. Nested
-        // reverse lookups borrow it instead of reserving the same scratch twice.
-        let workspace = self
+        // Start with a reverse-name scratch arena (like the packed adapter's
+        // bounded page) and grow it only if this inode's actual path work
+        // needs more. A flat 8 MiB per open let four concurrent unprivileged
+        // opens occupy the whole default pool and starve every read. Nested
+        // reverse lookups borrow this arena instead of reserving it twice.
+        const INITIAL_PATH_ARENA: u64 = 1 << 20;
+        const MAX_PATH_ARENA: u64 = 8 << 20;
+        let mut arena = INITIAL_PATH_ARENA;
+        let mut workspace = self
             .repository
             .budget
-            .admit(&[(V3BudgetPool::Workspace, 8 << 20)])
+            .admit_waiting_for(V3BudgetPool::Workspace, arena)
+            .await
             .map_err(meta_error)?;
         let root = self.root_ino();
         let mut pending = vec![(ino, Vec::<u8>::new(), 0usize)];
@@ -1960,6 +1993,22 @@ impl<B: ObjectBackend + Clone + 'static> MetaLayer for NativePackedPlacementProv
                     )));
                 }
                 pending.push((parent, path, depth + 1));
+            }
+            // Keep the arena at least twice the live work (pending + results
+            // + copies). Growing releases the old arena first, so a waiter
+            // never holds a partial charge in this pool while it queues.
+            let needed = ((pending_bytes + bytes) as u64)
+                .saturating_mul(2)
+                .clamp(INITIAL_PATH_ARENA, MAX_PATH_ARENA);
+            if needed > arena {
+                drop(workspace);
+                arena = needed.next_power_of_two().min(MAX_PATH_ARENA);
+                workspace = self
+                    .repository
+                    .budget
+                    .admit_waiting_for(V3BudgetPool::Workspace, arena)
+                    .await
+                    .map_err(meta_error)?;
             }
         }
         self.repository.budget.admit(&[]).map_err(meta_error)?;
@@ -2730,6 +2779,56 @@ mod tests {
         provider.start_runtime();
         (kv, repo, provider)
     }
+    #[tokio::test]
+    async fn native_concurrent_read_preparation_does_not_exhaust_default_workspace() {
+        // A 16-worker scan keeps that many unified reads preparing at once.
+        // Each must charge only its record's bounded clone, not a flat 1 MiB,
+        // or the default 8 MiB decode workspace returns ENOMEM; and the shared
+        // Plans arenas must wait for each other instead of failing.
+        let (_temp, client, snapshot, _reads) = fixture().await;
+        let (_kv, repo, native) = imported(client, snapshot).await;
+        let workspace = super::super::V3BudgetPool::Workspace as usize;
+        let capacity = repo.budget.capacity(super::super::V3BudgetPool::Workspace);
+        let per_read = native.entry(8).await.unwrap().unwrap().clone_bytes();
+        assert!(
+            per_read * 16 < capacity,
+            "16 concurrent preparations must fit the default workspace ({per_read} each, {capacity} total)"
+        );
+        // Sixteen concurrent preparations exceed the Plans pool's arena
+        // headroom (each admits up to 2 MiB before shrinking). They must queue
+        // for Plans rather than fail with ENOMEM.
+        let plans =
+            futures::future::join_all((0..16).map(|_| native.prepare_unified_read(8, 0, 0, 12)))
+                .await;
+        for plan in plans {
+            assert!(
+                plan.as_ref().is_ok_and(Option::is_some),
+                "concurrent preparation failed: {:?}",
+                plan.err()
+            );
+        }
+        assert_eq!(repo.budget.state().used[workspace], 0);
+        // Unprivileged FUSE resolves paths on every open while reads run.
+        // Sixteen concurrent opens plus reads must all succeed, and a small
+        // path's arena must stay small so opens cannot starve reads.
+        let (paths, reads) = futures::future::join(
+            futures::future::join_all((0..16).map(|_| native.get_paths_bytes_owned(8))),
+            futures::future::join_all((0..16).map(|_| native.prepare_unified_read(8, 0, 0, 12))),
+        )
+        .await;
+        for owned in paths {
+            assert!(!owned.unwrap().paths.is_empty());
+        }
+        for read in reads {
+            assert!(read.unwrap().is_some());
+        }
+        assert_eq!(repo.budget.state().used[workspace], 0);
+        assert!(
+            repo.budget.state().peak[workspace] < capacity,
+            "path arenas must not occupy the whole workspace pool"
+        );
+    }
+
     #[tokio::test]
     async fn native_tikv_same_snapshot_plan_and_data_match_packed_without_namespace_pages() {
         let (_temp, client, snapshot, reads) = fixture().await;

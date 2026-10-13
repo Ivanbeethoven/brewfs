@@ -3,9 +3,114 @@
 更新时间：2026-10-12 UTC  
 工作区：/home/hxy/brewfs  
 分支：codex/packed-metadata-aliyun-20260930  
-当前 HEAD：e980d592801388c3c359d7e82b966df84f636e6f
+当前基线：e980d592801388c3c359d7e82b966df84f636e6f；2026-10-13 轮次改动见本文首节对应 PR（分支 codex/packed-v3-busy-native-budget-split）。
 工作树：干净  
-PR：历史 PR #161、#162、#164 已合并；当前收尾证据以 e980d592 云端 artifact 为准。
+PR：历史 PR #161、#162、#164 已合并；当前收尾证据以 e980d592 云端 artifact 和 2026-10-13 ECS 本机 artifact 为准。
+
+## 2026-10-13 overlay + packed-v3/005 统一生命周期轮次（最新，优先阅读）
+
+基线 `e980d59`；本轮源码改动随本 PR 提交，评审时的候选 diff 为
+`build/candidate3.diff`（SHA-256 `1b950c0c…`）。全部实验在 ECS 主机 `brewfs-singapore-v2` 本机执行，未使用 GitHub Runner。
+证据根目录：`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z`（下称 `$R`）。
+
+### 结论分级
+
+| 范围 | 状态 | 证据 |
+| --- | --- | --- |
+| overlay control 矩阵（Redis/TiKV × no-writer C8、C1、C2、默认压力 C8、quiesce C8、降频 C8，各 3 次，严格模式） | **passed**（候选 3） | `$R/overlay/c3-matrix-summary.json`；36/36 行退出 0，fork 210/210、seal 210/210，资源账本全部 passed、Compose 资源归零 |
+| 同一矩阵在原始 `e980d59` 上 | **rejected** | `$R/overlay/matrix.jsonl` 前 9 行：Redis 默认 C8 seal 4/8、no-writer C8 7/8；TiKV 默认 C8 5/8、C1 0/1；失败全为 `workspace is busy` |
+| 真实后端 packed 生命周期核心集（18 例，Redis+TiKV，RustFS/S3 + 运行时/管理员 IAM） | **rejected**：16/18 | `$R/runs/packed-lifecycle-rustfs-20261012T235716Z-274316`；两例 pending-upload 失败 |
+| 同一核心集，LocalFS 对象 | **rejected**：15/18 | `$R/runs/packed-lifecycle-localfs-20261012T233539Z-262034`；另有一例 TiKV 间歇 EIO |
+| RustFS SID GC/孤儿回收（6 例，管理员仅读/删，PUT 被 IAM 403 拒绝） | **passed** 6/6 | `$R/runs/packed-lifecycle-rustfs-20261013T005543Z-434700` |
+| 初始 history 删除 + native 层 GC（2 例） | **rejected**（e980d59 与候选 3 相同失败） | `run_at` 返回 `Busy`，见下 |
+| paired acceptance：native-tikv vs packed 元数据放置（同 release、fixture、trace、RustFS、预算，各 3 次交替） | **passed**（full、stat 两组） | `$R/paired-final3/accept-{full,stat}-*`，表见下节 |
+| 消融（static/dynamic、inline、codec、p90） | **incomplete** | runner `tools/perf/run_packed_ablation.sh` 已就绪未运行；p90 无独立训练 trace |
+| overlay workspace vs 原生性能对照 | **incomplete** | 尚未建立同 trace 对照 runner |
+| ACK/operator E2E、Aliyun managed backend | **blocked**（凭据/集群缺失，未变） | — |
+
+### `workspace is busy` 设计修复（2026-10-13 最终形态，替代下文第 2 项的逐点补丁）
+
+根因：`TopologyTxn::commit` 把两类**预提交** Busy 原样抛给调用方——packet 准备时发现 sibling seal/fork 推进了共享 root/inventory/topology epoch，以及 TiKV 在提交前耗尽 key-lock 重试并已回滚。此时尚无任何写入，本质是普通 CAS 冲突，但 17 个调用点中只有 7 个各自特判了 Busy，其余（install_compaction、acquire_lease、fast_forward_commit、mark_workspace_deleting 等）直接失败，表现为并发 seal 下零星 `workspace is busy`。
+
+修复：在 `TopologyTxn::commit` 一处把这两类 Busy 归一为 `Ok(false)`；所有调用点都已处于 `CAS_MAX_RETRIES`（256 次，每次 ≤100 ms 退避）循环中，按既有 false 路径从新读取重建。只有整轮预算耗尽才返回 `workspace is busy`。先前 7 处逐点 `match Busy` 补丁已删除，规则只保留在一处。提交后的未知结果、Fenced 和后端错误保持原样（fail-closed 不变）。直接调用 `prepare_topology_packet` 的路径（如 `release_lease` 和 packed 管理路径）不在本次范围内。
+
+验证：`every_topology_transition_rebuilds_after_presubmit_busy`、`acquire_lease_retries_busy…`、`seal_flatten_retries_busy…`、`seal_retries_busy_returned_by_topology_commit` 均通过（`$R/build/busy-tests-central2.log`）。中心化修复的 release（SHA-256 `701b5c1f…`，镜像 `sha256:d1930e07…`）重跑 overlay 严格模式矩阵：Redis/TiKV × no-writer C8、C1、C2、默认压力 C8 各 3 次，24/24 行退出 0，fork 与 seal 全部成功，资源账本 passed、资源归零（`$R/overlay/cz-matrix-summary.json`）。seal p50/p95/p99：Redis 默认 C8 0.121/0.180/0.192 s，TiKV 默认 C8 4.547/5.861/5.875 s。
+
+### native-tikv 读路径预算修复（2026-10-13，paired acceptance 前置）
+
+首次 10k 文件 paired 运行中 native-tikv 臂 `full` 模式 479/10000 读失败（ENOMEM），packed 臂 0 失败。复现与定位（`$R/paired-probe/`）：
+
+1. `NativePackedPlacementProvider::prepare_unified_read_observed` 为每次读固定预留 1 MiB decode workspace（默认池 8 MiB），16 worker 并发时直接拒绝。改为按记录实际字段长度计费（`NativeInode::clone_bytes`，约 4 KiB）。
+2. 放大 workspace 后仍失败：共享 placement 入口每次读先预留至多 2 MiB 的 Plans arena，16 个并发读超过 32 MiB 池容量即 ENOMEM，而 packed 臂因读路径更短未触发。改为 `V3MountBudget::admit_waiting_for_plans`：只等待 Plans 池，不持有任何部分预留，arena 在执行前收缩、读完成即释放，故等待总能前进；超过池容量、预算关闭或其他池耗尽仍立即失败。inode 入口与 placement 入口共用该函数。
+
+3. 仍有 333/10000 失败。新增 debug 级别的预算拒绝归因（`brewfs::packed_v3_budget` target，记录被耗尽的池）后定位：非特权 FUSE 每次 open 都解析路径，`get_paths_bytes_owned` 固定预留 8 MiB workspace，4 个并发 open 就占满 32 MiB 池，读路径 4 KiB 的 clone 预留随之失败。改为路径 arena 从 1 MiB 起按实际工作量（pending + 结果的 2 倍）增长，上限仍为 8 MiB；增长时先释放旧 arena 再等待，避免持有部分预留排队。`names_raw` 与读路径 clone 预留也改为等待而非立即 ENOMEM。
+
+TDD：`native_concurrent_read_preparation_does_not_exhaust_default_workspace` 在恢复固定 1 MiB 计费的二进制上以 ENOMEM 失败（`$R/build/tdd-native-red.log`）；最终版本同时覆盖 16 个并发读、16 个并发路径解析与读交错，要求全部成功且 workspace 峰值低于池容量。`native_placement` 15/15 通过；`workspace_overlay` 954 passed，其余失败与 e980d59 基线同一集合（`writable_acl_independent_sqlite…` 在基线上间歇失败）。真实 10k 文件 native-tikv `full` 探测（release `c8c96b92…`）：10000/10000、0 错误，decode workspace 峰值 16 MiB（原先打满 32 MiB）（`$R/paired-probe/native-full-final3-*`）。
+
+后续范围：按用户指示，sealed base 只要求基本功能；本节之后的未完成项中，凡与直接性能无关的（初始 history GC Busy、pending-upload 契约、TiKV 间歇 EIO）不再深究。
+
+### paired acceptance 结果（release `c8c96b92…`，10000×100 KiB，16 worker，2 epoch，TTL0/direct-io，RustFS 回环）
+
+runner：`tools/perf/run_packed_paired.sh`（每组独立 TiKV namespace、RustFS 生命周期；arm 每轮交替顺序；trace、checksum、binary 必须一致，任一运行失败或清理失败即 rejected）。native-tikv 的导入（约 320 s）是独立的未计时步骤；两组 cleanup proof 均为零。表中为 3 次中位数，files/s 与延迟取第 2 epoch。
+
+| 模式 | arm | mount s | active s | files/s | p50 ms | p95 ms | p99 ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| full | packed | 0.24 | 172.18 | 117.5 | 141.8 | 171.0 | 183.6 |
+| full | native-tikv | 93.55 | 305.44 | 69.8 | 214.0 | 236.9 | 248.0 |
+| stat | packed | 0.35 | 60.11 | 354.8 | 49.6 | 58.4 | 62.4 |
+| stat | native-tikv | 96.49 | 111.35 | 212.0 | 70.2 | 80.2 | 85.3 |
+
+结论：同一数据路径下 packed 元数据放置在 full 与 stat 两种模式均快约 1.7 倍，挂载耗时从约 95 s 降到 0.3 s 以下。两组 summary 原始版本因 runner 把多 epoch trace 当成一个集合而误判 rejected，已保留为 `summary.original-trace-check-bug.json`；修正后的 `packed_paired_summary.py` 按每次运行的 epoch 序列比较，trace/checksum/binary 均一致，状态 passed。
+
+### 本地 CI gate（PR 提交前）
+
+`cargo fmt --check`、`check/build --workspace`、四组 feature check、`cargo test --workspace --lib --bins`（1177 passed / 0 failed）、`cargo clippy --workspace` 均通过。`cargo clippy --all-targets --features workspace-overlay -D warnings` 有 3 个错误（`remote.rs:1076`、`source.rs:10`、`borrowed_alias.rs:858`），在未修改的 e980d59 上同样存在，非本 PR 引入。
+
+### 本轮修复（均有失败证据→修复→回归）
+
+1. **维护型 CAS 丢失 CONTROL 检查（PR141 合并后回归）**。普通实体 CAS 不锁 CONTROL 是 PR141 的设计，但 packed carrier 发布、carrier 元数据删除和首次 ClaimInitial Prepare 是维护型转换，测试契约要求其检查集包含精确的 catalog header。修复位置：`complete_driver.rs` commit_owned 的 authority extras、`borrowed_alias.rs` `prepare_carrier_metadata_deletion`、`kv_store.rs` 终结化 extra-check 白名单（与本次 census 读取比较）、`native_begin.rs` ClaimInitial。效果：真实后端 native factory、history retirement、fork alias 在 Redis/TiKV 均由 failed 变为 passed；`workspace_overlay` 单元 942→953 passed。
+2. **seal flatten 与 lease acquire 未重试预提交 Busy**。新增 seal 步骤归因日志后定位：Redis 失败全部来自 `install_compaction`（seal 的 flatten 步），TiKV no-writer 剩余失败来自 `seal acquire`（`acquire_lease`）。两者在 `txn.commit()` 的 packet 准备阶段收到 `Busy` 时直接 `?` 返回，而 begin/advance/hash/commit seal 已在同一预算内重试。修复为同一有界 `retry_backoff` 重建（256 次，单次 ≤100 ms）；未知错误仍原样返回。两项均有 TDD：`seal_flatten_retries_busy_returned_by_compaction_commit`、`acquire_lease_retries_busy_returned_by_topology_commit`，先在去掉修复的二进制上失败（`$R/build/tdd-red.log`、`tdd-acquire-red.log`），再通过。
+3. **seal 步骤归因**：`lifecycle::seal_step` 在不改变错误值的前提下记录失败步骤（begin/quiesce/drain/hash/commit/flatten），用于 contention 分类。
+4. **overlay harness 写入控制**：`BREWFS_WORKSPACE_WRITERS`（0/1/2）、`BREWFS_WORKSPACE_WRITER_INTERVAL`、`BREWFS_WORKSPACE_WRITER_QUIESCE`（暂停→每个 mount `sync`→确认→seal 批次→恢复，30 s 有界）。metrics 记录 `profile_class`：只有 2 writer、20 ms、无 quiesce 才是 `default-pressure`，其余标记 `diagnostic`。默认值保持原高频压力。
+
+### overlay 矩阵（候选 3，`release` SHA-256 `9e4bfd04…`，镜像 `sha256:870e8405…`）
+
+| profile | 次数 | fork | seal | seal p50/p95/p99 (s) | 每次写入文件数 |
+| --- | --- | --- | --- | --- | --- |
+| redis no-writer C8 | 3 | 24/24 | 24/24 | 0.113/0.168/0.183 | 0 |
+| redis C1 默认 | 3 | 3/3 | 3/3 | 0.039/0.040/0.040 | 10–11 |
+| redis C2 默认 | 3 | 6/6 | 6/6 | 0.048/0.059/0.059 | 12 |
+| redis C8 默认压力 | 3 | 24/24 | 24/24 | 0.126/0.199/0.199 | 20–22 |
+| redis C8 quiesce | 3 | 24/24 | 24/24 | 0.109/0.192/0.196 | 8 |
+| redis C8 降频 200 ms | 3 | 24/24 | 24/24 | 0.119/0.181/0.202 | 4 |
+| tikv no-writer C8 | 3 | 24/24 | 24/24 | 3.777/4.837/4.960 | 0 |
+| tikv C1 默认 | 3 | 3/3 | 3/3 | 0.675/1.018/1.018 | 8–12 |
+| tikv C2 默认 | 3 | 6/6 | 6/6 | 1.199/1.559/1.559 | 11–13 |
+| tikv C8 默认压力 | 3 | 24/24 | 24/24 | 4.903/6.816/7.079 | 34–41 |
+| tikv C8 quiesce | 3 | 24/24 | 24/24 | 3.805/4.962/4.988 | 6–10 |
+| tikv C8 降频 200 ms | 3 | 24/24 | 24/24 | 4.454/6.044/6.105 | 22–26 |
+
+这是 overlay workspace-v1 seal/fork 的 control 证据（`workspace snapshot` 走 native seal + flatten），不是 packed-v3 发布或 paired acceptance。TiKV 默认压力 C8 已不依赖降频或 quiesce 通过；降频与 quiesce 行仍只作诊断。
+候选 2（未含 acquire 修复）曾有 TiKV no-writer C8 2/3 次失败于 `seal acquire`，保留在 `matrix.jsonl`。
+
+### 真实后端 packed 生命周期覆盖（候选 3 测试二进制 `ae8c449f…`）
+
+runner：`docker/compose-xfstests/run_packed_lifecycle_real_backends.sh` + `docker-compose.packed-lifecycle-backends.yml`。每次运行拥有独立 Compose 项目、回环端口、每例 UUID metadata namespace、独立 RustFS bucket 组与新建的运行时/管理员 IAM 身份（`tools/testing/rustfs_owned_iam.py`，运行时 DELETE 403、管理员 PUT 403 在开跑前实测）。每次生成 `run-manifest.json`、`toolchain.json`、`profile.env`、`summary.json`、`resource-journal.json`、`cleanup-proof.txt`、`binary.sha256`、`cases.sha256`，并记录镜像 RepoDigest：redis `sha256:29e8589c…`、pd `sha256:5cf66a73…`、tikv `sha256:0524a207…`、rustfs `sha256:1803faef…`。所有运行的 cleanup proof 均为零（FUSE 挂载、测试进程、容器/卷/网络、IAM 用户）。
+
+RustFS/S3 下 Redis 与 TiKV 均通过的阶段：实际 CLI overlay 挂载→变更→clean release；kill -9→租约过期→PVC 恢复→恢复源 repack/publish→remount 读到新 carrier；原始挂载 shutdown→drain→headless seal/repack→S1 发布→pin→carrier fork；native factory（变更→quiesce→capture→repack→原子 carrier/head 发布）；reader pin 阻止 history retirement→pin 释放→grace→旧 head 对象 DELETE；C2 sibling fork + 每 reader pin + child repack + alias retirement + carrier 元数据删除；reader pin 重开与崩溃 reader 过期；中止 journal 回收；SID 孤儿/GC。
+
+### 未通过与未完成
+
+- **pending-upload kill 恢复（Redis/TiKV × LocalFS/RustFS，4/4 失败）**：测试在对象 PUT 被拒绝期间等待 PVC dirty 记录，90 s 超时。测试配置为 `writeback_mode=upload_before_commit`，而 VFS 只在 `CommitBeforeUpload` 时创建 writeback 持久化缓存（`src/vfs/fs/mod.rs`），因此该配置下不会产生 dirty 记录。原始 `e980d59` 同样失败。属测试/产品契约不一致，未修改，**rejected**。
+- **TiKV 间歇 EIO**：TiKV 下真实 FUSE 读刚写入的文件偶发 EIO（不同运行落在不同用例：CLI mount mutation、headless snapshot），直接执行读计划时 `payload_matches=true`。Redis 未复现。根因未定位，**rejected**。
+- **初始 history 删除 + native GC**：history 已退役，但随后 `WorkspaceGc::run_at` 返回 `Busy`；`e980d59` 相同失败，未定位，**rejected**。
+- **单元测试 5 个确定性失败**（e980d59 已存在，非本轮引入）：`g13a_kv_released_lease_is_not_an_expired_recovery_root`、`kv_v3_open_topology_rejects_binding_change_between_routing_and_final_read`、`migration_marker_fences_entity_and_hot_native_packets_without_writes`、`packed_mount_renewal_busy_exhausts_exactly_64`、`packed_stat_binding_authentication_busy_exhausts_exactly_64`。
+- **paired acceptance、消融、overlay vs direct packed 对照**：未运行，**incomplete**。packed 发布仍只能经 operator crate 或被忽略的库测试触达，brewfs CLI 没有 packed seal/publish/GC 子命令，因此“同一 release binary + 同一 executor”的 paired 流程需要先补一个可执行入口。
+- **本地 CI gate**：见下一节结果；未全部通过前不得提交。
+
+### 主机变更（均记录在 `$R/build/toolchain.txt`）
+
+安装 `protobuf-compiler 3.21.12`（etcd-client 构建依赖）；`/etc/fuse.conf` 增加 `user_allow_other`（备份 `.pre-brewfs-20261012`）；安装 rustfmt 组件；新增 32 GiB swapfile `/mnt/brewfs-data/swapfile`。库测试编译 rustc 峰值约 29 GiB RSS，曾两次导致主机硬重启；之后所有构建在 `systemd-run -p MemoryHigh=24G -p MemoryMax=28G -p MemorySwapMax=24G` 下运行。`/etc/sysctl.d/99-apsara-sysctl.conf` 会把 `vm.swappiness` 重置为 0，构建前需重新设为 10，否则 cgroup OOM。
 
 ## 范围和硬约束
 

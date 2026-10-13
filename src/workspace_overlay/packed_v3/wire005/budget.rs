@@ -295,13 +295,16 @@ impl V3MountBudget {
                             .is_none_or(|n| n > self.limits.bytes[*i])
                     })
                     .expect("failed admission has an exhausted pool");
-                format!(
+                let reason = format!(
                     "mount {} budget temporarily exhausted: used={}, requested={}, limit={}",
                     V3BudgetPool::ALL[index].name(),
                     state.used[index],
                     bytes,
                     self.limits.bytes[index]
-                )
+                );
+                // ENOMEM at the FUSE boundary carries no pool; record it here.
+                tracing::debug!(target: "brewfs::packed_v3_budget", %reason, "admission rejected");
+                reason
             }));
         }
         for (i, bytes) in totals.iter().enumerate() {
@@ -357,6 +360,43 @@ impl V3MountBudget {
                     }
                     changed.await;
                 }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    /// Admit a read-preparation arena from Plans, waiting (without holding any
+    /// partial charge) while concurrent preparations occupy the pool. Plans
+    /// preparation arenas shrink to their real size before execution and are
+    /// released when a read finishes, so this wait always makes progress.
+    pub(super) async fn admit_waiting_for_plans(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> PackedResult<V3OwnedPermit> {
+        self.admit_waiting_for(V3BudgetPool::Plans, bytes).await
+    }
+    /// Admit one short-lived scratch arena from a single pool, waiting while
+    /// sibling requests hold it. Callers must admit before holding any other
+    /// charge in the same pool and release the arena when the request ends,
+    /// so a waiter only depends on other requests' progress.
+    pub(super) async fn admit_waiting_for(
+        self: &Arc<Self>,
+        pool: V3BudgetPool,
+        bytes: u64,
+    ) -> PackedResult<V3OwnedPermit> {
+        if bytes > self.limits.bytes[pool as usize] {
+            return Err(PackedWireError::LimitExceeded(format!(
+                "requested {} arena exceeds mount capacity",
+                pool.name()
+            )));
+        }
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match self.admit(&[(pool, bytes)]) {
+                Ok(permit) => return Ok(permit),
+                Err(error) if self.state().closed => return Err(error),
+                Err(PackedWireError::LimitExceeded(_)) => changed.await,
                 Err(error) => return Err(error),
             }
         }
