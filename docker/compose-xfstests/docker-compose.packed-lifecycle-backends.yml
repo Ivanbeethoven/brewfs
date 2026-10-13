@@ -1,0 +1,98 @@
+# Owned loopback backends for the ignored packed-v3/005 real-backend lifecycle
+# tests. Every service uses host networking bound to 127.0.0.1 so the test
+# process on the ECS host reaches Redis, PD/TiKV and RustFS through the same
+# addresses that TiKV advertises to PD. Ports come from the runner and must be
+# unique per Compose project. No sqlite/sqlx metadata service exists here.
+services:
+  redis:
+    image: ${PACKED_LIFECYCLE_REDIS_IMAGE:-docker.io/library/redis:7.2-alpine}
+    network_mode: host
+    command:
+      - redis-server
+      - --bind
+      - 127.0.0.1
+      - --port
+      - "${PACKED_LIFECYCLE_REDIS_PORT:?redis port}"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --loglevel
+      - warning
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p $${PACKED_LIFECYCLE_REDIS_PORT} ping | grep -q PONG"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    environment:
+      PACKED_LIFECYCLE_REDIS_PORT: ${PACKED_LIFECYCLE_REDIS_PORT}
+    profiles: ["redis"]
+
+  pd:
+    image: ${PACKED_LIFECYCLE_PD_IMAGE:-pingcap/pd:v8.5.0}
+    network_mode: host
+    command:
+      - --name=pd
+      - --data-dir=/data/pd
+      - --client-urls=http://127.0.0.1:${PACKED_LIFECYCLE_PD_PORT:?pd port}
+      - --advertise-client-urls=http://127.0.0.1:${PACKED_LIFECYCLE_PD_PORT}
+      - --peer-urls=http://127.0.0.1:${PACKED_LIFECYCLE_PD_PEER_PORT:?pd peer port}
+      - --advertise-peer-urls=http://127.0.0.1:${PACKED_LIFECYCLE_PD_PEER_PORT}
+      - --initial-cluster=pd=http://127.0.0.1:${PACKED_LIFECYCLE_PD_PEER_PORT}
+      - --log-level=warn
+    volumes:
+      - pd-data:/data/pd
+    profiles: ["tikv"]
+
+  tikv:
+    image: ${PACKED_LIFECYCLE_TIKV_IMAGE:-pingcap/tikv:v8.5.0}
+    network_mode: host
+    depends_on:
+      pd:
+        condition: service_started
+    command:
+      - --addr=127.0.0.1:${PACKED_LIFECYCLE_TIKV_PORT:?tikv port}
+      - --advertise-addr=127.0.0.1:${PACKED_LIFECYCLE_TIKV_PORT}
+      - --status-addr=127.0.0.1:${PACKED_LIFECYCLE_TIKV_STATUS_PORT:?tikv status port}
+      - --pd=127.0.0.1:${PACKED_LIFECYCLE_PD_PORT}
+      - --data-dir=/data/tikv
+      - --log-level=warn
+    volumes:
+      - tikv-data:/data/tikv
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    profiles: ["tikv"]
+
+  rustfs:
+    image: ${PACKED_LIFECYCLE_RUSTFS_IMAGE:-w23geq7ncegg6etqsl.xuanyuan.run/rustfs/rustfs:latest}
+    network_mode: host
+    command:
+      - --address
+      - 127.0.0.1:${PACKED_LIFECYCLE_RUSTFS_PORT:?rustfs port}
+      - --access-key
+      - ${PACKED_LIFECYCLE_RUSTFS_ROOT_ACCESS_KEY:?rustfs root access key}
+      - --secret-key
+      - ${PACKED_LIFECYCLE_RUSTFS_ROOT_SECRET_KEY:?rustfs root secret key}
+      - /data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PACKED_LIFECYCLE_RUSTFS_PORT}/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+    environment:
+      PACKED_LIFECYCLE_RUSTFS_PORT: ${PACKED_LIFECYCLE_RUSTFS_PORT}
+    volumes:
+      - rustfs-data:/data
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    profiles: ["rustfs"]
+
+volumes:
+  pd-data:
+  tikv-data:
+  rustfs-data:
