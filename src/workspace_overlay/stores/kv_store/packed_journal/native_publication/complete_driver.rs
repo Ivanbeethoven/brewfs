@@ -281,6 +281,12 @@ where
                 .into_bytes(),
                 crate::workspace_overlay::stores::kv_store::packed_carrier_basis::packed_carrier_basis_key(plan.carrier_layer_id),
                 crate::workspace_overlay::stores::kv_store::packed_carrier_basis::packed_carrier_claim_key(plan.carrier_layer_id),
+                // Carrier publication is a maintenance transition: unlike an
+                // ordinary entity CAS it keeps the catalog header in its exact
+                // check set, so a concurrent migrate cannot interleave between
+                // packet validation and the final CAS. Appended last so every
+                // earlier authority index is unchanged.
+                CONTROL_KEY.to_vec(),
             ];
             let mut actual = self
                 .store

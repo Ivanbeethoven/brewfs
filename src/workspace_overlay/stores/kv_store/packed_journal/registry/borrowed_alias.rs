@@ -267,6 +267,18 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             merge(&mut checks, exact_checks(&root_keys, &root_values))?;
             writes.extend(keys.into_iter().map(|key| KvWrite::Delete { key }));
         }
+        if !writes.is_empty() {
+            // Deleting a packed carrier is a maintenance transition, like its
+            // publication: keep the exact catalog header in the check set so
+            // a concurrent migrate cannot interleave with the final CAS.
+            // Ordinary layer GC without a carrier still excludes CONTROL.
+            let control = [CONTROL_KEY.to_vec()];
+            let values = self.alias_values(&control).await?;
+            if values[0].is_none() {
+                return Err(WorkspaceError::Fenced);
+            }
+            merge(&mut checks, exact_checks(&control, &values))?;
+        }
         Ok(CarrierMetadataDeletion {
             checks,
             writes,

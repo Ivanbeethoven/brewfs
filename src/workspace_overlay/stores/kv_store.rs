@@ -586,11 +586,32 @@ impl<'a, B: WorkspaceKvBackend> TopologyTxn<'a, B> {
             .map(|(key, expected)| KvCheck { key, expected })
             .collect::<Vec<_>>();
         let writes = self.writes.into_values().collect::<Vec<_>>();
-        let packet = self
+        // Every Busy reachable here is pre-submit: packet preparation saw a
+        // shared root/inventory/topology epoch move (a sibling seal or fork),
+        // or the backend rolled back before commit (TiKV exhausted key-lock
+        // retries). No mutation exists, so report it as an ordinary CAS
+        // conflict. Each caller's bounded retry loop then rebuilds from fresh
+        // reads instead of every caller having to special-case Busy; only
+        // exhausting that whole budget surfaces `workspace is busy`.
+        let packet = match self
             .store
             .prepare_topology_packet(checks, writes, self.deadline)
-            .await?;
-        self.store.commit_prepared_topology_packet(&packet).await
+            .await
+        {
+            Ok(packet) => packet,
+            Err(WorkspaceError::Busy) => {
+                tracing::debug!("topology packet preparation conflict; rebuilding");
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        match self.store.commit_prepared_topology_packet(&packet).await {
+            Err(WorkspaceError::Busy) => {
+                tracing::debug!("topology commit rolled back before submit; rebuilding");
+                Ok(false)
+            }
+            result => result,
+        }
     }
 }
 
@@ -1035,6 +1056,10 @@ where
             for check in extra_checks {
                 let current = if check.key.as_slice() == LAYER_INVENTORY_GENERATION_KEY {
                     inventory_generation.clone()
+                } else if check.key.as_slice() == CONTROL_KEY {
+                    // Packed carrier deletion retains the exact catalog
+                    // header; compare it with this attempt's census read.
+                    raw.clone()
                 } else if check.key.starts_with(HOT_LAYER_PREFIX) {
                     hot.get(&check.key).cloned().unwrap_or(None)
                 } else if self.is_carrier_deletion_check(&check.key)
@@ -3030,7 +3055,8 @@ where
             txn.put_workspace(&workspace)?;
             txn.put_lease(&lease)?;
             txn.put(lease_index_key(request.lease_id), &request.workspace_id)?;
-            if txn.commit().await? {
+            let committed = txn.commit().await?;
+            if committed {
                 return Ok(lease);
             }
             retry_backoff(attempt).await;
@@ -4123,18 +4149,7 @@ where
                 journal_index_key(request.journal_id),
                 &request.guard.workspace_id,
             )?;
-            let committed = match txn.commit().await {
-                Ok(committed) => committed,
-                Err(WorkspaceError::Busy) => {
-                    // Native owner preparation can observe a concurrent mount
-                    // advancing the shared root/inventory epoch. No mutation
-                    // was submitted; rebuild the seal packet under the same
-                    // bounded retry budget.
-                    retry_backoff(attempt).await;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+            let committed = txn.commit().await?;
             if committed {
                 return Ok(journal);
             }
@@ -4180,14 +4195,7 @@ where
             journal.last_error = request.last_error.clone();
             journal.updated_at_ns = now;
             txn.put_journal(&journal)?;
-            let committed = match txn.commit().await {
-                Ok(committed) => committed,
-                Err(WorkspaceError::Busy) => {
-                    retry_backoff(attempt).await;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+            let committed = txn.commit().await?;
             if committed {
                 return Ok(journal);
             }
@@ -4256,14 +4264,7 @@ where
             journal.root_hash = Some(root);
             journal.updated_at_ns = now;
             txn.put_journal(&journal)?;
-            let committed = match txn.commit().await {
-                Ok(committed) => committed,
-                Err(WorkspaceError::Busy) => {
-                    retry_backoff(attempt).await;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+            let committed = txn.commit().await?;
             if committed {
                 return Ok(journal);
             }
@@ -4301,14 +4302,7 @@ where
                     journal.phase = SealPhase::Completed;
                     journal.updated_at_ns = now;
                     txn.put_journal(&journal)?;
-                    let committed = match txn.commit().await {
-                        Ok(committed) => committed,
-                        Err(WorkspaceError::Busy) => {
-                            retry_backoff(attempt).await;
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
+                    let committed = txn.commit().await?;
                     if !committed {
                         retry_backoff(attempt).await;
                         continue;
@@ -4395,14 +4389,7 @@ where
             journal.phase = SealPhase::Completed;
             journal.updated_at_ns = now;
             txn.put_journal(&journal)?;
-            let committed = match txn.commit().await {
-                Ok(committed) => committed,
-                Err(WorkspaceError::Busy) => {
-                    retry_backoff(attempt).await;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+            let committed = txn.commit().await?;
             if committed {
                 return Ok(SealResult {
                     revision,
@@ -5256,7 +5243,8 @@ where
             for write in delta_writes {
                 txn.put_checked(write)?;
             }
-            if txn.commit().await? {
+            let committed = txn.commit().await?;
+            if committed {
                 return Ok(CompactionResult {
                     revision,
                     replacement_head_layer_id: request.replacement_head_layer_id,
@@ -7703,6 +7691,142 @@ mod tests {
             WorkspaceState::Sealing
         );
         assert!(store.backend.cas_checks.lock().await.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn every_topology_transition_rebuilds_after_presubmit_busy() {
+        // One shared rule: a pre-submit Busy from TopologyTxn::commit is an
+        // ordinary CAS conflict. Exercise several distinct transitions with
+        // their own retry loops; none may surface the transient Busy.
+        let (store, workspace, lease, guard) = initialized().await;
+        let busy = || store.backend.fail_busy_once.store(true, Ordering::SeqCst);
+        busy();
+        let journal = store
+            .begin_seal(BeginSeal {
+                guard,
+                journal_id: JournalId::from_uuid(id(631)),
+                new_head_layer_id: LayerId::from_uuid(id(632)),
+            })
+            .await
+            .expect("begin_seal rebuilds");
+        busy();
+        store
+            .abort_recoverable_seal(AbortSeal {
+                journal_id: journal.journal_id,
+                reason: "test".into(),
+            })
+            .await
+            .expect("abort_recoverable_seal rebuilds");
+        // release_lease builds its packet directly (not via TopologyTxn) and
+        // keeps its own semantics; release without injection.
+        store
+            .release_lease(ReleaseLease {
+                lease_id: lease.lease_id,
+                holder_generation: lease.holder_generation,
+            })
+            .await
+            .unwrap();
+        busy();
+        store
+            .mark_workspace_deleting(MarkDeleting {
+                workspace_id: workspace.workspace_id,
+                force_fence_lease: false,
+            })
+            .await
+            .expect("mark_workspace_deleting rebuilds");
+        assert!(!store.backend.fail_busy_once.load(Ordering::SeqCst));
+        assert_eq!(
+            store
+                .load_workspace(workspace.workspace_id)
+                .await
+                .unwrap()
+                .state,
+            WorkspaceState::Deleting
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_lease_retries_busy_returned_by_topology_commit() {
+        let (store, workspace, lease, _guard) = initialized().await;
+        store
+            .release_lease(ReleaseLease {
+                lease_id: lease.lease_id,
+                holder_generation: lease.holder_generation,
+            })
+            .await
+            .unwrap();
+        // A sibling seal/fork can advance the shared root epoch so packet
+        // preparation returns Busy before the acquire packet is submitted.
+        store.backend.fail_busy_once.store(true, Ordering::SeqCst);
+        let acquired = store
+            .acquire_lease(AcquireLease {
+                workspace_id: workspace.workspace_id,
+                lease_id: LeaseId::from_uuid(id(621)),
+                holder_generation: lease.holder_generation + 1,
+                ttl_ns: 120_000_000_000,
+            })
+            .await
+            .expect("transient acquire Busy should be retried");
+        assert!(!store.backend.fail_busy_once.load(Ordering::SeqCst));
+        assert_eq!(acquired.state, LeaseState::Active);
+        assert_eq!(
+            store
+                .load_workspace(workspace.workspace_id)
+                .await
+                .unwrap()
+                .active_lease,
+            Some(acquired.lease_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn seal_flatten_retries_busy_returned_by_compaction_commit() {
+        let (store, workspace, _lease, guard) = initialized().await;
+        let journal = store
+            .begin_seal(BeginSeal {
+                guard,
+                journal_id: JournalId::from_uuid(id(611)),
+                new_head_layer_id: LayerId::from_uuid(id(612)),
+            })
+            .await
+            .unwrap();
+        for (expected_phase, next_phase, pending_bytes) in [
+            (SealPhase::Prepare, SealPhase::Quiesced, None),
+            (SealPhase::Quiesced, SealPhase::DataDrained, Some(0)),
+        ] {
+            store
+                .advance_seal(AdvanceSeal {
+                    journal_id: journal.journal_id,
+                    expected_phase,
+                    next_phase,
+                    pending_bytes,
+                    last_error: None,
+                })
+                .await
+                .unwrap();
+        }
+        store.hash_seal(journal.journal_id).await.unwrap();
+        let sealed = store.commit_seal(journal.journal_id).await.unwrap();
+        let current = store.load_workspace(workspace.workspace_id).await.unwrap();
+        // The seal flatten step: a concurrent seal can advance the shared
+        // root epoch so packet preparation returns Busy before any write.
+        store.backend.fail_busy_once.store(true, Ordering::SeqCst);
+        let compacted = store
+            .install_compaction(InstallCompaction {
+                workspace_id: workspace.workspace_id,
+                expected_head_layer_id: current.head_layer_id,
+                expected_head_epoch: current.head_epoch,
+                expected_parent_layer_id: sealed.revision.layer_id,
+                compacted_layer_id: LayerId::from_uuid(id(613)),
+                replacement_head_layer_id: LayerId::from_uuid(id(614)),
+                delta: CanonicalLayerDelta::default(),
+            })
+            .await
+            .expect("transient compaction Busy should be retried");
+        assert!(!store.backend.fail_busy_once.load(Ordering::SeqCst));
+        let flattened = store.load_workspace(workspace.workspace_id).await.unwrap();
+        assert_eq!(flattened.head_layer_id, compacted.replacement_head_layer_id);
+        assert_eq!(flattened.head_epoch, compacted.head_epoch);
     }
 
     #[tokio::test]

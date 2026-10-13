@@ -25,6 +25,15 @@ pub(crate) use packed_mount_session::{
     PackedMountAuthority, PackedMountCatalog, PackedMountSessionRequest, PackedNeverAttached,
 };
 
+/// Name the seal step that failed without altering the returned error, so a
+/// contention diagnostic (e.g. Busy) keeps its exact type for classification.
+fn seal_step<T>(step: &str, result: Result<T, WorkspaceError>) -> Result<T, WorkspaceError> {
+    if let Err(error) = &result {
+        tracing::warn!(step, %error, "workspace seal step failed");
+    }
+    result
+}
+
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -83,7 +92,8 @@ impl<W: WorkspaceStore + 'static> WorkspaceLifecycle<W> {
         barrier: &dyn DurableRemoteBarrier,
     ) -> Result<SealResult, WorkspaceError> {
         let journal_id = JournalId::new();
-        self.store
+        let begin = self
+            .store
             .begin_seal(BeginSeal {
                 guard: HeadGuard {
                     workspace_id: view.workspace_id,
@@ -95,8 +105,10 @@ impl<W: WorkspaceStore + 'static> WorkspaceLifecycle<W> {
                 journal_id,
                 new_head_layer_id: LayerId::new(),
             })
-            .await?;
-        self.store
+            .await;
+        seal_step("begin", begin)?;
+        let quiesced = self
+            .store
             .advance_seal(AdvanceSeal {
                 journal_id,
                 expected_phase: SealPhase::Prepare,
@@ -104,7 +116,8 @@ impl<W: WorkspaceStore + 'static> WorkspaceLifecycle<W> {
                 pending_bytes: None,
                 last_error: None,
             })
-            .await?;
+            .await;
+        seal_step("quiesce", quiesced)?;
         if let Err(error) = barrier.drain(view.workspace_id, view.head_epoch).await {
             let _ = self
                 .store
@@ -115,7 +128,8 @@ impl<W: WorkspaceStore + 'static> WorkspaceLifecycle<W> {
                 .await;
             return Err(error);
         }
-        self.store
+        let drained = self
+            .store
             .advance_seal(AdvanceSeal {
                 journal_id,
                 expected_phase: SealPhase::Quiesced,
@@ -123,10 +137,14 @@ impl<W: WorkspaceStore + 'static> WorkspaceLifecycle<W> {
                 pending_bytes: Some(0),
                 last_error: None,
             })
-            .await?;
-        self.store.hash_seal(journal_id).await?;
-        self.store.commit_seal(journal_id).await?;
-        self.flatten_sealed_workspace(view.workspace_id).await
+            .await;
+        seal_step("drain", drained)?;
+        seal_step("hash", self.store.hash_seal(journal_id).await)?;
+        seal_step("commit", self.store.commit_seal(journal_id).await)?;
+        seal_step(
+            "flatten",
+            self.flatten_sealed_workspace(view.workspace_id).await,
+        )
     }
 
     async fn flatten_sealed_workspace(
