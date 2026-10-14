@@ -155,13 +155,40 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         Ok(self.packed_paths_bytes_owned(target).await?.paths)
     }
 
+    /// A path walk spans many reads under one head/lease view. A concurrent
+    /// local commit (for example another file's create) advances the head
+    /// and fences the walk with Busy; restart it from a fresh view a bounded
+    /// number of times, like every mutation retry. Other errors stay fatal.
     pub(super) async fn packed_paths_bytes_owned(
         &self,
         target: i64,
     ) -> Result<OwnedPaths, MetaError> {
+        const ATTEMPTS: usize = 64;
+        for attempt in 1..=ATTEMPTS {
+            match self.packed_paths_bytes_owned_attempt(target).await {
+                Err(MetaError::Io(ref error))
+                    if error.raw_os_error() == Some(libc::EBUSY) && attempt < ATTEMPTS =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("bounded path walk retry always returns")
+    }
+
+    async fn packed_paths_bytes_owned_attempt(&self, target: i64) -> Result<OwnedPaths, MetaError> {
         let lower = self
             .packed_lower()
             .ok_or_else(|| MetaError::Internal("missing packed path lower".into()))?;
+        // A bounded number of walks own their 16 MiB arena at once; others
+        // queue here instead of failing with ENOMEM. The FUSE request charge
+        // a caller may hold is never part of this wait.
+        let _walk = lower
+            .path_walks
+            .acquire()
+            .await
+            .map_err(|_| MetaError::Io(std::io::Error::from_raw_os_error(libc::ENOMEM)))?;
         let _permit: V3OwnedPermit = lower
             .budget
             .admit(&[(V3BudgetPool::Metadata, 16 << 20)])

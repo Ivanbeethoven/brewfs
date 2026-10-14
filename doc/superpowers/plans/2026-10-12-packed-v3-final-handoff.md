@@ -217,3 +217,29 @@ RustFS/S3 packed-v3/005 full-read smoke 使用镜像 `w23geq7ncegg6etqsl.xuanyua
 结论：overlay stat 相比基线约 450 倍提升，full 约 50 倍；但仍为 native 的约 1/5（stat 4.8×、full 4.9× 差距），**未达到“接近 native”**。剩余热点：full 模式每 file-epoch 约 91 MGET、17 TIME、12 EVALSHA（读请求 head/lease fence、upper extent/inode 查询、packed lower 读路径）。下一步候选：按 head sequence 缓存 head/lease fence、合并 inode+extent+fence 为单次 MGET。原 `summary.json` 因跨 mode 比较 checksum（stat 模式 checksum=0）被标为 rejected，保留未改；runner 已改为按 mode 校验。
 
 门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/frozen3/status.txt`）：release、fmt、clippy（workspace 与 `--all-targets --features workspace-overlay -D warnings`）、`cargo test --workspace --lib --bins`（1177 passed）、`git diff --check` 全部通过。overlay suite 959 passed / 4 failed，4 个均为既有失败：e980d59 的 3 个确定性失败 + `source_mutation_replacement_symlink_and_limits_fail_closed`（仅全量负载下失败，单独运行在 base 与 candidate 上均 5/5 通过）。`writable_acl_independent_sqlite_instances_keep_mode_acl_during_atime_writes` 在 merged-base 测试二进制上同样 9/10 失败，非本次引入。两个 `*_exhausts_exactly_64` 测试的期望已从 64 改为 store 现有的 `CAS_MAX_RETRIES`=256（base 上即已失败）。新增回归测试：frozen 读路径 0 次认证往返且 strict >0；frozen 写 open 仍提交认证 CAS；并发准备超过 Plans 容量时等待而非 ENOMEM。
+
+## 2026-10-14 overlay 热路径与小文件读写对比（续）
+
+新增 `tools/perf/smallfiles_rw.py` 和 runner 的 `rw` 模式：同一挂载内依次执行 write（2000 个 16 KiB 新文件，O_EXCL+fsync）、readback（逐字节校验读回，打乱顺序）、mixed（2000 次操作，30% 新建写、70% 读已写文件，种子固定），每步之间 drop_caches，各自独立 row 与 Redis commandstats。
+
+本轮改动：
+- frozen 模式下读请求与 chunk 准备使用一次一致性读（`read_fenced_inode`：ws/head/lease + 本 inode 两层行），取代 load_layer + inode MGET + fence MGET；请求与 fetcher 的 fence 改为按 inode（`validate_inode_read_fence`），其他文件的写不再使该读重启。strict 模式保持原整头 fence。
+- frozen 模式 `mutation_version` 只取最新 head + 不可变 base；权限快照与 commit 的 Metadata 预留按实际上界而非固定 16/32 MiB。
+- 只读 open 的 `record_close` 不再为已链接文件取 mutation version。
+- open 的反向路径遍历：并发 16 MiB arena 由每挂载 8 个信号量限流（避免与 FUSE 请求争用 256 MiB Metadata 池而 ENOMEM）；被并发本地提交 fence 的遍历有界重试（64 次），修复 mixed 的 EBUSY。
+- 卸载 drain：先回收已 release 且数据已提交/上传的 writer，再检查 256 文件上限；此前写入 >256 个小文件后 drain fail-closed，导致 lease 未释放、下一次挂载 `workspace writer was fenced`。
+- 尝试过按 TTL 的上层行缓存，因测试中直接经 store 的写入读到旧行而回退，未保留。
+
+结果（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/ovn-hot6/ovn-20261014T222454Z-1087430`，binary sha256 `30861a97…700b`，3 reps 中位数，30/30 行 0 错误，trace/checksum 按 mode 一致，cleanup 归零，status=passed）：
+
+| mode | native files/s | overlay files/s | overlay/native | native p50/p95/p99 ms | overlay p50/p95/p99 ms | Redis cmds/op native→overlay |
+|---|---|---|---|---|---|---|
+| stat | 3264.5 | 696.8 | 0.21 | 2.4/2.9/3.1 | 11.0/13.0/14.9 | 12.9→28.3 |
+| full | 768.2 | 153.2 | 0.20 | 10.0/12.6/14.1 | 50.7/58.9/62.9 | 44.7→164.3 |
+| write | 652.0 | 215.4 | 0.33 | 23.4/29.7/47.3 | 74.2/81.1/86.4 | 33.2→271.3 |
+| readback | 1272.4 | 485.4 | 0.38 | 11.9/16.4/20.6 | 32.3/40.5/46.2 | 33.0→153.9 |
+| mixed | 1005.2 | 259.4 | 0.26 | 13.6/25.6/28.7 | 49.7/126.4/168.9 | 31.5→383.1 |
+
+结论：overlay 小文件读写现在功能上可用（修复前 readback/mixed 在 16 并发下必失败，且写入后卸载 fail-closed），但仍为 native 的 0.2–0.4，**未接近 native**；stat/full 与上一轮持平，融合 fence 未带来可测吞吐提升。剩余主要成本：open 的 path-walk 权限检查（非 root uid，native 同样执行但每级仅 1 次 HGET）、每个 FUSE op 的权限快照 MGET、写路径每次 create/fsync 的多个 Lua CAS（packed writer authority/native reverse/extent 派生行）。下一步候选：为 frozen base 合并权限快照与 dentry/inode 读、减少 create/fsync 的派生 CAS、复用 VFS 级 attr 结果。
+
+门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/hot6/status.txt`）：release、fmt、clippy（workspace 与 `--all-targets --features workspace-overlay -D warnings`）、`cargo test --workspace --lib --bins`（1177 passed）、`git diff --check` 通过；overlay suite 959 passed / 4 failed，均为既有失败（e980d59 的 3 个确定性失败 + `source_root_pins…` 全量负载下偶发）。新增测试：drain 在文件上限低于历史 writer 数时仍成功；frozen 读路径 0 次认证往返测试保持通过。

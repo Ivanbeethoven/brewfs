@@ -5,6 +5,10 @@ use crate::workspace_overlay::packed_reader_lifecycle::PackedReaderRequestOwner;
 use crate::workspace_overlay::packed_v3::wire005::{V3BudgetPool, V3OwnedPermit};
 
 const OPERATION_BYTES: u64 = 16 << 20;
+// A frozen-base snapshot owns at most two inodes x two layers of rows plus
+// three permission xattrs each (bounded at 96 KiB/value by the store) and
+// the merged copies. Lower hot/cold reads admit their own charges.
+const FROZEN_SNAPSHOT_BYTES: u64 = 2 << 20;
 
 /// Keep copy-up templates and captured reader generation owned through the
 /// caller's policy calculation and its actual conditional backend response.
@@ -27,6 +31,22 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                 return Err(MetaError::NotSupported(
                     "conditional packed permission store".into(),
                 ));
+            }
+            if !lower.strict() {
+                // Frozen base: the mutation's own CAS re-authenticates the
+                // binding, head and lease against these exact layers, so only
+                // the current layer pair (fresh head, immutable base) is needed.
+                // The commit admits its own bounded row/packet budget.
+                let permit = lower
+                    .budget
+                    .admit(&[(V3BudgetPool::Metadata, FROZEN_SNAPSHOT_BYTES)])
+                    .map_err(packed_lower::budget_to_meta)?;
+                let layers = self.frozen_layer_pair(lower).await?;
+                return Ok(MutationVersion {
+                    layers,
+                    _permit: Some(permit),
+                    _reader: None,
+                });
             }
             let permit = lower
                 .budget
@@ -51,17 +71,45 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         })
     }
 
+    /// Fresh writable head plus the mount's immutable sealed base.
+    pub(super) async fn frozen_layer_pair(
+        &self,
+        lower: &WorkspacePackedLower,
+    ) -> Result<[LayerRecord; 2], MetaError> {
+        let guard = self.guard().await;
+        let chain = self.chain().await?;
+        let layers = [
+            self.store
+                .load_layer(guard.expected_head_layer_id)
+                .await
+                .map_err(workspace_to_meta)?,
+            chain[1].clone(),
+        ];
+        if layers[1].layer_id != lower.binding.base_layer_id {
+            return Err(workspace_to_meta(WorkspaceError::Fenced));
+        }
+        validate_fixed_layer_pair(&layers).map_err(workspace_to_meta)?;
+        Ok(layers)
+    }
+
     pub(super) async fn merged_packed_permission_snapshot(
         &self,
         lower: &WorkspacePackedLower,
         inodes: Vec<i64>,
         dentry: Option<(i64, Vec<u8>)>,
     ) -> Result<PermissionSnapshot, MetaError> {
+        let strict = lower.strict();
         let _permit = lower
             .budget
-            .admit(&[(V3BudgetPool::Metadata, OPERATION_BYTES)])
+            .admit(&[(
+                V3BudgetPool::Metadata,
+                if strict {
+                    OPERATION_BYTES
+                } else {
+                    FROZEN_SNAPSHOT_BYTES
+                },
+            )])
             .map_err(packed_lower::budget_to_meta)?;
-        let strict = lower.strict();
         let _reader = if strict {
             lower
                 .authority

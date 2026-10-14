@@ -288,12 +288,12 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             ));
         }
         let budget = self.packed_permission_budget()?;
-        let permit = budget
-            .admit(&[(V3BudgetPool::Metadata, OPERATION_BYTES)])
-            .map_err(|error| WorkspaceError::InvalidReadPlan(error.to_string()))?;
         // Refuse oversized owned templates before validation clones keys or
         // row encoding allocates a write list. Include caller Vec capacities.
-        validate_mutation_allocation_bounds(&request)?;
+        let bound = validate_mutation_allocation_bounds(&request)?;
+        let permit = budget
+            .admit(&[(V3BudgetPool::Metadata, bound)])
+            .map_err(|error| WorkspaceError::InvalidReadPlan(error.to_string()))?;
         if request.validate()? != count {
             return Err(WorkspaceError::Fenced);
         }
@@ -414,7 +414,9 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
     }
 }
 
-fn validate_mutation_allocation_bounds(request: &VersionedMutation) -> Result<(), WorkspaceError> {
+/// Returns the owned-plus-stored bytes this mutation can retain, which the
+/// commit admits instead of a fixed worst-case arena.
+fn validate_mutation_allocation_bounds(request: &VersionedMutation) -> Result<u64, WorkspaceError> {
     fn overflow() -> WorkspaceError {
         WorkspaceError::InvalidReadPlan("packed mutation allocation limit".into())
     }
@@ -482,7 +484,16 @@ fn validate_mutation_allocation_bounds(request: &VersionedMutation) -> Result<()
     for row in &request.extents {
         encoded(&mut stored, row, extent_key(row))?;
     }
-    Ok(())
+    // Checks/derived native reverse and extent CAS entries are at most a
+    // fixed view packet plus one derived pair per row; bound them by doubling
+    // the stored bytes and adding the fixed view envelope.
+    let bound = owned
+        .checked_add(stored.checked_mul(2).ok_or_else(overflow)?)
+        .and_then(|bytes| bytes.checked_add(1 << 20))
+        .ok_or_else(overflow)?;
+    Ok(u64::try_from(bound)
+        .map_err(|_| overflow())?
+        .min(OPERATION_BYTES))
 }
 
 fn append_versioned_rows(
