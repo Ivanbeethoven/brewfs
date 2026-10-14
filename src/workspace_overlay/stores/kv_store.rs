@@ -2116,6 +2116,67 @@ where
         Ok(())
     }
 
+    fn supports_fused_read_fence(&self) -> bool {
+        self.backend.supports_consistent_reads()
+    }
+
+    async fn validate_inode_read_fence(
+        &self,
+        guard: HeadGuard,
+        base: LayerRecord,
+        ino: i64,
+        expected: Vec<InodeDelta>,
+    ) -> Result<(), WorkspaceError> {
+        let (_, rows) = self.read_fenced_inode(guard, base, ino).await?;
+        if rows != expected {
+            return Err(WorkspaceError::Busy);
+        }
+        Ok(())
+    }
+
+    async fn read_fenced_inode(
+        &self,
+        guard: HeadGuard,
+        base: LayerRecord,
+        ino: i64,
+    ) -> Result<(LayerRecord, Vec<InodeDelta>), WorkspaceError> {
+        let keys = vec![
+            hot_workspace_key(guard.workspace_id),
+            hot_layer_key(guard.expected_head_layer_id),
+            hot_lease_key(guard.workspace_id, guard.lease_id),
+            inode_identity_key(guard.expected_head_layer_id, ino),
+            inode_identity_key(base.layer_id, ino),
+        ];
+        let (values, now) = self.backend.get_many_consistent_with_time(&keys).await?;
+        if values.len() != keys.len() {
+            return Err(WorkspaceError::Backend(
+                "short KV fused inode read-fence read".into(),
+            ));
+        }
+        let workspace: WorkspaceRecord = decode_required(&values[0])?;
+        let head: LayerRecord = decode_required(&values[1])?;
+        let lease: SnapshotLease = decode_required(&values[2])?;
+        checked_hot_guard(&workspace, &head, &lease, &guard, now)?;
+        if head.parent_layer_id != Some(base.layer_id) {
+            return Err(WorkspaceError::Fenced);
+        }
+        let mut rows = Vec::with_capacity(2);
+        for (value, layer) in values[3..]
+            .iter()
+            .zip([guard.expected_head_layer_id, base.layer_id])
+        {
+            let Some(value) = value else { continue };
+            let row: InodeDelta = decode(value)?;
+            if row.layer_id != layer || row.ino != ino {
+                return Err(WorkspaceError::CorruptMetadata(
+                    "fused inode key/record identity mismatch".into(),
+                ));
+            }
+            rows.push(row);
+        }
+        Ok((head, rows))
+    }
+
     async fn get_extent_deltas_bounded(
         &self,
         request: ExtentQuery,

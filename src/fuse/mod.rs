@@ -870,6 +870,7 @@ where
         let pending = self
             .begin_fuse_client_open(ino, kind, req.unique)
             .inspect_err(|_error| {
+                debug!(ino, error = ?_error, "fuse.open register failed");
                 #[cfg(test)]
                 eprintln!(
                     "[packed-v3-native-kernel-read-diag] stage=fuse-open-register unique={} inode={ino} flags={flags} error={_error}",
@@ -877,6 +878,9 @@ where
                 );
             })?;
         let result = self.open_client_untracked(req, ino, flags).await;
+        if let Err(error) = &result {
+            debug!(ino, error = ?error, "fuse.open failed");
+        }
         self.finish_client_open(pending, kind, result)
             .await
             .inspect_err(|_error| {

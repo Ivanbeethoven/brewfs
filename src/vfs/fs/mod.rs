@@ -5182,6 +5182,7 @@ where
                 Ok(data)
             }
             Err(error) => {
+                tracing::debug!(ino = handle.ino, offset, len, error = %format!("{error:#}"), "packed read request failed");
                 #[cfg(test)]
                 eprintln!(
                     "[packed-v3-native-kernel-read-diag] stage=packed-request inode={} fh={} offset={offset} len={len} error={error:#}",

@@ -1705,6 +1705,16 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         };
         if remove {
             self.open_counts.remove(&ino);
+        }
+        // Only an unlinked inode needs the orphan-removal commit. The common
+        // close of a linked file skips the mutation version entirely; the
+        // loop below re-reads the inode under a fresh version before writing.
+        let remove = remove
+            && self
+                .resolve_inode_delta(ino)
+                .await?
+                .is_some_and(|inode| inode.nlink == 0);
+        if remove {
             for attempt in 0..64 {
                 let expected_layers = self.mutation_version().await?;
                 let Some(mut inode) = self.resolve_inode_delta(ino).await? else {

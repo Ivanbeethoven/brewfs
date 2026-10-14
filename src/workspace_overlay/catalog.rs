@@ -602,6 +602,41 @@ pub trait WorkspaceStore: Send + Sync {
         ))
     }
 
+    fn supports_fused_read_fence(&self) -> bool {
+        false
+    }
+
+    /// Per-inode read fence for a frozen base: the head/lease guard is still
+    /// held, the head still sits on `base`, and this inode's upper rows are
+    /// exactly `expected`. Unrelated writes to other inodes do not fence.
+    /// Busy denotes a changed inode; Fenced denotes loss of authority.
+    async fn validate_inode_read_fence(
+        &self,
+        _guard: HeadGuard,
+        _base: LayerRecord,
+        _ino: i64,
+        _expected: Vec<InodeDelta>,
+    ) -> Result<(), WorkspaceError> {
+        Err(WorkspaceError::UnsupportedCapability(
+            "per-inode workspace read fence",
+        ))
+    }
+
+    /// One consistent read of the hot head/lease fence, the current writable
+    /// head record and one inode's rows in both layers. The returned head is
+    /// fresh (its sequence fences same-epoch writes); `base` is the caller's
+    /// cached sealed base, which is immutable for the binding.
+    async fn read_fenced_inode(
+        &self,
+        _guard: HeadGuard,
+        _base: LayerRecord,
+        _ino: i64,
+    ) -> Result<(LayerRecord, Vec<InodeDelta>), WorkspaceError> {
+        Err(WorkspaceError::UnsupportedCapability(
+            "fused workspace inode read fence",
+        ))
+    }
+
     /// Bound row decoding/allocation at the backend before returning it. A
     /// legacy get_extent_deltas followed by a length check is insufficient.
     async fn get_extent_deltas_bounded(

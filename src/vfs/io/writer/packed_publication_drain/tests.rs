@@ -191,3 +191,35 @@ async fn packed_writer_owner_is_registered_before_queued_task_runs() {
     release.send(()).unwrap();
     tasks.wait_idle(Duration::from_secs(2)).await.unwrap();
 }
+
+#[tokio::test]
+async fn packed_publication_reaps_released_committed_writers_before_file_cap() {
+    // A workload that wrote more small files than the publication cap must
+    // still drain: released writers whose data is committed and uploaded
+    // carry no publication work and are reaped before the cap is checked.
+    let (writer, store, _inode) = fixture().await;
+    store.release();
+    let meta = writer.backend.meta();
+    for index in 0..4 {
+        let ino = meta
+            .create_file(1, format!("small-{index}.bin"))
+            .await
+            .unwrap();
+        let file = writer.ensure_file(Inode::new(ino, 0));
+        file.write_at(0, &[index as u8; 512]).await.unwrap();
+        timeout(Duration::from_secs(2), file.flush())
+            .await
+            .unwrap()
+            .unwrap();
+        writer.release(ino as u64).await;
+    }
+    // Cap below the number of writers ever opened.
+    let proof = timeout(
+        Duration::from_secs(2),
+        writer.drain_for_packed_publication(2),
+    )
+    .await
+    .unwrap()
+    .expect("committed released writers must not count against the cap");
+    assert!(proof.inodes().len() <= 2);
+}

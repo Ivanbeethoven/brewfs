@@ -21,7 +21,12 @@ FILE_BYTES="${OVN_FILE_BYTES:-102400}"
 WORKERS="${OVN_WORKERS:-16}"
 EPOCHS="${OVN_EPOCHS:-2}"
 REPEATS="${OVN_REPEATS:-3}"
-MODES="${OVN_MODES:-full stat}"
+MODES="${OVN_MODES:-full stat rw}"
+# rw: small-file write -> readback -> mixed in one mount per arm/rep.
+RW_FILES="${OVN_RW_FILES:-2000}"
+RW_BYTES="${OVN_RW_FILE_BYTES:-16384}"
+RW_MIXED_OPS="${OVN_RW_MIXED_OPS:-2000}"
+RW_WRITE_RATIO="${OVN_RW_WRITE_RATIO:-0.3}"
 SEED="${OVN_SCANNER_SEED:-20261001}"
 (( FILES >= 100 && FILES % 100 == 0 )) || { echo "OVN_FILES must be a multiple of 100" >&2; exit 2; }
 [[ -x "$BINARY" && -x "$FIXTURE" && -e /dev/fuse ]] || { echo "binary/fixture/FUSE required" >&2; exit 2; }
@@ -115,8 +120,8 @@ for b in ("ovn-native", "ovn-packed"):
 PY
 sha256sum "$BINARY" "$FIXTURE" >"$group/binary.sha256"
 git -C "$ROOT" rev-parse HEAD >"$group/revision.txt"
-printf 'files=%s\nfile_bytes=%s\nworkers=%s\nepochs=%s\nrepeats=%s\nmodes=%s\nscanner_seed=%s\nfuse_ttl_ms=0\ndirect_io=1\nkeep_cache=0\nread_cache=0\n' \
-    "$FILES" "$FILE_BYTES" "$WORKERS" "$EPOCHS" "$REPEATS" "$MODES" "$SEED" >"$group/profile.env"
+printf 'files=%s\nfile_bytes=%s\nworkers=%s\nepochs=%s\nrepeats=%s\nmodes=%s\nscanner_seed=%s\nfuse_ttl_ms=0\ndirect_io=1\nkeep_cache=0\nread_cache=0\nrw_files=%s\nrw_file_bytes=%s\nrw_mixed_ops=%s\nrw_write_ratio=%s\nrw_fsync=1\n' \
+    "$FILES" "$FILE_BYTES" "$WORKERS" "$EPOCHS" "$REPEATS" "$MODES" "$SEED" "$RW_FILES" "$RW_BYTES" "$RW_MIXED_OPS" "$RW_WRITE_RATIO" >"$group/profile.env"
 sudo -n docker image inspect --format '{{json .RepoDigests}}' redis:7.2-alpine w23geq7ncegg6etqsl.xuanyuan.run/rustfs/rustfs:latest >"$group/image-digests.txt" 2>&1 || true
 
 data_yaml() {  # bucket
@@ -215,19 +220,65 @@ run_arm() {  # arm mode rep
         monitor=$!
     fi
     mount_s="$(mount_and_wait "$dir/mount.yaml" "$dir/mnt" "$art/brewfs.log")" || rc=1
-    if (( rc == 0 )); then
+    local profiler=""
+    # Optional diagnosis only: perf sampling perturbs timing, never use for numbers.
+    if (( rc == 0 )) && [[ -n "${OVN_PERF_ARM:-}" && "$OVN_PERF_ARM" == "$arm" ]]; then
+        local bpid; bpid="$(pgrep -f -- "mount --config $dir/mount.yaml" | head -1)"
+        sudo -n perf record -F 499 --call-graph "${OVN_PERF_CALLGRAPH:-fp}" -p "$bpid" -o "$art/perf.data" >"$art/perf-record.log" 2>&1 &
+        profiler=$!
+    fi
+    if (( rc == 0 )) && [[ "$mode" == rw ]]; then
+        # Each step is its own row with its own commandstats; the page cache is
+        # dropped between steps so readback/mixed read through FUSE.
+        local step sub="rw-r$rep"
+        # Unmeasured setup: roots are uid 0/0755 (like the corpus write), so
+        # create the workload directory privileged and hand it to this user.
+        sudo -n mkdir "$dir/mnt/$sub" && sudo -n chown "$(id -u):$(id -g)" "$dir/mnt/$sub" || rc=1
+        for step in write readback mixed; do
+            local sart="$group/runs/$step-r$rep-$arm"; mkdir -p "$sart"
+            sync; sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+            "${compose[@]}" exec -T redis redis-cli -p "$redis_port" INFO commandstats >"$sart/redis-cmdstats-before.txt" 2>&1 || true
+            local srcs=0
+            timeout 1800 python3 "$ROOT/tools/perf/smallfiles_rw.py" --root "$dir/mnt" --subdir "$sub" --mode "$step" \
+                --files "$RW_FILES" --file-bytes "$RW_BYTES" --workers "$WORKERS" --mixed-ops "$RW_MIXED_OPS" \
+                --write-ratio "$RW_WRITE_RATIO" --seed "$SEED" --label "$arm" --json-output "$sart/summary.json" \
+                >"$sart/scanner.log" 2>&1 || srcs=$?
+            "${compose[@]}" exec -T redis redis-cli -p "$redis_port" INFO commandstats >"$sart/redis-cmdstats-after.txt" 2>&1 || true
+            printf '%s\n' "$srcs" >"$sart/step-exit.txt"
+            (( srcs == 0 )) || rc=$srcs
+        done
+        tr -d '\000' <"$dir/mnt/.stats" >"$art/fuse-stats.txt" 2>/dev/null || true
+    elif (( rc == 0 )); then
         timeout 1800 python3 "$ROOT/tools/perf/smallfiles_scan.py" --root "$dir/mnt" --label "$arm" --mode "$mode" \
             --expected-files "$FILES" --min-size "$FILE_BYTES" --max-size "$FILE_BYTES" --dir-levels 2 --dirs-per-level 10 \
             --files-per-leaf "$((FILES / 100))" --workers "$WORKERS" --order shuffle --shuffle-seed "$SEED" --epochs "$EPOCHS" \
             --batch-size 256 --max-inflight-batches 2 --json-output "$art/summary.json" >"$art/scanner.log" 2>&1 || rc=$?
         tr -d '\000' <"$dir/mnt/.stats" >"$art/fuse-stats.txt" 2>/dev/null || true
     fi
-    stop_mount "$dir/mnt" || rc=1
+    if [[ -n "$profiler" ]]; then sudo -n kill -INT "$profiler" 2>/dev/null || true; wait "$profiler" 2>/dev/null || true; fi
+    local rc_mount=0
+    [[ -n "${mount_s:-}" ]] || rc_mount=1
+    stop_mount "$dir/mnt" || { rc=1; rc_mount=1; }
     if [[ -n "$monitor" ]]; then kill "$monitor" 2>/dev/null || true; wait "$monitor" 2>/dev/null || true; fi
     "${compose[@]}" exec -T redis redis-cli -p "$redis_port" INFO commandstats >"$art/redis-cmdstats-after.txt" 2>&1 || true
-    python3 - "$art" "$arm" "$mode" "$rep" "$rc" "${mount_s:-0}" <<'PY'
+    local row_dirs=("$art:$mode")
+    if [[ "$mode" == rw ]]; then
+        row_dirs=()
+        for step in write readback mixed; do row_dirs+=("$group/runs/$step-r$rep-$arm:$step"); done
+        rmdir "$art" 2>/dev/null || true
+    fi
+    local entry
+    for entry in "${row_dirs[@]}"; do
+    # rw: a step's own exit, or the arm's mount/unmount failure (rc_mount).
+    local step_rc="$rc"
+    if [[ "$mode" == rw ]]; then
+        step_rc="$rc_mount"
+        [[ -f "${entry%%:*}/step-exit.txt" ]] && (( step_rc == 0 )) && step_rc="$(cat "${entry%%:*}/step-exit.txt")"
+    fi
+    python3 - "${entry%%:*}" "$arm" "${entry##*:}" "$rep" "$step_rc" "${mount_s:-0}" <<'PY'
 import json, pathlib, sys
 art = pathlib.Path(sys.argv[1]); arm, mode, rep, rc, mount_s = sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), float(sys.argv[6])
+art.mkdir(parents=True, exist_ok=True)
 row = {"arm": arm, "mode": mode, "rep": rep, "exit": rc, "mount_s": mount_s}
 p = art / "summary.json"
 if p.exists():
@@ -239,6 +290,7 @@ if p.exists():
 (art / "row.json").write_text(json.dumps(row) + "\n")
 print(f"{mode} r{rep} {arm}: exit={rc} files_ok={row.get('files_ok')} files/s={row.get('files_per_sec')} p99={row.get('p99_ms')}")
 PY
+    done
     return 0
 }
 
