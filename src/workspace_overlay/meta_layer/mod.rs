@@ -222,6 +222,20 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         result
     }
 
+    /// Re-authenticate the packed lower binding, reader pin and head/lease
+    /// fence around every lower read instead of treating the attached lower as
+    /// a frozen base. Must be called before the layer is shared.
+    pub fn with_strict_packed_lower_validation(mut self) -> Result<Self, MetaError> {
+        if let WorkspaceLower::PackedV3(lower) = &mut self.lower {
+            Arc::get_mut(lower)
+                .ok_or_else(|| {
+                    MetaError::Internal("packed lower is already shared; cannot change mode".into())
+                })?
+                .frozen = false;
+        }
+        Ok(self)
+    }
+
     pub fn packed_reader_session(
         &self,
     ) -> Option<Arc<dyn super::packed_reader_lifecycle::PackedReaderSession>> {
@@ -263,6 +277,10 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         &self,
         lower: &WorkspacePackedLower,
     ) -> Result<(), MetaError> {
+        if !lower.strict() {
+            // Frozen base: authenticated once at attach, never per operation.
+            return Ok(());
+        }
         lower
             .authority
             .validate(&self.guard().await, &lower.binding)
@@ -283,6 +301,16 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         let Some(lower) = self.packed_lower() else {
             return Ok(None);
         };
+        if !lower.strict() {
+            // Frozen base: the cached head/base pair is the read view. No
+            // reader pin, binding authentication or remote fence per op.
+            let guard = self.guard().await;
+            let chain = self.chain().await?;
+            let layers: [LayerRecord; 2] = chain
+                .try_into()
+                .map_err(|_| workspace_to_meta(WorkspaceError::Fenced))?;
+            return Ok(Some((guard, layers, None)));
+        }
         let reader_owner = lower
             .authority
             .retain_reader_request()
@@ -317,6 +345,50 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         Ok(Some((guard, layers, reader_owner)))
     }
 
+    /// Fence for multi-step reads (directory pages, xattr lists, paths). They
+    /// hold a fresh head record and reader generation across awaits and
+    /// re-check the head/lease between steps. Frozen mode only skips binding
+    /// authentication; strict mode is the full per-operation fence.
+    pub(super) async fn packed_enumeration_fence(
+        &self,
+    ) -> Result<
+        Option<(
+            HeadGuard,
+            [LayerRecord; 2],
+            Option<super::packed_reader_lifecycle::PackedReaderRequestOwner>,
+        )>,
+        MetaError,
+    > {
+        let Some(lower) = self.packed_lower() else {
+            return Ok(None);
+        };
+        if lower.strict() {
+            return self.packed_metadata_fence().await;
+        }
+        let reader_owner = lower
+            .authority
+            .retain_reader_request()
+            .map_err(workspace_to_meta)?;
+        let guard = self.guard().await;
+        let chain = self.chain().await?;
+        let layers = [
+            self.store
+                .load_layer(guard.expected_head_layer_id)
+                .await
+                .map_err(workspace_to_meta)?,
+            chain[1].clone(),
+        ];
+        if layers[1].layer_id != lower.binding.base_layer_id {
+            return Err(workspace_to_meta(WorkspaceError::Fenced));
+        }
+        validate_fixed_layer_pair(&layers).map_err(workspace_to_meta)?;
+        self.store
+            .validate_read_fence(guard.clone(), layers.clone())
+            .await
+            .map_err(workspace_to_meta)?;
+        Ok(Some((guard, layers, reader_owner)))
+    }
+
     async fn validate_packed_metadata_fence(
         &self,
         fence: Option<(
@@ -325,10 +397,21 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             Option<super::packed_reader_lifecycle::PackedReaderRequestOwner>,
         )>,
     ) -> Result<(), MetaError> {
-        if let Some((guard, layers, _reader_owner)) = fence {
+        if let Some((guard, layers, reader_owner)) = fence {
             let lower = self
                 .packed_lower()
                 .ok_or_else(|| workspace_to_meta(WorkspaceError::Fenced))?;
+            if !lower.strict() {
+                // Single-step frozen reads carry no owner and need no recheck.
+                // Multi-step enumeration fences re-check the head/lease.
+                if reader_owner.is_some() {
+                    self.store
+                        .validate_read_fence(guard, layers)
+                        .await
+                        .map_err(workspace_to_meta)?;
+                }
+                return Ok(());
+            }
             lower
                 .authority
                 .validate(&guard, &lower.binding)
@@ -1536,9 +1619,14 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         let _mutation_guard = self.mutation_gate.lock().await;
         let actor = crate::meta::layer::namespace_actor();
         let created = actor.is_some() && crate::meta::layer::take_created_inode_open_authority(ino);
+        // A frozen-base read-only open changes no state, so it does not pay
+        // an empty authenticated CAS; write opens and strict mode still do.
+        let open_commits = self
+            .packed_lower()
+            .is_some_and(|lower| lower.strict() || _write || _append);
         for _ in 0..64 {
             let prepared = async {
-                let version = if self.packed_lower().is_some() {
+                let version = if self.packed_lower().is_some() && open_commits {
                     Some(self.mutation_version().await?)
                 } else {
                     None
@@ -1580,7 +1668,7 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                     )));
                 }
             }
-            if self.packed_lower().is_some() {
+            if open_commits {
                 match self
                     .commit_versioned_mutation(VersionedMutation::empty(
                         self.guard().await,

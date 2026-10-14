@@ -35,6 +35,9 @@ const MAX_UPPER_EXTENT_ROWS: usize = 1024;
 // upper segments, gaps and per-gap owner bookkeeping. Child plan clones are
 // admitted separately before cloning; child owners retain their own permits.
 const UPPER_PREPARATION_BYTES: u64 = 4 << 20;
+// Plans kept free for in-progress reads' non-waiting recipe/driver charges
+// while new upper arenas wait (same reserve as lower preparation arenas).
+const UPPER_ARENA_HEADROOM_BYTES: u64 = 512 << 10;
 // The request retains a fixed guard, two layer records and shared lower
 // owners. Chunk preparation keeps its separate row/segment admission.
 const REQUEST_FENCE_BYTES: u64 = 4096;
@@ -229,6 +232,12 @@ pub(crate) struct WorkspacePackedLower {
     pub authority: Arc<dyn WorkspacePackedBindingAuthority>,
     pub upper: Arc<dyn UnifiedReadSourceFetcher>,
     pub budget: Arc<V3MountBudget>,
+    /// The packed lower is a frozen immutable base authenticated once when the
+    /// mount attaches it. Per-operation reads then skip re-authenticating the
+    /// binding, reader pin and head/lease fence; the writable head is still
+    /// checked by every mutation CAS and the lease by its heartbeat. Strict
+    /// mode re-validates around every lower read and is opt-in.
+    pub(super) frozen: bool,
     upper_identity: usize,
     upper_layout: ChunkLayout,
 }
@@ -269,6 +278,7 @@ impl WorkspacePackedLower {
             binding,
             metadata,
             authority,
+            frozen: true,
             upper_identity: Arc::as_ptr(&upper) as *const () as usize,
             upper_layout: layout,
             upper: Arc::new(NativeUpperFetcher {
@@ -277,6 +287,11 @@ impl WorkspacePackedLower {
             }),
             budget,
         }))
+    }
+
+    /// True when reads must re-authenticate the binding/fence per operation.
+    pub(crate) fn strict(&self) -> bool {
+        !self.frozen
     }
 
     pub(super) fn begin_operation(&self, requested: u64) -> Option<TerminalGuard> {
@@ -298,6 +313,28 @@ async fn capture_read_fence<W: WorkspaceStore + 'static>(
     [LayerRecord; 2],
     Option<crate::workspace_overlay::packed_reader_lifecycle::PackedReaderRequestOwner>,
 )> {
+    if !lower.strict() {
+        // Frozen base: the sealed base record is the mount's cached one. Only
+        // the writable head is read fresh, because same-epoch upper writes
+        // advance its sequence; the head/lease fence runs in ensure_current.
+        let guard = meta.guard().await;
+        let cached: [LayerRecord; 2] = meta
+            .chain()
+            .await?
+            .try_into()
+            .map_err(|_| read_workspace_error(WorkspaceError::Fenced))?;
+        let head = meta
+            .store
+            .load_layer(guard.expected_head_layer_id)
+            .await
+            .map_err(read_workspace_error)?;
+        let layers = [head, cached[1].clone()];
+        if layers[1].layer_id != lower.binding.base_layer_id {
+            return Err(WorkspaceError::Fenced.into());
+        }
+        validate_fixed_layer_pair(&layers).map_err(read_workspace_error)?;
+        return Ok((guard, layers, None));
+    }
     let owner = lower
         .authority
         .retain_reader_request()
@@ -352,11 +389,15 @@ impl<W: WorkspaceStore + 'static> UnifiedReadRequestFence for PackedReadRequestF
     }
 
     async fn ensure_current(&self) -> anyhow::Result<()> {
-        self.lower
-            .authority
-            .validate(&self.guard, &self.lower.binding)
-            .await
-            .map_err(read_workspace_error)?;
+        // Frozen base skips binding authentication; the writable head/lease
+        // fence is one MGET and still applies to every read request.
+        if self.lower.strict() {
+            self.lower
+                .authority
+                .validate(&self.guard, &self.lower.binding)
+                .await
+                .map_err(read_workspace_error)?;
+        }
         self.store
             .validate_read_fence(self.guard.clone(), self.layers.clone())
             .await
@@ -479,11 +520,14 @@ impl<W: WorkspaceStore + 'static> UnifiedReadSourceFetcher for CompositeFetcher<
         if generation != self.generation {
             return Err(ReadViewChanged.into());
         }
-        self.lower
-            .authority
-            .validate(&self.guard, &self.lower.binding)
-            .await
-            .map_err(read_workspace_error)?;
+        if self.lower.strict() {
+            self.lower
+                .authority
+                .validate(&self.guard, &self.lower.binding)
+                .await
+                .map_err(read_workspace_error)?;
+        }
+        // Writable head/lease fence: one MGET, kept in frozen mode.
         self.store
             .validate_read_fence(self.guard.clone(), self.layers.clone())
             .await
@@ -622,13 +666,21 @@ pub(super) async fn prepare<W: WorkspaceStore + 'static>(
         .await
         .map_err(fetch_to_meta)?;
     // Reserve all bounded upper preparation/bookkeeping before backend query.
+    // This read holds no other Plans charge yet, so it waits for sibling
+    // arenas (which shrink before lower preparation) instead of failing.
+    let mut arena = lower
+        .budget
+        .admit_waiting_with_headroom(
+            V3BudgetPool::Plans,
+            UPPER_PREPARATION_BYTES,
+            UPPER_ARENA_HEADROOM_BYTES,
+        )
+        .await
+        .map_err(budget_to_meta)?;
     let mut permits = vec![
         lower
             .budget
-            .admit(&[
-                (V3BudgetPool::Plans, UPPER_PREPARATION_BYTES),
-                (V3BudgetPool::Control, 4096),
-            ])
+            .admit(&[(V3BudgetPool::Control, 4096)])
             .map_err(budget_to_meta)?,
     ];
     let inodes = meta
@@ -689,6 +741,20 @@ pub(super) async fn prepare<W: WorkspaceStore + 'static>(
         .map_err(read_workspace_to_meta)?;
     let coverage = resolve_extent_coverage(&layers, &rows, ino, chunk_index, offset..end)
         .map_err(read_workspace_to_meta)?;
+    // Backend rows are dropped here. Only resolved upper segments, their gaps
+    // and per-gap bookkeeping stay live; each segment yields at most one gap.
+    let retained_rows = rows.len() as u64 + 2;
+    drop(rows);
+    arena
+        .shrink(
+            V3BudgetPool::Plans,
+            retained_rows
+                .saturating_mul(4 * std::mem::size_of::<LogicalSegment>() as u64)
+                .saturating_add(4096)
+                .min(UPPER_PREPARATION_BYTES),
+        )
+        .map_err(budget_to_meta)?;
+    permits.push(arena);
     let upper = coverage.covered.into_iter().map(|extent| LogicalSegment {
         logical_offset: extent.logical_offset,
         length: extent.length,
@@ -777,10 +843,13 @@ pub(super) async fn prepare<W: WorkspaceStore + 'static>(
                 let clone_bytes = (child.plan.segments.len() as u64)
                     .checked_mul(2 * std::mem::size_of::<LogicalSegment>() as u64)
                     .ok_or_else(|| MetaError::Internal("composed plan charge overflows".into()))?;
+                // Held charges here are already shrunk to their real size, so
+                // waiting depends only on sibling arenas that shrink or finish.
                 permits.push(
                     lower
                         .budget
-                        .admit(&[(V3BudgetPool::Plans, clone_bytes)])
+                        .admit_waiting_for(V3BudgetPool::Plans, clone_bytes)
+                        .await
                         .map_err(budget_to_meta)?,
                 );
                 gap_plan.segments = child.plan.segments.clone();

@@ -392,6 +392,19 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         owner: Option<String>,
     },
+    /// Initialize a new workspace-v1 volume whose default workspace overlays
+    /// an existing authenticated packed-v3 manifest as its read-only lower.
+    InitPackedVolume {
+        /// Content-addressed packed-v3 manifest object key (wire 005).
+        #[arg(long)]
+        manifest_key: String,
+        /// Mount configuration whose `data` section selects the object store
+        /// holding the manifest; no other section is used.
+        #[arg(long)]
+        data_config: PathBuf,
+        #[arg(long)]
+        owner: Option<String>,
+    },
     /// Add the explicit native-v2 control header for an existing workspace-v1
     /// catalog. This never rewrites the catalog header or migrates data.
     #[cfg(feature = "native-packed-base")]

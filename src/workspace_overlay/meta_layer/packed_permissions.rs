@@ -61,10 +61,15 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             .budget
             .admit(&[(V3BudgetPool::Metadata, OPERATION_BYTES)])
             .map_err(packed_lower::budget_to_meta)?;
-        let _reader = lower
-            .authority
-            .retain_reader_request()
-            .map_err(workspace_to_meta)?;
+        let strict = lower.strict();
+        let _reader = if strict {
+            lower
+                .authority
+                .retain_reader_request()
+                .map_err(workspace_to_meta)?
+        } else {
+            None
+        };
         let guard = self.guard().await;
         let chain = self.chain().await?;
         validate_fixed_layer_pair(&chain).map_err(workspace_to_meta)?;
@@ -80,13 +85,27 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             if reader.binding() != &lower.binding {
                 return Err(workspace_to_meta(WorkspaceError::Fenced));
             }
-            reader.validate().await.map_err(workspace_to_meta)?;
+            if strict {
+                reader.validate().await.map_err(workspace_to_meta)?;
+            }
         }
-        let before = self
-            .store
-            .read_packed_permission_snapshot(guard.clone(), lower.binding.clone(), query.clone())
-            .await
-            .map_err(workspace_to_meta)?;
+        let before = if strict {
+            self.store
+                .read_packed_permission_snapshot(
+                    guard.clone(),
+                    lower.binding.clone(),
+                    query.clone(),
+                )
+                .await
+                .map_err(workspace_to_meta)?
+        } else {
+            // Frozen base: one atomic native row read. Every mutation built on
+            // these layers re-authenticates binding, head and lease in its CAS.
+            self.store
+                .read_permission_snapshot(query.clone())
+                .await
+                .map_err(workspace_to_meta)?
+        };
         let mut merged = before.clone();
         for ino in inodes {
             let state = resolve_inode_state(&before.layers, &before.inodes, ino)
@@ -176,6 +195,9 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                     }
                 }
             }
+        }
+        if !strict {
+            return Ok(merged);
         }
         // Re-read the same native rows/PWB/guard after actual authenticated
         // lower I/O. Every later mutation checks this unchanged layer version

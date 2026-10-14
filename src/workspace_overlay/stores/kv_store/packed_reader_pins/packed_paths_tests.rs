@@ -155,6 +155,9 @@ async fn bounded_raw_paths_fuse_ancestor_await_retains_output_and_cancellation_r
     let meta = Arc::new(
         WorkspaceMetaLayer::with_chunk_size(f.store.clone(), f.meta.view_context().await, CHUNK)
             .with_packed_v3_lower(binding, lower, authority.clone(), upper.clone(), layout)
+            .unwrap()
+            // The held await is per-operation binding authentication.
+            .with_strict_packed_lower_validation()
             .unwrap(),
     );
     meta.initialize().await.unwrap();

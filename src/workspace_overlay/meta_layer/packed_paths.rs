@@ -178,7 +178,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             _permit: output_permit,
             _reader: output_reader,
         });
-        let fence = self.packed_metadata_fence().await?;
+        let fence = self.packed_enumeration_fence().await?;
         let mut limits = Limits { pages: 0, work: 0 };
         if self.stat(target).await?.is_none() {
             lower

@@ -192,3 +192,28 @@ RustFS/S3 packed-v3/005 full-read smoke 使用镜像 `w23geq7ncegg6etqsl.xuanyua
 - 远端 Claude Code 2.1.296 已安装到 `/home/hxy/.local/bin/claude`，并通过 `/usr/local/bin/claude` 提供 PATH 入口。ccswitch 仍是本地 gateway；当前 `inferenceGatewayBaseUrl=http://127.0.0.1:15721/claude-desktop`，按 Claude 文档远端主机不能访问设备 localhost，因此 SSH session 的推理网关仍是外部门禁，不能宣称远端 Claude session 已完成。
 - ECS 包月仅做了阿里云 `ModifyInstanceChargeType` 的 DryRun：`PrePaid`、`Period=1`、`PeriodUnit=Month`、`IncludeDataDisks=true` 校验通过，当前实例仍未改为包月，也未产生费用。
 - 当前 release 构建使用独立 `/mnt/brewfs-data/target-packed`、单 job、`RUSTFLAGS=-C debuginfo=0`；结果以 `build-packed-e980d592-*` artifact 为准。构建完成后才允许运行 RustFS/S3 严格 smoke；未完成前不更新性能 acceptance。
+
+## 2026-10-14 overlay frozen-base 优化与 overlay-vs-native 对比
+
+范围：overlay（packed 作为只读 lower）对比 native（纯 Redis 元数据 + RustFS 对象，无 packed）。同一 release binary、同一 2000×100 KiB 语料、同一 scanner trace（shuffle seed 20261001，16 workers，2 epochs），TTL0/direct-io/keep-cache0，零 payload cache，单机 loopback Redis + RustFS。
+
+改动（默认 frozen，`with_strict_packed_lower_validation()` 保留旧的逐操作严格校验）：
+- packed lower 视为冻结基座：stat/lookup/getxattr/get_acl/权限快照不再逐操作做 binding 认证、reader-pin 校验和前后两次 PWB 重读；权限快照改为一次原子 MGET。所有 mutation 仍在自身 CAS 中重新认证 binding/head/lease。
+- 读请求和多步枚举（readdir 分页、listxattr、get_paths）仍读取最新 writable head，并用一次 MGET 校验 head/lease，因此同 epoch upper 写入和 lease 丢失仍 fail-closed；只有 binding 撤销检测是 strict-only。
+- 只读 `record_open` 不再提交空的认证 CAS；写/append open 和 strict 模式保留。
+- overlay upper 读准备 arena（4 MiB Plans）改为等待式 admission 并保留 512 KiB headroom，解析后收缩到实际大小；修复了提速后在并发下暴露的 13/2000 ENOMEM。
+
+基线（旧 binary，MONITOR 诊断）：每个 FUSE lookup 约 1300 GET、790 STRLEN、620 TYPE、260 EVALSHA；overlay stat 1.5 files/s（100 文件），full 2.9 files/s（200 文件）。artifact：`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/ovn/ovn-20261013T142413Z-856883`、`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/ovn-diag/ovn-20261013T153021Z-864206`。
+
+结果（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/ovn-frozen3/ovn-20261014T044617Z-928478`，binary sha256 `cc0f1ac4…59b7`，3 reps 中位数，全部 0 错误，cleanup 归零；`summary-per-mode.json` = passed）：
+
+| mode | arm | files/s | p50 ms | p95 ms | p99 ms | mount s | Redis cmds / file-epoch |
+|---|---|---|---|---|---|---|---|
+| full | native | 753.7 | 10.1 | 12.6 | 14.4 | 0.25 | 44.7 |
+| full | overlay | 152.4 | 50.8 | 59.2 | 63.4 | 0.33 | 180.2 |
+| stat | native | 3209.6 | 2.4 | 2.9 | 3.2 | 0.23 | 12.9 |
+| stat | overlay | 672.4 | 11.4 | 13.5 | 15.5 | 0.33 | 28.3 |
+
+结论：overlay stat 相比基线约 450 倍提升，full 约 50 倍；但仍为 native 的约 1/5（stat 4.8×、full 4.9× 差距），**未达到“接近 native”**。剩余热点：full 模式每 file-epoch 约 91 MGET、17 TIME、12 EVALSHA（读请求 head/lease fence、upper extent/inode 查询、packed lower 读路径）。下一步候选：按 head sequence 缓存 head/lease fence、合并 inode+extent+fence 为单次 MGET。原 `summary.json` 因跨 mode 比较 checksum（stat 模式 checksum=0）被标为 rejected，保留未改；runner 已改为按 mode 校验。
+
+门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/frozen3/status.txt`）：release、fmt、clippy（workspace 与 `--all-targets --features workspace-overlay -D warnings`）、`cargo test --workspace --lib --bins`（1177 passed）、`git diff --check` 全部通过。overlay suite 959 passed / 4 failed，4 个均为既有失败：e980d59 的 3 个确定性失败 + `source_mutation_replacement_symlink_and_limits_fail_closed`（仅全量负载下失败，单独运行在 base 与 candidate 上均 5/5 通过）。`writable_acl_independent_sqlite_instances_keep_mode_acl_during_atime_writes` 在 merged-base 测试二进制上同样 9/10 失败，非本次引入。两个 `*_exhausts_exactly_64` 测试的期望已从 64 改为 store 现有的 `CAS_MAX_RETRIES`=256（base 上即已失败）。新增回归测试：frozen 读路径 0 次认证往返且 strict >0；frozen 写 open 仍提交认证 CAS；并发准备超过 Plans 容量时等待而非 ENOMEM。

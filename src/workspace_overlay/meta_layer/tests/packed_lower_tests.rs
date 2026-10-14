@@ -241,6 +241,16 @@ impl Fixture {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with(false).await
+}
+
+/// Binding revocation is only observed per operation in strict mode; the
+/// frozen default fences only the writable head/lease per read.
+async fn strict_fixture() -> Fixture {
+    fixture_with(true).await
+}
+
+async fn fixture_with(strict: bool) -> Fixture {
     let native = super::test_meta().await;
     let temp = tempfile::tempdir().unwrap();
     let gets = Arc::new(AtomicU64::new(0));
@@ -369,6 +379,11 @@ async fn fixture() -> Fixture {
             },
         )
         .unwrap();
+    let meta = if strict {
+        meta.with_strict_packed_lower_validation().unwrap()
+    } else {
+        meta
+    };
     meta.initialize().await.unwrap();
     Fixture {
         _temp: temp,
@@ -574,7 +589,7 @@ async fn public_copyup_truncate_extend_masks_lower_across_chunks() {
 
 #[tokio::test]
 async fn public_prepared_rejects_same_epoch_mutation_and_binding_fence_before_io() {
-    let f = fixture().await;
+    let f = strict_fixture().await;
     let head = f.head().await;
     f.copy_up(vec![DataExtentDelta::hole(head, 400, 0, 0, 4096, 0)])
         .await;
@@ -890,7 +905,13 @@ async fn public_request_fence_rejects_same_epoch_sequence_between_chunks() {
 #[tokio::test]
 async fn public_request_fence_keeps_binding_and_lease_fencing_fatal() {
     for revoke_binding in [false, true] {
-        let f = fixture().await;
+        // Lease loss must fence the frozen default; binding revocation is
+        // the strict-mode contract.
+        let f = if revoke_binding {
+            strict_fixture().await
+        } else {
+            fixture().await
+        };
         f.copy_up(Vec::new()).await;
         let request = f
             .meta
@@ -926,4 +947,30 @@ async fn public_request_fence_keeps_binding_and_lease_fencing_fatal() {
         assert!(error.downcast_ref::<ReadViewChanged>().is_none());
         assert_eq!(f.gets.load(Ordering::SeqCst), gets_before);
     }
+}
+
+#[tokio::test]
+async fn concurrent_overlay_preparations_wait_for_plans_instead_of_enomem() {
+    use crate::workspace_overlay::packed_v3::wire005::V3BudgetPool;
+    let f = fixture().await;
+    let budget = f.meta.packed_lower().unwrap().budget.clone();
+    // More simultaneous 4 MiB upper arenas than the Plans pool holds.
+    let readers = (budget.capacity(V3BudgetPool::Plans) / (4 << 20)) as usize * 2 + 4;
+    let results = futures::future::join_all((0..readers).map(|_| async {
+        let prepared = f
+            .meta
+            .prepare_unified_read(400, 0, 0, 4096)
+            .await?
+            .expect("packed prepared read");
+        let mut out = vec![0u8; 4096];
+        execute_unified_into(prepared.fetcher.as_ref(), 0, &prepared.plan, &mut out)
+            .await
+            .map_err(|error| MetaError::Internal(error.to_string()))?;
+        Ok::<_, MetaError>(())
+    }))
+    .await;
+    for result in results {
+        result.expect("concurrent overlay preparation must not ENOMEM");
+    }
+    assert_eq!(budget.state().used[V3BudgetPool::Plans as usize], 0);
 }

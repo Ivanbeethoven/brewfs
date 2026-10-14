@@ -41,11 +41,15 @@ struct EnumerationView<W> {
 }
 impl<W: WorkspaceStore + 'static> EnumerationView<W> {
     async fn validate(&self) -> Result<(), MetaError> {
-        self.lower
-            .authority
-            .validate(&self.guard, &self.lower.binding)
-            .await
-            .map_err(workspace_to_meta)?;
+        // Frozen base skips binding authentication. The writable head/lease
+        // fence (one MGET per page) still detects same-epoch upper mutation.
+        if self.lower.strict() {
+            self.lower
+                .authority
+                .validate(&self.guard, &self.lower.binding)
+                .await
+                .map_err(workspace_to_meta)?;
+        }
         self.store
             .validate_read_fence(self.guard.clone(), self.layers.clone())
             .await
@@ -350,7 +354,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             .admit(&[(V3BudgetPool::Metadata, 32 << 10)])
             .map_err(packed_lower::budget_to_meta)?;
         let (guard, layers, reader) = self
-            .packed_metadata_fence()
+            .packed_enumeration_fence()
             .await?
             .ok_or_else(|| MetaError::Internal("packed directory missing fence".into()))?;
         let attr = self.stat(ino).await?.ok_or(MetaError::NotFound(ino))?;
@@ -411,7 +415,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                 _permit: permit,
                 _reader: reader,
             });
-        let fence = self.packed_metadata_fence().await?;
+        let fence = self.packed_enumeration_fence().await?;
         if self.stat(ino).await?.is_none() {
             return Err(MetaError::NotFound(ino));
         }
@@ -432,20 +436,22 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         let mut bytes = 0usize;
         let mut examined = 0u64;
         loop {
+            if examined.is_multiple_of(32) && lower.budget.state().closed {
+                return Err(MetaError::Io(std::io::Error::from_raw_os_error(
+                    libc::ENOMEM,
+                )));
+            }
             if examined.is_multiple_of(32) {
-                if lower.budget.state().closed {
-                    return Err(MetaError::Io(std::io::Error::from_raw_os_error(
-                        libc::ENOMEM,
-                    )));
-                }
                 let (guard, layers, _) = fence
                     .as_ref()
                     .ok_or_else(|| MetaError::Internal("packed xattrs missing fence".into()))?;
-                lower
-                    .authority
-                    .validate(guard, &lower.binding)
-                    .await
-                    .map_err(workspace_to_meta)?;
+                if lower.strict() {
+                    lower
+                        .authority
+                        .validate(guard, &lower.binding)
+                        .await
+                        .map_err(workspace_to_meta)?;
+                }
                 self.store
                     .validate_read_fence(guard.clone(), layers.clone())
                     .await

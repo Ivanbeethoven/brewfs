@@ -372,13 +372,20 @@ impl V3MountBudget {
         self: &Arc<Self>,
         bytes: u64,
     ) -> PackedResult<V3OwnedPermit> {
-        self.admit_waiting_for(V3BudgetPool::Plans, bytes).await
+        // Keep the recipe reserve free so readers already past preparation
+        // can still take their non-waiting recipe/driver charges.
+        let headroom = (512u64 << 10).min(
+            self.limits.bytes[V3BudgetPool::Plans as usize]
+                - bytes.min(self.limits.bytes[V3BudgetPool::Plans as usize]),
+        );
+        self.admit_waiting_with_headroom(V3BudgetPool::Plans, bytes, headroom)
+            .await
     }
     /// Admit one short-lived scratch arena from a single pool, waiting while
     /// sibling requests hold it. Callers must admit before holding any other
     /// charge in the same pool and release the arena when the request ends,
     /// so a waiter only depends on other requests' progress.
-    pub(super) async fn admit_waiting_for(
+    pub(crate) async fn admit_waiting_for(
         self: &Arc<Self>,
         pool: V3BudgetPool,
         bytes: u64,
@@ -399,6 +406,45 @@ impl V3MountBudget {
                 Err(PackedWireError::LimitExceeded(_)) => changed.await,
                 Err(error) => return Err(error),
             }
+        }
+    }
+    /// Like `admit_waiting_for`, but a new arena is only admitted while
+    /// `headroom` bytes remain free afterwards. In-progress reads take small
+    /// non-waiting charges (recipes, drivers) from the same pool; new arenas
+    /// must not starve them into ENOMEM.
+    pub(crate) async fn admit_waiting_with_headroom(
+        self: &Arc<Self>,
+        pool: V3BudgetPool,
+        bytes: u64,
+        headroom: u64,
+    ) -> PackedResult<V3OwnedPermit> {
+        let capacity = self.limits.bytes[pool as usize];
+        if bytes.saturating_add(headroom) > capacity {
+            return Err(PackedWireError::LimitExceeded(format!(
+                "requested {} arena exceeds mount capacity",
+                pool.name()
+            )));
+        }
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let fits = {
+                let state = self.state.lock().unwrap();
+                if state.closed {
+                    return Err(PackedWireError::LimitExceeded("mount budget closed".into()));
+                }
+                state.used[pool as usize] + bytes + headroom <= capacity
+            };
+            if fits {
+                match self.admit(&[(pool, bytes)]) {
+                    Ok(permit) => return Ok(permit),
+                    Err(error) if self.state().closed => return Err(error),
+                    Err(PackedWireError::LimitExceeded(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            changed.await;
         }
     }
     pub fn output(self: &Arc<Self>, length: usize) -> PackedResult<V3OwnedPermit> {
