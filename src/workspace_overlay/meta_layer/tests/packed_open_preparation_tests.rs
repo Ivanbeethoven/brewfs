@@ -62,6 +62,8 @@ struct ValidationControl {
     deadlines: Mutex<Vec<i64>>,
     binding_reads: Mutex<Vec<Vec<Vec<u8>>>>,
     renewal_routes: AtomicUsize,
+    /// Every authenticated/consistent backend round trip (frozen-base proof).
+    validations: AtomicUsize,
     reached: Semaphore,
     resume: Semaphore,
 }
@@ -77,6 +79,7 @@ impl ValidationControl {
             deadlines: Mutex::new(Vec::new()),
             binding_reads: Mutex::new(Vec::new()),
             renewal_routes: AtomicUsize::new(0),
+            validations: AtomicUsize::new(0),
             reached: Semaphore::new(0),
             resume: Semaphore::new(0),
         }
@@ -183,6 +186,7 @@ impl<B: WorkspaceKvBackend> WorkspaceKvBackend for ValidationBackend<B> {
         keys: &[Vec<u8>],
         limits: KvReadLimits,
     ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
+        self.control.validations.fetch_add(1, Ordering::SeqCst);
         let mode = self.control.mode.load(Ordering::SeqCst);
         if mounted_renewal_mode(mode)
             && keys.len() == 2
@@ -261,6 +265,7 @@ impl<B: WorkspaceKvBackend> WorkspaceKvBackend for ValidationBackend<B> {
         writes: &[KvWrite],
         expires_at_ns: i64,
     ) -> Result<bool, WorkspaceError> {
+        self.control.validations.fetch_add(1, Ordering::SeqCst);
         let mode = self.control.mode.load(Ordering::SeqCst);
         let renewal_tracked = mounted_renewal_mode(mode) && mounted_renewal_packet(checks, writes);
         if renewal_tracked {
@@ -318,6 +323,7 @@ impl<B: WorkspaceKvBackend> WorkspaceKvBackend for ValidationBackend<B> {
         expires_at_ns: i64,
         limits: KvReadLimits,
     ) -> Result<bool, WorkspaceError> {
+        self.control.validations.fetch_add(1, Ordering::SeqCst);
         let tracked = binding_authentication(checks)
             && matches!(
                 self.control.mode.load(Ordering::SeqCst),
@@ -387,7 +393,12 @@ struct Fixture<B: WorkspaceKvBackend> {
     authority: Arc<dyn PackedMountAuthority>,
 }
 
+/// Strict mode: these race tests target per-operation lower validation.
 async fn fixture() -> Fixture<impl WorkspaceKvBackend> {
+    fixture_with(true).await
+}
+
+async fn fixture_with(strict: bool) -> Fixture<impl WorkspaceKvBackend> {
     let (objects, client, snapshot, proof, _payload) = packed().await;
     let lower = Arc::new(PackedV3ReadonlyMeta::from_v3(client, snapshot, 4096, 0));
     let inner = Arc::new(packed_open_preparation_test_backend());
@@ -434,6 +445,11 @@ async fn fixture() -> Fixture<impl WorkspaceKvBackend> {
         )
         .await
         .unwrap();
+    let meta = if strict {
+        meta.with_strict_packed_lower_validation().unwrap()
+    } else {
+        meta
+    };
     meta.initialize().await.unwrap();
     Fixture {
         _objects: objects,
@@ -713,7 +729,7 @@ async fn packed_mount_renewal_restarts_after_preparation_busy() {
 }
 
 #[tokio::test]
-async fn packed_mount_renewal_busy_exhausts_exactly_64() {
+async fn packed_mount_renewal_busy_exhausts_exactly_cas_cap() {
     for mode in [MOUNT_RENEW_PREP_ALWAYS_BUSY, MOUNT_RENEW_ALWAYS_BUSY] {
         let f = fixture().await;
         let budget = f.authority.budget().clone();
@@ -729,11 +745,12 @@ async fn packed_mount_renewal_busy_exhausts_exactly_64() {
             matches!(result, Err(WorkspaceError::Busy)),
             "exhausted result: {result:?}"
         );
-        assert_eq!(f.control.renewal_routes.load(Ordering::SeqCst), 64);
+        // The bounded contention budget is the store's CAS_MAX_RETRIES (256).
+        assert_eq!(f.control.renewal_routes.load(Ordering::SeqCst), 256);
         assert_eq!(
             f.control.calls.load(Ordering::SeqCst),
             if mode == MOUNT_RENEW_ALWAYS_BUSY {
-                64
+                256
             } else {
                 0
             }
@@ -948,7 +965,7 @@ async fn packed_stat_restarts_binding_authentication_after_joint_renewal() {
 }
 
 #[tokio::test]
-async fn packed_stat_binding_authentication_busy_exhausts_exactly_64() {
+async fn packed_stat_binding_authentication_busy_exhausts_exactly_cas_cap() {
     let f = fixture().await;
     f.meta.stat(400).await.unwrap().unwrap();
     let budget = f.authority.budget().clone();
@@ -959,8 +976,8 @@ async fn packed_stat_binding_authentication_busy_exhausts_exactly_64() {
         .expect("binding authentication retry must be finite");
     assert!(matches!(result, Err(MetaError::Io(ref error))
         if error.raw_os_error() == Some(libc::EBUSY)));
-    assert_eq!(f.control.calls.load(Ordering::SeqCst), 64);
-    assert_eq!(f.control.binding_reads.lock().await.len(), 128);
+    assert_eq!(f.control.calls.load(Ordering::SeqCst), 256);
+    assert_eq!(f.control.binding_reads.lock().await.len(), 512);
     assert!(f.meta.open_counts.is_empty());
     assert_eq!(
         budget.state().used,
@@ -1045,4 +1062,57 @@ async fn packed_record_open_preparation_does_not_retry_fenced_or_backend_errors(
         assert!(f.meta.open_counts.is_empty());
         shutdown(&f).await;
     }
+}
+
+async fn read_only_round_trips<B: WorkspaceKvBackend>(f: &Fixture<B>) -> usize {
+    let before = f.control.validations.load(Ordering::SeqCst);
+    let attr = f.meta.stat(400).await.unwrap().unwrap();
+    f.meta.lookup_with_attr_bytes(1, b"nonzero").await.unwrap();
+    f.meta.inode_permissions(400).await.unwrap().unwrap();
+    f.meta
+        .record_open(400, attr, true, false, false)
+        .await
+        .unwrap();
+    f.meta.record_close(400).await.unwrap();
+    f.control.validations.load(Ordering::SeqCst) - before
+}
+
+#[tokio::test]
+async fn frozen_base_read_path_does_no_per_operation_lower_validation() {
+    let frozen = fixture_with(false).await;
+    assert!(!frozen.meta.packed_lower().unwrap().strict());
+    let frozen_trips = read_only_round_trips(&frozen).await;
+    // Frozen base: no binding/pin/fence authentication on stat, lookup,
+    // permission reads or a read-only open; native rows use plain MGETs.
+    assert_eq!(
+        frozen_trips, 0,
+        "frozen base must not re-authenticate lower"
+    );
+    shutdown(&frozen).await;
+
+    let strict = fixture_with(true).await;
+    assert!(strict.meta.packed_lower().unwrap().strict());
+    let strict_trips = read_only_round_trips(&strict).await;
+    assert!(
+        strict_trips > 0,
+        "strict mode keeps per-operation validation"
+    );
+    shutdown(&strict).await;
+}
+
+#[tokio::test]
+async fn frozen_base_write_open_still_authenticates_in_cas() {
+    let f = fixture_with(false).await;
+    let attr = f.meta.stat(400).await.unwrap().unwrap();
+    let before = f.control.validations.load(Ordering::SeqCst);
+    f.meta
+        .record_open(400, attr, true, true, false)
+        .await
+        .unwrap();
+    assert!(
+        f.control.validations.load(Ordering::SeqCst) > before,
+        "write open must commit its authenticated CAS"
+    );
+    f.meta.record_close(400).await.unwrap();
+    shutdown(&f).await;
 }

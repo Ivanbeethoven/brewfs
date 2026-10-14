@@ -2453,6 +2453,150 @@ async fn workspace_cmd(args: WorkspaceArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Create a workspace-v1 volume whose default workspace's sealed base is an
+/// authenticated packed-v3 lower. The manifest is opened and verified through
+/// the selected object store before any binding is written; the install lease
+/// is released afterwards so a normal mount can acquire the workspace.
+#[cfg(feature = "workspace-overlay")]
+async fn init_packed_volume<W>(
+    store: Arc<W>,
+    manifest_key: &str,
+    data_config: &std::path::Path,
+    owner: Option<String>,
+) -> anyhow::Result<crate::workspace_overlay::model::WorkspaceRecord>
+where
+    W: WorkspaceStore + 'static,
+{
+    use crate::workspace_overlay::catalog::{AcquireLease, HeadGuard, ReleaseLease};
+    use crate::workspace_overlay::ids::LeaseId;
+    use crate::workspace_overlay::model::BaseRevision;
+    use crate::workspace_overlay::packed_v3::wire005::{
+        AuthenticatedV3Snapshot, V3IndexReader, V3ObjectKind, V3ObjectRef,
+    };
+    use crate::workspace_overlay::publish::binding::{
+        InstallPackedLowerBinding, VerifiedPackedLower,
+    };
+
+    if store.load_volume_header().await?.is_some() {
+        anyhow::bail!("workspace volume is already initialized")
+    }
+    let component = manifest_key.rsplit('/').next().unwrap_or_default();
+    let digest: [u8; 32] = hex::decode(component)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("manifest key must end in its 64-hex SHA-256 content address")
+        })?;
+    // Reuse the mount configuration parser; only the data section matters.
+    let cli = Cli::try_parse_from([
+        std::ffi::OsStr::new("brewfs"),
+        std::ffi::OsStr::new("mount"),
+        std::ffi::OsStr::new("--config"),
+        data_config.as_os_str(),
+        std::ffi::OsStr::new("/nonexistent-init-packed-volume"),
+    ])?;
+    let Command::Mount(args) = cli.cmd else {
+        anyhow::bail!("internal: mount argument parsing produced another command")
+    };
+    let config = MountConfig::from_sources(*args)?;
+
+    async fn verify<B: crate::cadapter::client::ObjectBackend + Clone + 'static>(
+        client: ObjectClient<B>,
+        key: &str,
+        digest: [u8; 32],
+    ) -> anyhow::Result<VerifiedPackedLower> {
+        let object_len = client
+            .typed_object_size(
+                crate::cadapter::read_observer::ReadClass::ManifestProbe,
+                key,
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("packed manifest object is absent"))?;
+        let reference = V3ObjectRef {
+            key: key.to_owned(),
+            kind: V3ObjectKind::Manifest,
+            object_len,
+            digest,
+        };
+        let snapshot = AuthenticatedV3Snapshot::open(&client, &reference).await?;
+        Ok(VerifiedPackedLower::from_authenticated_snapshot(
+            &snapshot,
+            &V3IndexReader::new(client.clone(), 0),
+        )
+        .await?)
+    }
+    let lower = match config.data_backend {
+        DataBackendKind::LocalFs => {
+            verify(create_localfs_client(&config)?, manifest_key, digest).await?
+        }
+        DataBackendKind::S3 => {
+            verify(create_s3_client(&config).await?, manifest_key, digest).await?
+        }
+    };
+
+    store.initialize_workspace_schema().await?;
+    let workspace = store
+        .create_volume_root(CreateVolumeRoot {
+            volume_format: "workspace-v1".into(),
+            schema_version: WORKSPACE_SCHEMA_VERSION,
+            volume_id: uuid::Uuid::now_v7(),
+            workspace_id: WorkspaceId::new(),
+            root_layer_id: LayerId::new(),
+            writable_layer_id: LayerId::new(),
+            owner_id: owner,
+        })
+        .await?;
+    let lease = store
+        .acquire_lease(AcquireLease {
+            workspace_id: workspace.workspace_id,
+            lease_id: LeaseId::new(),
+            holder_generation: 1,
+            ttl_ns: 60_000_000_000,
+        })
+        .await?;
+    let expected_layers: [crate::workspace_overlay::model::LayerRecord; 2] = store
+        .load_layer_chain(workspace.head_layer_id)
+        .await?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("new workspace head is not a two-layer view"))?;
+    let base = &expected_layers[1];
+    let expected_base = BaseRevision {
+        layer_id: base.layer_id,
+        sealed_version: base
+            .sealed_version
+            .ok_or_else(|| anyhow::anyhow!("new sealed base has no version"))?,
+        root_hash: base
+            .root_hash
+            .ok_or_else(|| anyhow::anyhow!("new sealed base has no root hash"))?,
+    };
+    let guard = HeadGuard {
+        workspace_id: workspace.workspace_id,
+        expected_head_layer_id: workspace.head_layer_id,
+        expected_head_epoch: workspace.head_epoch,
+        lease_id: lease.lease_id,
+        holder_generation: lease.holder_generation,
+    };
+    let installed = store
+        .install_packed_lower_binding(InstallPackedLowerBinding {
+            guard,
+            expected_layers,
+            expected_base,
+            expected_binding: None,
+            lower,
+        })
+        .await;
+    // Always end the install lease; a failed install must not strand it.
+    let released = store
+        .release_lease(ReleaseLease {
+            lease_id: lease.lease_id,
+            holder_generation: lease.holder_generation,
+        })
+        .await;
+    installed?;
+    released?;
+    Ok(store.load_workspace(workspace.workspace_id).await?)
+}
+
 #[cfg(feature = "workspace-overlay")]
 async fn workspace_cmd_with_catalog<W>(
     command: WorkspaceCommand,
@@ -2488,6 +2632,14 @@ where
                     owner_id: owner,
                 })
                 .await?;
+            print_json(&workspace)?;
+        }
+        WorkspaceCommand::InitPackedVolume {
+            manifest_key,
+            data_config,
+            owner,
+        } => {
+            let workspace = init_packed_volume(store, &manifest_key, &data_config, owner).await?;
             print_json(&workspace)?;
         }
         #[cfg(feature = "native-packed-base")]

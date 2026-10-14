@@ -1073,10 +1073,10 @@ impl<B: ObjectBackend + Clone + 'static> UnifiedReadSourceFetcher for PackedFram
     }
 
     async fn ensure_generation(&self, generation: ReadGeneration) -> anyhow::Result<()> {
-        if let Some(expected) = self.generation {
-            if expected != generation {
-                return Err(crate::chunk::read_plan::ReadViewChanged.into());
-            }
+        if let Some(expected) = self.generation
+            && expected != generation
+        {
+            return Err(crate::chunk::read_plan::ReadViewChanged.into());
         }
         Ok(())
     }

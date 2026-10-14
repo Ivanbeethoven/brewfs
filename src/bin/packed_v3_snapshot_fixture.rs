@@ -560,7 +560,9 @@ async fn build_v3_fixture<B: ObjectBackend + Clone + Send + Sync + 'static>(
                 .await?;
             let group = captured.group(1, root_key, profile)?;
             let external_chunks = match &mut captured {
-                CapturedV3Source::External(source) => producer.add_external_source(source).await?,
+                CapturedV3Source::External(source) => {
+                    producer.add_external_source(source.as_mut()).await?
+                }
                 CapturedV3Source::Group(_) => 0,
             };
             let frames = match &captured {

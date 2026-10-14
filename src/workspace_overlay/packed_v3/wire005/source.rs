@@ -8,8 +8,10 @@ use crate::workspace_overlay::packed_v3::{
 use std::path::Path;
 
 pub enum CapturedV3Source {
-    Group(CapturedV3SourceFile),
-    External(CapturedV3SourceLayout),
+    // Both captures are large and short-lived; box them so the enum itself
+    // stays pointer-sized whichever route admission selects.
+    Group(Box<CapturedV3SourceFile>),
+    External(Box<CapturedV3SourceLayout>),
 }
 
 #[cfg(test)]
@@ -59,13 +61,13 @@ impl CapturedV3Source {
         .await
         .map_err(|_| PackedWireError::Backend("source admission task failed".into()))??;
         match group {
-            Some(group) => Ok(Self::Group(group)),
-            None => Ok(Self::External(
+            Some(group) => Ok(Self::Group(Box::new(group))),
+            None => Ok(Self::External(Box::new(
                 CapturedV3SourceLayout::capture_with_policy(
                     path, temporary, inode, profile, classes, policy,
                 )
                 .await?,
-            )),
+            ))),
         }
     }
     pub fn entry(&self) -> &GroupMetaEntry {
