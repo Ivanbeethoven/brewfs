@@ -5129,12 +5129,15 @@ where
                                 committed_len,
                             )
                             .await?;
-                        let committed = handle
-                            .read_into_unaccounted_locked(
-                                &handle_guard,
-                                offset,
-                                &mut data[..committed_len],
-                                operation.as_ref().and_then(|guard| guard.delivery_token()),
+                        let committed =
+                            crate::workspace_overlay::meta_layer::packed_lower::with_request_view(
+                                fence.as_ref(),
+                                handle.read_into_unaccounted_locked(
+                                    &handle_guard,
+                                    offset,
+                                    &mut data[..committed_len],
+                                    operation.as_ref().and_then(|guard| guard.delivery_token()),
+                                ),
                             )
                             .await;
                         match committed {

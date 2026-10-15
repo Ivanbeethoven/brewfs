@@ -393,6 +393,47 @@ type CapturedInodeFence = (
 /// Capture the read fence plus one inode's upper rows. A frozen base on a
 /// consistent store does this in one round trip that already validates the
 /// head/lease fence (`fused`); otherwise it is the separate strict sequence.
+/// A frozen-base request's view, captured atomically by `begin_request`
+/// (head/lease fence plus this inode's upper rows in one read). While a read
+/// runs inside `with_request_view`, chunk preparation reuses it instead of
+/// re-capturing, and execution skips its per-chunk fence round trips: the
+/// request's single final `ensure_current` re-validates the same inode-row
+/// fence after all bytes are read, so a lost lease or any same-epoch upper
+/// write to this file still fails the request (and the reader retries it)
+/// before bytes are returned. Work outside the scope uses the full path.
+#[derive(Clone)]
+pub struct RequestView {
+    store_identity: usize,
+    ino: i64,
+    guard: HeadGuard,
+    layers: [LayerRecord; 2],
+    inodes: Vec<crate::workspace_overlay::model::InodeDelta>,
+}
+
+tokio::task_local! {
+    static REQUEST_VIEW: RequestView;
+}
+
+/// Run a read under the request view its fence captured, if any.
+pub(crate) async fn with_request_view<F: std::future::Future>(
+    fence: &dyn UnifiedReadRequestFence,
+    future: F,
+) -> F::Output {
+    match fence.request_view() {
+        Some(view) => REQUEST_VIEW.scope(view, future).await,
+        None => future.await,
+    }
+}
+
+fn current_request_view(store_identity: usize, ino: i64) -> Option<RequestView> {
+    REQUEST_VIEW
+        .try_with(|view| {
+            (view.store_identity == store_identity && view.ino == ino).then(|| view.clone())
+        })
+        .ok()
+        .flatten()
+}
+
 async fn capture_inode_fence<W: WorkspaceStore + 'static>(
     meta: &WorkspaceMetaLayer<W>,
     lower: &WorkspacePackedLower,
@@ -472,6 +513,7 @@ struct PackedReadRequestFence<W> {
     guard: HeadGuard,
     layers: [LayerRecord; 2],
     inode_fence: Option<InodeFence>,
+    request_view: Option<RequestView>,
     lower: Arc<WorkspacePackedLower>,
     file_size: u64,
     _reader_owner:
@@ -483,6 +525,10 @@ struct PackedReadRequestFence<W> {
 impl<W: WorkspaceStore + 'static> UnifiedReadRequestFence for PackedReadRequestFence<W> {
     fn file_size(&self) -> u64 {
         self.file_size
+    }
+
+    fn request_view(&self) -> Option<RequestView> {
+        self.request_view.clone()
     }
 
     async fn ensure_current(&self) -> anyhow::Result<()> {
@@ -547,11 +593,19 @@ pub(super) async fn begin_request<W: WorkspaceStore + 'static>(
         ino,
         rows: inodes.clone(),
     });
+    let request_view = fused.then(|| RequestView {
+        store_identity: Arc::as_ptr(&meta.store) as *const () as usize,
+        ino,
+        guard: guard.clone(),
+        layers: layers.clone(),
+        inodes: inodes.clone(),
+    });
     let request = Arc::new(PackedReadRequestFence {
         store: meta.store.clone(),
         guard,
         layers,
         inode_fence,
+        request_view,
         lower,
         file_size,
         _reader_owner: reader_owner,
@@ -606,6 +660,9 @@ struct CompositeFetcher<W> {
     guard: HeadGuard,
     layers: [LayerRecord; 2],
     inode_fence: Option<InodeFence>,
+    /// Prepared inside a request view: that request's final fence covers
+    /// this plan, so the executor's per-chunk checks need no round trip.
+    request_fenced: bool,
     generation: ReadGeneration,
     lower: Arc<WorkspacePackedLower>,
     children: Vec<PreparedUnifiedRead>,
@@ -627,14 +684,17 @@ impl<W: WorkspaceStore + 'static> UnifiedReadSourceFetcher for CompositeFetcher<
                 .await
                 .map_err(read_workspace_error)?;
         }
-        // Head/lease fence (per inode in frozen mode): one round trip.
-        validate_fence(
-            self.store.as_ref(),
-            &self.guard,
-            &self.layers,
-            self.inode_fence.as_ref(),
-        )
-        .await?;
+        // Head/lease fence (per inode in frozen mode): one round trip, unless
+        // the enclosing request's final fence already covers this plan.
+        if !self.request_fenced {
+            validate_fence(
+                self.store.as_ref(),
+                &self.guard,
+                &self.layers,
+                self.inode_fence.as_ref(),
+            )
+            .await?;
+        }
         for child in &self.children {
             child
                 .fetcher
@@ -765,9 +825,16 @@ pub(super) async fn prepare<W: WorkspaceStore + 'static>(
     let base = chunk_index
         .checked_mul(meta.chunk_size)
         .ok_or_else(|| MetaError::Internal("workspace chunk base overflows".into()))?;
-    let (guard, layers, reader_owner, inodes, fused) = capture_inode_fence(meta, &lower, ino)
-        .await
-        .map_err(fetch_to_meta)?;
+    let scoped = (!lower.strict())
+        .then(|| current_request_view(Arc::as_ptr(&meta.store) as *const () as usize, ino))
+        .flatten();
+    let in_request = scoped.is_some();
+    let (guard, layers, reader_owner, inodes, fused) = match scoped {
+        Some(view) => (view.guard, view.layers, None, view.inodes, true),
+        None => capture_inode_fence(meta, &lower, ino)
+            .await
+            .map_err(fetch_to_meta)?,
+    };
     // Reserve all bounded upper preparation/bookkeeping before backend query.
     // This read holds no other Plans charge yet, so it waits for sibling
     // arenas (which shrink before lower preparation) instead of failing.
@@ -979,6 +1046,7 @@ pub(super) async fn prepare<W: WorkspaceStore + 'static>(
         guard,
         layers,
         inode_fence,
+        request_fenced: in_request,
         generation,
         lower,
         children,

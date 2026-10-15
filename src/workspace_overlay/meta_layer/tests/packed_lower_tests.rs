@@ -1001,3 +1001,44 @@ async fn upper_row_cache_is_frozen_only_and_commits_invalidate_it() {
         .with_upper_row_cache(std::time::Duration::from_secs(60));
     assert!(strict_meta.upper_row_cache().is_none());
 }
+
+#[tokio::test]
+async fn request_view_skips_chunk_fences_but_final_fence_rejects_same_epoch_write() {
+    use crate::workspace_overlay::meta_layer::packed_lower::with_request_view;
+    let f = fixture().await;
+    let head = f.head().await;
+    f.copy_up(vec![DataExtentDelta::hole(head, 400, 0, 0, 4096, 0)])
+        .await;
+    let request = f
+        .meta
+        .begin_unified_read_request(400)
+        .await
+        .unwrap()
+        .unwrap();
+    // Chunk prepared and executed inside the request view: no per-chunk
+    // re-capture, data is the upper hole.
+    let bytes = with_request_view(request.as_ref(), async {
+        let prepared = f
+            .meta
+            .prepare_unified_read(400, 0, 0, 4096)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bytes = vec![0x55; 4096];
+        execute_unified_into(prepared.fetcher.as_ref(), 0, &prepared.plan, &mut bytes)
+            .await
+            .unwrap();
+        bytes
+    })
+    .await;
+    assert_eq!(bytes, vec![0; 4096]);
+    // Untouched view: the single final fence passes.
+    request.ensure_current().await.unwrap();
+    // A same-epoch upper write to this inode after the chunk was read must
+    // fail the request's final fence (the reader then retries the request).
+    let epoch = f.meta.view_context().await.head_epoch;
+    f.set_native_file_size(8200).await;
+    assert_eq!(f.meta.view_context().await.head_epoch, epoch);
+    let error = request.ensure_current().await.unwrap_err();
+    assert!(error.downcast_ref::<ReadViewChanged>().is_some());
+}

@@ -814,9 +814,22 @@ where
                         .as_ref()
                         .map_or_else(|| self.inode.file_size(), |fence| fence.file_size());
                     let delivery = operation.as_ref().and_then(|guard| guard.delivery_token());
-                    let data = self
-                        .read_at_unaccounted(offset, len, file_size, delivery)
-                        .await;
+                    let read = self.read_at_unaccounted(offset, len, file_size, delivery);
+                    #[cfg(feature = "workspace-overlay")]
+                    let data = match &fence {
+                        // The final ensure_current below re-validates this
+                        // view, so chunks inside it skip duplicate fences.
+                        Some(fence) => {
+                            crate::workspace_overlay::meta_layer::packed_lower::with_request_view(
+                                fence.as_ref(),
+                                read,
+                            )
+                            .await
+                        }
+                        None => read.await,
+                    };
+                    #[cfg(not(feature = "workspace-overlay"))]
+                    let data = read.await;
                     if let Err(error) = &data
                         && crate::chunk::read_plan::is_read_request_beyond_view(error)
                         && let Some(fence) = &fence

@@ -1810,8 +1810,9 @@ where
         MetaBackendKind::Redis => {
             let backend =
                 RedisWorkspaceBackend::connect(&args.meta_url, &args.workspace_namespace).await?;
-            let catalog =
-                KvWorkspaceStore::new(backend).with_packed_reader_pin_budget(packed_budget.clone());
+            let catalog = KvWorkspaceStore::new(backend)
+                .with_packed_reader_pin_budget(packed_budget.clone())
+                .with_inode_id_blocks();
             let catalog = Arc::new(if args.workspace_operator_managed {
                 catalog.into_runtime()
             } else {
@@ -1827,8 +1828,9 @@ where
                 args.meta_tikv_tls.as_ref(),
             )
             .await?;
-            let catalog =
-                KvWorkspaceStore::new(backend).with_packed_reader_pin_budget(packed_budget.clone());
+            let catalog = KvWorkspaceStore::new(backend)
+                .with_packed_reader_pin_budget(packed_budget.clone())
+                .with_inode_id_blocks();
             let catalog = Arc::new(if args.workspace_operator_managed {
                 catalog.into_runtime()
             } else {

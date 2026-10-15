@@ -329,3 +329,27 @@ overlay p50：stat 10.6→7.6 ms，full 47.6→38.3 ms，readback 31.2→24.6 ms
 overlay write p50 78.4→70.9 ms。剩余写路径成本：每次提交内的 native extent/reverse 派生检查与权限快照读取；读路径成本：每次 FUSE read 约 4.5 次 head/lease fence MGET。
 
 门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/hot11/gate.txt`）：fmt、clippy（workspace 与严格 overlay）、`cargo test --workspace --lib --bins`（1177 passed）、overlay+fuse 套件 1074 passed / 4 failed（均为既有）、`git diff --check` 全部通过。
+
+## 2026-10-16 overlay 第 7 轮：结构性减少读写往返
+
+设计与不变量：
+- 读：frozen 模式下 `begin_request` 的融合捕获（head/lease + 本 inode 两层行，一次一致读）作为请求视图，经 task-local 传给同一请求内的 chunk 准备与执行；chunk 不再重复捕获，执行器的前/后 generation 检查不再各发一次 fence。请求结束时的 `ensure_current` 仍按 inode 行重新校验：lease 丢失或同 epoch 对本文件的上层写入（必然改写其 inode 行）都会让请求失败并由读者重试，任何字节返回前完成。task-local 之外（如 spawn 出去的工作）退回完整的逐 chunk fence。
+- 写：packed 提交原先在视图读之后，还要分别点读 native-reverse 层状态、extent generation 与 slice 删除标记。这些键可由请求行预先算出，现在并入同一次一致视图读（上限 32 个 slice）。每个值仍是最终 CAS 的 check，陈旧值只会让 CAS 失败并进入有界重试，不会提交错误状态。
+- inode 分配：挂载运行时 store 每次 allocator CAS 预留 64 个 inode ID（与 slice 相同）。packed 发布取 max(allocator, 最高 native inode+1) 作为下限，预留只会留空洞。admin/发布/测试 store 仍逐个分配。
+- 未做：把整个写提交改成单个 Lua CAS（需在 Lua 中重写 PWB/binding/writer authority 的 fail-closed 校验，风险大）。
+
+实测每操作 Redis 往返（单 worker MONITOR）：create 6.5→3.5（native 2.5），fsync 6.1→3.1（native 4.0），read 6.0→4.5（native 0.4），open 28→28（native 4）。
+
+结果（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/ovn-hot12/ovn-20261015T104201Z-1262737`，brewfs sha256 `23740b71…e9d1`，3 reps，30/30 通过，cleanup 归零）：
+
+| mode | native files/s | overlay files/s | ratio | 上一轮 overlay | 变化 |
+|---|---|---|---|---|---|
+| stat | 3028.2 | 964.9 | 0.32 | 1002.8 | −4%（噪声内） |
+| full | 774.3 | 204.4 | 0.26 | 200.7 | 持平 |
+| readback | 1084.5 | 680.7 | 0.63 | 624.9 | +9% |
+| write | 585.8 | 276.8 | 0.47 | 225.1 | +23% |
+| mixed | 903.3 | 300.9 | 0.33 | 273.6 | +10% |
+
+剩余：open 的反向路径遍历（约 9 次反向索引页扫描/次，写入后提交使 path memo 失效，单次 open 的文件难以命中）；读请求开头融合捕获之后仍有一次立即的 fence 检查（尝试跳过，但会违反"请求刚开始即检测到 lease/binding 撤销"的既有测试契约，已回退），以及 extent 范围扫描重复一次。
+
+门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/hot12/gate.txt`）：fmt、clippy（workspace 与严格 overlay）、`cargo test --workspace --lib --bins`（1177 passed）、overlay+fuse 套件 1076 passed / 3 failed（e980d59 既有确定性失败）、`git diff --check` 全部通过；提交内容与门禁/压测的 diff 完全一致。

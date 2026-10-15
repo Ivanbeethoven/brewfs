@@ -308,7 +308,13 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             ));
         }
         let keys = layers.iter().copied().map(state_key).collect::<Vec<_>>();
-        let values = self.reverse_points(&keys).await?;
+        // A caller may have read these exact keys in its own consistent view
+        // read. The final CAS still checks every value, so a prefetched value
+        // that is stale can only fail that CAS, never commit wrong state.
+        let values = match super::prefetched_points(&keys) {
+            Some(values) => values,
+            None => self.reverse_points(&keys).await?,
+        };
         let mut states = BTreeMap::new();
         let mut derived = BTreeMap::new();
         let mut derived_bytes = 0usize;

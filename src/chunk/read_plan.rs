@@ -653,6 +653,15 @@ pub fn is_read_request_beyond_view(error: &anyhow::Error) -> bool {
 pub trait UnifiedReadRequestFence: Send + Sync {
     fn file_size(&self) -> u64;
     async fn ensure_current(&self) -> anyhow::Result<()>;
+    /// A frozen workspace request's atomically captured view, which chunk
+    /// preparation inside the same request may reuse. None: full per-chunk
+    /// capture and fencing (the default for every other provider).
+    #[cfg(feature = "workspace-overlay")]
+    fn request_view(
+        &self,
+    ) -> Option<crate::workspace_overlay::meta_layer::packed_lower::RequestView> {
+        None
+    }
 }
 
 #[async_trait]
