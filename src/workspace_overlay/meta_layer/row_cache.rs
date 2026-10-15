@@ -26,6 +26,7 @@ pub(super) enum RowKey {
     Xattr(i64, Vec<u8>),
     Permission(i64),
     Paths(i64),
+    Aliases(i64),
 }
 
 #[derive(Clone)]
@@ -37,6 +38,10 @@ pub(super) enum RowValue {
     /// Complete effective paths of one inode. Only successful, complete
     /// walks are cached; quota/cycle/view errors never are.
     Paths(Arc<Vec<Vec<u8>>>),
+    /// Verified effective (parent, name) aliases of one inode. Lives in the
+    /// namespace cache: only commits that write dentries or delete an inode
+    /// can change it, so data-only commits keep it.
+    Aliases(Arc<Vec<(i64, Vec<u8>)>>),
 }
 
 pub(super) struct UpperRowCache {

@@ -353,3 +353,28 @@ overlay write p50 78.4→70.9 ms。剩余写路径成本：每次提交内的 na
 剩余：open 的反向路径遍历（约 9 次反向索引页扫描/次，写入后提交使 path memo 失效，单次 open 的文件难以命中）；读请求开头融合捕获之后仍有一次立即的 fence 检查（尝试跳过，但会违反"请求刚开始即检测到 lease/binding 撤销"的既有测试契约，已回退），以及 extent 范围扫描重复一次。
 
 门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/hot12/gate.txt`）：fmt、clippy（workspace 与严格 overlay）、`cargo test --workspace --lib --bins`（1177 passed）、overlay+fuse 套件 1076 passed / 3 failed（e980d59 既有确定性失败）、`git diff --check` 全部通过；提交内容与门禁/压测的 diff 完全一致。
+
+## 2026-10-16 overlay 第 8 轮：open 路径遍历的命名空间缓存
+
+问题：上一轮的 path memo 与通用行缓存共用，每次提交（大多是只写数据的 write/fsync）都会清空它，单次 open 的文件几乎不命中；每次 open 仍做约 9 次反向索引页扫描。
+
+改动：
+- 新增独立的命名空间缓存（与行缓存同 TTL、同样仅 CLI 挂载启用、仅 frozen 模式）。只有可能改变路径的提交才使其失效：写入任何 dentry 行或删除 inode（覆盖 create/mkdir/link/unlink/rename/rmdir）；只写数据的提交不再清空它；视图切换两者都清空。
+- 路径遍历中每个祖先目录已验证的 (parent, name) 别名按 inode 缓存，同目录下多个文件的 open 复用父目录别名。
+- 同样的 generation ticket、仅缓存完整成功结果；所有元数据层写入都经过 `commit_versioned_mutation`（已逐一核对），失效点不会遗漏。
+
+实测 open 往返 28→18.7（反向页扫描 9→5），native 4。
+
+结果（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/ovn-hot13/ovn-20261015T122039Z-1290274`，brewfs sha256 `63987d54…cbb4`，3 reps，30/30 通过，cleanup 归零）：
+
+| mode | native files/s | overlay files/s | ratio | 上一轮 overlay | 变化 |
+|---|---|---|---|---|---|
+| stat | 3240.1 | 1036.5 | 0.32 | 964.9 | +7% |
+| full | 740.1 | 225.0 | 0.30 | 204.4 | +10% |
+| readback | 1178.6 | 774.9 | 0.66 | 680.7 | +14% |
+| write | 613.7 | 268.1 | 0.44 | 276.8 | −3%（噪声） |
+| mixed | 900.5 | 385.1 | 0.43 | 300.9 | +28% |
+
+mixed p99 173→94 ms，readback p50 22.5→19.8 ms。
+
+门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/hot13/gate.txt`）：fmt、clippy（workspace 与严格 overlay）、`cargo test --workspace --lib --bins`（1177 passed）、`git diff --check` 通过；overlay+fuse 套件首轮因数据盘写满（ENOSPC）未能编译（日志 `test-overlay.enospc.log`），按用户选择删除 hot3–hot11、frozen3 的旧二进制（约 40 GB，保留 sha256/日志/diff，见各目录 `BINARIES_REMOVED.txt`）后重跑：1075 passed / 5 failed（均为既有失败）。提交内容与门禁/压测 diff 完全一致。

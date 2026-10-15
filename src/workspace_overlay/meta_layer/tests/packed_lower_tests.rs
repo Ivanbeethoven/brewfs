@@ -1042,3 +1042,34 @@ async fn request_view_skips_chunk_fences_but_final_fence_rejects_same_epoch_writ
     let error = request.ensure_current().await.unwrap_err();
     assert!(error.downcast_ref::<ReadViewChanged>().is_some());
 }
+
+#[tokio::test]
+async fn namespace_cache_survives_data_commits_and_clears_on_namespace_commits() {
+    use super::super::row_cache::{RowKey, RowValue};
+    let mut f = fixture().await;
+    f.meta = f
+        .meta
+        .with_upper_row_cache(std::time::Duration::from_secs(60));
+    let namespace = f
+        .meta
+        .namespace_row_cache()
+        .expect("frozen namespace cache");
+    let seed = |cache: &super::super::row_cache::UpperRowCache| {
+        cache.insert(
+            cache.ticket(),
+            RowKey::Aliases(400),
+            RowValue::Aliases(std::sync::Arc::new(vec![(1, b"nonzero".to_vec())])),
+        );
+    };
+    seed(namespace);
+    // Data-only commit (no dentry rows, no deletion): path results stay.
+    f.meta.invalidate_rows_for(false);
+    assert!(namespace.get(&RowKey::Aliases(400)).is_some());
+    // Any namespace commit clears them.
+    f.meta.invalidate_rows_for(true);
+    assert!(namespace.get(&RowKey::Aliases(400)).is_none());
+    seed(namespace);
+    // A view change or generic invalidation clears both caches.
+    f.meta.invalidate_upper_rows();
+    assert!(namespace.get(&RowKey::Aliases(400)).is_none());
+}
