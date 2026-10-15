@@ -76,6 +76,11 @@ pub trait MetaLayer: Send + Sync {
     fn posix_acl_capability(&self) -> PosixAclCapability {
         PosixAclCapability::Unsupported
     }
+    /// `inode_permissions` alone answers an access check (existence plus
+    /// attributes and ACLs in one snapshot), so callers may skip the stat.
+    fn permission_snapshot_answers_access(&self) -> bool {
+        false
+    }
     /// Optional human readable backend name.
     fn name(&self) -> &'static str {
         "meta-layer"

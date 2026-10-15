@@ -243,3 +243,24 @@ RustFS/S3 packed-v3/005 full-read smoke 使用镜像 `w23geq7ncegg6etqsl.xuanyua
 结论：overlay 小文件读写现在功能上可用（修复前 readback/mixed 在 16 并发下必失败，且写入后卸载 fail-closed），但仍为 native 的 0.2–0.4，**未接近 native**；stat/full 与上一轮持平，融合 fence 未带来可测吞吐提升。剩余主要成本：open 的 path-walk 权限检查（非 root uid，native 同样执行但每级仅 1 次 HGET）、每个 FUSE op 的权限快照 MGET、写路径每次 create/fsync 的多个 Lua CAS（packed writer authority/native reverse/extent 派生行）。下一步候选：为 frozen base 合并权限快照与 dentry/inode 读、减少 create/fsync 的派生 CAS、复用 VFS 级 attr 结果。
 
 门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/hot6/status.txt`）：release、fmt、clippy（workspace 与 `--all-targets --features workspace-overlay -D warnings`）、`cargo test --workspace --lib --bins`（1177 passed）、`git diff --check` 通过；overlay suite 959 passed / 4 failed，均为既有失败（e980d59 的 3 个确定性失败 + `source_root_pins…` 全量负载下偶发）。新增测试：drain 在文件上限低于历史 writer 数时仍成功；frozen 读路径 0 次认证往返测试保持通过。
+
+## 2026-10-15 overlay 热路径第 3 轮
+
+改动：
+- slice ID 按 64 个一块预留（一次 allocator CAS），inode 分配仍逐个（发布时作为下限使用）。
+- frozen overlay 的 FUSE access 检查直接用一次权限快照（存在性+属性+ACL），不再先单独 stat；通过 `MetaLayer::permission_snapshot_answers_access()` 仅对 frozen overlay 打开，native 与 strict 模式顺序不变。
+- 修复 PR #10 引入的回归：等待式 arena admission 无上限等待，导致 `fuse::cancel_tests::packed_prepare_admission_returns_enomem_and_next_read_recovers` 永久挂起（此前门禁未选中 fuse:: 测试，未被发现）。现在等待最多 2 s 后按原耗尽错误 fail-closed；lower 准备 arena 恢复原有无 headroom 等待（headroom 会饿死最小 Plans 容量下的同帧 follower）。门禁现已包含 `fuse::`。
+
+结果（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/ovn-hot8/ovn-20261015T020405Z-1125281`，binary sha256 `9ab96317…a39e`，3 reps 中位数，36 行全部通过、0 错误、cleanup 归零）：
+
+| mode | native files/s | overlay files/s | ratio | 上一轮 overlay | Redis cmds/op 上一轮→本轮 |
+|---|---|---|---|---|---|
+| stat | 3006.9 | 678.4 | 0.23 | 696.8 | 28.3→25.1 |
+| full | 763.9 | 157.1 | 0.21 | 153.2 | 164.3→154.1 |
+| write | 644.9 | 209.6 | 0.32 | 215.4 | 271.3→253.4 |
+| readback | 1195.1 | 500.7 | 0.42 | 485.4 | 153.9→146.9 |
+| mixed | 962.1 | 254.3 | 0.26 | 259.4 | 383.1→371.6 |
+
+结论：Redis 命令数下降 3–11%，但吞吐与上一轮持平（±4%，在噪声内）。说明 overlay 与 native 的差距目前主要不在 Redis 往返次数，而在本地 CPU/锁/调度路径（此前 perf 采样显示 overlay 在 7.4 s 窗口内消耗约 2.9 核，native 远低于此）。下一步应先做 CPU profile（dwarf 调用图）定位 meta_layer/packed 读路径的本地开销，再决定优化方向，而不是继续减少 Redis 往返。
+
+门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/hot8/status.txt`）：release、fmt、clippy（workspace 与严格 overlay）、`cargo test --workspace --lib --bins`（1177 passed）、overlay+fuse 套件 1072 passed / 4 failed（均为既有失败）、`git diff --check` 全部通过。

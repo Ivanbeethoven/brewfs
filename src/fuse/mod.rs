@@ -2868,6 +2868,19 @@ where
         pid: u32,
         mask: u32,
     ) -> FuseResult<()> {
+        // Writable-ACL layers answer existence, attributes and ACLs from one
+        // atomic permission snapshot; a separate stat would be a redundant
+        // round trip whose attributes the decision must not use anyway.
+        if mask != 0 && self.meta_layer().permission_snapshot_answers_access() {
+            let permissions = self
+                .meta_layer()
+                .inode_permissions(ino)
+                .await
+                .map_err(posix_acl_errno)?
+                .ok_or_else(|| Errno::from(libc::ENOENT))?;
+            let mode = self.access_mode_for_permissions(&permissions, uid, gid, pid, mask & 7)?;
+            return check_requested_access(mask, mode);
+        }
         let Some(attr) = self.stat_ino_checked(ino).await.map_err(Errno::from)? else {
             return Err(libc::ENOENT.into());
         };
@@ -3768,6 +3781,75 @@ where
         }
     }
 
+    /// Mode bits granted by one atomic permission snapshot (POSIX ACL,
+    /// control ACL, then owner/group/other), with the root execute rule.
+    fn access_mode_for_permissions(
+        &self,
+        permissions: &crate::meta::layer::InodePermissions,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+        requested: u32,
+    ) -> FuseResult<u32> {
+        let attr = &permissions.attr;
+        if uid == 0 {
+            return Ok(
+                if requested & libc::X_OK as u32 == 0
+                    || attr.kind == VfsFileType::Dir
+                    || attr.mode & 0o111 != 0
+                {
+                    requested
+                } else {
+                    0
+                },
+            );
+        }
+        if let Some(raw) = &permissions.access_acl {
+            let acl = crate::meta::posix_acl::PosixAcl::decode(raw)
+                .map_err(|_| Errno::from(libc::EIO))?;
+            if acl.mode_bits() != attr.mode & 0o777 {
+                return Err(libc::EIO.into());
+            }
+            let groups = if acl.user_access_mode(attr.uid, uid).is_some() {
+                Vec::new()
+            } else {
+                verified_request_group_ids(pid, uid, gid)?
+            };
+            return Ok(
+                if acl.allows_access(attr.uid, attr.gid, uid, &groups, requested) {
+                    requested
+                } else {
+                    0
+                },
+            );
+        }
+        if let Some(raw) = &permissions.control_acl {
+            let entries: Vec<ControlAclEntry> =
+                serde_json::from_slice(raw).map_err(|_| Errno::from(libc::EIO))?;
+            crate::control::protocol::validate_acl_entries(&entries)
+                .map_err(|_| Errno::from(libc::EIO))?;
+            let groups = if uid == attr.uid {
+                Vec::new()
+            } else {
+                verified_request_group_ids(pid, uid, gid)?
+            };
+            if let Some(allowed) = crate::meta::posix_acl::control_acl_allows_access(
+                &entries, attr.uid, attr.gid, uid, &groups, requested,
+            ) {
+                return Ok(if allowed { requested } else { 0 });
+            }
+        }
+        if uid == attr.uid {
+            return Ok((attr.mode >> 6) & 7);
+        }
+        let groups = verified_request_group_ids(pid, uid, gid)?;
+        Ok(if groups.contains(&attr.gid) {
+            (attr.mode >> 3) & 7
+        } else {
+            attr.mode & 7
+        })
+    }
+
     async fn access_mode_for_attr(
         &self,
         ino: i64,
@@ -3786,63 +3868,7 @@ where
                 .await
                 .map_err(posix_acl_errno)?
                 .ok_or_else(|| Errno::from(libc::ENOENT))?;
-            let attr = &permissions.attr;
-            if uid == 0 {
-                return Ok(
-                    if requested & libc::X_OK as u32 == 0
-                        || attr.kind == VfsFileType::Dir
-                        || attr.mode & 0o111 != 0
-                    {
-                        requested
-                    } else {
-                        0
-                    },
-                );
-            }
-            if let Some(raw) = permissions.access_acl {
-                let acl = crate::meta::posix_acl::PosixAcl::decode(&raw)
-                    .map_err(|_| Errno::from(libc::EIO))?;
-                if acl.mode_bits() != attr.mode & 0o777 {
-                    return Err(libc::EIO.into());
-                }
-                let groups = if acl.user_access_mode(attr.uid, uid).is_some() {
-                    Vec::new()
-                } else {
-                    verified_request_group_ids(pid, uid, gid)?
-                };
-                return Ok(
-                    if acl.allows_access(attr.uid, attr.gid, uid, &groups, requested) {
-                        requested
-                    } else {
-                        0
-                    },
-                );
-            }
-            if let Some(raw) = permissions.control_acl {
-                let entries: Vec<ControlAclEntry> =
-                    serde_json::from_slice(&raw).map_err(|_| Errno::from(libc::EIO))?;
-                crate::control::protocol::validate_acl_entries(&entries)
-                    .map_err(|_| Errno::from(libc::EIO))?;
-                let groups = if uid == attr.uid {
-                    Vec::new()
-                } else {
-                    verified_request_group_ids(pid, uid, gid)?
-                };
-                if let Some(allowed) = crate::meta::posix_acl::control_acl_allows_access(
-                    &entries, attr.uid, attr.gid, uid, &groups, requested,
-                ) {
-                    return Ok(if allowed { requested } else { 0 });
-                }
-            }
-            if uid == attr.uid {
-                return Ok((attr.mode >> 6) & 7);
-            }
-            let groups = verified_request_group_ids(pid, uid, gid)?;
-            return Ok(if groups.contains(&attr.gid) {
-                (attr.mode >> 3) & 7
-            } else {
-                attr.mode & 7
-            });
+            return self.access_mode_for_permissions(&permissions, uid, gid, pid, requested);
         }
 
         // This legacy control-ACL path predates the capability-aware
@@ -4100,6 +4126,17 @@ fn vfs_kind_to_fuse(k: VfsFileType) -> FuseFileType {
         VfsFileType::CharDevice => FuseFileType::CharDevice,
         VfsFileType::BlockDevice => FuseFileType::BlockDevice,
     }
+}
+
+fn check_requested_access(mask: u32, mode: u32) -> FuseResult<()> {
+    // mask uses libc constants: F_OK=0, X_OK=1, W_OK=2, R_OK=4
+    if ((mask & libc::R_OK as u32) != 0 && (mode & 0o4) == 0)
+        || ((mask & libc::W_OK as u32) != 0 && (mode & 0o2) == 0)
+        || ((mask & libc::X_OK as u32) != 0 && (mode & 0o1) == 0)
+    {
+        return Err(libc::EACCES.into());
+    }
+    Ok(())
 }
 
 fn vfs_to_fuse_attr(

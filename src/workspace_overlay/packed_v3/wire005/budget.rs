@@ -79,6 +79,10 @@ pub struct V3MountBudget {
     changed: tokio::sync::Notify,
     observer: Mutex<Weak<crate::cadapter::read_observer::ReadObserver>>,
 }
+/// Longest a waiting arena admission queues behind sibling owners before it
+/// fails closed with the ordinary exhaustion error.
+const ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl V3MountBudget {
     pub const REPLY_ALLOCATION_ALLOWANCE_BYTES: u64 = 1 << 20;
     pub const STATS_EXTENSION_RENDER_MAX_BYTES: usize = 32768;
@@ -372,14 +376,10 @@ impl V3MountBudget {
         self: &Arc<Self>,
         bytes: u64,
     ) -> PackedResult<V3OwnedPermit> {
-        // Keep the recipe reserve free so readers already past preparation
-        // can still take their non-waiting recipe/driver charges.
-        let headroom = (512u64 << 10).min(
-            self.limits.bytes[V3BudgetPool::Plans as usize]
-                - bytes.min(self.limits.bytes[V3BudgetPool::Plans as usize]),
-        );
-        self.admit_waiting_with_headroom(V3BudgetPool::Plans, bytes, headroom)
-            .await
+        // read_preparation_limit already leaves the recipe reserve out of the
+        // arena; an extra headroom wait would starve a same-frame follower at
+        // the minimum supported Plans capacity.
+        self.admit_waiting_for(V3BudgetPool::Plans, bytes).await
     }
     /// Admit one short-lived scratch arena from a single pool, waiting while
     /// sibling requests hold it. Callers must admit before holding any other
@@ -396,6 +396,7 @@ impl V3MountBudget {
                 pool.name()
             )));
         }
+        let deadline = tokio::time::Instant::now() + ADMISSION_WAIT;
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -403,7 +404,13 @@ impl V3MountBudget {
             match self.admit(&[(pool, bytes)]) {
                 Ok(permit) => return Ok(permit),
                 Err(error) if self.state().closed => return Err(error),
-                Err(PackedWireError::LimitExceeded(_)) => changed.await,
+                Err(error @ PackedWireError::LimitExceeded(_)) => {
+                    // Bounded: a pool that never drains (for example one
+                    // pinned by a long-lived owner) fails closed with ENOMEM.
+                    if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                        return Err(error);
+                    }
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -425,6 +432,7 @@ impl V3MountBudget {
                 pool.name()
             )));
         }
+        let deadline = tokio::time::Instant::now() + ADMISSION_WAIT;
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -444,7 +452,9 @@ impl V3MountBudget {
                     Err(error) => return Err(error),
                 }
             }
-            changed.await;
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                return self.admit(&[(pool, bytes)]);
+            }
         }
     }
     pub fn output(self: &Arc<Self>, length: usize) -> PackedResult<V3OwnedPermit> {
