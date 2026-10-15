@@ -286,3 +286,26 @@ CPU profile（dwarf，stat 模式）：packed 索引页缓存命中率约 99.99%
 结论：stat +7%、full +4%，rw 三项持平；overlay 仍为 native 的 0.22–0.42。profile 显示剩余 CPU 主要在 tokio 调度、Redis 管线编码/发送与 S3 SDK（签名/HTTP），而非单一可消除的热点；继续逼近 native 需要结构性改动（例如减少每个 FUSE op 跨越的 async 任务/锁层次，或在 VFS 层复用 attr 结果）。
 
 门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/hot9/gate.txt`）：fmt、clippy（workspace 与严格 overlay）、`cargo test --workspace --lib --bins`（1177 passed）、overlay+fuse 套件 1072 passed / 4 failed（均为既有失败）、`git diff --check` 全部通过。
+
+## 2026-10-15 overlay 第 5 轮：上层行缓存（挂载级 opt-in）
+
+改动：`WorkspaceMetaLayer::with_upper_row_cache(ttl)` 为只读路径缓存上层 inode/dentry/xattr 行和用于 access 判定的权限快照。
+- 仅 CLI 挂载启用（持有独占 workspace lease，是上层唯一写者）；测试夹具默认关闭（此前被回退的版本正是因为夹具直接经 store 写入而读到旧行）。
+- 仅 frozen 模式生效，strict 模式不使用。
+- 每次本地提交前后、视图切换时整体失效；generation ticket 防止与提交并发的读插入旧行。
+- 变更路径不经过缓存：mutation 仍读取新的权限快照并在自身 CAS 中校验。
+- TTL 与 native Redis 客户端 inode 缓存相同（500 ms），可用 `BREWFS_WORKSPACE_ROW_CACHE_TTL_MS` 调整，0 关闭。
+
+结果（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/ovn-hot10/ovn-20261015T065442Z-1209957`，brewfs sha256 `a032de33…381f`，3 reps，30/30 通过，cleanup 归零）：
+
+| mode | native files/s | overlay files/s | ratio | 上一轮 overlay | 变化 |
+|---|---|---|---|---|---|
+| stat | 2976.2 | 1009.0 | 0.34 | 723.0 | +40% |
+| full | 753.4 | 202.0 | 0.27 | 163.2 | +24% |
+| readback | 1136.2 | 621.3 | 0.55 | 497.1 | +25% |
+| mixed | 919.2 | 261.8 | 0.28 | 251.1 | +4% |
+| write | 611.6 | 205.0 | 0.34 | 204.7 | 0% |
+
+overlay p50：stat 10.6→7.6 ms，full 47.6→38.3 ms，readback 31.2→24.6 ms。写路径不读缓存，未变化。记录的 fixture sha256 曾因拷贝竞态记录为空文件哈希，已用实际文件重写（`binary.sha256.note`）；运行日志显示 fixture 正常生成 2000 文件/111 组。
+
+门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/hot10/gate.txt`）：fmt、clippy（workspace 与严格 overlay）、`cargo test --workspace --lib --bins`（1177 passed）、overlay+fuse 套件 1073 passed / 5 failed（3 个 e980d59 确定性失败 + 2 个 source_file 负载下偶发，均为既有）、`git diff --check` 全部通过。

@@ -974,3 +974,30 @@ async fn concurrent_overlay_preparations_wait_for_plans_instead_of_enomem() {
     }
     assert_eq!(budget.state().used[V3BudgetPool::Plans as usize], 0);
 }
+
+#[tokio::test]
+async fn upper_row_cache_is_frozen_only_and_commits_invalidate_it() {
+    let mut f = fixture().await;
+    let head = f.head().await;
+    f.copy_up(vec![DataExtentDelta::hole(head, 400, 0, 0, 4096, 0)])
+        .await;
+    f.meta = f
+        .meta
+        .with_upper_row_cache(std::time::Duration::from_secs(60));
+    assert!(f.meta.upper_row_cache().is_some());
+    let first = f.meta.stat(400).await.unwrap().unwrap();
+    assert_ne!(first.size, 12345);
+    // A store-direct write (impossible for a real mount, which holds the
+    // exclusive lease) is not seen while cached: proves reads are served
+    // from the cache.
+    f.set_native_file_size(12345).await;
+    assert_eq!(f.meta.stat(400).await.unwrap().unwrap().size, first.size);
+    // Every mount commit path invalidates; after it the new row is visible.
+    f.meta.invalidate_upper_rows();
+    assert_eq!(f.meta.stat(400).await.unwrap().unwrap().size, 12345);
+    let strict = strict_fixture().await;
+    let strict_meta = strict
+        .meta
+        .with_upper_row_cache(std::time::Duration::from_secs(60));
+    assert!(strict_meta.upper_row_cache().is_none());
+}
