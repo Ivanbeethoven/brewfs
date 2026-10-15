@@ -382,7 +382,30 @@ pub struct KvWorkspaceStore<B> {
         std::sync::OnceLock<Arc<crate::workspace_overlay::packed_v3::wire005::V3MountBudget>>,
     native_auxiliary_budget:
         std::sync::OnceLock<Arc<crate::workspace_overlay::packed_v3::wire005::V3MountBudget>>,
+    slice_ids: IdBlock,
 }
+
+/// Per-store reserved range of slice IDs, `[next, end)`.
+#[derive(Default)]
+struct IdBlock(std::sync::Mutex<(i64, i64)>);
+
+impl IdBlock {
+    fn take(&self) -> Option<i64> {
+        let mut range = self.0.lock().unwrap();
+        (range.0 < range.1).then(|| {
+            range.0 += 1;
+            range.0 - 1
+        })
+    }
+    fn refill(&self, first: i64, count: i64) {
+        let mut range = self.0.lock().unwrap();
+        if range.0 >= range.1 {
+            *range = (first, first + count);
+        }
+    }
+}
+
+const SLICE_ID_BLOCK: i64 = 64;
 
 struct TopologyTxn<'a, B> {
     store: &'a KvWorkspaceStore<B>,
@@ -619,12 +642,43 @@ impl<B> KvWorkspaceStore<B>
 where
     B: WorkspaceKvBackend,
 {
+    async fn allocate_id_block(&self, count: i64) -> Result<i64, WorkspaceError> {
+        self.allocate_id_block_named("slice", count).await
+    }
+
+    /// Advance a durable allocator by `count` in one CAS and return the
+    /// first reserved ID.
+    async fn allocate_id_block_named(&self, name: &str, count: i64) -> Result<i64, WorkspaceError> {
+        let key = hot_allocator_key(name);
+        for _ in 0..CAS_MAX_RETRIES {
+            let (raw, value) = self.load_hot::<i64>(key.clone()).await?;
+            let current = value.unwrap_or(1);
+            let next = current
+                .checked_add(count)
+                .ok_or_else(|| WorkspaceError::CorruptMetadata("allocator overflows".into()))?;
+            let writes = [put(key.clone(), &next)?];
+            let checks = [KvCheck {
+                key: key.clone(),
+                expected: raw,
+            }];
+            let packet = self
+                .prepare_topology_envelope(checks.to_vec(), writes.to_vec(), None)
+                .await?;
+            if self.commit_prepared_topology_packet(&packet).await? {
+                return Ok(current);
+            }
+            tokio::task::yield_now().await;
+        }
+        Err(WorkspaceError::Busy)
+    }
+
     pub fn new(backend: B) -> Self {
         Self {
             backend: Arc::new(backend),
             runtime_only: false,
             packed_reader_pin_budget: std::sync::OnceLock::new(),
             native_auxiliary_budget: std::sync::OnceLock::new(),
+            slice_ids: IdBlock::default(),
         }
     }
 
@@ -634,6 +688,7 @@ where
             runtime_only: false,
             packed_reader_pin_budget: std::sync::OnceLock::new(),
             native_auxiliary_budget: std::sync::OnceLock::new(),
+            slice_ids: IdBlock::default(),
         }
     }
 
@@ -2779,27 +2834,18 @@ where
                 "unknown workspace allocator {name}"
             )));
         }
-        let key = hot_allocator_key(name);
-        for _ in 0..CAS_MAX_RETRIES {
-            let (raw, value) = self.load_hot::<i64>(key.clone()).await?;
-            let current = value.unwrap_or(1);
-            let next = current
-                .checked_add(1)
-                .ok_or_else(|| WorkspaceError::CorruptMetadata("allocator overflows".into()))?;
-            let writes = [put(key.clone(), &next)?];
-            let checks = [KvCheck {
-                key: key.clone(),
-                expected: raw,
-            }];
-            let packet = self
-                .prepare_topology_envelope(checks.to_vec(), writes.to_vec(), None)
-                .await?;
-            if self.commit_prepared_topology_packet(&packet).await? {
-                return Ok(current);
+        if name == "slice" {
+            // Slice IDs only need uniqueness (no publication floor reads
+            // them). Reserve a block per durable CAS; unused IDs in a block
+            // are simply skipped after a restart.
+            if let Some(id) = self.slice_ids.take() {
+                return Ok(id);
             }
-            tokio::task::yield_now().await;
+            let first = self.allocate_id_block(SLICE_ID_BLOCK).await?;
+            self.slice_ids.refill(first, SLICE_ID_BLOCK);
+            return self.slice_ids.take().ok_or(WorkspaceError::Busy);
         }
-        Err(WorkspaceError::Busy)
+        self.allocate_id_block_named(name, 1).await
     }
 
     async fn create_volume_root(
@@ -8036,6 +8082,29 @@ mod tests {
             store_b.load_layer(second_head).await.unwrap().next_sequence,
             33
         );
+    }
+
+    #[tokio::test]
+    async fn slice_ids_are_reserved_in_blocks_and_unique_across_stores() {
+        let backend = MemoryBackend::default();
+        let first = budgeted_kv_store(backend.clone());
+        first.initialize_workspace_schema().await.unwrap();
+        first.create_volume_root(create_request(210)).await.unwrap();
+        let second = budgeted_kv_store(backend.clone());
+        backend.cas_write_keys.lock().await.clear();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..SLICE_ID_BLOCK {
+            assert!(seen.insert(first.allocate_id("slice").await.unwrap()));
+        }
+        // One durable allocator CAS covers the whole block.
+        assert_eq!(backend.cas_write_keys.lock().await.len(), 1);
+        for _ in 0..3 {
+            assert!(seen.insert(second.allocate_id("slice").await.unwrap()));
+            assert!(seen.insert(first.allocate_id("slice").await.unwrap()));
+        }
+        // Inode IDs stay dense: no block reservation.
+        let inode = first.allocate_id("inode").await.unwrap();
+        assert_eq!(first.allocate_id("inode").await.unwrap(), inode + 1);
     }
 
     #[tokio::test]

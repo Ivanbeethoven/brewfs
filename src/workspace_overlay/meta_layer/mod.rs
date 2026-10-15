@@ -1473,6 +1473,13 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         )))
     }
 
+    fn permission_snapshot_answers_access(&self) -> bool {
+        // Frozen base only: strict mode keeps per-operation lower validation
+        // ordering around the stat it performs first.
+        self.packed_lower().is_some_and(|lower| !lower.strict())
+            && self.posix_acl_capability() == PosixAclCapability::ReadWrite
+    }
+
     fn posix_acl_capability(&self) -> PosixAclCapability {
         if self.store.supports_versioned_permissions()
             && (self.packed_lower().is_none() || self.store.supports_packed_permissions())
