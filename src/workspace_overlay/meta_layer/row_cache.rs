@@ -25,6 +25,7 @@ pub(super) enum RowKey {
     Dentry(i64, Vec<u8>),
     Xattr(i64, Vec<u8>),
     Permission(i64),
+    Paths(i64),
 }
 
 #[derive(Clone)]
@@ -33,6 +34,9 @@ pub(super) enum RowValue {
     Dentry(Arc<Vec<DentryDelta>>),
     Xattr(Arc<Vec<XattrDelta>>),
     Permission(Arc<PermissionSnapshot>),
+    /// Complete effective paths of one inode. Only successful, complete
+    /// walks are cached; quota/cycle/view errors never are.
+    Paths(Arc<Vec<Vec<u8>>>),
 }
 
 pub(super) struct UpperRowCache {

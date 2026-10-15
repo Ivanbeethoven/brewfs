@@ -298,12 +298,19 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             return Err(WorkspaceError::Fenced);
         }
         let backend = self.backend.clone();
+        let committed_head = self.committed_head.clone();
         let recovery_owner = packed_admin::capture_mounted_recovery_owner();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let _permit = permit;
             let store = KvWorkspaceStore::from_arc(backend).with_packed_reader_pin_budget(budget);
             let commit = store.commit_packed_versioned_mutation(request, binding, count);
+            let commit = async move {
+                commit.await.map(|(result, head)| {
+                    *committed_head.lock().unwrap() = Some(head);
+                    result
+                })
+            };
             let result = match recovery_owner {
                 Some(owner) => owner.scope(commit).await,
                 None => commit.await,
@@ -320,7 +327,7 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
         request: VersionedMutation,
         binding: PackedLowerBinding,
         count: usize,
-    ) -> Result<MutationResult, WorkspaceError> {
+    ) -> Result<(MutationResult, LayerRecord), WorkspaceError> {
         let mut keys = view_keys(&request.guard, &binding)?;
         keys.push(CONTROL_KEY.to_vec());
         for _ in 0..CAS_MAX_RETRIES {
@@ -406,7 +413,8 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                 .compare_and_swap_before(&checks, &writes, view.lease.expires_at_ns)
                 .await?
             {
-                return Ok(result);
+                // `head` is exactly the committed head record.
+                return Ok((result, head));
             }
             tokio::task::yield_now().await;
         }

@@ -163,9 +163,31 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         &self,
         target: i64,
     ) -> Result<OwnedPaths, MetaError> {
+        // The path walk reads many upper rows; the opt-in row cache memoizes
+        // its complete result under the same commit invalidation as rows.
+        let cache = self.upper_row_cache();
+        if let Some(super::row_cache::RowValue::Paths(paths)) =
+            cache.and_then(|cache| cache.get(&super::row_cache::RowKey::Paths(target)))
+        {
+            return Ok(OwnedPaths {
+                paths: (*paths).clone(),
+                guard: None,
+            });
+        }
+        let ticket = cache.map(super::row_cache::UpperRowCache::ticket);
         const ATTEMPTS: usize = 64;
         for attempt in 1..=ATTEMPTS {
             match self.packed_paths_bytes_owned_attempt(target).await {
+                Ok(owned) => {
+                    if let (Some(cache), Some(ticket)) = (cache, ticket) {
+                        cache.insert(
+                            ticket,
+                            super::row_cache::RowKey::Paths(target),
+                            super::row_cache::RowValue::Paths(Arc::new(owned.paths.clone())),
+                        );
+                    }
+                    return Ok(owned);
+                }
                 Err(MetaError::Io(ref error))
                     if error.raw_os_error() == Some(libc::EBUSY) && attempt < ATTEMPTS =>
                 {
