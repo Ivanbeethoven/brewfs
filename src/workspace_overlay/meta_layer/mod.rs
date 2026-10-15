@@ -101,6 +101,54 @@ fn validate_fixed_layer_pair(chain: &[LayerRecord]) -> Result<(), WorkspaceError
     Ok(())
 }
 
+/// Cache keys whose source rows one versioned commit writes. A cached value
+/// depends only on the rows of its own key: `Inode` on that inode's rows,
+/// `Permission` on its inode and ACL-xattr rows, `Dentry`/`Xattr` on that
+/// exact (parent|ino, name). Extent rows touch only their inode's entries.
+/// ACL rows have no per-key mapping, so they clear the whole row cache.
+pub(super) struct RowsWritten {
+    row_keys: Option<Vec<row_cache::RowKey>>,
+    /// Any dentry row or inode deletion: paths/aliases may change.
+    namespace: bool,
+}
+
+impl RowsWritten {
+    pub(super) fn of(request: &VersionedMutation) -> Self {
+        let namespace = !request.dentries.is_empty()
+            || request
+                .inodes
+                .iter()
+                .any(|inode| inode.state == InodeState::Deleted);
+        let row_keys = request.acls.is_empty().then(|| {
+            let inodes = request
+                .inodes
+                .iter()
+                .map(|row| row.ino)
+                .chain(request.extents.iter().map(|row| row.ino))
+                .chain(request.xattrs.iter().map(|row| row.ino))
+                .collect::<BTreeSet<_>>();
+            let mut keys = Vec::with_capacity(
+                inodes.len() * 2 + request.dentries.len() + request.xattrs.len(),
+            );
+            for ino in inodes {
+                keys.push(row_cache::RowKey::Inode(ino));
+                keys.push(row_cache::RowKey::Permission(ino));
+            }
+            for row in &request.dentries {
+                keys.push(row_cache::RowKey::Dentry(row.parent_ino, row.name.clone()));
+            }
+            for row in &request.xattrs {
+                keys.push(row_cache::RowKey::Xattr(row.ino, row.name.clone()));
+            }
+            keys
+        });
+        Self {
+            row_keys,
+            namespace,
+        }
+    }
+}
+
 #[derive(Default)]
 struct WorkspaceLocks {
     plocks: BTreeMap<(i64, i64), Vec<PlockRecord>>,
@@ -143,8 +191,8 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         self
     }
 
-    /// Every commit and view change. Clears namespace results too; use
-    /// `invalidate_rows_for` when the commit is known to be data-only.
+    /// Every view change. Clears namespace results too; commits use
+    /// `invalidate_rows_written`.
     pub(super) fn invalidate_upper_rows(&self) {
         if let Some(cache) = &self.upper_rows {
             cache.invalidate_all();
@@ -154,14 +202,22 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         }
     }
 
-    /// Row cache always; namespace cache only when the commit can change a
-    /// path: any dentry row, or an inode deleted (state Deleted). Renames,
-    /// links, unlinks, creates and mkdir/rmdir all write dentry rows.
-    pub(super) fn invalidate_rows_for(&self, namespace: bool) {
+    /// One commit: the row cache drops only the entries whose source rows
+    /// the commit writes (see `RowsWritten`), so unrelated directories,
+    /// ancestors and ACL xattrs stay cached. The namespace cache clears only
+    /// when the commit can change a path: any dentry row, or an inode
+    /// deleted. Renames, links, unlinks, creates and mkdir/rmdir all write
+    /// dentry rows.
+    pub(super) fn invalidate_rows_written(&self, written: &RowsWritten) {
         if let Some(cache) = &self.upper_rows {
-            cache.invalidate_all();
+            match &written.row_keys {
+                Some(keys) => cache.invalidate_keys(keys),
+                None => cache.invalidate_all(),
+            }
         }
-        if namespace && let Some(cache) = &self.namespace_rows {
+        if written.namespace
+            && let Some(cache) = &self.namespace_rows
+        {
             cache.invalidate_all();
         }
     }
