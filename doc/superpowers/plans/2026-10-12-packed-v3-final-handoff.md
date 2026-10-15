@@ -405,3 +405,28 @@ mixed p99 173→94 ms，readback p50 22.5→19.8 ms。
 mixed p99 112.5→77.2 ms，write p99 82.0→79.5 ms。客户端 Redis 往返/操作：write 29.7→18.1，mixed 70.1→48.9，readback 不变（29.6）。此时段主机整体比第 8 轮记录时慢约 15%（native full 740→645），因此本表只与同时段的 hot13 对照比较；单独首跑 `ovn-hot15/ovn-20261015T160044Z-1338897` 紧跟构建、页缓存被挤出，native 同样下降，不作为结论。
 
 剩余：readback 每次读仍约 14 MGET + 8 次 TIME/MGET fence（`hot_mutation`/读 fence）；写提交约 7 次 EVALSHA（视图读、native-reverse 状态与行的 4 次前缀扫描、最终 CAS）。
+
+## 2026-10-16 overlay 第 10 轮：路径遍历信任后端证明的短页
+
+问题：readback 每个文件在 open 的路径权限检查中，对目标与每个祖先、每层各做一次反向索引页扫描；即使第一页只有 1 行（远少于 32 行上限），也还要再扫一个空页确认结束（单 worker trace：readback 阶段 780 次反向扫描中 260 次是这种空确认页）。
+
+改动：
+- `WorkspaceKvBackend::short_scan_page_is_end()`（默认 false）。只有 Redis 返回 true：其分页是单个 Lua 内的 `ZRANGEBYLEX … LIMIT max_records`，唯一的截断条件是行数上限，字节超限与索引幽灵都直接报错而非截断。TiKV 的分页可能因 RPC/region 上限返回短页，保持原语义。
+- `WorkspaceNamePage.end` 由 `bounded_name_page` 设置（短页且后端可证明）；仅 native-reverse 路径遍历使用它提前结束每层扫描。完整性仍由遍历结束时的 `confirm_native_reverse_authority` 精确 CAS 认证。
+- 测试：内存后端可选开启该语义，35 个别名（32 + 3 行）在两种语义下结果相同，反向扫描页数 4→3；真实 Redis 测试验证满页后续仍有行、短页之后确为空。
+
+同机两组对照（hot15→hot16 与 hot16→hot15 交替顺序），每组 3 reps，4 组均 30/30 通过、cleanup 归零；表中为两组合并 6 次中位数：
+- `ovn-hot15-paired2/ovn-20261015T182305Z-1389942`、`ovn-hot16-paired2/ovn-20261015T182720Z-1400656`
+- `ovn-hot16-paired3/ovn-20261015T183234Z-1411462`、`ovn-hot15-paired3/ovn-20261015T183644Z-1422070`
+
+| mode | native files/s | overlay hot15 | overlay hot16 | 变化 | ratio |
+|---|---|---|---|---|---|
+| stat | ~2990 | 981 | 983 | 持平 | 0.33 |
+| full | ~760 | 220 | 219 | 持平 | 0.29 |
+| write | ~570 | 287 | 278 | −3%（两组方向相反：284→275、291→291；改动不触及写路径） | 0.47 |
+| readback | ~1080 | 728 | 771 | +5.9% | 0.71 |
+| mixed | ~880 | 431 | 451 | +4.5% | 0.50 |
+
+mixed p99 66.1→58.1 ms，readback p99 35.0→33.5 ms；客户端 Redis 往返/操作 readback 29.5→28.4、mixed 48.0→44.0。
+
+操作记录：首次运行真实 Redis 测试时用 `--ignored real_redis_` 过滤，误选中会挂载 FUSE 的 ignored 测试并卡在 `request_wait_answer`；通过 `/sys/fs/fuse/connections/<minor>/abort` 中止连接、lazy umount 后进程正常退出，未留下 D 状态任务。之后只用 `--exact` 运行两个 Redis 后端测试（`build/hot16/test-redis-real.log`，2/2 通过）。

@@ -130,6 +130,11 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                     candidates.insert(next.clone());
                     cursor = Some(next);
                 }
+                // A backend-proven short page needs no empty confirmation
+                // page; completeness is still re-authenticated at the end.
+                if page.end {
+                    break;
+                }
             }
         }
         let mut after = None;

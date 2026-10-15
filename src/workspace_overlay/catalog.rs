@@ -225,6 +225,10 @@ pub struct XattrQuery {
 pub struct WorkspaceNamePage<T> {
     pub rows: Vec<T>,
     pub memory_guard: crate::meta::layer::MetadataMemoryGuard,
+    /// The backend proved no row follows this page (a short page from an
+    /// atomic single-range read). False never means more rows exist; callers
+    /// then continue until an empty page.
+    pub end: bool,
 }
 
 /// Opaque, owned completeness authority for the fixed two-layer native view.
