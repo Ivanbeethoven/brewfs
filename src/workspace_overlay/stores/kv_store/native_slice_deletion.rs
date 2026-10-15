@@ -202,9 +202,13 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
         }
         drop(primary_keys);
         let epoch_key = EXTENT_GENERATION_KEY.to_vec();
-        let mut epoch_values = self
-            .slice_fence_points(std::slice::from_ref(&epoch_key))
-            .await?;
+        let mut epoch_values = match super::prefetched_points(std::slice::from_ref(&epoch_key)) {
+            Some(values) => values,
+            None => {
+                self.slice_fence_points(std::slice::from_ref(&epoch_key))
+                    .await?
+            }
+        };
         let epoch = epoch_values.remove(0);
         let next = extent_generation(&epoch)?
             .checked_add(1)
@@ -241,7 +245,10 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
         checks: &mut Vec<KvCheck>,
         keys: &[Vec<u8>],
     ) -> Result<(), WorkspaceError> {
-        let values = self.slice_fence_points(keys).await?;
+        let values = match super::prefetched_points(keys) {
+            Some(values) => values,
+            None => self.slice_fence_points(keys).await?,
+        };
         for (key, value) in keys.iter().zip(values) {
             if value.is_some() {
                 return Err(WorkspaceError::Busy);

@@ -383,10 +383,41 @@ pub struct KvWorkspaceStore<B> {
     native_auxiliary_budget:
         std::sync::OnceLock<Arc<crate::workspace_overlay::packed_v3::wire005::V3MountBudget>>,
     slice_ids: IdBlock,
+    inode_ids: IdBlock,
+    /// Opt-in: a mounted runtime store reserves inode IDs in blocks. Admin,
+    /// publication and test stores keep dense one-at-a-time allocation.
+    inode_blocks: bool,
     /// Last head record this store committed through a packed versioned
     /// mutation. A hint only: callers use it as an expected version and the
     /// CAS fails with Busy if anything changed since.
     committed_head: Arc<std::sync::Mutex<Option<LayerRecord>>>,
+}
+
+tokio::task_local! {
+    /// Values a commit already read in its own consistent view read, keyed
+    /// by exact key. Derived-CAS preparation consults it instead of issuing a
+    /// second point read. Each value is still a CAS check, so staleness can
+    /// only fail the commit (Busy -> bounded retry), never apply wrong state.
+    static PREFETCHED_POINTS: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+}
+
+/// All requested keys from the commit's prefetch, or None to read normally.
+pub(super) fn prefetched_points(keys: &[Vec<u8>]) -> Option<Vec<Option<Vec<u8>>>> {
+    PREFETCHED_POINTS
+        .try_with(|points| {
+            keys.iter()
+                .map(|key| points.get(key).cloned())
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok()
+        .flatten()
+}
+
+pub(super) async fn with_prefetched_points<F: std::future::Future>(
+    points: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    future: F,
+) -> F::Output {
+    PREFETCHED_POINTS.scope(points, future).await
 }
 
 /// Per-store reserved range of slice IDs, `[next, end)`.
@@ -410,6 +441,7 @@ impl IdBlock {
 }
 
 const SLICE_ID_BLOCK: i64 = 64;
+const INODE_ID_BLOCK: i64 = 64;
 
 struct TopologyTxn<'a, B> {
     store: &'a KvWorkspaceStore<B>,
@@ -683,8 +715,16 @@ where
             packed_reader_pin_budget: std::sync::OnceLock::new(),
             native_auxiliary_budget: std::sync::OnceLock::new(),
             slice_ids: IdBlock::default(),
+            inode_ids: IdBlock::default(),
+            inode_blocks: false,
             committed_head: Arc::default(),
         }
+    }
+
+    /// Mounted runtime only: reserve inode IDs 64 per allocator CAS.
+    pub fn with_inode_id_blocks(mut self) -> Self {
+        self.inode_blocks = true;
+        self
     }
 
     pub fn from_arc(backend: Arc<B>) -> Self {
@@ -694,6 +734,8 @@ where
             packed_reader_pin_budget: std::sync::OnceLock::new(),
             native_auxiliary_budget: std::sync::OnceLock::new(),
             slice_ids: IdBlock::default(),
+            inode_ids: IdBlock::default(),
+            inode_blocks: false,
             committed_head: Arc::default(),
         }
     }
@@ -2858,6 +2900,19 @@ where
             let first = self.allocate_id_block(SLICE_ID_BLOCK).await?;
             self.slice_ids.refill(first, SLICE_ID_BLOCK);
             return self.slice_ids.take().ok_or(WorkspaceError::Busy);
+        }
+        if name == "inode" && self.inode_blocks {
+            // Packed publication takes max(allocator, highest native inode +
+            // 1) as its floor, so a reserved block only leaves gaps; the
+            // durable counter already covers every ID handed out from it.
+            if let Some(id) = self.inode_ids.take() {
+                return Ok(id);
+            }
+            let first = self
+                .allocate_id_block_named("inode", INODE_ID_BLOCK)
+                .await?;
+            self.inode_ids.refill(first, INODE_ID_BLOCK);
+            return self.inode_ids.take().ok_or(WorkspaceError::Busy);
         }
         self.allocate_id_block_named(name, 1).await
     }

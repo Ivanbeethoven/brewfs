@@ -330,15 +330,33 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
     ) -> Result<(MutationResult, LayerRecord), WorkspaceError> {
         let mut keys = view_keys(&request.guard, &binding)?;
         keys.push(CONTROL_KEY.to_vec());
+        let view_len = keys.len();
+        // Keys the derived native-reverse/extent preparation will read, known
+        // from the request rows alone. Reading them in this same consistent
+        // view read removes their separate round trips; every one is still a
+        // check in the final CAS, so a concurrent change fails that CAS.
+        keys.extend(derived_prefetch_keys(&request));
         for _ in 0..CAS_MAX_RETRIES {
-            let (values, now) = self
+            let (all_values, now) = self
                 .backend
                 .get_many_consistent_with_time_bounded(&keys, limits(keys.len()))
                 .await?;
+            if all_values.len() != keys.len() {
+                return Err(WorkspaceError::CorruptMetadata(
+                    "short packed mutation view read".into(),
+                ));
+            }
+            let prefetched: std::collections::BTreeMap<_, _> = keys[view_len..]
+                .iter()
+                .cloned()
+                .zip(all_values[view_len..].iter().cloned())
+                .collect();
+            let values = &all_values[..view_len];
+            let keys_view = &keys[..view_len];
             validate_current_control_raw(values.last().and_then(Option::as_deref))?;
             let view = decode_view(
-                &keys,
-                &values,
+                keys_view,
+                values,
                 now,
                 &request.guard,
                 &binding,
@@ -355,11 +373,16 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                 writes.push(put(keys[1].clone(), &head)?);
             }
             let mut checks = view.checks;
-            let _native_reverse = self
-                .prepare_native_reverse_cas(&mut checks, &mut writes)
-                .await?;
-            let _extent_fence = self
-                .prepare_native_extent_cas(&mut checks, &mut writes)
+            let (_native_reverse, _extent_fence) =
+                super::with_prefetched_points(prefetched, async {
+                    let reverse = self
+                        .prepare_native_reverse_cas(&mut checks, &mut writes)
+                        .await?;
+                    let extent = self
+                        .prepare_native_extent_cas(&mut checks, &mut writes)
+                        .await?;
+                    Ok::<_, WorkspaceError>((reverse, extent))
+                })
                 .await?;
             // All primary and derived entries use the original packet budget.
             if checks
@@ -424,6 +447,36 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
 
 /// Returns the owned-plus-stored bytes this mutation can retain, which the
 /// commit admits instead of a fixed worst-case arena.
+/// Exact derived keys the native-reverse and extent preparation read for
+/// this request. Bounded so the combined view read stays within its byte and
+/// record limits; a request over the bound just reads them separately.
+fn derived_prefetch_keys(request: &VersionedMutation) -> Vec<Vec<u8>> {
+    const MAX_PREFETCHED_SLICES: usize = 32;
+    let mut keys = Vec::new();
+    if !request.dentries.is_empty() {
+        keys.push(super::native_reverse::state_key(
+            request.guard.expected_head_layer_id,
+        ));
+    }
+    let slices: std::collections::BTreeSet<u64> = request
+        .extents
+        .iter()
+        .filter_map(|row| match row.kind {
+            ExtentKind::Data { slice_id, .. } => Some(slice_id),
+            ExtentKind::Hole => None,
+        })
+        .collect();
+    if !request.extents.is_empty() && slices.len() <= MAX_PREFETCHED_SLICES {
+        keys.push(super::native_slice_deletion::EXTENT_GENERATION_KEY.to_vec());
+        keys.extend(
+            slices
+                .into_iter()
+                .map(super::native_slice_deletion::slice_deletion_key),
+        );
+    }
+    keys
+}
+
 fn validate_mutation_allocation_bounds(request: &VersionedMutation) -> Result<u64, WorkspaceError> {
     fn overflow() -> WorkspaceError {
         WorkspaceError::InvalidReadPlan("packed mutation allocation limit".into())
