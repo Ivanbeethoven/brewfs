@@ -475,3 +475,22 @@ Redis 往返/操作 readback 28.4→24.4、mixed 43.7→40.9，但吞吐全部�
 全部在噪声内，**rejected**。open 的门内串行不是瓶颈。
 
 阶段结论（第 11、12 轮）：在当前主机上，继续削减单个往返或解除局部串行都不再改变吞吐。overlay 每次操作的 Redis 服务端时间是 native 的 4–8 倍（Lua 脚本，尤其写提交约 740 µs/op），客户端 CPU 分散在 Redis 编解码与分配上，且 rustfs 与 brewfs 共享 8 核。下一步应是结构性改动而非继续微调：把写提交的视图读 + native-reverse 检查 + 最终 CAS 合并为单个 Lua（需在 Lua 中重写 fail-closed 校验），或给 readback 的 open 路径权限检查提供与 native 相同的 inode 级权限缓存语义。
+
+## 2026-10-16 已知问题：32 worker 下 mixed 出现 ENOMEM/EIO（既有，非近期回归）
+
+并发扩展测试（仅 rw 模式、1 rep，诊断用，不作为验收数字）：
+
+| workers | 二进制 | overlay write | overlay readback | overlay mixed |
+|---|---|---|---|---|
+| 8 | hot16 | 296（0 错误） | 690（0 错误） | 424（0 错误） |
+| 16 | hot16 | 285（0 错误） | 777（0 错误） | 452（0 错误） |
+| 32 | hot16 | 291（0 错误） | 864（0 错误） | **525/2000 错误** |
+| 32 | hot13（第 8 轮） | 270（0 错误） | 885（0 错误） | **1028/2000 错误** |
+
+证据：`ovn-scale-w8`、`ovn-scale-w32/ovn-20261015T232611Z-1557684`、`ovn-scale-w32-hot13`。native 在 32 worker 下三种模式均 0 错误（write 733、readback 1236、mixed 1051）。
+
+现象：应用收到 `ENOMEM`（open/read）与 `EIO`（fsync）。日志：`try_commit failed … packed v3 object limit exceeded: mount metadata_owned budget temporarily exhausted: used≈266.9 MB, requested=2104238, limit=268435456`，随后 `commit_chunk dropping failed slice after retry budget exhausted` 与 `vfs.fsync_snapshot_failed`。fsync 向应用报告了失败，因此不是静默丢数据，但该次写入的数据未提交。
+
+原因（已核对代码，未改动）：mount 的 Metadata 池为 256 MiB。路径遍历每个持有 16 MiB arena，最多 8 个并发（`MAX_CONCURRENT_PATH_WALKS`，共 128 MiB）；每个 frozen 写提交持有 `FROZEN_SNAPSHOT_BYTES`（2 MiB）的 mutation version，提交时再用**不等待**的 `admit` 申请约 2.1 MiB 的行/packet 上限（`validate_mutation_allocation_bounds`）。32 个并发 worker 时剩余 128 MiB 不足，提交的 admission 立即失败。由于提交方已持有同池的 mutation-version permit，直接改成等待式 admission 可能互相等待，只能靠 2 s 超时退出；修复需要重新设计这一池的配额（例如为提交单独预留、或缩小路径遍历 arena 并按需增长），尚未实施。
+
+写路径测量（单 worker MONITOR，`ovn-diag-hot16`）：overlay 每次 write 约 14.5 ms，native 约 10 ms，两者都含约 6 ms 的 S3 上传/fsync 等待。overlay 多出的约 4.5 ms 分布在每个文件约 3 次提交上（create、fsync、close），每次为视图读 EVALSHA + 最终 CAS EVALSHA 及其间隔，约 1.2–1.5 ms。把视图读并入 CAS 的单 Lua 方案每次提交最多省约 0.25 ms，估计 write 最多改善约 5%，风险（在 Lua 中重写 fail-closed 校验）与收益不成比例，暂不实施。
