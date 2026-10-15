@@ -48,6 +48,7 @@ mod packed_enumeration;
 pub mod packed_lower;
 mod packed_paths;
 mod packed_permissions;
+mod row_cache;
 pub use packed_lower::{
     CatalogPackedBindingAuthority, PinnedCatalogPackedBindingAuthority,
     WorkspacePackedBindingAuthority,
@@ -70,6 +71,7 @@ pub struct WorkspaceMetaLayer<W> {
     chunk_size: u64,
     open_counts: DashMap<i64, u64>,
     resolver_cache: WorkspaceResolverCache,
+    upper_rows: Option<row_cache::UpperRowCache>,
     locks: Mutex<WorkspaceLocks>,
     mutation_gate: Mutex<()>,
     metrics: Arc<WorkspaceMetrics>,
@@ -113,6 +115,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             chunk_size: DEFAULT_CHUNK_SIZE,
             open_counts: DashMap::new(),
             resolver_cache: WorkspaceResolverCache::default(),
+            upper_rows: None,
             locks: Mutex::new(WorkspaceLocks::default()),
             mutation_gate: Mutex::new(()),
             metrics: global_workspace_metrics(),
@@ -124,6 +127,28 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         let mut layer = Self::new(store, view);
         layer.chunk_size = chunk_size;
         layer
+    }
+
+    /// Serve read-only upper-row lookups from a short-lived cache. Only valid
+    /// while this mount holds the exclusive workspace lease and is the sole
+    /// writer; every local commit invalidates it. Frozen packed base only.
+    pub fn with_upper_row_cache(mut self, ttl: std::time::Duration) -> Self {
+        if !ttl.is_zero() {
+            self.upper_rows = Some(row_cache::UpperRowCache::new(ttl));
+        }
+        self
+    }
+
+    pub(super) fn invalidate_upper_rows(&self) {
+        if let Some(cache) = &self.upper_rows {
+            cache.invalidate_all();
+        }
+    }
+
+    fn upper_row_cache(&self) -> Option<&row_cache::UpperRowCache> {
+        self.upper_rows
+            .as_ref()
+            .filter(|_| self.packed_lower().is_some_and(|lower| !lower.strict()))
     }
 
     pub fn with_read_plan_cache_max_weight(mut self, max_weight: u64) -> Self {
@@ -443,6 +468,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
     pub async fn replace_view_context(&self, view: ViewContext) {
         let old_workspace = self.view.read().await.workspace_id;
         self.resolver_cache.invalidate_workspace(old_workspace);
+        self.invalidate_upper_rows();
         *self.view.write().await = view;
         *self.layer_pair.write().await = None;
     }
@@ -485,14 +511,30 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         ino: i64,
     ) -> Result<Resolution<InodeDelta>, MetaError> {
         let chain = self.chain().await?;
-        let rows = self
-            .store
-            .get_inode_deltas(InodeQuery {
-                layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
-                ino,
-            })
-            .await
-            .map_err(workspace_to_meta)?;
+        let cache = self.upper_row_cache();
+        let rows = match cache.and_then(|cache| cache.get(&row_cache::RowKey::Inode(ino))) {
+            Some(row_cache::RowValue::Inode(rows)) => rows,
+            _ => {
+                let ticket = cache.map(row_cache::UpperRowCache::ticket);
+                let rows = std::sync::Arc::new(
+                    self.store
+                        .get_inode_deltas(InodeQuery {
+                            layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
+                            ino,
+                        })
+                        .await
+                        .map_err(workspace_to_meta)?,
+                );
+                if let (Some(cache), Some(ticket)) = (cache, ticket) {
+                    cache.insert(
+                        ticket,
+                        row_cache::RowKey::Inode(ino),
+                        row_cache::RowValue::Inode(rows.clone()),
+                    );
+                }
+                rows
+            }
+        };
         Ok(resolve_inode_state(&chain, &rows, ino)
             .map_err(workspace_to_meta)?
             .map(|resolved| resolved.inode))
@@ -515,15 +557,28 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
     ) -> Result<Option<ResolvedDentry>, MetaError> {
         let fence = self.packed_metadata_fence().await?;
         let chain = self.chain().await?;
-        let rows = self
-            .store
-            .get_dentry_deltas(DentryQuery {
-                layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
-                parent_ino: parent,
-                name: Some(name.to_vec()),
-            })
-            .await
-            .map_err(workspace_to_meta)?;
+        let cache = self.upper_row_cache();
+        let key = row_cache::RowKey::Dentry(parent, name.to_vec());
+        let rows = match cache.and_then(|cache| cache.get(&key)) {
+            Some(row_cache::RowValue::Dentry(rows)) => rows,
+            _ => {
+                let ticket = cache.map(row_cache::UpperRowCache::ticket);
+                let rows = std::sync::Arc::new(
+                    self.store
+                        .get_dentry_deltas(DentryQuery {
+                            layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
+                            parent_ino: parent,
+                            name: Some(name.to_vec()),
+                        })
+                        .await
+                        .map_err(workspace_to_meta)?,
+                );
+                if let (Some(cache), Some(ticket)) = (cache, ticket) {
+                    cache.insert(ticket, key, row_cache::RowValue::Dentry(rows.clone()));
+                }
+                rows
+            }
+        };
         let result =
             match resolve_dentry_state(&chain, &rows, parent, name).map_err(workspace_to_meta)? {
                 Resolution::Present(entry) => Ok(Some(entry)),
@@ -1498,7 +1553,25 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
     }
 
     async fn inode_permissions(&self, ino: i64) -> Result<Option<InodePermissions>, MetaError> {
-        let snapshot = self.permission_snapshot(vec![ino], None).await?;
+        // Read-only access decision: may use the cached snapshot. Mutations
+        // take their own fresh permission snapshot and CAS on its layers.
+        let cache = self.upper_row_cache();
+        let key = row_cache::RowKey::Permission(ino);
+        let snapshot = match cache.and_then(|cache| cache.get(&key)) {
+            Some(row_cache::RowValue::Permission(snapshot)) => (*snapshot).clone(),
+            _ => {
+                let ticket = cache.map(row_cache::UpperRowCache::ticket);
+                let snapshot = self.permission_snapshot(vec![ino], None).await?;
+                if let (Some(cache), Some(ticket)) = (cache, ticket) {
+                    cache.insert(
+                        ticket,
+                        key,
+                        row_cache::RowValue::Permission(std::sync::Arc::new(snapshot.clone())),
+                    );
+                }
+                snapshot
+            }
+        };
         let Some(inode) =
             resolve_inode(&snapshot.layers, &snapshot.inodes, ino).map_err(workspace_to_meta)?
         else {
@@ -2998,15 +3071,28 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
             return Err(MetaError::NotFound(inode));
         }
         let chain = self.chain().await?;
-        let rows = self
-            .store
-            .get_xattr_deltas(XattrQuery {
-                layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
-                ino: inode,
-                name: Some(name.to_vec()),
-            })
-            .await
-            .map_err(workspace_to_meta)?;
+        let cache = self.upper_row_cache();
+        let key = row_cache::RowKey::Xattr(inode, name.to_vec());
+        let rows = match cache.and_then(|cache| cache.get(&key)) {
+            Some(row_cache::RowValue::Xattr(rows)) => rows,
+            _ => {
+                let ticket = cache.map(row_cache::UpperRowCache::ticket);
+                let rows = std::sync::Arc::new(
+                    self.store
+                        .get_xattr_deltas(XattrQuery {
+                            layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
+                            ino: inode,
+                            name: Some(name.to_vec()),
+                        })
+                        .await
+                        .map_err(workspace_to_meta)?,
+                );
+                if let (Some(cache), Some(ticket)) = (cache, ticket) {
+                    cache.insert(ticket, key, row_cache::RowValue::Xattr(rows.clone()));
+                }
+                rows
+            }
+        };
         let result =
             match resolve_xattr_state(&chain, &rows, inode, name).map_err(workspace_to_meta)? {
                 Resolution::Present(value) => Ok(Some(value.value)),

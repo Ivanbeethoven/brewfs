@@ -1995,6 +1995,14 @@ where
         if let Some(max_weight) = args.meta_read_plan_cache_max_weight {
             meta_layer = meta_layer.with_read_plan_cache_max_weight(max_weight);
         }
+        // This mount holds the exclusive workspace lease, so it is the only
+        // upper writer. Same staleness bound as the native Redis client.
+        let row_cache_ttl = std::env::var("BREWFS_WORKSPACE_ROW_CACHE_TTL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| CacheTtl::for_backend("redis").inode_ttl);
+        meta_layer = meta_layer.with_upper_row_cache(row_cache_ttl);
         let meta_layer = Arc::new(meta_layer);
         let packed = meta_layer.packed_reader_session().is_some();
         if packed {
