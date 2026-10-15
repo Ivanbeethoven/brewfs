@@ -616,6 +616,22 @@ pub struct PackedV3ReadonlyMeta<B: ObjectBackend + Clone + 'static> {
     root: AtomicI64,
     chunk_size: u64,
     context: Arc<V3ReadonlyContext<B>>,
+    /// The snapshot is immutable and authenticated, so a resolved attribute
+    /// never changes for the life of this reader. Memoizing it removes the
+    /// per-stat index walk (budget admission, async gate and several page
+    /// cache lookups). Bounded by entry count; misses take the normal path.
+    /// None when metadata caching is disabled (`cache_bytes == 0`): every
+    /// stat must then observe the backend, including injected faults.
+    attrs: Option<moka::sync::Cache<i64, Option<FileAttr>>>,
+    attrs_closed: std::sync::atomic::AtomicBool,
+}
+
+const ATTR_MEMO_ENTRIES: u64 = 1 << 20;
+
+fn attr_memo() -> moka::sync::Cache<i64, Option<FileAttr>> {
+    moka::sync::Cache::builder()
+        .max_capacity(ATTR_MEMO_ENTRIES)
+        .build()
 }
 
 /// One authenticated reverse-index page and its memory owner.
@@ -689,6 +705,8 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
             root,
             chunk_size,
             context,
+            attrs: (metadata_bytes != 0).then(attr_memo),
+            attrs_closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -827,6 +845,10 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
     /// Stop backend admission, join the real frame worker and wait every
     /// started response driver/body. The caller owns pin/budget retirement.
     pub(crate) async fn drain_packed_transport(&self) -> Result<(), MetaError> {
+        self.attrs_closed.store(true, Ordering::Release);
+        if let Some(attrs) = &self.attrs {
+            attrs.invalidate_all();
+        }
         self.context.metrics.transport.stop_admission();
         self.context.reader.close().await;
         self.context
@@ -857,6 +879,43 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
             .transport
             .bind_reader(reader)
             .map_err(MetaError::Anyhow)
+    }
+
+    async fn stat_fresh_uncached(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
+        let inode = Self::inode(ino)?;
+        let manifest = self.context.snapshot.manifest();
+        if inode == manifest.root_inode {
+            if let Some(source) = &manifest.source {
+                return Ok(Some(attr_from_root(&source.root)));
+            }
+            return Ok(Some(FileAttr {
+                ino,
+                size: 0,
+                blocks: 0,
+                kind: FileType::Dir,
+                mode: 0o040755,
+                rdev: 0,
+                uid: 0,
+                gid: 0,
+                atime: 0,
+                mtime: 0,
+                ctime: 0,
+                nlink: 2,
+            }));
+        }
+        // II05 carries the complete hot attribute set.  Use it directly for
+        // getattr/open so a metadata-only operation does not fetch or clone a
+        // GroupMeta page merely to reconstruct FileAttr.
+        if let Some(index) = self.index_entry(inode).await? {
+            return Ok(Some(
+                self.with_source_blocks(attr_from_inode_index(&index))
+                    .await?,
+            ));
+        }
+        match self.entry(inode).await? {
+            Some(entry) => Ok(Some(self.with_source_blocks(attr(inode, &entry)).await?)),
+            None => Ok(None),
+        }
     }
 
     async fn index_entry(&self, inode: u64) -> Result<Option<PackedInodeIndexEntry>, MetaError> {
@@ -1076,40 +1135,21 @@ where
         self.stat_fresh(ino).await
     }
     async fn stat_fresh(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
-        let inode = Self::inode(ino)?;
-        let manifest = self.context.snapshot.manifest();
-        if inode == manifest.root_inode {
-            if let Some(source) = &manifest.source {
-                return Ok(Some(attr_from_root(&source.root)));
-            }
-            return Ok(Some(FileAttr {
-                ino,
-                size: 0,
-                blocks: 0,
-                kind: FileType::Dir,
-                mode: 0o040755,
-                rdev: 0,
-                uid: 0,
-                gid: 0,
-                atime: 0,
-                mtime: 0,
-                ctime: 0,
-                nlink: 2,
-            }));
+        // A closed mount budget fences every lower read; the memo must not
+        // outlive that fence. The uncached path reports the closed error.
+        if !self.attrs_closed.load(Ordering::Acquire)
+            && !self.context.budget.state().closed
+            && let Some(attr) = self.attrs.as_ref().and_then(|attrs| attrs.get(&ino))
+        {
+            return Ok(attr);
         }
-        // II05 carries the complete hot attribute set.  Use it directly for
-        // getattr/open so a metadata-only operation does not fetch or clone a
-        // GroupMeta page merely to reconstruct FileAttr.
-        if let Some(index) = self.index_entry(inode).await? {
-            return Ok(Some(
-                self.with_source_blocks(attr_from_inode_index(&index))
-                    .await?,
-            ));
+        let attr = self.stat_fresh_uncached(ino).await?;
+        if !self.attrs_closed.load(Ordering::Acquire)
+            && let Some(attrs) = &self.attrs
+        {
+            attrs.insert(ino, attr.clone());
         }
-        match self.entry(inode).await? {
-            Some(entry) => Ok(Some(self.with_source_blocks(attr(inode, &entry)).await?)),
-            None => Ok(None),
-        }
+        Ok(attr)
     }
     async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
         let parent = Self::inode(parent)?;

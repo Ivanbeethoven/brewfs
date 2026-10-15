@@ -264,3 +264,25 @@ RustFS/S3 packed-v3/005 full-read smoke 使用镜像 `w23geq7ncegg6etqsl.xuanyua
 结论：Redis 命令数下降 3–11%，但吞吐与上一轮持平（±4%，在噪声内）。说明 overlay 与 native 的差距目前主要不在 Redis 往返次数，而在本地 CPU/锁/调度路径（此前 perf 采样显示 overlay 在 7.4 s 窗口内消耗约 2.9 核，native 远低于此）。下一步应先做 CPU profile（dwarf 调用图）定位 meta_layer/packed 读路径的本地开销，再决定优化方向，而不是继续减少 Redis 往返。
 
 门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/hot8/status.txt`）：release、fmt、clippy（workspace 与严格 overlay）、`cargo test --workspace --lib --bins`（1177 passed）、overlay+fuse 套件 1072 passed / 4 failed（均为既有失败）、`git diff --check` 全部通过。
+
+## 2026-10-15 overlay 第 4 轮：CPU profile 与 packed lower 属性 memo
+
+CPU profile（dwarf，stat 模式）：packed 索引页缓存命中率约 99.99%（inode_index 106372 hit / 4 miss），但每次 overlay stat 仍走完整索引树（预算 admission、async reader 锁、多次页缓存查找）。由于 packed 快照不可变，已解析的 inode 属性在 reader 生命期内不变。
+
+改动：
+- `PackedV3ReadonlyMeta::stat_fresh` 增加按 inode 的不可变属性 memo（上限 1M 条）；`metadata_bytes == 0` 时禁用（保持"每次都观测后端/注入故障"的语义，`fuse_init_tests::packed_hot_inode_failures_preserve_io_errno…` 依赖此语义）；transport drain 或预算关闭后不再命中并清空，保持 fail-closed。
+- overlay 挂载的 `.stats` 现在包含 packed lower 的索引缓存、预算与 S3 读观测计数（此前 overlay 挂载未安装该扩展）。
+
+结果（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/ovn-hot9/ovn-20261015T044840Z-1182738`，binary sha256 `c82ffcb8…b52a`，3 reps，30/30 通过，cleanup 归零）。同目录下 `ovn-20261015T043910Z-1168872` 与残留的 native perf 采样任务重叠（两臂 mount 时间同时升至 1.1–1.8 s），作为受污染运行保留，不用于结论。
+
+| mode | native files/s | overlay files/s | ratio | 上一轮 overlay |
+|---|---|---|---|---|
+| stat | 3148.1 | 723.0 | 0.23 | 678.4 |
+| full | 755.8 | 163.2 | 0.22 | 157.1 |
+| write | 623.2 | 204.7 | 0.33 | 209.6 |
+| readback | 1187.1 | 497.1 | 0.42 | 500.7 |
+| mixed | 971.2 | 251.1 | 0.26 | 254.3 |
+
+结论：stat +7%、full +4%，rw 三项持平；overlay 仍为 native 的 0.22–0.42。profile 显示剩余 CPU 主要在 tokio 调度、Redis 管线编码/发送与 S3 SDK（签名/HTTP），而非单一可消除的热点；继续逼近 native 需要结构性改动（例如减少每个 FUSE op 跨越的 async 任务/锁层次，或在 VFS 层复用 attr 结果）。
+
+门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/hot9/gate.txt`）：fmt、clippy（workspace 与严格 overlay）、`cargo test --workspace --lib --bins`（1177 passed）、overlay+fuse 套件 1072 passed / 4 failed（均为既有失败）、`git diff --check` 全部通过。
