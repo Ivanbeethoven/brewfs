@@ -309,3 +309,23 @@ CPU profile（dwarf，stat 模式）：packed 索引页缓存命中率约 99.99%
 overlay p50：stat 10.6→7.6 ms，full 47.6→38.3 ms，readback 31.2→24.6 ms。写路径不读缓存，未变化。记录的 fixture sha256 曾因拷贝竞态记录为空文件哈希，已用实际文件重写（`binary.sha256.note`）；运行日志显示 fixture 正常生成 2000 文件/111 组。
 
 门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/hot10/gate.txt`）：fmt、clippy（workspace 与严格 overlay）、`cargo test --workspace --lib --bins`（1177 passed）、overlay+fuse 套件 1073 passed / 5 failed（3 个 e980d59 确定性失败 + 2 个 source_file 负载下偶发，均为既有）、`git diff --check` 全部通过。
+
+## 2026-10-15 overlay 第 6 轮：写路径（路径遍历 memo + 复用已提交 head）
+
+改动：
+- open 的反向路径遍历结果按 inode 存入挂载级 row cache（与其他上层行同一提交失效规则）；只缓存完整成功的遍历，配额/环/视图错误不缓存。
+- 每次 packed 提交返回其写入的 head 记录；下一次 frozen mutation 直接以它作为期望版本，省去一次 head 读。该值仅为提示：若期间 head 被其他写入改变，提交 CAS 以 Busy 失败，既有重试会重新读取 head。
+
+结果（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/ovn-hot11/ovn-20261015T083321Z-1237081`，brewfs sha256 `09445fec…d442`，3 reps，30/30 通过，cleanup 归零）：
+
+| mode | native files/s | overlay files/s | ratio | 上一轮 overlay | 变化 |
+|---|---|---|---|---|---|
+| stat | 3054.6 | 1002.8 | 0.33 | 1009.0 | 持平 |
+| full | 760.4 | 200.7 | 0.26 | 202.0 | 持平 |
+| readback | 1126.5 | 624.9 | 0.55 | 621.3 | 持平 |
+| write | 611.6 | 225.1 | 0.37 | 205.0 | +10% |
+| mixed | 938.5 | 273.6 | 0.29 | 261.8 | +5% |
+
+overlay write p50 78.4→70.9 ms。剩余写路径成本：每次提交内的 native extent/reverse 派生检查与权限快照读取；读路径成本：每次 FUSE read 约 4.5 次 head/lease fence MGET。
+
+门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/hot11/gate.txt`）：fmt、clippy（workspace 与严格 overlay）、`cargo test --workspace --lib --bins`（1177 passed）、overlay+fuse 套件 1074 passed / 4 failed（均为既有）、`git diff --check` 全部通过。

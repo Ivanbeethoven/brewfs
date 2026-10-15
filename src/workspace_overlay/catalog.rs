@@ -606,6 +606,13 @@ pub trait WorkspaceStore: Send + Sync {
         false
     }
 
+    /// Take the head record this store last committed for `head`, if any.
+    /// A hint: a stale record only makes the next conditional mutation fail
+    /// with Busy, after which the caller re-reads the head.
+    fn take_committed_head(&self, _head: LayerId) -> Option<LayerRecord> {
+        None
+    }
+
     /// Per-inode read fence for a frozen base: the head/lease guard is still
     /// held, the head still sits on `base`, and this inode's upper rows are
     /// exactly `expected`. Unrelated writes to other inodes do not fence.

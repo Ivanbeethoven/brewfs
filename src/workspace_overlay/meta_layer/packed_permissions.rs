@@ -78,13 +78,18 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
     ) -> Result<[LayerRecord; 2], MetaError> {
         let guard = self.guard().await;
         let chain = self.chain().await?;
-        let layers = [
-            self.store
+        // The head this mount just committed is the current head unless
+        // something else wrote since, in which case the mutation CAS fails
+        // with Busy and the caller's retry takes the fresh-read path.
+        let head = match self.store.take_committed_head(guard.expected_head_layer_id) {
+            Some(head) => head,
+            None => self
+                .store
                 .load_layer(guard.expected_head_layer_id)
                 .await
                 .map_err(workspace_to_meta)?,
-            chain[1].clone(),
-        ];
+        };
+        let layers = [head, chain[1].clone()];
         if layers[1].layer_id != lower.binding.base_layer_id {
             return Err(workspace_to_meta(WorkspaceError::Fenced));
         }

@@ -383,6 +383,10 @@ pub struct KvWorkspaceStore<B> {
     native_auxiliary_budget:
         std::sync::OnceLock<Arc<crate::workspace_overlay::packed_v3::wire005::V3MountBudget>>,
     slice_ids: IdBlock,
+    /// Last head record this store committed through a packed versioned
+    /// mutation. A hint only: callers use it as an expected version and the
+    /// CAS fails with Busy if anything changed since.
+    committed_head: Arc<std::sync::Mutex<Option<LayerRecord>>>,
 }
 
 /// Per-store reserved range of slice IDs, `[next, end)`.
@@ -679,6 +683,7 @@ where
             packed_reader_pin_budget: std::sync::OnceLock::new(),
             native_auxiliary_budget: std::sync::OnceLock::new(),
             slice_ids: IdBlock::default(),
+            committed_head: Arc::default(),
         }
     }
 
@@ -689,6 +694,7 @@ where
             packed_reader_pin_budget: std::sync::OnceLock::new(),
             native_auxiliary_budget: std::sync::OnceLock::new(),
             slice_ids: IdBlock::default(),
+            committed_head: Arc::default(),
         }
     }
 
@@ -2173,6 +2179,14 @@ where
 
     fn supports_fused_read_fence(&self) -> bool {
         self.backend.supports_consistent_reads()
+    }
+
+    fn take_committed_head(&self, head: LayerId) -> Option<LayerRecord> {
+        self.committed_head
+            .lock()
+            .unwrap()
+            .take()
+            .filter(|record| record.layer_id == head)
     }
 
     async fn validate_inode_read_fence(
