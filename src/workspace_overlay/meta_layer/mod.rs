@@ -243,6 +243,13 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             .and_then(|lower| lower.authority.reader_session())
     }
 
+    /// Diagnostics only: render the packed lower's index cache, budget and
+    /// read-observer counters in the mount's `.stats` file.
+    pub fn install_packed_lower_stats(&self, stats: &crate::vfs::stats::FsStats) -> bool {
+        self.packed_lower()
+            .is_some_and(|lower| lower.metadata.install_stats(stats))
+    }
+
     pub(crate) fn packed_lower(&self) -> Option<&Arc<WorkspacePackedLower>> {
         match &self.lower {
             WorkspaceLower::Native => None,

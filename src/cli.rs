@@ -2016,8 +2016,9 @@ where
                 .workspace_writeback_root(writeback_root)
                 .workspace_writer_epoch(mount_view.holder_generation);
         session.as_ref().expect("mount session retained").initialize_packed_writeback_identity(&vfs_config).await?;
-        let fs = VFS::from_workspace_components(vfs_config, block_store, meta_layer)?;
+        let fs = VFS::from_workspace_components(vfs_config, block_store, meta_layer.clone())?;
         if packed {
+            meta_layer.install_packed_lower_stats(fs.stats());
             packed_vfs = Some(fs.clone());
         }
         let concurrency = FuseConcurrencyConfig {
