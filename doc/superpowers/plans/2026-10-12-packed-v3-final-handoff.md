@@ -450,3 +450,28 @@ mixed p99 66.1→58.1 ms，readback p99 35.0→33.5 ms；客户端 Redis 往返/
 Redis 往返/操作 readback 28.4→24.4、mixed 43.7→40.9，但吞吐全部在噪声内，**rejected**。
 
 结论：readback 已不再受 Redis 往返数限制。单 worker 诊断（`ovn-diag-hot16`）中 overlay 每次 FUSE read 平均 1.89 ms，native 0.95 ms；S3 GET 次数与总延迟相近（337 次，616 ms vs 540 ms），lookup 相近（256 vs 230 µs）。多出的约 0.95 ms/read 在本地读路径（请求 fence/预算准入/计划构造/task-local 视图），下一步应先做 overlay 读路径的 CPU/await 剖析，而不是继续削减往返。
+
+## 2026-10-16 overlay 第 12 轮（rejected）：只读 open 的权限检查移出全局 mutation_gate
+
+剖析（hot16 二进制，16 worker，rw 模式，`ovn-prof-hot16`、`ovn-cpu-hot16`）：
+- perf（DWARF，499 Hz）：overlay 进程平均约 1.9 核（8 核主机），约 54% 样本在 Redis 客户端调用路径、约 11% 在多路复用连接驱动任务，S3 SDK 约 7%；路径遍历（`packed_paths_bytes_owned`）约 8%，权限快照约 5%，均以 malloc/free/realloc 为主，没有单一热点。
+- 每秒 CPU 采样：rw 阶段主机忙碌 55–79%，其中 rustfs 1–3 核、brewfs 2–3.5 核、redis-server 0.2–0.6 核；Redis 服务端 overlay 时约 26–41% 忙碌（native 5–14%），每次 readback 约 370 µs 服务端时间（native 44 µs），主要是 Lua 脚本。
+- 单 worker 时间线：一次 readback 约 9 ms，其中路径遍历（反向索引权威读→最终确认 CAS）约 1.9 ms（21%）；剩余为 4 次融合 fence、权限快照 MGET、extent 扫描以及约 2 ms 的 S3 GET。
+
+候选（hot18，已回退，diff `build/hot18/hot18.diff`）：`record_open` 原先在全局 `mutation_gate` 下做权限快照读取，所有 open 串行。只读、不提交的 open 改为在门外完成授权，进门后只发布 open 计数；新增 `deletions` 计数器（每次删除 inode 的提交尝试之后递增），若授权期间有删除提交则回退到原有完整门内路径重新读取。新增竞态测试（final unlink 先排队、open 在门外授权后排在其后，必须返回 NotFound 且不计数）通过；把删除检查禁用后该测试失败（`build/hot18/test-mutation.log`），证明其有效。原有 open/close 竞态测试与焦点套件（仅 3 个既有失败）均通过。
+
+两组交替顺序对照，4 组均 30/30 通过：
+- `ovn-hot16-r12pa/ovn-20261015T225856Z-1511886`、`ovn-hot18-r12pa/ovn-20261015T230310Z-1522585`
+- `ovn-hot18-r12pb/ovn-20261015T230717Z-1533113`、`ovn-hot16-r12pb/ovn-20261015T231124Z-1543744`
+
+| mode | overlay hot16 | overlay hot18 | 变化 |
+|---|---|---|---|
+| stat | 1020 | 1030 | +1.0% |
+| full | 218 | 221 | +1.1% |
+| write | 285 | 285 | 持平 |
+| readback | 777 | 772 | −0.6% |
+| mixed | 452 | 451 | 持平 |
+
+全部在噪声内，**rejected**。open 的门内串行不是瓶颈。
+
+阶段结论（第 11、12 轮）：在当前主机上，继续削减单个往返或解除局部串行都不再改变吞吐。overlay 每次操作的 Redis 服务端时间是 native 的 4–8 倍（Lua 脚本，尤其写提交约 740 µs/op），客户端 CPU 分散在 Redis 编解码与分配上，且 rustfs 与 brewfs 共享 8 核。下一步应是结构性改动而非继续微调：把写提交的视图读 + native-reverse 检查 + 最终 CAS 合并为单个 Lua（需在 Lua 中重写 fail-closed 校验），或给 readback 的 open 路径权限检查提供与 native 相同的 inode 级权限缓存语义。
