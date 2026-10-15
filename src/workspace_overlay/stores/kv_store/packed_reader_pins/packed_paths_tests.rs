@@ -433,6 +433,44 @@ async fn native_reverse_more_than_4096_unrelated_rows_only_scans_requested_inode
 }
 
 #[tokio::test]
+async fn reverse_path_walk_trusts_proven_short_page_and_stays_complete() {
+    let f = raw_fixture().await;
+    let mut mutation = raw_mutation(&f).await;
+    // 35 head aliases: one full 32-row page and a 3-row short page.
+    for index in 0..35 {
+        mutation.dentries.push(DentryDelta::put(
+            f.guard.expected_head_layer_id,
+            1,
+            format!("alias-{index:03}").into_bytes(),
+            400,
+            0,
+            0,
+        ));
+    }
+    f.store.apply_versioned_mutation(mutation).await.unwrap();
+    let reverse_pages = |pages: &[Vec<u8>]| {
+        pages
+            .iter()
+            .filter(|prefix| prefix.starts_with(b"packed/v3/native-reverse/rows/"))
+            .count()
+    };
+    // Default contract: a short page is followed by an empty proof page per
+    // layer (head: 32 + 3 + empty, base: empty).
+    f.backend.page_prefixes.lock().await.clear();
+    let paths = f.meta.get_paths_bytes(400).await.unwrap();
+    assert_eq!(paths.len(), 36);
+    assert_eq!(reverse_pages(&f.backend.page_prefixes.lock().await), 4);
+    // Single-range backend: the short page itself ends each layer's walk
+    // (head: 32 + 3, base: one empty page), with the identical result.
+    f.backend.short_page_is_end.store(true, Ordering::SeqCst);
+    f.backend.page_prefixes.lock().await.clear();
+    assert_eq!(f.meta.get_paths_bytes(400).await.unwrap(), paths);
+    assert_eq!(reverse_pages(&f.backend.page_prefixes.lock().await), 3);
+    assert!(paths.contains(&b"/alias-034".to_vec()));
+    f.reader.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn native_reverse_backfill_resumes_short_pages_and_dual_writes_behind_cursor() {
     let f = raw_fixture().await;
     let layer = f.guard.expected_head_layer_id;

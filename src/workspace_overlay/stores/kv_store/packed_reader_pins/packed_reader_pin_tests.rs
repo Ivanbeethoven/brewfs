@@ -27,6 +27,9 @@ struct PinMemoryBackend {
     page_prefixes: Arc<Mutex<Vec<Vec<u8>>>>,
     page_size: Arc<AtomicI64>,
     page_barrier: SharedTestBarrier,
+    /// Models Redis' single-range pages. A forced `page_size` truncation is
+    /// then a lie, so only enable this while `page_size` is unset.
+    short_page_is_end: Arc<AtomicBool>,
 }
 impl Default for PinMemoryBackend {
     fn default() -> Self {
@@ -42,6 +45,7 @@ impl Default for PinMemoryBackend {
             page_prefixes: Default::default(),
             page_size: Default::default(),
             page_barrier: Default::default(),
+            short_page_is_end: Default::default(),
         }
     }
 }
@@ -155,6 +159,9 @@ impl WorkspaceKvBackend for PinMemoryBackend {
     }
     fn supports_consistent_reads(&self) -> bool {
         true
+    }
+    fn short_scan_page_is_end(&self) -> bool {
+        self.short_page_is_end.load(Ordering::SeqCst)
     }
     async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, WorkspaceError> {
         Ok(self.rows.lock().await.get(key).cloned())
