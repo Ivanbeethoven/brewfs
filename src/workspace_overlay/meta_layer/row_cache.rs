@@ -2,11 +2,12 @@
 //!
 //! Opt-in per mount (`WorkspaceMetaLayer::with_upper_row_cache`). The
 //! workspace lease is exclusive, so while it is held the mounted layer is
-//! the only writer of upper rows; every local commit and every view change
-//! invalidates the whole cache, and a generation counter keeps a read that
-//! raced a commit from inserting pre-commit rows. The TTL bounds staleness
-//! for anything outside this mount, matching the native metadata client's
-//! inode/path cache. Mutation paths never read through this cache.
+//! the only writer of upper rows; every local commit invalidates the keys of
+//! the rows it writes, every view change invalidates the whole cache, and a
+//! generation counter keeps a read that raced any invalidation from leaving
+//! pre-commit rows behind. The TTL bounds staleness for anything outside
+//! this mount, matching the native metadata client's inode/path cache.
+//! Mutation paths never read through this cache.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,19 +75,31 @@ impl UpperRowCache {
     }
 
     pub(super) fn insert(&self, ticket: RowTicket, key: RowKey, value: RowValue) {
-        if self.generation.load(Ordering::Acquire) != ticket.0 {
+        if self.generation.load(Ordering::SeqCst) != ticket.0 {
             return;
         }
-        self.rows.insert(key, value);
+        self.rows.insert(key.clone(), value);
         // An invalidation that ran concurrently with this insert must win.
-        if self.generation.load(Ordering::Acquire) != ticket.0 {
-            self.rows.invalidate_all();
+        // Every invalidation bumps the generation before removing, so an
+        // insert landing after that removal sees the bump and drops itself;
+        // one landing before it is removed by the invalidation.
+        if self.generation.load(Ordering::SeqCst) != ticket.0 {
+            self.rows.invalidate(&key);
         }
     }
 
     pub(super) fn invalidate_all(&self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.rows.invalidate_all();
+    }
+
+    /// Only these keys; unrelated cached rows stay. Still bumps the
+    /// generation so any read in flight drops its insert.
+    pub(super) fn invalidate_keys(&self, keys: &[RowKey]) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        for key in keys {
+            self.rows.invalidate(key);
+        }
     }
 }
 
@@ -114,5 +127,24 @@ mod tests {
         assert!(cache.get(&RowKey::Inode(5)).is_some());
         cache.invalidate_all();
         assert!(cache.get(&RowKey::Inode(5)).is_none());
+    }
+
+    #[test]
+    fn key_invalidation_keeps_unrelated_rows_and_drops_racing_insert() {
+        let cache = UpperRowCache::new(Duration::from_secs(60));
+        let row = || RowValue::Inode(Arc::new(Vec::new()));
+        let ticket = cache.ticket();
+        cache.insert(ticket, RowKey::Inode(5), row());
+        cache.insert(ticket, RowKey::Inode(6), row());
+        let racing = cache.ticket();
+        cache.invalidate_keys(&[RowKey::Inode(5)]);
+        assert!(cache.get(&RowKey::Inode(5)).is_none());
+        assert!(cache.get(&RowKey::Inode(6)).is_some());
+        // A read that started before the commit must not re-insert the
+        // pre-commit row of any key.
+        cache.insert(racing, RowKey::Inode(5), row());
+        cache.insert(racing, RowKey::Inode(7), row());
+        assert!(cache.get(&RowKey::Inode(5)).is_none());
+        assert!(cache.get(&RowKey::Inode(7)).is_none());
     }
 }

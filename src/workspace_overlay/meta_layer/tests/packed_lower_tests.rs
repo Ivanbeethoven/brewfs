@@ -1062,14 +1062,106 @@ async fn namespace_cache_survives_data_commits_and_clears_on_namespace_commits()
         );
     };
     seed(namespace);
+    let head = f.head().await;
     // Data-only commit (no dentry rows, no deletion): path results stay.
-    f.meta.invalidate_rows_for(false);
+    let mut data = f.mutation().await;
+    data.extents
+        .push(DataExtentDelta::hole(head, 400, 0, 0, 4096, 0));
+    f.meta
+        .invalidate_rows_written(&super::super::RowsWritten::of(&data));
     assert!(namespace.get(&RowKey::Aliases(400)).is_some());
     // Any namespace commit clears them.
-    f.meta.invalidate_rows_for(true);
+    let mut rename = f.mutation().await;
+    rename
+        .dentries
+        .push(DentryDelta::put(head, 1, b"moved".to_vec(), 400, 0, 0));
+    f.meta
+        .invalidate_rows_written(&super::super::RowsWritten::of(&rename));
     assert!(namespace.get(&RowKey::Aliases(400)).is_none());
     seed(namespace);
     // A view change or generic invalidation clears both caches.
     f.meta.invalidate_upper_rows();
     assert!(namespace.get(&RowKey::Aliases(400)).is_none());
+}
+
+#[tokio::test]
+async fn commit_invalidates_only_the_row_cache_keys_it_writes() {
+    use super::super::row_cache::{RowKey, RowValue};
+    let mut f = fixture().await;
+    let head = f.head().await;
+    f.copy_up(vec![DataExtentDelta::hole(head, 400, 0, 0, 4096, 0)])
+        .await;
+    f.meta = f
+        .meta
+        .with_upper_row_cache(std::time::Duration::from_secs(60));
+    let cache = f.meta.upper_row_cache().expect("frozen row cache");
+    let before = f.meta.stat(400).await.unwrap().unwrap();
+    assert!(cache.get(&RowKey::Inode(400)).is_some());
+    let unrelated = || RowValue::Inode(std::sync::Arc::new(Vec::new()));
+    cache.insert(cache.ticket(), RowKey::Inode(1), unrelated());
+    cache.insert(
+        cache.ticket(),
+        RowKey::Dentry(1, b"other".to_vec()),
+        RowValue::Dentry(std::sync::Arc::new(Vec::new())),
+    );
+    // A real mount commit writing inode 400 (extent + inode row).
+    let mut request = f.mutation().await;
+    let rows = f
+        .meta
+        .store()
+        .get_inode_deltas(crate::workspace_overlay::catalog::InodeQuery {
+            layer_ids: request
+                .expected_layers
+                .iter()
+                .map(|layer| layer.layer_id)
+                .collect(),
+            ino: 400,
+        })
+        .await
+        .unwrap();
+    let mut inode =
+        crate::workspace_overlay::resolver::resolve_inode(&request.expected_layers, &rows, 400)
+            .unwrap()
+            .unwrap()
+            .inode;
+    inode.size = before.size + 1;
+    inode.data_version = inode.data_version.checked_add(1).unwrap();
+    request.inodes.push(inode);
+    // This adapter fixture cannot persist packed commits, so the mount
+    // commit fails; an uncertain/failed commit must still drop the written
+    // keys, and only those.
+    f.meta
+        .commit_versioned_mutation(request.clone())
+        .await
+        .unwrap_err();
+    assert!(cache.get(&RowKey::Inode(400)).is_none());
+    assert!(cache.get(&RowKey::Permission(400)).is_none());
+    assert!(cache.get(&RowKey::Inode(1)).is_some());
+    assert!(cache.get(&RowKey::Dentry(1, b"other".to_vec())).is_some());
+    // Once the rows land, the written inode is re-read fresh.
+    f.meta
+        .store()
+        .apply_versioned_mutation(request)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.meta.stat(400).await.unwrap().unwrap().size,
+        before.size + 1
+    );
+    assert!(cache.get(&RowKey::Inode(1)).is_some());
+    // ACL rows have no per-key mapping and clear the whole row cache.
+    let mut acl = f.mutation().await;
+    acl.acls.push(AclDelta {
+        layer_id: head,
+        ino: 400,
+        acl_type: 0,
+        acl_id: 0,
+        op: ValueOp::Put,
+        value: Some(Vec::new()),
+        sequence: 0,
+    });
+    f.meta
+        .invalidate_rows_written(&super::super::RowsWritten::of(&acl));
+    assert!(cache.get(&RowKey::Inode(1)).is_none());
+    assert!(cache.get(&RowKey::Dentry(1, b"other".to_vec())).is_none());
 }

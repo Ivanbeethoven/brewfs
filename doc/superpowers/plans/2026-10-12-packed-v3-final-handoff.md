@@ -378,3 +378,30 @@ overlay write p50 78.4→70.9 ms。剩余写路径成本：每次提交内的 na
 mixed p99 173→94 ms，readback p50 22.5→19.8 ms。
 
 门禁（`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/hot13/gate.txt`）：fmt、clippy（workspace 与严格 overlay）、`cargo test --workspace --lib --bins`（1177 passed）、`git diff --check` 通过；overlay+fuse 套件首轮因数据盘写满（ENOSPC）未能编译（日志 `test-overlay.enospc.log`），按用户选择删除 hot3–hot11、frozen3 的旧二进制（约 40 GB，保留 sha256/日志/diff，见各目录 `BINARIES_REMOVED.txt`）后重跑：1075 passed / 5 failed（均为既有失败）。提交内容与门禁/压测 diff 完全一致。
+
+## 2026-10-16 overlay 第 9 轮：提交只失效自己写入的行缓存键
+
+被拒候选（hot14，已回退）：上层 extent 的两层前缀扫描合并为一次 Lua（`scan_prefixes_bounded`）。单测通过，但 16 worker 压测各模式与第 8 轮相差 ±4% 以内（overlay write 268→267、readback 775→774、mixed 385→378），无收益，**rejected**。证据：`/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/ovn-hot14/ovn-20261015T141744Z-1317718`，diff `build/hot14/hot14.diff`。
+
+问题：单 worker MONITOR（`ovn-diag/ovn-20261015T142153Z-1328376`）显示，每次 write 前一次提交都会清空整个上层行缓存，因此每个文件 open/create 都要重新读根目录与父目录 inode、dentry、ACL xattr，约多 10 次 MGET。
+
+改动：
+- `commit_versioned_mutation` 前后只失效本次提交写入行对应的缓存键：每个 inode/extent/xattr 行所属 inode 的 `Inode` 与 `Permission`，每个 dentry 行的 `Dentry(parent, name)`，每个 xattr 行的 `Xattr(ino, name)`。每个缓存值只依赖自己键的行，键一一对应，不会漏。
+- 含 ACL 行的提交没有逐键映射，仍清空整个行缓存；命名空间缓存规则不变；视图切换仍全部清空。
+- 每次失效都推进 generation，失效前开始的读不会回填任何键；插入发现竞争时只删除自己插入的键。
+
+同机、同一时段背靠背对照（先第 8 轮 hot13 二进制，再本轮），3 reps，两组均 30/30 通过、cleanup 归零：
+- hot13：`ovn-hot13-paired/ovn-20261015T160651Z-1350478`
+- hot15：`ovn-hot15-paired/ovn-20261015T161137Z-1361770`，brewfs sha256 `d3d0f040…f247`
+
+| mode | native files/s | overlay hot13 | overlay hot15 | 变化 | ratio |
+|---|---|---|---|---|---|
+| stat | 2483 | 861 | 885 | +3% | 0.36 |
+| full | 665 | 189 | 197 | +4% | 0.30 |
+| write | 540 | 238 | 253 | +6.5% | 0.47 |
+| readback | 1010 | 684 | 681 | 持平 | 0.67 |
+| mixed | 809 | 332 | 365 | +10% | 0.45 |
+
+mixed p99 112.5→77.2 ms，write p99 82.0→79.5 ms。客户端 Redis 往返/操作：write 29.7→18.1，mixed 70.1→48.9，readback 不变（29.6）。此时段主机整体比第 8 轮记录时慢约 15%（native full 740→645），因此本表只与同时段的 hot13 对照比较；单独首跑 `ovn-hot15/ovn-20261015T160044Z-1338897` 紧跟构建、页缓存被挤出，native 同样下降，不作为结论。
+
+剩余：readback 每次读仍约 14 MGET + 8 次 TIME/MGET fence（`hot_mutation`/读 fence）；写提交约 7 次 EVALSHA（视图读、native-reverse 状态与行的 4 次前缀扫描、最终 CAS）。

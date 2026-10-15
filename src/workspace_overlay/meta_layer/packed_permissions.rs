@@ -274,13 +274,10 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         request: VersionedMutation,
     ) -> Result<super::super::catalog::MutationResult, WorkspaceError> {
         // Before and after: an uncertain/failed commit may still have
-        // applied, and no concurrent read may cache pre-commit rows.
-        let namespace = !request.dentries.is_empty()
-            || request
-                .inodes
-                .iter()
-                .any(|inode| inode.state == InodeState::Deleted);
-        self.invalidate_rows_for(namespace);
+        // applied, and no concurrent read may cache pre-commit rows. Only
+        // the keys this commit writes are dropped.
+        let written = super::RowsWritten::of(&request);
+        self.invalidate_rows_written(&written);
         let result = if let Some(lower) = self.packed_lower() {
             self.store
                 .apply_packed_versioned_mutation(request, lower.binding.clone())
@@ -288,7 +285,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         } else {
             self.store.apply_versioned_mutation(request).await
         };
-        self.invalidate_rows_for(namespace);
+        self.invalidate_rows_written(&written);
         result
     }
 }
