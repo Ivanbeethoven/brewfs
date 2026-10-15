@@ -430,3 +430,23 @@ mixed p99 112.5→77.2 ms，write p99 82.0→79.5 ms。客户端 Redis 往返/�
 mixed p99 66.1→58.1 ms，readback p99 35.0→33.5 ms；客户端 Redis 往返/操作 readback 29.5→28.4、mixed 48.0→44.0。
 
 操作记录：首次运行真实 Redis 测试时用 `--ignored real_redis_` 过滤，误选中会挂载 FUSE 的 ignored 测试并卡在 `request_wait_answer`；通过 `/sys/fs/fuse/connections/<minor>/abort` 中止连接、lazy umount 后进程正常退出，未留下 D 状态任务。之后只用 `--exact` 运行两个 Redis 后端测试（`build/hot16/test-redis-real.log`，2/2 通过）。
+
+## 2026-10-16 overlay 第 11 轮（rejected）：跳过融合捕获后的立即 fence
+
+候选（hot17，已回退，diff `build/hot17/hot17.diff`）：`UnifiedReadRequestFence::validated_at_capture()`。frozen 模式下 `begin_request` 的融合捕获本身就是一次一致读并校验了同一 head/lease + inode 行 fence，VFS 两处读路径据此跳过捕获后紧接着的 `ensure_current`，最终 fence 保留。新增测试（VFS 跳过仅限立即检查、捕获后丢失 lease 仍在最终检查失败；KV 融合 fixture 报告 validated、SQLite fixture 不报告）均通过；焦点套件只有 3 个既有失败。
+
+两组交替顺序对照（hot16→hot17、hot17→hot16），4 组均 30/30 通过：
+- `ovn-hot16-r11pa/ovn-20261015T202230Z-1448134`、`ovn-hot17-r11pa/ovn-20261015T202646Z-1458955`
+- `ovn-hot17-r11pb/ovn-20261015T203104Z-1469697`、`ovn-hot16-r11pb/ovn-20261015T203514Z-1480353`
+
+| mode | overlay hot16 | overlay hot17 | 变化 |
+|---|---|---|---|
+| stat | 985 | 990 | +0.5% |
+| full | 221 | 213 | −3.6% |
+| write | 280 | 276 | −1.3% |
+| readback | 767 | 761 | −0.8% |
+| mixed | 449 | 444 | −1.3% |
+
+Redis 往返/操作 readback 28.4→24.4、mixed 43.7→40.9，但吞吐全部在噪声内，**rejected**。
+
+结论：readback 已不再受 Redis 往返数限制。单 worker 诊断（`ovn-diag-hot16`）中 overlay 每次 FUSE read 平均 1.89 ms，native 0.95 ms；S3 GET 次数与总延迟相近（337 次，616 ms vs 540 ms），lookup 相近（256 vs 230 µs）。多出的约 0.95 ms/read 在本地读路径（请求 fence/预算准入/计划构造/task-local 视图），下一步应先做 overlay 读路径的 CPU/await 剖析，而不是继续削减往返。
