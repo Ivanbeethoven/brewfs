@@ -72,6 +72,8 @@ pub struct WorkspaceMetaLayer<W> {
     open_counts: DashMap<i64, u64>,
     resolver_cache: WorkspaceResolverCache,
     upper_rows: Option<row_cache::UpperRowCache>,
+    /// Path/alias results; invalidated only by namespace-changing commits.
+    namespace_rows: Option<row_cache::UpperRowCache>,
     locks: Mutex<WorkspaceLocks>,
     mutation_gate: Mutex<()>,
     metrics: Arc<WorkspaceMetrics>,
@@ -116,6 +118,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             open_counts: DashMap::new(),
             resolver_cache: WorkspaceResolverCache::default(),
             upper_rows: None,
+            namespace_rows: None,
             locks: Mutex::new(WorkspaceLocks::default()),
             mutation_gate: Mutex::new(()),
             metrics: global_workspace_metrics(),
@@ -135,14 +138,38 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
     pub fn with_upper_row_cache(mut self, ttl: std::time::Duration) -> Self {
         if !ttl.is_zero() {
             self.upper_rows = Some(row_cache::UpperRowCache::new(ttl));
+            self.namespace_rows = Some(row_cache::UpperRowCache::new(ttl));
         }
         self
     }
 
+    /// Every commit and view change. Clears namespace results too; use
+    /// `invalidate_rows_for` when the commit is known to be data-only.
     pub(super) fn invalidate_upper_rows(&self) {
         if let Some(cache) = &self.upper_rows {
             cache.invalidate_all();
         }
+        if let Some(cache) = &self.namespace_rows {
+            cache.invalidate_all();
+        }
+    }
+
+    /// Row cache always; namespace cache only when the commit can change a
+    /// path: any dentry row, or an inode deleted (state Deleted). Renames,
+    /// links, unlinks, creates and mkdir/rmdir all write dentry rows.
+    pub(super) fn invalidate_rows_for(&self, namespace: bool) {
+        if let Some(cache) = &self.upper_rows {
+            cache.invalidate_all();
+        }
+        if namespace && let Some(cache) = &self.namespace_rows {
+            cache.invalidate_all();
+        }
+    }
+
+    fn namespace_row_cache(&self) -> Option<&row_cache::UpperRowCache> {
+        self.namespace_rows
+            .as_ref()
+            .filter(|_| self.packed_lower().is_some_and(|lower| !lower.strict()))
     }
 
     fn upper_row_cache(&self) -> Option<&row_cache::UpperRowCache> {

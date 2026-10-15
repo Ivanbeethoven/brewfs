@@ -68,6 +68,36 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         inode: i64,
         limits: &mut Limits,
     ) -> Result<Vec<Name>, MetaError> {
+        let cache = self.namespace_row_cache();
+        if let Some(super::row_cache::RowValue::Aliases(aliases)) =
+            cache.and_then(|cache| cache.get(&super::row_cache::RowKey::Aliases(inode)))
+        {
+            for _ in aliases.iter() {
+                limits.work()?;
+            }
+            return Ok((*aliases).clone());
+        }
+        let ticket = cache.map(super::row_cache::UpperRowCache::ticket);
+        let effective = self
+            .packed_reverse_aliases_uncached(lower, authority, inode, limits)
+            .await?;
+        if let (Some(cache), Some(ticket)) = (cache, ticket) {
+            cache.insert(
+                ticket,
+                super::row_cache::RowKey::Aliases(inode),
+                super::row_cache::RowValue::Aliases(Arc::new(effective.clone())),
+            );
+        }
+        Ok(effective)
+    }
+
+    async fn packed_reverse_aliases_uncached(
+        &self,
+        lower: &WorkspacePackedLower,
+        authority: &crate::workspace_overlay::catalog::WorkspaceNativeReverseAuthority,
+        inode: i64,
+        limits: &mut Limits,
+    ) -> Result<Vec<Name>, MetaError> {
         let mut candidates = BTreeSet::new();
         for layer in self.chain().await? {
             let mut cursor: Option<Name> = None;
@@ -163,9 +193,10 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         &self,
         target: i64,
     ) -> Result<OwnedPaths, MetaError> {
-        // The path walk reads many upper rows; the opt-in row cache memoizes
-        // its complete result under the same commit invalidation as rows.
-        let cache = self.upper_row_cache();
+        // The path walk reads many upper rows; the opt-in namespace cache
+        // memoizes its complete result. Only namespace-changing commits
+        // (dentry writes, inode deletion) invalidate it.
+        let cache = self.namespace_row_cache();
         if let Some(super::row_cache::RowValue::Paths(paths)) =
             cache.and_then(|cache| cache.get(&super::row_cache::RowKey::Paths(target)))
         {
