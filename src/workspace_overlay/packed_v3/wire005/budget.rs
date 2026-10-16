@@ -787,6 +787,38 @@ mod tests {
         let _ = task.await;
         assert_eq!(budget.state().used, [0; 8]);
     }
+
+    #[tokio::test]
+    async fn headroom_arena_waits_instead_of_taking_the_small_charge_reserve() {
+        let mut limits = V3BudgetLimits::default();
+        limits.bytes[V3BudgetPool::Metadata as usize] = 64;
+        let budget = V3MountBudget::new(limits).unwrap();
+        // 32 used: an arena of 16 with headroom 24 would leave 16 < 24 free.
+        let held = budget.admit(&[(V3BudgetPool::Metadata, 32)]).unwrap();
+        let waiting = tokio::spawn({
+            let budget = budget.clone();
+            async move {
+                budget
+                    .admit_waiting_with_headroom(V3BudgetPool::Metadata, 16, 24)
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "arena must wait for headroom");
+        // A small non-waiting charge still fits in the protected reserve.
+        let small = budget.admit(&[(V3BudgetPool::Metadata, 8)]).unwrap();
+        drop(small);
+        // Releasing the holder lets the arena in with the reserve intact.
+        drop(held);
+        let arena = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.state().used[V3BudgetPool::Metadata as usize], 16);
+        drop(arena);
+        assert_eq!(budget.state().used[V3BudgetPool::Metadata as usize], 0);
+    }
 }
 
 #[cfg(test)]

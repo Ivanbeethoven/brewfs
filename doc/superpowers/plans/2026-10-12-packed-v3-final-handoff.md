@@ -494,3 +494,17 @@ Redis 往返/操作 readback 28.4→24.4、mixed 43.7→40.9，但吞吐全部�
 原因（已核对代码，未改动）：mount 的 Metadata 池为 256 MiB。路径遍历每个持有 16 MiB arena，最多 8 个并发（`MAX_CONCURRENT_PATH_WALKS`，共 128 MiB）；每个 frozen 写提交持有 `FROZEN_SNAPSHOT_BYTES`（2 MiB）的 mutation version，提交时再用**不等待**的 `admit` 申请约 2.1 MiB 的行/packet 上限（`validate_mutation_allocation_bounds`）。32 个并发 worker 时剩余 128 MiB 不足，提交的 admission 立即失败。由于提交方已持有同池的 mutation-version permit，直接改成等待式 admission 可能互相等待，只能靠 2 s 超时退出；修复需要重新设计这一池的配额（例如为提交单独预留、或缩小路径遍历 arena 并按需增长），尚未实施。
 
 写路径测量（单 worker MONITOR，`ovn-diag-hot16`）：overlay 每次 write 约 14.5 ms，native 约 10 ms，两者都含约 6 ms 的 S3 上传/fsync 等待。overlay 多出的约 4.5 ms 分布在每个文件约 3 次提交上（create、fsync、close），每次为视图读 EVALSHA + 最终 CAS EVALSHA 及其间隔，约 1.2–1.5 ms。把视图读并入 CAS 的单 Lua 方案每次提交最多省约 0.25 ms，估计 write 最多改善约 5%，风险（在 Lua 中重写 fail-closed 校验）与收益不成比例，暂不实施。
+
+## 2026-10-16 overlay 第 13 轮：修复 32 worker 下 Metadata 池耗尽（ENOMEM/EIO）
+
+根因（`brewfs::packed_v3_budget=debug` 复现，`ovn-w32-budgetlog`）：路径遍历 16 MiB arena 用**不等待**的 `admit` 直接占用 Metadata 池（最多 8 个，128 MiB），与每个 FUSE 请求 2 MiB、frozen mutation version 2 MiB、提交上限约 2.1 MiB 等小额非等待申请抢同一个 256 MiB 池；32 worker 时小额申请被拒（293 次约 2 MiB 拒绝、219 次 16 MiB 拒绝）。只调大池（512 MiB，env，同一二进制）即 0 错误，峰值 339 MiB，确认是池内竞争而非泄漏。
+
+改动：路径遍历 arena 改为 `admit_waiting_with_headroom(Metadata, 16 MiB, 64 MiB)`：只有在申请后仍留 64 MiB 空闲时才拿 arena，否则有界等待（`ADMISSION_WAIT` 2 s）。等待中的遍历只持有调用方的 2 MiB 请求额度，arena 随遍历结束释放，不会自锁。小额非等待申请不再被饿死。新增单测 `headroom_arena_waits_instead_of_taking_the_small_charge_reserve`。
+
+32 worker（3 reps）：
+- 修复前（`base-9e4f204`，从干净 9e4f204 重建）：r1 mixed 560/2000 错误，随后卸载报 `packed cutoff/drain is unverified`，r2/r3 的 overlay 挂载因 `workspace writer was fenced` 无法启动，整组 rejected（`ovn-base-w32/ovn-20261016T014552Z-1581863`）。
+- 修复后（hot19）：9/9 overlay 步骤 0 错误，组 passed（`ovn-hot19-w32/ovn-20261016T005343Z-1574164`）。overlay/native：write 276/725，readback 849/1152，mixed 431/942。
+
+16 worker 交替顺序对照（base→hot19、hot19→base，4 组均 30/30 通过，6 次合并中位数）：stat 974→993（+2.0%）、full 217→220（+1.7%）、write 278→289（+4.0%）、readback 744→766（+3.0%）、mixed 437→454（+3.9%），无回归。证据：`ovn-base-9e4f204-r13p{a,b}`、`ovn-hot19-r13p{a,b}`。
+
+门禁（`build/hot19/gate.txt`）：fmt、clippy（workspace 与严格 overlay）、`cargo test --workspace --lib --bins`（1177 passed）、overlay+fuse 套件 1079 passed / 5 failed（3 个 e980d59 确定性失败 + 2 个 source_file 负载下偶发，均为既有）、`git diff --check` 通过。
