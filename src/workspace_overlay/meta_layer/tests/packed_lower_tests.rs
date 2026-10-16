@@ -1085,6 +1085,49 @@ async fn namespace_cache_survives_data_commits_and_clears_on_namespace_commits()
 }
 
 #[tokio::test]
+async fn lease_bound_row_cache_stops_serving_once_the_lease_cannot_be_proven() {
+    use crate::workspace_overlay::lifecycle::LeaseValidity;
+    for revoke in [true, false] {
+        let mut f = fixture().await;
+        let head = f.head().await;
+        f.copy_up(vec![DataExtentDelta::hole(head, 400, 0, 0, 4096, 0)])
+            .await;
+        let ttl = if revoke {
+            std::time::Duration::from_secs(60)
+        } else {
+            std::time::Duration::from_millis(50)
+        };
+        let validity = std::sync::Arc::new(LeaseValidity::new(std::time::Instant::now(), ttl));
+        f.meta = f
+            .meta
+            .with_upper_row_cache(std::time::Duration::from_secs(600))
+            .with_lease_bound_row_cache(validity.clone());
+        let first = f.meta.stat(400).await.unwrap().unwrap();
+        // A store-direct write (impossible while this mount holds the lease)
+        // is hidden while the cache is authoritative.
+        f.set_native_file_size(first.size + 7).await;
+        assert_eq!(f.meta.stat(400).await.unwrap().unwrap().size, first.size);
+        if revoke {
+            validity.revoke();
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        }
+        // Lease lost or deadline passed: no cached upper row is served; the
+        // read goes to the store and the caches are emptied.
+        assert_eq!(
+            f.meta.stat(400).await.unwrap().unwrap().size,
+            first.size + 7
+        );
+        assert!(f.meta.upper_row_cache().is_none());
+        let rows = f.meta.upper_rows.as_ref().unwrap();
+        assert!(
+            rows.get(&super::super::row_cache::RowKey::Inode(400))
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
 async fn create_keeps_existing_paths_cached_but_other_namespace_commits_clear_them() {
     use super::super::row_cache::{RowKey, RowValue};
     let mut f = fixture().await;

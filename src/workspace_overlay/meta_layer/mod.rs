@@ -74,6 +74,9 @@ pub struct WorkspaceMetaLayer<W> {
     upper_rows: Option<row_cache::UpperRowCache>,
     /// Path/alias results; invalidated only by namespace-changing commits.
     namespace_rows: Option<row_cache::UpperRowCache>,
+    /// When set, both caches serve rows only while the mount provably holds
+    /// its exclusive lease; once that lapses they are cleared and bypassed.
+    lease_validity: Option<Arc<super::lifecycle::LeaseValidity>>,
     locks: Mutex<WorkspaceLocks>,
     mutation_gate: Mutex<()>,
     metrics: Arc<WorkspaceMetrics>,
@@ -199,6 +202,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             resolver_cache: WorkspaceResolverCache::default(),
             upper_rows: None,
             namespace_rows: None,
+            lease_validity: None,
             locks: Mutex::new(WorkspaceLocks::default()),
             mutation_gate: Mutex::new(()),
             metrics: global_workspace_metrics(),
@@ -260,16 +264,47 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         }
     }
 
+    /// Tie the row caches to this mount's lease: they serve rows only while
+    /// `validity` proves the exclusive lease is held. With this set, the TTL
+    /// is only a memory/working-set bound, not the staleness bound.
+    pub fn with_lease_bound_row_cache(
+        mut self,
+        validity: Arc<super::lifecycle::LeaseValidity>,
+    ) -> Self {
+        self.lease_validity = Some(validity);
+        self
+    }
+
+    /// False once the lease can no longer be proven: every cached row is
+    /// dropped (and stays bypassed), so no stale upper row is served.
+    fn row_caches_authoritative(&self) -> bool {
+        let Some(validity) = &self.lease_validity else {
+            return true;
+        };
+        if validity.authoritative() {
+            return true;
+        }
+        if let Some(cache) = &self.upper_rows {
+            cache.invalidate_all();
+        }
+        if let Some(cache) = &self.namespace_rows {
+            cache.invalidate_all();
+        }
+        false
+    }
+
     fn namespace_row_cache(&self) -> Option<&row_cache::UpperRowCache> {
-        self.namespace_rows
-            .as_ref()
-            .filter(|_| self.packed_lower().is_some_and(|lower| !lower.strict()))
+        self.namespace_rows.as_ref().filter(|_| {
+            self.packed_lower().is_some_and(|lower| !lower.strict())
+                && self.row_caches_authoritative()
+        })
     }
 
     fn upper_row_cache(&self) -> Option<&row_cache::UpperRowCache> {
-        self.upper_rows
-            .as_ref()
-            .filter(|_| self.packed_lower().is_some_and(|lower| !lower.strict()))
+        self.upper_rows.as_ref().filter(|_| {
+            self.packed_lower().is_some_and(|lower| !lower.strict())
+                && self.row_caches_authoritative()
+        })
     }
 
     pub fn with_read_plan_cache_max_weight(mut self, max_weight: u64) -> Self {

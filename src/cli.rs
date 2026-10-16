@@ -105,6 +105,12 @@ use crate::workspace_overlay::stores::tikv::TiKvWorkspaceBackend;
 #[cfg(feature = "native-packed-base")]
 use sha2::{Digest, Sha256};
 
+/// Working-set lifetime of the lease-bound upper row/namespace caches. Not a
+/// staleness bound: those caches stop serving as soon as the mount's lease
+/// can no longer be proven held (see `LeaseValidity`).
+#[cfg(feature = "workspace-overlay")]
+const LEASE_BOUND_ROW_CACHE_TTL: Duration = Duration::from_secs(60);
+
 pub async fn run() -> anyhow::Result<()> {
     init_tracing();
     raise_nofile_limit();
@@ -1998,13 +2004,22 @@ where
             meta_layer = meta_layer.with_read_plan_cache_max_weight(max_weight);
         }
         // This mount holds the exclusive workspace lease, so it is the only
-        // upper writer. Same staleness bound as the native Redis client.
+        // upper writer. The caches are bound to that lease: they serve rows
+        // only while a renewal proves it is held and are cleared once it
+        // lapses or fails, so the TTL here is a working-set bound, not the
+        // staleness bound.
         let row_cache_ttl = std::env::var("BREWFS_WORKSPACE_ROW_CACHE_TTL_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_millis)
-            .unwrap_or_else(|| CacheTtl::for_backend("redis").inode_ttl);
-        meta_layer = meta_layer.with_upper_row_cache(row_cache_ttl);
+            .unwrap_or(LEASE_BOUND_ROW_CACHE_TTL);
+        let lease_validity = session
+            .as_ref()
+            .expect("mount session acquired")
+            .lease_validity();
+        meta_layer = meta_layer
+            .with_upper_row_cache(row_cache_ttl)
+            .with_lease_bound_row_cache(lease_validity);
         let meta_layer = Arc::new(meta_layer);
         let packed = meta_layer.packed_reader_session().is_some();
         if packed {

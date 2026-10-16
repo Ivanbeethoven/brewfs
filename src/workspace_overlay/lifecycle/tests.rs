@@ -415,3 +415,55 @@ async fn failed_durable_barrier_restores_active_old_view() {
     assert_eq!(restored.head_epoch, old.head_epoch);
     session.release().await.unwrap();
 }
+
+#[tokio::test]
+async fn session_lease_validity_follows_real_renewals_and_lease_loss() {
+    let store = Arc::new(
+        SqliteWorkspaceStore::connect("sqlite::memory:")
+            .await
+            .unwrap(),
+    );
+    store.initialize_workspace_schema().await.unwrap();
+    let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(601));
+    store
+        .create_volume_root(CreateVolumeRoot {
+            volume_format: "workspace-v1".into(),
+            schema_version: crate::workspace_overlay::model::WORKSPACE_SCHEMA_VERSION,
+            volume_id: Uuid::from_u128(602),
+            workspace_id,
+            root_layer_id: LayerId::from_uuid(Uuid::from_u128(603)),
+            writable_layer_id: LayerId::from_uuid(Uuid::from_u128(604)),
+            owner_id: None,
+        })
+        .await
+        .unwrap();
+    // TTL 300 ms, renewed every 50 ms: the proof must outlive the initial
+    // TTL only because real renewals extend it.
+    let session = WorkspaceMountSession::acquire(
+        store.clone(),
+        workspace_id,
+        1,
+        Duration::from_millis(300),
+        Duration::from_millis(50),
+    )
+    .await
+    .unwrap();
+    let validity = session.lease_validity();
+    assert!(validity.authoritative());
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(validity.authoritative(), "renewals keep the proof alive");
+    // Lose the lease underneath the session: the next renewal fails and the
+    // proof is revoked permanently.
+    store
+        .release_lease(crate::workspace_overlay::catalog::ReleaseLease {
+            lease_id: session.view.lease_id,
+            holder_generation: session.view.holder_generation,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !validity.authoritative(),
+        "a failed renewal revokes the proof"
+    );
+}

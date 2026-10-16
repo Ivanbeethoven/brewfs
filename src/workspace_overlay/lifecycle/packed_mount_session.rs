@@ -109,10 +109,16 @@ pub(super) struct PackedMountRuntime {
 }
 
 impl PackedMountRuntime {
-    fn start(authority: Arc<dyn PackedMountAuthority>, ttl_ns: u64, interval: Duration) -> Self {
+    fn start(
+        authority: Arc<dyn PackedMountAuthority>,
+        ttl_ns: u64,
+        interval: Duration,
+        validity: Arc<super::LeaseValidity>,
+    ) -> Self {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let renewal = authority.clone();
+        let ttl = Duration::from_nanos(ttl_ns);
         let task = tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -124,10 +130,13 @@ impl PackedMountRuntime {
                 }
                 // This awaits one real joint CAS. No native lease-only renew or
                 // generic open sidecar can substitute for the opaque authority.
+                let started = std::time::Instant::now();
                 if let Err(error) = renewal.clone().renew(ttl_ns).await {
+                    validity.revoke();
                     tracing::warn!(?error, "packed-v3 joint heartbeat fenced");
                     break;
                 }
+                validity.extend(started, ttl);
             }
         });
         Self {
@@ -235,6 +244,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMountSession<W> {
             operator_managed,
             budget: budget.clone(),
         };
+        let acquire_started = std::time::Instant::now();
         let Some(authority) = store
             .clone()
             .acquire_packed_mount_if_present(request)
@@ -254,7 +264,13 @@ impl<W: WorkspaceStore + 'static> WorkspaceMountSession<W> {
         }
         let view = authority.view();
         let lease = authority.lease();
-        let packed = PackedMountRuntime::start(authority, duration_ns(ttl)?, heartbeat_interval);
+        let validity = Arc::new(super::LeaseValidity::new(acquire_started, ttl));
+        let packed = PackedMountRuntime::start(
+            authority,
+            duration_ns(ttl)?,
+            heartbeat_interval,
+            validity.clone(),
+        );
         let metrics = global_workspace_metrics();
         metrics.record_mount(true);
         metrics.add_active_lease();
@@ -264,6 +280,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMountSession<W> {
             view,
             heartbeat: None,
             packed: Some(packed),
+            validity,
         })
     }
 }
