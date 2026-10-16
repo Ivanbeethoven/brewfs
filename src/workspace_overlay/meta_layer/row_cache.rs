@@ -45,6 +45,29 @@ pub(super) enum RowValue {
     Aliases(Arc<Vec<(i64, Vec<u8>)>>),
 }
 
+/// Re-checks a lease-proven read fence: the exclusive lease is still proven
+/// held and this inode's cached rows still equal the rows the read used. Any
+/// local commit to the inode removes its cached rows (before and after the
+/// commit), so equality means the store's rows are unchanged.
+pub(crate) struct LeaseLocalFence {
+    pub(super) cache: Arc<UpperRowCache>,
+    pub(super) validity: Arc<crate::workspace_overlay::lifecycle::LeaseValidity>,
+}
+
+impl LeaseLocalFence {
+    pub(crate) fn unchanged(
+        &self,
+        ino: i64,
+        expected: &[crate::workspace_overlay::model::InodeDelta],
+    ) -> bool {
+        let same = matches!(
+            self.cache.get(&RowKey::Inode(ino)),
+            Some(RowValue::Inode(rows)) if rows.as_slice() == expected
+        );
+        same && self.validity.authoritative()
+    }
+}
+
 pub(super) struct UpperRowCache {
     rows: Cache<RowKey, RowValue>,
     generation: AtomicU64,

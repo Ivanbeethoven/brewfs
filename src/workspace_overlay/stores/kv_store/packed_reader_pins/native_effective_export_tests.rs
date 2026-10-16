@@ -80,6 +80,21 @@ async fn fixture_from_packed(
         Vec<u8>,
     ),
 ) -> Fixture {
+    fixture_with_lease(wrong_vfs_upper, input, None).await
+}
+
+/// `lease`: bind the upper row cache (60 s TTL) to this proof, as the CLI does.
+async fn fixture_with_lease(
+    wrong_vfs_upper: bool,
+    input: (
+        tempfile::TempDir,
+        ObjectClient<LocalFsBackend>,
+        AuthenticatedV3Snapshot,
+        crate::workspace_overlay::publish::binding::VerifiedPackedLower,
+        Vec<u8>,
+    ),
+    lease: Option<Arc<crate::workspace_overlay::lifecycle::LeaseValidity>>,
+) -> Fixture {
     let (directory, client, snapshot, lower_proof, payload) = input;
     let backend = PinMemoryBackend::default();
     backend.now.store(1_000_000_000, Ordering::SeqCst);
@@ -119,21 +134,25 @@ async fn fixture_from_packed(
         store: store.clone(),
         reader: reader.clone(),
     });
-    let meta = Arc::new(
-        WorkspaceMetaLayer::with_chunk_size(
-            store.clone(),
-            ViewContext {
-                workspace_id: guard.workspace_id,
-                head_layer_id: guard.expected_head_layer_id,
-                head_epoch: guard.expected_head_epoch,
-                lease_id: guard.lease_id,
-                holder_generation: guard.holder_generation,
-            },
-            CHUNK,
-        )
-        .with_packed_v3_lower(binding.binding, lower, authority, upper.clone(), layout)
-        .unwrap(),
-    );
+    let mut meta_layer = WorkspaceMetaLayer::with_chunk_size(
+        store.clone(),
+        ViewContext {
+            workspace_id: guard.workspace_id,
+            head_layer_id: guard.expected_head_layer_id,
+            head_epoch: guard.expected_head_epoch,
+            lease_id: guard.lease_id,
+            holder_generation: guard.holder_generation,
+        },
+        CHUNK,
+    )
+    .with_packed_v3_lower(binding.binding, lower, authority, upper.clone(), layout)
+    .unwrap();
+    if let Some(lease) = lease {
+        meta_layer = meta_layer
+            .with_upper_row_cache(std::time::Duration::from_secs(60))
+            .with_lease_bound_row_cache(lease);
+    }
+    let meta = Arc::new(meta_layer);
     meta.initialize().await.unwrap();
     let vfs_upper = if wrong_vfs_upper {
         Arc::new(InMemoryBlockStore::new())
@@ -597,6 +616,71 @@ async fn actual_native_capture_rejects_other_vfs_upper_without_catalog_write() {
     native.validate().await.unwrap();
     drop(native);
     f.meta.shutdown_session().await.unwrap();
+}
+
+#[tokio::test]
+async fn lease_proven_read_fence_is_local_and_falls_back_to_remote_on_doubt() {
+    use crate::chunk::read_plan::{ReadViewChanged, WorkspaceReadPlanProvider};
+    use crate::workspace_overlay::lifecycle::LeaseValidity;
+    let validity = Arc::new(LeaseValidity::new(
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(60),
+    ));
+    let f = fixture_with_lease(false, packed().await, Some(validity.clone())).await;
+    // Copy inode 400 up (a real chmod), then warm its cached rows.
+    f.vfs.chmod(400, 0o644).await.unwrap();
+    let warm = f
+        .meta
+        .begin_unified_read_request(400)
+        .await
+        .unwrap()
+        .unwrap();
+    warm.ensure_current().await.unwrap();
+    drop(warm);
+    // Lease proven and rows cached: begin + ensure_current issue no fence
+    // round trip at all.
+    let before = f.backend.timed_reads.load(Ordering::SeqCst);
+    let request = f
+        .meta
+        .begin_unified_read_request(400)
+        .await
+        .unwrap()
+        .unwrap();
+    request.ensure_current().await.unwrap();
+    request.ensure_current().await.unwrap();
+    assert_eq!(f.backend.timed_reads.load(Ordering::SeqCst), before);
+    // A local commit to the inode invalidates its cached rows: the open
+    // request's fence falls back to the remote check, which sees the changed
+    // rows and asks the reader to retry.
+    f.vfs.chmod(400, 0o600).await.unwrap();
+    let error = request.ensure_current().await.unwrap_err();
+    assert!(error.downcast_ref::<ReadViewChanged>().is_some());
+    assert!(f.backend.timed_reads.load(Ordering::SeqCst) > before);
+    // Lease no longer proven: fences are remote again, and losing the real
+    // lease fails the request closed.
+    validity.revoke();
+    let request = f
+        .meta
+        .begin_unified_read_request(400)
+        .await
+        .unwrap()
+        .unwrap();
+    let remote_before = f.backend.timed_reads.load(Ordering::SeqCst);
+    request.ensure_current().await.unwrap();
+    assert!(f.backend.timed_reads.load(Ordering::SeqCst) > remote_before);
+    f.store
+        .release_lease(crate::workspace_overlay::catalog::ReleaseLease {
+            lease_id: f.guard.lease_id,
+            holder_generation: f.guard.holder_generation,
+        })
+        .await
+        .unwrap();
+    let error = request.ensure_current().await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<WorkspaceError>(),
+        Some(WorkspaceError::Fenced)
+    ));
+    f.reader.shutdown().await.unwrap();
 }
 
 #[tokio::test]

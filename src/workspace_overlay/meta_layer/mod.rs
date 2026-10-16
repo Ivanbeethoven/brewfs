@@ -71,7 +71,7 @@ pub struct WorkspaceMetaLayer<W> {
     chunk_size: u64,
     open_counts: DashMap<i64, u64>,
     resolver_cache: WorkspaceResolverCache,
-    upper_rows: Option<row_cache::UpperRowCache>,
+    upper_rows: Option<Arc<row_cache::UpperRowCache>>,
     /// Path/alias results; invalidated only by namespace-changing commits.
     namespace_rows: Option<row_cache::UpperRowCache>,
     /// When set, both caches serve rows only while the mount provably holds
@@ -221,7 +221,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
     /// writer; every local commit invalidates it. Frozen packed base only.
     pub fn with_upper_row_cache(mut self, ttl: std::time::Duration) -> Self {
         if !ttl.is_zero() {
-            self.upper_rows = Some(row_cache::UpperRowCache::new(ttl));
+            self.upper_rows = Some(Arc::new(row_cache::UpperRowCache::new(ttl)));
             self.namespace_rows = Some(row_cache::UpperRowCache::new(ttl));
         }
         self
@@ -293,6 +293,64 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         false
     }
 
+    /// Frozen read fence without a round trip: while the exclusive lease is
+    /// proven held, no other writer can change upper rows and every local
+    /// commit invalidates the keys it writes (before and after), so the
+    /// cached rows of `ino` are exactly the store's rows. Returns the cached
+    /// head/base pair and those rows, or None to use the remote fence.
+    pub(super) async fn lease_proven_inode_rows(
+        &self,
+        ino: i64,
+    ) -> Result<Option<([LayerRecord; 2], Arc<Vec<InodeDelta>>)>, MetaError> {
+        if self.lease_validity.is_none() {
+            return Ok(None);
+        }
+        let Some(cache) = self.upper_row_cache() else {
+            return Ok(None);
+        };
+        let chain: [LayerRecord; 2] = match self.chain().await?.try_into() {
+            Ok(chain) => chain,
+            Err(_) => return Ok(None),
+        };
+        let rows = match cache.get(&row_cache::RowKey::Inode(ino)) {
+            Some(row_cache::RowValue::Inode(rows)) => rows,
+            _ => {
+                let ticket = cache.ticket();
+                let rows = Arc::new(
+                    self.store
+                        .get_inode_deltas(InodeQuery {
+                            layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
+                            ino,
+                        })
+                        .await
+                        .map_err(workspace_to_meta)?,
+                );
+                cache.insert(
+                    ticket,
+                    row_cache::RowKey::Inode(ino),
+                    row_cache::RowValue::Inode(rows.clone()),
+                );
+                rows
+            }
+        };
+        // Re-check after the (possibly awaited) load: the proof must still
+        // hold when the rows are used as the fence.
+        if !self.row_caches_authoritative() {
+            return Ok(None);
+        }
+        Ok(Some((chain, rows)))
+    }
+
+    /// A handle that re-checks the lease-proven local fence later (at the end
+    /// of a read request) without the meta layer.
+    pub(super) fn lease_local_fence(&self) -> Option<row_cache::LeaseLocalFence> {
+        let validity = self.lease_validity.clone()?;
+        let cache = self.upper_rows.clone()?;
+        self.packed_lower()
+            .is_some_and(|lower| !lower.strict())
+            .then_some(row_cache::LeaseLocalFence { cache, validity })
+    }
+
     fn namespace_row_cache(&self) -> Option<&row_cache::UpperRowCache> {
         self.namespace_rows.as_ref().filter(|_| {
             self.packed_lower().is_some_and(|lower| !lower.strict())
@@ -301,10 +359,13 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
     }
 
     fn upper_row_cache(&self) -> Option<&row_cache::UpperRowCache> {
-        self.upper_rows.as_ref().filter(|_| {
-            self.packed_lower().is_some_and(|lower| !lower.strict())
-                && self.row_caches_authoritative()
-        })
+        self.upper_rows
+            .as_ref()
+            .filter(|_| {
+                self.packed_lower().is_some_and(|lower| !lower.strict())
+                    && self.row_caches_authoritative()
+            })
+            .map(|cache| cache.as_ref())
     }
 
     pub fn with_read_plan_cache_max_weight(mut self, max_weight: u64) -> Self {

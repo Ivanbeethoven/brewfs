@@ -606,6 +606,23 @@ async fn capture_inode_fence<W: WorkspaceStore + 'static>(
     ino: i64,
 ) -> anyhow::Result<CapturedInodeFence> {
     let fused = !lower.strict() && meta.store.supports_fused_read_fence();
+    if fused && let Some((layers, rows)) = meta.lease_proven_inode_rows(ino).await? {
+        // Lease-proven: this mount is the only upper writer and every local
+        // commit invalidates the rows it writes, so the cached head/base pair
+        // and inode rows are the store's. The same rows are re-checked
+        // locally (and remotely on any doubt) before bytes are returned.
+        if layers[1].layer_id != lower.binding.base_layer_id {
+            return Err(WorkspaceError::Fenced.into());
+        }
+        validate_fixed_layer_pair(&layers).map_err(read_workspace_error)?;
+        return Ok((
+            meta.guard().await,
+            layers,
+            None,
+            rows.as_ref().clone(),
+            true,
+        ));
+    }
     Ok(if fused {
         // Frozen base: one consistent round trip carries the head/lease fence,
         // the fresh writable head and this inode's rows in both layers.
@@ -651,6 +668,23 @@ struct InodeFence {
     rows: Vec<crate::workspace_overlay::model::InodeDelta>,
 }
 
+/// Fence check: local when the lease-proven rows are unchanged, otherwise the
+/// remote per-inode fence. The remote fence still fails closed on any change.
+async fn validate_fence_or_local<W: WorkspaceStore + 'static>(
+    store: &W,
+    guard: &HeadGuard,
+    layers: &[LayerRecord; 2],
+    inode_fence: Option<&InodeFence>,
+    local: Option<&super::row_cache::LeaseLocalFence>,
+) -> anyhow::Result<()> {
+    if let (Some(fence), Some(local)) = (inode_fence, local)
+        && local.unchanged(fence.ino, &fence.rows)
+    {
+        return Ok(());
+    }
+    validate_fence(store, guard, layers, inode_fence).await
+}
+
 async fn validate_fence<W: WorkspaceStore + 'static>(
     store: &W,
     guard: &HeadGuard,
@@ -679,6 +713,8 @@ struct PackedReadRequestFence<W> {
     guard: HeadGuard,
     layers: [LayerRecord; 2],
     inode_fence: Option<InodeFence>,
+    /// Frozen + lease-bound mounts: re-check the inode fence locally.
+    local_fence: Option<super::row_cache::LeaseLocalFence>,
     request_view: Option<RequestView>,
     lower: Arc<WorkspacePackedLower>,
     file_size: u64,
@@ -707,11 +743,12 @@ impl<W: WorkspaceStore + 'static> UnifiedReadRequestFence for PackedReadRequestF
                 .await
                 .map_err(read_workspace_error)?;
         }
-        validate_fence(
+        validate_fence_or_local(
             self.store.as_ref(),
             &self.guard,
             &self.layers,
             self.inode_fence.as_ref(),
+            self.local_fence.as_ref(),
         )
         .await
     }
@@ -766,11 +803,17 @@ pub(super) async fn begin_request<W: WorkspaceStore + 'static>(
         layers: layers.clone(),
         inodes: inodes.clone(),
     });
+    let local_fence = if fused {
+        meta.lease_local_fence()
+    } else {
+        None
+    };
     let request = Arc::new(PackedReadRequestFence {
         store: meta.store.clone(),
         guard,
         layers,
         inode_fence,
+        local_fence,
         request_view,
         lower,
         file_size,
