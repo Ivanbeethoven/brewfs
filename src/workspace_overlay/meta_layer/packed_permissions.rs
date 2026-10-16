@@ -167,8 +167,10 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                 continue;
             }
             let needs_inode = matches!(state, Resolution::Absent);
+            // Immutable lower inputs come from binding-lifetime memos in
+            // frozen mode; the same conditions as before decide what is read.
             let hot = if needs_inode {
-                lower.metadata.frozen_inode_metadata_owned(ino).await?
+                lower.inode_hot(ino).await?
             } else {
                 None
             };
@@ -184,11 +186,11 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                 );
             }
             let cold = if needs_cold {
-                lower.metadata.frozen_cold_attributes_owned(ino).await?
+                lower.inode_cold(ino).await?
             } else {
                 None
             };
-            if let Some(hot) = hot {
+            if let Some(hot) = &hot {
                 let attr = &hot.attr;
                 if attr.ino != ino {
                     return Err(MetaError::Internal("packed copy-up inode identity".into()));
@@ -226,21 +228,22 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                     sequence: 0,
                 });
             }
-            if let Some(cold) = cold {
+            if let Some(cold) = &cold {
                 for name in [ACCESS_XATTR, DEFAULT_XATTR, b"system.brewfs.acl".as_slice()] {
                     match resolve_xattr_state(&before.layers, &before.xattrs, ino, name)
                         .map_err(workspace_to_meta)?
                     {
                         Resolution::Present(_) | Resolution::Masked => {}
                         Resolution::Absent => {
-                            if let Some(value) = cold.xattrs.iter().find(|value| value.name == name)
+                            if let Some((_, value)) =
+                                cold.xattrs.iter().find(|(stored, _)| stored == name)
                             {
                                 merged.xattrs.push(XattrDelta {
                                     layer_id: lower.binding.base_layer_id,
                                     ino,
                                     name: name.to_vec(),
                                     op: ValueOp::Put,
-                                    value: Some(value.value.clone()),
+                                    value: Some(value.clone()),
                                     sequence: 0,
                                 });
                             }
@@ -273,10 +276,29 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         &self,
         request: VersionedMutation,
     ) -> Result<super::super::catalog::MutationResult, WorkspaceError> {
+        let written = super::RowsWritten::of(&request);
+        self.commit_with_written(request, written).await
+    }
+
+    /// Only `create` may call this: `ino` was freshly allocated by the caller
+    /// and appears in exactly this commit's single new dentry.
+    pub(super) async fn commit_created_mutation(
+        &self,
+        request: VersionedMutation,
+        ino: i64,
+    ) -> Result<super::super::catalog::MutationResult, WorkspaceError> {
+        let written = super::RowsWritten::of_create(&request, ino);
+        self.commit_with_written(request, written).await
+    }
+
+    async fn commit_with_written(
+        &self,
+        request: VersionedMutation,
+        written: super::RowsWritten,
+    ) -> Result<super::super::catalog::MutationResult, WorkspaceError> {
         // Before and after: an uncertain/failed commit may still have
         // applied, and no concurrent read may cache pre-commit rows. Only
         // the keys this commit writes are dropped.
-        let written = super::RowsWritten::of(&request);
         self.invalidate_rows_written(&written);
         let result = if let Some(lower) = self.packed_lower() {
             self.store

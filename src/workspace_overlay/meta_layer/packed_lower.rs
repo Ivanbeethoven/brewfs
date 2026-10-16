@@ -248,8 +248,149 @@ pub(crate) struct WorkspacePackedLower {
     /// Caps concurrent 16 MiB reverse-path walks so they cannot exhaust the
     /// Metadata pool that ordinary FUSE requests also charge.
     pub(super) path_walks: tokio::sync::Semaphore,
+    /// Frozen mode only: the immutable lower's per-inode hot attributes and
+    /// cold permission inputs, resolved once and kept for the life of this
+    /// binding. No expiry and no re-validation: the snapshot cannot change
+    /// while bound. Upper rows still shadow these on every read.
+    pub(super) inode_hot_memo: moka::sync::Cache<i64, Option<Arc<LowerInodeHot>>>,
+    pub(super) inode_cold_memo: moka::sync::Cache<i64, Option<Arc<LowerInodeCold>>>,
+    /// Frozen mode only: the lower's authenticated reverse (parent, name)
+    /// aliases of an inode, complete across pages, for the binding lifetime.
+    pub(super) reverse_names: moka::sync::Cache<i64, LowerAliases>,
     upper_identity: usize,
     upper_layout: ChunkLayout,
+}
+
+/// A lower inode's complete authenticated reverse (parent, name) aliases.
+pub(super) type LowerAliases = Arc<Vec<(i64, Vec<u8>)>>;
+
+/// One lower inode's hot attributes, copied out of the authenticated
+/// snapshot (no retained budget permit; bounded by entry count).
+#[derive(Clone, Debug)]
+pub(super) struct LowerInodeHot {
+    pub attr: crate::meta::store::FileAttr,
+    pub parent_hint: Option<i64>,
+}
+
+/// One lower inode's cold permission inputs: the symlink target and the
+/// permission xattrs present in the lower, as (name, value).
+#[derive(Clone, Debug)]
+pub(super) struct LowerInodeCold {
+    pub symlink_target: Option<Vec<u8>>,
+    pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Byte bound for each immutable-lower memo (values plus cache overhead).
+/// Eviction only costs a re-read of the immutable snapshot.
+const LOWER_MEMO_BYTES: u64 = 64 << 20;
+const PERMISSION_XATTRS: [&[u8]; 3] = [
+    crate::meta::posix_acl::ACCESS_XATTR,
+    crate::meta::posix_acl::DEFAULT_XATTR,
+    b"system.brewfs.acl",
+];
+
+impl WorkspacePackedLower {
+    /// The lower inode's hot attributes (None: no such lower inode).
+    /// Frozen: memoized for the binding lifetime. Strict: always read through
+    /// the authenticated snapshot so every operation observes revalidation.
+    pub(super) async fn inode_hot(
+        &self,
+        ino: i64,
+    ) -> Result<Option<Arc<LowerInodeHot>>, MetaError> {
+        if self.frozen
+            && let Some(found) = self.inode_hot_memo.get(&ino)
+        {
+            return Ok(found);
+        }
+        let loaded = self
+            .metadata
+            .frozen_inode_metadata_owned(ino)
+            .await?
+            .map(|hot| {
+                Arc::new(LowerInodeHot {
+                    attr: hot.attr.clone(),
+                    parent_hint: hot.parent_hint,
+                })
+            });
+        if self.frozen {
+            self.inode_hot_memo.insert(ino, loaded.clone());
+        }
+        Ok(loaded)
+    }
+
+    /// The lower inode's cold permission inputs (None: no cold record).
+    /// Frozen: memoized for the binding lifetime. Strict: always fresh.
+    pub(super) async fn inode_cold(
+        &self,
+        ino: i64,
+    ) -> Result<Option<Arc<LowerInodeCold>>, MetaError> {
+        if self.frozen
+            && let Some(found) = self.inode_cold_memo.get(&ino)
+        {
+            return Ok(found);
+        }
+        let loaded = self
+            .metadata
+            .frozen_cold_attributes_owned(ino)
+            .await?
+            .map(|cold| {
+                Arc::new(LowerInodeCold {
+                    symlink_target: cold.symlink_target.clone(),
+                    xattrs: cold
+                        .xattrs
+                        .iter()
+                        .filter(|value| PERMISSION_XATTRS.contains(&value.name.as_slice()))
+                        .map(|value| (value.name.clone(), value.value.clone()))
+                        .collect(),
+                })
+            });
+        if self.frozen {
+            self.inode_cold_memo.insert(ino, loaded.clone());
+        }
+        Ok(loaded)
+    }
+
+    /// The lower's complete reverse aliases of `ino`. Frozen: memoized for the
+    /// binding lifetime (only a complete walk is stored). Strict: fresh.
+    pub(super) async fn reverse_aliases(
+        &self,
+        ino: i64,
+        mut page: impl FnMut() -> Result<(), MetaError>,
+    ) -> Result<LowerAliases, MetaError> {
+        if self.frozen
+            && let Some(found) = self.reverse_names.get(&ino)
+        {
+            return Ok(found);
+        }
+        let mut rows = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            page()?;
+            let next = self
+                .metadata
+                .frozen_reverse_names_page_owned(ino, after.as_deref())
+                .await?;
+            if next.rows.is_empty() {
+                break;
+            }
+            if next
+                .after
+                .as_ref()
+                .is_none_or(|cursor| after.as_ref().is_some_and(|old| cursor <= old))
+            {
+                return Err(MetaError::Internal(
+                    "packed reverse cursor did not advance".into(),
+                ));
+            }
+            rows.extend(next.rows.iter().cloned());
+            after = next.after.clone();
+        }
+        let rows = Arc::new(rows);
+        if self.frozen {
+            self.reverse_names.insert(ino, rows.clone());
+        }
+        Ok(rows)
+    }
 }
 
 impl WorkspacePackedLower {
@@ -290,6 +431,31 @@ impl WorkspacePackedLower {
             authority,
             frozen: true,
             path_walks: tokio::sync::Semaphore::new(MAX_CONCURRENT_PATH_WALKS),
+            inode_hot_memo: moka::sync::Cache::builder()
+                .weigher(|_, _| 192)
+                .max_capacity(LOWER_MEMO_BYTES)
+                .build(),
+            inode_cold_memo: moka::sync::Cache::builder()
+                .weigher(|_, value: &Option<Arc<LowerInodeCold>>| {
+                    let bytes = value.as_ref().map_or(0, |cold| {
+                        cold.symlink_target.as_ref().map_or(0, Vec::len)
+                            + cold
+                                .xattrs
+                                .iter()
+                                .map(|(name, value)| name.len() + value.len() + 48)
+                                .sum::<usize>()
+                    });
+                    u32::try_from(bytes).unwrap_or(u32::MAX).saturating_add(128)
+                })
+                .max_capacity(LOWER_MEMO_BYTES)
+                .build(),
+            reverse_names: moka::sync::Cache::builder()
+                .weigher(|_, rows: &LowerAliases| {
+                    let bytes = rows.iter().map(|(_, name)| name.len() + 40).sum::<usize>();
+                    u32::try_from(bytes).unwrap_or(u32::MAX).saturating_add(96)
+                })
+                .max_capacity(LOWER_MEMO_BYTES)
+                .build(),
             upper_identity: Arc::as_ptr(&upper) as *const () as usize,
             upper_layout: layout,
             upper: Arc::new(NativeUpperFetcher {

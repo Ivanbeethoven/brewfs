@@ -508,3 +508,33 @@ Redis 往返/操作 readback 28.4→24.4、mixed 43.7→40.9，但吞吐全部�
 16 worker 交替顺序对照（base→hot19、hot19→base，4 组均 30/30 通过，6 次合并中位数）：stat 974→993（+2.0%）、full 217→220（+1.7%）、write 278→289（+4.0%）、readback 744→766（+3.0%）、mixed 437→454（+3.9%），无回归。证据：`ovn-base-9e4f204-r13p{a,b}`、`ovn-hot19-r13p{a,b}`。
 
 门禁（`build/hot19/gate.txt`）：fmt、clippy（workspace 与严格 overlay）、`cargo test --workspace --lib --bins`（1177 passed）、overlay+fuse 套件 1079 passed / 5 failed（3 个 e980d59 确定性失败 + 2 个 source_file 负载下偶发，均为既有）、`git diff --check` 通过。
+
+## 2026-10-17 overlay 第 14–16 轮：不可变 lower 的权限/查找数据按绑定生命周期永久缓存；create 只失效新 inode 的路径缓存
+
+用户选择方案 (a)：lower 的权限检查保持正确，但其输入数据（不可变、已认证的快照）在 frozen 模式下对整个绑定生命周期缓存，无过期、无再校验；strict 模式不缓存。用户也批准了 upper 层的 inode 级权限缓存。
+
+改动：
+- `WorkspacePackedLower`（frozen 专用、生命周期等于该绑定）：
+  - `inode_hot` / `inode_cold`：lower inode 的 hot 属性与 cold 权限输入（symlink target、三个权限 xattr），以原调用条件按需读取后缓存；
+  - `reverse_aliases`：lower 反向名称（完整分页结果）缓存；
+  - 三个 moka 缓存按字节加权，各 64 MiB 上限，淘汰只会导致重读不可变快照。
+- `PackedV3ReadonlyMeta::lookup_with_attr_bytes`：(parent, name) → (inode, attr) 结果（含不存在）缓存，与已有 `attrs` 缓存同生命周期、同启用条件（`metadata_bytes != 0`）、同关闭/drain 失效；64 MiB 字节上限。去掉了每次 lookup 的 GroupMeta range GET 与解码。
+- upper：命名空间缓存原先在任何写 dentry 的提交后整体清空。新增 `RowsWritten::of_create`：仅 create 走 `commit_created_mutation`，且只有当提交恰好是一条 Put dentry、指向本提交新建（Present、parent_hint 等于该 dentry 的父目录）的 inode、且无删除时，才只失效该新 inode 自己的 Paths/Aliases；其余一律全清（误用只影响性能）。新建 dentry 无法改变任何已有 inode 的路径或别名。
+- upper 的 inode 级权限缓存（`RowKey::Permission`，按提交逐键失效，第 9 轮）此前已存在，本轮未改变其语义。
+
+中途问题：hot20 二进制是在 hot/cold 拆分修复之前的旧代码上构建的（单一 `permission_inputs` 对 root 也请求 hot 属性，触发 `packed root attributes missing`，真实挂载上 root readdir/stat 返回 EIO）；已标记 `build/hot20/STALE.txt`，其压测结果作废。之后每个候选先跑真实挂载探针（`/tmp/ovn_probe.sh`：root listdir、stat、子目录 listdir）再压测。
+
+验证：
+- 单测：`frozen_lower_permission_and_lookup_inputs_are_fetched_once_per_binding`（清空 upper 缓存后重复权限/lookup/路径查询，lower range GET 不再增加；upper chmod 仍覆盖缓存的 lower 输入）、`strict_lower_permission_inputs_are_never_memoized`、`create_keeps_existing_paths_cached_but_other_namespace_commits_clear_them`（create 保留已有路径缓存；通用提交、指向已有 inode 的 link、带删除的提交都全清）。焦点套件仅 3 个既有失败。
+- 32 worker（`ovn-hot22-w32/ovn-20261016T182154Z-1765004`）：stat/full/rw 15/15 overlay 行全部 0 错误，组 passed。overlay files/s：stat ~2114、full ~351、write ~290、readback ~883、mixed ~525。
+- 16 worker 交替顺序对照（hot19→hot22、hot22→hot19，4 组均 30/30 通过，6 次合并中位数）：
+
+| mode | native | overlay hot19 | overlay hot22 | 变化 | ratio |
+|---|---|---|---|---|---|
+| stat | 3069 | 1024 | 2309 | +125% | 0.33 → 0.75 |
+| full | 790 | 227 | 347 | +53% | 0.29 → 0.44 |
+| write | 633 | 293 | 313 | +7% | 0.50 → 0.49 |
+| readback | 1202 | 773 | 807 | +4% | 0.67 → 0.67 |
+| mixed | 993 | 455 | 553 | +21% | 0.48 → 0.56 |
+
+stat p99 10.7→5.0 ms，full p99 45.6→36.2 ms，mixed p99 57.4→49.5 ms；mixed 每操作 Redis 往返 43.9→30.3。证据：`ovn-hot19-r16p{a,b}`、`ovn-hot22-r16p{a,b}`（另有一轮未加字节上限的 hot21 对照 `ovn-hot{19,21}-r15p{a,b}`，结论一致）。

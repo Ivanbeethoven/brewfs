@@ -110,6 +110,12 @@ pub(super) struct RowsWritten {
     row_keys: Option<Vec<row_cache::RowKey>>,
     /// Any dentry row or inode deletion: paths/aliases may change.
     namespace: bool,
+    /// Set only for a create: the commit's single dentry is a Put naming an
+    /// inode this same commit introduces (allocated fresh, nlink 1/2, its
+    /// parent hint is that dentry's parent). Such an entry cannot change the
+    /// paths or aliases of any existing inode, so the namespace cache drops
+    /// only the new inode's own entries instead of everything.
+    created: Option<i64>,
 }
 
 impl RowsWritten {
@@ -145,7 +151,33 @@ impl RowsWritten {
         Self {
             row_keys,
             namespace,
+            created: None,
         }
+    }
+
+    /// `of(request)` for a create commit whose dentry introduces `ino`.
+    /// Falls back to the full namespace invalidation unless the request has
+    /// exactly that shape, so a misuse can only cost performance.
+    pub(super) fn of_create(request: &VersionedMutation, ino: i64) -> Self {
+        let mut written = Self::of(request);
+        let [dentry] = request.dentries.as_slice() else {
+            return written;
+        };
+        let fresh = dentry.op == crate::workspace_overlay::model::DentryOp::Put
+            && dentry.ino == Some(ino)
+            && request.inodes.iter().any(|row| {
+                row.ino == ino
+                    && row.state == InodeState::Present
+                    && row.parent_hint == Some(dentry.parent_ino)
+            })
+            && request
+                .inodes
+                .iter()
+                .all(|row| row.state != InodeState::Deleted);
+        if fresh {
+            written.created = Some(ino);
+        }
+        written
     }
 }
 
@@ -218,7 +250,13 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         if written.namespace
             && let Some(cache) = &self.namespace_rows
         {
-            cache.invalidate_all();
+            match written.created {
+                Some(ino) => cache.invalidate_keys(&[
+                    row_cache::RowKey::Paths(ino),
+                    row_cache::RowKey::Aliases(ino),
+                ]),
+                None => cache.invalidate_all(),
+            }
         }
     }
 
@@ -1354,23 +1392,26 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                         });
                     }
                 }
-                self.commit_versioned_mutation(VersionedMutation {
-                    expected_layers: expected_layers.clone(),
-                    xattrs,
-                    acls: Vec::new(),
-                    extents: Vec::new(),
-                    chunk_size: self.chunk_size,
-                    guard,
-                    dentries: vec![DentryDelta::put(
-                        inode.layer_id,
-                        parent,
-                        name.as_bytes().to_vec(),
-                        ino,
-                        inode.kind,
-                        0,
-                    )],
-                    inodes: vec![inode.clone(), parent_inode],
-                })
+                self.commit_created_mutation(
+                    VersionedMutation {
+                        expected_layers: expected_layers.clone(),
+                        xattrs,
+                        acls: Vec::new(),
+                        extents: Vec::new(),
+                        chunk_size: self.chunk_size,
+                        guard,
+                        dentries: vec![DentryDelta::put(
+                            inode.layer_id,
+                            parent,
+                            name.as_bytes().to_vec(),
+                            ino,
+                            inode.kind,
+                            0,
+                        )],
+                        inodes: vec![inode.clone(), parent_inode],
+                    },
+                    ino,
+                )
                 .await
                 .map_err(workspace_to_meta)?;
                 Ok((ino, file_attr(&inode)?))
