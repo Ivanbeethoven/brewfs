@@ -14,6 +14,11 @@ const MAX_PENDING_BYTES: usize = 2 << 20;
 // ancestor component vector. Admission precedes construction and follows the
 // returned paths through every awaited permission lookup.
 const PATHS_OUTPUT_BYTES: u64 = 1 << 20;
+const WALK_ARENA_BYTES: u64 = 16 << 20;
+// Metadata kept free for non-waiting FUSE request (2 MiB), frozen mutation
+// version (2 MiB) and commit-bound (~2 MiB) charges while walks wait: about
+// ten such operations in flight, a quarter of the default 256 MiB pool.
+const WALK_HEADROOM_BYTES: u64 = 64 << 20;
 
 struct PathsOutputOwner {
     _permit: V3OwnedPermit,
@@ -247,9 +252,20 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             .acquire()
             .await
             .map_err(|_| MetaError::Io(std::io::Error::from_raw_os_error(libc::ENOMEM)))?;
+        // Waits (bounded by ADMISSION_WAIT) while the pool is busy and only
+        // takes the arena if WALK_HEADROOM_BYTES stay free, so the small
+        // non-waiting per-request and commit charges in the same pool are
+        // not starved into ENOMEM. The only Metadata a waiting walk holds is
+        // its caller's 2 MiB request charge; arenas are released when walks
+        // finish, so waiters make progress or fail closed at the deadline.
         let _permit: V3OwnedPermit = lower
             .budget
-            .admit(&[(V3BudgetPool::Metadata, 16 << 20)])
+            .admit_waiting_with_headroom(
+                V3BudgetPool::Metadata,
+                WALK_ARENA_BYTES,
+                WALK_HEADROOM_BYTES,
+            )
+            .await
             .map_err(packed_lower::budget_to_meta)?;
         let output_permit = lower
             .budget
