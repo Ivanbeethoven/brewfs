@@ -538,3 +538,19 @@ Redis 往返/操作 readback 28.4→24.4、mixed 43.7→40.9，但吞吐全部�
 | mixed | 993 | 455 | 553 | +21% | 0.48 → 0.56 |
 
 stat p99 10.7→5.0 ms，full p99 45.6→36.2 ms，mixed p99 57.4→49.5 ms；mixed 每操作 Redis 往返 43.9→30.3。证据：`ovn-hot19-r16p{a,b}`、`ovn-hot22-r16p{a,b}`（另有一轮未加字节上限的 hot21 对照 `ovn-hot{19,21}-r15p{a,b}`，结论一致）。
+
+## 2026-10-17 overlay 第 17 轮（诊断，未改代码）：upper 行缓存 TTL
+
+单 worker MONITOR（hot22，`ovn-diag-hot22`）：readback 每文件仍有 8 次融合 fence（每个文件两次 FUSE read：数据 + EOF，每次 begin + 立即 ensure + 最终 ensure + chunk 视图），一次完整路径遍历（新建文件首次 open，反向索引权威读 → 确认 CAS），以及 3.3 次 10-key 权限快照读。mixed 中对已遍历文件的再次访问在默认 500 ms TTL 下已过期，因此重新遍历。
+
+实验（同一 hot22 二进制，只改 `BREWFS_WORKSPACE_ROW_CACHE_TTL_MS`，两组交替顺序，每组 3 reps，4 组均通过）：
+
+| mode | overlay TTL 500 ms | overlay TTL 60 s | 变化 | Redis 往返/操作 |
+|---|---|---|---|---|
+| write | 295 | 299 | +1% | 18.1 → 18.0 |
+| readback | 790 | 792 | 持平 | 28.4 → 28.1 |
+| mixed | 554 | 638 | +15% | 30.7 → 15.7 |
+
+证据：`ovn-hot22-ttl-{def,t60}-{pa,pb}`。native 同期 write ~640、readback ~1175、mixed ~988；60 s 时 mixed 比值 0.56 → 0.64。
+
+未改默认值的原因：TTL 是本挂载之外写入（以及失去租约后）的陈旧上限。本挂载自己的提交按键立即失效，视图切换全部失效；但 frozen 模式的 stat/lookup/权限读本身不做远程 fence，若租约丢失（心跳只记录 `packed-v3 joint heartbeat fenced` 后退出），挂载可在 TTL 内继续返回缓存的 upper 元数据。默认 500 ms 与 native Redis 客户端一致。安全地延长需要：在心跳失败/租约丢失时清空 upper 与命名空间缓存并拒绝后续元数据读，再把默认 TTL 提高；该改动待用户确认。
