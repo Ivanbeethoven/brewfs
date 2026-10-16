@@ -20,7 +20,9 @@ use super::model::{
     SnapshotLease, SnapshotRecord, ViewContext, WorkspaceRecord,
 };
 
+mod lease_validity;
 mod packed_mount_session;
+pub use lease_validity::LeaseValidity;
 pub(crate) use packed_mount_session::{
     PackedMountAuthority, PackedMountCatalog, PackedMountSessionRequest, PackedNeverAttached,
 };
@@ -311,9 +313,16 @@ pub struct WorkspaceMountSession<W> {
     pub view: ViewContext,
     heartbeat: Option<LeaseHeartbeat>,
     packed: Option<packed_mount_session::PackedMountRuntime>,
+    /// Shared with the heartbeat; see `LeaseValidity`.
+    validity: Arc<LeaseValidity>,
 }
 
 impl<W: WorkspaceStore + 'static> WorkspaceMountSession<W> {
+    /// Local proof that this session still holds its exclusive lease.
+    pub fn lease_validity(&self) -> Arc<LeaseValidity> {
+        self.validity.clone()
+    }
+
     pub async fn acquire(
         store: Arc<W>,
         workspace_id: WorkspaceId,
@@ -360,6 +369,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMountSession<W> {
             ));
         }
         let ttl_ns = duration_ns(ttl)?;
+        let acquire_started = Instant::now();
         let lease = store
             .acquire_lease(AcquireLease {
                 workspace_id,
@@ -402,12 +412,14 @@ impl<W: WorkspaceStore + 'static> WorkspaceMountSession<W> {
             lease_id: lease.lease_id,
             holder_generation,
         };
+        let validity = Arc::new(LeaseValidity::new(acquire_started, ttl));
         let heartbeat = LeaseHeartbeat::spawn(
             store.clone(),
             lease.lease_id,
             holder_generation,
             ttl,
             heartbeat_interval,
+            validity.clone(),
         );
         Ok(Self {
             store,
@@ -415,6 +427,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMountSession<W> {
             view,
             heartbeat: Some(heartbeat),
             packed: None,
+            validity,
         })
     }
 
@@ -491,13 +504,17 @@ impl LeaseHeartbeat {
         holder_generation: u64,
         ttl: Duration,
         interval: Duration,
+        validity: Arc<LeaseValidity>,
     ) -> Self {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let task = tokio::spawn(async move {
             let ttl_ns = match duration_ns(ttl) {
                 Ok(value) => value,
-                Err(_) => return,
+                Err(_) => {
+                    validity.revoke();
+                    return;
+                }
             };
             let mut timer = tokio::time::interval(interval);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -506,13 +523,16 @@ impl LeaseHeartbeat {
                 tokio::select! {
                     _ = task_cancel.cancelled() => break,
                     _ = timer.tick() => {
+                        let started = Instant::now();
                         if store.renew_lease(RenewLease {
                             lease_id,
                             holder_generation,
                             ttl_ns,
                         }).await.is_err() {
+                            validity.revoke();
                             break;
                         }
+                        validity.extend(started, ttl);
                     }
                 }
             }
@@ -731,6 +751,7 @@ mod lease_recovery_tests {
             1,
             Duration::from_secs(1),
             Duration::from_millis(10),
+            Arc::new(LeaseValidity::new(Instant::now(), Duration::from_secs(1))),
         );
         tokio::time::sleep(Duration::from_millis(60)).await;
         heartbeat.stop().await;

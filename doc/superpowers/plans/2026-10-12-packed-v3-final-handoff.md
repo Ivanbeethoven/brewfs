@@ -554,3 +554,29 @@ stat p99 10.7→5.0 ms，full p99 45.6→36.2 ms，mixed p99 57.4→49.5 ms；mi
 证据：`ovn-hot22-ttl-{def,t60}-{pa,pb}`。native 同期 write ~640、readback ~1175、mixed ~988；60 s 时 mixed 比值 0.56 → 0.64。
 
 未改默认值的原因：TTL 是本挂载之外写入（以及失去租约后）的陈旧上限。本挂载自己的提交按键立即失效，视图切换全部失效；但 frozen 模式的 stat/lookup/权限读本身不做远程 fence，若租约丢失（心跳只记录 `packed-v3 joint heartbeat fenced` 后退出），挂载可在 TTL 内继续返回缓存的 upper 元数据。默认 500 ms 与 native Redis 客户端一致。安全地延长需要：在心跳失败/租约丢失时清空 upper 与命名空间缓存并拒绝后续元数据读，再把默认 TTL 提高；该改动待用户确认。
+
+## 2026-10-17 overlay 第 18 轮：upper 行缓存与租约绑定，默认 TTL 500 ms → 60 s
+
+第 17 轮记录了：TTL 延长到 60 s 可让 mixed +15%，但 TTL 当时是租约丢失后唯一的陈旧上限。本轮先补上这一点，再延长默认值。
+
+改动：
+- 新增 `lifecycle::LeaseValidity`：首次获取租约（发出请求前的时刻 + TTL）建立本地"确知持有租约"的截止时间；每次续约成功按"该次续约发出前的时刻 + TTL"推进（只增不减）；续约失败永久撤销。原生心跳（`LeaseHeartbeat`）与 packed 联合心跳（`PackedMountRuntime`）都更新它；`WorkspaceMountSession::lease_validity()` 暴露。
+- `WorkspaceMetaLayer::with_lease_bound_row_cache`：upper 行缓存与命名空间缓存只有在 `authoritative()` 为真时才提供；一旦截止时间过去或被撤销，立即清空两个缓存并之后一直绕过（读走存储）。租约是排他的，且每个 upper 变更都在 CAS 中重新校验租约，因此截止时间之前不可能有其他持有者修改 upper 行。
+- CLI 挂载：启用租约绑定，默认 TTL 改为 60 s（`LEASE_BOUND_ROW_CACHE_TTL`，仅作工作集上限，不再是陈旧上限）；`BREWFS_WORKSPACE_ROW_CACHE_TTL_MS` 仍可覆盖。
+
+测试：`deadline_extends_on_renewal_and_revocation_is_permanent`（单调推进、过期、撤销永久）、`lease_bound_row_cache_stops_serving_once_the_lease_cannot_be_proven`（撤销与过期两种情况下，缓存不再返回旧行、读到存储的新值、缓存被清空）、`session_lease_validity_follows_real_renewals_and_lease_loss`（真实会话：300 ms TTL、50 ms 心跳，600 ms 后仍有效；在底下释放租约后下一次续约失败即撤销）。
+
+结果：
+- 真实挂载探针通过（`ovn-hot23-probe`）。
+- 32 worker（`ovn-hot23-w32/ovn-20261016T210130Z-1864759`）：15/15 overlay 行 0 错误；overlay stat ~2834、full ~404、write ~305、readback ~951、mixed ~648。
+- 16 worker 交替顺序对照（hot22→hot23、hot23→hot22，4 组均 30/30 通过，6 次合并中位数）：
+
+| mode | native | overlay hot22 | overlay hot23 | 变化 | ratio |
+|---|---|---|---|---|---|
+| stat | 3384 | 2310 | 2541 | +10% | 0.68 → 0.75 |
+| full | 824 | 365 | 381 | +4.5% | 0.44 → 0.46 |
+| write | 678 | 301 | 324 | +7.8% | 0.47 → 0.48 |
+| readback | 1287 | 813 | 892 | +9.7% | 0.67 → 0.69 |
+| mixed | 1063 | 569 | 691 | +21% | 0.57 → 0.65 |
+
+mixed 每操作 Redis 往返 30.4 → 15.7，mixed p99 48.5 → 45.6 ms。证据：`ovn-hot22-r18p{a,b}`、`ovn-hot23-r18p{a,b}`。本时段主机 native 偏快（stat 3384、readback 1287），故 hot22 的比值低于第 16 轮记录。
