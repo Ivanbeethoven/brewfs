@@ -1085,6 +1085,86 @@ async fn namespace_cache_survives_data_commits_and_clears_on_namespace_commits()
 }
 
 #[tokio::test]
+async fn create_keeps_existing_paths_cached_but_other_namespace_commits_clear_them() {
+    use super::super::row_cache::{RowKey, RowValue};
+    let mut f = fixture().await;
+    f.meta = f
+        .meta
+        .with_upper_row_cache(std::time::Duration::from_secs(60));
+    let namespace = f
+        .meta
+        .namespace_row_cache()
+        .expect("frozen namespace cache");
+    let head = f.head().await;
+    let seed = |cache: &super::super::row_cache::UpperRowCache| {
+        cache.insert(
+            cache.ticket(),
+            RowKey::Paths(400),
+            RowValue::Paths(std::sync::Arc::new(vec![b"/file".to_vec()])),
+        );
+        cache.insert(
+            cache.ticket(),
+            RowKey::Aliases(400),
+            RowValue::Aliases(std::sync::Arc::new(vec![(1, b"file".to_vec())])),
+        );
+    };
+    let fresh_inode = |ino: i64, parent: i64| InodeDelta {
+        layer_id: head,
+        ino,
+        state: InodeState::Present,
+        kind: 0,
+        size: 0,
+        mode: 0o100644,
+        uid: 1,
+        gid: 2,
+        rdev: 0,
+        nlink: 1,
+        atime_ns: 0,
+        mtime_ns: 0,
+        ctime_ns: 0,
+        symlink_target: None,
+        parent_hint: Some(parent),
+        data_version: 1,
+        sequence: 0,
+    };
+    // A create of a brand-new inode 900 under / keeps unrelated paths.
+    seed(namespace);
+    let mut create = f.mutation().await;
+    create
+        .dentries
+        .push(DentryDelta::put(head, 1, b"new".to_vec(), 900, 0, 0));
+    create.inodes.push(fresh_inode(900, 1));
+    f.meta
+        .invalidate_rows_written(&super::super::RowsWritten::of_create(&create, 900));
+    assert!(namespace.get(&RowKey::Paths(400)).is_some());
+    assert!(namespace.get(&RowKey::Aliases(400)).is_some());
+    // The same commit through the generic path, a link of an existing inode
+    // (dentry naming a non-introduced inode), or a deletion clears all.
+    for written in [
+        super::super::RowsWritten::of(&create),
+        super::super::RowsWritten::of_create(&create, 400),
+        {
+            let mut link = f.mutation().await;
+            link.dentries
+                .push(DentryDelta::put(head, 1, b"alias".to_vec(), 400, 0, 0));
+            super::super::RowsWritten::of_create(&link, 400)
+        },
+        {
+            let mut deleting = create.clone();
+            let mut deleted = fresh_inode(401, 1);
+            deleted.state = InodeState::Deleted;
+            deleting.inodes.push(deleted);
+            super::super::RowsWritten::of_create(&deleting, 900)
+        },
+    ] {
+        seed(namespace);
+        f.meta.invalidate_rows_written(&written);
+        assert!(namespace.get(&RowKey::Paths(400)).is_none());
+        assert!(namespace.get(&RowKey::Aliases(400)).is_none());
+    }
+}
+
+#[tokio::test]
 async fn commit_invalidates_only_the_row_cache_keys_it_writes() {
     use super::super::row_cache::{RowKey, RowValue};
     let mut f = fixture().await;

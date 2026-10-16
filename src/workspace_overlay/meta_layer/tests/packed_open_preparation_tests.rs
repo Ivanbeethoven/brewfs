@@ -387,6 +387,7 @@ impl BlockStore for UnusedUpper {
 
 struct Fixture<B: WorkspaceKvBackend> {
     _objects: tempfile::TempDir,
+    lower: Arc<PackedV3ReadonlyMeta<crate::cadapter::localfs::LocalFsBackend>>,
     meta: WorkspaceMetaLayer<KvWorkspaceStore<ValidationBackend<B>>>,
     inner: Arc<B>,
     control: Arc<ValidationControl>,
@@ -399,8 +400,19 @@ async fn fixture() -> Fixture<impl WorkspaceKvBackend> {
 }
 
 async fn fixture_with(strict: bool) -> Fixture<impl WorkspaceKvBackend> {
+    fixture_with_cache(strict, 0).await
+}
+
+/// `metadata_bytes` > 0 enables the lower index cache and immutable memos,
+/// as the CLI mount does.
+async fn fixture_with_cache(strict: bool, metadata_bytes: u64) -> Fixture<impl WorkspaceKvBackend> {
     let (objects, client, snapshot, proof, _payload) = packed().await;
-    let lower = Arc::new(PackedV3ReadonlyMeta::from_v3(client, snapshot, 4096, 0));
+    let lower = Arc::new(PackedV3ReadonlyMeta::from_v3(
+        client,
+        snapshot,
+        4096,
+        metadata_bytes,
+    ));
     let inner = Arc::new(packed_open_preparation_test_backend());
     let control = Arc::new(ValidationControl::new());
     let store = Arc::new(
@@ -434,6 +446,7 @@ async fn fixture_with(strict: bool) -> Fixture<impl WorkspaceKvBackend> {
         .await
         .unwrap()
         .expect("actual packed mount authority");
+    let lower_handle = lower.clone();
     let meta = WorkspaceMetaLayer::with_chunk_size(store, authority.view(), 4096)
         .with_packed_v3_lower_from_store(
             lower,
@@ -453,6 +466,7 @@ async fn fixture_with(strict: bool) -> Fixture<impl WorkspaceKvBackend> {
     meta.initialize().await.unwrap();
     Fixture {
         _objects: objects,
+        lower: lower_handle,
         meta,
         inner,
         control,
@@ -1098,6 +1112,78 @@ async fn frozen_base_read_path_does_no_per_operation_lower_validation() {
         "strict mode keeps per-operation validation"
     );
     shutdown(&strict).await;
+}
+
+#[tokio::test]
+async fn frozen_lower_permission_and_lookup_inputs_are_fetched_once_per_binding() {
+    use crate::meta::layer::MetaLayer;
+    let f = fixture_with_cache(false, 64 << 20).await;
+    // First pass loads the immutable lower once.
+    let first_permissions = f.meta.inode_permissions(400).await.unwrap().unwrap();
+    let first_lookup = f
+        .meta
+        .lookup_with_attr_bytes(1, b"nonzero")
+        .await
+        .unwrap()
+        .unwrap();
+    let first_paths = f.meta.get_paths_bytes(400).await.unwrap();
+    let after_first = f.lower.runtime_range_gets();
+    // Drop every upper-side cache: only the binding-lifetime lower memos may
+    // answer now, and no lower object is fetched again.
+    f.meta.invalidate_upper_rows();
+    for _ in 0..3 {
+        let permissions = f.meta.inode_permissions(400).await.unwrap().unwrap();
+        assert_eq!(permissions.attr.mode, first_permissions.attr.mode);
+        assert_eq!(permissions.attr.uid, first_permissions.attr.uid);
+        assert_eq!(permissions.access_acl, first_permissions.access_acl);
+        let lookup = f
+            .meta
+            .lookup_with_attr_bytes(1, b"nonzero")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lookup.0, first_lookup.0);
+        assert_eq!(f.meta.get_paths_bytes(400).await.unwrap(), first_paths);
+        f.meta.invalidate_upper_rows();
+    }
+    assert_eq!(
+        f.lower.runtime_range_gets(),
+        after_first,
+        "frozen lower inputs must be served from the binding-lifetime memo"
+    );
+    assert_eq!(first_paths, vec![b"/nonzero".to_vec()]);
+    // An upper change still shadows the cached lower inputs (copy-up chmod).
+    f.meta
+        .set_attr(
+            400,
+            &crate::meta::store::SetAttrRequest {
+                mode: Some(0o600),
+                ..Default::default()
+            },
+            crate::meta::store::SetAttrFlags::empty(),
+        )
+        .await
+        .unwrap();
+    let changed = f.meta.inode_permissions(400).await.unwrap().unwrap();
+    assert_eq!(changed.attr.mode & 0o777, 0o600);
+    assert_ne!(first_permissions.attr.mode & 0o777, 0o600);
+    shutdown(&f).await;
+}
+
+#[tokio::test]
+async fn strict_lower_permission_inputs_are_never_memoized() {
+    let f = fixture_with_cache(true, 64 << 20).await;
+    let lower = f.meta.packed_lower().unwrap();
+    assert!(lower.strict());
+    f.meta.inode_permissions(400).await.unwrap().unwrap();
+    f.meta.get_paths_bytes(400).await.unwrap();
+    lower.inode_hot_memo.run_pending_tasks();
+    lower.inode_cold_memo.run_pending_tasks();
+    lower.reverse_names.run_pending_tasks();
+    assert_eq!(lower.inode_hot_memo.entry_count(), 0);
+    assert_eq!(lower.inode_cold_memo.entry_count(), 0);
+    assert_eq!(lower.reverse_names.entry_count(), 0);
+    shutdown(&f).await;
 }
 
 #[tokio::test]

@@ -623,6 +623,11 @@ pub struct PackedV3ReadonlyMeta<B: ObjectBackend + Clone + 'static> {
     /// None when metadata caching is disabled (`cache_bytes == 0`): every
     /// stat must then observe the backend, including injected faults.
     attrs: Option<moka::sync::Cache<i64, Option<FileAttr>>>,
+    /// Resolved (parent, name) -> (inode, attr) lookups, including absence.
+    /// Same lifetime, invalidation and enablement as `attrs`: the snapshot is
+    /// immutable, so an authenticated lookup result never changes. Removes the
+    /// per-lookup GroupMeta range fetch and decode.
+    dentries: Option<DentryMemo>,
     attrs_closed: std::sync::atomic::AtomicBool,
 }
 
@@ -631,6 +636,23 @@ const ATTR_MEMO_ENTRIES: u64 = 1 << 20;
 fn attr_memo() -> moka::sync::Cache<i64, Option<FileAttr>> {
     moka::sync::Cache::builder()
         .max_capacity(ATTR_MEMO_ENTRIES)
+        .build()
+}
+
+/// Byte bound for the lookup memo (keys, attributes and cache overhead).
+const DENTRY_MEMO_BYTES: u64 = 64 << 20;
+
+/// (parent inode, name) -> resolved (inode, attr), or None when absent.
+type DentryMemo = moka::sync::Cache<(u64, Vec<u8>), Option<(i64, FileAttr)>>;
+
+fn dentry_memo() -> DentryMemo {
+    moka::sync::Cache::builder()
+        .weigher(|key: &(u64, Vec<u8>), _value: &Option<(i64, FileAttr)>| {
+            u32::try_from(key.1.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(192)
+        })
+        .max_capacity(DENTRY_MEMO_BYTES)
         .build()
 }
 
@@ -706,6 +728,7 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
             chunk_size,
             context,
             attrs: (metadata_bytes != 0).then(attr_memo),
+            dentries: (metadata_bytes != 0).then(dentry_memo),
             attrs_closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -733,6 +756,12 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
 
     pub fn mount_budget(&self) -> Arc<super::wire005::V3MountBudget> {
         Arc::clone(&self.context.budget)
+    }
+
+    /// Runtime backend range GETs issued by this reader (metadata and data).
+    #[cfg(test)]
+    pub(crate) fn runtime_range_gets(&self) -> u64 {
+        self.context.metrics.range_gets.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn frozen_cold_attributes_owned(
@@ -848,6 +877,9 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
         self.attrs_closed.store(true, Ordering::Release);
         if let Some(attrs) = &self.attrs {
             attrs.invalidate_all();
+        }
+        if let Some(dentries) = &self.dentries {
+            dentries.invalidate_all();
         }
         self.context.metrics.transport.stop_admission();
         self.context.reader.close().await;
@@ -1188,15 +1220,35 @@ where
         name: &[u8],
     ) -> Result<Option<(i64, FileAttr)>, MetaError> {
         let parent = Self::inode(parent)?;
-        let Some(entry) = self.lookup_entry(self.parent_key(parent), name).await? else {
-            return Ok(None);
+        // Same closed-budget fence as the attribute memo: a retired mount
+        // reports its error from the uncached path, never a memoized entry.
+        let memo = self
+            .dentries
+            .as_ref()
+            .filter(|_| !self.attrs_closed.load(Ordering::Acquire));
+        let key = (parent, name.to_vec());
+        if !self.context.budget.state().closed
+            && let Some(found) = memo.and_then(|memo| memo.get(&key))
+        {
+            return Ok(found);
+        }
+        let found = match self.lookup_entry(self.parent_key(parent), name).await? {
+            None => None,
+            Some(entry) => {
+                let inode = i64::try_from(entry.inode)
+                    .map_err(|_| MetaError::Internal("packed inode exceeds i64".into()))?;
+                Some((
+                    inode,
+                    self.with_source_blocks(attr(entry.inode, &entry)).await?,
+                ))
+            }
         };
-        let inode = i64::try_from(entry.inode)
-            .map_err(|_| MetaError::Internal("packed inode exceeds i64".into()))?;
-        Ok(Some((
-            inode,
-            self.with_source_blocks(attr(entry.inode, &entry)).await?,
-        )))
+        if !self.attrs_closed.load(Ordering::Acquire)
+            && let Some(memo) = &self.dentries
+        {
+            memo.insert(key, found.clone());
+        }
+        Ok(found)
     }
     async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError> {
         if path.is_empty() || !path.starts_with('/') {
