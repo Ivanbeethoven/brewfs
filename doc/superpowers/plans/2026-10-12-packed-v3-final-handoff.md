@@ -580,3 +580,31 @@ stat p99 10.7→5.0 ms，full p99 45.6→36.2 ms，mixed p99 57.4→49.5 ms；mi
 | mixed | 1063 | 569 | 691 | +21% | 0.57 → 0.65 |
 
 mixed 每操作 Redis 往返 30.4 → 15.7，mixed p99 48.5 → 45.6 ms。证据：`ovn-hot22-r18p{a,b}`、`ovn-hot23-r18p{a,b}`。本时段主机 native 偏快（stat 3384、readback 1287），故 hot22 的比值低于第 16 轮记录。
+
+## 2026-10-17 overlay 第 19 轮：租约可证明时，frozen 读 fence 在本地完成
+
+问题：小文件 readback 每个文件两次 FUSE read（数据 + EOF 探测），每次在 begin 与结束时各做一次远程融合 fence（head/lease + 本 inode 两层行），约 8 次/文件。
+
+依据：第 18 轮的 `LeaseValidity` 证明本挂载仍持有排他租约时，不可能有其他写者修改 upper 行，且本挂载每次提交在提交前后都会失效其写入 inode 的缓存行。因此，若该 inode 的缓存行仍等于读请求所用的行，存储中的行也必然未变。
+
+改动：
+- `WorkspaceMetaLayer::lease_proven_inode_rows`：frozen + 融合 fence 可用 + 租约绑定 + 租约可证明时，用缓存的 head/base 对与该 inode 的缓存行（未命中则读一次并入缓存）作为请求视图，跳过捕获时的远程融合读；加载后再次确认租约仍可证明。
+- `row_cache::LeaseLocalFence`：`ensure_current` 及 chunk 的 `ensure_generation` 先做本地检查（缓存行与请求所用行相等且租约仍可证明）；任何不一致（缓存被提交失效、租约过期/撤销、未命中）都退回原有的远程 per-inode fence，远程 fence 仍对任何变化 fail closed（Busy → ReadViewChanged 重试，失去租约 → Fenced）。
+- strict 模式、无租约绑定、或存储不支持融合 fence 时行为与之前完全相同。
+
+测试：`lease_proven_read_fence_is_local_and_falls_back_to_remote_on_doubt`（KV 融合 fixture + 租约绑定：预热后 begin + 两次 ensure_current 不产生任何 timed read；本 inode 的 chmod 使缓存失效，原请求退回远程 fence 并返回 ReadViewChanged；撤销租约证明后 fence 重新走远程，真实释放租约后请求以 Fenced 失败）。
+
+结果：
+- 真实挂载探针通过（`ovn-hot24-probe`）。
+- 32 worker（`ovn-hot24-w32/ovn-20261016T225059Z-1929054`）：15/15 overlay 行 0 错误；readback ~1025、mixed ~672。
+- 16 worker 交替顺序对照（hot23→hot24、hot24→hot23，4 组均 30/30 通过，6 次合并中位数）：
+
+| mode | native | overlay hot23 | overlay hot24 | 变化 | ratio |
+|---|---|---|---|---|---|
+| stat | 3367 | 2422 | 2413 | 持平（两组方向相反） | 0.72 |
+| full | 841 | 394 | 410 | +4% | 0.47 → 0.49 |
+| write | 665 | 303 | 304 | 持平 | 0.46 |
+| readback | 1187 | 826 | 952 | +15% | 0.66 → 0.80 |
+| mixed | 1022 | 663 | 687 | +4% | 0.63 → 0.67 |
+
+Redis 往返/操作：readback 28.1 → 16.1，mixed 15.7 → 7.3；readback p99 30.9 → 27.0 ms。证据：`ovn-hot23-r19p{a,b}`、`ovn-hot24-r19p{a,b}`。

@@ -30,6 +30,8 @@ struct PinMemoryBackend {
     /// Models Redis' single-range pages. A forced `page_size` truncation is
     /// then a lie, so only enable this while `page_size` is unset.
     short_page_is_end: Arc<AtomicBool>,
+    /// Consistent timed reads (head/lease and per-inode read fences).
+    timed_reads: Arc<AtomicI64>,
 }
 impl Default for PinMemoryBackend {
     fn default() -> Self {
@@ -46,6 +48,7 @@ impl Default for PinMemoryBackend {
             page_size: Default::default(),
             page_barrier: Default::default(),
             short_page_is_end: Default::default(),
+            timed_reads: Default::default(),
         }
     }
 }
@@ -177,6 +180,7 @@ impl WorkspaceKvBackend for PinMemoryBackend {
         &self,
         keys: &[Vec<u8>],
     ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
+        self.timed_reads.fetch_add(1, Ordering::SeqCst);
         let rows = self.rows.lock().await;
         Ok((
             keys.iter().map(|key| rows.get(key).cloned()).collect(),
