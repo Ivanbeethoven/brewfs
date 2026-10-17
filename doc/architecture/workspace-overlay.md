@@ -267,9 +267,9 @@ alternated, 6 runs pooled, after PR #30 (`tools/perf/run_overlay_vs_native.sh`):
 | --- | ---: |
 | stat | 0.75 |
 | full read | 0.57 |
-| write | 0.55 |
-| readback | 0.81 |
-| mixed | 0.80 |
+| write | 0.59 (PR #32) |
+| readback | 0.79–0.81 |
+| mixed | 0.86 (PR #32) |
 
 The 32-worker rw run had 0 errors. Write is the largest gap: about three
 commits per file (create, fsync, close), each a server-side Lua CAS. The
