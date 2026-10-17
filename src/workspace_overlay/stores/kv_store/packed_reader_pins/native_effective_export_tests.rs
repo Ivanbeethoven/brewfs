@@ -918,6 +918,44 @@ async fn sole_writer_commit_skips_the_view_pre_read_and_survives_renewal() {
     f.reader.shutdown().await.unwrap();
 }
 
+/// A binding publication by the holder's own lease rewrites the workspace
+/// and head records, which every cached commit still checks: the next commit
+/// against the old binding cannot succeed from the cache and is fenced after
+/// its fresh re-read.
+#[tokio::test]
+async fn cached_commit_cannot_outlive_a_binding_publication() {
+    let f = fixture(false).await;
+    f.vfs.create_file("/warm").await.unwrap();
+    let layers: [crate::workspace_overlay::model::LayerRecord; 2] = f
+        .store
+        .load_layer_chain(f.guard.expected_head_layer_id)
+        .await
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let (_objects, _, _, lower, _) =
+        crate::workspace_overlay::stores::binding_tests::packed_with_snapshot_id([12; 32]).await;
+    f.store
+        .publish_packed_lower_binding(
+            crate::workspace_overlay::publish::binding::PublishPackedLowerBinding {
+                guard: f.guard.clone(),
+                expected_layers: layers,
+                expected_base: f.binding.base_revision.clone(),
+                expected_binding: f.binding.clone(),
+                lower,
+            },
+        )
+        .await
+        .unwrap();
+    let before = f.backend.view_reads.load(Ordering::SeqCst);
+    assert!(f.vfs.create_file("/after-publish").await.is_err());
+    assert!(
+        f.backend.view_reads.load(Ordering::SeqCst) > before,
+        "the stale cached view must fall back to a fresh read"
+    );
+    f.reader.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn packed_workspace_filesystem_57_byte_write_and_readback_complete_within_deadline() {
     use asyncfuse::raw::{Filesystem, Request};
