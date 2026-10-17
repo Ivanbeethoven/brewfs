@@ -114,6 +114,21 @@ Redis per written file: 98.7 → 72.6 cmds and 1047 → 866 µs server time
 (native: 33 cmds, 428 µs). Remaining write gap: 2 Lua CAS commits per file
 (still 3.2 EVALSHA vs native 2.0) plus the per-op permission reads.
 
+### Round 25 (open decision from the lease-bound cache)
+
+Order-swapped rw vs #32 (`$R/ovn-{r24,r25}-r25p{a,b}`), 6 runs pooled,
+0/78 errors including 32 workers:
+
+| Mode | #32 overlay | r25 overlay | Change | r25 overlay/native |
+| --- | ---: | ---: | ---: | ---: |
+| write | 213 ± 7 | 222 ± 4 | +4.3% | 0.62 |
+| readback | 493 ± 25 | 500 ± 15 | +1.5% (noise) | 0.83 |
+| mixed | 434 ± 17 | 444 ± 17 | +2.1% (noise) | 0.90 |
+
+Client round trips per created file: 12 → 11 (MGET 9 → 8). The rest is the
+create commit's parent/new-inode snapshot, which feeds a CAS and so must be
+fresh, plus two Lua CAS commits.
+
 Rejected designs:
 - merging the create and first-fsync commits (breaks O_EXCL visibility);
 - full metadata copy-up of the lower (no write-op gain for new files; breaks
