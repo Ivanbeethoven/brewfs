@@ -1,5 +1,8 @@
 # packed-v3/005 当前收尾交接（2026-10-12）
 
+> overlay-on-packed 最新状态（无 seal 模型、PR #30、性能比与续作方法）见
+> [2026-10-17 handoff](2026-10-17-overlay-no-seal-handoff.md)。
+
 更新时间：2026-10-12 UTC  
 工作区：/home/hxy/brewfs  
 分支：codex/packed-metadata-aliyun-20260930  

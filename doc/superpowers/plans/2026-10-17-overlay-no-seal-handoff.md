@@ -1,0 +1,179 @@
+# Overlay-on-packed handoff (2026-10-17)
+
+Read this first when resuming the overlay-on-packed performance work. It
+replaces the overlay part of
+[2026-10-12-packed-v3-final-handoff.md](2026-10-12-packed-v3-final-handoff.md).
+
+## Repository state
+
+- Integration branch: `codex/packed-metadata-aliyun-20260930` (PRs target this
+  branch, not `main`).
+- Head after this work: `9c0b195` (merge of PR #30), plus this handoff doc PR.
+- PR #30 `refactor(overlay): immutable lower + non-rotating overlay; drop seal`
+  contains two commits:
+  - `e7a345d`: SPEC/docs only;
+  - `0742303`: code.
+- Earlier rounds 1–22 were merged as PRs #10–#29. Per-round notes are in the
+  PR descriptions.
+- Commits on this host need an explicit identity:
+  `GIT_AUTHOR_NAME/GIT_COMMITTER_NAME="Xiaoyang Han"`,
+  `GIT_AUTHOR_EMAIL/GIT_COMMITTER_EMAIL=lux1an@qq.com`.
+- To change a PR base: `gh api -X PATCH repos/Ivanbeethoven/brewfs/pulls/N -f base=...`
+  (`gh pr edit --base` fails here).
+
+## Current model (final)
+
+- One **immutable packed-v3 lower** plus one **writable overlay**. The overlay
+  head never rotates while a writer lease is live.
+- There is no seal transaction, no compaction/flatten and no strict lower mode.
+- New lowers come only from packed publication, run under the workspace's
+  single active writable lease.
+- Maintained references:
+  - [architecture doc](../../architecture/workspace-overlay.md): has the
+    head-writer and lease audit table;
+  - [overlay implementation spec](../specs/2026-08-23-brewfs-workspace-overlay-implementation-spec.md):
+    2026-10-17 banner, §14–§16, §24;
+  - [operator spec](../specs/2026-09-03-brewfs-workspace-operator-lifecycle-spec.md).
+- CLI: `init-volume`, `init-packed-volume`, `create --from <rev>`,
+  `fork <rev>`, `list`, `inspect`, `diff`, `discard`. The commands
+  `snapshot`, `commit` and `fork <workspace-uuid>` were removed.
+- Operator: `BrewFSWorkspaceSnapshot` works only for packed workspaces;
+  native workspaces go to `Failed`.
+
+## Key design decisions
+
+1. **Sole-writer safety is the only write authority.** Every mutation CAS
+   checks:
+   - the lease row;
+   - `workspace.active_lease`;
+   - the packed writer-authority and open records;
+   - a backend-time deadline (`lease.expires_at_ns`).
+
+   Regression tests in `native_effective_export_tests.rs`:
+   - `invariant_second_mount_cannot_acquire_a_live_lease`;
+   - `invariant_commit_after_lease_expiry_fails_closed`;
+   - `invariant_commit_after_lease_loss_fails_closed_and_blocks_takeover`;
+   - `invariant_no_head_change_under_an_active_lease`.
+2. **No head changes under a foreign live lease.** Every head writer (binding
+   install/publish, packed journal commit, initial bootstrap, native complete
+   driver, clean restore/headless) requires the caller's own live lease.
+   `acquire_lease` refuses a second lease while one is live. The audit table is
+   in the architecture doc.
+3. **Immutable-lower memos.** The lower is authenticated once at attach. Lower
+   inode, permission, reverse-alias and lookup data are memoized for the
+   lifetime of the binding. Upper caches serve only while `LeaseValidity`
+   proves the lease is held (rounds 18–19).
+4. **Commit view cache (round 23).** `packed_permissions.rs::CommitViewCache`:
+   - A commit reuses its own post-commit view bytes (plus head reverse state
+     and extent generation; slice-delete keys are guessed absent) as the CAS
+     conditions, so it skips the view pre-read.
+   - Any outside change only fails the CAS. The commit then does one fresh
+     read: `Fenced` or `Busy` from the cache means re-read.
+   - Recovery-token writers never use the cache.
+   - Test: `sole_writer_commit_skips_the_view_pre_read_and_survives_renewal`.
+5. **Test-only lower seeding.** `src/workspace_overlay/test_base_fixture.rs`
+   with `#[cfg(test)] install_test_base` replaces seal in GC/diff/resolver
+   tests. It is not a production API.
+
+## Measured overlay-vs-native ratios
+
+Runner: `tools/perf/run_overlay_vs_native.sh`. Small files: 2000 × 16 KiB for
+rw; 2000 × 100 KiB for stat/full. Redis metadata, RustFS objects, 16 workers,
+arms alternated, 6 runs pooled.
+
+Round 23 (`$R/ovn-{hot27,noseal1}-r23p{a,b}`): `hot27` is the merged #29 build,
+`noseal1` is #30. Errors: 0 in all 168 runs. The host ran about 2× slower than
+in rounds 18–22, so compare only within this table.
+
+| Mode | #29 overlay | #30 overlay | Change | #30 overlay/native |
+| --- | ---: | ---: | ---: | ---: |
+| stat | 959 | 937 | noise | 0.75 |
+| full | 201 | 199 | noise | 0.57 |
+| write | 169 | 186 | +10.4% | 0.55 |
+| readback | 451 | 459 | +1.8% | 0.81 |
+| mixed | 358 | 380 | +6.2% | 0.80 |
+
+- 32 workers rw (`$R/ovn-noseal1-w32`): 0 errors. Overlay/native: write
+  185/404, readback 492/600, mixed 373/517.
+- Real-mount probe: `$R/ovn-noseal1-probe` passed.
+
+## Verified
+
+| Gate | Result |
+| --- | --- |
+| fmt, clippy (overlay and default, all targets), tokio+overlay check, `cargo test --workspace --lib --bins` | pass |
+| overlay + fuse lib tests | 1066 pass; 3 known failures (below) |
+| operator | 56 tests pass |
+| real mount | probe passed, 32-worker run 0 errors |
+| perf | order-swapped comparison above |
+
+Logs: `$R/build/noseal1/gate.txt` and `*.log`.
+
+## Unverified / left
+
+- **Docker workspace-overlay compose smoke** for the rewritten harness has not
+  run. It now builds the lower with `packed_v3_snapshot_fixture` and forks by
+  revision. The harness helpers were checked against real CLI output only. CI
+  `docker-workspace-overlay-smoke` runs it on PRs.
+- **Operator clippy** fails on a `must_use` lint from rustc 1.99 in
+  `operator/brewfs-operator/src/workspace/admin.rs:73` and `gc.rs:44,233`.
+  `gc.rs` is untouched by this work; `admin.rs` was edited, but not at line 73.
+  This was not re-checked on the base commit.
+- **Biggest remaining gap: write (0.55×).** Each file costs about 3 commits
+  (create, fsync, close), each a server-side Lua CAS. The pre-read is gone.
+  Next idea, not started and needing user approval: merge the create and first
+  fsync commits for a newly created inode. A single-Lua-script commit was
+  estimated in round 13 at ≤5%.
+- **stat (0.75×) and full (0.57×)**: remaining cost is per-op permission and
+  path work plus FUSE read count (rounds 11–12 found no single hotspot).
+
+## Known bugs / pre-existing failures
+
+These fail deterministically, also on the base commit:
+
+- `g13a_kv_released_lease_is_not_an_expired_recovery_root`;
+- `kv_v3_open_topology_rejects_binding_change_between_routing_and_final_read`;
+- `migration_marker_fences_entity_and_hot_native_packets_without_writes`.
+
+Flaky tests: `source_file::source_*` (under load) and
+`writable_acl_independent_sqlite…`.
+
+## Host, build and disk
+
+- ECS `brewfs-singapore-v2`. The repo is at `/mnt/brewfs-data/src/brewfs`
+  (`/home/hxy/brewfs` is a symlink to it).
+- `$R=/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z`.
+- Builds:
+  - Use `CARGO_BUILD_JOBS=4` and run under
+    `systemd-run --user --scope -p MemoryHigh=24G -p MemoryMax=28G -p MemorySwapMax=24G`.
+  - Check `cat /proc/sys/vm/swappiness` = 10 before each build; it resets to 0
+    silently (`sudo sysctl -w vm.swappiness=10`). There is a 32G swapfile.
+  - Never run a release build and a test build at the same time (OOM risk).
+  - Release builds take about 40 min; the lib test build about 10–20 min.
+- Disk: 85% used (37G free). Each round's build dir is about 4 GB
+  (`$R/build/hot2*`, `noseal1`). Ask the user before deleting merged rounds'
+  binaries. Keep `hot27` (#29 baseline) and `noseal1` (#30).
+- A stuck FUSE connection makes `ps` hang. Fix:
+  `echo 1 | sudo tee /sys/fs/fuse/connections/<n>/abort`.
+- Never run ignored real-backend tests with a broad filter; use `--exact`.
+
+## Exact commands
+
+```bash
+cd /mnt/brewfs-data/src/brewfs
+R=/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z
+# Full gate + release binaries into $R/build/<round>/ (template):
+cat $R/build/noseal1/gate.sh
+# Real-mount probe:
+OVN_FILES=100 OVN_WORKERS=1 OVN_EPOCHS=1 OVN_REPEATS=1 OVN_MODES="stat rw" \
+  OVN_RW_FILES=200 OVN_RW_MIXED_OPS=200 OVN_ARTIFACT_ROOT=$R/ovn-<round>-probe \
+  OVN_BINARY=$R/build/<round>/brewfs OVN_FIXTURE=$R/build/<round>/packed_v3_snapshot_fixture \
+  bash tools/perf/run_overlay_vs_native.sh
+# 32-worker rw: same with OVN_WORKERS=32 OVN_REPEATS=1 OVN_MODES=rw.
+# Order-swapped comparison: run arms in the order base pa, cand pa, cand pb,
+# base pb with default OVN_* settings; pool per binary. Template: /tmp/r23.sh
+# (not persistent; the loop is reproduced in this doc's history).
+```
+
+Unset `BREWFS_WORKSPACE_ROW_CACHE_TTL_MS` before perf runs (the default is
+60 s). Run perf alone; never alongside a build or a profiling run.
