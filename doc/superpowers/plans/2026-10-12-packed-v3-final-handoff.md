@@ -608,3 +608,23 @@ mixed 每操作 Redis 往返 30.4 → 15.7，mixed p99 48.5 → 45.6 ms。证据
 | mixed | 1022 | 663 | 687 | +4% | 0.63 → 0.67 |
 
 Redis 往返/操作：readback 28.1 → 16.1，mixed 15.7 → 7.3；readback p99 30.9 → 27.0 ms。证据：`ovn-hot23-r19p{a,b}`、`ovn-hot24-r19p{a,b}`。
+
+## 2026-10-17 overlay 第 20–21 轮：packed 变更驱动丢失请求身份（正确性修复）；创建者首次写打开不再提交空 CAS
+
+第 20 轮（rejected，单独无效）：`record_open` 对创建者自己刚创建的 inode 的首次写打开跳过空的认证 CAS。压测（`ovn-hot{24,25}-r20p{a,b}`）各模式持平，write 每操作往返不变（18.0）。追查原因：每个 packed 写路径（create/unlink/rename/link/mkdir/open/…）都经 `MutationDriver::run` 用 `tokio::spawn` 执行，而 namespace actor、open 访问掩码、setattr 写句柄授权、created-inode 授权都是 tokio task-local，spawn 后全部丢失。因此在 packed 挂载上：
+- 元数据层 `check_namespace_actor`、`record_open`、`create_node` 等在其条件版本内重复执行的身份/权限检查一律按"无 actor"跳过（FUSE 层的前置检查仍执行，但这些与 CAS 同版本的复查失效）；
+- 创建者首次打开的授权（`scope_created_inode_open`）同样丢失，所以第 20 轮的改动从未生效。
+
+第 21 轮改动：
+- `meta::layer::RequestScope`：`capture_request_scope()` 捕获当前请求的 actor、访问掩码、setattr 写句柄授权，并**取走**（而非复制）created-inode 授权以保持一次性语义；`scope()` 在驱动任务中重新进入这些作用域。
+- `MutationDriver::run` 在 spawn 前捕获、在驱动任务内重新进入请求作用域。
+- 保留第 20 轮的 `record_open` 改动：frozen 模式下创建者首次写打开不再提交空 CAS（create 提交已在同一 head 版本认证了绑定/head/租约/写者权限）；其余写打开与 strict 模式不变。
+
+测试：`spawned_driver_keeps_request_scope_and_created_authority_stays_once`（spawn 后 actor、掩码、setattr 授权仍在；created 授权被移交且只能取一次；请求外捕获为空）、`creators_first_write_open_skips_the_empty_cas_but_later_opens_commit_it`（frozen 下首次写打开 0 次认证、之后的写打开仍提交；strict 下总是提交）。焦点套件（含 `meta::layer::`、`vfs::fs::`、`fuse::`）仅 3 个既有失败。
+
+结果：
+- 单 worker MONITOR（`ovn-hot26-probe`）：写阶段每文件的空 CAS（`n=13`）与其 12-key 视图读消失（每文件 EVALSHA 7.2 → 5.2）；但因元数据层现在真正执行 actor 的父目录/祖先权限复查，每文件多约 3 次 10-key 权限快照 MGET，总往返持平。
+- 32 worker（`ovn-hot26-w32/ovn-20261017T021238Z-2052596`）：15/15 overlay 行 0 错误。
+- 16 worker 交替顺序对照（hot24→hot26、hot26→hot24，4 组均 30/30 通过）：stat 2442→2467、full 416→404、write 310→313、readback 960→931、mixed 718→695，均在 ±3% 噪声内（证据 `ovn-hot{24,26}-r21p{a,b}`）。
+
+结论：吞吐持平，但修复了 packed 挂载上元数据层身份/权限复查被静默跳过的问题，合入。下一步：`check_namespace_actor` 的父目录与祖先权限快照可以复用第 9/18 轮的租约绑定 Permission 行缓存（它们是只读决策，CAS 仍校验层版本），预计可抵消新增的约 3 次 MGET。

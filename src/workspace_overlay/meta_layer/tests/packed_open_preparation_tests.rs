@@ -1187,6 +1187,51 @@ async fn strict_lower_permission_inputs_are_never_memoized() {
 }
 
 #[tokio::test]
+async fn creators_first_write_open_skips_the_empty_cas_but_later_opens_commit_it() {
+    use crate::meta::layer::{NamespaceActor, scope_created_inode_open, scope_namespace_actor};
+    for strict in [false, true] {
+        let f = fixture_with(strict).await;
+        let attr = f.meta.stat(400).await.unwrap().unwrap();
+        let actor = NamespaceActor {
+            uid: 0,
+            gid: 0,
+            groups: Vec::new(),
+        };
+        // The creator's own first open (create just committed this inode).
+        let before = f.control.validations.load(Ordering::SeqCst);
+        scope_namespace_actor(
+            Some(actor.clone()),
+            scope_created_inode_open(
+                400,
+                true,
+                f.meta.record_open(400, attr.clone(), true, true, false),
+            ),
+        )
+        .await
+        .unwrap();
+        let after_created = f.control.validations.load(Ordering::SeqCst);
+        if strict {
+            assert!(after_created > before, "strict mode always commits");
+        } else {
+            assert_eq!(after_created, before, "creator's first open: no CAS");
+        }
+        assert_eq!(f.meta.open_counts.get(&400).map(|count| *count), Some(1));
+        // Any other writable open still commits its authenticated CAS.
+        scope_namespace_actor(
+            Some(actor),
+            f.meta.record_open(400, attr, true, true, false),
+        )
+        .await
+        .unwrap();
+        assert!(f.control.validations.load(Ordering::SeqCst) > after_created);
+        f.meta.record_close(400).await.unwrap();
+        f.meta.record_close(400).await.unwrap();
+        assert!(f.meta.open_counts.is_empty());
+        shutdown(&f).await;
+    }
+}
+
+#[tokio::test]
 async fn frozen_base_write_open_still_authenticates_in_cas() {
     let f = fixture_with(false).await;
     let attr = f.meta.stat(400).await.unwrap().unwrap();

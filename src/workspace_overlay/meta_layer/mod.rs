@@ -1928,9 +1928,14 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         let created = actor.is_some() && crate::meta::layer::take_created_inode_open_authority(ino);
         // A frozen-base read-only open changes no state, so it does not pay
         // an empty authenticated CAS; write opens and strict mode still do.
+        // The creator's own first open of an inode its create just committed
+        // (frozen mode) needs no second authenticated CAS: the create commit
+        // already authenticated binding, head, lease and writer authority at
+        // the same head version, and this mount is the only upper writer.
+        // Any later writable open, and strict mode, still commits one.
         let open_commits = self
             .packed_lower()
-            .is_some_and(|lower| lower.strict() || _write || _append);
+            .is_some_and(|lower| lower.strict() || ((_write || _append) && !created));
         for _ in 0..64 {
             let prepared = async {
                 let version = if self.packed_lower().is_some() && open_commits {
