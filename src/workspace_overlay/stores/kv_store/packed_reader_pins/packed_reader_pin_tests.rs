@@ -32,6 +32,8 @@ struct PinMemoryBackend {
     short_page_is_end: Arc<AtomicBool>,
     /// Consistent timed reads (head/lease and per-inode read fences).
     timed_reads: Arc<AtomicI64>,
+    /// Consistent untimed multi-key reads (permission snapshots and rows).
+    consistent_reads: Arc<AtomicI64>,
 }
 impl Default for PinMemoryBackend {
     fn default() -> Self {
@@ -49,6 +51,7 @@ impl Default for PinMemoryBackend {
             page_barrier: Default::default(),
             short_page_is_end: Default::default(),
             timed_reads: Default::default(),
+            consistent_reads: Default::default(),
         }
     }
 }
@@ -173,6 +176,7 @@ impl WorkspaceKvBackend for PinMemoryBackend {
         &self,
         keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, WorkspaceError> {
+        self.consistent_reads.fetch_add(1, Ordering::SeqCst);
         let rows = self.rows.lock().await;
         Ok(keys.iter().map(|key| rows.get(key).cloned()).collect())
     }

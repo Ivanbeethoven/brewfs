@@ -684,6 +684,58 @@ async fn lease_proven_read_fence_is_local_and_falls_back_to_remote_on_doubt() {
 }
 
 #[tokio::test]
+async fn lease_proven_actor_checks_reuse_cached_parent_permissions_but_see_chmod() {
+    use crate::meta::layer::{NamespaceActor, scope_namespace_actor};
+    use crate::workspace_overlay::lifecycle::LeaseValidity;
+    let validity = Arc::new(LeaseValidity::new(
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(60),
+    ));
+    let f = fixture_with_lease(false, packed().await, Some(validity.clone())).await;
+    // A world-writable upper directory, so a non-root actor may create in it.
+    let dir = f.vfs.mkdir_p("/actor-dir").await.unwrap();
+    f.vfs.chmod(dir, 0o777).await.unwrap();
+    let actor = NamespaceActor {
+        uid: 4242,
+        gid: 4242,
+        groups: vec![4242],
+    };
+    let create = |name: &'static str| {
+        let vfs = f.vfs.clone();
+        let actor = actor.clone();
+        async move {
+            scope_namespace_actor(
+                Some(actor),
+                vfs.create_file_at_with_umask(dir, name, true, 0o644, 0, 4242, 4242),
+            )
+            .await
+        }
+    };
+    create("warm").await.unwrap();
+    // Parent (and root ancestor) permission rows are now cached.
+    let first = f.backend.consistent_reads.load(Ordering::SeqCst);
+    create("a").await.unwrap();
+    let cached = f.backend.consistent_reads.load(Ordering::SeqCst) - first;
+    // While the cache is authoritative, a local chmod removing write access
+    // is still enforced on the very next create: the chmod commit
+    // invalidated the cached parent rows.
+    f.vfs.chmod(dir, 0o755).await.unwrap();
+    assert!(create("denied").await.is_err());
+    f.vfs.chmod(dir, 0o777).await.unwrap();
+    create("warm-again").await.unwrap();
+    // Without the lease proof every actor check reads the store again.
+    validity.revoke();
+    let start = f.backend.consistent_reads.load(Ordering::SeqCst);
+    create("c").await.unwrap();
+    let uncached = f.backend.consistent_reads.load(Ordering::SeqCst) - start;
+    assert!(
+        cached < uncached,
+        "cached actor checks ({cached}) must read less than uncached ({uncached})"
+    );
+    f.reader.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn packed_workspace_filesystem_57_byte_write_and_readback_complete_within_deadline() {
     use asyncfuse::raw::{Filesystem, Request};
     use std::ffi::OsStr;

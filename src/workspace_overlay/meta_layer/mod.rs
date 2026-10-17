@@ -893,7 +893,8 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         if actor.uid == 0 {
             return Ok(());
         }
-        let (directory, access, _, control) = self.permission_inode(expected, parent).await?;
+        let (directory, access, _, control) =
+            self.permission_inode_for_check(expected, parent).await?;
         if directory.kind != file_type_code(FileType::Dir) {
             return Err(MetaError::NotDirectory(parent));
         }
@@ -922,7 +923,8 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                 if !visited.insert(ino) {
                     return Err(MetaError::Io(std::io::Error::from_raw_os_error(libc::EIO)));
                 }
-                let (inode, access, _, control) = self.permission_inode(expected, ino).await?;
+                let (inode, access, _, control) =
+                    self.permission_inode_for_check(expected, ino).await?;
                 if inode.kind != file_type_code(FileType::Dir) {
                     return Err(MetaError::NotDirectory(ino));
                 }
@@ -948,7 +950,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             && actor.uid != directory.uid
             && let Some(child) = child
         {
-            let (inode, _, _, _) = self.permission_inode(expected, child).await?;
+            let (inode, _, _, _) = self.permission_inode_for_check(expected, child).await?;
             if actor.uid != inode.uid {
                 return Err(MetaError::Io(std::io::Error::from_raw_os_error(
                     libc::EPERM,
@@ -999,6 +1001,44 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             0
         };
         Ok((inode.mode >> shift) & requested == requested)
+    }
+
+    /// For a read-only permission decision inside a conditional mutation.
+    /// While the exclusive lease is proven held, the cached permission rows
+    /// of `ino` are exactly the store's (every local commit invalidates the
+    /// rows it writes), so they answer the decision without a round trip;
+    /// the mutation's own CAS still checks its layer version. Otherwise this
+    /// is `permission_inode`. Never use it for rows the commit writes back.
+    async fn permission_inode_for_check(
+        &self,
+        expected: &[LayerRecord; 2],
+        ino: i64,
+    ) -> Result<PermissionInode, MetaError> {
+        if self.lease_validity.is_some()
+            && let Some(cache) = self.upper_row_cache()
+            && let Some(row_cache::RowValue::Permission(snapshot)) =
+                cache.get(&row_cache::RowKey::Permission(ino))
+            && snapshot.layers[0].layer_id == expected[0].layer_id
+            && snapshot.layers[1].layer_id == expected[1].layer_id
+            && self.row_caches_authoritative()
+        {
+            return Self::decode_permission_inode((*snapshot).clone(), ino);
+        }
+        let ticket = self.upper_row_cache().map(row_cache::UpperRowCache::ticket);
+        let snapshot = self.permission_snapshot(vec![ino], None).await?;
+        if &snapshot.layers != expected {
+            return Err(workspace_to_meta(WorkspaceError::Busy));
+        }
+        if self.lease_validity.is_some()
+            && let (Some(cache), Some(ticket)) = (self.upper_row_cache(), ticket)
+        {
+            cache.insert(
+                ticket,
+                row_cache::RowKey::Permission(ino),
+                row_cache::RowValue::Permission(Arc::new(snapshot.clone())),
+            );
+        }
+        Self::decode_permission_inode(snapshot, ino)
     }
 
     async fn permission_inode(
