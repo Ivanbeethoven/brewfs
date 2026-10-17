@@ -761,6 +761,63 @@ pub(crate) fn created_inode_open_authorizes(ino: i64) -> bool {
         .unwrap_or(false)
 }
 
+/// The current request's scoped credentials and authorities, moved out so a
+/// task that executes this same request (for example a cancellation-safe
+/// driver spawned to finish it) can re-enter them. The created-inode
+/// authority is taken, not copied, so it stays exactly-once.
+pub(crate) struct RequestScope {
+    actor: Option<NamespaceActor>,
+    access_mask: Option<u32>,
+    setattr_write_handle: Option<i64>,
+    created_inode: Option<i64>,
+}
+
+pub(crate) fn capture_request_scope() -> RequestScope {
+    RequestScope {
+        actor: namespace_actor(),
+        access_mask: open_access_mask(),
+        setattr_write_handle: SETATTR_WRITE_HANDLE.try_with(|ino| *ino).ok(),
+        created_inode: CREATED_INODE_OPEN
+            .try_with(|created| created.take())
+            .ok()
+            .flatten(),
+    }
+}
+
+impl RequestScope {
+    pub(crate) async fn scope<F: std::future::Future>(self, operation: F) -> F::Output {
+        let Self {
+            actor,
+            access_mask,
+            setattr_write_handle,
+            created_inode,
+        } = self;
+        let operation = async move {
+            match created_inode {
+                Some(ino) => {
+                    CREATED_INODE_OPEN
+                        .scope(std::cell::Cell::new(Some(ino)), operation)
+                        .await
+                }
+                None => operation.await,
+            }
+        };
+        let operation = async move {
+            match setattr_write_handle {
+                Some(ino) => SETATTR_WRITE_HANDLE.scope(ino, operation).await,
+                None => operation.await,
+            }
+        };
+        let operation = async move {
+            match access_mask {
+                Some(mask) => OPEN_ACCESS_MASK.scope(mask, operation).await,
+                None => operation.await,
+            }
+        };
+        scope_namespace_actor(actor, operation).await
+    }
+}
+
 /// Consume the creation authority exactly once for the matching inode.
 pub(crate) fn take_created_inode_open_authority(ino: i64) -> bool {
     CREATED_INODE_OPEN
@@ -773,4 +830,49 @@ pub(crate) fn take_created_inode_open_authority(ino: i64) -> bool {
             }
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod request_scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn spawned_driver_keeps_request_scope_and_created_authority_stays_once() {
+        let actor = NamespaceActor {
+            uid: 1234,
+            gid: 5678,
+            groups: vec![9],
+        };
+        scope_open_actor(
+            Some(actor),
+            2,
+            scope_setattr_write_handle(
+                77,
+                true,
+                scope_created_inode_open(88, true, async {
+                    let request = capture_request_scope();
+                    // Taken, not copied: the original task no longer holds it.
+                    assert!(!created_inode_open_authorizes(88));
+                    tokio::spawn(request.scope(async {
+                        assert_eq!(namespace_actor().unwrap().uid, 1234);
+                        assert_eq!(open_access_mask(), Some(2));
+                        assert!(setattr_write_handle_authorizes(77));
+                        assert!(take_created_inode_open_authority(88));
+                        assert!(!take_created_inode_open_authority(88));
+                    }))
+                    .await
+                    .unwrap();
+                }),
+            ),
+        )
+        .await;
+        // Outside any request, a captured scope is empty.
+        tokio::spawn(capture_request_scope().scope(async {
+            assert!(namespace_actor().is_none());
+            assert!(open_access_mask().is_none());
+            assert!(!take_created_inode_open_authority(88));
+        }))
+        .await
+        .unwrap();
+    }
 }

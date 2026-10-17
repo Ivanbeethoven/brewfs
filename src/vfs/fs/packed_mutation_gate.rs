@@ -178,10 +178,14 @@ impl MutationDriver {
     {
         let (sender, receiver) = oneshot::channel();
         let gate = self.gate.clone();
+        // The driver executes this same request, so it carries the request's
+        // scoped actor, access mask and one-shot authorities; a bare spawn
+        // would silently drop them.
+        let request = crate::meta::layer::capture_request_scope();
         // Dropping receiver never cancels this driver or releases its owner.
         tokio::spawn(MUTATION_OWNER.scope(gate, async move {
             let mut owner = self;
-            let result = future.await;
+            let result = request.scope(future).await;
             owner.terminal = true;
             let _ = sender.send(result);
         }));
