@@ -628,3 +628,23 @@ Redis 往返/操作：readback 28.1 → 16.1，mixed 15.7 → 7.3；readback p99
 - 16 worker 交替顺序对照（hot24→hot26、hot26→hot24，4 组均 30/30 通过）：stat 2442→2467、full 416→404、write 310→313、readback 960→931、mixed 718→695，均在 ±3% 噪声内（证据 `ovn-hot{24,26}-r21p{a,b}`）。
 
 结论：吞吐持平，但修复了 packed 挂载上元数据层身份/权限复查被静默跳过的问题，合入。下一步：`check_namespace_actor` 的父目录与祖先权限快照可以复用第 9/18 轮的租约绑定 Permission 行缓存（它们是只读决策，CAS 仍校验层版本），预计可抵消新增的约 3 次 MGET。
+
+## 2026-10-17 overlay 第 22 轮：actor 父目录/祖先权限复查使用租约绑定的 Permission 缓存
+
+第 21 轮修复请求身份后，元数据层在 create/link/unlink/rename 的条件版本内真正执行 actor 的父目录与祖先权限复查，每文件多约 3 次 10-key 权限快照读。这些是只读决策，提交自身的 CAS 仍校验层版本。
+
+改动：`permission_inode_for_check` —— 租约可证明且层 id 与预期一致时，直接用 `RowKey::Permission` 缓存行（本挂载每次提交在提交前后都会失效其写入 inode 的 Permission 键）；否则读存储并在租约绑定时回填缓存。只用于 `check_namespace_actor` 的父目录、祖先与粘滞位子项检查；create 写回的父目录行仍取新鲜快照。
+
+测试：`lease_proven_actor_checks_reuse_cached_parent_permissions_but_see_chmod`（非 root actor 在可写目录中连续 create；缓存生效时一致读次数少于撤销租约证明后；缓存生效期间 chmod 0755 后下一次 create 立即被拒）。
+
+结果（16 worker 交替顺序对照 hot26↔hot27，4 组均 30/30 通过，6 次合并中位数；`ovn-hot{26,27}-r22p{a,b}`）：
+
+| mode | native | overlay hot26 | overlay hot27 | 变化 | ratio |
+|---|---|---|---|---|---|
+| stat | 3098 | 2331 | 2319 | 持平 | 0.75 |
+| full | 774 | 406 | 391 | −3.6%（噪声） | 0.51 |
+| write | 624 | 302 | 338 | +12% | 0.49 → 0.54 |
+| readback | 1194 | 882 | 888 | 持平 | 0.74 |
+| mixed | 977 | 648 | 706 | +9% | 0.67 → 0.72 |
+
+write 每操作 Redis 往返 18.3 → 15.8，mixed 7.5 → 6.6；write p99 74.0 → 63.6 ms。门禁：1178 workspace 通过；overlay 套件 1089 通过 / 4 既有失败。
