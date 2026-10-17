@@ -99,6 +99,15 @@ impl CommitViewCache {
 
 const SLICE_DELETION_KEY_PREFIX: &[u8] = b"packed/v3/native-slice-delete/";
 
+/// `view_keys` positions a cached (sole-writer) commit still compares: the
+/// workspace, head, lease, writer-authority and open records, plus CONTROL
+/// (a schema migration needs no lease). The lower layer, PWB current/claim/
+/// history and recovery rows change only through paths that must hold this
+/// workspace's single live lease; while the lease row is byte-identical and
+/// live (both checked here, the deadline at the CAS), none of them ran. Any
+/// change to a kept row fails the CAS and the retry re-reads and checks all.
+const CACHED_VIEW_CHECKS: [usize; 6] = [0, 1, 3, 8, 9, 11];
+
 /// Derived keys whose final checked bytes the next commit may reuse.
 fn cacheable_derived_key(key: &[u8], head: LayerId) -> bool {
     key == super::native_slice_deletion::EXTENT_GENERATION_KEY
@@ -439,6 +448,13 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                 None
             };
             let from_cache = cached.is_some();
+            // Derived bytes this writer committed earlier (create commits
+            // carry reverse state, extent commits the extent generation);
+            // keep them across commits of the other kind.
+            let mut carried = cached
+                .as_ref()
+                .map(|cache| cache.derived.clone())
+                .unwrap_or_default();
             let (view, prefetched) = match cached {
                 // No pre-read: the cached post-commit bytes are the CAS
                 // conditions, including the derived points.
@@ -506,8 +522,15 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             if count != 0 {
                 writes.push(put(keys[1].clone(), &head)?);
             }
-            let mut checks = view.checks;
-            let view_checks = checks.clone();
+            let view_checks = view.checks.clone();
+            let mut checks = if from_cache {
+                CACHED_VIEW_CHECKS
+                    .iter()
+                    .map(|index| view.checks[*index].clone())
+                    .collect()
+            } else {
+                view.checks
+            };
             let derived = async {
                 let reverse = self
                     .prepare_native_reverse_cas(&mut checks, &mut writes)
@@ -527,11 +550,14 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                 Err(WorkspaceError::Busy) if from_cache => continue,
                 Err(error) => return Err(error),
             };
-            let derived_checks: std::collections::BTreeMap<_, _> = checks
-                .iter()
-                .filter(|check| cacheable_derived_key(&check.key, head.layer_id))
-                .map(|check| (check.key.clone(), check.expected.clone()))
-                .collect();
+            carried.retain(|key, _| cacheable_derived_key(key, head.layer_id));
+            carried.extend(
+                checks
+                    .iter()
+                    .filter(|check| cacheable_derived_key(&check.key, head.layer_id))
+                    .map(|check| (check.key.clone(), check.expected.clone())),
+            );
+            let derived_checks = carried;
             // All primary and derived entries use the original packet budget.
             if checks
                 .len()

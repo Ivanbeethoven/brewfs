@@ -679,12 +679,38 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
 
     async fn resolve_inode_delta(&self, ino: i64) -> Result<Option<InodeDelta>, MetaError> {
         if self.packed_lower().is_some() {
-            let snapshot = self.permission_snapshot(vec![ino], None).await?;
+            let snapshot = self.cached_permission_snapshot(ino).await?;
             return Ok(resolve_inode(&snapshot.layers, &snapshot.inodes, ino)
                 .map_err(workspace_to_meta)?
                 .map(|value| value.inode));
         }
         Ok(self.resolve_inode_delta_state(ino).await?.into_option())
+    }
+
+    /// One inode's permission snapshot. While the exclusive lease is proven
+    /// held the lease-bound row cache answers it: this mount is the only
+    /// upper writer and every commit drops the `Permission` key of each inode
+    /// it writes (before and after). A mutation built on it still CASes the
+    /// head version it read, so a stale entry can only fail that CAS.
+    async fn cached_permission_snapshot(&self, ino: i64) -> Result<PermissionSnapshot, MetaError> {
+        let lease_bound = self.lease_validity.is_some() && self.row_caches_authoritative();
+        let cache = self.upper_row_cache().filter(|_| lease_bound);
+        let key = row_cache::RowKey::Permission(ino);
+        if let Some(row_cache::RowValue::Permission(snapshot)) =
+            cache.and_then(|cache| cache.get(&key))
+        {
+            return Ok((*snapshot).clone());
+        }
+        let ticket = cache.map(row_cache::UpperRowCache::ticket);
+        let snapshot = self.permission_snapshot(vec![ino], None).await?;
+        if let (Some(cache), Some(ticket)) = (cache, ticket) {
+            cache.insert(
+                ticket,
+                key,
+                row_cache::RowValue::Permission(Arc::new(snapshot.clone())),
+            );
+        }
+        Ok(snapshot)
     }
 
     async fn resolve_dentry_entry(
