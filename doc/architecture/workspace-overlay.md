@@ -258,6 +258,25 @@ There is no `workspace snapshot`, `workspace commit` or `fork <workspace-uuid>`:
 each of those sealed a live workspace. Named snapshots pin an existing immutable
 revision (packed publication) and are managed by the operator.
 
+## Measured performance and remaining gaps (2026-10-17)
+
+Small-file overlay vs native files/s, 16 workers, Redis + RustFS, arms
+alternated, 6 runs pooled, after PR #30 (`tools/perf/run_overlay_vs_native.sh`):
+
+| Mode | Overlay/native |
+| --- | ---: |
+| stat | 0.75 |
+| full read | 0.57 |
+| write | 0.55 |
+| readback | 0.81 |
+| mixed | 0.80 |
+
+The 32-worker rw run had 0 errors. Write is the largest gap: about three
+commits per file (create, fsync, close), each a server-side Lua CAS. The
+candidate next step, merging the create and first-fsync commits for a newly
+created inode, is not started. Details and the resume procedure are in the
+[2026-10-17 handoff](../superpowers/plans/2026-10-17-overlay-no-seal-handoff.md).
+
 ## Code map
 
 - `src/workspace_overlay/meta_layer/`: POSIX-facing workspace metadata layer;
