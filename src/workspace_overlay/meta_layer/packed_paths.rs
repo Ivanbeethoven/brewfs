@@ -142,42 +142,12 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                 }
             }
         }
-        if lower.strict() {
-            // Strict mode re-validates the binding before every lower page.
-            let mut after = None;
-            loop {
-                limits.page()?;
-                self.validate_packed_metadata(lower).await?;
-                let page = lower
-                    .metadata
-                    .frozen_reverse_names_page_owned(inode, after.as_deref())
-                    .await?;
-                if page.rows.is_empty() {
-                    break;
-                }
-                if page
-                    .after
-                    .as_ref()
-                    .is_none_or(|next| after.as_ref().is_some_and(|old| next <= old))
-                {
-                    return Err(MetaError::Internal(
-                        "packed reverse cursor did not advance".into(),
-                    ));
-                }
-                for (parent, name) in &page.rows {
-                    limits.work()?;
-                    candidates.insert((*parent, name.clone()));
-                }
-                after = page.after.clone();
-            }
-        } else {
-            // Frozen: the immutable lower's complete alias list is memoized
-            // for the binding lifetime; page limits apply on the first load.
-            let lower_aliases = lower.reverse_aliases(inode, || limits.page()).await?;
-            for (parent, name) in lower_aliases.iter() {
-                limits.work()?;
-                candidates.insert((*parent, name.clone()));
-            }
+        // The immutable lower's complete alias list is memoized
+        // for the binding lifetime; page limits apply on the first load.
+        let lower_aliases = lower.reverse_aliases(inode, || limits.page()).await?;
+        for (parent, name) in lower_aliases.iter() {
+            limits.work()?;
+            candidates.insert((*parent, name.clone()));
         }
         let mut effective = Vec::new();
         for (parent, name) in candidates {

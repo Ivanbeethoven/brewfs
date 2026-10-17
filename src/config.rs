@@ -411,24 +411,18 @@ pub enum WorkspaceCommand {
     InitNative,
     /// Migrate an existing workspace catalog to the current entity format.
     Migrate,
-    /// Create a workspace from an exact sealed revision.
+    /// Create a workspace overlay on an exact immutable revision.
     Create {
         #[arg(long = "from", value_name = "REVISION")]
         revision: Option<crate::workspace_overlay::model::BaseRevision>,
         #[arg(long)]
         owner: Option<String>,
     },
-    /// Seal a workspace and create a named snapshot root.
-    Snapshot {
-        workspace: crate::workspace_overlay::ids::WorkspaceId,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long)]
-        owner: Option<String>,
-    },
-    /// Fork one or more workspaces from a workspace UUID or exact revision.
+    /// Fork one or more workspace overlays from an exact immutable revision.
+    /// A live workspace is never sealed to produce one.
     Fork {
-        source: String,
+        #[arg(value_name = "REVISION")]
+        source: crate::workspace_overlay::model::BaseRevision,
         #[arg(long, default_value_t = 1)]
         count: usize,
         #[arg(long)]
@@ -436,7 +430,7 @@ pub enum WorkspaceCommand {
     },
     /// List workspaces.
     List,
-    /// Inspect one workspace and its active lease/seal state.
+    /// Inspect one workspace and its active lease state.
     Inspect {
         workspace: crate::workspace_overlay::ids::WorkspaceId,
     },
@@ -453,12 +447,6 @@ pub enum WorkspaceCommand {
         workspace: crate::workspace_overlay::ids::WorkspaceId,
         #[arg(long)]
         force: bool,
-    },
-    /// Seal and fast-forward a target workspace if its base is unchanged.
-    Commit {
-        workspace: crate::workspace_overlay::ids::WorkspaceId,
-        #[arg(long = "to")]
-        target: crate::workspace_overlay::ids::WorkspaceId,
     },
 }
 

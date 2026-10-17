@@ -372,39 +372,6 @@ async fn native_slice_orphan_unknown_reply_commits_one_complete_packet_without_r
 }
 
 #[tokio::test]
-async fn native_slice_public_compaction_rejects_reserved_sid_and_preserves_topology() {
-    let (backend, store, budget) = catalog().await;
-    orphan(&store, layer(141), 251).await.unwrap();
-    store
-        .reserve_gc_slice_deletion(251, 6, &[layer(141)])
-        .await
-        .unwrap();
-    let workspace = store
-        .load_workspace(WorkspaceId::from_uuid(Uuid::from_u128(32)))
-        .await
-        .unwrap();
-    let before = backend.rows.lock().await.clone();
-    let used = budget.state().used;
-    let result = store
-        .install_compaction(InstallCompaction {
-            workspace_id: workspace.workspace_id,
-            expected_head_layer_id: workspace.head_layer_id,
-            expected_head_epoch: workspace.head_epoch,
-            expected_parent_layer_id: layer(33),
-            compacted_layer_id: layer(142),
-            replacement_head_layer_id: layer(143),
-            delta: crate::workspace_overlay::digest::CanonicalLayerDelta {
-                extents: vec![extent(layer(142), 9, 251)],
-                ..Default::default()
-            },
-        })
-        .await;
-    assert!(matches!(result, Err(WorkspaceError::Busy)));
-    assert_eq!(*backend.rows.lock().await, before);
-    assert_eq!(budget.state().used, used);
-}
-
-#[tokio::test]
 async fn native_slice_public_packed_mutation_rejects_reserved_sid_and_preserves_sequences() {
     let backend = Arc::new(JournalMemoryBackend::at_time(100));
     let budget = V3MountBudget::defaults();

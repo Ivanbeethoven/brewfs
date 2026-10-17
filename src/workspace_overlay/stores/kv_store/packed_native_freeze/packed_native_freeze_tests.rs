@@ -415,31 +415,6 @@ async fn packed_native_quiesce_lease_expiry_is_checked_at_locked_backend_validat
 }
 
 #[tokio::test]
-async fn packed_native_public_phase_flag_does_not_upgrade_quiesce_into_drain_proof() {
-    let (store, _backend, guard, layers, budget) = fixture().await;
-    let journal = JournalId::new();
-    let fence = store
-        .clone()
-        .begin_packed_native_quiesce(guard, layers, journal, LayerId::new(), budget)
-        .await
-        .unwrap();
-    store
-        .advance_seal(AdvanceSeal {
-            journal_id: journal,
-            expected_phase: SealPhase::Quiesced,
-            next_phase: SealPhase::DataDrained,
-            pending_bytes: Some(0),
-            last_error: None,
-        })
-        .await
-        .unwrap();
-    assert!(matches!(
-        fence.validate().await,
-        Err(WorkspaceError::Fenced)
-    ));
-}
-
-#[tokio::test]
 async fn packed_native_begin_rejects_oversized_control_before_any_catalog_change() {
     let (store, backend, guard, layers, budget) = fixture().await;
     {

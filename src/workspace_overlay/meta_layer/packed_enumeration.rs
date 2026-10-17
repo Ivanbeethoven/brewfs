@@ -41,15 +41,8 @@ struct EnumerationView<W> {
 }
 impl<W: WorkspaceStore + 'static> EnumerationView<W> {
     async fn validate(&self) -> Result<(), MetaError> {
-        // Frozen base skips binding authentication. The writable head/lease
-        // fence (one MGET per page) still detects same-epoch upper mutation.
-        if self.lower.strict() {
-            self.lower
-                .authority
-                .validate(&self.guard, &self.lower.binding)
-                .await
-                .map_err(workspace_to_meta)?;
-        }
+        // The immutable lower needs no binding authentication. The writable
+        // head/lease fence (one MGET per page) detects same-epoch upper mutation.
         self.store
             .validate_read_fence(self.guard.clone(), self.layers.clone())
             .await
@@ -445,13 +438,6 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                 let (guard, layers, _) = fence
                     .as_ref()
                     .ok_or_else(|| MetaError::Internal("packed xattrs missing fence".into()))?;
-                if lower.strict() {
-                    lower
-                        .authority
-                        .validate(guard, &lower.binding)
-                        .await
-                        .map_err(workspace_to_meta)?;
-                }
                 self.store
                     .validate_read_fence(guard.clone(), layers.clone())
                     .await

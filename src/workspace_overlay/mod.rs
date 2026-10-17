@@ -7,7 +7,6 @@ pub mod cache;
 pub mod cache_scope;
 pub mod catalog;
 // Packed-v2 clustered snapshots are retired; packed-v3 is the only packed format.
-pub mod compaction;
 pub mod control;
 pub mod digest;
 pub mod error;
@@ -19,6 +18,8 @@ pub mod metrics;
 pub mod model;
 pub mod packed_reader_lifecycle;
 pub mod packed_shutdown;
+#[cfg(test)]
+pub(crate) mod test_base_fixture;
 pub use stores::kv_store::packed_admin;
 pub mod packed_v3;
 pub mod publish;

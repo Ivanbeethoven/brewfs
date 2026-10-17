@@ -26,48 +26,35 @@ impl std::ops::Deref for MutationVersion {
 
 impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
     pub(super) async fn retain_mutation_version(&self) -> Result<MutationVersion, MetaError> {
-        let (permit, reader) = if let Some(lower) = self.packed_lower() {
+        if let Some(lower) = self.packed_lower() {
             if !self.store.supports_packed_permissions() {
                 return Err(MetaError::NotSupported(
                     "conditional packed permission store".into(),
                 ));
             }
-            if !lower.strict() {
-                // Frozen base: the mutation's own CAS re-authenticates the
-                // binding, head and lease against these exact layers, so only
-                // the current layer pair (fresh head, immutable base) is needed.
-                // The commit admits its own bounded row/packet budget.
-                let permit = lower
-                    .budget
-                    .admit(&[(V3BudgetPool::Metadata, FROZEN_SNAPSHOT_BYTES)])
-                    .map_err(packed_lower::budget_to_meta)?;
-                let layers = self.frozen_layer_pair(lower).await?;
-                return Ok(MutationVersion {
-                    layers,
-                    _permit: Some(permit),
-                    _reader: None,
-                });
-            }
+            // Immutable lower: the mutation's own CAS re-authenticates the
+            // binding, head and lease against these exact layers, so only
+            // the current layer pair (fresh head, immutable base) is needed.
+            // The commit admits its own bounded row/packet budget.
             let permit = lower
                 .budget
-                .admit(&[(V3BudgetPool::Metadata, OPERATION_BYTES)])
+                .admit(&[(V3BudgetPool::Metadata, FROZEN_SNAPSHOT_BYTES)])
                 .map_err(packed_lower::budget_to_meta)?;
-            let reader = lower
-                .authority
-                .retain_reader_request()
-                .map_err(workspace_to_meta)?;
-            (Some(permit), reader)
-        } else {
-            (None, None)
-        };
+            let layers = self.frozen_layer_pair(lower).await?;
+            return Ok(MutationVersion {
+                layers,
+                _permit: Some(permit),
+                _reader: None,
+            });
+        }
         let layers = self
             .permission_snapshot(vec![self.root_ino()], None)
             .await?
             .layers;
         Ok(MutationVersion {
             layers,
-            _permit: permit,
-            _reader: reader,
+            _permit: None,
+            _reader: None,
         })
     }
 
@@ -103,26 +90,10 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         inodes: Vec<i64>,
         dentry: Option<(i64, Vec<u8>)>,
     ) -> Result<PermissionSnapshot, MetaError> {
-        let strict = lower.strict();
         let _permit = lower
             .budget
-            .admit(&[(
-                V3BudgetPool::Metadata,
-                if strict {
-                    OPERATION_BYTES
-                } else {
-                    FROZEN_SNAPSHOT_BYTES
-                },
-            )])
+            .admit(&[(V3BudgetPool::Metadata, FROZEN_SNAPSHOT_BYTES)])
             .map_err(packed_lower::budget_to_meta)?;
-        let _reader = if strict {
-            lower
-                .authority
-                .retain_reader_request()
-                .map_err(workspace_to_meta)?
-        } else {
-            None
-        };
         let guard = self.guard().await;
         let chain = self.chain().await?;
         validate_fixed_layer_pair(&chain).map_err(workspace_to_meta)?;
@@ -134,31 +105,18 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         if [chain[0].layer_id, chain[1].layer_id] != query.layer_ids {
             return Err(workspace_to_meta(WorkspaceError::Fenced));
         }
-        if let Some(reader) = lower.authority.reader_session() {
-            if reader.binding() != &lower.binding {
-                return Err(workspace_to_meta(WorkspaceError::Fenced));
-            }
-            if strict {
-                reader.validate().await.map_err(workspace_to_meta)?;
-            }
+        if let Some(reader) = lower.authority.reader_session()
+            && reader.binding() != &lower.binding
+        {
+            return Err(workspace_to_meta(WorkspaceError::Fenced));
         }
-        let before = if strict {
-            self.store
-                .read_packed_permission_snapshot(
-                    guard.clone(),
-                    lower.binding.clone(),
-                    query.clone(),
-                )
-                .await
-                .map_err(workspace_to_meta)?
-        } else {
-            // Frozen base: one atomic native row read. Every mutation built on
-            // these layers re-authenticates binding, head and lease in its CAS.
-            self.store
-                .read_permission_snapshot(query.clone())
-                .await
-                .map_err(workspace_to_meta)?
-        };
+        // One atomic native row read. Every mutation built on these layers
+        // re-authenticates binding, head and lease in its CAS.
+        let before = self
+            .store
+            .read_permission_snapshot(query.clone())
+            .await
+            .map_err(workspace_to_meta)?;
         let mut merged = before.clone();
         for ino in inodes {
             let state = resolve_inode_state(&before.layers, &before.inodes, ino)
@@ -167,8 +125,8 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                 continue;
             }
             let needs_inode = matches!(state, Resolution::Absent);
-            // Immutable lower inputs come from binding-lifetime memos in
-            // frozen mode; the same conditions as before decide what is read.
+            // Immutable lower inputs come from binding-lifetime memos; the
+            // same conditions as before decide what is read.
             let hot = if needs_inode {
                 lower.inode_hot(ino).await?
             } else {
@@ -251,23 +209,6 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                     }
                 }
             }
-        }
-        if !strict {
-            return Ok(merged);
-        }
-        // Re-read the same native rows/PWB/guard after actual authenticated
-        // lower I/O. Every later mutation checks this unchanged layer version
-        // and current PWB again in its actual timed CAS.
-        let after = self
-            .store
-            .read_packed_permission_snapshot(guard, lower.binding.clone(), query)
-            .await
-            .map_err(workspace_to_meta)?;
-        if after != before {
-            return Err(workspace_to_meta(WorkspaceError::Busy));
-        }
-        if let Some(reader) = lower.authority.reader_session() {
-            reader.validate().await.map_err(workspace_to_meta)?;
         }
         Ok(merged)
     }

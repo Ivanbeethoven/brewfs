@@ -10,7 +10,6 @@ use crate::workspace_overlay::catalog::*;
 use crate::workspace_overlay::error::WorkspaceError;
 use crate::workspace_overlay::gc::WorkspaceGc;
 use crate::workspace_overlay::ids::{LeaseId, WorkspaceId};
-use crate::workspace_overlay::lifecycle::{NoopDurableRemoteBarrier, WorkspaceLifecycle};
 use crate::workspace_overlay::meta_layer::WorkspaceMetaLayer;
 use crate::workspace_overlay::model::*;
 
@@ -189,10 +188,6 @@ pub(super) async fn build_shared_base<W: WorkspaceStore + 'static>(
     )
     .await
     .unwrap();
-    let sealed = WorkspaceLifecycle::new(store.clone())
-        .seal(&view, &NoopDurableRemoteBarrier)
-        .await
-        .unwrap();
     store
         .release_lease(ReleaseLease {
             lease_id: lease.lease_id,
@@ -200,6 +195,11 @@ pub(super) async fn build_shared_base<W: WorkspaceStore + 'static>(
         })
         .await
         .unwrap();
+    let sealed = crate::workspace_overlay::test_base_fixture::install_test_base(
+        &store,
+        workspace.workspace_id,
+    )
+    .await;
     store
         .mark_workspace_deleting(MarkDeleting {
             workspace_id: workspace.workspace_id,

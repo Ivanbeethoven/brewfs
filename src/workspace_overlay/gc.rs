@@ -250,8 +250,7 @@ mod tests {
     use crate::workspace_overlay::catalog::{CreateVolumeRoot, RecordOrphanSlice, WorkspaceStore};
     use crate::workspace_overlay::ids::{LayerId, WorkspaceId};
     use crate::workspace_overlay::lifecycle::{
-        DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LEASE_TTL, NoopDurableRemoteBarrier,
-        WorkspaceLifecycle, WorkspaceMountSession,
+        DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LEASE_TTL, WorkspaceLifecycle, WorkspaceMountSession,
     };
     use crate::workspace_overlay::meta_layer::WorkspaceMetaLayer;
     use crate::workspace_overlay::stores::database::SqliteWorkspaceStore;
@@ -402,16 +401,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let sealed = lifecycle
-            .seal(&session.view, &NoopDurableRemoteBarrier)
-            .await
-            .unwrap();
+        let source_workspace_id = session.view.workspace_id;
+        session.release().await.unwrap();
+        let sealed = crate::workspace_overlay::test_base_fixture::install_test_base(
+            &store,
+            source_workspace_id,
+        )
+        .await;
         lifecycle
             .fork_revision(sealed.revision, 1, None)
             .await
             .unwrap();
-        let source_workspace_id = session.view.workspace_id;
-        session.release().await.unwrap();
         lifecycle.discard(source_workspace_id, false).await.unwrap();
         let gc = WorkspaceGc::new(
             store,

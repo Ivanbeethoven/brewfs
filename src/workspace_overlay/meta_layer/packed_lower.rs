@@ -239,23 +239,16 @@ pub(crate) struct WorkspacePackedLower {
     pub authority: Arc<dyn WorkspacePackedBindingAuthority>,
     pub upper: Arc<dyn UnifiedReadSourceFetcher>,
     pub budget: Arc<V3MountBudget>,
-    /// The packed lower is a frozen immutable base authenticated once when the
-    /// mount attaches it. Per-operation reads then skip re-authenticating the
-    /// binding, reader pin and head/lease fence; the writable head is still
-    /// checked by every mutation CAS and the lease by its heartbeat. Strict
-    /// mode re-validates around every lower read and is opt-in.
-    pub(super) frozen: bool,
     /// Caps concurrent 16 MiB reverse-path walks so they cannot exhaust the
     /// Metadata pool that ordinary FUSE requests also charge.
     pub(super) path_walks: tokio::sync::Semaphore,
-    /// Frozen mode only: the immutable lower's per-inode hot attributes and
-    /// cold permission inputs, resolved once and kept for the life of this
+    /// The immutable lower's per-inode hot attributes and cold permission
+    /// inputs, resolved once and kept for the life of this
     /// binding. No expiry and no re-validation: the snapshot cannot change
     /// while bound. Upper rows still shadow these on every read.
     pub(super) inode_hot_memo: moka::sync::Cache<i64, Option<Arc<LowerInodeHot>>>,
     pub(super) inode_cold_memo: moka::sync::Cache<i64, Option<Arc<LowerInodeCold>>>,
-    /// Frozen mode only: the lower's authenticated reverse (parent, name)
-    /// aliases of an inode, complete across pages, for the binding lifetime.
+    /// The lower's authenticated reverse (parent, name) aliases of an inode, complete across pages, for the binding lifetime.
     pub(super) reverse_names: moka::sync::Cache<i64, LowerAliases>,
     upper_identity: usize,
     upper_layout: ChunkLayout,
@@ -290,16 +283,13 @@ const PERMISSION_XATTRS: [&[u8]; 3] = [
 ];
 
 impl WorkspacePackedLower {
-    /// The lower inode's hot attributes (None: no such lower inode).
-    /// Frozen: memoized for the binding lifetime. Strict: always read through
-    /// the authenticated snapshot so every operation observes revalidation.
+    /// The lower inode's hot attributes (None: no such lower inode),
+    /// memoized for the binding lifetime.
     pub(super) async fn inode_hot(
         &self,
         ino: i64,
     ) -> Result<Option<Arc<LowerInodeHot>>, MetaError> {
-        if self.frozen
-            && let Some(found) = self.inode_hot_memo.get(&ino)
-        {
+        if let Some(found) = self.inode_hot_memo.get(&ino) {
             return Ok(found);
         }
         let loaded = self
@@ -312,21 +302,17 @@ impl WorkspacePackedLower {
                     parent_hint: hot.parent_hint,
                 })
             });
-        if self.frozen {
-            self.inode_hot_memo.insert(ino, loaded.clone());
-        }
+        self.inode_hot_memo.insert(ino, loaded.clone());
         Ok(loaded)
     }
 
-    /// The lower inode's cold permission inputs (None: no cold record).
-    /// Frozen: memoized for the binding lifetime. Strict: always fresh.
+    /// The lower inode's cold permission inputs (None: no cold record),
+    /// memoized for the binding lifetime.
     pub(super) async fn inode_cold(
         &self,
         ino: i64,
     ) -> Result<Option<Arc<LowerInodeCold>>, MetaError> {
-        if self.frozen
-            && let Some(found) = self.inode_cold_memo.get(&ino)
-        {
+        if let Some(found) = self.inode_cold_memo.get(&ino) {
             return Ok(found);
         }
         let loaded = self
@@ -344,22 +330,18 @@ impl WorkspacePackedLower {
                         .collect(),
                 })
             });
-        if self.frozen {
-            self.inode_cold_memo.insert(ino, loaded.clone());
-        }
+        self.inode_cold_memo.insert(ino, loaded.clone());
         Ok(loaded)
     }
 
-    /// The lower's complete reverse aliases of `ino`. Frozen: memoized for the
-    /// binding lifetime (only a complete walk is stored). Strict: fresh.
+    /// The lower's complete reverse aliases of `ino`, memoized for the binding
+    /// lifetime (only a complete walk is stored).
     pub(super) async fn reverse_aliases(
         &self,
         ino: i64,
         mut page: impl FnMut() -> Result<(), MetaError>,
     ) -> Result<LowerAliases, MetaError> {
-        if self.frozen
-            && let Some(found) = self.reverse_names.get(&ino)
-        {
+        if let Some(found) = self.reverse_names.get(&ino) {
             return Ok(found);
         }
         let mut rows = Vec::new();
@@ -386,9 +368,7 @@ impl WorkspacePackedLower {
             after = next.after.clone();
         }
         let rows = Arc::new(rows);
-        if self.frozen {
-            self.reverse_names.insert(ino, rows.clone());
-        }
+        self.reverse_names.insert(ino, rows.clone());
         Ok(rows)
     }
 }
@@ -429,7 +409,6 @@ impl WorkspacePackedLower {
             binding,
             metadata,
             authority,
-            frozen: true,
             path_walks: tokio::sync::Semaphore::new(MAX_CONCURRENT_PATH_WALKS),
             inode_hot_memo: moka::sync::Cache::builder()
                 .weigher(|_, _| 192)
@@ -466,11 +445,6 @@ impl WorkspacePackedLower {
         }))
     }
 
-    /// True when reads must re-authenticate the binding/fence per operation.
-    pub(crate) fn strict(&self) -> bool {
-        !self.frozen
-    }
-
     pub(super) fn begin_operation(&self, requested: u64) -> Option<TerminalGuard> {
         self.metadata.begin_unified_read_operation(requested)
     }
@@ -490,62 +464,26 @@ async fn capture_read_fence<W: WorkspaceStore + 'static>(
     [LayerRecord; 2],
     Option<crate::workspace_overlay::packed_reader_lifecycle::PackedReaderRequestOwner>,
 )> {
-    if !lower.strict() {
-        // Frozen base: the sealed base record is the mount's cached one. Only
-        // the writable head is read fresh, because same-epoch upper writes
-        // advance its sequence; the head/lease fence runs in ensure_current.
-        let guard = meta.guard().await;
-        let cached: [LayerRecord; 2] = meta
-            .chain()
-            .await?
-            .try_into()
-            .map_err(|_| read_workspace_error(WorkspaceError::Fenced))?;
-        let head = meta
-            .store
-            .load_layer(guard.expected_head_layer_id)
-            .await
-            .map_err(read_workspace_error)?;
-        let layers = [head, cached[1].clone()];
-        if layers[1].layer_id != lower.binding.base_layer_id {
-            return Err(WorkspaceError::Fenced.into());
-        }
-        validate_fixed_layer_pair(&layers).map_err(read_workspace_error)?;
-        return Ok((guard, layers, None));
-    }
-    let owner = lower
-        .authority
-        .retain_reader_request()
-        .map_err(read_workspace_error)?;
+    // Immutable lower: the base record is the mount's cached one. Only
+    // the writable head is read fresh, because same-epoch upper writes
+    // advance its sequence; the head/lease fence runs in ensure_current.
     let guard = meta.guard().await;
-    lower
-        .authority
-        .validate(&guard, &lower.binding)
+    let cached: [LayerRecord; 2] = meta
+        .chain()
+        .await?
+        .try_into()
+        .map_err(|_| read_workspace_error(WorkspaceError::Fenced))?;
+    let head = meta
+        .store
+        .load_layer(guard.expected_head_layer_id)
         .await
         .map_err(read_workspace_error)?;
-    let cached_chain = meta.chain().await?;
-    let layers = [
-        meta.store
-            .load_layer(cached_chain[0].layer_id)
-            .await
-            .map_err(read_workspace_error)?,
-        meta.store
-            .load_layer(cached_chain[1].layer_id)
-            .await
-            .map_err(read_workspace_error)?,
-    ];
-    if layers[0].layer_id != guard.expected_head_layer_id
-        || layers[1].layer_id != lower.binding.base_layer_id
-    {
+    let layers = [head, cached[1].clone()];
+    if layers[1].layer_id != lower.binding.base_layer_id {
         return Err(WorkspaceError::Fenced.into());
     }
-    meta.store
-        .validate_read_fence(guard.clone(), layers.clone())
-        .await
-        .map_err(read_workspace_error)?;
-    // A former writable head becoming sealed is a lost guard. Check
-    // authority before reporting malformed fixed-pair metadata.
     validate_fixed_layer_pair(&layers).map_err(read_workspace_error)?;
-    Ok((guard, layers, owner))
+    Ok((guard, layers, None))
 }
 
 type CapturedInodeFence = (
@@ -558,7 +496,7 @@ type CapturedInodeFence = (
 
 /// Capture the read fence plus one inode's upper rows. A frozen base on a
 /// consistent store does this in one round trip that already validates the
-/// head/lease fence (`fused`); otherwise it is the separate strict sequence.
+/// head/lease fence (`fused`); otherwise it is the separate fence sequence.
 /// A frozen-base request's view, captured atomically by `begin_request`
 /// (head/lease fence plus this inode's upper rows in one read). While a read
 /// runs inside `with_request_view`, chunk preparation reuses it instead of
@@ -605,7 +543,7 @@ async fn capture_inode_fence<W: WorkspaceStore + 'static>(
     lower: &WorkspacePackedLower,
     ino: i64,
 ) -> anyhow::Result<CapturedInodeFence> {
-    let fused = !lower.strict() && meta.store.supports_fused_read_fence();
+    let fused = meta.store.supports_fused_read_fence();
     if fused && let Some((layers, rows)) = meta.lease_proven_inode_rows(ino).await? {
         // Lease-proven: this mount is the only upper writer and every local
         // commit invalidates the rows it writes, so the cached head/base pair
@@ -734,15 +672,8 @@ impl<W: WorkspaceStore + 'static> UnifiedReadRequestFence for PackedReadRequestF
     }
 
     async fn ensure_current(&self) -> anyhow::Result<()> {
-        // Frozen base skips binding authentication; the writable head/lease
-        // fence is one MGET and still applies to every read request.
-        if self.lower.strict() {
-            self.lower
-                .authority
-                .validate(&self.guard, &self.lower.binding)
-                .await
-                .map_err(read_workspace_error)?;
-        }
+        // The immutable lower needs no binding authentication; the writable
+        // head/lease fence is one MGET and still applies to every read request.
         validate_fence_or_local(
             self.store.as_ref(),
             &self.guard,
@@ -886,14 +817,7 @@ impl<W: WorkspaceStore + 'static> UnifiedReadSourceFetcher for CompositeFetcher<
         if generation != self.generation {
             return Err(ReadViewChanged.into());
         }
-        if self.lower.strict() {
-            self.lower
-                .authority
-                .validate(&self.guard, &self.lower.binding)
-                .await
-                .map_err(read_workspace_error)?;
-        }
-        // Head/lease fence (per inode in frozen mode): one round trip, unless
+        // Head/lease fence (per inode): one round trip, unless
         // the enclosing request's final fence already covers this plan.
         if !self.request_fenced {
             validate_fence(
@@ -1034,9 +958,7 @@ pub(super) async fn prepare<W: WorkspaceStore + 'static>(
     let base = chunk_index
         .checked_mul(meta.chunk_size)
         .ok_or_else(|| MetaError::Internal("workspace chunk base overflows".into()))?;
-    let scoped = (!lower.strict())
-        .then(|| current_request_view(Arc::as_ptr(&meta.store) as *const () as usize, ino))
-        .flatten();
+    let scoped = current_request_view(Arc::as_ptr(&meta.store) as *const () as usize, ino);
     let in_request = scoped.is_some();
     let (guard, layers, reader_owner, inodes, fused) = match scoped {
         Some(view) => (view.guard, view.layers, None, view.inodes, true),

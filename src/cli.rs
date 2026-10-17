@@ -83,8 +83,7 @@ use crate::workspace_overlay::gc::WorkspaceGc;
 use crate::workspace_overlay::ids::{LayerId, WorkspaceId};
 #[cfg(feature = "workspace-overlay")]
 use crate::workspace_overlay::lifecycle::{
-    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LEASE_TTL, NoopDurableRemoteBarrier, WorkspaceLifecycle,
-    WorkspaceMountSession,
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LEASE_TTL, WorkspaceLifecycle, WorkspaceMountSession,
 };
 #[cfg(feature = "workspace-overlay")]
 use crate::workspace_overlay::meta_layer::WorkspaceMetaLayer;
@@ -1281,11 +1280,6 @@ where
         );
     }
 
-    if !args.workspace_operator_managed {
-        WorkspaceLifecycle::new(workspace_store.clone())
-            .recover_incomplete_seals()
-            .await?;
-    }
     let generation = new_workspace_holder_generation();
     let session = WorkspaceMountSession::acquire(
         workspace_store.clone(),
@@ -1877,7 +1871,6 @@ where
         anyhow::anyhow!("--workspace is required when volume_format is workspace-v1")
     })?;
     let packed_header = workspace_store.packed_mount_header(workspace_id).await?;
-    let packed_startup = packed_header.is_some();
     let header = match packed_header {
         Some(header) => header,
         None => workspace_store.load_volume_header().await?.ok_or_else(|| {
@@ -1895,11 +1888,6 @@ where
             "unsupported workspace schema version {}",
             header.schema_version
         )
-    }
-    if !args.workspace_operator_managed && !packed_startup {
-        WorkspaceLifecycle::new(workspace_store.clone())
-            .recover_incomplete_seals()
-            .await?;
     }
 
     let generation = new_workspace_holder_generation();
@@ -2697,18 +2685,6 @@ where
                 .await?;
             print_json(&created.remove(0))?;
         }
-        WorkspaceCommand::Snapshot {
-            workspace,
-            name,
-            owner,
-        } => {
-            validate_workspace_header(&store).await?;
-            let revision = seal_workspace(store.clone(), workspace).await?;
-            let snapshot = WorkspaceLifecycle::new(store)
-                .snapshot_revision(revision, name, owner)
-                .await?;
-            print_json(&snapshot)?;
-        }
         WorkspaceCommand::Fork {
             source,
             count,
@@ -2718,17 +2694,7 @@ where
             if count == 0 {
                 anyhow::bail!("--count must be greater than zero")
             }
-            let revision = match source.parse() {
-                Ok(revision) => revision,
-                Err(_) => {
-                    let workspace = source.parse::<WorkspaceId>().map_err(|error| {
-                        anyhow::anyhow!(
-                            "source must be a workspace UUID or exact revision: {error}"
-                        )
-                    })?;
-                    seal_workspace(store.clone(), workspace).await?
-                }
-            };
+            let revision = source;
             let created = WorkspaceLifecycle::new(store)
                 .fork_revision(revision, count, owner)
                 .await?;
@@ -2763,19 +2729,6 @@ where
                 .discard(workspace, force)
                 .await?;
             println!("discarded {workspace}");
-        }
-        WorkspaceCommand::Commit { workspace, target } => {
-            validate_workspace_header(&store).await?;
-            let source = store.load_workspace(workspace).await?;
-            let fork_base = source.fork_base.clone().ok_or_else(|| {
-                anyhow::anyhow!("source workspace has no exact fork-base revision")
-            })?;
-            let revision = seal_workspace(store.clone(), workspace).await?;
-            let target = store.load_workspace(target).await?;
-            let result = WorkspaceLifecycle::new(store)
-                .fast_forward(revision, fork_base, &target)
-                .await?;
-            print_json(&result)?;
         }
     }
     Ok(())
@@ -2833,34 +2786,6 @@ async fn validate_workspace_header<W: WorkspaceStore + ?Sized>(
         )
     }
     Ok(())
-}
-
-#[cfg(feature = "workspace-overlay")]
-async fn seal_workspace<W>(
-    store: Arc<W>,
-    workspace_id: WorkspaceId,
-) -> anyhow::Result<crate::workspace_overlay::model::BaseRevision>
-where
-    W: WorkspaceStore + 'static,
-{
-    let generation = new_workspace_holder_generation();
-    let session = WorkspaceMountSession::acquire(
-        store.clone(),
-        workspace_id,
-        generation,
-        DEFAULT_LEASE_TTL,
-        DEFAULT_HEARTBEAT_INTERVAL,
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!("seal acquire {workspace_id}: {error}"))?;
-    let result = WorkspaceLifecycle::new(store)
-        .seal(&session.view, &NoopDurableRemoteBarrier)
-        .await
-        .map_err(|error| anyhow::anyhow!("seal execute {workspace_id}: {error}"));
-    let release_result = session.release().await;
-    let revision = result?.revision;
-    release_result.map_err(|error| anyhow::anyhow!("seal release {workspace_id}: {error}"))?;
-    Ok(revision)
 }
 
 #[cfg(feature = "workspace-overlay")]
