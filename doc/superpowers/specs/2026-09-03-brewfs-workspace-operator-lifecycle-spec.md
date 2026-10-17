@@ -10,6 +10,21 @@ finalizer/recovery/GC和真实后端验收仍必需；旧flat/CR/存储格式兼
 - 适用后端：Redis、TiKV
 - 依赖能力：`workspace-overlay` / `workspace-v1`
 
+### 2026-10-17 模型更新
+
+workspace 模型为 **不可变 lower + 不轮转的可写 overlay**：
+
+- 不存在 seal 事务：operator 不再封存 native workspace，`WorkspaceAdmin::seal_and_snapshot`
+  已删除；
+- `BrewFSWorkspaceSnapshot` 只对 packed workspace 生效（pin clean packed snapshot、发布或
+  恢复 packed publication）；native workspace 的 snapshot 请求进入 `Failed`，消息为
+  “snapshots require a packed-v3 workspace; native workspaces are never sealed”；
+- mount 期间 head 不轮转；改变 head 的 packed publication 必须持有该 workspace 唯一的
+  active writable lease（见 workspace overlay 实现规范 §15.3）；
+- mount 启动不再执行 seal recovery（`recover_incomplete_seals` 已删除）。
+
+下文旧的 native seal 流程已按此更新；冲突处以本节为准。
+
 ## 1. 目的
 
 本规范定义 Kubernetes 场景下 BrewFS workspace 的声明式管理方式，作为后续 CRD、controller、挂载工作负载和测试代码的实现依据。
@@ -18,8 +33,8 @@ finalizer/recovery/GC和真实后端验收仍必需；旧flat/CR/存储格式兼
 
 1. 把逻辑 workspace、运行时挂载和不可变快照拆成独立生命周期；
 2. 保证任意 agent 的写操作只能进入自己的 writable upper layer；
-3. 保证一个 workspace 当前引用的 sealed lower revision 不会被挂载进程、其他 workspace 或 GC 原地修改；
-4. 正确处理 Pod 重启、节点故障、operator 重启、lease 过期、seal 中断和资源删除；
+3. 保证一个 workspace 当前引用的不可变 lower revision 不会被挂载进程、其他 workspace 或 GC 原地修改；
+4. 正确处理 Pod 重启、节点故障、operator 重启、lease 过期、packed publication 中断和资源删除；
 5. 不改变现有 `BrewFSCluster` / `BrewFSMount` 的 flat-volume 行为；
 6. Redis 和 TiKV 使用完全一致的状态机语义。
 
@@ -33,7 +48,7 @@ finalizer/recovery/GC和真实后端验收仍必需；旧flat/CR/存储格式兼
 - 新增 `BrewFSWorkspace`；
 - 新增 `BrewFSWorkspaceMount`；
 - 新增 `BrewFSWorkspaceSnapshot`；
-- 管理 workspace 的 create、mount、suspend、resume、seal、snapshot 和 delete；
+- 管理 workspace 的 create、mount、suspend、resume、snapshot（packed）和 delete；
 - 管理 mount lease、holder generation、优雅 drain 和异常 fencing；
 - 用 finalizer 保护 mount、workspace、snapshot 和 cluster 的删除顺序；
 - 为 agent workload 生成单 workspace、单 writable mount 的 Pod/StatefulSet；
@@ -115,7 +130,7 @@ writable head (depth=2, owner_workspace_id=<workspace>)
   -> null
 ```
 
-seal 是唯一允许切换 base 的操作。seal 创建新的 sealed base 和新的空 writable head，然后以 CAS 原子切换 workspace head；旧 base 永远不原地修改。
+不存在 seal。唯一允许切换 lower 的是 packed publication：它在持有该 workspace 唯一 writable lease 的前提下，以一次 CAS 安装/发布新的 packed lower binding；旧 lower 永远不原地修改。挂载中的 mount 不会看到 head 被其他 holder 改变。
 
 ## 4. 总体架构
 
@@ -332,7 +347,7 @@ status:
   conditions: []
 ```
 
-`originRevision` 在资源整个生命周期内不变；`currentBaseRevision` 只会在显式 seal 成功后改变。
+`originRevision` 在资源整个生命周期内不变；`currentBaseRevision` 只会在 packed publication 成功后改变。
 
 ### 7.4 Phase
 
@@ -344,9 +359,7 @@ stateDiagram-v2
     Active --> Quiescing: desiredState=Suspended
     Quiescing --> Suspended: mounts drained and leases released
     Suspended --> Active: desiredState=Active
-    Suspended --> Sealing: snapshot request
-    Sealing --> Suspended: atomic head switch complete
-    Sealing --> RecoveryRequired: interrupted/uncertain drain
+    Active --> RecoveryRequired: lease expired / uncertain drain
     RecoveryRequired --> Suspended: recovery mount drains state
     Pending --> Failed
     Provisioning --> Failed
@@ -447,15 +460,15 @@ workspace mount 默认采用同 Pod sidecar 模型，不使用节点级 hostPath
 - lease TTL/heartbeat；
 - Pod UID 和 mount CR UID，写入 lease holder identity；
 - 仅 runtime 权限的 backend/object credentials；
-- `--workspace-operator-managed`；该统一开关同时禁止 mount-local GC 和 mount 启动时的全局 seal recovery。
+- `--workspace-operator-managed`；该开关禁止 mount-local GC，并使 mount 使用 runtime-only catalog 权限。
 
 不得允许 agent 自己提供或覆盖上述参数。
 
-当前 `mount_workspace_with_catalog` 会启动本地 `WorkspaceGc`，并在获取 lease 前调用 `recover_incomplete_seals()`。Operator 模式必须把这两个职责移到 workspace controller：
+普通 CLI mount 会启动本地 `WorkspaceGc`；不存在 mount 启动时的 seal recovery。Operator 模式把 GC 移到 workspace controller：
 
 - mount sidecar 不持有 object delete/topology credential；
 - GC 由一个有 leader election 的 operator worker 集中执行；
-- seal recovery 由对应 Workspace/Snapshot reconcile 驱动；
+- packed publication recovery 由对应 Workspace/Snapshot reconcile 驱动；
 - 普通 CLI mount 的现有默认行为保持不变。
 
 ### 8.3.1 实现映射
@@ -558,6 +571,7 @@ spec:
 约束：
 
 - `workspaceRef` 创建后不可变；
+- source workspace 必须是 packed workspace（存在 packed lower binding）；
 - source workspace 必须处于 `Suspended`；
 - source 不得有 active writable lease；
 - source 最近一次 mount 必须 clean release，并且 drained head epoch 必须等于当前 head epoch；
@@ -568,20 +582,17 @@ spec:
 ### 9.2 Snapshot 流程
 
 1. 解析 source workspace 和 cluster；
-2. 确认 `desiredState=Suspended`；
-3. 确认不存在 active lease；
-4. 核对最近 lease 是 `Released`，不是 `Expired`；
-5. 在 Snapshot status 中先持久化 `phase=Sealing`、source workspace ID 和待 seal 的 head epoch `E`；该 intent 写入成功前不得开始 seal；
-6. controller 使用 operator holder identity 获取一次短期控制 lease；
-7. 使用真实 durable remote barrier 执行 seal；
-8. seal 将 upper materialize 为新的 flat sealed base，并创建新的空 upper；
-9. 原子切换 workspace head，并在完成固定两层压平后令 head epoch 变为 `E+2`；
-10. 用确定性 snapshot ID 创建 SnapshotRecord；
-11. 校验 `(layer_id, sealed_version, root_hash)`；
-12. 更新 Snapshot status 为 Ready；
-13. 释放控制 lease，workspace 保持 Suspended。
+2. 确认 `desiredState=Suspended`、不存在 active lease、最近 lease 是 `Released`；
+3. 在 Snapshot status 中先持久化 source workspace ID 和 head epoch `E` 的 intent；
+4. 若 source 不是 packed workspace：status 置 `Failed`（native workspace 永不被封存），结束；
+5. 若存在 clean unmounted packed epoch 或 clean published view：直接 pin 该不可变 revision；
+6. 否则验证 clean mount reference，按其状态发布（`publish_packed_snapshot`）或恢复
+   （`recover_packed_snapshot`）packed publication；该路径持有 workspace 唯一的 writable lease；
+7. 用确定性 snapshot ID 创建 SnapshotRecord，校验 `(layer_id, sealed_version, root_hash)`；
+8. 更新 Snapshot status 为 Ready，workspace 保持 Suspended。
 
-若在 seal 中崩溃，controller 先调用现有 journal recovery，再将 backend 状态与已持久化 intent 对照：当前 epoch 为 `E` 时重新执行 seal，为 `E+2` 时直接按当前 exact base revision 幂等补建 SnapshotRecord；其他 epoch 表示并发修改或不一致，必须停止并报告冲突。SnapshotRecord 已存在时必须先验证其 exact revision，再直接收敛为 Ready。不得只根据 Kubernetes phase 猜测 seal 是否成功。
+SnapshotRecord 已存在时必须先验证其 exact revision（packed workspace 还要验证 packed
+revision），再直接收敛为 Ready。不得只根据 Kubernetes phase 猜测 publication 是否成功。
 
 ### 9.3 Status
 
@@ -610,7 +621,7 @@ lower 身份必须是完整三元组：
 (layer_id, sealed_version, root_hash)
 ```
 
-禁止只保存 layer ID，禁止在 mount 时解析“某 workspace 当前最新版本”。Workspace 创建后 `originRevision` 不可更改；当前 lower 只有在显式 seal 的原子 head switch 中才能变为一个新 revision。
+禁止只保存 layer ID，禁止在 mount 时解析“某 workspace 当前最新版本”。Workspace 创建后 `originRevision` 不可更改；当前 lower 只有在持有唯一 writable lease 的 packed publication CAS 中才能变为一个新 revision。
 
 ### 10.2 Metadata 写保护
 
@@ -670,7 +681,7 @@ FUSE runtime 不得持有 `WorkspaceGcBlockStore`。
 - Workspace 创建前；
 - Mount Pod 创建前；
 - mount process 获取 lease 前；
-- seal head switch 前后；
+- packed publication binding 切换前后；
 - Snapshot 标记 Ready 前；
 - operator 从 crash 恢复后第一次 reconcile。
 
@@ -680,10 +691,10 @@ O(1) verification 核对 layer record 和 revision tuple，不扫描全量 metad
 
 以下对象均为 GC root：
 
-- active workspace head 及其 sealed base；
+- active workspace head 及其不可变 lower；
 - `BrewFSWorkspaceSnapshot` 对应 SnapshotRecord；
 - active/releasing lease；
-- incomplete seal journal；
+- incomplete packed publication journal；
 - recovery grace 内的 expired lease。
 
 GC 必须先生成 reachability snapshot，再删除 object blocks，最后删除 layer metadata。任一阶段失败都保留可重试记录。只要一个 workspace 或 snapshot 仍引用 lower revision，lower layer 和其 blocks 都不可删除。
@@ -750,8 +761,8 @@ GC 必须先生成 reachability snapshot，再删除 object blocks，最后删�
 
 1. `desiredState=Active`；
 2. 验证 current base revision；
-3. 确认没有 incomplete seal journal；
-4. 若有 recoverable journal，先完成/回滚 recovery；
+3. 确认没有 incomplete packed publication journal；
+4. 若有 recoverable journal，先完成/回滚 packed recovery；
 5. Mount controller 重新创建 Pod；
 6. 新 Pod 获取新 generation/lease 并 mount 当前 head epoch。
 
@@ -762,7 +773,7 @@ GC 必须先生成 reachability snapshot，再删除 object blocks，最后删�
 3. controller 不把 `Expired` 当成 clean release；
 4. 如果 WriteBack PVC 可用，启动 recovery Pod，使用同一 PVC 恢复 pending upload；
 5. recovery Pod完成 drain、写 clean release 并退出；
-6. 如果 PVC丢失，设置 `RecoveryRequired=True`，禁止 seal 和 SnapshotAndDelete；
+6. 如果 PVC丢失，设置 `RecoveryRequired=True`，禁止 snapshot/publication 和 SnapshotAndDelete；
 7. 只有显式 force-delete annotation 才能放弃未确认 upper writeback。
 
 force annotation：
@@ -780,7 +791,7 @@ force 只允许丢弃/围栏 upper；它绝不能修改当前或历史 lower。
 
 1. 从 backend 重建真实 workspace/snapshot/lease/journal 状态；
 2. 从 Kubernetes owner UID重新计算确定性 ID；
-3. 完成或回滚 incomplete seal；
+3. 完成或回滚 incomplete packed publication；
 4. 对已完成的 ensure/create 识别为成功；
 5. 不重复创建 workspace、snapshot 或 root layer；
 6. 不依据过期 status 发起 destructive operation。
@@ -861,7 +872,7 @@ finalizer：`storage.brewfs.io/workspace-snapshot-protection`
 ### 13.1 Source of truth
 
 - Kubernetes spec：用户期望状态；
-- workspace backend：head、epoch、lease、seal、snapshot、GC 的事实来源；
+- workspace backend：head、epoch、lease、packed publication、snapshot、GC 的事实来源；
 - Kubernetes status：可重建缓存；
 - Pod status：只表示容器状态，不代表 lease 或 durable drain 状态。
 
@@ -870,9 +881,9 @@ finalizer：`storage.brewfs.io/workspace-snapshot-protection`
 - 两个 Mount controller 竞争同一 workspace：backend writable lease 只允许一个成功；
 - Mount 与 Suspend 竞争：workspace state/lease CAS决定结果；
 - Snapshot 与 Mount 竞争：Snapshot 只接受 Suspended + no active lease；
-- Snapshot 与 Delete 竞争：Deleting state 拒绝新的 seal/snapshot；
+- Snapshot 与 Delete 竞争：Deleting state 拒绝新的 snapshot/publication；
 - 两个 Snapshot 请求：通过 workspace state和控制 lease 串行化；
-- GC 与 mount/seal 竞争：reachability roots、lease grace 和 journal root 阻止提前回收；
+- GC 与 mount/publication 竞争：reachability roots、lease grace 和 journal root 阻止提前回收；
 - 旧 Pod 与新 Pod 竞争：holder generation + head epoch fencing。
 
 所有 backend transition 必须是原子 CAS/transaction。Kubernetes controller 的单对象队列不能替代 backend fencing。
@@ -890,7 +901,6 @@ trait WorkspaceAdmin: Send + Sync {
     async fn verify_revision(&self, revision: &BaseRevision) -> Result<()>;
     async fn list_leases(&self, id: WorkspaceId) -> Result<Vec<LeaseView>>;
     async fn recover_workspace(&self, id: WorkspaceId) -> Result<RecoveryResult>;
-    async fn seal_and_snapshot(&self, request: SealSnapshot) -> Result<SnapshotView>;
     async fn ensure_snapshot(&self, request: EnsureSnapshot) -> Result<SnapshotView>;
     async fn delete_snapshot(&self, id: SnapshotId) -> Result<()>;
     async fn mark_deleting(&self, id: WorkspaceId, force: bool) -> Result<()>;
@@ -920,7 +930,7 @@ backend factory 从 `BrewFSCluster` 生成的 ConfigMap/Secret 创建 Redis 或 
 - active lease waiting：`min(lease_expiry-now, 10s)`；
 - backend transient error：指数退避 1s..60s + jitter；
 - spec conflict/corrupt metadata/unsupported capability：不做快速循环，写 condition/Event，等待资源变化；
-- seal recovery：立即继续直到达到稳定 journal phase，但每次 reconcile 只推进一个 durable phase。
+- packed publication recovery：立即继续直到达到稳定 journal phase，但每次 reconcile 只推进一个 durable phase。
 
 ## 16. 可观察性
 
@@ -935,8 +945,8 @@ backend factory 从 `BrewFSCluster` 生成的 ConfigMap/Secret 创建 Redis 或 
 - `MountLeaseReleased`
 - `MountFenced`
 - `RecoveryRequired`
-- `SealStarted`
-- `SealRecovered`
+- `PublicationStarted`
+- `PublicationRecovered`
 - `SnapshotReady`
 - `DeletionBlocked`
 - `ForceDeleteRequested`
@@ -967,7 +977,7 @@ brewfs_operator_workspace_force_delete_total
 - mount/snapshot ID；
 - head layer ID/head epoch；
 - lease ID/holder generation；
-- seal journal ID/phase；
+- packed publication journal ID/phase；
 - reconcile action/result。
 
 ## 17. 测试规范
@@ -995,7 +1005,7 @@ brewfs_operator_workspace_force_delete_total
 - expired lease 进入 RecoveryRequired；
 - backend 不可达时 finalizer 不释放；
 - Snapshot 只在 Suspended 时执行；
-- seal 每一 journal phase crash 后恢复；
+- packed publication 每一 journal phase crash 后恢复；
 - Delete/Retain/SnapshotAndDelete 三种路径；
 - Snapshot 有引用时删除被阻塞；
 - Cluster 有子资源时删除被阻塞。
@@ -1029,7 +1039,7 @@ brewfs_operator_workspace_force_delete_total
 - agent container 看不到 Secret；
 - Pod 正常重启 lease handoff；
 - `kill -9` 后 lease expiry/fencing/recovery；
-- operator 在 Provisioning、Sealing、Terminating 中重启；
+- operator 在 Provisioning、Terminating 与 packed publication 中重启；
 - drain 期间删除 CR；
 - Snapshot 后 fork 新 workspace；
 - cluster 删除保护；
@@ -1041,7 +1051,7 @@ brewfs_operator_workspace_force_delete_total
 - 单 workspace xfstests，沿用 workspace exclude 文件；
 - 单 workspace LTP，沿用 workspace skip 文件；
 - 双 workspace 并发 isolation suite；
-- seal 前后相同 mounted view 的数据一致性；
+- packed publication 前后相同 mounted view 的数据一致性；
 - flat `BrewFSMount` 原有 operator 测试全部通过。
 
 ### 17.6 故障注入
@@ -1052,7 +1062,7 @@ brewfs_operator_workspace_force_delete_total
 - lease acquire 前/后；
 - writeback drain 前/后；
 - lease release 前/后；
-- seal Prepare/Quiesced/DataDrained/Hashed/HeadSwitched；
+- packed publication 各 journal phase；native workspace 的 snapshot 请求进入 `Failed`；
 - SnapshotRecord create 前/后；
 - workspace deleting marker 前/后；
 - object delete 与 layer metadata delete 之间。
@@ -1105,12 +1115,12 @@ brewfs_operator_workspace_force_delete_total
 - graceful drain/release；
 - mount finalizer和 restart tests。
 
-### PR 6：Snapshot/seal/recovery/finalizer
+### PR 6：Snapshot（packed）/recovery/finalizer
 
 - Snapshot CR controller；
 - clean release/drained epoch记录；
 - durable remote barrier；
-- seal journal recovery；
+- packed publication journal recovery；
 - recovery Pod；
 - SnapshotAndDelete；
 - Snapshot/Cluster删除保护；

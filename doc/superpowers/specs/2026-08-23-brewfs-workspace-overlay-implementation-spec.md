@@ -13,11 +13,29 @@
 - 首要生产 backend：Redis、TiKV
 - 本地语义与故障注入 backend：SQLite / SQLx
 
+### 2026-10-17 模型更新：不可变 lower + 不轮转的可写 overlay
+
+当前实现只有一种模型：每个 mount 是 **一个不可变 lower + 一个可写 overlay**。
+
+- 不存在 seal 事务、flatten/compaction 物化和 strict lower 模式；对应代码、store 接口
+  （`begin_seal`/`advance_seal`/`hash_seal`/`commit_seal`/`abort_recoverable_seal`/
+  `fast_forward_commit`/`install_compaction`）与 CLI `workspace snapshot`、
+  `workspace commit`、`fork <workspace-uuid>` 已删除。
+- 新的不可变 lower 只来自 packed publication（pack 上传 -> 认证 manifest -> binding
+  install/publish）。`SealJournal`/`SealPhase` 类型名保留，仅表示 packed publication journal。
+- 挂载中的 head 永不轮转：任何改变 `head_layer_id`/`head_epoch` 的路径都必须持有该
+  workspace 唯一的 active writable lease（§15.3）。
+- lower 在 attach 时认证一次；之后 lower inode、权限输入、反向别名与 `(parent, name)`
+  查找按 binding 生命周期 memo，不再逐操作重新认证。
+- lease/唯一写者安全保持不变（§6.5、§15）。
+
+下文凡与本节冲突处以本节为准；已删除的历史设计不再保留在规范中。
+
 ### 2026-10-03 范围澄清：workspace-v1 与 packed-v3
 
-本文控制面契约适用于现有 `workspace-v1` sealed-layer/delta 实现；“与代码同步”不表示
+本文控制面契约适用于现有 `workspace-v1` 不可变 lower/delta 实现；“与代码同步”不表示
 后续所有packed格式或新worktree都已全量审计。它不是004/005对象的wire定义，也不能由
-standalone packed readonly mount推导本规范的fork/seal/recovery/GC已支持packed lower。
+standalone packed readonly mount推导本规范的fork/publication/recovery/GC已支持packed lower。
 
 [packed-v3 SPEC](2026-09-27-brewfs-packed-metadata-v3-readonly-smallfiles.md)负责当前packed-v3
 对象与只读plan，packed lower集成为其P5待完成项。既有 `BaseRevision` 的layer/version/
@@ -31,22 +49,20 @@ inode data_version/sequence或等价locking，head_epoch/lease guard本身不是
 
 ## 1. 实现目标
 
-在 BrewFS 中增加可 fork 的 workspace view：多个 workspace 共享 sealed base layer 和
+在 BrewFS 中增加可 fork 的 workspace view：多个 workspace 共享不可变 lower 和
 immutable slice/block，每个 workspace 只保存自己的 namespace、inode 属性和数据 extent
 变更。
 
 v1 必须支持：
 
-1. 创建 workspace volume；
-2. 创建、挂载和销毁 workspace；
-3. seal/snapshot；
-4. 从 sealed revision fork；
-5. workspace 内完整的核心 POSIX mutation 隔离；
-6. path 级 diff；
-7. discard；
-8. fast-forward、all-or-reject commit；
-9. lease-aware GC 和 layer compaction；
-10. crash recovery 与 stale writer fencing。
+1. 创建 workspace volume（空 lower 或 packed-v3 lower）；
+2. 从精确不可变 revision 创建/fork workspace，挂载和销毁 workspace；
+3. workspace 内完整的核心 POSIX mutation 隔离；
+4. path 级 diff；
+5. discard；
+6. lease-aware GC；
+7. crash recovery 与 stale writer fencing；
+8. 通过 packed publication 产生新的不可变 lower（不封存挂载中的 workspace）。
 
 ## 2. 不可破坏的兼容契约
 
@@ -58,7 +74,7 @@ v1 必须支持：
 4. `SliceDesc` 的字段、serde/rkyv 编码和 golden bytes 不改变；
 5. object key 继续使用 `chunks/{slice_id}/{block_index}`；
 6. flat cache key、dirty writeback key 和现有后台任务不增加 workspace 维度；
-7. 普通 volume 不查询 workspace schema，不启动 workspace lease/watch/GC/compaction；
+7. 普通 volume 不查询 workspace schema，不启动 workspace lease/watch/GC；
 8. legacy volume 不允许通过 mount 参数直接转换成 workspace volume；
 9. flat-only binary 遇到 `workspace-v1` volume 必须返回
    `FeatureNotCompiled("workspace-overlay")`；
@@ -158,18 +174,13 @@ src/workspace_overlay/
     data.rs
     locks.rs
   lifecycle/
-    mod.rs
-    create.rs
-    seal.rs
-    fork.rs
-    discard.rs
-    lease.rs
-    recovery.rs
+    mod.rs                  # fork/discard、mount session、heartbeat
+    lease_validity.rs
+    packed_mount_session.rs
   publish/
     mod.rs
+    binding.rs              # packed lower binding install/publish
     diff.rs
-    commit.rs
-    conflict.rs
   stores/
     mod.rs
     database.rs
@@ -179,8 +190,8 @@ src/workspace_overlay/
     tikv.rs
   cache.rs
   gc.rs
-  compaction.rs
   control.rs
+  test_base_fixture.rs      # 仅测试：播种非空 flat lower
   metrics.rs
 
 src/chunk/read_plan.rs
@@ -245,8 +256,9 @@ pub struct ViewContext {
 }
 ```
 
-`head_epoch` 仅在 seal/restack、recovery head replacement 或 commit 时增加。普通 metadata
-mutation 不增加 head epoch。
+`head_epoch` 只在持有该 workspace 唯一 active writable lease 的 packed publication
+（binding install/publish、native publication complete）或 clean restore 中增加。挂载中的
+head 不会被其他 holder 改变（§15.3）。普通 metadata mutation 不增加 head epoch。
 
 ### 5.3 状态枚举
 
@@ -274,9 +286,12 @@ pub enum LeaseState {
 }
 ```
 
-sealed layer 永不可修改；active workspace 恰好有一个 writable head 和一个平坦 sealed
-base。固定不变量为 `writable(depth=2) -> sealed(depth=1) -> null`，不得把 sealed ancestry
-暴露给挂载数据路径。
+`Sealed` layer（即不可变 lower）永不可修改；active workspace 恰好有一个 writable head 和
+一个不可变 lower。固定不变量为 `writable(depth=2) -> sealed(depth=1) -> null`。不存在把
+非平坦链压平的路径：mount 遇到非固定层对直接返回 `CorruptMetadata`。
+
+`WorkspaceState::{Quiescing, Sealing}`、`LayerState::Sealing` 的 discriminant 仍保留以
+解码旧记录，不再由任何新代码路径写入。
 
 ### 5.4 持久 enum 编码
 
@@ -293,6 +308,9 @@ ExtentKind:     Data=0, Hole=1
 SealPhase:      Prepare=0, Quiesced=1, DataDrained=2, Hashed=3,
                 HeadSwitched=4, Completed=5, Aborted=6
 ```
+
+`SealPhase`/`SealJournal` 现只承载 packed publication journal 的状态；名称因持久编码
+保留。
 
 未知值返回 `UnsupportedSchemaVersion` 或 `CorruptMetadata`，不得映射到默认状态。
 
@@ -334,13 +352,11 @@ pub trait WorkspaceStore: Send + Sync {
     async fn apply_acl_mutation(&self, request: AclMutation) -> Result<(), WorkspaceError>;
     async fn apply_lock_mutation(&self, request: LockMutation) -> Result<(), WorkspaceError>;
 
-    async fn begin_seal(&self, request: BeginSeal) -> Result<SealJournal, WorkspaceError>;
-    async fn advance_seal(&self, request: AdvanceSeal) -> Result<SealJournal, WorkspaceError>;
-    async fn commit_seal(&self, request: CommitSeal) -> Result<SealResult, WorkspaceError>;
-    async fn abort_recoverable_seal(&self, request: AbortSeal) -> Result<(), WorkspaceError>;
+    async fn install_packed_lower_binding(&self, request: InstallPackedLowerBinding) -> Result<PackedLowerBindingRecord, WorkspaceError>;
+    async fn publish_packed_lower_binding(&self, request: PublishPackedLowerBinding) -> Result<PackedLowerBindingRecord, WorkspaceError>;
+    async fn load_seal_journal(&self, id: JournalId) -> Result<SealJournal, WorkspaceError>; // packed publication journal
+    async fn list_seal_journals(&self, workspace: WorkspaceId) -> Result<Vec<SealJournal>, WorkspaceError>;
 
-    async fn fork_revision(&self, request: ForkRevision) -> Result<Vec<WorkspaceRecord>, WorkspaceError>;
-    async fn fast_forward_commit(&self, request: FastForwardCommit) -> Result<CommitResult, WorkspaceError>;
     async fn mark_workspace_deleting(&self, request: MarkDeleting) -> Result<(), WorkspaceError>;
 
     async fn list_gc_roots(&self) -> Result<GcRoots, WorkspaceError>;
@@ -371,7 +387,10 @@ backend 在同一事务中检查：
 4. lease 为 `Active` 且未过期；
 5. holder generation 匹配。
 
-任一不匹配返回 `WorkspaceError::Fenced`，不得重试到新 head。
+任一不匹配返回 `WorkspaceError::Fenced`，不得重试到新 head。packed mount 的 mutation CAS
+另外检查 `workspace.active_lease`、packed writer-authority/open 记录，并以
+`lease.expires_at_ns` 作为 CAS 截止时间：lease 过期后旧 holder 的任何提交都失败。
+head ID/epoch 在挂载期间不变（§15.3），其相等检查只是唯一写者保证的冗余防线。
 
 ### 6.2 Capability
 
@@ -452,7 +471,7 @@ PD TSO physical 毫秒分量并安全换算为纳秒，禁止使用 mount host w
 
 ### 6.4 拓扑事务（read-tracked）
 
-seal、fork、snapshot、commit、compaction、GC、租约获取与释放通过读追踪事务执行：
+fork、snapshot pin、discard、GC、租约获取与释放、packed publication 通过读追踪事务执行：
 
 ```rust
 let mut txn = store.topology_txn();
@@ -471,7 +490,7 @@ txn.commit().await?;
 - 提交调用 `compare_and_swap(checks, writes)`，一次 CAS 原子提交全部检查与写入，外部只能
   观察到提交前或提交后状态；
 - 冲突重试时在最新值上重新读取并回放操作；
-- 任何操作不得触碰其他 workspace 的键；不同 workspace 的 fork、seal、GC 可以并行，无关
+- 任何操作不得触碰其他 workspace 的键；不同 workspace 的 fork、publication、GC 可以并行，无关
   workspace 的心跳与热写不进入本事务的检查集；
 - 不存在进程内全局拓扑 gate；不同 workspace 的拓扑并发由 backend 多键 CAS 串行化，互不
   阻塞；
@@ -483,11 +502,8 @@ txn.commit().await?;
 | 操作 | 检查集 | 写入集 |
 |---|---|---|
 | `acquire_lease` / `release_lease` | ws record、本 lease | ws record（`active_lease`）、lease record |
-| seal 各阶段 | journal、ws record、head layer、`active_lease` 指向的租约 | 各阶段对应实体 |
-| `commit_seal` | journal、ws record、旧 head layer、本 workspace 租约、`alloc/sealed_version` | 旧 layer（Sealed）、新 head layer、ws（head 切换）、租约、journal |
+| packed binding install/publish | ws record、head layer、本 workspace 的 active lease、base layer、PWB3 current/history、root generation | ws（head epoch）、head layer、PWB3 current/history |
 | `create_workspace` / `create_snapshot` | base layer（须 `Sealed`） | ws record 与 head layer / snapshot |
-| `install_compaction` | ws record、head layer、parent layer | compacted layer、replacement head、ws、compacted delta 键 |
-| `fast_forward_commit` | source base layer、目标 ws record 与 head layer | 目标 ws、新 head layer |
 | GC 删除 | 目标 layer（CAS 至 `Deleting`） | layer record、delta 键 |
 
 ### 6.5 单活跃 writable lease
@@ -501,7 +517,7 @@ Option<LeaseId>` 承载互斥：获取租约时 CAS 该字段 `None -> Some(leas
 
 GC 不依赖全局一致快照，使用两阶段删除加提交点复核：
 
-1. 扫描根集合（workspace、snapshot、lease、journal）与 layer，得出可达集合与待删除候选
+1. 扫描根集合（workspace、snapshot、lease、非终态 publication journal）与 layer，得出可达集合与待删除候选
    （允许陈旧）；
 2. 对每个候选 layer 以读取到的精确值 CAS 标记 `Deleting`；
 3. 重新扫描根集合复核：在标记前提交的根创建（fork、snapshot、mount、journal）在复核中
@@ -509,7 +525,7 @@ GC 不依赖全局一致快照，使用两阶段删除加提交点复核：
    base layer 精确值的 CAS 检查必然失败；
 4. 复核通过后删除 delta 键与 layer record。
 
-根创建操作（fork、snapshot、`acquire_lease`、`begin_seal`）在其事务中 CAS 检查所引用
+根创建操作（fork、snapshot、`acquire_lease`、packed publication）在其事务中 CAS 检查所引用
 base layer 的精确值（含 `state == Sealed`），这是上述协议的另一半。
 
 GC 周期删除超过宽限期的 `Released`/`Expired` lease 与 `Completed`/`Aborted` journal
@@ -754,6 +770,9 @@ snapshot 是 sealed `BaseRevision` 的持久 GC root。删除 snapshot 只删除
 
 ### 7.10 Journal 与 allocator
 
+journal 表/键只由 packed publication 使用（native freeze、recovery claim、complete
+driver），不存在 workspace seal journal。
+
 ```sql
 CREATE TABLE ws_v1_seal_journal (
     journal_id            BLOB PRIMARY KEY,
@@ -780,7 +799,7 @@ allocator 至少包含 `inode`、`sealed_version`。slice ID 继续使用现有 
 
 ## 8. Layer digest
 
-seal 时计算：
+创建 volume root、packed publication 冻结 native source 时计算：
 
 ```text
 delta_digest = BLAKE3(canonical layer delta stream)
@@ -810,14 +829,14 @@ resolver 必须是无 I/O 的纯逻辑；store 负责批量加载固定 layer pa
 `load_layer_chain(head)` 为兼容 store contract 保留，但挂载只能接受：
 
 ```text
-[writable head, flat sealed base]
+[writable head, immutable lower]
 ```
 
 校验：
 
 - 长度必须为 2；
 - head 为 writable、depth=2、parent 指向 base；
-- base 为 sealed、depth=1、parent 为空；
+- base 为 `Sealed`（不可变 lower）、depth=1、parent 为空；不平坦即 `CorruptMetadata`，不存在压平路径；
 - point lookup 使用一次 Redis `MGET` 或 TiKV batch-get 读取两个完整 key；
 - named dentry/inode/xattr/ACL 查询不得调用 prefix scan。
 
@@ -1066,9 +1085,9 @@ read plan:         (head_epoch, ino, chunk_index, data_version)
 xattr/ACL:         (head_epoch, ino, attribute_version)
 ```
 
-namespace mutation 增加相关 parent/inode version 并精确失效。seal/restack 后 effective view
-不变，但更新 head epoch 并清空 writable-head mutation cache；sealed lower cache可按
-`BaseRevision` 保留。
+namespace mutation 增加相关 parent/inode version 并精确失效。lower cache 以 binding 生命周期
+为界保留（lower 不可变）；upper row、namespace 与权限 cache 只在 `LeaseValidity` 证明 lease
+仍被持有时服务，失去证明即清空。
 
 ## 12. POSIX mutation
 
@@ -1195,8 +1214,8 @@ sequence 在追加 metadata 的事务内分配；不得根据 slice ID推断顺�
 2. 已进入现有可 crash-recover 的 durable writeback staging/journal，且 staging key 可由
    workspace recovery 唯一定位。
 
-seal/snapshot/fork 不接受第二种状态；`DurableRemote` barrier 必须把所有引用 slice 上传并
-确认 remote durable。
+packed publication 不接受第二种状态：发布前必须 quiesce VFS 并确认所有引用 slice
+remote durable。fork 只接受已存在的不可变 revision，不涉及 dirty 数据。
 
 若 object upload 成功后 HeadGuard 被 fence，metadata 不提交，该 slice 记录为 orphan并由
 grace GC 回收。不得把 mutation 自动重放到新 head。
@@ -1249,37 +1268,22 @@ marker 最后写。marker 写入前失败可重试初始化；marker 存在但 s
 
 任何后续步骤失败必须释放 lease。agent 不获得 metadata/object backend credential。
 
-### 14.3 Seal/restack
+### 14.3 新的不可变 lower
 
-phase：
+不存在 seal/restack。新的不可变 lower 只由 packed publication 产生：
 
-```text
-Prepare -> Quiesced -> DataDrained -> Hashed -> HeadSwitched -> Completed
-```
+1. 由 operator/admin 在持有该 workspace 唯一 writable lease 的前提下 quiesce VFS；
+2. 冻结 native source 并上传 packed-v3 对象；
+3. 认证 manifest，得到 `VerifiedPackedLower`；
+4. 在一次 CAS 中 install/publish binding（检查 lease、head、base、PWB3 current/history）；
+5. head epoch 只在该 CAS 中增加。
 
-算法：
+挂载中的普通 mount 不调用以上任何一步。
 
-1. 控制面阻止该 workspace 新 command；
-2. 等 active command 退出；超时返回 `Busy`；
-3. CAS workspace `Active -> Quiescing -> Sealing`；
-4. 创建 seal journal，记录 old head/epoch；
-5. fence 新 metadata mutation；
-6. 等待已接收 VFS mutation 完成；
-7. 执行 `DurableRemote` barrier，确认 pending upload/writeback 为零；
-8. materialize 固定 base 与 old head，计算平坦 delta/root hash 和 sealed version；
-9. 创建 parent 为空的新 sealed base，复用所有仍可见 immutable slice；
-10. 创建空 new head，parent 指向新 sealed base；
-11. 原子切换 workspace 和 active lease 到新的固定 layer pair，并增加 epoch；
-12. journal 标记 HeadSwitched/Completed；
-13. 更新 mount ViewContext，恢复 workspace Active 和 command admission。
+### 14.4 Fork / Create
 
-步骤 11 是唯一可见性切换点。实现允许 journal recovery 中出现短暂 sealed chain，但在重新
-mount 或恢复 command admission 前必须完成 flatten；普通 FUSE I/O 永远不可观察该状态。
-
-### 14.4 Fork
-
-输入必须是 `BaseRevision`。若从 active workspace fork，先 seal/restack，得到 sealed
-revision。
+输入必须是精确的不可变 `BaseRevision`。不存在“从 active workspace fork”：
+`fork <workspace-uuid>` 已删除，因为它需要先封存 live workspace。
 
 事务内为每个 child：
 
@@ -1292,16 +1296,13 @@ child mount 时再获取 lease。
 
 ### 14.5 Snapshot
 
-`workspace snapshot`：
+snapshot 只 pin 一个已存在的不可变 revision（来自 packed publication），不封存 workspace：
 
-1. 对 source 执行 seal/restack；
-2. 得到 sealed `BaseRevision`；
-3. 创建 `SnapshotRecord`；
-4. snapshot record 成功持久化后返回 snapshot ID/revision；
-5. 同名 snapshot 返回 `AlreadyExists`，不覆盖旧 snapshot。
+1. 创建 `SnapshotRecord`（CAS 检查 base layer 精确值）；
+2. 同名 snapshot 返回 `AlreadyExists`，不覆盖旧 snapshot。
 
-snapshot 创建失败不回滚已经成功的 seal；返回错误中携带 sealed revision，调用方可重试
-只创建 snapshot record。
+CLI 不提供 `workspace snapshot`；operator 的 `BrewFSWorkspaceSnapshot` 只对 packed
+workspace 生效，native workspace 的 snapshot 请求进入 `Failed`。
 
 ### 14.6 Discard
 
@@ -1312,26 +1313,9 @@ snapshot 创建失败不回滚已经成功的 seal；返回错误中携带 seale
 5. 由后台 GC 回收不可达 layer/object；
 6. 不同步递归删除 parent。
 
-### 14.7 Fast-forward commit
+### 14.7 Commit
 
-v1 precondition：
-
-1. source 已 seal；
-2. target 没有 active writable lease；
-3. target writable head 为空，不含任何 delta；
-4. target head 的 sealed parent revision 与 source 的 `fork_base` 完整相等；
-5. source/target 属于同一 volume；
-6. source 的固定层对与 revision 校验通过。
-
-一个事务内：
-
-1. 再次比较 target revision；
-2. 创建 target new writable head，parent=source sealed head；
-3. 切换 target head并增加 epoch；
-4. 返回 commit revision。
-
-任一 precondition 失败返回 `Conflict`，target 不发生任何变化。v1 target 必须没有 active
-mount lease；commit 后的新 mount 看到新 revision。
+不存在 fast-forward commit（`workspace commit` 已删除）：它需要先封存 source workspace。
 
 ## 15. Lease 与 fencing
 
@@ -1349,37 +1333,44 @@ mount lease；commit 后的新 mount 看到新 revision。
 
 ### 15.2 Holder generation
 
-每次 mount/session 重建分配新的 generation。recovery 后旧 generation 的 heartbeat、write、
-seal continuation 全部返回 `Fenced`。
+每次 mount/session 重建分配新的 generation。recovery 后旧 generation 的 heartbeat、write
+全部返回 `Fenced`。
 
-### 15.3 Head switch
+### 15.3 Head 不在 active lease 下改变
 
-head switch 增加 `head_epoch`。旧 epoch mutation 永久失败；调用方不得自动替换 guard 后重放
-非幂等 mutation。
+所有改变 `head_layer_id`/`head_epoch` 的路径都要求调用方出示该 workspace 唯一的 active
+writable lease：
+
+| 路径 | 检查 |
+|---|---|
+| hot mutation（仅 `next_sequence`） | mutation CAS 中的 `checked_hot_guard` |
+| `install_packed_lower_binding` / `publish_packed_lower_binding` | KV `checked_hot_guard`、SQLite `checked_guard` |
+| packed journal commit | guard 精确相等 + committed state 复核 |
+| initial packed bootstrap | `workspace.active_lease == guard.lease_id` |
+| native publication complete driver | CAS 中 `workspace.active_lease == actual.lease` |
+| clean restore / headless recovery | 原 lease 必须 `Released`，successor 是唯一 `Active` writable lease |
+
+`acquire_lease` 在已有 live lease 时返回 `Busy`，因此任何 admin 在 mount 持有 workspace
+期间都拿不到上述路径所需的权限。旧 epoch mutation 永久失败；调用方不得自动替换 guard
+后重放非幂等 mutation。回归测试：`invariant_no_head_change_under_an_active_lease`、
+`invariant_second_mount_cannot_acquire_a_live_lease`、
+`invariant_commit_after_lease_expiry_fails_closed`、
+`invariant_commit_after_lease_loss_fails_closed_and_blocks_takeover`。
 
 ## 16. Crash recovery
 
-启动时扫描非终态 seal journal：
+不存在 workspace seal journal 恢复。重启后：
 
-| Journal phase | 恢复动作 |
-|---|---|
-| Prepare/Quiesced | 若 head 未切换，恢复旧 head Writable/Active 或继续 seal |
-| DataDrained | 验证 remote objects 后继续 hash/seal |
-| Hashed | 验证 digest 后创建/复用 new head并执行 CAS switch |
-| HeadSwitched | 保留新 head，完成 journal，不回滚 |
-| Completed | 可归档/清理 journal |
-
-恢复规则：
-
+- 过期 lease 由 `acquire_lease` 与 GC 回收；
+- packed publication journal 由 packed recovery（`RecoverPackedMount`、clean restore、
+  headless recovery）按其自身 phase 继续或中止；
 - object 已上传但 metadata 未引用：进入 orphan grace；
 - metadata 不得引用不存在或未 durable 的 object；
-- head switch 前后必须得到旧 view 或新 view之一；
-- new head 创建操作用 journal ID 保证幂等；
 - 无法证明状态时将 workspace 设为 Error，不猜测继续。
 
 ## 17. Diff
 
-v1 `workspace diff` 比较 fork base 与当前 sealed/head delta：
+v1 `workspace diff` 比较 fork base（或 `--against` 的不可变 revision）与当前 writable head：
 
 ```rust
 pub enum PathChangeKind {
@@ -1417,9 +1408,8 @@ mark roots：
 
 - 所有 workspace head；
 - 所有 active/releasing lease 的 base；
-- 所有非终态 journal 引用；
-- 所有管理员 snapshot/tag；
-- 正在构建的 compaction result。
+- 所有非终态 packed publication journal 引用；
+- 所有管理员 snapshot/tag。
 
 ### 18.2 Layer mark
 
@@ -1427,11 +1417,12 @@ mark roots：
 两阶段协议删除：先以精确值 CAS 标记 `Deleting`，重新扫描根集合复核，通过后删除 delta 键
 与 layer record；复核发现新引用则恢复为 `Sealed`。GC 同时删除超过宽限期的
 `Released`/`Expired` lease 与 `Completed`/`Aborted` journal（每个 workspace 保留最近一条
-journal 供 `inspect`）。
+journal 供 `inspect`）。extent commit 复核 slice deletion reservation，挂载内 GC 并发删除
+orphan slice 时新 extent 不会引用正在删除的 slice。
 
 ### 18.3 Slice mark
 
-不能仅按 `owner_layer` 删除 object，因为 compaction layer 可能继续引用原 slice。每次 GC
+不能仅按 `owner_layer` 删除 object，因为多个 layer 可能引用同一 slice。每次 GC
 cycle 从所有 reachable layer 的 Data extent 标记 reachable slice ID：
 
 1. mark reachable layers；
@@ -1443,23 +1434,11 @@ cycle 从所有 reachable layer 的 Data extent 标记 reachable slice ID：
 
 不得为 fork 对每个 slice 增加 eager refcount。
 
-## 19. Seal materialization
+## 19. Lower materialization
 
-active workspace 不存在可增长 layer depth，也不依赖后台 depth compaction。seal 的
-materialization：
-
-1. 读取固定 sealed base 和已 quiesce 的 writable upper；
-2. 构建等价的平坦 sealed layer；
-3. namespace/dentry/xattr/ACL 计算 newest winner；
-4. extent 计算等价 Data/Hole plan；
-5. 可复用 immutable slice，不强制重写 object；
-6. 计算新 digest/root hash；
-7. CAS 替换 workspace、active lease 和空 writable head；
-8. 旧 layer 保留到所有 lease/reference 消失；
-9. 后续 GC 回收。
-
-materialization 只发生在显式 seal/snapshot/publish 控制路径，不进入 foreground FUSE
-mutation。fork 只接受 flat `BaseRevision`，因此仍为 O(1) metadata mutation。
+不存在 seal/flatten 物化。新的 lower 只由 packed publication 生成（§14.3）。测试需要非空
+flat lower 时使用 `test_base_fixture::install_test_base`（`#[cfg(test)]`），它只能用于离线
+workspace，不是生产 API。
 
 ## 20. 后台任务
 
@@ -1467,11 +1446,8 @@ workspace mount/daemon 只启动 feature module 内的：
 
 ```text
 lease heartbeat（只执行 renew_lease，不回收租约）
-seal recovery worker（开头执行过期租约回收）
 layer GC（含终止态 lease/journal 清理）
 orphan object GC
-workspace compaction
-head invalidation watcher（backend 支持时）
 ```
 
 不得为 workspace mount 启动当前基于 raw flat MetaStore 的 CompactionWorker/GC。普通 mount
@@ -1488,15 +1464,14 @@ brewfs workspace --meta-backend <sqlx|redis|tikv> \
   [--workspace-namespace <name>] <command>
 
 brewfs workspace init-volume
+brewfs workspace init-packed-volume --manifest-key <key> --data-config <file>
 brewfs workspace migrate
 brewfs workspace create [--from <revision>]
-brewfs workspace snapshot <workspace>
-brewfs workspace fork <workspace-or-revision> --count <n>
+brewfs workspace fork <revision> --count <n>
 brewfs workspace list
 brewfs workspace inspect <workspace>
 brewfs workspace diff <workspace> [--against <revision>]
 brewfs workspace discard <workspace>
-brewfs workspace commit <workspace> --to <target>
 
 brewfs mount <mountpoint> --workspace <workspace-id>
 ```
@@ -1512,7 +1487,8 @@ revision 外部编码：
 <layer-uuid>:<sealed-version>:<root-hash-hex>
 ```
 
-API 不接受只有 layer ID 的 fork/commit precondition。
+API 不接受只有 layer ID 的 fork precondition。`workspace snapshot`、`workspace commit` 与
+`fork <workspace-uuid>` 已删除：它们都需要封存 live workspace。
 
 ### 21.1 Inspect 输出
 
@@ -1525,7 +1501,7 @@ base_revision/layer_depth
 lease_id/holder_generation/expires_at
 private metadata rows/private bytes/shared bytes
 pending writeback
-last seal journal phase/error
+last packed publication journal phase/error
 ```
 
 ## 22. Error 类型
@@ -1566,9 +1542,6 @@ brewfs_workspace_mount_total{result}
 brewfs_workspace_fork_total{result}
 brewfs_workspace_fork_control_latency_seconds
 brewfs_workspace_fork_drain_latency_seconds
-brewfs_workspace_seal_total{result,phase}
-brewfs_workspace_seal_pending_bytes
-brewfs_workspace_quiesce_latency_seconds
 brewfs_workspace_publish_total{result}
 brewfs_workspace_publish_changed_paths
 brewfs_workspace_layer_depth
@@ -1581,7 +1554,6 @@ brewfs_workspace_active_leases
 brewfs_workspace_fenced_writes_total
 brewfs_workspace_gc_reachable_layers
 brewfs_workspace_gc_orphan_bytes
-brewfs_workspace_compaction_bytes
 ```
 
 flat `.stats` 现有字段不得改变；workspace metric 仅在 feature build 注册。
@@ -1631,39 +1603,25 @@ flat `.stats` 现有字段不得改变；workspace metric 仅在 feature build �
 - symlink 与循环限制；
 - xfstests、pjdfstest 双 workspace harness。
 
-### 24.4 Lifecycle/crash tests
+### 24.4 Lifecycle/fencing tests
 
-在 seal 每一 phase 注入 crash：
+唯一写者不变量（全部为必过回归）：
 
-```text
-before/after quiesce
-before/after dirty freeze
-before/after object upload
-before/after metadata append
-before/after digest
-before/after layer sealed
-before/after head switch
-before/after journal complete
-```
-
-结果必须为旧 view 或新 view 之一。
-
-另测：
-
-- stale head epoch write；
+- 第二个 mount 不能获取 live lease（`Busy`），原 holder 继续提交；
+- lease 过期（backend 时钟）后旧 holder 的提交失败；
+- lease 丢失后提交失败，且持有 packed open record 时其他 holder 不能接管；
+- 任何 admin 路径都不能在他人 live lease 下改变 head（§15.3）；
+- 挂载期间 fork/discard 其他 workspace 不改变挂载 workspace 的 head/epoch；
 - stale holder generation heartbeat/write；
 - fork 不遍历文件/slice；
-- commit target revision changed；
-- commit 一个 conflict 时零部分生效；
-- publish失败保留 source workspace；
-- active command 未退出返回 Busy。
+- packed publication 各 phase crash 后结果为旧 binding 或新 binding 之一。
 
-### 24.5 GC/compaction
+### 24.5 GC
 
-- 100 child 共享 base，删除 99 个不回收 base；
+- 100 child 共享 lower，删除 99 个不回收 lower；
 - active lease 阻止回收；
 - expired lease grace；
-- compaction 复用 slice 后 origin layer 删除不误删 object；
+- 共享 slice 被多个 layer 引用时删除 origin layer 不误删 object；
 - CAS replacement 失败保留旧 graph；
 - orphan upload grace 后回收；
 - GC 重启幂等。
@@ -1676,8 +1634,8 @@ before/after journal complete
 - point lookup 必须保持一次 backend round trip，且耗时不随无关 key 数量增长；
 - 100 child 读同 base block 的 shared cache/singleflight；
 - randrw、small-file create、rename、git checkout/build；
-- 分开报告 active throughput、fsync/close、seal drain、fork control latency；
-- 并发 fork 与并发 seal 的拓扑吞吐与延迟基准；拓扑操作延迟不得随无关 workspace 数量与
+- 分开报告 active throughput、fsync/close、fork control latency；
+- 并发 fork 的拓扑吞吐与延迟基准；拓扑操作延迟不得随无关 workspace 数量与
   无关写入频率增长；
 - default-flat 与 feature-enabled-flat 对照，回归超出噪声阈值即阻断。
 
@@ -1700,7 +1658,7 @@ workspace TiKV: live distributed catalog contract + 双 mount FUSE + pjdfstest
 
 ### 24.8 拓扑事务并发与目录迁移
 
-- 并发心跳不阻塞 seal；
+- 并发心跳不阻塞 fork/publication；
 - 64 个并发 fork 全部成功；
 - 拓扑操作 × 心跳 / × 本 workspace 写入 / × 其他 workspace 写入的冲突矩阵；
 - GC 与根创建竞争两个方向（故障注入）；
@@ -1709,6 +1667,8 @@ workspace TiKV: live distributed catalog contract + 双 mount FUSE + pjdfstest
 - Redis、TiKV、SQLite 三个后端运行同一套契约。
 
 ## 25. 分阶段 PR
+
+（历史交付顺序；PR 6–8 中的 seal/commit/compaction 部分已在 2026-10-17 删除。）
 
 ### PR 1：Feature scaffolding 与纯 resolver
 
@@ -1757,29 +1717,21 @@ workspace TiKV: live distributed catalog contract + 双 mount FUSE + pjdfstest
 - CLI mount flag；
 - recovery cleanup。
 
-### PR 6：Seal/fork/discard
+### PR 6：Fork/discard
 
-- quiesce；
-- DurableRemote barrier；
-- seal journal/recovery；
-- fork/discard；
-- control CLI/API；
-- crash injection。
+- fork from exact revision/discard；
+- control CLI/API。
 
-### PR 7：Diff/commit
+### PR 7：Diff
 
-- path diff；
-- fast-forward preconditions；
-- all-or-reject CAS commit；
-- conflict diagnostics。
+- path diff。
 
-### PR 8：GC/compaction/observability
+### PR 8：GC/observability
 
 - layer/slice mark-and-sweep；
 - orphan GC；
-- lease-aware compaction；
 - metrics/inspect；
-- depth/performance gates。
+- performance gates。
 
 ### PR 9：Redis/TiKV 生产 backend
 
@@ -1802,15 +1754,15 @@ Workspace Overlay v1 只有满足以下全部条件才可声明可用：
 3. 两个 workspace 在核心 POSIX mutation 上完全隔离；
 4. partial write 只产生修改范围相关的新 slice/block；
 5. truncate/hole 不暴露 lower data；
-6. seal/fork/commit crash test 不产生半提交 view；
+6. fork 与 packed publication crash test 不产生半提交 view；
 7. fork 不遍历 base inode/slice/object；
 8. stale writer/lease 被 fencing；
-9. discard/GC/compaction 不删除可达 object；
-10. fast-forward commit 为 all-or-reject；
+9. discard/GC 不删除可达 object；
+10. 任何路径都不在他人 live lease 下改变 head（§15.3）；
 11. xfstests、pjdfstest 和现有 Rust workspace gate 通过；
 12. flat-only 与 workspace-enabled binary 的部署错误均 fail-closed。
 13. Redis 和 TiKV 分别通过两个独立 store instance 的 CAS 并发 contract；
-14. Redis/TiKV 上两个 sibling workspace 同时挂载时共享 sealed base 且 mutation 互不可见；
+14. Redis/TiKV 上两个 sibling workspace 同时挂载时共享不可变 lower 且 mutation 互不可见；
 15. 拓扑事务检查集等于读取集、不触碰无关 workspace 的键，并发心跳不阻塞其他 workspace 的
     拓扑操作；
 16. v1 目录迁移可续跑且实体完整，迁移完成前 mount 被拒绝，迁移后旧版本二进制 fail-closed。

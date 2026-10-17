@@ -5,9 +5,11 @@
 - Volume format: `workspace-v1`
 - Catalog format: 2 (entity-key layout; `control` keeps only the volume header)
 - Production metadata backends: Redis and TiKV
+- Model (2026-10-17): immutable lower + non-rotating writable overlay. There is
+  no seal transaction, no compaction/flatten step and no strict lower mode.
 
 This document is the maintained architecture reference for BrewFS agent
-workspaces. The detailed API, state-machine fields, and implementation checklist
+workspaces. The detailed API, record fields, and implementation checklist
 remain in the
 [workspace overlay implementation spec](../superpowers/specs/2026-08-23-brewfs-workspace-overlay-implementation-spec.md).
 Changes to persisted records, transaction boundaries, fencing, layer reachability,
@@ -15,10 +17,11 @@ or mount integration must update this document in the same pull request.
 
 ## Goals and boundaries
 
-Workspace Overlay lets multiple agents share immutable base files and object
+Workspace Overlay lets multiple agents share immutable lower files and object
 blocks while keeping each agent's namespace, inode attributes, and data extents
-private. Forking creates metadata records and a new writable head; it does not
-copy the sealed base or clean object data.
+private. Creating or forking a workspace from an exact revision writes metadata
+records and a new empty writable overlay; it does not copy the lower or object
+data.
 
 The feature is deliberately isolated from existing BrewFS volumes:
 
@@ -27,6 +30,37 @@ The feature is deliberately isolated from existing BrewFS volumes:
 - the default build does not compile `src/workspace_overlay/`;
 - object keys and the existing `SliceDesc` representation are unchanged;
 - a workspace error never falls back to flat-volume semantics.
+
+## The two-layer model
+
+Every mounted view is exactly one immutable lower plus one writable overlay:
+
+```text
+writable overlay (depth 2, owned by one workspace) -> immutable lower (depth 1) -> null
+```
+
+- **Immutable lower.** A `Sealed` layer with no parent. In production it is an
+  authenticated packed-v3 manifest bound to the workspace (`PackedLowerBinding`);
+  the volume root created by `init-volume` is an empty lower. A lower never
+  changes after it is bound, so the mount authenticates its binding once at
+  attach and then serves lower inodes, permission inputs, reverse aliases and
+  `(parent, name)` lookups from binding-lifetime memos.
+- **Writable overlay.** The workspace's head. Its layer ID and head epoch do not
+  change while a writer lease is live: no code path seals, rotates or flattens a
+  mounted head. Whiteouts in the overlay stop fallback to the lower.
+- **Where new lowers come from.** Only the packed publication pipeline
+  (pack upload -> authenticated manifest -> binding install/publish) produces a
+  new immutable lower. It runs under the single writable lease of the workspace
+  it changes (see [Head changes](#head-changes-and-the-active-lease)).
+
+Point reads batch the two exact keys into one Redis `MGET` or TiKV batch-get;
+they never scan metadata. Extents are clipped and combined into a read plan
+before the existing chunk reader fetches object blocks.
+
+`statfs` does not enumerate inode deltas to synthesize effective usage. Until
+Redis, TiKV, and SQLite persist usage counters atomically with each mutation,
+the workspace metadata layer returns an explicit `NotSupported` error instead of
+reporting zero usage or an inconsistent snapshot.
 
 ## Component architecture
 
@@ -38,75 +72,100 @@ flowchart TB
     FuseA --> MetaA[WorkspaceMetaLayer<br/>workspace A]
     FuseB --> MetaB[WorkspaceMetaLayer<br/>workspace B]
 
-    MetaA --> Resolver[Layer resolver<br/>newest record wins]
+    MetaA --> Resolver[Layer resolver<br/>overlay wins over lower]
     MetaB --> Resolver
-    MetaA --> Catalog[WorkspaceStore state machine]
+    MetaA --> Catalog[WorkspaceStore]
     MetaB --> Catalog
 
     Catalog --> KV{Redis or TiKV}
     Resolver --> KV
 
     KV --> Control[control<br/>volume header · catalog format]
-    KV --> Entities[ws · layer<br/>lease · journal<br/>snapshot · alloc]
+    KV --> Entities[ws · layer · lease<br/>journal · snapshot · alloc]
     KV --> Delta[delta/dentry · inode<br/>xattr · acl · extent]
 
     FuseA --> Chunk[Existing chunk read/write path]
     FuseB --> Chunk
     Chunk --> Objects[(S3-compatible or local<br/>immutable blocks)]
 
-    Shared[Fixed sealed base] --> Resolver
+    Lower[Immutable lower<br/>packed-v3 manifest] --> Resolver
     Delta --> Resolver
-    Shared -. shared by both agents .-> Objects
+    Lower -. shared by both agents .-> Objects
 ```
-
-Every active view contains exactly two layers: one private writable overlay and
-one flat sealed base. The base has no parent and remains fixed until an explicit
-seal publishes a replacement base. Point reads batch the two exact keys into one
-Redis `MGET` or TiKV batch-get; they never scan metadata. Whiteouts in the upper
-stop fallback to the base. Extents are clipped and combined into a read plan
-before the existing chunk reader fetches object blocks.
-
-`statfs` does not enumerate inode deltas to synthesize effective usage. Such a
-scan is O(N), needs to block workspace mutations for a consistent view, and is
-unbounded on the FUSE hot path. Until Redis, TiKV, and SQLite persist usage
-counters and update them atomically with each workspace mutation, the workspace
-metadata layer returns an explicit `NotSupported` error instead of reporting
-zero usage or an inconsistent snapshot.
 
 ## Persisted graph
 
 ```mermaid
 flowchart LR
-    WS1[Workspace A] --> HA[Writable head A]
-    WS2[Workspace B] --> HB[Writable head B]
-    HA --> Base[Sealed base revision]
+    WS1[Workspace A] --> HA[Writable overlay A]
+    WS2[Workspace B] --> HB[Writable overlay B]
+    HA --> Base[Immutable lower revision]
     HB --> Base
-    LeaseA[Lease A] -. fences writes .-> WS1
-    LeaseB[Lease B] -. fences writes .-> WS2
+    LeaseA[Lease A] -. sole writer .-> WS1
+    LeaseB[Lease B] -. sole writer .-> WS2
     Snap[Snapshot] -. GC root .-> Base
-    Journal[Seal journal] -. recovery root .-> HA
+    Journal[Packed publication journal] -. recovery root .-> HA
 
     HA --> DA[Private deltas A]
     HB --> DB[Private deltas B]
     Base --> Blocks[Shared immutable blocks]
 ```
 
-Workspace heads, snapshots, active leases, and incomplete seal journals are GC
-roots. A layer or object slice may be deleted only after it is unreachable from
-all roots and the configured lease grace period has elapsed.
+Workspace heads, fork bases, snapshots, protected leases and incomplete packed
+publication journals are GC roots. A layer or object slice may be deleted only
+after it is unreachable from all roots and the configured lease grace period has
+elapsed.
 
-The active graph invariant is `writable(depth=2) -> sealed(depth=1) -> null`.
-Sealed ancestry is never exposed to the FUSE data path.
+## Lease and sole-writer safety
+
+One writable lease per workspace is the only write authority:
+
+- `WorkspaceRecord.active_lease` is CASed `None -> Some(lease_id)` on acquire, so
+  a second mount gets `Busy` while a lease is live. Release and expiry clear it;
+  acquire also clears a dangling pointer to an already-invalid lease.
+- Every mutation CAS checks the lease row (ID, holder generation, `Active`,
+  writable), `workspace.active_lease`, the packed writer-authority and open
+  records, and a backend-time deadline (`lease.expires_at_ns`). A stalled or
+  fenced mount cannot commit after its lease expires, even with no other change.
+- Lease expiry uses metadata-backend time, never mount-host wall time: Redis
+  `TIME`; TiKV the transaction start timestamp (PD TSO physical milliseconds,
+  converted with checked arithmetic); SQLite its local transaction clock.
+- The heartbeat renews only its own lease. `LeaseValidity` keeps a local
+  deadline (request start + TTL, extended by each successful renewal of both the
+  native and packed heartbeats, revoked on any failure). Upper-row, namespace
+  and permission caches serve only while it is authoritative and are cleared
+  otherwise.
+- While a packed open record is held, no other holder can take the workspace
+  over, even after this mount loses its lease.
+
+## Head changes and the active lease
+
+No path changes `head_layer_id` or `head_epoch` of a workspace whose writable
+lease belongs to someone else. Every head writer requires the caller to present
+the single live writable lease of that workspace:
+
+| Writer | Gate |
+| --- | --- |
+| Hot mutation (`next_sequence` only) | `checked_hot_guard` in the mutation CAS |
+| `install_packed_lower_binding` / `publish_packed_lower_binding` | `checked_hot_guard` (KV) / `checked_guard` (SQLite) inside the CAS |
+| Packed journal commit | exact guard equality plus committed-state revalidation |
+| Initial packed bootstrap | `workspace.active_lease == guard.lease_id` |
+| Native publication complete driver | `workspace.active_lease == actual.lease` in the CAS |
+| Clean restore / headless recovery | original lease must be `Released`; the successor lease is the only `Active` writable lease |
+
+Because `acquire_lease` refuses a second live lease, an administrator cannot
+obtain the authority these writers need while a mount holds the workspace. The
+regression test `invariant_no_head_change_under_an_active_lease` covers a
+foreign holder generation, a foreign lease ID and a competing acquire.
 
 ## Transaction architecture
 
 ### Hot data path
 
 Ordinary namespace, inode, xattr, ACL, and extent mutations do not read or CAS
-the global `control` record. They atomically check exactly three entity records
-(`ws/<workspace-id>`, `layer/<head-layer-id>`,
-`lease/<workspace-id>/<lease-id>`) and update the current layer plus delta
-keys:
+the global `control` record. They atomically check the workspace, head-layer and
+lease records (plus the packed authority rows on packed mounts) and update the
+head layer plus delta keys:
 
 ```mermaid
 sequenceDiagram
@@ -115,9 +174,9 @@ sequenceDiagram
     participant K as Redis / TiKV
 
     M->>S: mutation + HeadGuard
-    S->>K: batched entity records + authoritative time<br/>(Redis TIME+MGET / TiKV transaction timestamp+batch-get)
-    S->>S: validate workspace, head epoch,<br/>owner, lease generation and expiry
-    S->>K: atomic CAS(three expected values)<br/>put layer record + delta keys
+    S->>K: batched entity records + authoritative time
+    S->>S: validate workspace, owner, lease generation and expiry
+    S->>K: atomic CAS(expected values, lease deadline)<br/>put layer record + delta keys
     alt CAS conflict
         S->>K: bounded retry from fresh values
     else committed
@@ -125,67 +184,55 @@ sequenceDiagram
     end
 ```
 
+Because the mount is the sole writer and its head never rotates, a packed
+commit does not pre-read its view. It reuses the exact post-commit bytes of its
+own previous commit (workspace, head, lower, lease, PWB3, writer-authority and
+open records, CONTROL, head reverse state and extent generation) as the CAS
+conditions. Each value is still compared atomically, and the CAS still enforces
+the lease deadline in backend time. A value changed outside the mount (a lease
+renewal, an admin fence, GC) only fails the CAS; the commit then re-reads and
+fully revalidates once. The first commit after mount, and every commit made
+under a recovery token, always read fresh.
+
 The writable layer owns its `next_sequence`, so writers in the same workspace
 serialize correctly while sibling workspaces do not contend. Lease renewal CASes
 only `lease/<workspace-id>/<lease-id>`. Each ID allocator CASes only its own
-`alloc/<name>` record.
+`alloc/<name>` record. The in-mount GC deletes orphan slices concurrently, so the
+native extent-generation and slice-deletion checks stay in every extent commit.
 
 Named dentry, inode, xattr, and ACL resolution uses exact batched reads. Prefix
-enumeration is reserved for `readdir`, layer materialization, and GC. Redis keeps
-a transactionally maintained lexicographic key index so those operations read
-only the requested key range; `SCAN MATCH` is used once only to migrate an older
-catalog that lacks the index marker.
+enumeration is reserved for `readdir`, publication capture and GC.
 
 ### Low-frequency topology path
 
-Seal, fork, snapshot, commit, compaction, GC, and lease acquire/release build a
-read-tracked topology transaction. The store reads each entity it needs by exact
-key, records the original value of every read, and runs a pure closure that
-validates and modifies those entities. The check set equals the read set, the
-write set is exactly the entities the closure modified, and one multi-key CAS
-commits all checks and writes atomically; an outside observer sees either the
-pre-commit or the post-commit state. A closure cannot read an entity it did not
-declare, so an undeclared dependency fails at the interface instead of silently
-committing from an old view, and retries re-execute the closure on fresh values.
-
-Every topology operation touches only keys of the workspaces it involves. Sibling
-workspaces' seals, forks, and GC run in parallel, and heartbeats or hot writes
-from unrelated workspaces never intersect a topology transaction's check set.
-Conflicting retries use bounded exponential backoff with jitter. There is no
-process-global topology gate: concurrent topology transactions serialize through
-the backend multi-key CAS, and transactions on different workspaces proceed in
+Fork, snapshot pinning, discard, GC, lease acquire/release and packed
+publication build a read-tracked topology transaction. The store reads each
+entity it needs by exact key, records the original value of every read, and runs
+a pure closure that validates and modifies those entities. The check set equals
+the read set, the write set is exactly the entities the closure modified, and
+one multi-key CAS commits all checks and writes atomically. Retries re-execute
+the closure on fresh values with bounded exponential backoff and jitter. There
+is no process-global topology gate; transactions on different workspaces run in
 parallel.
 
 The catalog stores one key per entity — `ws/<workspace-id>`,
 `layer/<layer-id>`, `lease/<workspace-id>/<lease-id>`,
 `journal/<workspace-id>/<journal-id>`, `snapshot/<snapshot-id>`, and
-`alloc/<name>` — with entity keys as the sole copy of each record. The
-`control` key holds only the volume header and catalog format and is written
-only at volume creation and catalog migration. Lease and journal keys are
-grouped by workspace prefix so per-workspace listing stays exact.
-
-A single active writable lease per workspace is enforced by
-`WorkspaceRecord.active_lease`: acquire CASes the field `None ->
-Some(lease_id)`, release and expiry clear it, and acquire also clears a dangling
-pointer to an already-invalid lease so no termination path can block remount.
+`alloc/<name>`. Journal keys hold the packed publication journal only. The
+`control` key holds the volume header and catalog format and is written only at
+volume creation and catalog migration.
 
 GC deletes a layer in two phases: it CAS-marks the candidate `Deleting` from the
 exact value it read, rescans the root set to confirm no new root references the
-layer (abandoning the deletion and restoring `Sealed` on a hit), and only then
-deletes the delta keys and the layer record. Root-creating operations (fork,
-snapshot, lease acquire, seal begin) CAS-check the exact value of the base layer
-they reference, including `state == Sealed`. GC also reaps `Released`/`Expired`
-leases and `Completed`/`Aborted` journals past their grace period, keeping the
-most recent journal per workspace for `inspect`, so catalog size tracks active
-entities. Expired-lease reaping lives in lease acquire, the GC cycle, and the
-start of seal recovery; the heartbeat task only renews its own lease and stops
-on renewal failure, after which writes are fenced.
+layer (restoring `Sealed` on a hit), and only then deletes the delta keys and
+the layer record. Root-creating operations (fork, snapshot, lease acquire,
+packed publication) CAS-check the exact value of the lower layer they reference.
+GC also reaps `Released`/`Expired` leases and terminal journals past their grace
+period.
 
-`initialize_workspace_schema` migrates older catalogs: it detects the previous
-document format, writes each entity to its entity key, and CAS-switches `control`
-to a header-only document with `catalog_format: 2`. The single-key CAS makes the
-migration run once and a crash mid-migration can resume. Mounting refuses an
-unmigrated catalog and points at the migration command:
+`initialize_workspace_schema` migrates older catalogs to the entity-key layout
+(`catalog_format: 2`) with a single-key CAS. Mounting refuses an unmigrated
+catalog and points at the migration command:
 
 ```text
 brewfs workspace --meta-backend redis --meta-url <url> migrate
@@ -193,84 +240,63 @@ brewfs workspace --meta-backend sqlx --meta-url <url> migrate
 brewfs workspace --meta-backend tikv --meta-tikv-pd-endpoints <pd-endpoints> migrate
 ```
 
-TiKV selects its PD endpoints with `--meta-tikv-pd-endpoints`; `--meta-url` is
-used only by the Redis and SQLite backends. The command selects the same
-backend, endpoint, and `workspace-namespace` as every other workspace CLI
-invocation. Migration is one-way: once `control` carries
-`catalog_format: 2`, older binaries that only understand the entity-table
-document cannot read the catalog, so the release notes must state that all
-readers must be upgraded before `migrate` runs. The operator-facing upgrade notice is in
-[`doc/releases/workspace-catalog-format-2.md`](../releases/workspace-catalog-format-2.md).
-
-Redis implements multi-key CAS with a binary-safe Lua script. All workspace keys
+Redis implements multi-key CAS with a binary-safe Lua script; all workspace keys
 use one fixed cluster hash tag. TiKV uses pessimistic transactions and
 `get_for_update` for the checked entity keys.
 
-## Authoritative lease time
+## Workspace lifecycle (CLI)
 
-Lease expiry must be based on metadata-backend time, never mount-host wall time:
+| Command | Effect |
+| --- | --- |
+| `init-volume` / `init-packed-volume` | Create the volume and its default workspace over an empty or packed-v3 lower |
+| `create --from <revision>` | One new workspace overlay on an exact immutable revision |
+| `fork <revision> --count N` | N new workspace overlays on an exact immutable revision |
+| `list`, `inspect`, `diff` | Read-only views |
+| `discard` | Mark a workspace `Deleting` for lease-aware GC |
 
-- Redis uses `TIME`;
-- TiKV reuses the transaction start timestamp and converts its PD TSO physical
-  millisecond component to nanoseconds with checked arithmetic;
-- SQLite is a local semantic and fault-injection backend and uses its local
-  transaction clock.
-
-Every mutation also checks workspace ID, head layer ID, head epoch, lease ID,
-holder generation, writable state, and expiry. A stale mount is fenced before
-any delta or sequence update is committed.
-
-## State transitions
-
-Writable heads follow `Writable -> Sealing`; abort is permitted only before
-hashing and restores the old writable view. A successful seal materializes the
-fixed base plus the writable delta into a new flat sealed base, creates one empty
-writable overlay, and atomically switches the workspace and active lease to that
-pair. Immutable object blocks are reused rather than copied. The durable journal
-makes recovery idempotent across crashes, and mount recovery flattens a transient
-post-switch chain before admitting a writer.
-
-Fast-forward commit is deliberately restricted: the source revision and target
-fork base must still match, the target head must be empty, and the target must
-have no active writable lease. Conflicts preserve the child workspace for
-inspection or retry.
+There is no `workspace snapshot`, `workspace commit` or `fork <workspace-uuid>`:
+each of those sealed a live workspace. Named snapshots pin an existing immutable
+revision (packed publication) and are managed by the operator.
 
 ## Code map
 
-- `src/workspace_overlay/meta_layer.rs`: POSIX-facing workspace metadata layer.
-- `src/workspace_overlay/resolver.rs`: layered namespace and extent resolution.
+- `src/workspace_overlay/meta_layer/`: POSIX-facing workspace metadata layer;
+  `packed_lower.rs` holds the immutable-lower memos and read fences.
+- `src/workspace_overlay/resolver/`: layered namespace and extent resolution.
 - `src/workspace_overlay/catalog.rs`: backend-neutral storage contract.
 - `src/workspace_overlay/stores/kv_store.rs`: shared Redis/TiKV state machine,
   read-tracked topology transactions, and catalog migration.
-- `src/workspace_overlay/stores/redis.rs`: Redis key scoping, Lua CAS, server time.
-- `src/workspace_overlay/stores/tikv.rs`: TiKV transactions, scans, and PD TSO.
-- `src/workspace_overlay/lifecycle.rs`: seal, fork, snapshot, commit, recovery.
-- `src/workspace_overlay/gc.rs` and `compaction.rs`: reachability and flattening.
-- `src/workspace_overlay/cache_scope.rs`: workspace-aware cache identities.
+- `src/workspace_overlay/stores/kv_store/packed_journal/`: packed publication
+  journal, native publication drivers and registry.
+- `src/workspace_overlay/stores/redis.rs` / `tikv.rs`: backend CAS and time.
+- `src/workspace_overlay/lifecycle/`: fork, discard, mount session, heartbeat
+  and `LeaseValidity`.
+- `src/workspace_overlay/gc.rs`: reachability and deletion.
+- `src/workspace_overlay/test_base_fixture.rs` (tests only): seeds a non-empty
+  flat lower for GC/diff/resolver tests.
 
 ## Required maintenance and verification
 
 Any architecture change must preserve and test these invariants:
 
-1. sibling workspaces share sealed bases but never observe each other's deltas;
-2. hot mutations never CAS `control`;
-3. same-head sequence allocation is gap-safe under backend CAS retries;
-4. heartbeat and allocators remain entity-local;
-5. stale epochs and lease generations cannot partially write;
-6. active leases and incomplete journals prevent premature GC;
-7. default flat-volume behavior and serialized metadata remain unchanged;
-8. Redis and TiKV both pass the distributed two-store concurrency contract;
-9. every mounted workspace resolves exactly two layers;
-10. named point reads issue no prefix scans, regardless of backend key count;
-11. every topology transaction checks exactly the entities it read and touches no
-    other workspace's keys;
-12. GC marks a layer `Deleting` and rechecks the root set before deleting its
-    delta keys, and root-creating operations check the referenced base layer's
-    exact value;
-13. `Released`/`Expired` leases and `Completed`/`Aborted` journals past grace
-    are reaped, and the heartbeat task never reaps leases;
-14. mounting refuses an unmigrated catalog and directs the operator to the
-    migration command.
+1. sibling workspaces share a lower but never observe each other's deltas;
+2. every mounted workspace resolves exactly one immutable lower and one writable
+   overlay, and no code path rotates a mounted head;
+3. a second mount cannot acquire a live lease (`Busy`);
+4. a commit after lease expiry or lease loss fails closed, and a held packed open
+   record blocks takeover;
+5. no admin path changes the head of a workspace under another holder's live
+   lease;
+6. hot mutations never CAS `control`;
+7. same-head sequence allocation is gap-safe under backend CAS retries;
+8. heartbeat and allocators remain entity-local;
+9. lease-bound caches serve only while the lease is proven held;
+10. active leases and incomplete publication journals prevent premature GC, and
+    extent commits recheck slice-deletion reservations;
+11. named point reads issue no prefix scans;
+12. every topology transaction checks exactly the entities it read and touches
+    no other workspace's keys;
+13. default flat-volume behavior and serialized metadata remain unchanged.
 
 The feature test suite, resolver oracle tests, real Redis/TiKV backend contracts,
 dual-mount isolation tests, pjdfstest, and xfstests gates are the acceptance
