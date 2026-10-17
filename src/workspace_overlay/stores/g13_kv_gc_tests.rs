@@ -912,19 +912,6 @@ async fn g13d_kv_packed_root_change_at_delete_cas_is_revalidated() {
         })
         .await
         .unwrap();
-    let sealed = crate::workspace_overlay::lifecycle::WorkspaceLifecycle::new(store.clone())
-        .seal(
-            &ViewContext {
-                workspace_id: child.workspace_id,
-                head_layer_id: child.head_layer_id,
-                head_epoch: child.head_epoch,
-                lease_id: child_lease.lease_id,
-                holder_generation: child_lease.holder_generation,
-            },
-            &crate::workspace_overlay::lifecycle::NoopDurableRemoteBarrier,
-        )
-        .await
-        .unwrap();
     store
         .release_lease(ReleaseLease {
             lease_id: child_lease.lease_id,
@@ -932,6 +919,7 @@ async fn g13d_kv_packed_root_change_at_delete_cas_is_revalidated() {
         })
         .await
         .unwrap();
+    let sealed = crate::workspace_overlay::test_base_fixture::install_test_base(&store, child.workspace_id).await;
     store
         .mark_workspace_deleting(MarkDeleting {
             workspace_id: child.workspace_id,
@@ -1007,25 +995,13 @@ async fn g13c_kv_sealed_then_deleted_fork_releases_all_cached_history_for_real_g
         })
         .await
         .unwrap();
-    let sealed = crate::workspace_overlay::lifecycle::WorkspaceLifecycle::new(peer.clone())
-        .seal(
-            &ViewContext {
-                workspace_id: child.workspace_id,
-                head_layer_id: child.head_layer_id,
-                head_epoch: child.head_epoch,
-                lease_id: lease.lease_id,
-                holder_generation: lease.holder_generation,
-            },
-            &crate::workspace_overlay::lifecycle::NoopDurableRemoteBarrier,
-        )
-        .await
-        .unwrap();
     peer.release_lease(ReleaseLease {
         lease_id: lease.lease_id,
         holder_generation: lease.holder_generation,
     })
     .await
     .unwrap();
+    let sealed = crate::workspace_overlay::test_base_fixture::install_test_base(&peer, child.workspace_id).await;
     assert_child_reads_shared(
         peer.clone(),
         child.workspace_id,
@@ -1036,15 +1012,9 @@ async fn g13c_kv_sealed_then_deleted_fork_releases_all_cached_history_for_real_g
     .await;
     let active = writer.load_workspace(child.workspace_id).await.unwrap();
     assert_eq!(active.state, WorkspaceState::Active);
-    assert_eq!(active.head_layer_id, sealed.new_head_layer_id);
+    assert_eq!(active.head_layer_id, sealed.replacement_head_layer_id);
     assert_eq!(active.head_epoch, sealed.head_epoch);
     assert_ne!(active.head_layer_id, child.head_layer_id);
-    assert!(
-        peer.list_incomplete_seal_journals()
-            .await
-            .unwrap()
-            .is_empty()
-    );
     peer.mark_workspace_deleting(MarkDeleting {
         workspace_id: child.workspace_id,
         force_fence_lease: false,
@@ -1064,7 +1034,7 @@ async fn g13c_kv_sealed_then_deleted_fork_releases_all_cached_history_for_real_g
         .collect::<Vec<_>>();
     expected_layers.sort();
     assert!(expected_layers.contains(&sealed.revision.layer_id));
-    assert!(expected_layers.contains(&sealed.new_head_layer_id));
+    assert!(expected_layers.contains(&sealed.replacement_head_layer_id));
     let report = collector(fresh, blocks.clone(), 0)
         .run_at(i64::MAX / 2)
         .await
@@ -1096,12 +1066,6 @@ async fn g13c_kv_sealed_then_deleted_fork_releases_all_cached_history_for_real_g
         "seal history cannot reappear from an old ControlState cache"
     );
     assert!(after.slice_references.is_empty());
-    assert!(
-        peer.list_incomplete_seal_journals()
-            .await
-            .unwrap()
-            .is_empty()
-    );
     let retry = collector(peer, blocks, 0)
         .run_at(i64::MAX / 2)
         .await

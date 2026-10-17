@@ -175,7 +175,13 @@ async fn payload_fixture() -> (Fixture, Arc<PayloadReadProbe>) {
             },
             CHUNK,
         )
-        .with_packed_v3_lower(binding.binding, lower, authority, upper.clone(), layout)
+        .with_packed_v3_lower(
+            binding.binding.clone(),
+            lower,
+            authority,
+            upper.clone(),
+            layout,
+        )
         .unwrap(),
     );
     meta.initialize().await.unwrap();
@@ -199,6 +205,7 @@ async fn payload_fixture() -> (Fixture, Arc<PayloadReadProbe>) {
             vfs,
             guard,
             payload,
+            binding,
         },
         probe,
     )

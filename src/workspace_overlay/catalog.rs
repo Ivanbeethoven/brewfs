@@ -7,9 +7,9 @@ use super::digest::CanonicalLayerDelta;
 use super::error::WorkspaceError;
 use super::ids::{JournalId, LayerId, LeaseId, SnapshotId, WorkspaceId};
 use super::model::{
-    AclDelta, BaseRevision, CommitResult, DataExtentDelta, DentryDelta, InodeDelta, InodeState,
-    LayerRecord, LayerState, SealJournal, SealPhase, SealResult, SnapshotLease, SnapshotRecord,
-    ValueOp, VolumeHeader, WorkspaceRecord, XattrDelta,
+    AclDelta, BaseRevision, DataExtentDelta, DentryDelta, InodeDelta, InodeState, LayerRecord,
+    LayerState, SealJournal, SnapshotLease, SnapshotRecord, ValueOp, VolumeHeader, WorkspaceRecord,
+    XattrDelta,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,38 +108,6 @@ pub struct CreateSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BeginSeal {
-    pub guard: HeadGuard,
-    pub journal_id: JournalId,
-    pub new_head_layer_id: LayerId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdvanceSeal {
-    pub journal_id: JournalId,
-    pub expected_phase: SealPhase,
-    pub next_phase: SealPhase,
-    pub pending_bytes: Option<u64>,
-    pub last_error: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AbortSeal {
-    pub journal_id: JournalId,
-    pub reason: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FastForwardCommit {
-    pub source_revision: BaseRevision,
-    pub source_fork_base: BaseRevision,
-    pub target_workspace_id: WorkspaceId,
-    pub target_expected_head_layer_id: LayerId,
-    pub target_expected_head_epoch: u64,
-    pub new_head_layer_id: LayerId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkDeleting {
     pub workspace_id: WorkspaceId,
     pub force_fence_lease: bool,
@@ -173,8 +141,11 @@ pub struct DeleteLayerMetadata {
     pub lease_grace_ns: u64,
 }
 
+/// Test-only: materialize an offline workspace's resolved chain as a new flat
+/// immutable lower. Production lowers come only from packed publication.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InstallCompaction {
+pub struct InstallTestBase {
     pub workspace_id: WorkspaceId,
     pub expected_head_layer_id: LayerId,
     pub expected_head_epoch: u64,
@@ -184,8 +155,9 @@ pub struct InstallCompaction {
     pub delta: CanonicalLayerDelta,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompactionResult {
+pub struct TestBaseResult {
     pub revision: BaseRevision,
     pub replacement_head_layer_id: LayerId,
     pub head_epoch: u64,
@@ -869,23 +841,13 @@ pub trait WorkspaceStore: Send + Sync {
         &self,
         layer_id: LayerId,
     ) -> Result<CanonicalLayerDelta, WorkspaceError>;
-    async fn begin_seal(&self, request: BeginSeal) -> Result<SealJournal, WorkspaceError>;
-    async fn advance_seal(&self, request: AdvanceSeal) -> Result<SealJournal, WorkspaceError>;
-    async fn hash_seal(&self, journal_id: JournalId) -> Result<SealJournal, WorkspaceError>;
-    async fn commit_seal(&self, journal_id: JournalId) -> Result<SealResult, WorkspaceError>;
-    async fn abort_recoverable_seal(&self, request: AbortSeal) -> Result<(), WorkspaceError>;
     async fn load_seal_journal(&self, journal_id: JournalId)
     -> Result<SealJournal, WorkspaceError>;
-    async fn list_incomplete_seal_journals(&self) -> Result<Vec<SealJournal>, WorkspaceError>;
     /// 列出指定 workspace 的所有 seal journal，包括终止状态的记录。
     async fn list_seal_journals(
         &self,
         workspace_id: WorkspaceId,
     ) -> Result<Vec<SealJournal>, WorkspaceError>;
-    async fn fast_forward_commit(
-        &self,
-        request: FastForwardCommit,
-    ) -> Result<CommitResult, WorkspaceError>;
     async fn mark_workspace_deleting(&self, request: MarkDeleting) -> Result<(), WorkspaceError>;
     async fn record_orphan_slice(&self, request: RecordOrphanSlice) -> Result<(), WorkspaceError>;
     async fn gc_snapshot(
@@ -926,8 +888,12 @@ pub trait WorkspaceStore: Send + Sync {
         now_ns: i64,
         grace_ns: u64,
     ) -> Result<(), WorkspaceError>;
-    async fn install_compaction(
+    /// Test fixture only; see `InstallTestBase`.
+    #[cfg(test)]
+    async fn install_test_base(
         &self,
-        request: InstallCompaction,
-    ) -> Result<CompactionResult, WorkspaceError>;
+        _request: InstallTestBase,
+    ) -> Result<TestBaseResult, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedCapability("test base fixture"))
+    }
 }

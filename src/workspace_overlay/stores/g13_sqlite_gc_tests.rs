@@ -1,13 +1,8 @@
 use super::*;
-use crate::workspace_overlay::catalog::{
-    AdvanceSeal, DeleteLayerMetadata, MarkDeleting, ReleaseLease,
-};
+use crate::workspace_overlay::catalog::{DeleteLayerMetadata, MarkDeleting, ReleaseLease};
 use crate::workspace_overlay::error::WorkspaceError;
-use crate::workspace_overlay::ids::JournalId;
-use crate::workspace_overlay::model::{LeaseState, SealPhase, SnapshotLease, WorkspaceState};
-use crate::workspace_overlay::stores::g13_gc_contract_tests::{
-    BOUNDARIES, assert_delete, assert_mark,
-};
+use crate::workspace_overlay::model::{LeaseState, SnapshotLease, WorkspaceState};
+use crate::workspace_overlay::stores::g13_gc_contract_tests::{BOUNDARIES, assert_delete, assert_mark};
 
 async fn fixture(
     reaped: bool,
@@ -274,118 +269,5 @@ async fn g13d_sqlite_finalize_rejects_bound_deleting_head_and_keeps_batch_atomic
             .await
             .unwrap(),
         Some(record),
-    );
-}
-
-#[tokio::test]
-async fn g13d_sqlite_finalize_rechecks_packed_history_parent_closure() {
-    let (_objects, _client, _snapshot, proof, _payload) =
-        crate::workspace_overlay::stores::binding_tests::packed().await;
-    let store = SqliteWorkspaceStore::connect("sqlite::memory:")
-        .await
-        .unwrap();
-    let request = crate::workspace_overlay::stores::binding_tests::request(&store, proof).await;
-    let initial = store
-        .install_packed_lower_binding(request.clone())
-        .await
-        .unwrap();
-    let mut guard = HeadGuard {
-        expected_head_epoch: initial.head_epoch,
-        ..request.guard.clone()
-    };
-    let mut sealed = Vec::new();
-    // Retain an actual native parent chain. The public seal primitives are
-    // used directly here because WorkspaceLifecycle::seal flattens the chain.
-    for _ in 0..3 {
-        let journal = JournalId::new();
-        store
-            .begin_seal(BeginSeal {
-                guard: guard.clone(),
-                journal_id: journal,
-                new_head_layer_id: LayerId::new(),
-            })
-            .await
-            .unwrap();
-        for (expected_phase, next_phase, pending_bytes) in [
-            (SealPhase::Prepare, SealPhase::Quiesced, None),
-            (SealPhase::Quiesced, SealPhase::DataDrained, Some(0)),
-        ] {
-            store
-                .advance_seal(AdvanceSeal {
-                    journal_id: journal,
-                    expected_phase,
-                    next_phase,
-                    pending_bytes,
-                    last_error: None,
-                })
-                .await
-                .unwrap();
-        }
-        store.hash_seal(journal).await.unwrap();
-        let result = store.commit_seal(journal).await.unwrap();
-        guard.expected_head_layer_id = result.new_head_layer_id;
-        guard.expected_head_epoch = result.head_epoch;
-        sealed.push(result.revision);
-    }
-    store
-        .mark_workspace_deleting(MarkDeleting {
-            workspace_id: initial.workspace_id,
-            force_fence_lease: true,
-        })
-        .await
-        .unwrap();
-    let ancestor = sealed[1].layer_id;
-    // Stage a candidate while only the original binding history exists.
-    store
-        .delete_layer_metadata(DeleteLayerMetadata {
-            layer_ids: vec![ancestor],
-            now_ns: i64::MAX / 2,
-            lease_grace_ns: 0,
-        })
-        .await
-        .unwrap();
-    let before = store.load_layer(ancestor).await.unwrap();
-    assert_eq!(before.state, LayerState::Deleting);
-
-    // Persist a checksummed later-history fixture over that real native chain.
-    // This isolates history-root finalization; it makes no assertion about
-    // publication or seal recovery for a deleted workspace.
-    let mut history = initial.clone();
-    history.binding.binding_version = 2;
-    history.base_revision = sealed[2].clone();
-    history.binding.base_layer_id = history.base_revision.layer_id;
-    history.head_layer_id = guard.expected_head_layer_id;
-    history.head_epoch = guard.expected_head_epoch;
-    store
-        .rewrite_packed_binding_for_test(history.workspace_id, &history, false)
-        .await
-        .unwrap();
-    let snapshot = store.gc_snapshot(i64::MAX / 2, 0).await.unwrap();
-    assert!(
-        snapshot
-            .root_layers
-            .contains(&history.base_revision.layer_id)
-    );
-    assert!(!snapshot.root_layers.contains(&ancestor));
-    assert_eq!(
-        store
-            .load_layer(history.base_revision.layer_id)
-            .await
-            .unwrap()
-            .parent_layer_id,
-        Some(ancestor),
-    );
-    let error = store
-        .finalize_layer_metadata_deletion(vec![ancestor])
-        .await
-        .unwrap_err();
-    assert!(matches!(error, WorkspaceError::Busy));
-    assert_eq!(store.load_layer(ancestor).await.unwrap(), before);
-    assert_eq!(
-        store
-            .load_packed_binding_version(history.workspace_id, 2)
-            .await
-            .unwrap(),
-        Some(history),
     );
 }

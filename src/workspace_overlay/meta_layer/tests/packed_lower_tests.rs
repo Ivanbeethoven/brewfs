@@ -241,16 +241,6 @@ impl Fixture {
 }
 
 async fn fixture() -> Fixture {
-    fixture_with(false).await
-}
-
-/// Binding revocation is only observed per operation in strict mode; the
-/// frozen default fences only the writable head/lease per read.
-async fn strict_fixture() -> Fixture {
-    fixture_with(true).await
-}
-
-async fn fixture_with(strict: bool) -> Fixture {
     let native = super::test_meta().await;
     let temp = tempfile::tempdir().unwrap();
     let gets = Arc::new(AtomicU64::new(0));
@@ -379,11 +369,6 @@ async fn fixture_with(strict: bool) -> Fixture {
             },
         )
         .unwrap();
-    let meta = if strict {
-        meta.with_strict_packed_lower_validation().unwrap()
-    } else {
-        meta
-    };
     meta.initialize().await.unwrap();
     Fixture {
         _temp: temp,
@@ -588,8 +573,8 @@ async fn public_copyup_truncate_extend_masks_lower_across_chunks() {
 }
 
 #[tokio::test]
-async fn public_prepared_rejects_same_epoch_mutation_and_binding_fence_before_io() {
-    let f = strict_fixture().await;
+async fn public_prepared_rejects_same_epoch_mutation_before_io() {
+    let f = fixture().await;
     let head = f.head().await;
     f.copy_up(vec![DataExtentDelta::hole(head, 400, 0, 0, 4096, 0)])
         .await;
@@ -628,13 +613,6 @@ async fn public_prepared_rejects_same_epoch_mutation_and_binding_fence_before_io
         .await
         .unwrap_err();
     assert!(matches!(err, ReadPlanError::StaleView(ReadViewChanged)));
-    f.authority.valid.store(false, Ordering::SeqCst);
-    let err = execute_unified_into(current.fetcher.as_ref(), 0, &current.plan, &mut out)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, ReadPlanError::Backend(ref cause) if matches!(cause.downcast_ref::<WorkspaceError>(), Some(WorkspaceError::Fenced)))
-    );
     assert_eq!(f.gets.load(Ordering::SeqCst), before);
 }
 
@@ -903,50 +881,38 @@ async fn public_request_fence_rejects_same_epoch_sequence_between_chunks() {
 }
 
 #[tokio::test]
-async fn public_request_fence_keeps_binding_and_lease_fencing_fatal() {
-    for revoke_binding in [false, true] {
-        // Lease loss must fence the frozen default; binding revocation is
-        // the strict-mode contract.
-        let f = if revoke_binding {
-            strict_fixture().await
-        } else {
-            fixture().await
-        };
-        f.copy_up(Vec::new()).await;
-        let request = f
-            .meta
-            .begin_unified_read_request(400)
-            .await
-            .unwrap()
-            .expect("mutable packed reads must retain a whole-request fence");
-        if revoke_binding {
-            f.authority.valid.store(false, Ordering::SeqCst);
-        } else {
-            let view = f.meta.view_context().await;
-            f.meta
-                .store()
-                .release_lease(crate::workspace_overlay::catalog::ReleaseLease {
-                    lease_id: view.lease_id,
-                    holder_generation: view.holder_generation,
-                })
-                .await
-                .unwrap();
-        }
-        let gets_before = f.gets.load(Ordering::SeqCst);
-        let error = request.ensure_current().await.unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<WorkspaceError>(),
-            Some(WorkspaceError::Fenced)
-        ));
-        assert!(error.downcast_ref::<ReadViewChanged>().is_none());
-        let next = f.meta.begin_unified_read_request(400).await;
-        let error = match next {
-            Err(error) => error,
-            Ok(_) => panic!("lost ownership must reject a new read request"),
-        };
-        assert!(error.downcast_ref::<ReadViewChanged>().is_none());
-        assert_eq!(f.gets.load(Ordering::SeqCst), gets_before);
-    }
+async fn public_request_fence_keeps_lease_fencing_fatal() {
+    let f = fixture().await;
+    f.copy_up(Vec::new()).await;
+    let request = f
+        .meta
+        .begin_unified_read_request(400)
+        .await
+        .unwrap()
+        .expect("mutable packed reads must retain a whole-request fence");
+    let view = f.meta.view_context().await;
+    f.meta
+        .store()
+        .release_lease(crate::workspace_overlay::catalog::ReleaseLease {
+            lease_id: view.lease_id,
+            holder_generation: view.holder_generation,
+        })
+        .await
+        .unwrap();
+    let gets_before = f.gets.load(Ordering::SeqCst);
+    let error = request.ensure_current().await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<WorkspaceError>(),
+        Some(WorkspaceError::Fenced)
+    ));
+    assert!(error.downcast_ref::<ReadViewChanged>().is_none());
+    let next = f.meta.begin_unified_read_request(400).await;
+    let error = match next {
+        Err(error) => error,
+        Ok(_) => panic!("lost ownership must reject a new read request"),
+    };
+    assert!(error.downcast_ref::<ReadViewChanged>().is_none());
+    assert_eq!(f.gets.load(Ordering::SeqCst), gets_before);
 }
 
 #[tokio::test]
@@ -995,11 +961,6 @@ async fn upper_row_cache_is_frozen_only_and_commits_invalidate_it() {
     // Every mount commit path invalidates; after it the new row is visible.
     f.meta.invalidate_upper_rows();
     assert_eq!(f.meta.stat(400).await.unwrap().unwrap().size, 12345);
-    let strict = strict_fixture().await;
-    let strict_meta = strict
-        .meta
-        .with_upper_row_cache(std::time::Duration::from_secs(60));
-    assert!(strict_meta.upper_row_cache().is_none());
 }
 
 #[tokio::test]

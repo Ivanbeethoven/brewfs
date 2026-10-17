@@ -34,6 +34,9 @@ struct PinMemoryBackend {
     timed_reads: Arc<AtomicI64>,
     /// Consistent untimed multi-key reads (permission snapshots and rows).
     consistent_reads: Arc<AtomicI64>,
+    /// Packed mutation view reads: bounded reads of the workspace record
+    /// together with at least ten more view keys.
+    view_reads: Arc<AtomicI64>,
 }
 impl Default for PinMemoryBackend {
     fn default() -> Self {
@@ -52,6 +55,7 @@ impl Default for PinMemoryBackend {
             short_page_is_end: Default::default(),
             timed_reads: Default::default(),
             consistent_reads: Default::default(),
+            view_reads: Default::default(),
         }
     }
 }
@@ -197,6 +201,9 @@ impl WorkspaceKvBackend for PinMemoryBackend {
         limits: KvReadLimits,
     ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
         limits.validate_keys(keys)?;
+        if keys.len() >= 11 && keys[0].starts_with(b"ws/") {
+            self.view_reads.fetch_add(1, Ordering::SeqCst);
+        }
         let rows = self.rows.lock().await;
         let mut total = 0usize;
         for key in keys {

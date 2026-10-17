@@ -41,8 +41,9 @@ parts of BrewFS itself.
 - **Tiered read and write acceleration.** Linux page cache, BrewFS memory cache,
   SSD cache, read-ahead, writeback staging, and large-write coalescing work
   together instead of treating object storage as a block device.
-- **Isolated agent sandboxes.** Workspace Overlay lets agents share one sealed
-  base while keeping namespace, inode, xattr, ACL, and extent changes private.
+- **Isolated agent sandboxes.** Workspace Overlay lets agents share one
+  immutable lower while keeping namespace, inode, xattr, ACL, and extent changes
+  private.
 - **Deployable in stages.** Start with SQLite and local data, move metadata to a
   distributed backend, then attach any supported S3-compatible store.
 - **Correctness is measured.** The repository carries Rust tests, xfstests,
@@ -116,23 +117,24 @@ object capacity; sharing one writable mount weakens isolation.
 
 BrewFS Workspace Overlay provides a filesystem-native alternative:
 
-1. A **sealed base** holds the shared namespace and immutable object blocks.
-2. Each agent gets one **private writable overlay**.
-3. Forking creates metadata and a new writable head; it does not copy clean
-   object data.
-4. `diff`, snapshot, fast-forward `commit`, and lease-aware `discard`
-   make changes explicit.
-5. Backend-time leases and generation fencing prevent a stale mount from
-   writing after ownership changes.
+1. An **immutable lower** (a packed-v3 snapshot) holds the shared namespace and
+   object blocks. It never changes while bound.
+2. Each agent gets one **private writable overlay**. Its head never rotates
+   while the agent is mounted; there is no seal step.
+3. Creating or forking a workspace from an exact revision writes metadata and a
+   new writable head; it does not copy clean object data.
+4. `diff` and lease-aware `discard` make changes explicit.
+5. Backend-time leases and generation fencing keep exactly one writer per
+   workspace and prevent a stale mount from writing after ownership changes.
 
 ```mermaid
 flowchart LR
-    Base[Sealed base revision] --> A[Agent A private overlay]
+    Base[Immutable lower revision] --> A[Agent A private overlay]
     Base --> B[Agent B private overlay]
     Base --> C[Agent C private overlay]
-    A --> Commit[Review / commit]
+    A --> Diff[Review / diff]
     B --> Discard[Discard]
-    C --> Snapshot[Snapshot / fork again]
+    Base --> Fork[Fork more overlays]
     Base -. shared immutable blocks .-> Objects[(Object storage)]
 ```
 
@@ -143,11 +145,11 @@ cargo build -p brewfs --release --features workspace-overlay
 target/release/brewfs workspace --help
 ```
 
-The CLI exposes `init-volume`, `create`, `snapshot`, `fork`, `list`,
-`inspect`, `diff`, `commit`, and `discard`. Redis and TiKV are the
-distributed catalog backends; SQLite is available for local semantics and
+The CLI exposes `init-volume`, `init-packed-volume`, `create --from`,
+`fork <revision>`, `list`, `inspect`, `diff`, and `discard`. Redis and TiKV are
+the distributed catalog backends; SQLite is available for local semantics and
 development. Every mounted workspace resolves exactly two layers: one private
-writable head and one fixed sealed base.
+writable head and one immutable lower.
 
 Current boundaries are intentional: the feature is off by default,
 `workspace-v1` never falls back to flat-volume behavior, workspace

@@ -347,24 +347,20 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         let validity = self.lease_validity.clone()?;
         let cache = self.upper_rows.clone()?;
         self.packed_lower()
-            .is_some_and(|lower| !lower.strict())
+            .is_some()
             .then_some(row_cache::LeaseLocalFence { cache, validity })
     }
 
     fn namespace_row_cache(&self) -> Option<&row_cache::UpperRowCache> {
-        self.namespace_rows.as_ref().filter(|_| {
-            self.packed_lower().is_some_and(|lower| !lower.strict())
-                && self.row_caches_authoritative()
-        })
+        self.namespace_rows
+            .as_ref()
+            .filter(|_| self.packed_lower().is_some() && self.row_caches_authoritative())
     }
 
     fn upper_row_cache(&self) -> Option<&row_cache::UpperRowCache> {
         self.upper_rows
             .as_ref()
-            .filter(|_| {
-                self.packed_lower().is_some_and(|lower| !lower.strict())
-                    && self.row_caches_authoritative()
-            })
+            .filter(|_| self.packed_lower().is_some() && self.row_caches_authoritative())
             .map(|cache| cache.as_ref())
     }
 
@@ -464,20 +460,6 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         result
     }
 
-    /// Re-authenticate the packed lower binding, reader pin and head/lease
-    /// fence around every lower read instead of treating the attached lower as
-    /// a frozen base. Must be called before the layer is shared.
-    pub fn with_strict_packed_lower_validation(mut self) -> Result<Self, MetaError> {
-        if let WorkspaceLower::PackedV3(lower) = &mut self.lower {
-            Arc::get_mut(lower)
-                .ok_or_else(|| {
-                    MetaError::Internal("packed lower is already shared; cannot change mode".into())
-                })?
-                .frozen = false;
-        }
-        Ok(self)
-    }
-
     pub fn packed_reader_session(
         &self,
     ) -> Option<Arc<dyn super::packed_reader_lifecycle::PackedReaderSession>> {
@@ -522,21 +504,6 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         Ok(())
     }
 
-    async fn validate_packed_metadata(
-        &self,
-        lower: &WorkspacePackedLower,
-    ) -> Result<(), MetaError> {
-        if !lower.strict() {
-            // Frozen base: authenticated once at attach, never per operation.
-            return Ok(());
-        }
-        lower
-            .authority
-            .validate(&self.guard().await, &lower.binding)
-            .await
-            .map_err(workspace_to_meta)
-    }
-
     async fn packed_metadata_fence(
         &self,
     ) -> Result<
@@ -550,54 +517,21 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         let Some(lower) = self.packed_lower() else {
             return Ok(None);
         };
-        if !lower.strict() {
-            // Frozen base: the cached head/base pair is the read view. No
-            // reader pin, binding authentication or remote fence per op.
-            let guard = self.guard().await;
-            let chain = self.chain().await?;
-            let layers: [LayerRecord; 2] = chain
-                .try_into()
-                .map_err(|_| workspace_to_meta(WorkspaceError::Fenced))?;
-            return Ok(Some((guard, layers, None)));
-        }
-        let reader_owner = lower
-            .authority
-            .retain_reader_request()
-            .map_err(workspace_to_meta)?;
+        let _ = lower;
+        // Immutable lower: the cached head/base pair is the read view. No
+        // reader pin, binding authentication or remote fence per op.
         let guard = self.guard().await;
         let chain = self.chain().await?;
-        let layers = [
-            self.store
-                .load_layer(chain[0].layer_id)
-                .await
-                .map_err(workspace_to_meta)?,
-            self.store
-                .load_layer(chain[1].layer_id)
-                .await
-                .map_err(workspace_to_meta)?,
-        ];
-        if layers[0].layer_id != guard.expected_head_layer_id
-            || layers[1].layer_id != lower.binding.base_layer_id
-        {
-            return Err(workspace_to_meta(WorkspaceError::Fenced));
-        }
-        lower
-            .authority
-            .validate(&guard, &lower.binding)
-            .await
-            .map_err(workspace_to_meta)?;
-        self.store
-            .validate_read_fence(guard.clone(), layers.clone())
-            .await
-            .map_err(workspace_to_meta)?;
-        validate_fixed_layer_pair(&layers).map_err(workspace_to_meta)?;
-        Ok(Some((guard, layers, reader_owner)))
+        let layers: [LayerRecord; 2] = chain
+            .try_into()
+            .map_err(|_| workspace_to_meta(WorkspaceError::Fenced))?;
+        Ok(Some((guard, layers, None)))
     }
 
     /// Fence for multi-step reads (directory pages, xattr lists, paths). They
     /// hold a fresh head record and reader generation across awaits and
-    /// re-check the head/lease between steps. Frozen mode only skips binding
-    /// authentication; strict mode is the full per-operation fence.
+    /// re-check the head/lease between steps. The immutable lower's binding
+    /// is authenticated once at attach, never per step.
     pub(super) async fn packed_enumeration_fence(
         &self,
     ) -> Result<
@@ -611,9 +545,6 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         let Some(lower) = self.packed_lower() else {
             return Ok(None);
         };
-        if lower.strict() {
-            return self.packed_metadata_fence().await;
-        }
         let reader_owner = lower
             .authority
             .retain_reader_request()
@@ -650,26 +581,15 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             let lower = self
                 .packed_lower()
                 .ok_or_else(|| workspace_to_meta(WorkspaceError::Fenced))?;
-            if !lower.strict() {
-                // Single-step frozen reads carry no owner and need no recheck.
-                // Multi-step enumeration fences re-check the head/lease.
-                if reader_owner.is_some() {
-                    self.store
-                        .validate_read_fence(guard, layers)
-                        .await
-                        .map_err(workspace_to_meta)?;
-                }
-                return Ok(());
+            let _ = lower;
+            // Single-step reads carry no owner and need no recheck.
+            // Multi-step enumeration fences re-check the head/lease.
+            if reader_owner.is_some() {
+                self.store
+                    .validate_read_fence(guard, layers)
+                    .await
+                    .map_err(workspace_to_meta)?;
             }
-            lower
-                .authority
-                .validate(&guard, &lower.binding)
-                .await
-                .map_err(workspace_to_meta)?;
-            self.store
-                .validate_read_fence(guard, layers)
-                .await
-                .map_err(workspace_to_meta)?;
         }
         Ok(())
     }
@@ -804,9 +724,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                     let Some(lower) = self.packed_lower() else {
                         return Ok(None);
                     };
-                    self.validate_packed_metadata(lower).await?;
                     let entry = lower.metadata.lookup_with_attr_bytes(parent, name).await?;
-                    self.validate_packed_metadata(lower).await?;
                     Ok(entry.map(|(ino, attr)| ResolvedDentry {
                         layer_id: lower.binding.base_layer_id,
                         parent_ino: parent,
@@ -1796,9 +1714,7 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
     }
 
     fn permission_snapshot_answers_access(&self) -> bool {
-        // Frozen base only: strict mode keeps per-operation lower validation
-        // ordering around the stat it performs first.
-        self.packed_lower().is_some_and(|lower| !lower.strict())
+        self.packed_lower().is_some()
             && self.posix_acl_capability() == PosixAclCapability::ReadWrite
     }
 
@@ -1906,7 +1822,6 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         }
         self.chain().await?;
         if let Some(lower) = self.packed_lower() {
-            self.validate_packed_metadata(lower).await?;
             let chain = self.chain().await?;
             if lower.binding.base_layer_id != chain[1].layer_id
                 || lower.metadata.root_ino() != self.root_ino()
@@ -1939,9 +1854,7 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                 let Some(lower) = self.packed_lower() else {
                     return Ok(None);
                 };
-                self.validate_packed_metadata(lower).await?;
                 let attr = lower.metadata.stat_fresh(ino).await?;
-                self.validate_packed_metadata(lower).await?;
                 Ok(attr)
             }
         };
@@ -1967,15 +1880,15 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         let actor = crate::meta::layer::namespace_actor();
         let created = actor.is_some() && crate::meta::layer::take_created_inode_open_authority(ino);
         // A frozen-base read-only open changes no state, so it does not pay
-        // an empty authenticated CAS; write opens and strict mode still do.
+        // an empty authenticated CAS; later write opens still do.
         // The creator's own first open of an inode its create just committed
         // (frozen mode) needs no second authenticated CAS: the create commit
         // already authenticated binding, head, lease and writer authority at
         // the same head version, and this mount is the only upper writer.
-        // Any later writable open, and strict mode, still commits one.
+        // Any later writable open still commits one.
         let open_commits = self
             .packed_lower()
-            .is_some_and(|lower| lower.strict() || ((_write || _append) && !created));
+            .is_some_and(|_| (_write || _append) && !created);
         for _ in 0..64 {
             let prepared = async {
                 let version = if self.packed_lower().is_some() && open_commits {
@@ -3366,9 +3279,7 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                     let Some(lower) = self.packed_lower() else {
                         return Ok(None);
                     };
-                    self.validate_packed_metadata(lower).await?;
                     let value = lower.metadata.get_xattr_bytes(inode, name).await?;
-                    self.validate_packed_metadata(lower).await?;
                     Ok(value)
                 }
             };
@@ -3575,9 +3486,7 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                 let Some(lower) = self.packed_lower() else {
                     return Ok(None);
                 };
-                self.validate_packed_metadata(lower).await?;
                 let value = lower.metadata.get_acl(inode, acl_type, acl_id).await?;
-                self.validate_packed_metadata(lower).await?;
                 self.validate_packed_metadata_fence(fence).await?;
                 return Ok(value);
             }

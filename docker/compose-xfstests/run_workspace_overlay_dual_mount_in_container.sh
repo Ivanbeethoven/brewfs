@@ -28,32 +28,18 @@ concurrency="${BREWFS_WORKSPACE_CONCURRENCY:-8}"
     printf 'BREWFS_WORKSPACE_CONCURRENCY must be a positive integer\n' >&2
     exit 2
 }
-allow_expected_contention="${BREWFS_WORKSPACE_ALLOW_EXPECTED_CONTENTION:-0}"
-case "$allow_expected_contention" in
-    0|1) ;;
-    *)
-        printf 'BREWFS_WORKSPACE_ALLOW_EXPECTED_CONTENTION must be 0 or 1\n' >&2
-        exit 2
-        ;;
-esac
 writer_stop_file="$artifact_dir/writers.stop"
-writer_pause_file="$artifact_dir/writers.pause"
 # Writer pressure controls. Defaults keep the original high-frequency profile
-# (two mounted writers, one file every 20 ms). Reduced frequency, no-writer and
-# quiesced runs are separate diagnostics and are labelled in their metrics.
+# (two mounted writers, one file every 20 ms). Reduced frequency and no-writer
+# runs are separate diagnostics and are labelled in their metrics.
 writer_count="${BREWFS_WORKSPACE_WRITERS:-2}"
 writer_interval="${BREWFS_WORKSPACE_WRITER_INTERVAL:-0.02}"
-writer_quiesce="${BREWFS_WORKSPACE_WRITER_QUIESCE:-0}"
 [[ "$writer_count" =~ ^[0-2]$ ]] || {
     printf 'BREWFS_WORKSPACE_WRITERS must be 0, 1 or 2\n' >&2
     exit 2
 }
 [[ "$writer_interval" =~ ^[0-9]+(\.[0-9]+)?$ ]] || {
     printf 'BREWFS_WORKSPACE_WRITER_INTERVAL must be a non-negative number of seconds\n' >&2
-    exit 2
-}
-[[ "$writer_quiesce" == 0 || "$writer_quiesce" == 1 ]] || {
-    printf 'BREWFS_WORKSPACE_WRITER_QUIESCE must be 0 or 1\n' >&2
     exit 2
 }
 catalog_args=(
@@ -160,19 +146,6 @@ wait_for_mount() {
     return 1
 }
 
-seed_base() {
-    log "seeding workspace $workspace_a"
-    printf 'shared-base\n' >"$mount_a/shared-base.txt"
-    printf '0123456789abcdef' >"$mount_a/base-data.bin"
-    python3 - "$mount_a/mmap-base.bin" <<'PY'
-import pathlib
-import sys
-
-pathlib.Path(sys.argv[1]).write_bytes(b"x" * 4096)
-PY
-    sync "$mount_a/shared-base.txt" "$mount_a/base-data.bin" "$mount_a/mmap-base.bin"
-}
-
 verify_isolation() {
     [[ -n "$workspace_b" ]] || {
         log "BREWFS_WORKSPACE_B is required in verify mode"
@@ -269,25 +242,13 @@ writer_labels() {
 
 start_writers() {
     local label target ready deadline
-    rm -f "$writer_stop_file" "$writer_pause_file" \
-        "$artifact_dir/writer-a.ready" "$artifact_dir/writer-b.ready" \
-        "$artifact_dir/writer-a.paused" "$artifact_dir/writer-b.paused"
+    rm -f "$writer_stop_file" \
+        "$artifact_dir/writer-a.ready" "$artifact_dir/writer-b.ready"
     for label in $(writer_labels); do
         if [[ "$label" == a ]]; then target="$mount_a"; else target="$mount_b"; fi
         (
             index=0
             while [[ ! -e "$writer_stop_file" ]]; do
-                if [[ -e "$writer_pause_file" ]]; then
-                    # Quiesce: flush this mount's dirty data, acknowledge,
-                    # and issue no further writes until resumed or stopped.
-                    if [[ ! -e "$artifact_dir/writer-$label.paused" ]]; then
-                        sync "$target"
-                        : >"$artifact_dir/writer-$label.paused"
-                    fi
-                    sleep 0.05
-                    continue
-                fi
-                rm -f "$artifact_dir/writer-$label.paused"
                 index=$((index + 1))
                 printf '%s-%s\n' "$label" "$index" >"$target/concurrent-$label-$index.txt"
                 : >"$artifact_dir/writer-$label.ready"
@@ -306,24 +267,6 @@ start_writers() {
             sleep 0.1
         done
     done
-}
-
-# Writer/seal coordination: pause the mounted writers, wait (bounded) until
-# each has flushed and acknowledged, run the topology batch, then resume. A
-# writer that does not acknowledge within the deadline fails the batch.
-quiesce_writers() {
-    local label deadline=$((SECONDS + 30))
-    : >"$writer_pause_file"
-    for label in $(writer_labels); do
-        until [[ -e "$artifact_dir/writer-$label.paused" ]]; do
-            (( SECONDS < deadline )) || { log "writer $label did not quiesce"; return 1; }
-            sleep 0.05
-        done
-    done
-}
-
-resume_writers() {
-    rm -f "$writer_pause_file"
 }
 
 wait_writers() {
@@ -361,7 +304,6 @@ write_concurrency_metrics() {
     local label="$1" started="$2" ended="$3"
     BREWFS_WORKSPACE_WRITERS="$writer_count" \
     BREWFS_WORKSPACE_WRITER_INTERVAL="$writer_interval" \
-    BREWFS_WORKSPACE_WRITER_QUIESCE="$writer_quiesce" \
     python3 - "$artifact_dir" "$label" "$concurrency" "$started" "$ended" <<'PY'
 import json
 import os
@@ -395,7 +337,6 @@ report = {
     "timed_scope": "parallel CLI operations, excluding workspace setup and writer drain",
     "mounted_writers": int(os.environ.get("BREWFS_WORKSPACE_WRITERS", "2")),
     "writer_interval_seconds": float(os.environ.get("BREWFS_WORKSPACE_WRITER_INTERVAL", "0.02")),
-    "writer_quiesce": os.environ.get("BREWFS_WORKSPACE_WRITER_QUIESCE", "0") == "1",
     "writer_files": {
         label: int((root / f"writer-{label}.count").read_text())
         for label in ("a", "b")
@@ -405,7 +346,6 @@ report = {
         "default-pressure"
         if os.environ.get("BREWFS_WORKSPACE_WRITERS", "2") == "2"
         and os.environ.get("BREWFS_WORKSPACE_WRITER_INTERVAL", "0.02") == "0.02"
-        and os.environ.get("BREWFS_WORKSPACE_WRITER_QUIESCE", "0") == "0"
         else "diagnostic"
     ),
     "operation_count": count,
@@ -467,110 +407,13 @@ concurrent_forks() {
     log "concurrent fork PASS ($concurrency distinct workspaces)"
 }
 
-concurrent_seals() {
-    local revision index workspace
-    local -a workspaces=() jobs=()
-    revision="$(base_revision)"
-    run_cli fork "$revision" --count "$concurrency" --owner concurrent-seal-setup \
-        >"$artifact_dir/seal-workspaces.json" 2>"$artifact_dir/seal-setup.log"
-    mapfile -t workspaces < <(python3 - "$artifact_dir/seal-workspaces.json" <<'PY'
-import json
-import sys
-
-for record in json.load(open(sys.argv[1], encoding="utf-8")):
-    print(record["workspace_id"])
-PY
-)
-    [[ ${#workspaces[@]} -eq "$concurrency" ]] || {
-        log "seal setup returned ${#workspaces[@]} workspaces, expected $concurrency"
-        return 1
-    }
-    start_writers
-    if [[ "$writer_quiesce" == 1 ]]; then
-        quiesce_writers || { wait_writers || true; return 1; }
-    fi
-    local batch_started batch_ended
-    batch_started="$(date +%s%N)"
-    index=0
-    for workspace in "${workspaces[@]}"; do
-        index=$((index + 1))
-        measure_cli seal "$index" snapshot "$workspace" --name "concurrent-seal-$index" \
-            --owner "concurrent-seal-$index" \
-            >"$artifact_dir/seal-$index.json" 2>"$artifact_dir/seal-$index.log" &
-        jobs+=("$!")
-    done
-    local cli_status=0
-    wait_cli_jobs "${jobs[@]}" || cli_status=1
-    batch_ended="$(date +%s%N)"
-    resume_writers
-    wait_writers
-    write_concurrency_metrics seal "$batch_started" "$batch_ended"
-    if (( cli_status != 0 )); then
-        if [[ "$allow_expected_contention" == 1 ]] && python3 - "$artifact_dir" "$concurrency" <<'PY'
-import json
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-count = int(sys.argv[2])
-failed = []
-for index in range(1, count + 1):
-    timing = json.loads((root / f"seal-{index}.time.json").read_text())
-    if timing["exit_status"] == 0:
-        continue
-    log = (root / f"seal-{index}.log").read_text(errors="replace")
-    if "workspace is busy" not in log:
-        raise SystemExit(f"seal-{index} has an unknown failure")
-    failed.append(index)
-if not failed:
-    raise SystemExit("seal batch failed without a failed operation")
-(root / "concurrent-seal-contention.json").write_text(
-    json.dumps({
-        "status": "expected-contention",
-        "acceptance": "rejected",
-        "failed_operations": failed,
-        "failure_class": "workspace is busy",
-        "allow_expected_contention": True,
-    }, indent=2) + "\n",
-    encoding="utf-8",
-)
-PY
-        then
-            log "concurrent seal recorded expected workspace contention (${concurrency} operations; acceptance rejected)"
-            return 0
-        fi
-        log "concurrent seal failed with an unknown error; inspect seal-*.log"
-        return 1
-    fi
-    python3 - "$artifact_dir" "$concurrency" <<'PY'
-import json
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-count = int(sys.argv[2])
-seen = set()
-for index in range(1, count + 1):
-    snapshot = json.loads((root / f"seal-{index}.json").read_text())
-    revision = snapshot["revision"]
-    identity = (revision["layer_id"], revision["sealed_version"])
-    if identity in seen:
-        raise SystemExit(f"seal-{index} returned a duplicate revision")
-    seen.add(identity)
-PY
-    log "concurrent seal PASS ($concurrency distinct revisions)"
-}
-
 mkdir -p "$state_dir" "$data_dir" "$artifact_dir"
 start_mount "$workspace_a" "$mount_a" "$state_dir/cache-a" "$artifact_dir/mount-a.log"
 pid_a=$last_pid
 wait_for_mount "$pid_a" "$mount_a" "$artifact_dir/mount-a.log"
 
 case "$mode" in
-    seed)
-        seed_base
-        ;;
-    verify|concurrent-fork|concurrent-seal)
+    verify|concurrent-fork)
         [[ -n "$workspace_b" ]] || { log "BREWFS_WORKSPACE_B is required in $mode mode"; exit 2; }
         start_mount "$workspace_b" "$mount_b" "$state_dir/cache-b" "$artifact_dir/mount-b.log"
         pid_b=$last_pid
@@ -578,7 +421,6 @@ case "$mode" in
         case "$mode" in
             verify) verify_isolation ;;
             concurrent-fork) concurrent_forks ;;
-            concurrent-seal) concurrent_seals ;;
         esac
         ;;
     *)

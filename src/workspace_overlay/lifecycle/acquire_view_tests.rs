@@ -1,4 +1,4 @@
-//! Deterministic control-plane switch between mount preflight and lease CAS.
+//! Deterministic out-of-band head change between mount preflight and lease CAS.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,8 +8,9 @@ use uuid::Uuid;
 
 use super::*;
 use crate::meta::MetaLayer;
-use crate::workspace_overlay::catalog::{CreateVolumeRoot, FastForwardCommit};
+use crate::workspace_overlay::catalog::CreateVolumeRoot;
 use crate::workspace_overlay::meta_layer::WorkspaceMetaLayer;
+use crate::workspace_overlay::model::LeaseState;
 use crate::workspace_overlay::stores::kv_backend::{
     KvCheck, KvEntry, KvReadLimits, KvWrite, WorkspaceKvBackend,
 };
@@ -25,6 +26,23 @@ struct PausedClockBackend {
 
 impl PausedClockBackend {
     const NOW: i64 = 1_000_000_000;
+
+    /// Bump the stored workspace head epoch in place, keeping its envelope.
+    async fn rotate_head(&self, store: &KvWorkspaceStore<Self>, id: WorkspaceId) -> u64 {
+        let mut record = store.load_workspace(id).await.unwrap();
+        let old_payload = bincode::serialize(&record).unwrap();
+        record.head_epoch += 1;
+        let new_payload = bincode::serialize(&record).unwrap();
+        let mut records = self.records.lock().await;
+        let (_, value) = records
+            .iter_mut()
+            .find(|(_, value)| value.ends_with(&old_payload))
+            .expect("workspace record is stored");
+        let envelope = value.len() - old_payload.len();
+        value.truncate(envelope);
+        value.extend_from_slice(&new_payload);
+        record.head_epoch
+    }
 
     async fn cas(
         &self,
@@ -273,18 +291,8 @@ async fn switched_head_during_acquire_releases_lease_and_rejects_stale_view() {
     )
     .await
     .expect("mount must reach lease acquisition after the preflight view read");
-    let base = workspace.fork_base.clone().unwrap();
-    let switched = store
-        .fast_forward_commit(FastForwardCommit {
-            source_revision: base.clone(),
-            source_fork_base: base,
-            target_workspace_id: workspace_id,
-            target_expected_head_layer_id: workspace.head_layer_id,
-            target_expected_head_epoch: workspace.head_epoch,
-            new_head_layer_id: LayerId::new(),
-        })
-        .await
-        .unwrap();
+    // An out-of-band head rotation lands between preflight and lease CAS.
+    let switched = backend.rotate_head(&store, workspace_id).await;
     backend.lease_cas_continue.notify_one();
     let result = tokio::time::timeout(Duration::from_secs(10), mount)
         .await
@@ -316,8 +324,7 @@ async fn switched_head_during_acquire_releases_lease_and_rejects_stale_view() {
     )
     .await
     .unwrap();
-    assert_eq!(fresh.view.head_layer_id, switched.target_head_layer_id);
-    assert_eq!(fresh.view.head_epoch, switched.target_head_epoch);
+    assert_eq!(fresh.view.head_epoch, switched);
     let meta = WorkspaceMetaLayer::new(store.clone(), fresh.view.clone());
     meta.create_file(meta.root_ino(), "after-acquire-retry".into())
         .await

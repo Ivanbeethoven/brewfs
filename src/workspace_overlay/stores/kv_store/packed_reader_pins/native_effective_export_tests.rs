@@ -64,6 +64,7 @@ struct Fixture {
     vfs: NativeVfs,
     guard: HeadGuard,
     payload: Vec<u8>,
+    binding: crate::workspace_overlay::publish::binding::PackedLowerBindingRecord,
 }
 
 async fn fixture(wrong_vfs_upper: bool) -> Fixture {
@@ -145,7 +146,13 @@ async fn fixture_with_lease(
         },
         CHUNK,
     )
-    .with_packed_v3_lower(binding.binding, lower, authority, upper.clone(), layout)
+    .with_packed_v3_lower(
+        binding.binding.clone(),
+        lower,
+        authority,
+        upper.clone(),
+        layout,
+    )
     .unwrap();
     if let Some(lease) = lease {
         meta_layer = meta_layer
@@ -178,6 +185,7 @@ async fn fixture_with_lease(
         vfs,
         guard,
         payload,
+        binding,
     }
 }
 
@@ -732,6 +740,181 @@ async fn lease_proven_actor_checks_reuse_cached_parent_permissions_but_see_chmod
         cached < uncached,
         "cached actor checks ({cached}) must read less than uncached ({uncached})"
     );
+    f.reader.shutdown().await.unwrap();
+}
+
+/// Kept invariant: a live lease excludes a second holder (no split-brain).
+#[tokio::test]
+async fn invariant_second_mount_cannot_acquire_a_live_lease() {
+    let f = fixture(false).await;
+    let second = f
+        .store
+        .acquire_lease(crate::workspace_overlay::catalog::AcquireLease {
+            workspace_id: f.guard.workspace_id,
+            lease_id: crate::workspace_overlay::ids::LeaseId::new(),
+            holder_generation: 99,
+            ttl_ns: 30_000_000_000,
+        })
+        .await;
+    assert!(matches!(second, Err(WorkspaceError::Busy)), "{second:?}");
+    // The original holder still commits.
+    f.vfs.create_file("/still-mine").await.unwrap();
+    f.reader.shutdown().await.unwrap();
+}
+
+/// Kept invariant: once the lease has expired (backend clock), no commit by
+/// the old holder succeeds, even though nothing else changed.
+#[tokio::test]
+async fn invariant_commit_after_lease_expiry_fails_closed() {
+    let f = fixture(false).await;
+    f.vfs.create_file("/before-expiry").await.unwrap();
+    // Past the 30 s fixture lease (backend clock), with no renewal.
+    f.backend.now.fetch_add(31_000_000_000, Ordering::SeqCst);
+    assert!(f.vfs.create_file("/after-expiry").await.is_err());
+    assert!(f.vfs.stat("/after-expiry").await.is_err());
+    f.reader.shutdown().await.unwrap();
+}
+
+/// Kept invariant: losing the lease fences this mount, and while the packed
+/// open record is held no other holder can take the workspace over.
+#[tokio::test]
+async fn invariant_commit_after_lease_loss_fails_closed_and_blocks_takeover() {
+    let f = fixture(false).await;
+    f.store
+        .release_lease(crate::workspace_overlay::catalog::ReleaseLease {
+            lease_id: f.guard.lease_id,
+            holder_generation: f.guard.holder_generation,
+        })
+        .await
+        .unwrap();
+    assert!(f.vfs.create_file("/after-release").await.is_err());
+    let takeover = f
+        .store
+        .acquire_lease(crate::workspace_overlay::catalog::AcquireLease {
+            workspace_id: f.guard.workspace_id,
+            lease_id: crate::workspace_overlay::ids::LeaseId::new(),
+            holder_generation: 99,
+            ttl_ns: 30_000_000_000,
+        })
+        .await;
+    assert!(
+        matches!(takeover, Err(WorkspaceError::Busy)),
+        "{takeover:?}"
+    );
+    f.reader.shutdown().await.unwrap();
+}
+
+/// Kept invariant: no admin path rotates the head of a workspace whose
+/// writable lease is live. Head-changing publication must present the live
+/// lease itself; a foreign holder (or a fresh lease) is fenced and nothing
+/// is written, so the mount keeps committing against an unchanged head.
+#[tokio::test]
+async fn invariant_no_head_change_under_an_active_lease() {
+    let f = fixture(false).await;
+    let expected_binding = f.binding.clone();
+    let before_workspace = f.store.load_workspace(f.guard.workspace_id).await.unwrap();
+    let layers: [crate::workspace_overlay::model::LayerRecord; 2] = f
+        .store
+        .load_layer_chain(f.guard.expected_head_layer_id)
+        .await
+        .unwrap()
+        .try_into()
+        .unwrap();
+    // A genuinely new manifest, so only the lease authority can refuse it.
+    let (_new_objects, _, _, lower, _) =
+        crate::workspace_overlay::stores::binding_tests::packed_with_snapshot_id([11; 32]).await;
+    for foreign in [
+        // Another holder generation of the same lease id.
+        HeadGuard {
+            holder_generation: f.guard.holder_generation + 1,
+            ..f.guard.clone()
+        },
+        // A different lease id (an admin's own fresh lease).
+        HeadGuard {
+            lease_id: crate::workspace_overlay::ids::LeaseId::new(),
+            ..f.guard.clone()
+        },
+    ] {
+        let result = f
+            .store
+            .publish_packed_lower_binding(
+                crate::workspace_overlay::publish::binding::PublishPackedLowerBinding {
+                    guard: foreign,
+                    expected_layers: layers.clone(),
+                    expected_base: expected_binding.base_revision.clone(),
+                    expected_binding: expected_binding.clone(),
+                    lower: lower.clone(),
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(WorkspaceError::Fenced)), "{result:?}");
+    }
+    // A competing lease cannot even be acquired while this one is live.
+    let competing = f
+        .store
+        .acquire_lease(crate::workspace_overlay::catalog::AcquireLease {
+            workspace_id: f.guard.workspace_id,
+            lease_id: crate::workspace_overlay::ids::LeaseId::new(),
+            holder_generation: 99,
+            ttl_ns: 30_000_000_000,
+        })
+        .await;
+    assert!(
+        matches!(competing, Err(WorkspaceError::Busy)),
+        "{competing:?}"
+    );
+    let after_workspace = f.store.load_workspace(f.guard.workspace_id).await.unwrap();
+    assert_eq!(
+        after_workspace.head_layer_id,
+        before_workspace.head_layer_id
+    );
+    assert_eq!(after_workspace.head_epoch, before_workspace.head_epoch);
+    assert_eq!(after_workspace.active_lease, Some(f.guard.lease_id));
+    f.vfs.create_file("/head-unchanged").await.unwrap();
+    f.reader.shutdown().await.unwrap();
+}
+
+/// Sole writer: a warm commit reuses its own last commit's post-image as the
+/// CAS conditions and issues no view pre-read; a lease renewal (the only
+/// expected outside change) costs one fallback re-read, never an error.
+#[tokio::test]
+async fn sole_writer_commit_skips_the_view_pre_read_and_survives_renewal() {
+    let f = fixture(false).await;
+    f.vfs.create_file("/warm-0").await.unwrap();
+    let before = f.backend.view_reads.load(Ordering::SeqCst);
+    for index in 1..=4 {
+        f.vfs.create_file(&format!("/warm-{index}")).await.unwrap();
+    }
+    let warm = f.backend.view_reads.load(Ordering::SeqCst) - before;
+    assert_eq!(warm, 0, "warm commits must not pre-read their view");
+    // Renew the lease out of band one second later (backend clock), so the
+    // cached lease bytes really go stale.
+    f.backend.now.fetch_add(1_000_000_000, Ordering::SeqCst);
+    f.store
+        .renew_lease(crate::workspace_overlay::catalog::RenewLease {
+            lease_id: f.guard.lease_id,
+            holder_generation: f.guard.holder_generation,
+            ttl_ns: 30_000_000_000,
+        })
+        .await
+        .unwrap();
+    let before = f.backend.view_reads.load(Ordering::SeqCst);
+    f.vfs.create_file("/after-renew").await.unwrap();
+    assert!(f.vfs.stat("/after-renew").await.is_ok());
+    // The stale lease bytes fail one cached CAS; one fresh read recovers.
+    assert_eq!(f.backend.view_reads.load(Ordering::SeqCst) - before, 1);
+    for index in 0..=4 {
+        assert!(f.vfs.stat(&format!("/warm-{index}")).await.is_ok());
+    }
+    // Losing the lease still fails closed even with a warm cache.
+    f.store
+        .release_lease(crate::workspace_overlay::catalog::ReleaseLease {
+            lease_id: f.guard.lease_id,
+            holder_generation: f.guard.holder_generation,
+        })
+        .await
+        .unwrap();
+    assert!(f.vfs.create_file("/after-release").await.is_err());
     f.reader.shutdown().await.unwrap();
 }
 

@@ -31,7 +31,7 @@ BrewFS 通过 FUSE 提供 Linux 文件系统接口，同时允许元数据与文
 
 - **面向对象存储的数据路径。** 文件按 64 MiB chunk 和 4 MiB block 组织，在事务型 namespace 下使用不可变对象。
 - **分层读写加速。** Linux page cache、BrewFS 内存缓存、SSD 缓存、预读、writeback staging 和大写聚合共同工作，而不是把对象存储简单模拟成块设备。
-- **隔离的 Agent Sandbox。** Workspace Overlay 让多个 Agent 共享同一个 sealed base，同时保持 namespace、inode、xattr、ACL 与 extent 变更相互隔离。
+- **隔离的 Agent Sandbox。** Workspace Overlay 让多个 Agent 共享同一个不可变 lower，同时保持 namespace、inode、xattr、ACL 与 extent 变更相互隔离。
 - **可渐进部署。** 可以从 SQLite + 本地数据开始，再切换到分布式元数据后端和任意受支持的 S3 兼容存储。
 - **以正确性为门槛。** 仓库内置 Rust tests、xfstests、pjdfstest、LTP、stress-ng、fio、fuzz 与可复现的 Docker Compose runner。
 - **控制读放大。** 当前读路径会先检查内存和 Linux page cache，再访问本地磁盘缓存；persistent slice 支持按范围读取，并按句柄跟踪 buffered FUSE fragment。只有观察到重复使用后才会提升完整 block，高并发预读则保持私有，避免污染共享缓存。
@@ -92,20 +92,20 @@ AI 编码 Agent 经常从相同代码基线开始，但需要私有、短生命�
 
 BrewFS Workspace Overlay 提供文件系统原生的处理方式：
 
-1. **Sealed base** 保存共享 namespace 与不可变对象块。
-2. 每个 Agent 获得一个 **private writable overlay**。
-3. Fork 只创建元数据和新的 writable head，不复制未修改的对象数据。
-4. `diff`、snapshot、fast-forward `commit` 与 lease-aware `discard` 让变更的去向显式可控。
-5. 基于元数据后端时间的 lease 与 generation fencing 会阻止已经失去所有权的旧挂载继续写入。
+1. **不可变 lower**（packed-v3 快照）保存共享 namespace 与对象块，绑定后永不改变。
+2. 每个 Agent 获得一个 **private writable overlay**；挂载期间其 head 不轮转，不存在 seal 步骤。
+3. 从精确 revision 创建或 fork workspace 只写元数据和新的 writable head，不复制未修改的对象数据。
+4. `diff` 与 lease-aware `discard` 让变更的去向显式可控。
+5. 基于元数据后端时间的 lease 与 generation fencing 保证每个 workspace 只有一个写者，并阻止已经失去所有权的旧挂载继续写入。
 
 ```mermaid
 flowchart LR
-    Base[Sealed base revision] --> A[Agent A private overlay]
+    Base[Immutable lower revision] --> A[Agent A private overlay]
     Base --> B[Agent B private overlay]
     Base --> C[Agent C private overlay]
-    A --> Commit[Review / commit]
+    A --> Diff[Review / diff]
     B --> Discard[Discard]
-    C --> Snapshot[Snapshot / 再次 fork]
+    Base --> Fork[再次 fork]
     Base -. 共享不可变对象块 .-> Objects[(Object storage)]
 ```
 
@@ -116,9 +116,9 @@ cargo build -p brewfs --release --features workspace-overlay
 target/release/brewfs workspace --help
 ```
 
-CLI 已提供 `init-volume`、`create`、`snapshot`、`fork`、`list`、
-`inspect`、`diff`、`commit` 与 `discard`。Redis 和 TiKV 是分布式
-catalog 后端；SQLite 用于本地语义验证与开发。每个已挂载 workspace 始终只解析两层：一个私有 writable head 和一个固定 sealed base。
+CLI 已提供 `init-volume`、`init-packed-volume`、`create --from`、`fork <revision>`、
+`list`、`inspect`、`diff` 与 `discard`。Redis 和 TiKV 是分布式
+catalog 后端；SQLite 用于本地语义验证与开发。每个已挂载 workspace 始终只解析两层：一个私有 writable head 和一个不可变 lower。
 
 当前边界是有意保留的：feature 默认关闭；`workspace-v1` 发生错误时绝不回退到 flat-volume 语义；workspace `statfs` 要等待原子 usage counter；WebDAV gateway 目前只接受 `flat-v1`。构建 operator 或多 Agent 服务前，请先阅读 [Workspace Overlay 架构文档](doc/architecture/workspace-overlay.md)。
 

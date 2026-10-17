@@ -39,27 +39,6 @@ const CLUSTER_FINALIZER: &str = "storage.brewfs.io/workspace-cluster-protection"
 const FORCE_DELETE_ANNOTATION: &str = "storage.brewfs.io/force-delete";
 const FORCE_DELETE_REASON_ANNOTATION: &str = "storage.brewfs.io/force-delete-reason";
 const ID_NAMESPACE: Uuid = Uuid::from_u128(0xb7e6_f500_9a2d_4d17_8b4d_7f24_4c45_a011);
-const SEAL_HEAD_EPOCH_ADVANCE: u64 = 2;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SnapshotResumeAction {
-    Seal,
-    PinRecoveredRevision,
-    Conflict,
-}
-
-fn snapshot_resume_action(source_head_epoch: u64, current_head_epoch: u64) -> SnapshotResumeAction {
-    if current_head_epoch == source_head_epoch {
-        SnapshotResumeAction::Seal
-    } else if source_head_epoch
-        .checked_add(SEAL_HEAD_EPOCH_ADVANCE)
-        .is_some_and(|sealed_epoch| sealed_epoch == current_head_epoch)
-    {
-        SnapshotResumeAction::PinRecoveredRevision
-    } else {
-        SnapshotResumeAction::Conflict
-    }
-}
 
 #[derive(Debug, Error)]
 pub enum WorkspaceReconcileError {
@@ -779,13 +758,8 @@ pub async fn reconcile_workspace_snapshot(
             if admin.packed_binding(workspace_id).await?.is_some() {
                 admin.verify_packed_revision(&existing.revision).await?;
             }
-            let source = recorded_source.or_else(|| {
-                current
-                    .record
-                    .head_epoch
-                    .checked_sub(SEAL_HEAD_EPOCH_ADVANCE)
-                    .map(|epoch| (workspace_id.to_string(), epoch))
-            });
+            let source = recorded_source
+                .or_else(|| Some((workspace_id.to_string(), current.record.head_epoch)));
             patch_snapshot_status(
                 &api,
                 &snapshot,
@@ -808,8 +782,8 @@ pub async fn reconcile_workspace_snapshot(
         patch_snapshot_status(
             &api,
             &snapshot,
-            "Sealing",
-            "snapshot intent recorded; waiting to seal the source head",
+            "Pending",
+            "snapshot intent recorded; waiting to pin the source revision",
             None,
             None,
             Some((workspace_id.to_string(), current.record.head_epoch)),
@@ -817,7 +791,6 @@ pub async fn reconcile_workspace_snapshot(
         .await?;
         return Ok(Action::await_change());
     };
-    let generation = holder_generation(resource_uuid(&snapshot_uid));
     let request = EnsureSnapshotRequest {
         snapshot_id,
         name: format!("{namespace}/{name}"),
@@ -861,44 +834,26 @@ pub async fn reconcile_workspace_snapshot(
             }
         }
     } else {
-        match snapshot_resume_action(source_head_epoch, current.record.head_epoch) {
-            SnapshotResumeAction::Seal => {
-                admin
-                    .seal_and_snapshot(
-                        workspace_id,
-                        source_head_epoch,
-                        generation,
-                        cluster_spec.lease_ttl_seconds,
-                        cluster_spec.heartbeat_seconds,
-                        request,
-                    )
-                    .await?
-                    .1
-            }
-            SnapshotResumeAction::PinRecoveredRevision => admin.ensure_snapshot(request).await?,
-            SnapshotResumeAction::Conflict => {
-                patch_snapshot_status(
-                &api,
-                &snapshot,
-                "Failed",
-                &format!(
-                    "source head changed unexpectedly: intended epoch {source_head_epoch}, current epoch {}",
-                    current.record.head_epoch
-                ),
-                None,
-                None,
-                Some((workspace_id.to_string(), source_head_epoch)),
-            )
-            .await?;
-                return Ok(Action::await_change());
-            }
-        }
+        // No seal transaction exists: a native workspace head is never
+        // turned into an immutable revision. Snapshots come only from a
+        // packed publication.
+        patch_snapshot_status(
+            &api,
+            &snapshot,
+            "Failed",
+            "snapshots require a packed-v3 workspace; native workspaces are never sealed",
+            None,
+            None,
+            Some((workspace_id.to_string(), source_head_epoch)),
+        )
+        .await?;
+        return Ok(Action::await_change());
     };
     patch_snapshot_status(
         &api,
         &snapshot,
         "Ready",
-        "workspace was sealed and the immutable revision was pinned",
+        "the packed workspace revision was pinned",
         Some(pinned.snapshot_id.to_string()),
         Some(revision_to_status(&pinned.revision)),
         Some((workspace_id.to_string(), source_head_epoch)),
@@ -1459,13 +1414,6 @@ fn resource_uuid(uid: &str) -> Uuid {
     Uuid::parse_str(uid).unwrap_or_else(|_| deterministic_uuid(ID_NAMESPACE, uid))
 }
 
-fn holder_generation(id: Uuid) -> u64 {
-    let bytes: [u8; 8] = id.as_bytes()[8..]
-        .try_into()
-        .expect("UUID suffix always contains eight bytes");
-    (u64::from_be_bytes(bytes) & i64::MAX as u64).max(1)
-}
-
 fn validate_mount_cluster_ref(
     mount_cluster: &str,
     workspace_cluster: &str,
@@ -1491,24 +1439,6 @@ mod tests {
     fn fallback_resource_uuid_is_stable() {
         assert_eq!(resource_uuid("not-a-uuid"), resource_uuid("not-a-uuid"));
         assert_ne!(resource_uuid("not-a-uuid"), resource_uuid("another-uid"));
-    }
-
-    #[test]
-    fn snapshot_retry_only_accepts_the_original_or_fully_sealed_epoch() {
-        assert_eq!(snapshot_resume_action(7, 7), SnapshotResumeAction::Seal);
-        assert_eq!(
-            snapshot_resume_action(7, 9),
-            SnapshotResumeAction::PinRecoveredRevision
-        );
-        assert_eq!(snapshot_resume_action(7, 8), SnapshotResumeAction::Conflict);
-        assert_eq!(
-            snapshot_resume_action(7, 10),
-            SnapshotResumeAction::Conflict
-        );
-        assert_eq!(
-            snapshot_resume_action(u64::MAX, 0),
-            SnapshotResumeAction::Conflict
-        );
     }
 
     #[test]

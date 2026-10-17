@@ -636,26 +636,6 @@ impl<B: WorkspaceKvBackend> WorkspaceAdmin for PackedStoreWorkspaceAdmin<B> {
             revision: snapshot.revision,
         })
     }
-    async fn seal_and_snapshot(
-        &self,
-        workspace_id: WorkspaceId,
-        expected_head_epoch: u64,
-        holder_generation: u64,
-        ttl_seconds: u32,
-        heartbeat_seconds: u32,
-        request: EnsureSnapshotRequest,
-    ) -> anyhow::Result<(WorkspaceView, SnapshotView)> {
-        self.native
-            .seal_and_snapshot(
-                workspace_id,
-                expected_head_epoch,
-                holder_generation,
-                ttl_seconds,
-                heartbeat_seconds,
-                request,
-            )
-            .await
-    }
     async fn delete_snapshot(&self, id: SnapshotId) -> anyhow::Result<()> {
         self.native.delete_snapshot(id).await
     }
