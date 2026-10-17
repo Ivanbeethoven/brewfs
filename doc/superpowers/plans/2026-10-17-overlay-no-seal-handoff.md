@@ -97,6 +97,28 @@ in rounds 18–22, so compare only within this table.
   185/404, readback 492/600, mixed 373/517.
 - Real-mount probe: `$R/ovn-noseal1-probe` passed.
 
+### Round 24 (PR #32, `a281922`)
+
+Write-path cuts: cached commits check only ws/head/lease/writer/open/CONTROL;
+derived keys are carried across commits; packed `resolve_inode_delta` uses
+the lease-bound permission cache. Order-swapped rw vs #30
+(`$R/ovn-{noseal1,r24}-r24p{a,b}`), 6 runs pooled, 0/72 errors:
+
+| Mode | #30 overlay | #32 overlay | Change | #32 overlay/native |
+| --- | ---: | ---: | ---: | ---: |
+| write | 188 | 203 | +7.9% | 0.59 |
+| readback | 462 | 463 | noise | 0.79 |
+| mixed | 392 | 413 | +5.2% | 0.86 |
+
+Redis per written file: 98.7 → 72.6 cmds and 1047 → 866 µs server time
+(native: 33 cmds, 428 µs). Remaining write gap: 2 Lua CAS commits per file
+(still 3.2 EVALSHA vs native 2.0) plus the per-op permission reads.
+
+Rejected designs:
+- merging the create and first-fsync commits (breaks O_EXCL visibility);
+- full metadata copy-up of the lower (no write-op gain for new files; breaks
+  O(1) fork and change-proportional diff).
+
 ## Verified
 
 | Gate | Result |
