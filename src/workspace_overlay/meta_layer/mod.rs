@@ -1922,7 +1922,12 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                 } else {
                     None
                 };
-                let snapshot = self.permission_snapshot(vec![ino], None).await?;
+                let snapshot = match &version {
+                    // A commit follows: it CASes this exact head version.
+                    Some(_) => self.permission_snapshot(vec![ino], None).await?,
+                    // Decision only (no commit): the lease-bound cache.
+                    None => self.cached_permission_snapshot(ino).await?,
+                };
                 Ok::<_, MetaError>((version, snapshot))
             }
             .await;
