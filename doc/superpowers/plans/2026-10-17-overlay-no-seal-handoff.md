@@ -129,6 +129,26 @@ Client round trips per created file: 12 → 11 (MGET 9 → 8). The rest is the
 create commit's parent/new-inode snapshot, which feeds a CAS and so must be
 fresh, plus two Lua CAS commits.
 
+### Round 26 (rejected, not merged)
+
+Seeding a freshly created inode's row (and the absent `security.capability`
+xattr) into the lease-bound cache cut client round trips per created file
+from 11 to 9 (MGET 8 → 6) and Redis load from 71.4 to 68.8 cmds/file.
+Throughput did not move. Order-swapped vs #34 (`$R/ovn-{r25,r26}-r26p{a,b}`),
+6 runs pooled, 0/78 errors:
+
+| Mode | #34 | r26 | Change |
+| --- | ---: | ---: | ---: |
+| write | 227.0 ± 5.8 | 227.5 ± 7.9 | +0.3% |
+| readback | 511.1 ± 13.8 | 500.1 ± 17.8 | −2.1% |
+| mixed | 454.9 ± 17.8 | 453.4 ± 16.1 | −0.3% |
+
+The code was reverted. Conclusion: the remaining small MGETs are no longer the
+write bottleneck. Per file, the two Lua CAS commits (~790 µs Redis server
+time, vs native 428 µs total) and the data path dominate. Further write gains
+need a cheaper commit script (fewer checked keys and ZADD index writes per
+commit), which is a larger protocol change not started.
+
 Rejected designs:
 - merging the create and first-fsync commits (breaks O_EXCL visibility);
 - full metadata copy-up of the lower (no write-op gain for new files; breaks
