@@ -149,6 +149,23 @@ time, vs native 428 µs total) and the data path dominate. Further write gains
 need a cheaper commit script (fewer checked keys and ZADD index writes per
 commit), which is a larger protocol change not started.
 
+### Round 27 (rejected, not merged): ungated data commits
+
+Observation: overlay write plateaus at ~230 files/s regardless of workers
+(1w 0.78x, 16w 0.63x, 32w 0.51x native). Hypothesis: the mount-wide
+`mutation_gate` serializes commits. Removing it from `write()` (CAS-safe;
+new test showed no lost updates) made write ~30% slower at 16 workers:
+#34 234 files/s vs ungated 163–166 files/s (`$R/ovn-{r25,r27}-r27w16p{a,b}`;
+run stopped early, the 32w arms were not run). Redis commandstats explain it:
+EVALSHA per file 3.2 → 11.5 and MGET 9.8 → 15.5. Every data commit CASes the
+same head-layer record (`next_sequence`), so ungated commits collide and
+retry. The gate was serializing commits that conflict anyway.
+
+Conclusion: the write ceiling is the per-workspace head-layer sequence
+counter that every commit bumps. Removing it needs a row-ordering change
+(per-inode or block-reserved sequences; resolver newest-wins and persisted
+format affected). Only after that would narrowing the gate help. Not started.
+
 Rejected designs:
 - merging the create and first-fsync commits (breaks O_EXCL visibility);
 - full metadata copy-up of the lower (no write-op gain for new files; breaks
