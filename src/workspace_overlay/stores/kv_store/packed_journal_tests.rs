@@ -8,6 +8,9 @@ use crate::workspace_overlay::stores::redis::RedisWorkspaceBackend;
 use crate::workspace_overlay::stores::tikv::TiKvWorkspaceBackend;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
+/// (pages still to serve before applying, writes to apply).
+pub(super) type PendingExtentWrite = (i64, Vec<KvWrite>);
+
 #[derive(Clone)]
 pub(super) struct JournalMemoryBackend {
     pub(super) rows: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
@@ -18,6 +21,9 @@ pub(super) struct JournalMemoryBackend {
     bounded_calls: Arc<AtomicI64>,
     pub(super) page_size: Arc<AtomicI64>,
     pub(super) page_calls: Arc<AtomicI64>,
+    /// Applied (once) right after the Nth extent scan page is served, to
+    /// land a concurrent write behind the scan cursor.
+    pub(super) after_extent_page: Arc<std::sync::Mutex<Option<PendingExtentWrite>>>,
 }
 impl Default for JournalMemoryBackend {
     fn default() -> Self {
@@ -30,6 +36,7 @@ impl Default for JournalMemoryBackend {
             bounded_calls: Default::default(),
             page_size: Default::default(),
             page_calls: Default::default(),
+            after_extent_page: Default::default(),
         }
     }
 }
@@ -269,6 +276,32 @@ impl WorkspaceKvBackend for JournalMemoryBackend {
     ) -> Result<Vec<KvEntry>, WorkspaceError> {
         limits.validate_scan_page(prefix, after_key_exclusive)?;
         self.page_calls.fetch_add(1, Ordering::SeqCst);
+        if prefix == b"delta/extent/" {
+            let injected = {
+                let mut hook = self.after_extent_page.lock().unwrap();
+                match hook.as_mut() {
+                    Some((0, _)) => hook.take().map(|(_, writes)| writes),
+                    Some((remaining, _)) => {
+                        *remaining -= 1;
+                        None
+                    }
+                    None => None,
+                }
+            };
+            if let Some(writes) = injected {
+                let mut rows = self.rows.lock().await;
+                for write in writes {
+                    match write {
+                        KvWrite::Put { key, value } => {
+                            rows.insert(key, value);
+                        }
+                        KvWrite::Delete { key } => {
+                            rows.remove(&key);
+                        }
+                    }
+                }
+            }
+        }
         let rows = self.rows.lock().await;
         let configured = self.page_size.load(Ordering::SeqCst);
         let cap = if configured > 0 {
