@@ -956,6 +956,75 @@ async fn cached_commit_cannot_outlive_a_binding_publication() {
     f.reader.shutdown().await.unwrap();
 }
 
+/// Concurrency oracle for any change to commit conflict detection: many
+/// tasks concurrently create files in one directory, write their own files
+/// and extend one shared file. No create may be lost or duplicated and no
+/// size update may be lost, whatever the commit serialization strategy.
+#[tokio::test]
+async fn concurrency_oracle_no_lost_creates_or_size_updates() {
+    use crate::chunk::SliceDesc;
+    use crate::meta::layer::MetaLayer;
+    const TASKS: u64 = 8;
+    const ROUNDS: u64 = 6;
+    let f = fixture(false).await;
+    let shared = f.meta.create_file(1, "oracle-shared".into()).await.unwrap();
+    let mut tasks = Vec::new();
+    for task in 0..TASKS {
+        let meta = f.meta.clone();
+        tasks.push(tokio::spawn(async move {
+            for round in 0..ROUNDS {
+                let ino = meta
+                    .create_file(1, format!("oracle-{task}-{round}"))
+                    .await
+                    .unwrap();
+                for (target, offset, slice) in [
+                    (ino, 0, 20_000 + task * 100 + round * 2),
+                    (
+                        shared,
+                        (task * ROUNDS + round) * 64,
+                        20_001 + task * 100 + round * 2,
+                    ),
+                ] {
+                    let chunk_id = crate::vfs::chunk_id_for(target, 0).unwrap();
+                    meta.write(
+                        target,
+                        chunk_id,
+                        SliceDesc {
+                            slice_id: slice,
+                            chunk_id,
+                            offset,
+                            length: 64,
+                        },
+                        offset + 64,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    for task in 0..TASKS {
+        for round in 0..ROUNDS {
+            let ino = f
+                .meta
+                .lookup(1, &format!("oracle-{task}-{round}"))
+                .await
+                .unwrap()
+                .expect("a committed create was lost");
+            assert_eq!(f.meta.stat(ino).await.unwrap().unwrap().size, 64);
+        }
+    }
+    assert_eq!(
+        f.meta.stat(shared).await.unwrap().unwrap().size,
+        TASKS * ROUNDS * 64,
+        "a concurrent size update to the shared file was lost"
+    );
+    f.reader.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn packed_workspace_filesystem_57_byte_write_and_readback_complete_within_deadline() {
     use asyncfuse::raw::{Filesystem, Request};
