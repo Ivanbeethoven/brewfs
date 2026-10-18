@@ -433,3 +433,49 @@ async fn native_slice_public_packed_mutation_rejects_reserved_sid_and_preserves_
     assert_eq!(*backend.rows.lock().await, before);
     assert_eq!(budget.state().used, used);
 }
+
+/// Phantom insertion: a live extent referencing the SID commits behind the
+/// reservation's scan cursor (after the scan passed its key position, before
+/// the reservation CAS). The reservation must not be granted, whatever fence
+/// protocol replaces the global extent generation.
+#[tokio::test]
+async fn native_slice_extent_landing_behind_the_scan_cursor_blocks_the_reservation() {
+    let (backend, store, _) = catalog().await;
+    // Orphan on layer 0x5b; the live extent goes on layer 0x22, which sorts
+    // before it. Scan one row per page and inject only once the cursor is
+    // past every row (the orphan was the last), so the scan never sees it.
+    orphan(&store, layer(91), 191).await.unwrap();
+    let extent_rows = backend
+        .rows
+        .lock()
+        .await
+        .keys()
+        .filter(|key| key.starts_with(b"delta/extent/"))
+        .count() as i64;
+    let live = extent(layer(34), 1, 191);
+    let mut checks = Vec::new();
+    let mut writes = vec![put(extent_key(&live), &live).unwrap()];
+    let _owner = store
+        .prepare_native_extent_cas(&mut checks, &mut writes)
+        .await
+        .unwrap();
+    backend.page_size.store(1, Ordering::SeqCst);
+    *backend.after_extent_page.lock().unwrap() = Some((extent_rows, writes.clone()));
+    let result = store.reserve_gc_slice_deletion(191, 6, &[layer(91)]).await;
+    assert!(
+        backend.after_extent_page.lock().unwrap().is_none(),
+        "the concurrent commit was not injected during the scan"
+    );
+    assert!(backend.get(&extent_key(&live)).await.unwrap().is_some());
+    assert!(
+        matches!(result, Err(WorkspaceError::Busy)),
+        "reservation granted over a live extent: {result:?}"
+    );
+    assert!(
+        backend
+            .get(&slice_deletion_key(191))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
