@@ -9,9 +9,7 @@ use crate::workspace_overlay::ids::LeaseId;
 use crate::workspace_overlay::model::{DataExtentDelta, LayerState};
 use crate::workspace_overlay::stores::kv_backend::{KvEntry, KvReadLimits};
 use crate::workspace_overlay::stores::kv_store::native_reverse;
-use crate::workspace_overlay::stores::kv_store::native_slice_deletion::{
-    EXTENT_GENERATION_KEY, slice_deletion_key,
-};
+use crate::workspace_overlay::stores::kv_store::native_slice_deletion::slice_deletion_key;
 use crate::workspace_overlay::stores::redis::RedisWorkspaceBackend;
 use crate::workspace_overlay::stores::tikv::TiKvWorkspaceBackend;
 use aws_sdk_s3::error::SdkError;
@@ -202,11 +200,11 @@ impl<B: WorkspaceKvBackend + Clone> Scheduled<B> {
 
     async fn before_cas(&self, checks: &[KvCheck], writes: &[KvWrite]) -> bool {
         if Self::is_reservation(writes) {
-            assert!(
-                checks
-                    .iter()
-                    .any(|check| check.key == EXTENT_GENERATION_KEY)
-            );
+            assert!(checks.iter().any(|check| {
+                check
+                    .key
+                    .starts_with(b"packed/v3/native-extent-generation/")
+            }));
             let pause = self.reservation_pause.lock().await.take();
             if let Some(pause) = pause {
                 pause.pause().await;
@@ -220,11 +218,11 @@ impl<B: WorkspaceKvBackend + Clone> Scheduled<B> {
             assert!(checks.iter().any(|check| {
                 check.key == slice_deletion_key(SLICE) && check.expected.is_none()
             }));
-            assert!(
-                checks
-                    .iter()
-                    .any(|check| check.key == EXTENT_GENERATION_KEY)
-            );
+            assert!(checks.iter().any(|check| {
+                check
+                    .key
+                    .starts_with(b"packed/v3/native-extent-generation/")
+            }));
             self.attempts.fetch_add(1, Ordering::SeqCst);
             let pause = self.pause.lock().await.take();
             if let Some(pause) = pause {

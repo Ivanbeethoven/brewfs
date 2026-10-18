@@ -1,5 +1,5 @@
 //! The real catalog/final CAS protocol on the existing atomic test substrate.
-use super::super::native_slice_deletion::{EXTENT_GENERATION_KEY, slice_deletion_key};
+use super::super::native_slice_deletion::slice_deletion_key;
 use super::super::*;
 use super::tests::JournalMemoryBackend;
 use crate::workspace_overlay::packed_v3::wire005::{V3BudgetPool, V3MountBudget};
@@ -53,13 +53,17 @@ async fn orphan(
         .await
 }
 
+/// Sum of every per-layer extent generation: any extent change in any layer
+/// advances it.
 async fn epoch(backend: &JournalMemoryBackend) -> u64 {
     backend
-        .get(EXTENT_GENERATION_KEY)
+        .rows
+        .lock()
         .await
-        .unwrap()
-        .map(|raw| decode(&raw).unwrap())
-        .unwrap_or(0)
+        .iter()
+        .filter(|(key, _)| key.starts_with(b"packed/v3/native-extent-generation/"))
+        .map(|(_, raw)| decode::<u64>(raw).unwrap())
+        .sum()
 }
 
 #[tokio::test]
