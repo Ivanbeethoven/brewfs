@@ -166,6 +166,40 @@ counter that every commit bumps. Removing it needs a row-ordering change
 (per-inode or block-reserved sequences; resolver newest-wins and persisted
 format affected). Only after that would narrowing the gate help. Not started.
 
+### Round 29 (in progress on `codex/overlay-write-a-r29`): write scaling design
+
+Committed, not merged: `6693d39` per-layer extent generation
+(`packed/v3/native-extent-generation/<layer>`). GC reservations check every
+census layer's generation; mutation-checked by
+`native_slice_extent_landing_behind_the_scan_cursor_blocks_the_reservation`
+(PR #38). It removes cross-workspace data-commit contention only; this
+single-workspace benchmark is unaffected, so it is unbenchmarked.
+
+Findings that block scaling within one workspace:
+1. Every data commit bumps the head's `next_sequence` (round 27: ungating
+   `write()` alone tripled EVALSHA/file and lost 30%).
+2. Every data commit also bumps its head layer's extent generation, which is
+   the same per-workspace hotspot. The proposed fix: exempt extent commits that
+   only write slice IDs freshly allocated by this mount. A GC reservation
+   for such a SID cannot predate its first commit; needs proof plus tests
+   covering reuse paths (truncate, fallocate, copy-up).
+3. Eight admin paths decide "head is empty" from `next_sequence == 1 &&
+   owned_* == 0`: `read_unmounted_packed_source`,
+   `finish_clean_publication`, `read_clean_published_view`,
+   `finish_committed_clean_snapshot`, `finish_initial_publication`,
+   `restore_initial_before_seed`, `claim_initial_open`,
+   `finish_committed_initial_snapshot`. Sequence blocks / head-free data
+   commits break this. Safe replacement only where no writer can exist (no
+   live lease, checked in the CAS; acquire refused meanwhile), plus a bounded
+   row scan of the head's delta prefixes. Each site must be verified and
+   tested individually; a wrong site publishes a lower missing overlay data.
+
+Order to resume: (3) per-site emptiness via lease-absent + row scan, tests
+first; then (2) the fresh-SID exemption with mutation-checked tests; then
+per-mount sequence blocks and inode-row CAS for data commits; then ungate
+`write()`; then the oracle, the full gate, the probe, the 32-worker run and
+the order-swapped comparison with a 1/16/32-worker table.
+
 Rejected designs:
 - merging the create and first-fsync commits (breaks O_EXCL visibility);
 - full metadata copy-up of the lower (no write-op gain for new files; breaks
