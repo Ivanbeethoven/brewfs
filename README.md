@@ -14,6 +14,7 @@
     <a href="#architecture">Architecture</a> ·
     <a href="#performance">Performance</a> ·
     <a href="doc/README.md">Documentation</a> ·
+    <a href="innovations/README.md">Innovations</a> ·
     <a href="README_CN.md">中文</a>
   </p>
 </div>

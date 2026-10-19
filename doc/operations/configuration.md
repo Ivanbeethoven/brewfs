@@ -300,7 +300,7 @@ CLI 的 `--s3-rustfs-ec-block-size-hint` 优先于 YAML。未配置时不发送�
 
 提示通过 S3 用户元数据头 `x-amz-meta-rustfs-ec-block-size-hint` 随普通 PUT、create-only PUT 和 multipart initiation 发送。它是 RustFS 扩展，不是 S3 标准的 EC 布局控制参数；只有支持且启用了提示处理的服务端才会解释它。服务端决定实际采用的布局，已有对象不会因为挂载配置变化而重新编码。
 
-`auto` 是显式启用的整对象读写候选策略：最终 S3 对象 **≤ 1 MiB 不发送 hint**，由 RustFS 保留默认及内联策略；**> 1 MiB 请求 4 MiB EC 块**，减少大对象的 EC 分段次数。不会自动选择 64/256 KiB 小块；这些固定值仍可用于实验。阈值还需通过不同文件大小、压缩率和并发的实测验收，不代表所有负载均有收益。
+`auto` 是显式启用的整对象读写策略：最终 S3 对象 **≤ 1 MiB 不发送 hint**，由 RustFS 保留默认及内联策略；**> 1 MiB 请求 1 MiB EC 块**。ACS 上相同客户端与服务端的整文件对照没有支持旧策略自动选择 4 MiB EC，故按实测修正。不会自动选择 64/256 KiB 小块；固定值仍可用于显式覆盖和实验。该策略主要配合完整 GET 合并与缓存路径，不代表改变 EC 数值本身就能提升所有负载。技术细节及证据见 [Innovations](../../innovations/README.md)。
 
 此字段与 BrewFS 的 `layout.block_size`、`data.s3.part_size` 和服务端校验片大小分别控制不同层次。自动选择使用上传入口已经定型的对象字节数，包括压缩结果、补零和 4 字节持久化格式头；普通上传、后台上传与恢复上传共用此入口，不读取正在增长的 inode 长度、SSD 预分配空间或全局缓存占用，也不等待整个文件关闭。multipart 在创建时使用整个对象大小，part 请求不重复发送 hint。选择固定模式时不再按对象大小推断；CLI 始终优先于 YAML。
 

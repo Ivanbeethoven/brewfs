@@ -1,0 +1,42 @@
+{
+  "passed": true,
+  "campaigns": {
+    "screen": {
+      "groups": 20,
+      "full_file_hash_checks": 3584,
+      "metadata_layout_checks": 8704
+    },
+    "hot_screen": {
+      "groups": 32,
+      "full_file_hash_checks": 27472,
+      "metadata_layout_checks": 17920
+    },
+    "acceptance": {
+      "groups": 184,
+      "full_file_hash_checks": 162432,
+      "metadata_layout_checks": 346112
+    },
+    "shared_screen": {
+      "groups": 32,
+      "full_file_hash_checks": 27472,
+      "metadata_layout_checks": 17920
+    },
+    "hot_acceptance": {
+      "groups": 64,
+      "full_file_hash_checks": 54944,
+      "metadata_layout_checks": 35840
+    },
+    "policy_smoke": {
+      "groups": 3,
+      "full_file_hash_checks": 12,
+      "metadata_layout_checks": 56
+    },
+    "policy_acceptance": {
+      "groups": 88,
+      "full_file_hash_checks": 13824,
+      "metadata_layout_checks": 44032
+    }
+  },
+  "raw_files": 7499,
+  "archive_sha256": "e4fbe5d14430bc480017d3cf2224d427bb2c53ac3027823ae1c0b3c6c1a9b3d5"
+}

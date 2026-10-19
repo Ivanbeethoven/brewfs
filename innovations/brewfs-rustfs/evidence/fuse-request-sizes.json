@@ -1,0 +1,139 @@
+[
+  {
+    "size": 4096,
+    "request_bytes": null,
+    "histogram": {
+      "read": {
+        "read": {
+          "4096": 4
+        }
+      },
+      "write": {
+        "write": {
+          "4096": 2
+        }
+      }
+    }
+  },
+  {
+    "size": 65536,
+    "request_bytes": null,
+    "histogram": {
+      "read": {
+        "read": {
+          "65536": 2,
+          "4096": 2
+        }
+      },
+      "write": {
+        "write": {
+          "65536": 2
+        }
+      }
+    }
+  },
+  {
+    "size": 1048576,
+    "request_bytes": null,
+    "histogram": {
+      "read": {
+        "read": {
+          "131072": 16,
+          "4096": 2
+        }
+      },
+      "write": {
+        "write": {
+          "1048576": 2
+        }
+      }
+    }
+  },
+  {
+    "size": 4194304,
+    "request_bytes": null,
+    "histogram": {
+      "read": {
+        "read": {
+          "131072": 64,
+          "4096": 2
+        }
+      },
+      "write": {
+        "write": {
+          "4194304": 2
+        }
+      }
+    }
+  },
+  {
+    "size": 4259840,
+    "request_bytes": null,
+    "histogram": {
+      "read": {
+        "read": {
+          "131072": 64,
+          "65536": 2,
+          "4096": 2
+        }
+      },
+      "write": {
+        "write": {
+          "4194304": 2,
+          "65536": 2
+        }
+      }
+    }
+  },
+  {
+    "size": 16777216,
+    "request_bytes": null,
+    "histogram": {
+      "read": {
+        "read": {
+          "131072": 256,
+          "4096": 2
+        }
+      },
+      "write": {
+        "write": {
+          "4194304": 8
+        }
+      }
+    }
+  },
+  {
+    "size": 4194304,
+    "request_bytes": 131072,
+    "histogram": {
+      "read": {
+        "read": {
+          "131072": 64,
+          "4096": 2
+        }
+      },
+      "write": {
+        "write": {
+          "131072": 64
+        }
+      }
+    }
+  },
+  {
+    "size": 4194304,
+    "request_bytes": 4194304,
+    "histogram": {
+      "read": {
+        "read": {
+          "131072": 64,
+          "4096": 2
+        }
+      },
+      "write": {
+        "write": {
+          "4194304": 2
+        }
+      }
+    }
+  }
+]
