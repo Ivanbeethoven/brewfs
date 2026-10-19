@@ -1025,6 +1025,136 @@ async fn concurrency_oracle_no_lost_creates_or_size_updates() {
     f.reader.shutdown().await.unwrap();
 }
 
+/// Group commit: many concurrent writes share commits. Every write lands
+/// with its own extent and size; a write whose inode is gone fails alone
+/// without failing the writes it was batched with; a write returns only
+/// after its batch committed (so fsync after write sees it durable).
+#[tokio::test]
+async fn group_committed_writes_land_individually_and_fail_individually() {
+    use crate::chunk::SliceDesc;
+    use crate::meta::layer::MetaLayer;
+    let f = fixture(false).await;
+    let mut inodes = Vec::new();
+    for index in 0..24 {
+        inodes.push(f.meta.create_file(1, format!("gc-{index}")).await.unwrap());
+    }
+    let gone = 9_999_999;
+    let mut tasks = Vec::new();
+    for (index, ino) in inodes
+        .iter()
+        .copied()
+        .chain(std::iter::once(gone))
+        .enumerate()
+    {
+        let meta = f.meta.clone();
+        tasks.push(tokio::spawn(async move {
+            let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+            let result = meta
+                .write(
+                    ino,
+                    chunk_id,
+                    SliceDesc {
+                        slice_id: 30_000 + index as u64,
+                        chunk_id,
+                        offset: 0,
+                        length: 100 + index as u64,
+                    },
+                    100 + index as u64,
+                )
+                .await;
+            (ino, index as u64, result)
+        }));
+    }
+    for task in tasks {
+        let (ino, index, result) = task.await.unwrap();
+        if ino == gone {
+            assert!(
+                matches!(result, Err(crate::meta::store::MetaError::NotFound(_))),
+                "{result:?}"
+            );
+            continue;
+        }
+        result.unwrap();
+        // Returned => committed: visible right away with its own size.
+        assert_eq!(f.meta.stat(ino).await.unwrap().unwrap().size, 100 + index);
+    }
+    f.reader.shutdown().await.unwrap();
+}
+
+/// Writes to one file batched together keep every extent and the maximum
+/// size; the later of two overlapping writes wins on the overlap.
+#[tokio::test]
+async fn group_commit_same_file_keeps_order_and_size() {
+    use crate::chunk::SliceDesc;
+    use crate::meta::layer::MetaLayer;
+    let f = fixture(false).await;
+    let ino = f.meta.create_file(1, "gc-same".into()).await.unwrap();
+    let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+    let mut tasks = Vec::new();
+    for index in 0..16u64 {
+        let meta = f.meta.clone();
+        tasks.push(tokio::spawn(async move {
+            meta.write(
+                ino,
+                chunk_id,
+                SliceDesc {
+                    slice_id: 40_000 + index,
+                    chunk_id,
+                    offset: index * 64,
+                    length: 64,
+                },
+                index * 64 + 64,
+            )
+            .await
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    assert_eq!(f.meta.stat(ino).await.unwrap().unwrap().size, 16 * 64);
+    // Sequential overlapping writes: the second must win where they overlap.
+    for (slice_id, length) in [(41_000u64, 128u64), (41_001, 64)] {
+        f.meta
+            .write(
+                ino,
+                chunk_id,
+                SliceDesc {
+                    slice_id,
+                    chunk_id,
+                    offset: 0,
+                    length,
+                },
+                16 * 64,
+            )
+            .await
+            .unwrap();
+    }
+    use crate::workspace_overlay::model::ExtentKind;
+    let mut rows = f
+        .store
+        .get_extent_deltas(crate::workspace_overlay::catalog::ExtentQuery {
+            layer_ids: vec![f.guard.expected_head_layer_id],
+            ino,
+            chunk_index: 0,
+            range_start: 0,
+            range_end: 128,
+        })
+        .await
+        .unwrap();
+    rows.sort_by_key(|row| row.sequence);
+    let slices = rows
+        .iter()
+        .filter_map(|row| match row.kind {
+            ExtentKind::Data { slice_id, .. } if slice_id >= 41_000 => Some(slice_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // Arrival order is preserved in sequence order, so 41_001 resolves over
+    // 41_000 on their overlap (newest-wins).
+    assert_eq!(slices, vec![41_000, 41_001], "{rows:?}");
+    f.reader.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn packed_workspace_filesystem_57_byte_write_and_readback_complete_within_deadline() {
     use asyncfuse::raw::{Filesystem, Request};
