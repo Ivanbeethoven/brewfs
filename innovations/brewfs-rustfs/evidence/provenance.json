@@ -1,0 +1,63 @@
+{
+  "date": "2026-10-19",
+  "brewfs": {
+    "repository": "https://github.com/Ivanbeethoven/brewfs",
+    "source_commit": "687925b724f3550a47cc530f875e0470a693a022",
+    "baseline_commit": "e5fec716503817917a5d47abd62a1986ffedec38",
+    "binary_sha256": "0b29553fa2cd5577c8eba9d03e9e1433a8da29e78e47c4894fcc44c728816b03"
+  },
+  "rustfs": {
+    "repository": "https://github.com/Ivanbeethoven/rustfs",
+    "source_commit": "cc4926fac1107aee76540f28bf22dbd47fcbca24",
+    "branch": "perf/frame-aware-batch-read",
+    "binary_sha256": "dc5e70da04d904f5ba3ec114776eb680551a2554107b36e5521393d80a9ffc9b",
+    "environment": {
+      "RUST_LOG": "warn",
+      "RUSTFS_CONSOLE_ENABLE": "false",
+      "RUSTFS_OBS_LOG_DIRECTORY": "",
+      "RUSTFS_STORAGE_CLASS_STANDARD": "EC:2",
+      "RUSTFS_EC_BLOCK_SIZE_HINT_ENABLE": "true",
+      "RUSTFS_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED": "true",
+      "RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE": "true",
+      "RUSTFS_EC_READ_QUANTUM_ENABLE": "false",
+      "RUSTFS_EC_READ_QUANTUM_FLEET_CONFIRMED": "false",
+      "RUSTFS_OBJECT_MMAP_READ_ENABLE": "true",
+      "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE": "true",
+      "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE": "false",
+      "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD": "4194304"
+    }
+  },
+  "plan_sha256": "be7cf57eaf81d38d782fdfe9300b4f4a81cc6e554a3821b8d68ef94b3417ae1c",
+  "deployment": {
+    "region": "cn-hangzhou",
+    "platform": "Aliyun ACS",
+    "client_cpu": 4,
+    "client_memory_gib": 8,
+    "server_cpu": 8,
+    "server_memory_gib": 16,
+    "disks": 4,
+    "disk_gib": 40,
+    "disk_type": "ESSD PL1",
+    "ec_data_shards": 2,
+    "ec_parity_shards": 2
+  },
+  "evidence_sha256": {
+    "policy-summary.json": "0eedeb909269a5c397a3859b73cfcf8dc89033aa49d03b41883763d8511da2a3",
+    "policy-comparisons.json": "e691e3ab5ff57a8bed0c482f70bb835485e7d7293a2dd9f6c5fa6111d244e3fc",
+    "resident-summary.json": "a3b90d6149ffea638caca8fdbab1d9529e4831fd975c91bf5a2f1799b6b8402d",
+    "resident-comparisons.json": "5e203fe6b285303d2671b8cb0ebf594fe8810d85996956644179d1c2dd9fc9db",
+    "summary.json": "155dfd4404bf5471b042f26aa51581d85ea65b652446fc761819a39b18ff5f7e",
+    "comparisons.json": "6679a384691c37daf98d241ccb2f12e2f5d4168d29bc38c793b4ed234aaa0f58",
+    "fuse-request-sizes.json": "748f2e5a8776aa89d53dd8bf777099a197351547398a2e6778f91b2036e92202",
+    "export.json": "7f64305f1a4f75a0037cf2ad77b4bd6c674534795cdbe5ea8f793d1a9749ad77",
+    "delivery-audit.json": "c3bf5ce964e77bc90e66e1eb478698bb9168f1cf665c3cd974445eb8e2bdeedb"
+  },
+  "figures_sha256": {
+    "final_client_cold_read.png": "6e2ae735e9c81f49c737738048dc7c16a18fe537b1917367276a4b24d28ef66e",
+    "final_write.png": "b5169d914494bd6489569ef46ef141361948646c7b703c29a5cf2abbe70d2a05",
+    "hint_isolation.png": "c10945f52bda4e3632082975d0a9c89f3de1b7879bd16f211637694f6555d2c5",
+    "original_comparison.png": "931f11ab6c948a3962bd1d392e8e876755d7bbfc32159ab90f11c7ceea7fd8e6",
+    "resident_hot.png": "1a0542a790a5c142af6908a48d96262e4b33909eab5f853a9825c0a20a50417f"
+  },
+  "raw_archive_sha256": "e4fbe5d14430bc480017d3cf2224d427bb2c53ac3027823ae1c0b3c6c1a9b3d5"
+}

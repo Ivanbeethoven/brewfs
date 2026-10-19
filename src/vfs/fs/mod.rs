@@ -4870,7 +4870,7 @@ where
                 data,
                 _guard: guard,
             }),
-            None => bytes::Bytes::from(data),
+            None => data.into_bytes(),
         })
     }
 
@@ -4883,7 +4883,9 @@ where
     }
 
     pub async fn read(&self, fh: u64, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
-        self.read_inner(fh, offset, len, false).await
+        self.read_inner(fh, offset, len, false)
+            .await
+            .map(crate::vfs::io::reader::ReadReply::into_vec)
     }
 
     async fn read_inner(
@@ -4892,7 +4894,7 @@ where
         offset: u64,
         len: usize,
         output_reserved: bool,
-    ) -> Result<Vec<u8>, VfsError> {
+    ) -> Result<crate::vfs::io::reader::ReadReply, VfsError> {
         #[cfg(not(feature = "workspace-overlay"))]
         let _ = output_reserved;
         if len == 0 {
@@ -4905,7 +4907,7 @@ where
             #[cfg(not(feature = "workspace-overlay"))]
             let fenced = false;
             if !fenced {
-                return Ok(Vec::new());
+                return Ok(Vec::new().into());
             }
         }
 
@@ -4935,7 +4937,7 @@ where
                 operation.deliver(data.len() as u64);
             }
             handle.update_offset(offset + data.len() as u64);
-            return Ok(data);
+            return Ok(data.into());
         }
 
         #[cfg(feature = "workspace-overlay")]
@@ -4950,14 +4952,15 @@ where
                     provider,
                     None,
                 )
-                .await;
+                .await
+                .map(Into::into);
         }
 
         let file_size = self
             .inode_size_cached(handle.ino)
             .unwrap_or_else(|| handle.attr().size);
         if offset >= file_size {
-            return Ok(Vec::new());
+            return Ok(Vec::new().into());
         }
         let actual_len = len.min((file_size - offset) as usize);
         self.wait_split_write_barrier(handle.ino, offset, actual_len)
@@ -4983,7 +4986,7 @@ where
                 .map_err(VfsError::from)?
         };
         if let Some(data) = dirty_data {
-            return Ok(data);
+            return Ok(data.into());
         }
 
         // We intentionally do NOT call flush_if_exists here: blocking every

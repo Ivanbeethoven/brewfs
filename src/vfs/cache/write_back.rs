@@ -98,6 +98,10 @@ pub struct FsWriteBackCache {
 }
 
 impl FsWriteBackCache {
+    pub(crate) fn has_recoverable_data(&self) -> bool {
+        !self.recoverable_keys.is_empty()
+    }
+
     #[cfg(feature = "workspace-overlay")]
     pub(crate) fn has_recoverable_for_inode(
         &self,

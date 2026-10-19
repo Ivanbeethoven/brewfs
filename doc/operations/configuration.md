@@ -201,6 +201,7 @@ brewfs console [OPTIONS]
 | `--s3-max-concurrency <N>` | S3 multipart 最大并发，默认 32。 |
 | `--s3-force-path-style <true|false>` | path-style S3 访问。MinIO/RustFS 通常设为 `true`。 |
 | `--s3-disable-payload-checksum <true|false>` | 禁用 SigV4 payload SHA-256，默认 `true`。 |
+| `--s3-rustfs-ec-block-size-hint <auto或BYTES>` | 需要编译 feature `rustfs-ec-block-size-hint`；`auto` 按最终对象大小选择，或固定为 `65536`、`262144`、`1048576`、`4194304`，默认关闭，只用于 S3 后端。 |
 | `--meta-backend <sqlx|redis|etcd|tikv>` | 元数据后端。 |
 | `--meta-url <URL>` | SQLx 或 Redis URL。 |
 | `--meta-etcd-urls <URLS>` | 逗号分隔的 Etcd endpoint。 |
@@ -253,6 +254,7 @@ compact: {}
 | `data.s3.max_concurrency` | `32` | S3 multipart 最大并发。 |
 | `data.s3.force_path_style` | `false` | MinIO/RustFS/Ceph RGW 常需要 `true`。 |
 | `data.s3.disable_payload_checksum` | `true` | 自建 S3 通常建议 `true` 以降低写路径 CPU。 |
+| `data.s3.rustfs_ec_block_size_hint` | 关闭 | 需要编译 feature `rustfs-ec-block-size-hint`；支持 `auto` 或固定 bytes：`65536`、`262144`、`1048576`、`4194304`。 |
 
 S3 凭据走 AWS SDK 标准环境变量和配置文件，例如：
 
@@ -261,6 +263,65 @@ export AWS_ACCESS_KEY_ID=rustfsadmin
 export AWS_SECRET_ACCESS_KEY=rustfsadmin
 export AWS_DEFAULT_REGION=us-east-1
 export AWS_EC2_METADATA_DISABLED=true
+```
+
+#### RustFS EC 块大小提示
+
+该功能由 Cargo feature `rustfs-ec-block-size-hint` 控制，默认编译关闭。需要先构建启用该 feature 的 BrewFS：
+
+```bash
+cargo build --release --features rustfs-ec-block-size-hint
+```
+
+若部署内核不支持默认 io_uring FUSE 路径所要求的同步取消（本次 ACS 5.10 内核返回 `Invalid argument`），使用已有的 Tokio 运行时：
+
+```bash
+cargo build --release --no-default-features --features fuse-tokio-runtime,rustfs-ec-block-size-hint
+```
+
+需要网关时再同时启用 `gateway-s3,gateway-webdav`。这是运行时兼容选择，自动 hint 规则相同。
+
+未启用 feature 的二进制不包含提示发送逻辑，CLI 帮助中隐藏该参数；显式使用 CLI、YAML 或 SDK 配置提示会报 `feature not compiled: rustfs-ec-block-size-hint`，不会静默忽略。启用 feature 后，仍需显式配置 `auto` 或固定提示；省略时不发送提示。
+
+在支持 Dynamic Block Size 扩展的 RustFS 上，可为新上传的 S3 对象启用自动选择。例如：
+
+```yaml
+data:
+  backend: s3
+  s3:
+    bucket: brewfs-data
+    endpoint: http://127.0.0.1:9000
+    region: us-east-1
+    force_path_style: true
+    rustfs_ec_block_size_hint: auto
+```
+
+CLI 的 `--s3-rustfs-ec-block-size-hint` 优先于 YAML。未配置时不发送提示；关闭时删除 YAML 字段并省略 CLI 参数。`0` 和其他未列出的尺寸会被拒绝，`local-fs` 后端也不接受此字段。
+
+提示通过 S3 用户元数据头 `x-amz-meta-rustfs-ec-block-size-hint` 随普通 PUT、create-only PUT 和 multipart initiation 发送。它是 RustFS 扩展，不是 S3 标准的 EC 布局控制参数；只有支持且启用了提示处理的服务端才会解释它。服务端决定实际采用的布局，已有对象不会因为挂载配置变化而重新编码。
+
+`auto` 是显式启用的整对象读写策略：最终 S3 对象 **≤ 1 MiB 不发送 hint**，由 RustFS 保留默认及内联策略；**> 1 MiB 请求 1 MiB EC 块**。ACS 上相同客户端与服务端的整文件对照没有支持旧策略自动选择 4 MiB EC，故按实测修正。不会自动选择 64/256 KiB 小块；固定值仍可用于显式覆盖和实验。该策略主要配合完整 GET 合并与缓存路径，不代表改变 EC 数值本身就能提升所有负载。技术细节及证据见 [Innovations](../../innovations/README.md)。
+
+此字段与 BrewFS 的 `layout.block_size`、`data.s3.part_size` 和服务端校验片大小分别控制不同层次。自动选择使用上传入口已经定型的对象字节数，包括压缩结果、补零和 4 字节持久化格式头；普通上传、后台上传与恢复上传共用此入口，不读取正在增长的 inode 长度、SSD 预分配空间或全局缓存占用，也不等待整个文件关闭。multipart 在创建时使用整个对象大小，part 请求不重复发送 hint。选择固定模式时不再按对象大小推断；CLI 始终优先于 YAML。
+
+例如，不压缩的 1 MiB 数据块带格式头后会超过阈值；4 MiB 的高可压缩数据若压缩到 1 MiB 以下则不发送 hint；一个大文件的短尾块可使用不同于前面整块的 hint。BrewFS 文件切分和压缩格式不变。完整设计与测试标准见 [自动提示设计](../testing/rustfs-auto-object-hint.md)。
+
+直接上传诊断可绕过 FUSE 检查 S3 写入路径：
+
+```bash
+brewfs object-put-bench --s3-bucket brewfs-hint-test \
+  --s3-endpoint http://127.0.0.1:9000 \
+  --s3-rustfs-ec-block-size-hint 1048576 \
+  --object-size 4194304 --workers 1 --objects 20 --duration-secs 0
+```
+
+该命令上传测试对象，不能替代文件系统正确性或端到端性能测试。另有显式启用的实时回归，覆盖上传、HEAD 中的实际 EC 块大小及完整/Range 读取。运行前需要隔离的 Dynamic Block RustFS、已创建的测试 bucket，以及已启用的动态块和客户端提示开关；凭据使用上方 AWS SDK 配置：
+
+```bash
+BREWFS_S3_ENDPOINT=http://127.0.0.1:9000 \
+BREWFS_S3_BUCKET=brewfs-hint-test \
+  cargo test --features rustfs-ec-block-size-hint --lib cadapter::s3::tests::rustfs_ec_hint_live_upload_head_and_range \
+  -- --ignored --exact
 ```
 
 ### meta

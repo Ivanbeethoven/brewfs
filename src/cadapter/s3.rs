@@ -19,6 +19,78 @@ use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 use tokio_util::io::ReaderStream;
 
+#[cfg(feature = "rustfs-ec-block-size-hint")]
+const RUSTFS_EC_BLOCK_SIZE_HINT_KEY: &str = "rustfs-ec-block-size-hint";
+
+/// Optional per-object RustFS layout policy. `Auto` uses the finalized wire
+/// length, after BrewFS compression/framing, not the file or SSD allocation size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustfsEcBlockSizeHint {
+    Auto,
+    Fixed(usize),
+}
+
+impl std::str::FromStr for RustfsEcBlockSizeHint {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == "auto" {
+            Ok(Self::Auto)
+        } else {
+            value.parse::<usize>().map(Self::Fixed).map_err(|_| {
+                "RustFS EC block size hint must be auto, 65536, 262144, 1048576 or 4194304 bytes".into()
+            })
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RustfsEcBlockSizeHint {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            Bytes(usize),
+            Text(String),
+        }
+        match <Input as serde::Deserialize>::deserialize(deserializer)? {
+            Input::Bytes(size) => Ok(Self::Fixed(size)),
+            Input::Text(value) => value.parse().map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+impl RustfsEcBlockSizeHint {
+    #[cfg(feature = "rustfs-ec-block-size-hint")]
+    fn for_object(self, object_bytes: usize) -> Option<usize> {
+        match self {
+            Self::Fixed(size) => Some(size),
+            // Preserve the server's default/inline path for small objects.
+            // Whole-file ACS tests favor 1 MiB EC for BrewFS's 4 MiB objects;
+            // fewer EC segments alone did not make the 4 MiB layout faster.
+            Self::Auto if object_bytes > 1_048_576 => Some(1_048_576),
+            Self::Auto => None,
+        }
+    }
+}
+
+pub(crate) fn validate_rustfs_ec_block_size_hint(
+    hint: Option<RustfsEcBlockSizeHint>,
+) -> Result<()> {
+    #[cfg(not(feature = "rustfs-ec-block-size-hint"))]
+    if hint.is_some() {
+        anyhow::bail!("feature not compiled: rustfs-ec-block-size-hint");
+    }
+    #[cfg(feature = "rustfs-ec-block-size-hint")]
+    if let Some(RustfsEcBlockSizeHint::Fixed(size)) = hint
+        && ![65_536, 262_144, 1_048_576, 4_194_304].contains(&size)
+    {
+        return Err(anyhow!(
+            "RustFS EC block size hint must be 65536, 262144, 1048576 or 4194304 bytes"
+        ));
+    }
+    Ok(())
+}
+
 /// S3 backend configuration options
 #[derive(Debug, Clone)]
 pub struct S3Config {
@@ -43,6 +115,11 @@ pub struct S3Config {
     /// Disable SDK-level request checksums and SigV4 payload hashing.
     /// Safe for self-hosted S3 backends (RustFS/MinIO) over trusted networks.
     pub disable_payload_checksum: bool,
+    /// Optional RustFS EC encoding block size policy (`auto` or fixed bytes). This does not
+    /// change BrewFS block boundaries or S3 multipart part sizes.
+    /// Requires the `rustfs-ec-block-size-hint` Cargo feature; otherwise
+    /// constructors reject configured hints before loading AWS configuration.
+    pub rustfs_ec_block_size_hint: Option<RustfsEcBlockSizeHint>,
 }
 
 impl Default for S3Config {
@@ -58,6 +135,7 @@ impl Default for S3Config {
             endpoint: None,
             force_path_style: false,
             disable_payload_checksum: true,
+            rustfs_ec_block_size_hint: None,
         }
     }
 }
@@ -156,6 +234,13 @@ mod gc_replay_tests {
 
 #[allow(dead_code)]
 impl S3Backend {
+    #[cfg(feature = "rustfs-ec-block-size-hint")]
+    fn ec_block_size_hint(&self, object_bytes: usize) -> Option<usize> {
+        self.config
+            .rustfs_ec_block_size_hint
+            .and_then(|hint| hint.for_object(object_bytes))
+    }
+
     /// Create new S3 backend with default configuration
     pub async fn new(bucket: impl Into<String>) -> Result<Self> {
         let config = S3Config {
@@ -230,6 +315,7 @@ impl S3Backend {
         if config.bucket.is_empty() {
             return Err(anyhow!("Bucket name cannot be empty"));
         }
+        validate_rustfs_ec_block_size_hint(config.rustfs_ec_block_size_hint)?;
 
         let mut aws_config_loader = aws_config::defaults(BehaviorVersion::latest());
 
@@ -644,6 +730,10 @@ impl S3Backend {
                 .body(body)
                 .content_length(total_size as i64);
 
+            #[cfg(feature = "rustfs-ec-block-size-hint")]
+            if let Some(size) = self.ec_block_size_hint(total_size) {
+                request = request.metadata(RUSTFS_EC_BLOCK_SIZE_HINT_KEY, size.to_string());
+            }
             if let Some(sum) = checksum.as_ref() {
                 request = request.content_md5(sum.clone());
             }
@@ -680,6 +770,10 @@ impl S3Backend {
                 .key(key)
                 .body(SdkBody::from(data.to_vec()).into());
 
+            #[cfg(feature = "rustfs-ec-block-size-hint")]
+            if let Some(size) = self.ec_block_size_hint(data.len()) {
+                request = request.metadata(RUSTFS_EC_BLOCK_SIZE_HINT_KEY, size.to_string());
+            }
             if self.config.enable_md5 {
                 let checksum = Self::md5_base64(data);
                 request = request.content_md5(checksum);
@@ -706,13 +800,17 @@ impl S3Backend {
     /// Handle multipart upload for large objects
     async fn multipart_upload(&self, key: &str, data: &[u8]) -> Result<()> {
         // Create multipart upload
-        let create = self
+        let request = self
             .client
             .create_multipart_upload()
             .bucket(&self.config.bucket)
-            .key(key)
-            .send()
-            .await?;
+            .key(key);
+        #[cfg(feature = "rustfs-ec-block-size-hint")]
+        let request = match self.ec_block_size_hint(data.len()) {
+            Some(size) => request.metadata(RUSTFS_EC_BLOCK_SIZE_HINT_KEY, size.to_string()),
+            None => request,
+        };
+        let create = request.send().await?;
 
         let upload_id = create
             .upload_id()
@@ -835,13 +933,17 @@ impl S3Backend {
 
     #[tracing::instrument(level = "debug", skip(self, chunks), fields(key, parts))]
     async fn multipart_upload_vectored(&self, key: &str, chunks: Vec<Bytes>) -> Result<()> {
-        let create = self
+        let request = self
             .client
             .create_multipart_upload()
             .bucket(&self.config.bucket)
-            .key(key)
-            .send()
-            .await?;
+            .key(key);
+        #[cfg(feature = "rustfs-ec-block-size-hint")]
+        let request = match self.ec_block_size_hint(chunks.iter().map(Bytes::len).sum()) {
+            Some(size) => request.metadata(RUSTFS_EC_BLOCK_SIZE_HINT_KEY, size.to_string()),
+            None => request,
+        };
+        let create = request.send().await?;
 
         let upload_id = create
             .upload_id()
@@ -1005,6 +1107,11 @@ impl Drop for MultipartCleanupGuard {
 
 #[async_trait]
 impl ObjectBackend for S3Backend {
+    #[cfg(feature = "rustfs-ec-block-size-hint")]
+    fn prefers_full_object_reads(&self) -> bool {
+        self.config.rustfs_ec_block_size_hint.is_some()
+    }
+
     fn forbids_mutation_replay(&self) -> bool {
         self.mutation_replay_forbidden
     }
@@ -1044,6 +1151,10 @@ impl ObjectBackend for S3Backend {
             .key(key)
             .if_none_match("*")
             .body(SdkBody::from(data.to_vec()).into());
+        #[cfg(feature = "rustfs-ec-block-size-hint")]
+        if let Some(size) = self.ec_block_size_hint(data.len()) {
+            request = request.metadata(RUSTFS_EC_BLOCK_SIZE_HINT_KEY, size.to_string());
+        }
         if self.config.enable_md5 {
             request = request.content_md5(Self::md5_base64(data));
         }
@@ -1550,15 +1661,479 @@ mod tests {
 
     use super::*;
     use aws_sdk_s3::Config;
+    use aws_sdk_s3::config::retry::RetryConfig;
     use aws_sdk_s3::config::{Credentials, Region};
+    use axum::body::{Body as AxumBody, to_bytes};
+    use axum::extract::{Request, State};
+    use axum::http::{HeaderMap, Method, StatusCode as AxumStatusCode};
+    use axum::response::{IntoResponse, Response};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::AsyncReadExt;
     use tokio::time::timeout;
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        method: Method,
+        path: String,
+        query: String,
+        headers: HeaderMap,
+        body: Bytes,
+    }
+
+    #[derive(Clone, Default)]
+    struct CaptureState {
+        requests: Arc<tokio::sync::Mutex<Vec<CapturedRequest>>>,
+        fail_next_put: Arc<AtomicBool>,
+    }
+
+    struct MockS3 {
+        endpoint: String,
+        state: CaptureState,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for MockS3 {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn is_multipart_initiation(query: &str) -> bool {
+        query
+            .split('&')
+            .any(|parameter| parameter.split('=').next() == Some("uploads"))
+    }
+
+    async fn capture_s3_request(State(state): State<CaptureState>, request: Request) -> Response {
+        let method = request.method().clone();
+        let path = request.uri().path().to_string();
+        let query = request.uri().query().unwrap_or_default().to_string();
+        let headers = request.headers().clone();
+        let body = to_bytes(request.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        state.requests.lock().await.push(CapturedRequest {
+            method: method.clone(),
+            path,
+            query: query.clone(),
+            headers,
+            body,
+        });
+
+        if method == Method::PUT && state.fail_next_put.swap(false, Ordering::SeqCst) {
+            return (
+                AxumStatusCode::INTERNAL_SERVER_ERROR,
+                "<Error><Code>InternalError</Code></Error>",
+            )
+                .into_response();
+        }
+
+        let body = if method == Method::POST && is_multipart_initiation(&query) {
+            "<InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>test</Key><UploadId>test-upload</UploadId></InitiateMultipartUploadResult>"
+        } else if method == Method::POST {
+            "<CompleteMultipartUploadResult><Bucket>test-bucket</Bucket><Key>test</Key><ETag>\"test-etag\"</ETag></CompleteMultipartUploadResult>"
+        } else {
+            ""
+        };
+        Response::builder()
+            .status(AxumStatusCode::OK)
+            .header("content-type", "application/xml")
+            .header("etag", "\"test-etag\"")
+            .body(AxumBody::from(body))
+            .unwrap()
+    }
+
+    impl MockS3 {
+        async fn new() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let state = CaptureState::default();
+            let app = axum::Router::new()
+                .fallback(capture_s3_request)
+                .with_state(state.clone());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            Self {
+                endpoint,
+                state,
+                task,
+            }
+        }
+
+        fn backend(&self, hint: Option<RustfsEcBlockSizeHint>) -> S3Backend {
+            let config = Config::builder()
+                .endpoint_url(&self.endpoint)
+                .force_path_style(true)
+                .region(Region::new("us-east-1"))
+                .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+                .retry_config(RetryConfig::standard().with_max_attempts(1))
+                .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+                .response_checksum_validation(
+                    aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+                )
+                .timeout_config(
+                    TimeoutConfig::builder()
+                        .operation_timeout(Duration::from_secs(10))
+                        .build(),
+                )
+                .build();
+            S3Backend {
+                client: Client::from_conf(config),
+                config: S3Config {
+                    bucket: "test-bucket".to_string(),
+                    part_size: 5 * 1024 * 1024,
+                    max_concurrency: 1,
+                    retry_base_delay: 1,
+                    rustfs_ec_block_size_hint: hint,
+                    ..Default::default()
+                },
+                mutation_replay_forbidden: false,
+            }
+        }
+    }
+
+    async fn check_hint_on_upload_paths(hint: Option<usize>, expected_hint: Option<usize>) {
+        let mock = MockS3::new().await;
+        let backend = mock.backend(hint.map(RustfsEcBlockSizeHint::Fixed));
+        let small = b"hint-upload-payload";
+        backend.put_object("simple", small).await.unwrap();
+        backend
+            .put_object_vectored(
+                "vectored",
+                vec![
+                    Bytes::copy_from_slice(&small[..5]),
+                    Bytes::copy_from_slice(&small[5..]),
+                ],
+            )
+            .await
+            .unwrap();
+        backend
+            .put_object_create_only("create-only", small)
+            .await
+            .unwrap();
+        backend.put_object_vectored("empty", vec![]).await.unwrap();
+        let large = vec![42; 5 * 1024 * 1024 + 13];
+        backend.put_object("multipart", &large).await.unwrap();
+        backend
+            .put_object_vectored(
+                "multipart-vectored",
+                vec![
+                    Bytes::copy_from_slice(&large[..17]),
+                    Bytes::copy_from_slice(&large[17..]),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let requests = mock.state.requests.lock().await;
+        let mut creates = 0;
+        let mut parts = 0;
+        let mut completes = 0;
+        for request in requests.iter() {
+            let creates_object = (request.method == Method::PUT
+                && !request.query.contains("uploadId="))
+                || (request.method == Method::POST && is_multipart_initiation(&request.query));
+            let expected = if creates_object {
+                creates += 1;
+                expected_hint.map(|size| size.to_string())
+            } else {
+                None
+            };
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-amz-meta-rustfs-ec-block-size-hint")
+                    .map(|value| value.to_str().unwrap()),
+                expected.as_deref(),
+                "unexpected hint for {} {}?{}",
+                request.method,
+                request.path,
+                request.query,
+            );
+            if expected.is_some() {
+                assert!(
+                    request.headers["authorization"]
+                        .to_str()
+                        .unwrap()
+                        .contains("x-amz-meta-rustfs-ec-block-size-hint")
+                );
+            }
+            if request.path.ends_with("/create-only") {
+                assert_eq!(request.headers["if-none-match"], "*");
+            }
+            if request.method == Method::PUT && request.query.contains("partNumber=") {
+                parts += 1;
+                assert!(!request.body.is_empty());
+            } else if request.method == Method::POST && request.query.contains("uploadId=") {
+                completes += 1;
+            } else if request.method == Method::PUT {
+                let expected_body = if request.path.ends_with("/empty") {
+                    &[][..]
+                } else {
+                    small.as_slice()
+                };
+                assert_eq!(request.body.as_ref(), expected_body);
+            }
+        }
+        assert_eq!(creates, 6);
+        assert_eq!(parts, 4);
+        assert_eq!(completes, 2);
+    }
+
+    #[cfg(feature = "rustfs-ec-block-size-hint")]
+    #[tokio::test]
+    async fn rustfs_ec_hint_reaches_all_upload_creation_paths() {
+        for size in [65_536, 262_144, 1_048_576, 4_194_304] {
+            check_hint_on_upload_paths(Some(size), Some(size)).await;
+        }
+    }
+
+    #[cfg(feature = "rustfs-ec-block-size-hint")]
+    #[tokio::test]
+    async fn rustfs_ec_hint_auto_selects_each_object_on_all_upload_paths() {
+        let mock = MockS3::new().await;
+        let mut backend = mock.backend(Some("auto".parse().unwrap()));
+        backend.config.max_retries = 2;
+        // These lengths are final wire bytes, including any BrewFS frame.
+        for (length, expected) in [
+            (0, None),
+            (65_536, None),
+            (262_144, None),
+            (1_048_575, None),
+            (1_048_576, None),
+            (1_048_577, Some("1048576")),
+            (4_194_303, Some("1048576")),
+            (4_194_304, Some("1048576")),
+            (4_194_305, Some("1048576")),
+            (5_242_893, Some("1048576")),
+            // A small tail after a large object must not inherit its hint.
+            (17, None),
+        ] {
+            let data = Bytes::from((0..length).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+            for mode in [
+                "simple",
+                "vectored",
+                "create-only",
+                "multipart",
+                "multipart-vectored",
+            ] {
+                if mode.starts_with("multipart") && length <= 5 * 1024 * 1024 {
+                    continue;
+                }
+                mock.state.requests.lock().await.clear();
+                let chunks = || {
+                    vec![
+                        data.slice(..length / 2),
+                        Bytes::new(),
+                        data.slice(length / 2..),
+                    ]
+                };
+                match mode {
+                    "simple" => {
+                        mock.state.fail_next_put.store(true, Ordering::SeqCst);
+                        backend.put_object_simple(mode, &data).await.unwrap();
+                    }
+                    "vectored" => backend
+                        .put_object_vectored_simple(mode, chunks())
+                        .await
+                        .unwrap(),
+                    "create-only" => backend.put_object_create_only(mode, &data).await.unwrap(),
+                    "multipart" => backend.multipart_upload(mode, &data).await.unwrap(),
+                    "multipart-vectored" => backend
+                        .multipart_upload_vectored(mode, chunks())
+                        .await
+                        .unwrap(),
+                    _ => unreachable!(),
+                }
+                let requests = mock.state.requests.lock().await;
+                let mut parts = Vec::new();
+                for request in requests.iter() {
+                    let creates = (request.method == Method::PUT
+                        && !request.query.contains("uploadId="))
+                        || is_multipart_initiation(&request.query);
+                    let actual = request
+                        .headers
+                        .get("x-amz-meta-rustfs-ec-block-size-hint")
+                        .map(|v| v.to_str().unwrap());
+                    assert_eq!(
+                        actual,
+                        if creates { expected } else { None },
+                        "{mode}, {length}"
+                    );
+                    if request.method == Method::PUT {
+                        if request.query.contains("partNumber=") {
+                            parts.extend_from_slice(&request.body);
+                        } else {
+                            assert_eq!(request.body, data);
+                        }
+                    }
+                }
+                if mode.starts_with("multipart") {
+                    assert_eq!(parts, data.as_ref());
+                }
+                if mode == "simple" {
+                    assert_eq!(requests.len(), 2, "both retry requests must be checked");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "rustfs-ec-block-size-hint")]
+    #[tokio::test]
+    async fn rustfs_ec_hint_auto_uses_encoded_block_size() {
+        use crate::cadapter::client::ObjectClient;
+        use crate::chunk::cache::ChunksCacheConfig;
+        use crate::chunk::compress::{Compression, decompress_framed_bytes};
+        use crate::chunk::store::{BlockStore, BlockStoreConfig, ObjectBlockStore};
+
+        let mock = MockS3::new().await;
+        // Exercise the real block-store encoder and both ordinary and
+        // create-only routes. A raw 4 MiB block can compress below the cutoff.
+        for create_only_writes in [false, true] {
+            for (compression, logical_len, expected) in [
+                (Compression::Lz4, 4_194_304, None),
+                (Compression::Zstd(1), 4_194_304, None),
+                (Compression::None, 1_048_572, None),
+                (Compression::None, 1_048_573, Some("1048576")),
+                (Compression::None, 4_194_304, Some("1048576")),
+            ] {
+                mock.state.requests.lock().await.clear();
+                let store = ObjectBlockStore::new_with_configs_async(
+                    ObjectClient::new(mock.backend(Some(RustfsEcBlockSizeHint::Auto))),
+                    ChunksCacheConfig::default(),
+                    BlockStoreConfig {
+                        compression,
+                        create_only_writes,
+                        populate_write_cache_after_upload: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let data = Bytes::from(vec![42; logical_len]);
+                store
+                    .write_fresh_vectored((123, 0), 0, vec![data.clone()])
+                    .await
+                    .unwrap();
+                let requests = mock.state.requests.lock().await;
+                assert_eq!(requests.len(), 1);
+                let request = &requests[0];
+                assert_eq!(
+                    request
+                        .headers
+                        .get("x-amz-meta-rustfs-ec-block-size-hint")
+                        .map(|v| v.to_str().unwrap()),
+                    expected,
+                    "{compression:?}, {logical_len}, {create_only_writes}"
+                );
+                assert_eq!(
+                    decompress_framed_bytes(request.body.clone())
+                        .unwrap()
+                        .as_ref(),
+                    data.as_ref()
+                );
+                assert_eq!(
+                    request.headers.contains_key("if-none-match"),
+                    create_only_writes
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rustfs_ec_hint_is_absent_by_default_on_all_upload_paths() {
+        check_hint_on_upload_paths(None, None).await;
+    }
+
+    #[cfg(not(feature = "rustfs-ec-block-size-hint"))]
+    #[tokio::test]
+    async fn rustfs_ec_hint_is_absent_without_compiled_feature_on_all_upload_paths() {
+        check_hint_on_upload_paths(Some(4_194_304), None).await;
+    }
+
+    #[cfg(feature = "rustfs-ec-block-size-hint")]
+    #[tokio::test]
+    async fn rustfs_ec_hint_is_preserved_on_put_retry() {
+        let mock = MockS3::new().await;
+        mock.state.fail_next_put.store(true, Ordering::SeqCst);
+        let mut backend = mock.backend(Some(RustfsEcBlockSizeHint::Fixed(262_144)));
+        backend.config.max_retries = 2;
+        backend.put_object("retry", b"retry-payload").await.unwrap();
+        let requests = mock.state.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_eq!(
+                request.headers["x-amz-meta-rustfs-ec-block-size-hint"],
+                "262144"
+            );
+            assert_eq!(request.body.as_ref(), b"retry-payload");
+        }
+    }
+
+    #[cfg(feature = "rustfs-ec-block-size-hint")]
+    #[tokio::test]
+    async fn rustfs_ec_hint_invalid_sdk_config_is_rejected_before_client_creation() {
+        for size in [0, 65_535, 65_537, 2_097_152, usize::MAX] {
+            let config = S3Config {
+                bucket: "test-bucket".to_string(),
+                rustfs_ec_block_size_hint: Some(RustfsEcBlockSizeHint::Fixed(size)),
+                ..Default::default()
+            };
+            for result in [
+                S3Backend::with_config(config.clone()).await,
+                S3Backend::with_gc_config(config.clone()).await,
+                S3Backend::with_static_credentials(config.clone(), "test".into(), "test".into())
+                    .await,
+                S3Backend::with_gc_static_credentials(config, "test".into(), "test".into()).await,
+            ] {
+                let error = result.err().expect("invalid hint was accepted");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("RustFS EC block size hint must be")
+                );
+            }
+        }
+    }
 
     #[test]
     fn s3_config_defaults_raise_parallelism() {
         let config = S3Config::default();
 
         assert_eq!(config.max_concurrency, 32);
+    }
+
+    #[cfg(not(feature = "rustfs-ec-block-size-hint"))]
+    #[tokio::test]
+    async fn rustfs_ec_hint_requires_compiled_feature_in_all_sdk_constructors() {
+        for hint in [
+            RustfsEcBlockSizeHint::Auto,
+            RustfsEcBlockSizeHint::Fixed(65_536),
+            RustfsEcBlockSizeHint::Fixed(262_144),
+            RustfsEcBlockSizeHint::Fixed(1_048_576),
+            RustfsEcBlockSizeHint::Fixed(4_194_304),
+        ] {
+            let config = S3Config {
+                bucket: "test-bucket".into(),
+                region: Some("us-east-1".into()),
+                rustfs_ec_block_size_hint: Some(hint),
+                ..Default::default()
+            };
+            for result in [
+                S3Backend::with_config(config.clone()).await,
+                S3Backend::with_gc_config(config.clone()).await,
+                S3Backend::with_static_credentials(config.clone(), "test".into(), "test".into())
+                    .await,
+                S3Backend::with_gc_static_credentials(config, "test".into(), "test".into()).await,
+            ] {
+                let error = result
+                    .err()
+                    .expect("hint accepted without compiled feature");
+                assert_eq!(
+                    error.to_string(),
+                    "feature not compiled: rustfs-ec-block-size-hint"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1589,6 +2164,13 @@ mod tests {
             .endpoint_url(endpoint)
             .force_path_style(true)
             .region(Region::new(region))
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .connect_timeout(Duration::from_secs(5))
+                    .read_timeout(Duration::from_secs(30))
+                    .operation_timeout(Duration::from_secs(60))
+                    .build(),
+            )
             .credentials_provider(Credentials::new(
                 std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "rustfsadmin".to_string()),
                 std::env::var("AWS_SECRET_ACCESS_KEY")
@@ -1613,7 +2195,193 @@ mod tests {
                 endpoint: None,
                 force_path_style: true,
                 disable_payload_checksum: true,
+                rustfs_ec_block_size_hint: None,
             },
+        }
+    }
+
+    #[cfg(feature = "rustfs-ec-block-size-hint")]
+    #[derive(Clone, Debug, Default)]
+    struct EffectiveBlockCapture(Arc<std::sync::Mutex<Option<String>>>);
+
+    #[cfg(feature = "rustfs-ec-block-size-hint")]
+    impl aws_sdk_s3::config::Intercept for EffectiveBlockCapture {
+        fn name(&self) -> &'static str {
+            "EffectiveBlockCapture"
+        }
+
+        fn read_before_deserialization(
+            &self,
+            context: &aws_sdk_s3::config::interceptors::BeforeDeserializationInterceptorContextRef<
+                '_,
+            >,
+            _runtime: &aws_sdk_s3::config::RuntimeComponents,
+            _config: &mut aws_sdk_s3::config::ConfigBag,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            *self.0.lock().unwrap() = context
+                .response()
+                .headers()
+                .get("x-rustfs-effective-ec-block-size")
+                .map(str::to_owned);
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "rustfs-ec-block-size-hint")]
+    #[tokio::test]
+    #[ignore = "requires isolated Dynamic Block RustFS with hint gates enabled and an existing test bucket"]
+    async fn rustfs_ec_hint_live_auto_whole_objects() {
+        std::env::var("BREWFS_S3_ENDPOINT").expect("set the isolated BREWFS_S3_ENDPOINT");
+        std::env::var("BREWFS_S3_BUCKET").expect("set the isolated BREWFS_S3_BUCKET");
+        let mut backend = test_backend();
+        backend.config.rustfs_ec_block_size_hint = Some(RustfsEcBlockSizeHint::Auto);
+        backend.config.part_size = 5 * 1024 * 1024;
+        let prefix = format!("diagnostics/auto-hint/{}", uuid::Uuid::new_v4());
+        eprintln!("Auto hint test prefix: {prefix}; failed probes are retained");
+        for (length, expected) in [
+            (4_096, "1048576"),
+            (65_536, "1048576"),
+            (262_144, "1048576"),
+            (1_048_575, "1048576"),
+            (1_048_576, "1048576"),
+            (1_048_577, "1048576"),
+            (4_194_304, "1048576"),
+            (4_194_308, "1048576"),
+            (5_242_893, "1048576"),
+        ] {
+            let payload = Bytes::from((0..length).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+            for mode in ["normal", "vectored", "create-only"] {
+                let key = format!("{prefix}/{length}/{mode}");
+                match mode {
+                    "normal" => backend.put_object(&key, &payload).await.unwrap(),
+                    "vectored" => backend
+                        .put_object_vectored(&key, vec![payload.slice(..23), payload.slice(23..)])
+                        .await
+                        .unwrap(),
+                    "create-only" => backend
+                        .put_object_create_only(&key, &payload)
+                        .await
+                        .unwrap(),
+                    _ => unreachable!(),
+                }
+                let effective = EffectiveBlockCapture::default();
+                let head = backend
+                    .client
+                    .head_object()
+                    .bucket(&backend.config.bucket)
+                    .key(&key)
+                    .customize()
+                    .interceptor(effective.clone())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(head.content_length(), Some(length as i64));
+                assert_eq!(
+                    effective.0.lock().unwrap().as_deref(),
+                    Some(expected),
+                    "{key}"
+                );
+                assert_eq!(
+                    backend.get_object(&key).await.unwrap().as_deref(),
+                    Some(payload.as_ref()),
+                    "{key}"
+                );
+                eprintln!(
+                    "auto hint verified: object_bytes={length} path={mode} effective_ec_bytes={expected} full_get=ok"
+                );
+                backend.delete_object(&key).await.unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "rustfs-ec-block-size-hint")]
+    #[tokio::test]
+    #[ignore = "requires isolated Dynamic Block RustFS with hint gates enabled and an existing test bucket"]
+    async fn rustfs_ec_hint_live_upload_head_and_range() {
+        std::env::var("BREWFS_S3_ENDPOINT").expect("set the isolated BREWFS_S3_ENDPOINT");
+        std::env::var("BREWFS_S3_BUCKET").expect("set the isolated BREWFS_S3_BUCKET");
+        let mut backend = test_backend();
+        backend.config.part_size = 5 * 1024 * 1024;
+        let payload: Vec<u8> = (0..6 * 1024 * 1024 + 257)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let prefix = format!("diagnostics/dynamic-block/{}", uuid::Uuid::new_v4());
+        eprintln!("Dynamic Block test prefix: {prefix}; failed probes are retained for diagnosis");
+        for size in [65_536, 262_144, 1_048_576, 4_194_304] {
+            backend.config.rustfs_ec_block_size_hint = Some(RustfsEcBlockSizeHint::Fixed(size));
+            for mode in [
+                "simple",
+                "vectored",
+                "create-only",
+                "multipart",
+                "multipart-vectored",
+            ] {
+                let key = format!("{prefix}/{size}/{mode}");
+                let chunks = || {
+                    vec![
+                        Bytes::copy_from_slice(&payload[..23]),
+                        Bytes::copy_from_slice(&payload[23..]),
+                    ]
+                };
+                match mode {
+                    "simple" => backend.put_object_simple(&key, &payload).await.unwrap(),
+                    "vectored" => backend
+                        .put_object_vectored_simple(&key, chunks())
+                        .await
+                        .unwrap(),
+                    "create-only" => {
+                        backend
+                            .put_object_create_only(&key, &payload)
+                            .await
+                            .unwrap();
+                        backend
+                            .put_object_create_only(&key, &payload)
+                            .await
+                            .unwrap();
+                    }
+                    "multipart" => backend.multipart_upload(&key, &payload).await.unwrap(),
+                    "multipart-vectored" => backend
+                        .multipart_upload_vectored(&key, chunks())
+                        .await
+                        .unwrap(),
+                    _ => unreachable!(),
+                }
+                let effective = EffectiveBlockCapture::default();
+                backend
+                    .client
+                    .head_object()
+                    .bucket(&backend.config.bucket)
+                    .key(&key)
+                    .customize()
+                    .interceptor(effective.clone())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    *effective.0.lock().unwrap(),
+                    Some(size.to_string()),
+                    "layout for {key}"
+                );
+                let full = backend.get_object(&key).await.unwrap();
+                assert!(
+                    full.as_deref() == Some(payload.as_slice()),
+                    "full GET payload mismatch for {key}"
+                );
+                for offset in [0, size - 31, 5 * 1024 * 1024 - 31, payload.len() - 4096] {
+                    let mut actual = vec![0; 4096];
+                    let read = backend
+                        .get_object_range(&key, offset as u64, &mut actual)
+                        .await
+                        .unwrap();
+                    assert_eq!(read, actual.len(), "short range for {key}");
+                    assert_eq!(
+                        actual,
+                        &payload[offset..offset + read],
+                        "range for {key} at {offset}"
+                    );
+                }
+                backend.delete_object(&key).await.unwrap();
+            }
         }
     }
 
