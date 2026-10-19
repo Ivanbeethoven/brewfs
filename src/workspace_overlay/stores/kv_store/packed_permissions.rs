@@ -110,7 +110,7 @@ const CACHED_VIEW_CHECKS: [usize; 6] = [0, 1, 3, 8, 9, 11];
 
 /// Derived keys whose final checked bytes the next commit may reuse.
 fn cacheable_derived_key(key: &[u8], head: LayerId) -> bool {
-    key == super::native_slice_deletion::EXTENT_GENERATION_KEY
+    key == super::native_slice_deletion::layer_extent_generation_key(head).as_slice()
         || key == super::native_reverse::state_key(head).as_slice()
 }
 
@@ -661,7 +661,9 @@ fn derived_prefetch_keys(request: &VersionedMutation) -> Vec<Vec<u8>> {
         })
         .collect();
     if !request.extents.is_empty() && slices.len() <= MAX_PREFETCHED_SLICES {
-        keys.push(super::native_slice_deletion::EXTENT_GENERATION_KEY.to_vec());
+        keys.push(super::native_slice_deletion::layer_extent_generation_key(
+            request.guard.expected_head_layer_id,
+        ));
         keys.extend(
             slices
                 .into_iter()

@@ -79,6 +79,8 @@ pub struct WorkspaceMetaLayer<W> {
     lease_validity: Option<Arc<super::lifecycle::LeaseValidity>>,
     locks: Mutex<WorkspaceLocks>,
     mutation_gate: Mutex<()>,
+    /// Data writes waiting for the next group commit (see `write`).
+    write_queue: std::sync::Mutex<WriteQueue>,
     metrics: Arc<WorkspaceMetrics>,
     lower: WorkspaceLower,
 }
@@ -184,6 +186,45 @@ impl RowsWritten {
     }
 }
 
+/// One `MetaLayer::write` waiting for a group commit.
+struct PendingWrite {
+    ino: i64,
+    chunk_id: u64,
+    slice: SliceDesc,
+    new_size: u64,
+    reply: tokio::sync::oneshot::Sender<Result<(), MetaError>>,
+}
+
+/// Concurrent data writes share one versioned commit. Exactly one leader at a
+/// time drains the queue under the mutation gate; everyone else waits for the
+/// leader's reply. A batch is one CAS on the same head version a single write
+/// uses, so conflict detection and row ordering are unchanged.
+#[derive(Default)]
+struct WriteQueue {
+    pending: Vec<PendingWrite>,
+    leader: bool,
+}
+
+/// Each member of a failed batch gets the same failure. I/O errors keep their
+/// errno (the FUSE reply); every other kind keeps its variant where it carries
+/// only plain data, else its message.
+fn duplicate_write_error(error: &MetaError) -> MetaError {
+    match error {
+        MetaError::Io(io) => match io.raw_os_error() {
+            Some(errno) => MetaError::Io(std::io::Error::from_raw_os_error(errno)),
+            None => MetaError::Io(std::io::Error::new(io.kind(), io.to_string())),
+        },
+        MetaError::NotFound(ino) => MetaError::NotFound(*ino),
+        MetaError::NotSupported(message) => MetaError::NotSupported(message.clone()),
+        MetaError::InvalidPath(message) => MetaError::InvalidPath(message.clone()),
+        MetaError::Internal(message) => MetaError::Internal(message.clone()),
+        other => MetaError::Internal(other.to_string()),
+    }
+}
+
+/// Bound on writes folded into one commit, far inside the packet limits.
+const MAX_GROUP_WRITES: usize = 64;
+
 #[derive(Default)]
 struct WorkspaceLocks {
     plocks: BTreeMap<(i64, i64), Vec<PlockRecord>>,
@@ -205,6 +246,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             lease_validity: None,
             locks: Mutex::new(WorkspaceLocks::default()),
             mutation_gate: Mutex::new(()),
+            write_queue: std::sync::Mutex::new(WriteQueue::default()),
             metrics: global_workspace_metrics(),
             lower: WorkspaceLower::Native,
         }
@@ -687,6 +729,157 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         Ok(self.resolve_inode_delta_state(ino).await?.into_option())
     }
 
+    fn validate_write(
+        ino: i64,
+        chunk_id: u64,
+        slice: &SliceDesc,
+        new_size: u64,
+        chunk_size: u64,
+    ) -> Result<(), MetaError> {
+        let (chunk_ino, chunk_index) = crate::vfs::extract_ino_and_chunk_index(chunk_id);
+        if chunk_ino != ino || slice.chunk_id != chunk_id || slice.length == 0 {
+            return Err(MetaError::InvalidPath(
+                "slice does not match the workspace inode/chunk".into(),
+            ));
+        }
+        let end = slice
+            .offset
+            .checked_add(slice.length)
+            .ok_or_else(|| MetaError::InvalidPath("slice range overflows".into()))?;
+        if end > chunk_size {
+            return Err(MetaError::InvalidPath(
+                "slice range exceeds workspace chunk size".into(),
+            ));
+        }
+        let slice_start = chunk_index
+            .checked_mul(chunk_size)
+            .and_then(|start| start.checked_add(slice.offset))
+            .ok_or_else(|| MetaError::InvalidPath("slice start overflows".into()))?;
+        if new_size <= slice_start {
+            return Err(MetaError::InvalidPath(format!(
+                "new size {new_size} does not cover slice start {slice_start}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Drain the write queue in batches until it is empty, then give up
+    /// leadership. Runs while the caller's own write is queued, so the
+    /// caller always ends up in one of these batches.
+    async fn lead_group_commits(&self) {
+        loop {
+            let batch = {
+                let mut queue = self.write_queue.lock().unwrap();
+                if queue.pending.is_empty() {
+                    queue.leader = false;
+                    return;
+                }
+                let take = queue.pending.len().min(MAX_GROUP_WRITES);
+                queue.pending.drain(..take).collect::<Vec<_>>()
+            };
+            let _mutation_guard = self.mutation_gate.lock().await;
+            // A member whose inode is gone or not a regular file fails alone;
+            // it must not fail unrelated writes sharing the batch.
+            let mut members = Vec::with_capacity(batch.len());
+            for member in batch {
+                match self.write_target_is_file(member.ino).await {
+                    Ok(()) => members.push(member),
+                    Err(error) => {
+                        let _ = member.reply.send(Err(error));
+                    }
+                }
+            }
+            if members.is_empty() {
+                continue;
+            }
+            let result = self.commit_write_batch(&members).await;
+            drop(_mutation_guard);
+            for member in members {
+                let _ = member.reply.send(match &result {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(duplicate_write_error(error)),
+                });
+            }
+        }
+    }
+
+    async fn write_target_is_file(&self, ino: i64) -> Result<(), MetaError> {
+        let inode = self
+            .resolve_inode_delta(ino)
+            .await?
+            .ok_or(MetaError::NotFound(ino))?;
+        if file_type_from_code(inode.kind)? != FileType::File {
+            return Err(MetaError::NotSupported(
+                "workspace data writes require a regular file".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Commit every write of `batch` in one versioned mutation: one inode row
+    /// per distinct inode (folded in arrival order) and every visible extent
+    /// in arrival order, so a later write still wins on overlap.
+    async fn commit_write_batch(&self, batch: &[PendingWrite]) -> Result<(), MetaError> {
+        for _ in 0..64 {
+            let expected_layers = self.mutation_version().await?;
+            let result = async {
+                let mut inodes: BTreeMap<i64, InodeDelta> = BTreeMap::new();
+                let mut extents = Vec::with_capacity(batch.len());
+                let now = now_ns()?;
+                for write in batch {
+                    let inode = match inodes.remove(&write.ino) {
+                        Some(inode) => inode,
+                        None => {
+                            let inode = self
+                                .resolve_inode_delta(write.ino)
+                                .await?
+                                .ok_or(MetaError::NotFound(write.ino))?;
+                            if file_type_from_code(inode.kind)? != FileType::File {
+                                return Err(MetaError::NotSupported(
+                                    "workspace data writes require a regular file".into(),
+                                ));
+                            }
+                            inode
+                        }
+                    };
+                    let mut inode = inode;
+                    let (_, chunk_index) = crate::vfs::extract_ino_and_chunk_index(write.chunk_id);
+                    let slice_start = chunk_index * self.chunk_size + write.slice.offset;
+                    // Publish only the visible prefix; see the single-write
+                    // rationale (aligned tails past EOF stay out of the graph).
+                    let visible_length = write.slice.length.min(write.new_size - slice_start);
+                    inode.size = inode.size.max(write.new_size);
+                    inode.mtime_ns = now;
+                    inode.ctime_ns = now;
+                    inode.data_version = inode.data_version.saturating_add(1);
+                    extents.push(DataExtentDelta::data(
+                        inode.layer_id,
+                        write.ino,
+                        chunk_index,
+                        write.slice.offset,
+                        visible_length,
+                        write.slice.slice_id,
+                        0,
+                        0,
+                    ));
+                    inodes.insert(write.ino, inode);
+                }
+                self.mutate_data_batch(&expected_layers, inodes.into_values().collect(), extents)
+                    .await
+            }
+            .await;
+            match result {
+                Err(MetaError::Io(ref error)) if error.raw_os_error() == Some(libc::EBUSY) => {
+                    tokio::task::yield_now().await;
+                }
+                other => return other,
+            }
+        }
+        Err(MetaError::Io(std::io::Error::from_raw_os_error(
+            libc::EBUSY,
+        )))
+    }
+
     /// One inode's permission snapshot. While the exclusive lease is proven
     /// held the lease-bound row cache answers it: this mount is the only
     /// upper writer and every commit drops the `Permission` key of each inode
@@ -1089,6 +1282,44 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         self.resolver_cache
             .invalidate_inode(guard.workspace_id, inode.ino);
         Ok(inode)
+    }
+
+    async fn mutate_data_batch(
+        &self,
+        expected: &[LayerRecord; 2],
+        mut inodes: Vec<InodeDelta>,
+        mut extents: Vec<DataExtentDelta>,
+    ) -> Result<(), MetaError> {
+        let guard = self.guard().await;
+        for inode in &mut inodes {
+            inode.layer_id = guard.expected_head_layer_id;
+            inode.sequence = 0;
+        }
+        for extent in &mut extents {
+            extent.layer_id = guard.expected_head_layer_id;
+            extent.sequence = 0;
+        }
+        let private_bytes = extents
+            .iter()
+            .filter_map(|extent| {
+                matches!(extent.kind, super::model::ExtentKind::Data { .. })
+                    .then_some(extent.length)
+            })
+            .fold(0u64, u64::saturating_add);
+        let touched = inodes.iter().map(|inode| inode.ino).collect::<Vec<_>>();
+        self.commit_versioned_mutation(VersionedMutation {
+            inodes,
+            extents,
+            ..VersionedMutation::empty(guard.clone(), expected.clone(), self.chunk_size)
+        })
+        .await
+        .map_err(|error| self.mutation_error(error))?;
+        self.metrics.add_private_bytes_written(private_bytes);
+        for ino in touched {
+            self.resolver_cache
+                .invalidate_inode(guard.workspace_id, ino);
+        }
+        Ok(())
     }
 
     fn mutation_error(&self, error: WorkspaceError) -> MetaError {
@@ -2890,81 +3121,27 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         slice: SliceDesc,
         new_size: u64,
     ) -> Result<(), MetaError> {
-        let _mutation_guard = self.mutation_gate.lock().await;
-        for _ in 0..64 {
-            let expected_layers = self.mutation_version().await?;
-            let result = async {
-                let (chunk_ino, chunk_index) = crate::vfs::extract_ino_and_chunk_index(chunk_id);
-                if chunk_ino != ino || slice.chunk_id != chunk_id || slice.length == 0 {
-                    return Err(MetaError::InvalidPath(
-                        "slice does not match the workspace inode/chunk".into(),
-                    ));
-                }
-                let end = slice
-                    .offset
-                    .checked_add(slice.length)
-                    .ok_or_else(|| MetaError::InvalidPath("slice range overflows".into()))?;
-                if end > self.chunk_size {
-                    return Err(MetaError::InvalidPath(
-                        "slice range exceeds workspace chunk size".into(),
-                    ));
-                }
-                let mut inode = self
-                    .resolve_inode_delta(ino)
-                    .await?
-                    .ok_or(MetaError::NotFound(ino))?;
-                if file_type_from_code(inode.kind)? != FileType::File {
-                    return Err(MetaError::NotSupported(
-                        "workspace data writes require a regular file".into(),
-                    ));
-                }
-                let chunk_start = chunk_index
-                    .checked_mul(self.chunk_size)
-                    .ok_or_else(|| MetaError::InvalidPath("file size overflows".into()))?;
-                let slice_start = chunk_start
-                    .checked_add(slice.offset)
-                    .ok_or_else(|| MetaError::InvalidPath("slice start overflows".into()))?;
-                if new_size <= slice_start {
-                    return Err(MetaError::InvalidPath(format!(
-                        "new size {new_size} does not cover slice start {slice_start}"
-                    )));
-                }
-                // The writer may persist an aligned physical slice that extends past the
-                // logical EOF (for example a 64 KiB cached sub-block produced by a 4 KiB
-                // mmap write).  Only publish the visible prefix.  Keeping the aligned tail
-                // out of the extent graph also guarantees that a later truncate-extend
-                // observes zeroes rather than resurrecting bytes beyond the old EOF.
-                let visible_length = slice.length.min(new_size - slice_start);
-                let now = now_ns()?;
-                inode.size = inode.size.max(new_size);
-                inode.mtime_ns = now;
-                inode.ctime_ns = now;
-                inode.data_version = inode.data_version.saturating_add(1);
-                let extent = DataExtentDelta::data(
-                    inode.layer_id,
-                    ino,
-                    chunk_index,
-                    slice.offset,
-                    visible_length,
-                    slice.slice_id,
-                    0,
-                    0,
-                );
-                self.mutate_data(&expected_layers, inode, vec![extent], Vec::new())
-                    .await?;
-                Ok(())
-            }
-            .await;
-            match result {
-                Err(MetaError::Io(ref error)) if error.raw_os_error() == Some(libc::EBUSY) => {
-                    tokio::task::yield_now().await;
-                }
-                other => return other,
-            }
+        Self::validate_write(ino, chunk_id, &slice, new_size, self.chunk_size)?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let lead = {
+            let mut queue = self.write_queue.lock().unwrap();
+            queue.pending.push(PendingWrite {
+                ino,
+                chunk_id,
+                slice,
+                new_size,
+                reply: sender,
+            });
+            !std::mem::replace(&mut queue.leader, true)
+        };
+        if lead {
+            self.lead_group_commits().await;
         }
-        Err(MetaError::Io(std::io::Error::from_raw_os_error(
-            libc::EBUSY,
-        )))
+        receiver.await.unwrap_or_else(|_| {
+            Err(MetaError::Internal(
+                "workspace group commit leader was dropped".into(),
+            ))
+        })
     }
 
     async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError> {
