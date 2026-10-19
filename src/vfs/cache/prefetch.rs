@@ -154,8 +154,12 @@ impl GlobalPrefetcher {
             let first = rx.recv().await;
             let Some(first) = first else { break };
             batch.push(first);
-            // recv_many fills up to capacity without blocking
-            let _ = rx.recv_many(&mut batch, 63).await;
+            // Only collect tasks already queued. recv_many would wait for a
+            // second task and strand a lone stream's first prefetch.
+            while batch.len() < 64 {
+                let Ok(task) = rx.try_recv() else { break };
+                batch.push(task);
+            }
             batch.sort_by_key(|task| task.priority);
 
             for task in batch.drain(..) {
@@ -223,6 +227,32 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn isolated_prefetch_starts_without_waiting_for_a_second_task() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let prefetcher = GlobalPrefetcher::new(1, 16, move |ino, start, len| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send((ino, start, len));
+            }
+        });
+        prefetcher
+            .submit(PrefetchTask {
+                ino: 10,
+                start: 4096,
+                len: 4096,
+                priority: PrefetchPriority::Sequential,
+                owner_fh: 1,
+            })
+            .await;
+        assert_eq!(
+            timeout(Duration::from_secs(1), rx.recv()).await,
+            Ok(Some((10, 4096, 4096))),
+            "a single stream must start its prefetch without a second queued request"
+        );
+        drop(prefetcher);
+    }
 
     #[tokio::test]
     async fn cancelled_handle_skips_queued_task_behind_other_prefetches() {

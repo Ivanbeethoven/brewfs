@@ -9,8 +9,9 @@
 | 技术链路、决策规则、内存所有权、服务端配合 | [Design](brewfs-rustfs/design.md) |
 | 测试对象、标准、绝对结果、图表与不利结果 | [Evaluation](brewfs-rustfs/evaluation.md) |
 | 上游关系、受测版本、合并与后续更新方法 | [Maintenance](brewfs-rustfs/maintenance.md) |
+| 并发修复、撤回的预取方案与仍未达标的性能维度 | [Adverse-dimension maintenance](brewfs-rustfs/adverse-maintenance.md) |
 | 完整机器可读统计及版本指纹 | [Evidence](brewfs-rustfs/evidence/README.md) |
 
 本轮测试入口是 **BrewFS 的真实 FUSE 挂载目录**。应用执行完整文件写入和读取，经 BrewFS 缓存、Redis 元数据与 S3 接口访问 RustFS；运行环境为 Aliyun ACS。单独的 RustFS HTTP 测试用于校验协议及布局，不能代替这些文件系统性能结果。
 
-当前受测组合：BrewFS `687925b724f3550a47cc530f875e0470a693a022` 与 RustFS `cc4926fac1107aee76540f28bf22dbd47fcbca24`。之后仅增加文档的提交不改变性能代码。本文档集整理的是该数据路径的改进，其他 packed metadata / workspace 设计仍以 [现有文档索引](../doc/README.md) 为准。
+原性能收益对应的受测组合为 BrewFS `687925b724f3550a47cc530f875e0470a693a022` 与 RustFS `cc4926fac1107aee76540f28bf22dbd47fcbca24`。后续缓存发布与孤立预取的并发修复单独测试，结果和未达标项目见 [不利维度维护](brewfs-rustfs/adverse-maintenance.md)，不能把原收益直接归因于这些修复。本文档集整理的是该数据路径的改进，其他 packed metadata / workspace 设计仍以 [现有文档索引](../doc/README.md) 为准。

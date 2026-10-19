@@ -1,11 +1,13 @@
 # Upstream maintenance and integration
 
+2026-10-20 后续维护见 [Adverse-dimension maintenance](adverse-maintenance.md)：修复缓存发布与合并下载的交接，以及孤立预取任务等待；跨块片段预取因尾延迟退步撤回。主矩阵仍有 20 项未通过严格性能门槛，不能将本次缺陷修复表述为全场景性能验收完成。本次修复基于 `5c952b7`，按授权直接快进上游和维护分支；下文的 PR #167 和仅文档合并说明记录此前 2026-10-19 的集成。
+
 ## 维护对象与版本
 
 | 仓库/分支 | 用途 |
 |---|---|
-| [brewfs/brewfs main](https://github.com/brewfs/brewfs) | BrewFS 正式上游；本轮沿用已有 [PR #167](https://github.com/brewfs/brewfs/pull/167) 集成 |
-| [Ivanbeethoven/brewfs codex/rustfs-ec-block-size-hint](https://github.com/Ivanbeethoven/brewfs/tree/codex/rustfs-ec-block-size-hint) | 本轮维护分支；代码基于上游 `3b6f528`，受测实现为 `687925b` |
+| [brewfs/brewfs main](https://github.com/brewfs/brewfs) | BrewFS 正式上游；此前通过 [PR #167](https://github.com/brewfs/brewfs/pull/167) 集成原性能实现，后续并发修复直接快进 |
+| [Ivanbeethoven/brewfs codex/rustfs-ec-block-size-hint](https://github.com/Ivanbeethoven/brewfs/tree/codex/rustfs-ec-block-size-hint) | 维护分支；原受测实现 `687925b`，后续并发修复基于其文档合入提交 `5c952b7` |
 | [Ivanbeethoven/rustfs perf/frame-aware-batch-read](https://github.com/Ivanbeethoven/rustfs/tree/perf/frame-aware-batch-read) | 已验证服务器依赖，固定 `cc4926f` |
 | [Ivanbeethoven/rustfs main](https://github.com/Ivanbeethoven/rustfs) | 官方 RustFS 主线镜像；2026-10-19 快进到 `9a1f3d2c4cd5dfe3335a7af142e317f4d0dffcd8` |
 | [rustfs/rustfs main](https://github.com/rustfs/rustfs) | 官方服务器上游；同步主线不代表已经包含或验证本研究扩展 |
@@ -18,7 +20,7 @@ BrewFS fork 的旧 `main` 包含 `85d2e15`、`7b94b64` 两个历史独有提交�
 
 ## 已验证边界与合并原则
 
-本次文档整理只增加说明、固定结果与图表，并纠正 YAML 示例/配置文档仍写成 4 MiB auto 的注释；没有改变受测源码。合并前检查上游是否仍为受测基底，确认所有源码、Cargo/lockfile、vendor 和构建配置未变，再复用已有测试。若出现新代码或冲突解决，须为受影响路径补测，不能沿用旧二进制结果。
+此前 2026-10-19 的文档整理只增加说明、固定结果与图表，并纠正 YAML 示例/配置文档仍写成 4 MiB auto 的注释；没有改变当时的受测源码。该次合并前检查上游是否仍为受测基底，确认所有源码、Cargo/lockfile、vendor 和构建配置未变，再复用已有测试。若出现新代码或冲突解决，须为受影响路径补测，不能沿用旧二进制结果。2026-10-20 的两处并发修复另有完整默认/hint 工作区验证和独立性能结果，见本页开头的后续维护说明。
 
 现有上游 PR 的早期说明曾记录：all-features 测试 14 项失败，其中 13 项在独立上游 overlay 过滤运行中复现，另一个 ACL/atime 并发失败未被该基线复现；overlay clippy 有两类诊断，operator clippy 有 32 个 `double_must_use` 诊断。这些历史检查未在本轮重新宣布通过。当前默认/hint 工作区测试及具体通过项见 [Evaluation](evaluation.md)，它们不等于 all-features、完整 POSIX 或所有 CI 通过。
 

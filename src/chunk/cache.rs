@@ -2518,6 +2518,14 @@ impl ChunksCache {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn hold_publication(&self, key: &str) -> tokio::sync::MutexGuard<'_, ()> {
+        self.disk_storage.key_shards[DiskStorage::key_shard_index(key)]
+            .gate
+            .lock()
+            .await
+    }
+
     pub async fn insert_recent_write_opportunistic(&self, key: String, data: bytes::Bytes) {
         let generation = self.disk_storage.store_generation(&key);
         let shard = &self.disk_storage.key_shards[DiskStorage::key_shard_index(&key)];

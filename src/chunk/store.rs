@@ -971,12 +971,12 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                 object_metrics.record_read_background_prefetch_dropped();
                 return;
             };
-            if cache.get(&cache_key).await.is_some() {
-                return;
-            }
-
             let block_data = read_flight
                 .execute(key, || async move {
+                    // Another leader may have published after our first miss.
+                    if let Some(data) = cache.get(&cache_key).await {
+                        return Ok::<_, anyhow::Error>(data);
+                    }
                     bandwidth.acquire_download(block_size).await;
                     let started = Instant::now();
                     client.read_event_with_origin(
@@ -996,6 +996,9 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                     match fetched {
                         Some((stored, data)) => {
                             object_metrics.record_get(stored as u64, started.elapsed());
+                            if !data.is_empty() {
+                                cache.insert_opportunistic(cache_key, data.clone()).await;
+                            }
                             Ok::<_, anyhow::Error>(data)
                         }
                         None => {
@@ -1006,15 +1009,8 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                 })
                 .await;
 
-            match block_data {
-                Ok(block_data) => {
-                    cache
-                        .insert_opportunistic(cache_key, (*block_data).clone())
-                        .await;
-                }
-                Err(err) => {
-                    tracing::debug!(error = %err, ?key, "background block prefetch failed");
-                }
+            if let Err(err) = block_data {
+                tracing::debug!(error = %err, ?key, "background block prefetch failed");
             }
         });
     }
@@ -1551,7 +1547,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             return Ok(());
         }
 
-        // Large read — fetch full block via SingleFlight, then cache it.
+        // Keep cache publication inside the flight: late arrivals must see
+        // either the shared download or its cached result, without a gap.
         tracing::Span::current().record("strategy", "coalesced_full");
         let client = &self.client;
         let object_metrics = self.object_metrics.clone();
@@ -1560,6 +1557,9 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         let block_data = self
             .read_flight
             .execute(key, || async move {
+                if let Some(data) = self.block_cache.get(&key_str).await {
+                    return Ok::<_, anyhow::Error>(data);
+                }
                 let layout = match layout {
                     Some(layout) => layout,
                     // The full response carries its own frame header. A
@@ -1607,6 +1607,11 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                 match fetched {
                     Some((stored, data)) => {
                         object_metrics.record_get(stored as u64, started.elapsed());
+                        if !data.is_empty() {
+                            self.block_cache
+                                .insert_opportunistic(key_str, data.clone())
+                                .await;
+                        }
                         Ok::<_, anyhow::Error>(data)
                     }
                     None => {
@@ -1618,7 +1623,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             .await
             .map_err(|e| anyhow::anyhow!("SingleFlight read failed: {e}"))?;
 
-        // Copy data to caller's buffer first — minimize read latency.
+        // Each caller validates its own range, including shared short objects.
         let offset_usize = offset as usize;
         let end = offset_usize + len;
         let mut copy_len = 0;
@@ -1630,13 +1635,6 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         tracing::Span::current().record("read_len", copy_len);
 
         require_complete_read(key, offset, len, copy_len)?;
-
-        // Populate caches after serving the read — the hot cache insert is
-        // fast (in-memory) so we await it to ensure subsequent reads hit.
-        // Disk persistence is spawned in the background by insert_opportunistic.
-        self.block_cache
-            .insert_opportunistic(key_str.clone(), (*block_data).clone())
-            .await;
 
         Ok(())
     }
@@ -1710,6 +1708,85 @@ mod tests {
     use crate::cadapter::client::ObjectClient;
     use crate::cadapter::localfs::LocalFsBackend;
     use crate::chunk::layout::ChunkLayout;
+
+    #[tokio::test]
+    async fn whole_object_download_stays_shared_until_cache_publication() -> anyhow::Result<()> {
+        struct ImmediateBackend {
+            data: Vec<u8>,
+            gets: Arc<AtomicU64>,
+        }
+        #[async_trait]
+        impl ObjectBackend for ImmediateBackend {
+            fn prefers_full_object_reads(&self) -> bool {
+                true
+            }
+            async fn get_object(&self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                self.gets.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(self.data.clone()))
+            }
+            async fn put_object(&self, _: &str, _: &[u8]) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            async fn get_object_range(
+                &self,
+                _: &str,
+                _: u64,
+                _: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                unreachable!()
+            }
+            async fn get_etag(&self, _: &str) -> anyhow::Result<String> {
+                unreachable!()
+            }
+            async fn delete_object(&self, _: &str) -> anyhow::Result<()> {
+                unreachable!()
+            }
+        }
+        let cache_dir = tempfile::tempdir()?;
+        let raw = vec![37; 4096];
+        let gets = Arc::new(AtomicU64::new(0));
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(ImmediateBackend {
+                data: encode_persisted_block(&raw, Compression::None).to_vec(),
+                gets: gets.clone(),
+            }),
+            ChunksCacheConfig::with_budgets(65536, 0, cache_dir.path().to_path_buf()),
+            BlockStoreConfig {
+                block_size: 4096,
+                compression: Compression::None,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let key = (700, 0);
+        let cache_key = ObjectBlockStore::<ImmediateBackend>::key_for(key);
+        // Hold the real cache publication gate, not the object fetch. A caller
+        // arriving after download must still share that completed download.
+        let gate = store.block_cache.hold_publication(&cache_key).await;
+        let mut first = vec![0; 4096];
+        let mut second = vec![0; 128];
+        let mut leader = Box::pin(store.read_range(key, 0, &mut first));
+        assert!(futures::poll!(&mut leader).is_pending());
+        assert_eq!(gets.load(Ordering::SeqCst), 1);
+        let mut follower = Box::pin(store.read_range(key, 256, &mut second));
+        assert!(futures::poll!(&mut follower).is_pending());
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            1,
+            "cache publication must remain inside the shared download"
+        );
+        drop(gate);
+        let (a, b) = tokio::join!(leader, follower);
+        a?;
+        b?;
+        assert_eq!(first, raw);
+        assert_eq!(second, raw[256..384]);
+        store.read_range(key, 512, &mut second).await?;
+        assert_eq!(gets.load(Ordering::SeqCst), 1);
+        // A cached short object must not satisfy a request beyond its end.
+        assert!(store.read_range(key, 4090, &mut second).await.is_err());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn whole_object_policy_coalesces_payload_and_header_reads() -> anyhow::Result<()> {
