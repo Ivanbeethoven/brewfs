@@ -13,7 +13,12 @@
 - 首要生产 backend：Redis、TiKV
 - 本地语义与故障注入 backend：SQLite / SQLx
 
-### 2026-10-17 模型更新：不可变 lower + 不轮转的可写 overlay
+### 2026-10-19 交付模型：不可变 lower + 不轮转的可写 overlay
+
+代码基线：`codex/packed-metadata-aliyun-20260930` 的 `0d4e36c`（PR #41）。
+PR #39 已合入 per-layer extent generation 与 data group commit；PR #41 只增加
+新建 inode 的完整路径 memo，没有实现 create group commit。交付状态、已知失败及复现命令见
+[交接文档](../plans/2026-10-17-overlay-no-seal-handoff.md)。
 
 当前实现只有一种模型：每个 mount 是 **一个不可变 lower + 一个可写 overlay**。
 
@@ -31,14 +36,16 @@
 
 下文凡与本节冲突处以本节为准；已删除的历史设计不再保留在规范中。
 
-### 2026-10-03 范围澄清：workspace-v1 与 packed-v3
+### workspace-v1 与 packed-v3 的边界
 
 本文控制面契约适用于现有 `workspace-v1` 不可变 lower/delta 实现；“与代码同步”不表示
 后续所有packed格式或新worktree都已全量审计。它不是004/005对象的wire定义，也不能由
 standalone packed readonly mount推导本规范的fork/publication/recovery/GC已支持packed lower。
 
 [packed-v3 SPEC](2026-09-27-brewfs-packed-metadata-v3-readonly-smallfiles.md)负责当前packed-v3
-对象与只读plan，packed lower集成为其P5待完成项。既有 `BaseRevision` 的layer/version/
+对象与只读plan；当前 packed lower 的接入、publication/recovery 与性能交付状态以
+[维护中的架构文档](../../architecture/workspace-overlay.md)及交接文档为准，不再将整个
+packed lower 集成标为未开始。既有 `BaseRevision` 的layer/version/
 root_hash和bincode bytes保持不变；不能把root_hash暗解释成PM07 object digest。新binding
 需独立版本化、capability检查和原子head/binding切换；旧workspace不查询它，错误不回退。
 
@@ -449,9 +456,19 @@ delta/extent/<layer>/<ino-order-key>/<chunk-index>/<sequence>
 workspace 归组，支持精确的前缀列举。
 
 普通 mutation 在同一事务检查 workspace record、head layer record 与该 workspace 的
-lease record，并提交 delta key；lease heartbeat 只 CAS 对应 lease record；allocator
+lease record，并提交 delta key；native `renew_lease` 只 CAS 对应 lease record；allocator
 只 CAS 对应 `alloc/<name>` record。不同 workspace 的热路径不得读取、锁定或写入其他
 workspace 的键，也不得共享进程内 mutex。
+packed mount 的 joint heartbeat 在一个 CAS 中续期该 workspace 的 lease 与 open authority。
+
+packed mutation 还比较 `control`，用于 fence 无需 lease 的 schema migration，但不写它。
+`CommitViewCache` 可复用上次成功提交的 view 与 derived bytes，省去 view pre-read。
+cached CAS 保留 workspace/head/lease/writer-authority/open/CONTROL 六个 view checks，
+另保留本次 reverse-index、extent generation 和 slice-deletion checks；被省略的 lower、
+PWB3 current/claim/history 与 recovery rows 由唯一 live lease 及不轮转 head 的不变量保护。
+slice deletion 的 absent 猜测也必须成为真实 CAS 条件。lease deadline 仍在 backend time
+检查；cached conflict/Fenced 或 derived Busy 时重新读取并完整校验，有界重试。
+首次提交与 recovery-token writer 始终读取新 view；backend uncertainty 不盲目重放。
 
 inode、chunk 和 sequence 使用固定宽度、保持数值顺序的十六进制 component；文件名和
 xattr name 使用原始 bytes 的 hex，禁止 UTF-8 有损转换。layer 删除必须先进入
@@ -1007,11 +1024,12 @@ VFS 当前 `range_has_committed_slices()` 在 workspace provider 存在时必须
 
 中立provider现有可选 `supports_prepared_unified_read` / `prepare_unified_read` 返回
 `PreparedUnifiedRead {UnifiedReadPlan, Arc<dyn UnifiedReadSourceFetcher>}`；VFS使用
-`execute_unified_into`，成功交付后计logical bytes。005 readonly已走该接缝；native
-workspace仍可以使用§10.1–10.2的旧slice计划，不能把接口存在等同mutable P5已经完成。
+`execute_unified_into`，成功交付后计logical bytes。packed-v3 readonly 与 packed-lower
+workspace 已走该接缝；native workspace 仍可以使用§10.1–10.2的旧slice计划。
+接口存在本身不代替 publication/recovery/GC 与实际 mount 的验收证据。
 
 packed lower需保持absolute/chunk-relative offsets明确，preserve raw names、cold attrs、
-hardlinks和holes，upper fully covered时无需lower GET。seal物化不得把未覆盖lower bytes
+hardlinks和holes，upper fully covered时无需lower GET。packed publication 不得把未覆盖lower bytes
 省略成holes；普通fsync/close只做workspace durability，显式packed publish才repack。
 读取fence、packed graph可达性GC、journal/lease/head-CAS和实际双mount必须独立验收。
 
@@ -1085,9 +1103,21 @@ read plan:         (head_epoch, ino, chunk_index, data_version)
 xattr/ACL:         (head_epoch, ino, attribute_version)
 ```
 
-namespace mutation 增加相关 parent/inode version 并精确失效。lower cache 以 binding 生命周期
-为界保留（lower 不可变）；upper row、namespace 与权限 cache 只在 `LeaseValidity` 证明 lease
-仍被持有时服务，失去证明即清空。
+packed lower 在 attach 时认证一次，inode、权限输入、反向别名与 lookup memo 按 binding
+生命周期保留。可变数据 cache 的权威来自 `LeaseValidity`，不是 TTL：
+
+- upper inode/dentry/xattr 与 permission snapshot 在每次 commit 前后失效受影响的 keys；
+- namespace cache 保存完整 paths 与已验证 aliases，data-only commit 不清空它；create
+  只失效新 inode 的 paths/aliases，其他 namespace mutation 清空 namespace cache；
+- invalidation generation 阻止并发读取在 commit 后重新插入旧 rows；view change 清空
+  可变 caches；失去 lease proof 后清空并绕过 upper/namespace/permission caches；
+- `LeaseLocalFence` 同时验证 lease 仍有效与 inode cached rows 未变，不能由 lower memo
+  代替；cached permission snapshot 可以用于构建 mutation，但仍必须 CAS expected head/lease；
+- 新 inode 的唯一 dentry 已在 create 中提交，可从 parent 的完整 cached paths 加 name
+  seed 其 paths；root path 已知，其他 parent 未命中时不 seed。没有 seed inode/xattr rows。
+
+默认 `BREWFS_WORKSPACE_ROW_CACHE_TTL_MS=60000`，在 live lease proof 下只限制保留时间。
+lower memo 不因 lease proof 丢失而变成写权限；所有读 fence 与写 CAS 仍然生效。
 
 ## 12. POSIX mutation
 
@@ -1179,6 +1209,25 @@ DataExtentDelta::Data {
 
 同一 transaction 更新 inode size、mtime/ctime、data_version。不得向 flat slice table
 append。
+
+### 13.1.1 Group commit（2026-10-19，PR #39）
+
+校验后的 `MetaLayer::write` 进入每个 mount 的 FIFO 队列；同一时刻只有一个 leader，
+先取出至多 64 个 write，再持有 mount-wide mutation gate，将合法成员组成**一个**
+`VersionedMutation`：每个不同 inode 一行（按队列顺序取 size 最大值、递增 data_version，
+使用 batch 的 mtime/ctime），每个 extent 的 visible prefix 按队列顺序排列。
+它仍 CAS expected head，原 row allocator 仍递增 `next_sequence`，extent sequence
+保留重叠范围 newest-wins 顺序；head counter、lease 与 GC checks 没有删除。
+没有 sequence block、head-free commit 或 fresh-SID GC exemption。
+
+- inode 已不存在或不是普通文件的成员单独失败，不影响同批其他 write；
+- batch 失败时每个合法成员收到相同 errno；
+- write 只在其 batch 提交后返回，fsync 语义不变；
+- create/unlink/rename/link/setattr/open/close 仍各自持有 gate 提交。
+
+测试：`group_committed_writes_land_individually_and_fail_individually`、
+`group_commit_same_file_keeps_order_and_size`、
+`concurrency_oracle_no_lost_creates_or_size_updates`。
 
 ### 13.2 Truncate
 
@@ -1326,10 +1375,11 @@ workspace 生效，native workspace 的 snapshot 请求进入 `Failed`。
 - GC grace：至少 2 × TTL；
 - heartbeat 只允许相同 holder generation 延长；
 - wall clock 由 backend/server 产生，不信任客户端时间；
-- heartbeat 只执行 `renew_lease`；续期失败即终止 heartbeat 任务，挂载的后续写入收到
-  `Fenced`；
+- native heartbeat 执行 `renew_lease`；packed mount 使用 joint heartbeat，续期 native
+  lease 与 packed open authority，两者成功后才延长 `LeaseValidity` 的本地 deadline
+  （请求起点 + TTL）。失败永久 revoke proof 并终止 heartbeat，后续写入 fail closed；
 - 过期租约回收不在 heartbeat 中进行，集中在 `acquire_lease` 的本 workspace 顺路清理、
-  GC 周期的全局回收与 `recover_incomplete_seals` 的开头。
+  GC 周期的全局回收；不存在 `recover_incomplete_seals` 路径。
 
 ### 15.2 Holder generation
 
@@ -1433,6 +1483,34 @@ cycle 从所有 reachable layer 的 Data extent 标记 reachable slice ID：
 5. 删除失败保留 tombstone 并重试。
 
 不得为 fork 对每个 slice 增加 eager refcount。
+
+### 18.4 Slice 删除 fence（per-layer extent generation，PR #39）
+
+GC 删除 object slice 前必须写入 reservation `packed/v3/native-slice-delete/<sid>`。
+reservation 的 CAS 同时检查：
+
+1. layer inventory generation 与全部 layer 记录（census）；
+2. census 中**每个** layer 的 extent generation `packed/v3/native-extent-generation/<layer>`；
+3. 全量 `delta/extent/` 扫描：任何非 target layer 引用该 slice 则拒绝，即便该 layer
+   当前看似不可达；
+4. 该 slice key 不存在（或与已有 reservation 完全相同）。
+
+extent 新增、覆盖、删除均在同一 CAS 中递增所写 layer 的 generation；新写入 Data extent
+还检查所引用 slice 的 reservation key 不存在。CAS 同时保留 root/topology authority 与
+target `Deleting` rows 的精确检查。
+
+安全论证：若 extent 在 reservation 的扫描越过其位置之后、reservation CAS 之前提交，
+它已递增所在 layer 的 generation，reservation CAS 失败；若在此期间新建 layer，
+inventory generation 已变化，同样失败；若 reservation 先提交，extent commit 的 slice
+absent 检查失败。因此不能同时接受未被扫描发现的新引用与 slice 删除。回归测试
+`native_slice_extent_landing_behind_the_scan_cursor_blocks_the_reservation`
+（去掉 per-layer 检查后该测试失败）。旧的全卷 key 不再写入，但 reservation 仍检查它，
+以 fence 旧版本二进制的递增。
+
+per-layer generation 消除了该 counter 上跨 workspace 的 extent commit 竞争；同一 workspace 内仍共享
+head layer 的 generation 与 `next_sequence`，由 group commit 摊薄。
+该 native collector 仍有小 catalog 限制：最多 120 target layers、4,096 extent rows、
+32 MiB scan data；越界返回 `Busy`，不会使用不完整 census 放行。
 
 ## 19. Lower materialization
 
@@ -1627,6 +1705,33 @@ flat `.stats` 现有字段不得改变；workspace metric 仅在 feature build �
 - GC 重启幂等。
 
 ### 24.6 性能
+
+2026-10-19 交付的 r31 / PR #41 已完成测量（overlay/native files/s）：
+
+| Workers | stat | full read | write | readback | mixed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.00 | 0.71 | 0.86 | 1.06 | 1.02 |
+| 16 | — | — | 0.63 | 0.91 | 0.85 |
+| 32 | — | — | 0.57 | 0.88 | 0.87 |
+
+1 worker：500 files/operations，2 repetitions；16/32 workers：2,000 files/operations，
+rw order-swapped 合并后每个 arm 6 repetitions。比值为每个 arm 的 files/s 算术均值之比，
+不混用 runner summary 中的 median。stat/full 为 100 KiB 文件与第二个 scan epoch，
+rw 为 16 KiB、fsync、mixed 30% writes；Redis + RustFS、FUSE TTL0/direct I/O、无压缩、
+无 payload cache/prefetch，默认 lease-bound metadata cache。92 rows 无错误且 teardown 完整。
+
+最终 sweep 在 16-worker rw 中被中断，32-worker 未启动。16-worker 已落盘的 stat/full
+rows 得到 0.72/0.57，但缺少整个 run 的 summary/cleanup proof，故不列为完成验收。
+历史完整 stat/full：16w PR #30 为 0.75/0.57；32w `hot26`（PR #29 前）为 0.79/0.53，
+均不是 r31 测量。完整 artifact 路径、重算/复现命令、三个 baseline overlay 失败、
+`source_file` flake、operator `double_must_use` 与未验证 smoke 见
+[交接文档](../plans/2026-10-17-overlay-no-seal-handoff.md)。
+
+剩余限制：并发 write 仍受单独 create gate 与共享 head/generation 影响；stat/full 的
+permission/path/FUSE read 成本仍在。`statfs` usage counter 未实现，native GC census 有界。
+没有实现 create batching、sequence block、head-free commit、fresh-SID exemption 或
+lower full copy-up；create 与首次 fsync 合并因 `O_EXCL` 可见性被拒绝。
+这些 small-file 结果不代替下面的广泛性能要求，也不代表完整 feature suite 已通过。
 
 - 百万文件 base fork 的 metadata mutation 数为常数；
 - 修改 10 GiB 文件中 4 KiB 不复制整文件；

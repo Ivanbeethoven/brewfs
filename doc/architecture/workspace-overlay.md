@@ -5,7 +5,9 @@
 - Volume format: `workspace-v1`
 - Catalog format: 2 (entity-key layout; `control` keeps only the volume header)
 - Production metadata backends: Redis and TiKV
-- Model (2026-10-17): immutable lower + non-rotating writable overlay. There is
+- Delivery baseline (2026-10-19): `0d4e36c`, PR #41, on
+  `codex/packed-metadata-aliyun-20260930`.
+- Model: immutable lower + non-rotating writable overlay. There is
   no seal transaction, no compaction/flatten step and no strict lower mode.
 
 This document is the maintained architecture reference for BrewFS agent
@@ -131,8 +133,8 @@ One writable lease per workspace is the only write authority:
   `TIME`; TiKV the transaction start timestamp (PD TSO physical milliseconds,
   converted with checked arithmetic); SQLite its local transaction clock.
 - The heartbeat renews only its own lease. `LeaseValidity` keeps a local
-  deadline (request start + TTL, extended by each successful renewal of both the
-  native and packed heartbeats, revoked on any failure). Upper-row, namespace
+  deadline (request start + TTL, extended after the joint lease/open renewal
+  succeeds on packed mounts, revoked on any failure). Upper-row, namespace
   and permission caches serve only while it is authoritative and are cleared
   otherwise.
 - While a packed open record is held, no other holder can take the workspace
@@ -162,10 +164,11 @@ foreign holder generation, a foreign lease ID and a competing acquire.
 
 ### Hot data path
 
-Ordinary namespace, inode, xattr, ACL, and extent mutations do not read or CAS
-the global `control` record. They atomically check the workspace, head-layer and
+Ordinary namespace, inode, xattr, ACL, and extent mutations never **write** the
+global `control` record. They atomically check the workspace, head-layer and
 lease records (plus the packed authority rows on packed mounts) and update the
-head layer plus delta keys:
+head layer plus delta keys. Packed mutations also compare `control` to fence
+schema migration; the non-packed hot mutation path does not read or compare it.
 
 ```mermaid
 sequenceDiagram
@@ -185,20 +188,106 @@ sequenceDiagram
 ```
 
 Because the mount is the sole writer and its head never rotates, a packed
-commit does not pre-read its view. It reuses the exact post-commit bytes of its
-own previous commit (workspace, head, lower, lease, PWB3, writer-authority and
-open records, CONTROL, head reverse state and extent generation) as the CAS
-conditions. Each value is still compared atomically, and the CAS still enforces
-the lease deadline in backend time. A value changed outside the mount (a lease
-renewal, an admin fence, GC) only fails the CAS; the commit then re-reads and
-fully revalidates once. The first commit after mount, and every commit made
-under a recovery token, always read fresh.
+commit can reuse its previous successful commit's exact post-commit view bytes
+(`CommitViewCache`) and skip the view pre-read. The cache carries the workspace,
+head, lower, lease, PWB3, writer-authority, open and CONTROL rows, plus derived
+head reverse state and extent generation. Referenced slice-deletion keys may
+be guessed absent, but that absence is always checked in the actual CAS.
+The CAS still enforces the lease deadline in backend time. A stale comparison,
+cached `Fenced`, or derived `Busy` forces a fresh read and full revalidation
+within the bounded retry loop. The first commit and recovery-token commits
+always read fresh. Backend uncertainty is returned, never blindly replayed.
+
+A cached commit compares only the rows that can change while this mount
+holds its lease: the workspace, head, lease, writer-authority and open
+records, plus CONTROL (schema migration needs no lease). The lower layer,
+PWB3 current/claim/history and recovery rows change only on paths that must
+hold this workspace's single live lease, so while the lease row is
+byte-identical and live, none of them ran. A change to any compared row
+fails the CAS, and the retry re-reads and checks every row.
+
+### Group commit for data writes
+
+Every validated `MetaLayer::write` joins a per-mount FIFO queue. One leader at
+a time drains up to 64 writes, then takes the mount-wide mutation gate and
+commits the valid members as **one** `VersionedMutation`: one inode row per
+distinct inode, folding maximum size and data-version increments in queue order
+with the batch's mtime/ctime, plus each extent's visible prefix in queue order.
+The unchanged row allocator advances `head.next_sequence`; extent sequences
+preserve newest-wins ordering on overlap. There are no sequence reservations,
+head-free commits, or fresh-slice exemptions from GC checks. A member whose
+inode is gone or not a regular file fails alone. A failed batch reports the same
+errno to every valid member. A write returns only after its batch has committed,
+so the existing write/fsync durability boundary is unchanged.
+Namespace operations (create, unlink, rename, link, setattr, open, close)
+still take the gate individually.
+
+### Extent generations and the GC slice fence
+
+GC may delete an object slice only after reserving it
+(`packed/v3/native-slice-delete/<sid>`). The reservation:
+
+1. reads the layer inventory generation and the census of every layer;
+2. reads each census layer's extent generation
+   (`packed/v3/native-extent-generation/<layer>`);
+3. scans the complete `delta/extent/` family and refuses if **any non-target**
+   layer references the slice, even if that layer appears unreachable;
+4. CASes those generations, topology/root authority and target `Deleting` rows,
+   plus the slice key's absence (or exact existing reservation on retry).
+
+Every extent birth, overwrite or deletion bumps the generation of each layer
+it writes in the same CAS. Every newly written Data extent also checks that its
+referenced slice has no deletion reservation.
+An extent landing behind the scan cursor, after the scan passed its key
+position and before the reservation CAS, bumped its layer's generation, so the
+reservation CAS fails. A new layer created meanwhile bumps the inventory
+generation, so it fails too. If the reservation lands first, the commit's
+slice-key check fails. The scan/reservation race cannot admit both an unchecked
+new reference and deletion. The regression test
+`native_slice_extent_landing_behind_the_scan_cursor_blocks_the_reservation`
+fails if the per-layer check is removed. The legacy volume-wide key
+`packed/v3/native-extent-generation` is no longer written; reservations still
+check it, so a bump by an older binary is still fenced.
+
+Per-layer generations remove cross-workspace contention on that counter. Within one
+workspace, every data commit still bumps its head layer's generation and the
+head `next_sequence`; group commit amortizes both. This native slice collector
+is bounded (currently 120 target layers, 4,096 scanned extent rows and 32 MiB
+of scan data); exceeding its limits returns `Busy`, never a partial census.
+
+### Lease-bound caches on the hot path
+
+While the lease is proven held (`LeaseValidity`), these are served locally:
+
+- upper inode/dentry/xattr rows and permission snapshots, invalidated for the
+  affected keys both before and after each local commit;
+- complete namespace paths and verified aliases, kept across data-only commits;
+  fresh-inode creates invalidate only that inode's namespace entries, while
+  other namespace changes clear the namespace cache;
+- immutable lower inodes, permission inputs, reverse aliases and lookups,
+  from binding-lifetime memos;
+- read fences, checked against cached rows (`LeaseLocalFence`);
+- a fresh inode's paths, seeded at create from the parent's cached paths (its
+  only dentry is the one just written), so the first non-root open needs no
+  reverse-index walk. Seeding requires the parent's complete cached paths (or
+  the known root path); otherwise the normal walk runs. PR #41 adds this path
+  memo, not create group commit or inode/xattr-row seeding.
+
+Invalidation generations prevent in-flight reads from reinserting stale rows.
+Losing the lease proof clears and bypasses upper/namespace/permission caches;
+immutable-lower memos remain binding-scoped and cannot authorize a write or
+bypass read fences. A view change clears mutable caches. The default row-cache
+TTL is 60 seconds (`BREWFS_WORKSPACE_ROW_CACHE_TTL_MS`); under the lease proof it
+bounds retention, not correctness. Cached permission inputs may feed a mutation,
+but that mutation must still CAS its expected head and lease.
 
 The writable layer owns its `next_sequence`, so writers in the same workspace
-serialize correctly while sibling workspaces do not contend. Lease renewal CASes
-only `lease/<workspace-id>/<lease-id>`. Each ID allocator CASes only its own
+serialize correctly while sibling workspaces do not contend on that counter.
+Native lease renewal CASes its lease row; packed mounts renew the lease and open
+authority in one joint CAS. Each ID allocator CASes only its own
 `alloc/<name>` record. The in-mount GC deletes orphan slices concurrently, so the
-native extent-generation and slice-deletion checks stay in every extent commit.
+per-layer extent-generation and slice-deletion checks stay in every extent
+commit.
 
 Named dentry, inode, xattr, and ACL resolution uses exact batched reads. Prefix
 enumeration is reserved for `readdir`, publication capture and GC.
@@ -258,24 +347,49 @@ There is no `workspace snapshot`, `workspace commit` or `fork <workspace-uuid>`:
 each of those sealed a live workspace. Named snapshots pin an existing immutable
 revision (packed publication) and are managed by the operator.
 
-## Measured performance and remaining gaps (2026-10-17)
+## Measured performance and remaining limits (2026-10-19)
 
-Small-file overlay vs native files/s, 16 workers, Redis + RustFS, arms
-alternated, 6 runs pooled, after PR #30 (`tools/perf/run_overlay_vs_native.sh`):
+Completed measurements of the final r31 binary (PR #41), overlay/native
+files/s, from `tools/perf/run_overlay_vs_native.sh`:
 
-| Mode | Overlay/native |
-| --- | ---: |
-| stat | 0.75 |
-| full read | 0.57 |
-| write | 0.64 (16w), 0.56 (32w) |
-| readback | 0.83 |
-| mixed | 0.90 |
+| Workers | stat | full read | write | readback | mixed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.00 | 0.71 | 0.86 | 1.06 | 1.02 |
+| 16 | — | — | 0.63 | 0.91 | 0.85 |
+| 32 | — | — | 0.57 | 0.88 | 0.87 |
 
-The 32-worker rw run had 0 errors. Write is the largest gap: about three
-commits per file (create, fsync, close), each a server-side Lua CAS. The
-candidate next step, merging the create and first-fsync commits for a newly
-created inode, is not started. Details and the resume procedure are in the
-[2026-10-17 handoff](../superpowers/plans/2026-10-17-overlay-no-seal-handoff.md).
+Ratios divide arithmetic mean overlay throughput by mean native throughput.
+The one-worker sweep has two repetitions, 500 files and 500 mixed operations;
+16/32-worker rw measurements pool six repetitions per arm over two
+order-swapped runs, with 2,000 files/operations. Workers are workload threads;
+the FUSE worker pool remains 16. Stat/full files are 100 KiB;
+rw files are 16 KiB, fsynced, with 30% writes in mixed mode. Both arms use the
+same binary, Redis + RustFS, no compression, FUSE TTL 0/direct I/O/keep-cache 0,
+no payload cache or prefetch, and the default lease-bound metadata cache.
+Stat/full throughput uses the second scan epoch; setup and mount are separate.
+These are specific small-file results, not a replacement for broad fio/POSIX
+acceptance or evidence of TiKV performance parity.
+
+The final sweep was interrupted during 16-worker rw; it has no final summary
+or cleanup proof, and the 32-worker sweep never started. Its completed
+16-worker stat/full rows give provisional 0.72/0.57, excluded from the table.
+The last complete 16-worker stat/full comparison remains PR #30 at 0.75/0.57.
+Earlier 32-worker stat/full results (`hot26`, before PR #29) were 0.79/0.53;
+neither historical pair is a measurement of r31. The completed r31 sources
+above contain 0 errors in 92 rows with matching traces/checksums and clean
+teardown. Exact artifacts and reproduction commands are in the
+[delivery handoff](../superpowers/plans/2026-10-17-overlay-no-seal-handoff.md).
+
+Write remains the largest measured gap at concurrency: about 217 files/s at
+16 workers and 237 at 32. Creates remain individually gated; data batches still
+share the head sequence and per-layer extent generation. Combining create with
+first fsync was rejected because it breaks `O_EXCL` visibility. Sequence blocks,
+head-free commits, GC exemptions, create batching and full lower copy-up are
+not part of the delivered design. Stat/full still pay permission/path and FUSE
+read costs. `statfs` usage counters remain unsupported, and the bounded native
+GC census can return `Busy`. The three baseline overlay test failures,
+`source_file` flake, operator clippy failure and unverified compose smoke are
+recorded explicitly in the handoff; the full feature suite is not green.
 
 ## Code map
 
@@ -306,7 +420,8 @@ Any architecture change must preserve and test these invariants:
    record blocks takeover;
 5. no admin path changes the head of a workspace under another holder's live
    lease;
-6. hot mutations never CAS `control`;
+6. hot mutations never write `control`; packed mutations compare it to fence
+   schema migration;
 7. same-head sequence allocation is gap-safe under backend CAS retries;
 8. heartbeat and allocators remain entity-local;
 9. lease-bound caches serve only while the lease is proven held;
