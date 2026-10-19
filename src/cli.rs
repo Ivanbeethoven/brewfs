@@ -827,6 +827,7 @@ async fn gateway_webdav_cmd(args: WebDavGatewayArgs) -> anyhow::Result<()> {
 fn validate_volume_format_support(format: VolumeFormat) -> anyhow::Result<()> {
     match format {
         VolumeFormat::FlatV1 => Ok(()),
+        VolumeFormat::WorkspaceEntityV1 => validate_entity_mount_support(),
         #[cfg(feature = "workspace-overlay")]
         VolumeFormat::WorkspaceV1 => Ok(()),
         #[cfg(not(feature = "workspace-overlay"))]
@@ -852,11 +853,21 @@ fn validate_volume_format_support(format: VolumeFormat) -> anyhow::Result<()> {
     }
 }
 
+fn validate_entity_mount_support() -> anyhow::Result<()> {
+    #[cfg(feature = "workspace-overlay")]
+    anyhow::bail!(
+        "workspace-entity-v1 is experimental: stage 2 reference namespace only; packed ownership and VFS mount admission are not qualified"
+    );
+    #[cfg(not(feature = "workspace-overlay"))]
+    anyhow::bail!("feature not compiled: workspace-overlay");
+}
+
 async fn dispatch_mount<S>(layout: ChunkLayout, store: S, args: &MountConfig) -> anyhow::Result<()>
 where
     S: BlockStore + Send + Sync + 'static,
 {
     match args.volume_format {
+        VolumeFormat::WorkspaceEntityV1 => validate_entity_mount_support(),
         VolumeFormat::FlatV1 => {
             let meta_store = create_meta_store(args).await?;
             tracing::info!("mount startup meta store ready");
@@ -3043,6 +3054,26 @@ fn database_type_from_url(url: &str) -> DatabaseType {
 #[cfg(test)]
 mod volume_format_tests {
     use super::*;
+
+    #[test]
+    fn entity_format_is_explicit_and_mount_fails_closed() {
+        use clap::ValueEnum;
+        assert_eq!(
+            VolumeFormat::from_str("workspace-entity-v1", false).unwrap(),
+            VolumeFormat::WorkspaceEntityV1
+        );
+        assert_eq!(VolumeFormat::default(), VolumeFormat::FlatV1);
+        let error = validate_volume_format_support(VolumeFormat::WorkspaceEntityV1)
+            .unwrap_err()
+            .to_string();
+        #[cfg(feature = "workspace-overlay")]
+        assert!(
+            error.contains("stage 2 reference namespace only"),
+            "{error}"
+        );
+        #[cfg(not(feature = "workspace-overlay"))]
+        assert!(error.contains("feature not compiled"), "{error}");
+    }
 
     #[test]
     fn flat_format_is_always_supported() {

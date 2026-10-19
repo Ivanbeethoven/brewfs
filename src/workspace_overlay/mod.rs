@@ -9,6 +9,7 @@ pub mod catalog;
 // Packed-v2 clustered snapshots are retired; packed-v3 is the only packed format.
 pub mod control;
 pub mod digest;
+pub mod entity;
 pub mod error;
 pub mod gc;
 pub mod ids;

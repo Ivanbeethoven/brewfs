@@ -288,6 +288,8 @@ pub enum VolumeFormat {
     #[default]
     FlatV1,
     WorkspaceV1,
+    /// Experimental entity namespace; production mount admission is not enabled.
+    WorkspaceEntityV1,
     WorkspaceNativeV2,
     #[cfg(feature = "native-packed-base")]
     PackedMetadataV1,
@@ -1096,6 +1098,9 @@ impl MountConfig {
         }
         if workspace.is_none() && volume_format == VolumeFormat::WorkspaceNativeV2 {
             anyhow::bail!("workspace id is required with volume_format=workspace-native-v2");
+        }
+        if workspace.is_none() && volume_format == VolumeFormat::WorkspaceEntityV1 {
+            anyhow::bail!("workspace id is required with volume_format=workspace-entity-v1");
         }
         #[cfg(feature = "native-packed-base")]
         if volume_format == VolumeFormat::PackedMetadataV1 {
