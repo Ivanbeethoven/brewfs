@@ -77,6 +77,11 @@ pub trait BlockStore {
     /// corruption and must return [`IncompleteBlockRead`].
     async fn read_range(&self, key: BlockKey, offset: u64, buf: &mut [u8]) -> anyhow::Result<()>;
 
+    /// Borrow a complete range already in memory. A miss uses the normal read path.
+    async fn read_cached_range(&self, _key: BlockKey, _offset: u64, _len: usize) -> Option<Bytes> {
+        None
+    }
+
     /// Delete `block_count` blocks starting from `key.1` (block_index) for slice `key.0`.
     async fn delete_range(&self, key: BlockKey, block_count: u64) -> anyhow::Result<()>;
 
@@ -1119,6 +1124,17 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         self.write_fresh_vectored_inner(key, offset, chunks)
             .await
             .map(|_| data.len() as u64)
+    }
+
+    async fn read_cached_range(&self, key: BlockKey, offset: u64, len: usize) -> Option<Bytes> {
+        let data = self
+            .block_cache
+            .get_cached_range(&Self::key_for(key), offset as usize, len)
+            .await?;
+        self.client
+            .read_event(ReadClass::NativePayload, ReadEvent::CacheHit);
+        self.object_metrics.record_read_block_cache_hit();
+        Some(data)
     }
 
     #[tracing::instrument(

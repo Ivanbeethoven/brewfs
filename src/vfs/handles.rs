@@ -432,7 +432,11 @@ where
     }
 
     #[tracing::instrument(name = "Handle.read", level = "trace", skip(self))]
-    pub(crate) async fn read(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
+    pub(crate) async fn read(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> anyhow::Result<crate::vfs::io::reader::ReadReply> {
         let _guard = self.gate.read_lock().await;
         let reader = {
             let guard = self.state.lock().unwrap();
@@ -441,7 +445,7 @@ where
                 .clone()
                 .ok_or_else(|| anyhow!("file handle reader not initialized"))?
         };
-        let data = reader.read(offset, len).await?;
+        let data = reader.read_reply(offset, len).await?;
         self.update_offset(offset + data.len() as u64);
         Ok(data)
     }

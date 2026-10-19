@@ -247,7 +247,7 @@ pub struct MountArgs {
     #[arg(long)]
     pub s3_disable_payload_checksum: Option<bool>,
 
-    /// RustFS EC block size: auto (omit for objects <=1 MiB, else 4 MiB),
+    /// RustFS EC block size: auto (omit for objects <=1 MiB, else 1 MiB),
     /// or fixed bytes (65536, 262144, 1048576 or 4194304).
     /// Omit to disable. Requires the s3 backend and a compatible RustFS server.
     /// Requires compilation with the rustfs-ec-block-size-hint Cargo feature.
@@ -551,7 +551,7 @@ pub struct ObjectPutBenchArgs {
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub s3_disable_payload_checksum: bool,
 
-    /// RustFS EC block size: auto (omit for objects <=1 MiB, else 4 MiB),
+    /// RustFS EC block size: auto (omit for objects <=1 MiB, else 1 MiB),
     /// or fixed bytes (65536, 262144, 1048576 or 4194304).
     /// Omit to disable. Requires a compatible RustFS server.
     /// Requires compilation with the rustfs-ec-block-size-hint Cargo feature.

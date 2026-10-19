@@ -64,10 +64,10 @@ impl RustfsEcBlockSizeHint {
     fn for_object(self, object_bytes: usize) -> Option<usize> {
         match self {
             Self::Fixed(size) => Some(size),
-            // Opt-in whole-object policy: preserve the server's default/inline
-            // path for small objects; reduce EC iterations for larger objects.
-            // This is a candidate policy, not an empirically optimal threshold.
-            Self::Auto if object_bytes > 1_048_576 => Some(4_194_304),
+            // Preserve the server's default/inline path for small objects.
+            // Whole-file ACS tests favor 1 MiB EC for BrewFS's 4 MiB objects;
+            // fewer EC segments alone did not make the 4 MiB layout faster.
+            Self::Auto if object_bytes > 1_048_576 => Some(1_048_576),
             Self::Auto => None,
         }
     }
@@ -1900,11 +1900,11 @@ mod tests {
             (262_144, None),
             (1_048_575, None),
             (1_048_576, None),
-            (1_048_577, Some("4194304")),
-            (4_194_303, Some("4194304")),
-            (4_194_304, Some("4194304")),
-            (4_194_305, Some("4194304")),
-            (5_242_893, Some("4194304")),
+            (1_048_577, Some("1048576")),
+            (4_194_303, Some("1048576")),
+            (4_194_304, Some("1048576")),
+            (4_194_305, Some("1048576")),
+            (5_242_893, Some("1048576")),
             // A small tail after a large object must not inherit its hint.
             (17, None),
         ] {
@@ -1993,8 +1993,8 @@ mod tests {
                 (Compression::Lz4, 4_194_304, None),
                 (Compression::Zstd(1), 4_194_304, None),
                 (Compression::None, 1_048_572, None),
-                (Compression::None, 1_048_573, Some("4194304")),
-                (Compression::None, 4_194_304, Some("4194304")),
+                (Compression::None, 1_048_573, Some("1048576")),
+                (Compression::None, 4_194_304, Some("1048576")),
             ] {
                 mock.state.requests.lock().await.clear();
                 let store = ObjectBlockStore::new_with_configs_async(
@@ -2244,10 +2244,10 @@ mod tests {
             (262_144, "1048576"),
             (1_048_575, "1048576"),
             (1_048_576, "1048576"),
-            (1_048_577, "4194304"),
-            (4_194_304, "4194304"),
-            (4_194_308, "4194304"),
-            (5_242_893, "4194304"),
+            (1_048_577, "1048576"),
+            (4_194_304, "1048576"),
+            (4_194_308, "1048576"),
+            (5_242_893, "1048576"),
         ] {
             let payload = Bytes::from((0..length).map(|i| (i % 251) as u8).collect::<Vec<_>>());
             for mode in ["normal", "vectored", "create-only"] {

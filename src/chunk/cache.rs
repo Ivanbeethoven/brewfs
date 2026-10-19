@@ -2287,6 +2287,23 @@ impl ChunksCache {
         Some(value)
     }
 
+    /// Share memory-cache bytes without allocating a FUSE-sized output buffer.
+    pub(crate) async fn get_cached_range(
+        &self,
+        key: &String,
+        offset: usize,
+        len: usize,
+    ) -> Option<bytes::Bytes> {
+        let covers = |value: &bytes::Bytes| offset <= value.len() && len <= value.len() - offset;
+        let value = match self.write_hot_cache.get(key).filter(covers) {
+            Some(value) => value,
+            None => self.hot_cache.get(key).await.filter(covers)?,
+        };
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        self.policy.record_cache_request(true);
+        Some(value.slice(offset..offset + len))
+    }
+
     pub async fn get_range_into(
         &self,
         key: &String,
