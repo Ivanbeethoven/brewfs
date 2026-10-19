@@ -1,0 +1,1396 @@
+//! Namespace contracts exercise public operations against current-row storage.
+//! The paused backend proves ordering/read predicates without timing benchmarks.
+
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use futures::FutureExt;
+use tokio::sync::{Barrier, Notify};
+use uuid::Uuid;
+
+use super::backend::{
+    CommitOutcome, EntityBackend, EntityPlan, RowCheck, RowSnapshot, RowWrite, TransactionAuthority,
+};
+use super::codec;
+use super::keys::EntityKeys;
+use super::lifecycle::Lifecycle;
+use super::memory::MemoryEntityBackend;
+use super::model::{EntityDentry, EntityInode, EntityKind, EntityValue, UpperInode};
+use super::namespace::{CreateRequest, Credentials, EntityNamespace};
+use super::redis::RedisEntityBackend;
+use super::resolver::test_support::{MemoryLower, inode_record};
+use super::resolver::{self, ImmutableLower};
+use super::{EntityError, Result};
+use crate::meta::posix_acl::{ACCESS_XATTR, DEFAULT_XATTR, PosixAcl};
+
+struct Fixture<B> {
+    backend: Arc<B>,
+    lower: Arc<MemoryLower>,
+    keys: EntityKeys,
+    ns: Arc<EntityNamespace<B, MemoryLower>>,
+}
+
+fn root() -> Credentials {
+    Credentials {
+        uid: 0,
+        gid: 0,
+        groups: vec![0],
+        umask: 0o022,
+    }
+}
+
+fn user(uid: u32) -> Credentials {
+    Credentials {
+        uid,
+        gid: uid,
+        groups: vec![uid],
+        umask: 0o022,
+    }
+}
+
+fn request(parent: i64, name: &[u8], kind: EntityKind) -> CreateRequest {
+    CreateRequest {
+        parent,
+        name: name.to_vec(),
+        kind,
+        mode: if kind == EntityKind::Directory {
+            0o777
+        } else {
+            0o666
+        },
+        rdev: 0,
+        symlink_target: None,
+    }
+}
+
+async fn attach<B: EntityBackend + 'static>(
+    backend: Arc<B>,
+    lower: Arc<MemoryLower>,
+    keys: EntityKeys,
+) -> Fixture<B> {
+    attach_with_ttl(backend, lower, keys, 1_000_000).await
+}
+
+async fn attach_with_ttl<B: EntityBackend + 'static>(
+    backend: Arc<B>,
+    lower: Arc<MemoryLower>,
+    keys: EntityKeys,
+    ttl_ns: i64,
+) -> Fixture<B> {
+    let lifecycle = Lifecycle::new(backend.clone(), keys.clone());
+    lifecycle.provision(lower.binding()).await.unwrap();
+    let session = lifecycle.acquire(Uuid::new_v4(), ttl_ns).await.unwrap();
+    let ns = EntityNamespace::new(backend.clone(), lower.clone(), keys.clone(), session);
+    Fixture {
+        backend,
+        lower,
+        keys,
+        ns,
+    }
+}
+
+async fn fixture(lower: MemoryLower) -> Fixture<MemoryEntityBackend> {
+    attach(
+        Arc::new(MemoryEntityBackend::new(1000)),
+        Arc::new(lower),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await
+}
+
+async fn current_inode<B: EntityBackend + 'static>(fixture: &Fixture<B>, ino: i64) -> EntityInode {
+    let snapshot = fixture
+        .backend
+        .read(&[fixture.keys.inode(ino)])
+        .await
+        .unwrap();
+    let upper: Option<UpperInode> = snapshot.rows[0]
+        .as_deref()
+        .map(codec::decode)
+        .transpose()
+        .unwrap();
+    resolver::resolve_inode(
+        fixture.lower.as_ref(),
+        fixture.lower.binding(),
+        ino,
+        upper.as_ref(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+fn add_directory(lower: &mut MemoryLower, parent: i64, name: &[u8], ino: i64, mode: u32) {
+    let mut inode = inode_record(ino, EntityKind::Directory, 0);
+    inode.parent_hint = Some(parent);
+    inode.mode = mode;
+    lower.inodes.insert(ino, inode);
+    lower.inodes.get_mut(&parent).unwrap().nlink += 1;
+    lower.dentries.insert(
+        (parent, name.to_vec()),
+        EntityDentry::Present {
+            ino,
+            kind: EntityKind::Directory,
+        },
+    );
+    lower.binding.max_ino = lower.binding.max_ino.max(ino);
+}
+
+#[tokio::test]
+async fn lower_only_lookup_does_not_copy_up_and_siblings_isolate_recreation() {
+    let mut lower = MemoryLower::empty();
+    lower.add_file(1, b"base", 2, 10);
+    let lower = Arc::new(lower);
+    let backend = Arc::new(MemoryEntityBackend::new(1000));
+    let volume = Uuid::new_v4();
+    let first = attach(
+        backend.clone(),
+        lower.clone(),
+        EntityKeys::new(volume, Uuid::new_v4()),
+    )
+    .await;
+    let second = attach(backend, lower, EntityKeys::new(volume, Uuid::new_v4())).await;
+    assert_eq!(first.ns.lookup(1, b"base", &root()).await.unwrap().ino, 2);
+    assert_eq!(
+        first
+            .backend
+            .read(&[first.keys.inode(2)])
+            .await
+            .unwrap()
+            .rows,
+        vec![None]
+    );
+    first
+        .ns
+        .unlink(1, b"base".to_vec(), false, root())
+        .await
+        .unwrap();
+    assert_eq!(
+        first.ns.lookup(1, b"base", &root()).await.unwrap_err(),
+        EntityError::NotFound
+    );
+    let recreated = first
+        .ns
+        .create(request(1, b"base", EntityKind::File), root())
+        .await
+        .unwrap();
+    assert!(recreated.ino > 2);
+    assert_eq!((recreated.size, recreated.lower_visible_size), (0, 0));
+    let original = second.ns.lookup(1, b"base", &root()).await.unwrap();
+    assert_eq!((original.ino, original.size, original.nlink), (2, 10, 1));
+    assert_eq!(current_inode(&first, 2).await.nlink, 0);
+}
+
+#[tokio::test]
+async fn concurrent_exclusive_creates_have_exactly_one_visible_winner() {
+    let fixture = fixture(MemoryLower::empty()).await;
+    let barrier = Arc::new(Barrier::new(33));
+    let mut tasks = Vec::new();
+    for _ in 0..32 {
+        let ns = fixture.ns.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            ns.create(request(1, b"exclusive", EntityKind::File), root())
+                .await
+        }));
+    }
+    barrier.wait().await;
+    let mut winners = Vec::new();
+    let mut exists = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(inode) => winners.push(inode),
+            Err(EntityError::Exists) => exists += 1,
+            other => panic!("unexpected create outcome: {other:?}"),
+        }
+    }
+    assert_eq!(winners.len(), 1);
+    assert_eq!(exists, 31);
+    assert_eq!(
+        fixture.ns.lookup(1, b"exclusive", &root()).await.unwrap(),
+        winners[0]
+    );
+    assert_eq!(winners[0].nlink, 1);
+}
+
+#[tokio::test]
+async fn rename_and_hardlinks_preserve_inode_identity_and_retire_replacements() {
+    let fixture = fixture(MemoryLower::empty()).await;
+    let original = fixture
+        .ns
+        .create(request(1, b"a", EntityKind::File), root())
+        .await
+        .unwrap();
+    fixture
+        .ns
+        .link(original.ino, 1, b"b".to_vec(), root())
+        .await
+        .unwrap();
+    assert_eq!(fixture.ns.lookup(1, b"a", &root()).await.unwrap().nlink, 2);
+    fixture
+        .ns
+        .rename(1, b"a".to_vec(), 1, b"c".to_vec(), false, root())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.ns.lookup(1, b"a", &root()).await.unwrap_err(),
+        EntityError::NotFound
+    );
+    assert_eq!(
+        fixture.ns.lookup(1, b"b", &root()).await.unwrap().ino,
+        original.ino
+    );
+    let replaced = fixture
+        .ns
+        .create(request(1, b"d", EntityKind::File), root())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .ns
+            .rename(1, b"c".to_vec(), 1, b"d".to_vec(), true, root())
+            .await
+            .unwrap_err(),
+        EntityError::Exists
+    );
+    fixture
+        .ns
+        .rename(1, b"c".to_vec(), 1, b"d".to_vec(), false, root())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.ns.lookup(1, b"d", &root()).await.unwrap().ino,
+        original.ino
+    );
+    assert_eq!(current_inode(&fixture, replaced.ino).await.nlink, 0);
+    assert!(
+        fixture
+            .backend
+            .read(&[fixture.keys.orphan(replaced.ino)])
+            .await
+            .unwrap()
+            .rows[0]
+            .is_some()
+    );
+    fixture
+        .ns
+        .unlink(1, b"b".to_vec(), false, root())
+        .await
+        .unwrap();
+    assert_eq!(fixture.ns.lookup(1, b"d", &root()).await.unwrap().nlink, 1);
+    fixture
+        .ns
+        .unlink(1, b"d".to_vec(), false, root())
+        .await
+        .unwrap();
+    assert_eq!(current_inode(&fixture, original.ino).await.nlink, 0);
+    assert!(
+        fixture
+            .backend
+            .read(&[fixture.keys.orphan(original.ino)])
+            .await
+            .unwrap()
+            .rows[0]
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn directory_cycles_nonempty_removal_and_replacement_keep_parent_counts() {
+    let fixture = fixture(MemoryLower::empty()).await;
+    let a = fixture
+        .ns
+        .create(request(1, b"a", EntityKind::Directory), root())
+        .await
+        .unwrap();
+    let child = fixture
+        .ns
+        .create(request(a.ino, b"child", EntityKind::Directory), root())
+        .await
+        .unwrap();
+    let b = fixture
+        .ns
+        .create(request(1, b"b", EntityKind::Directory), root())
+        .await
+        .unwrap();
+    assert_eq!(current_inode(&fixture, 1).await.nlink, 4);
+    assert!(matches!(
+        fixture
+            .ns
+            .rename(
+                1,
+                b"a".to_vec(),
+                child.ino,
+                b"cycle".to_vec(),
+                false,
+                root()
+            )
+            .await,
+        Err(EntityError::Invalid(_))
+    ));
+    assert_eq!(
+        fixture
+            .ns
+            .unlink(1, b"a".to_vec(), true, root())
+            .await
+            .unwrap_err(),
+        EntityError::NotEmpty
+    );
+    fixture
+        .ns
+        .rename(1, b"a".to_vec(), 1, b"b".to_vec(), false, root())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.ns.lookup(1, b"b", &root()).await.unwrap().ino,
+        a.ino
+    );
+    assert_eq!(current_inode(&fixture, 1).await.nlink, 3);
+    assert_eq!(current_inode(&fixture, b.ino).await.nlink, 0);
+    assert_eq!(
+        current_inode(&fixture, child.ino).await.parent_hint,
+        Some(a.ino)
+    );
+    fixture
+        .ns
+        .unlink(a.ino, b"child".to_vec(), true, root())
+        .await
+        .unwrap();
+    fixture
+        .ns
+        .unlink(1, b"b".to_vec(), true, root())
+        .await
+        .unwrap();
+    assert_eq!(current_inode(&fixture, 1).await.nlink, 2);
+}
+
+#[tokio::test]
+async fn sticky_directory_and_ancestor_search_permissions_are_enforced() {
+    let mut lower = MemoryLower::empty();
+    lower.inodes.get_mut(&1).unwrap().mode = 0o1777;
+    lower.add_file(1, b"owned", 2, 0);
+    lower.inodes.get_mut(&2).unwrap().uid = 100;
+    add_directory(&mut lower, 1, b"ancestor", 3, 0o777);
+    add_directory(&mut lower, 3, b"parent", 4, 0o777);
+    lower.add_file(4, b"readable", 5, 0);
+    let fixture = fixture(lower).await;
+    assert_eq!(
+        fixture
+            .ns
+            .unlink(1, b"owned".to_vec(), false, user(200))
+            .await
+            .unwrap_err(),
+        EntityError::Permission
+    );
+    assert_eq!(
+        fixture
+            .ns
+            .rename(1, b"owned".to_vec(), 1, b"moved".to_vec(), false, user(200))
+            .await
+            .unwrap_err(),
+        EntityError::Permission
+    );
+    let handle = fixture
+        .ns
+        .open(4, b"readable", 4, &user(200))
+        .await
+        .unwrap();
+    fixture.ns.close(handle).unwrap();
+    fixture.ns.chmod(3, 0o700, root()).await.unwrap();
+    assert!(matches!(
+        fixture.ns.open(4, b"readable", 4, &user(200)).await,
+        Err(EntityError::Permission)
+    ));
+    fixture
+        .ns
+        .unlink(1, b"owned".to_vec(), false, user(100))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn absent_name_open_checks_parent_search_permission_before_name_existence() {
+    let mut lower = MemoryLower::empty();
+    lower.inodes.get_mut(&1).unwrap().mode = 0o700;
+    lower.add_file(1, b"existing", 2, 0);
+    let fixture = fixture(lower).await;
+    let before = fixture
+        .backend
+        .scan_prefix(fixture.keys.volume_prefix(), 4096)
+        .await
+        .unwrap();
+    for name in [b"absent".as_slice(), b"existing"] {
+        assert!(matches!(
+            fixture.ns.open(1, name, 4, &user(2000)).await,
+            Err(EntityError::Permission)
+        ));
+        assert_eq!(
+            fixture.ns.lookup(1, name, &user(2000)).await.unwrap_err(),
+            EntityError::Permission
+        );
+    }
+    assert_eq!(
+        fixture
+            .backend
+            .scan_prefix(fixture.keys.volume_prefix(), 4096)
+            .await
+            .unwrap(),
+        before
+    );
+}
+
+fn named_acl(uid: u32) -> Vec<u8> {
+    let mut bytes = 2_u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in [
+        (1_u16, 7_u16, u32::MAX),
+        (2, 6, uid),
+        (4, 0, u32::MAX),
+        (16, 6, u32::MAX),
+        (32, 0, u32::MAX),
+    ] {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&permissions.to_le_bytes());
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    PosixAcl::decode(&bytes).unwrap();
+    bytes
+}
+
+#[tokio::test]
+async fn default_acl_setgid_inheritance_and_chmod_mask_remain_consistent() {
+    let mut lower = MemoryLower::empty();
+    let parent = lower.inodes.get_mut(&1).unwrap();
+    parent.mode = 0o2777;
+    parent.gid = 77;
+    lower
+        .xattrs
+        .insert((1, DEFAULT_XATTR.to_vec()), named_acl(1000));
+    let fixture = fixture(lower).await;
+    let mut owner = user(2000);
+    owner.umask = 0o077;
+    let file = fixture
+        .ns
+        .create(request(1, b"acl", EntityKind::File), owner.clone())
+        .await
+        .unwrap();
+    assert_eq!((file.uid, file.gid, file.mode), (2000, 77, 0o660));
+    let handle = fixture.ns.open(1, b"acl", 6, &user(1000)).await.unwrap();
+    fixture.ns.close(handle).unwrap();
+    assert!(matches!(
+        fixture.ns.open(1, b"acl", 4, &user(3000)).await,
+        Err(EntityError::Permission)
+    ));
+    fixture.ns.chmod(file.ino, 0o640, owner).await.unwrap();
+    assert!(matches!(
+        fixture.ns.open(1, b"acl", 2, &user(1000)).await,
+        Err(EntityError::Permission)
+    ));
+    let handle = fixture.ns.open(1, b"acl", 4, &user(1000)).await.unwrap();
+    fixture.ns.close(handle).unwrap();
+    let snapshot = fixture
+        .backend
+        .read(&[fixture.keys.xattr(file.ino, ACCESS_XATTR)])
+        .await
+        .unwrap();
+    let EntityValue::Present(bytes) = codec::decode(snapshot.rows[0].as_deref().unwrap()).unwrap()
+    else {
+        panic!("missing access ACL")
+    };
+    assert_eq!(
+        PosixAcl::decode(&bytes).unwrap().mode_bits(),
+        current_inode(&fixture, file.ino).await.mode & 0o777
+    );
+}
+
+#[tokio::test]
+async fn user_xattrs_follow_write_acl_and_group_permissions_including_removal() {
+    let mut lower = MemoryLower::empty();
+    lower.add_file(1, b"named", 2, 0);
+    lower.add_file(1, b"group", 3, 0);
+    lower.add_file(1, b"readonly", 4, 0);
+    for ino in [2, 3, 4] {
+        lower.inodes.get_mut(&ino).unwrap().uid = 1000;
+    }
+    let acl = named_acl(2000);
+    lower.inodes.get_mut(&2).unwrap().mode = PosixAcl::decode(&acl).unwrap().mode_bits();
+    lower.xattrs.insert((2, ACCESS_XATTR.to_vec()), acl);
+    let group_inode = lower.inodes.get_mut(&3).unwrap();
+    group_inode.gid = 77;
+    group_inode.mode = 0o620;
+    lower.inodes.get_mut(&4).unwrap().mode = 0o444;
+    lower
+        .xattrs
+        .insert((4, b"user.value".to_vec()), b"existing".to_vec());
+    let fixture = fixture(lower).await;
+    let mut member = user(3000);
+    member.groups.push(77);
+    for (ino, credentials) in [(2, user(2000)), (3, member)] {
+        fixture
+            .ns
+            .set_xattr(
+                ino,
+                b"user.value".to_vec(),
+                Some(b"written".to_vec()),
+                credentials.clone(),
+            )
+            .await
+            .unwrap();
+        let row = fixture
+            .backend
+            .read(&[fixture.keys.xattr(ino, b"user.value")])
+            .await
+            .unwrap();
+        assert_eq!(
+            codec::decode::<EntityValue>(row.rows[0].as_deref().unwrap()).unwrap(),
+            EntityValue::Present(b"written".to_vec())
+        );
+        fixture
+            .ns
+            .set_xattr(ino, b"user.value".to_vec(), None, credentials)
+            .await
+            .unwrap();
+        let row = fixture
+            .backend
+            .read(&[fixture.keys.xattr(ino, b"user.value")])
+            .await
+            .unwrap();
+        assert_eq!(
+            codec::decode::<EntityValue>(row.rows[0].as_deref().unwrap()).unwrap(),
+            EntityValue::Whiteout
+        );
+    }
+    let before = fixture
+        .backend
+        .scan_prefix(fixture.keys.volume_prefix(), 4096)
+        .await
+        .unwrap();
+    for value in [Some(b"denied".to_vec()), None] {
+        assert_eq!(
+            fixture
+                .ns
+                .set_xattr(4, b"user.value".to_vec(), value, user(1000))
+                .await
+                .unwrap_err(),
+            EntityError::Permission,
+            "owning a read-only inode does not grant user-xattr write access"
+        );
+    }
+    assert_eq!(
+        fixture
+            .ns
+            .set_xattr(2, ACCESS_XATTR.to_vec(), Some(named_acl(2000)), user(2000))
+            .await
+            .unwrap_err(),
+        EntityError::Permission,
+        "write ACL access does not grant permission to change that ACL"
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .scan_prefix(fixture.keys.volume_prefix(), 4096)
+            .await
+            .unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn sticky_directory_user_xattrs_require_directory_owner_or_root() {
+    let mut lower = MemoryLower::empty();
+    add_directory(&mut lower, 1, b"sticky", 2, 0o1777);
+    add_directory(&mut lower, 1, b"ordinary", 3, 0o777);
+    for ino in [2, 3] {
+        lower.inodes.get_mut(&ino).unwrap().uid = 1000;
+    }
+    lower
+        .xattrs
+        .insert((2, b"user.value".to_vec()), b"existing".to_vec());
+    let fixture = fixture(lower).await;
+    let before = fixture
+        .backend
+        .scan_prefix(fixture.keys.volume_prefix(), 4096)
+        .await
+        .unwrap();
+    for value in [Some(b"denied".to_vec()), None] {
+        assert_eq!(
+            fixture
+                .ns
+                .set_xattr(2, b"user.value".to_vec(), value, user(2000))
+                .await
+                .unwrap_err(),
+            EntityError::Permission
+        );
+    }
+    assert_eq!(
+        fixture
+            .backend
+            .scan_prefix(fixture.keys.volume_prefix(), 4096)
+            .await
+            .unwrap(),
+        before
+    );
+    for (ino, credentials) in [(2, user(1000)), (2, root()), (3, user(2000))] {
+        fixture
+            .ns
+            .set_xattr(
+                ino,
+                b"user.value".to_vec(),
+                Some(b"permitted".to_vec()),
+                credentials,
+            )
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn symlink_user_xattrs_and_acls_fail_closed_without_mutation() {
+    let fixture = fixture(MemoryLower::empty()).await;
+    let mut symlink = request(1, b"link", EntityKind::Symlink);
+    symlink.symlink_target = Some(b"destination".to_vec());
+    let inode = fixture.ns.create(symlink, root()).await.unwrap();
+    let before = fixture
+        .backend
+        .scan_prefix(fixture.keys.volume_prefix(), 4096)
+        .await
+        .unwrap();
+    for (name, value) in [
+        (b"user.value".as_slice(), b"value".to_vec()),
+        (ACCESS_XATTR, named_acl(2000)),
+        (DEFAULT_XATTR, named_acl(2000)),
+    ] {
+        for value in [Some(value), None] {
+            assert!(matches!(
+                fixture
+                    .ns
+                    .set_xattr(inode.ino, name.to_vec(), value, root())
+                    .await,
+                Err(EntityError::Unsupported(_))
+            ));
+        }
+    }
+    assert_eq!(
+        fixture
+            .backend
+            .scan_prefix(fixture.keys.volume_prefix(), 4096)
+            .await
+            .unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn device_creation_requires_root_and_retains_kind_and_rdev() {
+    let mut lower = MemoryLower::empty();
+    lower.inodes.get_mut(&1).unwrap().mode = 0o777;
+    let fixture = fixture(lower).await;
+    let before = fixture
+        .backend
+        .scan_prefix(fixture.keys.volume_prefix(), 4096)
+        .await
+        .unwrap();
+    for kind in [EntityKind::CharDevice, EntityKind::BlockDevice] {
+        let mut device = request(1, b"device", kind);
+        device.rdev = 0x1234;
+        assert_eq!(
+            fixture.ns.create(device, user(2000)).await.unwrap_err(),
+            EntityError::Permission
+        );
+    }
+    assert_eq!(
+        fixture
+            .backend
+            .scan_prefix(fixture.keys.volume_prefix(), 4096)
+            .await
+            .unwrap(),
+        before
+    );
+    for (name, kind) in [
+        (b"char".as_slice(), EntityKind::CharDevice),
+        (b"block".as_slice(), EntityKind::BlockDevice),
+    ] {
+        let mut device = request(1, name, kind);
+        device.rdev = 0x1234;
+        let created = fixture.ns.create(device, root()).await.unwrap();
+        let looked_up = fixture.ns.lookup(1, name, &root()).await.unwrap();
+        assert_eq!(looked_up, created);
+        assert_eq!((looked_up.kind, looked_up.rdev), (kind, 0x1234));
+    }
+}
+
+#[tokio::test]
+async fn xattr_whiteout_does_not_reveal_lower_and_open_close_is_noatime() {
+    let mut lower = MemoryLower::empty();
+    lower.add_file(1, b"file", 2, 10);
+    lower
+        .xattrs
+        .insert((2, b"user.value".to_vec()), b"lower".to_vec());
+    let fixture = fixture(lower).await;
+    fixture
+        .ns
+        .set_xattr(2, b"user.value".to_vec(), None, root())
+        .await
+        .unwrap();
+    let snapshot = fixture
+        .backend
+        .read(&[fixture.keys.xattr(2, b"user.value")])
+        .await
+        .unwrap();
+    let upper: EntityValue = codec::decode(snapshot.rows[0].as_deref().unwrap()).unwrap();
+    assert_eq!(upper, EntityValue::Whiteout);
+    assert_eq!(
+        resolver::resolve_xattr(
+            fixture.lower.as_ref(),
+            fixture.lower.binding(),
+            2,
+            b"user.value",
+            Some(&upper)
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    let before = fixture
+        .backend
+        .scan_prefix(fixture.keys.volume_prefix(), 4096)
+        .await
+        .unwrap();
+    let inode_before = current_inode(&fixture, 2).await;
+    let handle = fixture.ns.open(1, b"file", 6, &root()).await.unwrap();
+    assert_eq!(handle.ino(), 2);
+    fixture.ns.close(handle).unwrap();
+    assert_eq!(
+        fixture
+            .backend
+            .scan_prefix(fixture.keys.volume_prefix(), 4096)
+            .await
+            .unwrap(),
+        before
+    );
+    assert_eq!(current_inode(&fixture, 2).await, inode_before);
+}
+
+#[tokio::test]
+async fn expired_lease_rejects_namespace_mutations_without_writes() {
+    let fixture = fixture(MemoryLower::empty()).await;
+    let before = fixture
+        .backend
+        .scan_prefix(fixture.keys.volume_prefix(), 4096)
+        .await
+        .unwrap();
+    fixture.backend.set_time(1_001_000).unwrap();
+    assert_eq!(
+        fixture
+            .ns
+            .create(request(1, b"fenced", EntityKind::File), root())
+            .await
+            .unwrap_err(),
+        EntityError::Fenced
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .scan_prefix(fixture.keys.volume_prefix(), 4096)
+            .await
+            .unwrap(),
+        before
+    );
+}
+
+async fn inject_dentry(fixture: &Fixture<MemoryEntityBackend>, name: &[u8], row: EntityDentry) {
+    // A deliberate storage fault, outside namespace APIs. Keep the descriptor
+    // fixed so the tested failure is the corrupt row, not lost writer authority.
+    let keys = [fixture.keys.descriptor(), fixture.keys.dentry(1, name)];
+    let snapshot = fixture.backend.read(&keys).await.unwrap();
+    let authority = TransactionAuthority::from_validated(
+        vec![RowCheck {
+            key: keys[0].clone(),
+            expected: snapshot.rows[0].clone(),
+        }],
+        None,
+        None,
+    )
+    .unwrap();
+    let plan = EntityPlan {
+        checks: vec![RowCheck {
+            key: keys[1].clone(),
+            expected: snapshot.rows[1].clone(),
+        }],
+        writes: vec![RowWrite::Put {
+            key: keys[1].clone(),
+            value: codec::encode(&row).unwrap(),
+        }],
+    };
+    assert_eq!(
+        fixture.backend.commit(&authority, &plan).await.unwrap(),
+        CommitOutcome::Committed
+    );
+}
+
+#[tokio::test]
+async fn corrupt_dentry_kind_or_missing_inode_fails_without_namespace_writes() {
+    for corrupt in [
+        EntityDentry::Present {
+            ino: 2,
+            kind: EntityKind::Directory,
+        },
+        EntityDentry::Present {
+            ino: 999,
+            kind: EntityKind::File,
+        },
+    ] {
+        let mut lower = MemoryLower::empty();
+        lower.add_file(1, b"bad", 2, 10);
+        let fixture = fixture(lower).await;
+        inject_dentry(&fixture, b"bad", corrupt).await;
+        let before = fixture
+            .backend
+            .scan_prefix(fixture.keys.volume_prefix(), 4096)
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture.ns.lookup(1, b"bad", &root()).await,
+            Err(EntityError::Corrupt(_))
+        ));
+        assert!(matches!(
+            fixture
+                .ns
+                .create(request(1, b"bad", EntityKind::File), root())
+                .await,
+            Err(EntityError::Corrupt(_))
+        ));
+        assert!(matches!(
+            fixture.ns.unlink(1, b"bad".to_vec(), false, root()).await,
+            Err(EntityError::Corrupt(_))
+        ));
+        assert!(matches!(
+            fixture
+                .ns
+                .rename(1, b"bad".to_vec(), 1, b"moved".to_vec(), false, root())
+                .await,
+            Err(EntityError::Corrupt(_))
+        ));
+        assert_eq!(
+            fixture
+                .backend
+                .scan_prefix(fixture.keys.volume_prefix(), 4096)
+                .await
+                .unwrap(),
+            before
+        );
+    }
+}
+
+#[tokio::test]
+async fn namespace_with_wrong_lower_binding_cannot_read_or_mutate() {
+    let backend = Arc::new(MemoryEntityBackend::new(1000));
+    let keys = EntityKeys::new(Uuid::new_v4(), Uuid::new_v4());
+    let original = MemoryLower::empty();
+    let lifecycle = Lifecycle::new(backend.clone(), keys.clone());
+    lifecycle.provision(original.binding()).await.unwrap();
+    let session = lifecycle.acquire(Uuid::new_v4(), 1_000_000).await.unwrap();
+    let before = backend
+        .scan_prefix(keys.volume_prefix(), 4096)
+        .await
+        .unwrap();
+    for mismatch in 0..3 {
+        let mut wrong = MemoryLower::empty();
+        match mismatch {
+            0 => wrong.binding.manifest_digest = [9; 32],
+            1 => wrong.binding.manifest_key = b"other-authenticated-manifest".to_vec(),
+            _ => wrong.binding.max_ino += 1,
+        }
+        let namespace = EntityNamespace::new(
+            backend.clone(),
+            Arc::new(wrong),
+            keys.clone(),
+            session.clone(),
+        );
+        assert_eq!(
+            namespace.lookup(1, b"absent", &root()).await.unwrap_err(),
+            EntityError::Fenced
+        );
+        assert_eq!(
+            namespace
+                .create(request(1, b"forbidden", EntityKind::File), root())
+                .await
+                .unwrap_err(),
+            EntityError::Fenced
+        );
+        assert!(matches!(
+            namespace.open(1, b"absent", 4, &root()).await,
+            Err(EntityError::Fenced)
+        ));
+        assert_eq!(
+            backend
+                .scan_prefix(keys.volume_prefix(), 4096)
+                .await
+                .unwrap(),
+            before
+        );
+    }
+}
+
+struct PausingBackend {
+    inner: MemoryEntityBackend,
+    pause_key: Mutex<Option<Vec<u8>>>,
+    entered: Notify,
+    resume: Notify,
+    lose_reply: AtomicBool,
+    mutation_commits: AtomicUsize,
+}
+
+impl PausingBackend {
+    fn new() -> Self {
+        Self {
+            inner: MemoryEntityBackend::new(1000),
+            pause_key: Mutex::new(None),
+            entered: Notify::new(),
+            resume: Notify::new(),
+            lose_reply: AtomicBool::new(false),
+            mutation_commits: AtomicUsize::new(0),
+        }
+    }
+    fn pause(&self, key: Vec<u8>) {
+        *self.pause_key.lock().unwrap() = Some(key);
+    }
+    async fn entered(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.entered.notified())
+            .await
+            .unwrap();
+    }
+    fn resume(&self) {
+        self.resume.notify_one();
+    }
+}
+
+#[async_trait]
+impl EntityBackend for PausingBackend {
+    async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
+        self.inner.read(keys).await
+    }
+    async fn commit(
+        &self,
+        authority: &TransactionAuthority,
+        plan: &EntityPlan,
+    ) -> Result<CommitOutcome> {
+        let pause = {
+            let mut target = self.pause_key.lock().unwrap();
+            if target.as_ref().is_some_and(|key| {
+                plan.writes
+                    .iter()
+                    .any(|write| write.key() == key.as_slice())
+            }) {
+                target.take();
+                true
+            } else {
+                false
+            }
+        };
+        if pause {
+            self.entered.notify_one();
+            self.resume.notified().await;
+        }
+        let outcome = self.inner.commit(authority, plan).await?;
+        if outcome == CommitOutcome::Committed && !plan.writes.is_empty() {
+            self.mutation_commits.fetch_add(1, Ordering::SeqCst);
+            if self.lose_reply.swap(false, Ordering::SeqCst) {
+                return Err(EntityError::Backend(
+                    "injected committed response loss".into(),
+                ));
+            }
+        }
+        Ok(outcome)
+    }
+    async fn allocate(&self, authority: &TransactionAuthority, key: &[u8]) -> Result<u64> {
+        self.inner.allocate(authority, key).await
+    }
+    async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.scan_prefix(prefix, limit).await
+    }
+}
+
+#[tokio::test]
+async fn unrelated_parent_create_completes_while_another_commit_is_paused() {
+    let mut lower = MemoryLower::empty();
+    add_directory(&mut lower, 1, b"a", 2, 0o777);
+    add_directory(&mut lower, 1, b"b", 3, 0o777);
+    let backend = Arc::new(PausingBackend::new());
+    let fixture = attach(
+        backend.clone(),
+        Arc::new(lower),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+    backend.pause(fixture.keys.dentry(2, b"paused"));
+    let ns = fixture.ns.clone();
+    let paused = tokio::spawn(async move {
+        ns.create(request(2, b"paused", EntityKind::File), root())
+            .await
+    });
+    backend.entered().await;
+    let independent = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture
+            .ns
+            .create(request(3, b"independent", EntityKind::File), root()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        fixture
+            .ns
+            .lookup(3, b"independent", &root())
+            .await
+            .unwrap()
+            .ino,
+        independent.ino
+    );
+    backend.resume();
+    let completed = paused.await.unwrap().unwrap();
+    assert_eq!(
+        fixture.ns.lookup(2, b"paused", &root()).await.unwrap().ino,
+        completed.ino
+    );
+}
+
+#[tokio::test]
+async fn ancestor_chmod_invalidates_a_prepared_create_before_visibility() {
+    let mut lower = MemoryLower::empty();
+    add_directory(&mut lower, 1, b"ancestor", 2, 0o777);
+    add_directory(&mut lower, 2, b"parent", 3, 0o777);
+    let backend = Arc::new(PausingBackend::new());
+    let fixture = attach(
+        backend.clone(),
+        Arc::new(lower),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+    backend.pause(fixture.keys.dentry(3, b"must-not-exist"));
+    let ns = fixture.ns.clone();
+    let pending = tokio::spawn(async move {
+        ns.create(request(3, b"must-not-exist", EntityKind::File), user(2000))
+            .await
+    });
+    backend.entered().await;
+    tokio::time::timeout(Duration::from_secs(5), fixture.ns.chmod(2, 0o700, root()))
+        .await
+        .unwrap()
+        .unwrap();
+    backend.resume();
+    assert_eq!(pending.await.unwrap().unwrap_err(), EntityError::Permission);
+    assert_eq!(
+        fixture
+            .ns
+            .lookup(3, b"must-not-exist", &root())
+            .await
+            .unwrap_err(),
+        EntityError::NotFound
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .read(&[fixture.keys.dentry(3, b"must-not-exist")])
+            .await
+            .unwrap()
+            .rows,
+        vec![None]
+    );
+}
+
+#[tokio::test]
+async fn uncertain_create_reply_does_not_replay_the_committed_mutation() {
+    let backend = Arc::new(PausingBackend::new());
+    let fixture = attach(
+        backend.clone(),
+        Arc::new(MemoryLower::empty()),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+    let before = backend.mutation_commits.load(Ordering::SeqCst);
+    backend.lose_reply.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        fixture
+            .ns
+            .create(request(1, b"uncertain", EntityKind::File), root())
+            .await,
+        Err(EntityError::Backend(_))
+    ));
+    assert_eq!(backend.mutation_commits.load(Ordering::SeqCst), before + 1);
+    let inode = fixture.ns.lookup(1, b"uncertain", &root()).await.unwrap();
+    assert_eq!(inode.nlink, 1);
+    assert!(inode.ino > fixture.lower.binding.max_ino);
+    assert_eq!(
+        fixture
+            .ns
+            .create(request(1, b"uncertain", EntityKind::File), root())
+            .await
+            .unwrap_err(),
+        EntityError::Exists
+    );
+    assert_eq!(backend.mutation_commits.load(Ordering::SeqCst), before + 1);
+}
+
+#[tokio::test]
+async fn cancellation_retains_operation_locks_until_submitted_create_finishes() {
+    let backend = Arc::new(PausingBackend::new());
+    let fixture = attach(
+        backend.clone(),
+        Arc::new(MemoryLower::empty()),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+    backend.pause(fixture.keys.dentry(1, b"cancelled"));
+    let ns = fixture.ns.clone();
+    let caller = tokio::spawn(async move {
+        ns.create(request(1, b"cancelled", EntityKind::File), root())
+            .await
+    });
+    backend.entered().await;
+    let counter = backend
+        .read(&[fixture.keys.counter("inode")])
+        .await
+        .unwrap();
+    let allocated = std::str::from_utf8(counter.rows[0].as_deref().unwrap())
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    let ns = fixture.ns.clone();
+    let competitor = tokio::spawn(async move {
+        ns.create(request(1, b"cancelled", EntityKind::File), root())
+            .await
+    });
+    backend.resume();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), competitor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err(),
+        EntityError::Exists
+    );
+    assert_eq!(
+        fixture
+            .ns
+            .lookup(1, b"cancelled", &root())
+            .await
+            .unwrap()
+            .ino,
+        allocated
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires BREWFS_TEST_REDIS_URL pointing to an isolated local Redis"]
+async fn redis_entity_namespace_contract() {
+    let url = std::env::var("BREWFS_TEST_REDIS_URL").expect("BREWFS_TEST_REDIS_URL");
+    let volume = Uuid::new_v4();
+    let keys = EntityKeys::new(volume, Uuid::new_v4());
+    let backend = Arc::new(RedisEntityBackend::connect(&url, volume).await.unwrap());
+    let outcome = AssertUnwindSafe(async {
+        let mut lower = MemoryLower::empty();
+        lower.add_file(1, b"base", 2, 10);
+        // The memory fixture's 1 ms lifetime is deliberately not reused with
+        // a wall-clock Redis backend. This contract has a real 60 s lease.
+        let fixture = attach_with_ttl(
+            backend.clone(),
+            Arc::new(lower),
+            keys.clone(),
+            60_000_000_000,
+        )
+        .await;
+        assert_eq!(fixture.ns.lookup(1, b"base", &root()).await.unwrap().ino, 2);
+        let barrier = Arc::new(Barrier::new(33));
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let ns = fixture.ns.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                ns.create(request(1, b"exclusive", EntityKind::File), root())
+                    .await
+            }));
+        }
+        barrier.wait().await;
+        // Join every task before asserting, so cleanup never races unfinished
+        // test writers if one of the outcomes was unexpected.
+        let results = futures::future::join_all(tasks).await;
+        let mut winners = Vec::new();
+        let mut exists = 0;
+        for result in results {
+            match result.unwrap() {
+                Ok(inode) => winners.push(inode),
+                Err(EntityError::Exists) => exists += 1,
+                other => panic!("unexpected Redis O_EXCL outcome: {other:?}"),
+            }
+        }
+        assert_eq!(winners.len(), 1);
+        assert_eq!(exists, 31);
+        let ino = winners[0].ino;
+        assert_eq!(
+            fixture
+                .ns
+                .lookup(1, b"exclusive", &root())
+                .await
+                .unwrap()
+                .ino,
+            ino
+        );
+        fixture
+            .ns
+            .link(ino, 1, b"alias".to_vec(), root())
+            .await
+            .unwrap();
+        fixture
+            .ns
+            .rename(
+                1,
+                b"exclusive".to_vec(),
+                1,
+                b"renamed".to_vec(),
+                false,
+                root(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .ns
+                .lookup(1, b"exclusive", &root())
+                .await
+                .unwrap_err(),
+            EntityError::NotFound
+        );
+        assert_eq!(
+            fixture.ns.lookup(1, b"alias", &root()).await.unwrap().nlink,
+            2
+        );
+        fixture
+            .ns
+            .unlink(1, b"alias".to_vec(), false, root())
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .ns
+                .lookup(1, b"renamed", &root())
+                .await
+                .unwrap()
+                .nlink,
+            1
+        );
+
+        fixture
+            .ns
+            .unlink(1, b"base".to_vec(), false, root())
+            .await
+            .unwrap();
+        let tombstone = backend.read(&[keys.dentry(1, b"base")]).await.unwrap();
+        assert_eq!(
+            codec::decode::<EntityDentry>(tombstone.rows[0].as_deref().unwrap()).unwrap(),
+            EntityDentry::Whiteout
+        );
+        assert_eq!(
+            fixture.ns.lookup(1, b"base", &root()).await.unwrap_err(),
+            EntityError::NotFound
+        );
+        let recreated = fixture
+            .ns
+            .create(request(1, b"base", EntityKind::File), root())
+            .await
+            .unwrap();
+        assert!(recreated.ino > 2);
+        assert_ne!(recreated.ino, ino);
+        assert_eq!((recreated.size, recreated.lower_visible_size), (0, 0));
+
+        fixture.ns.chmod(ino, 0o600, root()).await.unwrap();
+        assert!(matches!(
+            fixture.ns.open(1, b"renamed", 4, &user(1000)).await,
+            Err(EntityError::Permission)
+        ));
+        fixture
+            .ns
+            .set_xattr(ino, ACCESS_XATTR.to_vec(), Some(named_acl(1000)), root())
+            .await
+            .unwrap();
+        let named = fixture
+            .ns
+            .open(1, b"renamed", 6, &user(1000))
+            .await
+            .unwrap();
+        fixture.ns.close(named).unwrap();
+        assert!(matches!(
+            fixture.ns.open(1, b"renamed", 4, &user(2000)).await,
+            Err(EntityError::Permission)
+        ));
+
+        let before = backend
+            .scan_prefix(keys.volume_prefix(), 4096)
+            .await
+            .unwrap();
+        let handle = fixture.ns.open(1, b"renamed", 6, &root()).await.unwrap();
+        fixture.ns.close(handle).unwrap();
+        assert_eq!(
+            backend
+                .scan_prefix(keys.volume_prefix(), 4096)
+                .await
+                .unwrap(),
+            before,
+            "ordinary linked open/close changed Redis rows"
+        );
+        fixture.ns.chmod(1, 0o700, root()).await.unwrap();
+        assert!(matches!(
+            fixture.ns.open(1, b"absent", 4, &user(1000)).await,
+            Err(EntityError::Permission)
+        ));
+    })
+    .catch_unwind()
+    .await;
+
+    // Remove only exact keys under this test's freshly generated volume UUID.
+    // No FLUSHDB, glob deletion, or deletion of another test's namespace.
+    let cleanup = async {
+        let rows = backend.scan_prefix(keys.volume_prefix(), 4096).await?;
+        let Some((key, value)) = rows.first() else {
+            return Ok::<_, EntityError>(());
+        };
+        let authority = TransactionAuthority::from_validated(
+            vec![RowCheck {
+                key: key.clone(),
+                expected: Some(value.clone()),
+            }],
+            None,
+            None,
+        )?;
+        let checks = rows
+            .iter()
+            .map(|(key, value)| RowCheck {
+                key: key.clone(),
+                expected: Some(value.clone()),
+            })
+            .collect();
+        let writes = rows
+            .into_iter()
+            .map(|(key, _)| RowWrite::Delete { key })
+            .collect();
+        match backend
+            .commit(&authority, &EntityPlan { checks, writes })
+            .await?
+        {
+            CommitOutcome::Committed => Ok(()),
+            CommitOutcome::Conflict => Err(EntityError::Conflict),
+        }
+    }
+    .await;
+    cleanup.unwrap();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}

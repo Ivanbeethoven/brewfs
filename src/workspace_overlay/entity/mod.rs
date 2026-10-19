@@ -9,9 +9,13 @@ pub mod keys;
 pub mod lifecycle;
 pub mod memory;
 pub mod model;
+pub mod namespace;
 pub mod ownership;
 pub mod redis;
 pub mod resolver;
+
+#[cfg(test)]
+mod namespace_tests;
 
 pub type Result<T> = std::result::Result<T, EntityError>;
 

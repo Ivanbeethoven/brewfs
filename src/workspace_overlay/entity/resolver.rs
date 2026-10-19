@@ -359,6 +359,130 @@ pub async fn merge_directory<L: ImmutableLower + ?Sized>(
     Ok(merged.into_iter().collect())
 }
 
+/// Deterministic immutable fixture for namespace/ownership contracts. No
+/// production mount can obtain authenticated packed authority from this type.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) struct MemoryLower {
+        pub binding: LowerBinding,
+        pub inodes: BTreeMap<i64, EntityInode>,
+        pub dentries: BTreeMap<(i64, Vec<u8>), EntityDentry>,
+        pub xattrs: BTreeMap<(i64, Vec<u8>), Vec<u8>>,
+        pub chunks: BTreeMap<(i64, u64), ChunkMap>,
+    }
+
+    pub(crate) fn inode_record(ino: i64, kind: EntityKind, size: u64) -> EntityInode {
+        EntityInode {
+            ino,
+            kind,
+            size,
+            mode: if kind == EntityKind::Directory {
+                0o755
+            } else {
+                0o644
+            },
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            nlink: if kind == EntityKind::Directory { 2 } else { 1 },
+            atime_ns: 1,
+            mtime_ns: 1,
+            ctime_ns: 1,
+            symlink_target: (kind == EntityKind::Symlink).then(|| b"target".to_vec()),
+            parent_hint: Some(1),
+            lower_visible_size: if kind == EntityKind::File { size } else { 0 },
+            data_version: 0,
+        }
+    }
+
+    impl MemoryLower {
+        pub(crate) fn empty() -> Self {
+            Self {
+                binding: LowerBinding {
+                    manifest_key: b"test-only/entity-manifest".to_vec(),
+                    manifest_digest: [1; 32],
+                    root_ino: 1,
+                    max_ino: 1,
+                },
+                inodes: BTreeMap::from([(1, inode_record(1, EntityKind::Directory, 0))]),
+                dentries: BTreeMap::new(),
+                xattrs: BTreeMap::new(),
+                chunks: BTreeMap::new(),
+            }
+        }
+
+        pub(crate) fn add_file(&mut self, parent: i64, name: &[u8], ino: i64, size: u64) {
+            assert!(parent > 0 && ino > 0);
+            validate_name(name).unwrap();
+            let mut file = inode_record(ino, EntityKind::File, size);
+            file.parent_hint = Some(parent);
+            self.inodes.insert(ino, file);
+            self.dentries.insert(
+                (parent, name.to_vec()),
+                EntityDentry::Present {
+                    ino,
+                    kind: EntityKind::File,
+                },
+            );
+            self.binding.max_ino = self.binding.max_ino.max(ino);
+        }
+    }
+
+    #[async_trait]
+    impl ImmutableLower for MemoryLower {
+        fn binding(&self) -> &LowerBinding {
+            &self.binding
+        }
+        async fn inode(&self, ino: i64) -> Result<Option<EntityInode>, EntityError> {
+            Ok(self.inodes.get(&ino).cloned())
+        }
+        async fn dentry(
+            &self,
+            parent: i64,
+            name: &[u8],
+        ) -> Result<Option<EntityDentry>, EntityError> {
+            Ok(self.dentries.get(&(parent, name.to_vec())).cloned())
+        }
+        async fn xattr(&self, ino: i64, name: &[u8]) -> Result<Option<Vec<u8>>, EntityError> {
+            Ok(self.xattrs.get(&(ino, name.to_vec())).cloned())
+        }
+        async fn chunk(
+            &self,
+            ino: i64,
+            chunk_index: u64,
+            chunk_size: u64,
+        ) -> Result<Option<ChunkMap>, EntityError> {
+            if let Some(map) = self.chunks.get(&(ino, chunk_index)) {
+                return Ok(Some(map.clone()));
+            }
+            let Some(inode) = self.inodes.get(&ino) else {
+                return Ok(None);
+            };
+            let start = chunk_index
+                .checked_mul(chunk_size)
+                .ok_or(EntityError::Overflow)?;
+            ChunkMap::inherited(chunk_size, &self.binding, ino, start, inode.size).map(Some)
+        }
+        async fn readdir(&self, ino: i64) -> Result<Vec<(Vec<u8>, EntityDentry)>, EntityError> {
+            let rows: Vec<_> = self
+                .dentries
+                .iter()
+                .filter(|((parent, _), _)| *parent == ino)
+                .take(MAX_DIRECTORY_ENTRIES + 1)
+                .map(|((_, name), row)| (name.clone(), row.clone()))
+                .collect();
+            if rows.len() > MAX_DIRECTORY_ENTRIES {
+                return Err(EntityError::Unsupported(
+                    "test lower directory requires paging",
+                ));
+            }
+            Ok(rows)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
