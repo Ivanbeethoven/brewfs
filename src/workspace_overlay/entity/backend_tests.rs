@@ -1,0 +1,462 @@
+use std::{collections::BTreeSet, sync::Arc};
+
+use uuid::Uuid;
+
+use super::*;
+use crate::workspace_overlay::entity::{keys::EntityKeys, redis::RedisEntityBackend};
+
+fn check(key: Vec<u8>, expected: Option<&[u8]>) -> RowCheck {
+    RowCheck {
+        key,
+        expected: expected.map(<[u8]>::to_vec),
+    }
+}
+
+fn put(key: Vec<u8>, value: &[u8]) -> RowWrite {
+    RowWrite::Put {
+        key,
+        value: value.to_vec(),
+    }
+}
+
+async fn initialize<B: EntityBackend>(backend: &B, keys: &EntityKeys) -> TransactionAuthority {
+    let initial =
+        TransactionAuthority::from_validated(vec![check(keys.descriptor(), None)], None, None)
+            .unwrap();
+    let plan = EntityPlan {
+        checks: vec![check(keys.counter("inode"), None)],
+        writes: vec![
+            put(keys.descriptor(), b"active"),
+            put(keys.lease(), b"lease-1"),
+            put(keys.counter("inode"), b"9007199254740991"),
+        ],
+    };
+    assert_eq!(
+        backend.commit(&initial, &plan).await.unwrap(),
+        CommitOutcome::Committed
+    );
+    TransactionAuthority::from_validated(
+        vec![
+            check(keys.descriptor(), Some(b"active")),
+            check(keys.lease(), Some(b"lease-1")),
+        ],
+        None,
+        None,
+    )
+    .unwrap()
+}
+
+async fn conformance<B: EntityBackend + 'static>(backend: Arc<B>, keys: EntityKeys) {
+    let authority = initialize(backend.as_ref(), &keys).await;
+    let protected = keys.inode(100);
+    let foreign = EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()).inode(100);
+    assert!(matches!(
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![
+                        put(protected.clone(), b"must-not-appear"),
+                        put(foreign.clone(), b"foreign")
+                    ],
+                }
+            )
+            .await,
+        Err(EntityError::Invalid(_))
+    ));
+    assert_eq!(backend.read(&[protected]).await.unwrap().rows, vec![None]);
+    assert!(matches!(
+        backend.allocate(&authority, &foreign).await,
+        Err(EntityError::Invalid(_))
+    ));
+    let contested = keys.dentry(1, b"exclusive");
+    let mut tasks = tokio::task::JoinSet::new();
+    for candidate in 1..=32 {
+        let backend = backend.clone();
+        let authority = authority.clone();
+        let key = contested.clone();
+        tasks.spawn(async move {
+            backend
+                .commit(
+                    &authority,
+                    &EntityPlan {
+                        checks: vec![check(key.clone(), None)],
+                        writes: vec![put(key, candidate.to_string().as_bytes())],
+                    },
+                )
+                .await
+                .unwrap()
+        });
+    }
+    let mut committed = 0;
+    while let Some(outcome) = tasks.join_next().await {
+        committed += usize::from(outcome.unwrap() == CommitOutcome::Committed);
+    }
+    assert_eq!(committed, 1, "exclusive create has exactly one winner");
+
+    let mut allocations = tokio::task::JoinSet::new();
+    for _ in 0..32 {
+        let backend = backend.clone();
+        let authority = authority.clone();
+        let counter = keys.counter("inode");
+        allocations.spawn(async move { backend.allocate(&authority, &counter).await.unwrap() });
+    }
+    let mut ids = BTreeSet::new();
+    while let Some(id) = allocations.join_next().await {
+        assert!(ids.insert(id.unwrap()));
+    }
+    assert_eq!(ids, (9007199254740992..9007199254741024).collect());
+
+    let empty_key = keys.inode(2);
+    let other_key = keys.inode(3);
+    assert_eq!(
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![put(empty_key.clone(), b"")]
+                }
+            )
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    assert_eq!(
+        backend
+            .read(&[empty_key.clone(), other_key.clone()])
+            .await
+            .unwrap()
+            .rows,
+        vec![Some(vec![]), None]
+    );
+    assert_eq!(
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![check(empty_key.clone(), None)],
+                    writes: vec![put(other_key.clone(), b"must-not-appear")],
+                }
+            )
+            .await
+            .unwrap(),
+        CommitOutcome::Conflict
+    );
+    assert_eq!(
+        backend
+            .read(std::slice::from_ref(&other_key))
+            .await
+            .unwrap()
+            .rows,
+        vec![None]
+    );
+
+    let prefix = keys.dentry_prefix(2);
+    for name in [b"a", b"b", b"c"] {
+        assert_eq!(
+            backend
+                .commit(
+                    &authority,
+                    &EntityPlan {
+                        checks: vec![],
+                        writes: vec![put(keys.dentry(2, name), name)]
+                    }
+                )
+                .await
+                .unwrap(),
+            CommitOutcome::Committed
+        );
+    }
+    assert!(matches!(
+        backend.scan_prefix(&prefix, 2).await,
+        Err(EntityError::Invalid(_))
+    ));
+    let rows = backend.scan_prefix(&prefix, 3).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert!(
+        rows.iter()
+            .all(|(key, value)| key.starts_with(&prefix) && value.len() == 1)
+    );
+
+    let snapshot = backend.read(&[]).await.unwrap();
+    let expired =
+        TransactionAuthority::from_validated(authority.checks.clone(), None, Some(snapshot.now_ns))
+            .unwrap();
+    let future =
+        TransactionAuthority::from_validated(authority.checks.clone(), Some(i64::MAX), None)
+            .unwrap();
+    for fenced in [expired, future] {
+        assert_eq!(
+            backend
+                .commit(
+                    &fenced,
+                    &EntityPlan {
+                        checks: vec![],
+                        writes: vec![put(other_key.clone(), b"must-not-appear")]
+                    }
+                )
+                .await,
+            Err(EntityError::Fenced)
+        );
+        assert_eq!(
+            backend.allocate(&fenced, &keys.counter("inode")).await,
+            Err(EntityError::Fenced)
+        );
+    }
+    assert_eq!(
+        backend
+            .read(std::slice::from_ref(&other_key))
+            .await
+            .unwrap()
+            .rows,
+        vec![None]
+    );
+
+    assert_eq!(
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![put(keys.counter("inode"), b"9223372036854775807")]
+                }
+            )
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    assert_eq!(
+        backend.allocate(&authority, &keys.counter("inode")).await,
+        Err(EntityError::Exhausted)
+    );
+    assert_eq!(
+        backend.read(&[keys.counter("inode")]).await.unwrap().rows,
+        vec![Some(b"9223372036854775807".to_vec())]
+    );
+    for invalid in [b"01".as_slice(), b"-1", b"9223372036854775808"] {
+        assert_eq!(
+            backend
+                .commit(
+                    &authority,
+                    &EntityPlan {
+                        checks: vec![],
+                        writes: vec![put(keys.counter("inode"), invalid)]
+                    }
+                )
+                .await
+                .unwrap(),
+            CommitOutcome::Committed
+        );
+        assert!(matches!(
+            backend.allocate(&authority, &keys.counter("inode")).await,
+            Err(EntityError::Corrupt(_))
+        ));
+    }
+
+    assert_eq!(
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![put(keys.lease(), b"lease-2")]
+                }
+            )
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    assert_eq!(
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![put(other_key.clone(), b"stale-writer")]
+                }
+            )
+            .await,
+        Ok(CommitOutcome::Conflict)
+    );
+    assert_eq!(
+        backend.allocate(&authority, &keys.counter("inode")).await,
+        Err(EntityError::Conflict)
+    );
+    // A heartbeat changes exact lease bytes without changing writer identity.
+    // Only a fresh lifecycle read may create replacement authority; a caller
+    // must never substitute a later deadline into the stale authority itself.
+    let renewed = TransactionAuthority::from_validated(
+        vec![
+            check(keys.descriptor(), Some(b"active")),
+            check(keys.lease(), Some(b"lease-2")),
+        ],
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        backend
+            .commit(&renewed, &EntityPlan::default())
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    assert_eq!(
+        backend
+            .read(&[other_key, keys.descriptor()])
+            .await
+            .unwrap()
+            .rows,
+        vec![None, Some(b"active".to_vec())]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_backend_conformance() {
+    conformance(
+        Arc::new(MemoryEntityBackend::new(100)),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn memory_authority_uses_half_open_backend_time_and_rejects_plan_before_writes() {
+    let backend = MemoryEntityBackend::new(10);
+    let keys = EntityKeys::new(Uuid::new_v4(), Uuid::new_v4());
+    let authority = initialize(&backend, &keys).await;
+    let bounded =
+        TransactionAuthority::from_validated(authority.checks.clone(), Some(20), Some(30)).unwrap();
+    assert_eq!(
+        backend.commit(&bounded, &EntityPlan::default()).await,
+        Err(EntityError::Fenced)
+    );
+    backend.set_time(20).unwrap();
+    assert_eq!(
+        backend
+            .commit(&bounded, &EntityPlan::default())
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    backend.set_time(29).unwrap();
+    assert_eq!(
+        backend
+            .commit(&bounded, &EntityPlan::default())
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    backend.set_time(30).unwrap();
+    assert_eq!(
+        backend.commit(&bounded, &EntityPlan::default()).await,
+        Err(EntityError::Fenced)
+    );
+    let row = keys.inode(2);
+    let duplicate = EntityPlan {
+        checks: vec![],
+        writes: vec![put(row.clone(), b"first"), put(row.clone(), b"last")],
+    };
+    assert!(matches!(
+        backend.commit(&authority, &duplicate).await,
+        Err(EntityError::Invalid(_))
+    ));
+    assert_eq!(backend.read(&[row]).await.unwrap().rows, vec![None]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires BREWFS_TEST_REDIS_URL pointing to an isolated local Redis"]
+async fn redis_entity_backend_conformance() {
+    let url = std::env::var("BREWFS_TEST_REDIS_URL").expect("BREWFS_TEST_REDIS_URL");
+    let volume = Uuid::new_v4();
+    let backend = Arc::new(RedisEntityBackend::connect(&url, volume).await.unwrap());
+    conformance(backend, EntityKeys::new(volume, Uuid::new_v4())).await;
+}
+
+#[tokio::test]
+#[ignore = "requires BREWFS_TEST_REDIS_URL pointing to an isolated local Redis"]
+async fn redis_entity_rejects_wrong_type_and_oversize_before_any_write_or_decode() {
+    let url = std::env::var("BREWFS_TEST_REDIS_URL").expect("BREWFS_TEST_REDIS_URL");
+    let volume = Uuid::new_v4();
+    let keys = EntityKeys::new(volume, Uuid::new_v4());
+    let backend = RedisEntityBackend::connect(&url, volume).await.unwrap();
+    let authority = initialize(&backend, &keys).await;
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let first = keys.inode(10);
+    let wrong_type = keys.inode(11);
+    redis::cmd("LPUSH")
+        .arg(&wrong_type)
+        .arg("bad")
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+    assert!(matches!(
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![
+                        put(first.clone(), b"must-not-appear"),
+                        put(wrong_type.clone(), b"overwrite")
+                    ]
+                }
+            )
+            .await,
+        Err(EntityError::Corrupt(_))
+    ));
+    assert_eq!(
+        backend
+            .read(std::slice::from_ref(&first))
+            .await
+            .unwrap()
+            .rows,
+        vec![None]
+    );
+    assert!(matches!(
+        backend.read(&[wrong_type]).await,
+        Err(EntityError::Corrupt(_))
+    ));
+
+    let oversized = keys.inode(12);
+    redis::cmd("SET")
+        .arg(&oversized)
+        .arg(vec![b'x'; MAX_ROW_BYTES + 1])
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+    assert!(matches!(
+        backend.read(std::slice::from_ref(&oversized)).await,
+        Err(EntityError::Invalid(_))
+    ));
+    assert!(matches!(
+        backend.scan_prefix(&oversized, 1).await,
+        Err(EntityError::Invalid(_))
+    ));
+    assert!(matches!(
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![
+                        put(first.clone(), b"must-not-appear"),
+                        RowWrite::Delete { key: oversized }
+                    ]
+                }
+            )
+            .await,
+        Err(EntityError::Invalid(_))
+    ));
+    assert_eq!(backend.read(&[first]).await.unwrap().rows, vec![None]);
+    assert!(matches!(
+        backend
+            .read(&[EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()).inode(1)])
+            .await,
+        Err(EntityError::Invalid(_))
+    ));
+}

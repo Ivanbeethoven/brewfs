@@ -3,9 +3,14 @@
 //! Stage 2 exposes a reference namespace and Redis transaction substrate. Production
 //! mounts remain closed until packed ownership and VFS durability are qualified.
 
+pub mod backend;
 pub mod codec;
 pub mod keys;
+pub mod lifecycle;
+pub mod memory;
 pub mod model;
+pub mod ownership;
+pub mod redis;
 pub mod resolver;
 
 pub type Result<T> = std::result::Result<T, EntityError>;
