@@ -271,7 +271,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
 
     /// Every view change. Clears namespace results too; commits use
     /// `invalidate_rows_written`.
-    pub(super) fn invalidate_upper_rows(&self) {
+    pub(crate) fn invalidate_upper_rows(&self) {
         if let Some(cache) = &self.upper_rows {
             cache.invalidate_all();
         }
@@ -878,6 +878,46 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         Err(MetaError::Io(std::io::Error::from_raw_os_error(
             libc::EBUSY,
         )))
+    }
+
+    /// A create just committed the only dentry naming the fresh inode `ino`
+    /// (it was allocated by this create, so no other alias exists), so its
+    /// complete path set is exactly `parent`'s cached paths joined with
+    /// `name`. Seed it so the first permission walk of the new file needs no
+    /// reverse-index scan. Only when `parent`'s complete paths are cached
+    /// under the lease-bound namespace cache; otherwise nothing is seeded.
+    fn seed_created_paths(&self, parent: i64, name: &str, ino: i64) {
+        let Some(cache) = self.namespace_row_cache() else {
+            return;
+        };
+        let ticket = cache.ticket();
+        let parent_paths = if parent == self.root_ino() {
+            Arc::new(vec![b"/".to_vec()])
+        } else {
+            match cache.get(&row_cache::RowKey::Paths(parent)) {
+                Some(row_cache::RowValue::Paths(paths)) => paths,
+                _ => return,
+            }
+        };
+        if parent_paths.is_empty() {
+            return;
+        }
+        let paths = parent_paths
+            .iter()
+            .map(|path| {
+                let mut child = path.clone();
+                if child.last() != Some(&b'/') {
+                    child.push(b'/');
+                }
+                child.extend_from_slice(name.as_bytes());
+                child
+            })
+            .collect::<Vec<_>>();
+        cache.insert(
+            ticket,
+            row_cache::RowKey::Paths(ino),
+            row_cache::RowValue::Paths(Arc::new(paths)),
+        );
     }
 
     /// One inode's permission snapshot. While the exclusive lease is proven
@@ -1725,6 +1765,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                 )
                 .await
                 .map_err(workspace_to_meta)?;
+                self.seed_created_paths(parent, &name, ino);
                 Ok((ino, file_attr(&inode)?))
             }
             .await;
