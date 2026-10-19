@@ -1155,6 +1155,37 @@ async fn group_commit_same_file_keeps_order_and_size() {
     f.reader.shutdown().await.unwrap();
 }
 
+/// A create seeds the fresh inode's paths from its parent's cached paths;
+/// they must equal what an uncached reverse walk computes, at the root and
+/// in a subdirectory.
+#[tokio::test]
+async fn created_paths_are_seeded_exactly() {
+    use crate::meta::layer::MetaLayer;
+    let validity = Arc::new(crate::workspace_overlay::lifecycle::LeaseValidity::new(
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(30),
+    ));
+    let seeded = fixture_with_lease(false, packed().await, Some(validity)).await;
+    let dir = seeded.meta.mkdir(1, "seed-dir".into()).await.unwrap();
+    // Cache the directory's complete paths, then create under it and root.
+    let dir_paths = seeded.meta.get_paths_bytes(dir).await.unwrap();
+    let nested = seeded.meta.create_file(dir, "nested".into()).await.unwrap();
+    let top = seeded.meta.create_file(1, "top".into()).await.unwrap();
+    let nested_seeded = seeded.meta.get_paths_bytes(nested).await.unwrap();
+    let top_seeded = seeded.meta.get_paths_bytes(top).await.unwrap();
+    assert_eq!(dir_paths, vec![b"/seed-dir".to_vec()]);
+    assert_eq!(nested_seeded, vec![b"/seed-dir/nested".to_vec()]);
+    assert_eq!(top_seeded, vec![b"/top".to_vec()]);
+    // Drop every cache: a full reverse walk over the store must agree.
+    seeded.meta.invalidate_upper_rows();
+    assert_eq!(
+        seeded.meta.get_paths_bytes(nested).await.unwrap(),
+        nested_seeded
+    );
+    assert_eq!(seeded.meta.get_paths_bytes(top).await.unwrap(), top_seeded);
+    seeded.reader.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn packed_workspace_filesystem_57_byte_write_and_readback_complete_within_deadline() {
     use asyncfuse::raw::{Filesystem, Request};
