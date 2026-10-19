@@ -1,5 +1,14 @@
 # Overlay-on-packed delivery handoff (updated 2026-10-19)
 
+> **Historical implementation checkpoint.** This document describes shipped
+> r31, not the proposed replacement. On 2026-10-19 the owner directed an
+> ordinary per-entity upper namespace design. The maintained
+> [architecture](../../architecture/workspace-overlay.md) and
+> [implementation spec](../specs/2026-08-23-brewfs-workspace-overlay-implementation-spec.md)
+> now describe that unimplemented target and its staged migration. R32's
+> unvalidated performance drafts were archived and removed, with no candidate
+> benchmark or merge; see the [investigation](2026-10-19-overlay-write-r32.md).
+
 Read this first when taking over the delivered overlay-on-packed work. It
 replaces the overlay part of
 [2026-10-12-packed-v3-final-handoff.md](2026-10-12-packed-v3-final-handoff.md).
@@ -46,11 +55,11 @@ distinguished below.
 - There is no seal transaction, no compaction/flatten and no strict lower mode.
 - New lowers come only from packed publication, run under the workspace's
   single active writable lease.
-- Maintained references:
-  - [architecture doc](../../architecture/workspace-overlay.md): has the
-    head-writer and lease audit table;
-  - [overlay implementation spec](../specs/2026-08-23-brewfs-workspace-overlay-implementation-spec.md):
-    2026-10-19 banner, §6.3, §11.3, §13.1.1, §14–§16, §18.4, §24.6;
+- Delivered references at commit `6b54270` (use `git show 6b54270:<path>`):
+  - `doc/architecture/workspace-overlay.md`: r31 head-writer/lease audit;
+  - `doc/superpowers/specs/2026-08-23-brewfs-workspace-overlay-implementation-spec.md`:
+    r31 fields, group commit, GC and cache contract. Current versions of these
+    two paths describe the proposed replacement, not this checkpoint;
   - [operator spec](../specs/2026-09-03-brewfs-workspace-operator-lifecycle-spec.md).
 - CLI: `init-volume`, `init-packed-volume`, `create --from <rev>`,
   `fork <rev>`, `list`, `inspect`, `diff`, `discard`. The commands
