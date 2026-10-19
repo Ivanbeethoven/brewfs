@@ -1107,6 +1107,11 @@ impl Drop for MultipartCleanupGuard {
 
 #[async_trait]
 impl ObjectBackend for S3Backend {
+    #[cfg(feature = "rustfs-ec-block-size-hint")]
+    fn prefers_full_object_reads(&self) -> bool {
+        self.config.rustfs_ec_block_size_hint.is_some()
+    }
+
     fn forbids_mutation_replay(&self) -> bool {
         self.mutation_replay_forbidden
     }
