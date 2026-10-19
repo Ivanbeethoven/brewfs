@@ -1,9 +1,12 @@
 # BrewFS Workspace Overlay implementation specification
 
-Updated 2026-10-19. **Status: proposed replacement design; not implemented.**
+Updated 2026-10-20. **Status: stage 2 reference implementation on an experiment
+branch; production mount admission remains disabled.**
 This specification replaces the previous mutable-layer log design as the target
-for future implementation. It does not describe a completed schema migration or
-claim that the current binary already has the behavior below.
+for staged implementation. The
+[stage 2 checkpoint](../plans/2026-10-19-overlay-entity-stage2.md) distinguishes
+implemented reference APIs from the remaining production behavior below.
+No completed schema migration or new mounted data path is claimed.
 
 The shipped baseline remains r31, PR #41 (`0d4e36c`), with its delivery documents
 in `6b54270` on `codex/packed-metadata-aliyun-20260930`. That implementation uses
@@ -25,7 +28,7 @@ Baseline diagnostic artifacts are retained in the
 [WRITE investigation](../plans/2026-10-19-overlay-write-r32.md).
 
 The maintained [architecture](../../architecture/workspace-overlay.md) describes
-the same proposed model. The
+the same target model. The
 [packed-v3 specification](2026-09-27-brewfs-packed-metadata-v3-readonly-smallfiles.md)
 continues to define immutable packed objects, checksums, authenticated manifests
 and bounded reads. Removing a mutable overlay digest does not weaken those
@@ -50,10 +53,9 @@ strict-lower mode. Fork accepts an exact existing immutable packed lower;
 creating a new immutable lower remains an explicit packed publication operation.
 Ordinary fsync/close does not pack a workspace.
 
-This is an architectural direction and staged implementation contract. It does
-not authorize a large refactor in the documentation delivery, claim an achieved
-throughput gain, or prescribe a new on-disk format identifier before its separate
-schema review.
+This is a staged implementation contract. The experiment defines
+`workspace-entity-v1` and a bounded reference schema; it does not establish a
+production wire-format promise, mounted-write admission or a throughput gain.
 
 ## 2. Required semantics and removable machinery
 
@@ -247,7 +249,7 @@ be tested rather than inferred from the word transaction.
 
 | Operation | Required atomic result |
 | --- | --- |
-| Create/mkdir/symlink/mknod | Check parent/type/permissions/ACL inheritance and effective name absence; allocate inode, install inode/dentry and update parent together |
+| Create/mkdir/symlink/mknod | Reserve a unique inode ID; atomically validate parent/type/permissions/ACL inheritance and effective name absence, install inode/dentry and update parent |
 | O_EXCL create | Exactly one winner for the effective name; visibility is committed before CREATE succeeds |
 | Link | New dentry and effective nlink change together; aliases retain one inode identity |
 | Unlink | Whiteout/removal as required by lower presence, nlink/parent update and orphan status together |
@@ -256,14 +258,20 @@ be tested rather than inferred from the word transaction.
 | Chmod/chown/xattr/ACL | Current inode/ACL relationship and privilege rules remain consistent in one transaction |
 | Write/punch-hole | Current chunk map(s), inode size/times and slice-owner deltas publish together for the admitted write unit |
 
+ID reservation may use a separate authority-checked INCR before the namespace
+transaction. Failed attempts may leave allocator gaps; only the final atomic
+transaction may expose the inode, name and parent updates. All mutable validation
+inputs, including effective absence for O_EXCL, participate in that transaction.
+
 Sticky-bit, setgid/default ACL, symlink, raw-name, special-inode/rdev and existing
 lock semantics remain required. Rename cycle detection must use a stable view
 of the affected ancestry; simplifying storage does not remove that POSIX check.
 File locks are scoped to the workspace and inode, so siblings do not interfere.
 
-The target's initial atime policy is explicitly **noatime**. Regular open and
-linked close perform lease/permission checks and local open-count bookkeeping;
-they do not commit metadata or update atime. `O_TRUNC` is still a data/metadata
+The target's initial atime policy is explicitly **noatime**. Regular open checks
+lease/permissions with zero metadata writes and retains a local handle. Linked
+close releases the handle locally, including after lease expiry; neither
+operation updates atime. `O_TRUNC` is still a data/metadata
 mutation. Last close of an unlinked inode and orphan recovery retain durable
 cleanup behavior. This policy is confined to the proposed workspace layout;
 it does not alter flat volumes or claim uniform native relatime behavior.
@@ -504,14 +512,15 @@ the write path.
 Expose operations in terms of current entities and ownership, not
 `VersionedMutation` templates tied to an expected layer pair. The implementation
 should have bounded point reads and operation-specific atomic mutations for
-namespace, inode/ACL, chunk replacement, ownership and lifecycle state. Exact
-Rust signatures belong to the implementation review; this proposal does not
-claim those methods already exist.
+namespace, inode/ACL, chunk replacement, ownership and lifecycle state.
+The stage 2 `EntityBackend` provides bounded row transactions for the reference
+namespace. Production operation/VFS integration remains a separate stage.
 
 Redis is the primary implementation target, using bounded binary-safe scripts
 in one volume hash slot and backend `TIME` for lease checks. TiKV must implement
-the same transaction/authority contract with its transaction clock; SQLite is
-the local reference/fault-injection backend. Unsupported capabilities must fail
+the same transaction/authority contract with its transaction clock. The stage 2
+local reference/fault-injection backend is `MemoryEntityBackend`; SQLite is
+unimplemented and unqualified. Unsupported capabilities must fail
 explicitly rather than run an unsafe partial protocol. Live Redis validation
 does not imply TiKV or SQLite migration support is complete.
 
@@ -528,7 +537,11 @@ not justification for reinstating a workspace-wide CAS on every write.
 
 ## 15. Staged migration and removal
 
-Each stage has its own reviewable result. No stage is implemented by this doc.
+Each stage has its own reviewable result. Stage 2 is now an isolated experiment
+on `codex/overlay-entity-namespace-20261019` from `b6f297e`; see the
+[implementation checkpoint](../plans/2026-10-19-overlay-entity-stage2.md).
+The reference namespace and Redis transaction substrate do not admit production
+mounts. The production stage 3 path and stages 4–7 remain unimplemented.
 
 1. **Preserve the baseline and finish design review.** Keep r31 code/format and
    accepted artifacts. Drop unvalidated r32 code; preserve diagnostics and
@@ -641,6 +654,8 @@ total-order-replay contract and removes live mutable-layer digest identity.
 Upper-only diff candidates remain available. These are explicit tradeoffs;
 they do not assert that the shipped layout was a complete replay log.
 
-This rewrite ships the design and migration contract only. Implementation,
-schema migration, correctness acceptance and performance gains remain future
-work with separate evidence.
+The stage 2 experiment adds a separately dispatched `workspace-entity-v1`
+reference namespace. Existing-format runtime behavior and integration history
+remain unchanged. Production packed ownership, VFS data publication, truncate
+recovery, fsync and conversion remain future work with separate evidence;
+neither the reference model nor its gates are performance acceptance.

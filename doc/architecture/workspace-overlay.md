@@ -1,6 +1,6 @@
 # Workspace Overlay Architecture
 
-Status: **proposed replacement design, not implemented** (2026-10-19).
+Status: **stage 2 experiment; production mount remains disabled** (2026-10-20).
 This document and the [implementation spec](../superpowers/specs/2026-08-23-brewfs-workspace-overlay-implementation-spec.md)
 now specify an ordinary per-entity writable namespace over one immutable packed
 lower. They supersede the previous mutation/version architecture as the target,
@@ -11,7 +11,12 @@ documentation on `codex/packed-metadata-aliyun-20260930`.
 Its actual design, validation gaps and reproduction commands remain in the
 [r31 delivery handoff](../superpowers/plans/2026-10-17-overlay-no-seal-handoff.md).
 The unvalidated r32 candidate has been dropped in favor of this direction.
-No replacement implementation, migration or performance result is delivered here.
+The isolated `workspace-entity-v1` reference implementation lives on
+`codex/overlay-entity-namespace-20261019`, branched from `b6f297e`.
+The integration branch remains unchanged. See the
+[stage 2 checkpoint](../superpowers/plans/2026-10-19-overlay-entity-stage2.md)
+for implemented APIs, exact gates and remaining admission requirements.
+There is no conversion, production mount or replacement performance result.
 
 ## Contract and boundaries
 
@@ -37,7 +42,8 @@ data integrity checks.
 Default flat volumes retain their existing path. A new versioned namespace
 format and explicit dispatch separate this target from existing workspace-v1
 records. Old binaries must reject the new format. The format identifier and
-new APIs are not shipped yet.
+new APIs are experimental. Selecting `workspace-entity-v1` explicitly reaches a
+fail-closed mount dispatch; it never falls back to the old workspace path.
 
 ## Audit of the current design
 
@@ -100,9 +106,13 @@ qualification; it is not assumed from Redis results.
 | Allocators | Plain INCR/INCRBY uniqueness counters, unrelated to mutation order |
 | Recovery intent | In-progress truncate, publication or discard with an idempotent cleanup cursor |
 
-Names are illustrative, not a wire-format promise. There is no per-commit
-workspace counter. A shared descriptor/lease may be read and checked by every
-operation without being rewritten by unrelated file mutations.
+The stage 2 schema uses `{brewfs-entity:<volume UUID>}/workspace/<namespace UUID>/`
+for inode, dentry, xattr, chunk, orphan and lifecycle rows. Raw names are
+hex-encoded injectively; slice records and the slice allocator use the shared
+volume prefix. Rows use bounded typed JSON; allocator values are canonical
+decimal integers. The experiment is not yet a production wire-format promise.
+There is no per-commit workspace counter. A shared descriptor/lease may be read
+and checked by every operation without being rewritten by unrelated file mutations.
 
 Inode allocation starts above imported lower IDs. Object/slice IDs are unique
 across sharing namespaces, never reused after deletion, restore or failover.
@@ -133,10 +143,12 @@ atomic-write guarantee is implied.
 
 ### Namespace transactions and open/close
 
-Create atomically checks parent permissions and effective name absence, allocates
-an inode, and writes inode/dentry/parent changes before returning. The immutable
-lower lookup may be prepared outside Lua, but its binding must be unchanged and
-the final transaction must recheck upper absence and mutable policy inputs.
+Create reserves a unique inode ID and atomically checks parent permissions and
+effective name absence while installing inode/dentry/parent changes before
+returning. The reference implementation reserves the ID with a separate INCR;
+failed attempts may consume IDs but cannot expose partial namespace changes.
+The immutable lower lookup may be prepared outside Lua, but its binding must be
+unchanged and the final transaction must recheck upper absence and mutable policy inputs.
 Never merge create visibility with the first data fsync.
 
 Rename, link and unlink transact over the affected parents, names, inodes and
@@ -149,10 +161,11 @@ Checks include mutable ancestor search-permission inputs used by the operation.
 Lua errors do not roll back earlier writes: types, bounds, overflow, refcount
 underflow and key collisions must be validated before the first entity write.
 
-Ordinary open and linked close maintain local handle counts and check current
-permissions/lease; they do not commit metadata. O_TRUNC still performs a data
-mutation. Unlink of an open inode records a recoverable orphan, and final close
-or post-crash recovery completes retirement. The initial target uses explicit
+Ordinary open checks current permissions/lease with zero metadata writes and
+retains a local handle. Linked close releases that handle locally, including
+after lease expiry. O_TRUNC still performs a data mutation. Unlink of an open
+inode records a recoverable orphan; closing its final handle allows proven
+quiescent recovery to complete retirement. The initial target uses explicit
 noatime semantics; adding a different timestamp policy is a separate decision.
 
 ### Truncate, object lifetime and fsync
@@ -239,6 +252,11 @@ a canonical writable-layer digest is no longer an identity contract.
    atomic namespace operations behind explicit new-format dispatch. Establish
    lower pins, pending uploads, object ownership, deletion reservations and
    orphan recovery before admitting writes. Keep old format operational.
+   The current experiment implements a bounded reference namespace and Redis
+   substrate. Its lower registry is not yet connected to legacy packed-object
+   collectors, and its lower interface is not a production packed adapter.
+   Consequently production mount/write admission stays closed. Reference
+   operations require their namespace lower owner and active writer authority.
 3. **Correctness before conversion.** Validate O_EXCL, rename/hardlinks,
    permissions, same-inode overlap, shrink/extend, fsync, cancellation, lease
    expiry and GC/reference races with crash injection. Qualify every supported
