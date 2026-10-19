@@ -200,6 +200,27 @@ per-mount sequence blocks and inode-row CAS for data commits; then ungate
 `write()`; then the oracle, the full gate, the probe, the 32-worker run and
 the order-swapped comparison with a 1/16/32-worker table.
 
+### Round 30 (PR #39, `503ab08`): group commit + per-layer extent generation
+
+CPU sampling at 16 workers showed that overlay write is not CPU-bound or
+Redis-bound: Redis was at 0.33 cores and the host was 68% busy. The cost is
+the mount-wide gate serializing every commit with its round trip inside.
+Group commit (one leader drains up to 64 queued writes into one versioned
+mutation under the gate) keeps today's conflict detection unchanged.
+
+Write scaling (overlay files/s, overlay/native), order-swapped, 0/144 errors:
+
+| Workers | #34 | #39 | #39 overlay/native |
+| --- | ---: | ---: | ---: |
+| 1 (2 runs) | 43.7 | 43.9 | 0.86 |
+| 16 | 209 ± 8 | 213 ± 6 | 0.64 |
+| 32 | 210 ± 8 | 234 ± 6 (+11.1%) | 0.56 |
+
+Readback/mixed unchanged (16w 0.82/0.90, 32w 0.83/0.84). EVALSHA per file
+3.26 → 2.72. Write still plateaus near 210–235 files/s, so the cap is now
+partly elsewhere: create commits (still one per file, gated) and the head
+next_sequence. The next candidate is group-committing creates the same way.
+
 Rejected designs:
 - merging the create and first-fsync commits (breaks O_EXCL visibility);
 - full metadata copy-up of the lower (no write-op gain for new files; breaks

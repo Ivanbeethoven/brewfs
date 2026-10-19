@@ -267,7 +267,7 @@ alternated, 6 runs pooled, after PR #30 (`tools/perf/run_overlay_vs_native.sh`):
 | --- | ---: |
 | stat | 0.75 |
 | full read | 0.57 |
-| write | 0.62 |
+| write | 0.64 (16w), 0.56 (32w) |
 | readback | 0.83 |
 | mixed | 0.90 |
 
