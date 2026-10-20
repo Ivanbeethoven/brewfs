@@ -6,6 +6,13 @@ and ultimately based on `b6f297e`. Integration branch
 Production admission for `workspace-entity-v1` remains disabled. No benchmark,
 performance comparison, conversion or merge is part of this continuation.
 
+Historical checkpoint: the later
+[structural continuation](2026-10-20-overlay-entity-batching.md#structural-refactor-checkpoint)
+removes the SDK VFS bridge described below and uses direct
+`EntityFuse -> EntityNamespace / EntityData` calls. This report preserves its
+original source and test evidence, including the removed bridge's tests; those
+results do not validate the subsequent refactor.
+
 The implementation is split into these commits; the gates below validate their
 combined source, with checksums tying the pre-commit artifacts to the final tree:
 
