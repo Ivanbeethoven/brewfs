@@ -19,6 +19,7 @@ BrewFS 分块仍为 4 MiB，chunk 为 64 MiB。auto 对最终编码对象 ≤1 M
 | 生成产物（30%读 / 70%写） | 22.80 秒 | 21.99 秒 | +3.7% | [+1.9%, +5.9%] |
 
 总时间包含完整文件读写、读后内容校验及最终上传排空；每组完成同样的工作量。
+有效吞吐按逻辑字节计算并包含缓存命中，不是实际网络或 S3 传输带宽。
 数字为六轮几何平均，区间以配对轮次计算。所有轮次、尾段和不利值都保留。
 
 ![三个场景的任务与排空耗时](figures/agent-mixed-task-time.png)
@@ -107,7 +108,8 @@ BrewFS 分块仍为 4 MiB，chunk 为 64 MiB。auto 对最终编码对象 ≤1 M
 - 原始归档 `brewfs-agent-mixed/raw-records.tar.gz` 共 1,816 个已核验文件；
   SHA-256 `ba27d32e7634ba83503084259f350a136acb313406593063ab0791397131ec3c`。归档独立交付，包含 frozen tools、
   输入轨迹、各轮原始操作、诊断和失败记录；产品仓库只保存汇总及指纹。
-- 凭据、kubeconfig 和二进制不在归档内。最终导出后删除本轮专用资源，
-  删除核验见同一交付目录的 `cleanup-complete.json`，共享网络保留。
+- 凭据、kubeconfig 和二进制不在归档内。导出后回收本轮专用资源，
+  最新核验见同一交付目录的 `cleanup-current.json`；全部释放后另写
+  `cleanup-complete.json`。共享网络保留，不把云平台的依赖释放延迟记为删除成功。
 
 ![编辑验证六轮完整时间线](figures/agent-mixed-timelines.png)
