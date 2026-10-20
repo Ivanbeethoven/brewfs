@@ -11,6 +11,8 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::config::*;
 use crate::console;
 #[cfg(feature = "workspace-overlay")]
+mod entity_mount;
+#[cfg(feature = "workspace-overlay")]
 mod mount_store;
 #[cfg(feature = "workspace-overlay")]
 mod native_reverse_maintenance;
@@ -374,6 +376,10 @@ fn init_tracing() {
 }
 
 async fn mount_cmd(mut args: MountConfig) -> anyhow::Result<()> {
+    #[cfg(feature = "workspace-overlay")]
+    if args.volume_format == VolumeFormat::WorkspaceEntityV1 && args.experimental_entity_mount {
+        return entity_mount::mount(args).await;
+    }
     validate_volume_format_support(args.volume_format)?;
     if !args.mount_point.exists() {
         std::fs::create_dir_all(&args.mount_point)?;
@@ -856,7 +862,7 @@ fn validate_volume_format_support(format: VolumeFormat) -> anyhow::Result<()> {
 fn validate_entity_mount_support() -> anyhow::Result<()> {
     #[cfg(feature = "workspace-overlay")]
     anyhow::bail!(
-        "workspace-entity-v1 is experimental: stage 2 reference namespace only; packed ownership and VFS mount admission are not qualified"
+        "workspace-entity-v1 requires --experimental-entity-mount for a fresh namespace; production admission and process-crash takeover remain disabled"
     );
     #[cfg(not(feature = "workspace-overlay"))]
     anyhow::bail!("feature not compiled: workspace-overlay");
@@ -3067,10 +3073,7 @@ mod volume_format_tests {
             .unwrap_err()
             .to_string();
         #[cfg(feature = "workspace-overlay")]
-        assert!(
-            error.contains("stage 2 reference namespace only"),
-            "{error}"
-        );
+        assert!(error.contains("--experimental-entity-mount"), "{error}");
         #[cfg(not(feature = "workspace-overlay"))]
         assert!(error.contains("feature not compiled"), "{error}");
     }

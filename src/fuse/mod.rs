@@ -15,6 +15,8 @@
 pub(crate) mod adapter;
 #[cfg(all(test, feature = "workspace-overlay", target_os = "linux"))]
 mod cancel_tests;
+#[cfg(feature = "workspace-overlay")]
+pub mod entity;
 pub mod mount;
 use crate::chunk::store::BlockStore;
 use crate::control::protocol::{CONTROL_ACL_XATTR_NAME, ControlAclEntry};

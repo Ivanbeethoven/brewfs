@@ -6,6 +6,7 @@
 pub mod backend;
 pub mod codec;
 pub mod data;
+pub(crate) mod experiment;
 pub mod keys;
 pub mod lifecycle;
 pub mod memory;
