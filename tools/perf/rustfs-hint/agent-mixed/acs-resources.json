@@ -1,0 +1,399 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "storage.k8s.io/v1",
+      "kind": "StorageClass",
+      "metadata": {
+        "name": "${NAMESPACE}-essd",
+        "labels": {
+          "app.kubernetes.io/part-of": "${NAMESPACE}"
+        }
+      },
+      "provisioner": "diskplugin.csi.alibabacloud.com",
+      "parameters": {
+        "type": "cloud_essd",
+        "performanceLevel": "PL1"
+      },
+      "reclaimPolicy": "Delete",
+      "volumeBindingMode": "WaitForFirstConsumer",
+      "allowVolumeExpansion": true
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolumeClaim",
+      "metadata": {
+        "name": "agent-disk0",
+        "namespace": "${NAMESPACE}",
+        "labels": {
+          "app.kubernetes.io/part-of": "${NAMESPACE}"
+        }
+      },
+      "spec": {
+        "accessModes": [
+          "ReadWriteOnce"
+        ],
+        "storageClassName": "${NAMESPACE}-essd",
+        "resources": {
+          "requests": {
+            "storage": "40Gi"
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolumeClaim",
+      "metadata": {
+        "name": "agent-disk1",
+        "namespace": "${NAMESPACE}",
+        "labels": {
+          "app.kubernetes.io/part-of": "${NAMESPACE}"
+        }
+      },
+      "spec": {
+        "accessModes": [
+          "ReadWriteOnce"
+        ],
+        "storageClassName": "${NAMESPACE}-essd",
+        "resources": {
+          "requests": {
+            "storage": "40Gi"
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolumeClaim",
+      "metadata": {
+        "name": "agent-disk2",
+        "namespace": "${NAMESPACE}",
+        "labels": {
+          "app.kubernetes.io/part-of": "${NAMESPACE}"
+        }
+      },
+      "spec": {
+        "accessModes": [
+          "ReadWriteOnce"
+        ],
+        "storageClassName": "${NAMESPACE}-essd",
+        "resources": {
+          "requests": {
+            "storage": "40Gi"
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolumeClaim",
+      "metadata": {
+        "name": "agent-disk3",
+        "namespace": "${NAMESPACE}",
+        "labels": {
+          "app.kubernetes.io/part-of": "${NAMESPACE}"
+        }
+      },
+      "spec": {
+        "accessModes": [
+          "ReadWriteOnce"
+        ],
+        "storageClassName": "${NAMESPACE}-essd",
+        "resources": {
+          "requests": {
+            "storage": "40Gi"
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "name": "agent-store",
+        "namespace": "${NAMESPACE}",
+        "labels": {
+          "app.kubernetes.io/part-of": "${NAMESPACE}"
+        }
+      },
+      "spec": {
+        "selector": {
+          "app": "agent-store"
+        },
+        "ports": [
+          {
+            "name": "s3",
+            "port": 9000,
+            "targetPort": 9000
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "name": "agent-redis",
+        "namespace": "${NAMESPACE}",
+        "labels": {
+          "app.kubernetes.io/part-of": "${NAMESPACE}"
+        }
+      },
+      "spec": {
+        "selector": {
+          "app": "agent-redis"
+        },
+        "ports": [
+          {
+            "name": "redis",
+            "port": 6379,
+            "targetPort": 6379
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Pod",
+      "metadata": {
+        "name": "agent-store",
+        "namespace": "${NAMESPACE}",
+        "labels": {
+          "app": "agent-store",
+          "app.kubernetes.io/part-of": "${NAMESPACE}",
+          "alibabacloud.com/compute-class": "performance",
+          "alibabacloud.com/compute-qos": "default"
+        }
+      },
+      "spec": {
+        "nodeSelector": {
+          "topology.kubernetes.io/zone": "${ZONE}"
+        },
+        "restartPolicy": "Never",
+        "automountServiceAccountToken": false,
+        "activeDeadlineSeconds": 28800,
+        "containers": [
+          {
+            "name": "rustfs",
+            "image": "${REGISTRY}/library/ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac",
+            "resources": {
+              "requests": {
+                "cpu": "16",
+                "memory": "32Gi"
+              },
+              "limits": {
+                "cpu": "16",
+                "memory": "32Gi"
+              }
+            },
+            "env": [
+              {
+                "name": "RUSTFS_ACCESS_KEY",
+                "valueFrom": {
+                  "secretKeyRef": {
+                    "name": "agent-auth",
+                    "key": "access"
+                  }
+                }
+              },
+              {
+                "name": "RUSTFS_SECRET_KEY",
+                "valueFrom": {
+                  "secretKeyRef": {
+                    "name": "agent-auth",
+                    "key": "secret"
+                  }
+                }
+              }
+            ],
+            "volumeMounts": [
+              {
+                "name": "disk0",
+                "mountPath": "/data0"
+              },
+              {
+                "name": "disk1",
+                "mountPath": "/data1"
+              },
+              {
+                "name": "disk2",
+                "mountPath": "/data2"
+              },
+              {
+                "name": "disk3",
+                "mountPath": "/data3"
+              },
+              {
+                "name": "work",
+                "mountPath": "/work"
+              }
+            ],
+            "ports": [
+              {
+                "containerPort": 9000
+              }
+            ],
+            "command": [
+              "/bin/bash",
+              "-euc"
+            ],
+            "args": [
+              "export DEBIAN_FRONTEND=noninteractive\nsed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources\napt-get update -qq\napt-get install -y -qq --no-install-recommends ca-certificates libssl3t64 python3 procps util-linux\ntouch /work/ready\nwhile [ ! -f /work/finished ]; do sleep 5; done\n"
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "disk0",
+            "persistentVolumeClaim": {
+              "claimName": "agent-disk0"
+            }
+          },
+          {
+            "name": "disk1",
+            "persistentVolumeClaim": {
+              "claimName": "agent-disk1"
+            }
+          },
+          {
+            "name": "disk2",
+            "persistentVolumeClaim": {
+              "claimName": "agent-disk2"
+            }
+          },
+          {
+            "name": "disk3",
+            "persistentVolumeClaim": {
+              "claimName": "agent-disk3"
+            }
+          },
+          {
+            "name": "work",
+            "emptyDir": {}
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Pod",
+      "metadata": {
+        "name": "agent-redis",
+        "namespace": "${NAMESPACE}",
+        "labels": {
+          "app": "agent-redis",
+          "app.kubernetes.io/part-of": "${NAMESPACE}",
+          "alibabacloud.com/compute-class": "general-purpose",
+          "alibabacloud.com/compute-qos": "default"
+        }
+      },
+      "spec": {
+        "restartPolicy": "Never",
+        "automountServiceAccountToken": false,
+        "activeDeadlineSeconds": 28800,
+        "containers": [
+          {
+            "name": "redis",
+            "image": "${REGISTRY}/library/redis:7.2-alpine",
+            "resources": {
+              "requests": {
+                "cpu": "1",
+                "memory": "2Gi"
+              },
+              "limits": {
+                "cpu": "1",
+                "memory": "2Gi"
+              }
+            },
+            "args": [
+              "redis-server",
+              "--save",
+              "",
+              "--appendonly",
+              "no"
+            ],
+            "ports": [
+              {
+                "containerPort": 6379
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Pod",
+      "metadata": {
+        "name": "agent-client",
+        "namespace": "${NAMESPACE}",
+        "labels": {
+          "app.kubernetes.io/part-of": "${NAMESPACE}",
+          "alibabacloud.com/compute-class": "general-purpose",
+          "alibabacloud.com/compute-qos": "default"
+        }
+      },
+      "spec": {
+        "restartPolicy": "Never",
+        "automountServiceAccountToken": false,
+        "activeDeadlineSeconds": 28800,
+        "containers": [
+          {
+            "name": "client",
+            "image": "${REGISTRY}/library/ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac",
+            "securityContext": {
+              "runAsUser": 0,
+              "capabilities": {
+                "add": [
+                  "SYS_ADMIN"
+                ]
+              }
+            },
+            "resources": {
+              "requests": {
+                "cpu": "4",
+                "memory": "8Gi"
+              },
+              "limits": {
+                "cpu": "4",
+                "memory": "8Gi"
+              }
+            },
+            "volumeMounts": [
+              {
+                "name": "fuse",
+                "mountPath": "/dev/fuse"
+              },
+              {
+                "name": "work",
+                "mountPath": "/work"
+              }
+            ],
+            "command": [
+              "/bin/bash",
+              "-euc"
+            ],
+            "args": [
+              "exec 3<>/dev/fuse\nexec 3>&-\necho FUSE_DEVICE_OPEN_PASSED\nexport DEBIAN_FRONTEND=noninteractive\nsed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources\napt-get update -qq\napt-get install -y -qq --no-install-recommends ca-certificates fuse3 bindfs python3 python3-boto3 curl redis-tools libssl3t64 procps util-linux\nmkdir -p /work/logs /work/backing /work/probe\nbindfs /work/backing /work/probe\necho fuse-permission-check > /work/probe/probe.txt\ntest \"$(cat /work/backing/probe.txt)\" = fuse-permission-check\nfusermount3 -u /work/probe\ntouch /work/ready\nwhile [ ! -f /work/finished ]; do sleep 5; done\n"
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "fuse",
+            "hostPath": {
+              "path": "/dev/fuse",
+              "type": "CharDevice"
+            }
+          },
+          {
+            "name": "work",
+            "emptyDir": {}
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -92,6 +92,8 @@ jobs:
           python3 -m unittest discover -s tools/perf -p test_smallfiles_scan.py
           bash -n tools/perf/run_packed_local.sh
           python3 -m unittest discover -s tools/perf -p 'test_packed_*.py'
+          python3 -m compileall -q tools/perf/rustfs-hint
+          python3 -m unittest discover -s tools/perf/rustfs-hint/agent-mixed -p 'test_*.py' -v
 
       - name: Check patched FUSE transport
         run: |

@@ -16,4 +16,6 @@
 
 本轮测试入口是 **BrewFS 的真实 FUSE 挂载目录**。应用执行完整文件写入和读取，经 BrewFS 缓存、Redis 元数据与 S3 接口访问 RustFS；运行环境为 Aliyun ACS。单独的 RustFS HTTP 测试用于校验协议及布局，不能代替这些文件系统性能结果。
 
+测试代码及复现入口见 [RustFS hint benchmark scripts](../tools/perf/rustfs-hint/README.md)：包含混合负载生成、ACS FUSE 执行、布局/内容核验、配对统计与图表，以及整文件、写回/热读和恢复扫描的历史诊断脚本。
+
 原性能收益对应的受测组合为 BrewFS `687925b724f3550a47cc530f875e0470a693a022` 与 RustFS `cc4926fac1107aee76540f28bf22dbd47fcbca24`。后续缓存发布与孤立预取的并发修复单独测试，结果和未达标项目见 [不利维度维护](brewfs-rustfs/adverse-maintenance.md)，不能把原收益直接归因于这些修复。本文档集整理的是该数据路径的改进，其他 packed metadata / workspace 设计仍以 [现有文档索引](../doc/README.md) 为准。
