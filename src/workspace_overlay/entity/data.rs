@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+#[cfg(test)]
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -46,18 +47,6 @@ pub struct WriteOutcome {
     pub size: u64,
 }
 
-/// The existing VFS handle path can dispatch through this interface without
-/// manufacturing legacy slices or a workspace-wide read generation.
-#[async_trait]
-pub trait EntityFileIo: Send + Sync {
-    fn ino(&self) -> i64;
-    async fn attr(&self) -> Result<EntityInode>;
-    async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>>;
-    async fn write(&self, offset: u64, data: Bytes, append: bool) -> Result<WriteOutcome>;
-    async fn truncate(&self, size: u64) -> Result<EntityInode>;
-    async fn fsync(&self) -> Result<()>;
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct DataConfig {
     chunk_size: u64,
@@ -79,11 +68,6 @@ pub struct EntityData<B, L, O> {
     chunk_size: u64,
     config_key: Vec<u8>,
     config_bytes: Vec<u8>,
-}
-
-struct BoundFile<B, L, O> {
-    data: Arc<EntityData<B, L, O>>,
-    handle: Arc<EntityHandle>,
 }
 
 struct UploadedRange {
@@ -160,14 +144,6 @@ where
             }
         }
         Err(EntityError::Busy)
-    }
-
-    pub fn bind(self: &Arc<Self>, handle: Arc<EntityHandle>) -> Result<Arc<dyn EntityFileIo>> {
-        self.namespace.validate_handle(&handle, 0)?;
-        Ok(Arc::new(BoundFile {
-            data: self.clone(),
-            handle,
-        }))
     }
 
     async fn snapshot(
@@ -1049,35 +1025,6 @@ where
         }))
         .await
         .map_err(|e| EntityError::Backend(format!("owned entity discard failed: {e}")))?
-    }
-}
-
-#[async_trait]
-impl<B, L, O> EntityFileIo for BoundFile<B, L, O>
-where
-    B: EntityBackend + 'static,
-    L: ImmutableLowerData + 'static,
-    O: ObjectBackend + 'static,
-{
-    fn ino(&self) -> i64 {
-        self.handle.ino()
-    }
-    async fn attr(&self) -> Result<EntityInode> {
-        self.data.attr(self.handle.clone()).await
-    }
-    async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
-        self.data.read(self.handle.clone(), offset, length).await
-    }
-    async fn write(&self, offset: u64, data: Bytes, append: bool) -> Result<WriteOutcome> {
-        self.data
-            .write(self.handle.clone(), offset, data, append)
-            .await
-    }
-    async fn truncate(&self, size: u64) -> Result<EntityInode> {
-        self.data.truncate(self.handle.clone(), size).await
-    }
-    async fn fsync(&self) -> Result<()> {
-        self.data.fsync(self.handle.clone()).await
     }
 }
 

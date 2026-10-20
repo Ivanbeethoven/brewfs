@@ -293,37 +293,116 @@ async fn lower_only_lookup_does_not_copy_up_and_siblings_isolate_recreation() {
     assert_eq!(current_inode(&first, 2).await.nlink, 0);
 }
 
-#[tokio::test]
-async fn concurrent_exclusive_creates_have_exactly_one_visible_winner() {
-    let fixture = fixture(MemoryLower::empty()).await;
+async fn exclusive_creates<B: EntityBackend + 'static>(
+    ns: Arc<EntityNamespace<B, MemoryLower>>,
+    create_open: bool,
+) -> EntityInode {
     let barrier = Arc::new(Barrier::new(33));
-    let mut tasks = Vec::new();
-    for _ in 0..32 {
-        let ns = fixture.ns.clone();
-        let barrier = barrier.clone();
-        tasks.push(tokio::spawn(async move {
-            barrier.wait().await;
-            ns.create(request(1, b"exclusive", EntityKind::File), root())
-                .await
-        }));
-    }
+    let tasks = (0..32)
+        .map(|_| {
+            let ns = ns.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let request = request(1, b"exclusive", EntityKind::File);
+                if create_open {
+                    let (inode, handle) = ns.create_open(request, root(), 6).await?;
+                    assert_eq!(ns.validate_handle(&handle, 6), Ok(inode.ino));
+                    ns.close(handle).unwrap();
+                    Ok(inode)
+                } else {
+                    ns.create(request, root()).await
+                }
+            })
+        })
+        .collect::<Vec<_>>();
     barrier.wait().await;
+    // Join every writer before assertions/cleanup, including failed outcomes.
+    let results = futures::future::join_all(tasks).await;
     let mut winners = Vec::new();
     let mut exists = 0;
-    for task in tasks {
-        match task.await.unwrap() {
+    for result in results {
+        match result.unwrap() {
             Ok(inode) => winners.push(inode),
             Err(EntityError::Exists) => exists += 1,
-            other => panic!("unexpected create outcome: {other:?}"),
+            other => panic!("unexpected O_EXCL outcome: {other:?}"),
         }
     }
     assert_eq!(winners.len(), 1);
     assert_eq!(exists, 31);
     assert_eq!(
-        fixture.ns.lookup(1, b"exclusive", &root()).await.unwrap(),
+        ns.lookup(1, b"exclusive", &root()).await.unwrap(),
         winners[0]
     );
     assert_eq!(winners[0].nlink, 1);
+    winners.pop().unwrap()
+}
+
+#[tokio::test]
+async fn concurrent_exclusive_creates_have_exactly_one_visible_winner() {
+    exclusive_creates(fixture(MemoryLower::empty()).await.ns, false).await;
+}
+
+async fn mount_contract<B: EntityBackend + 'static>(backend: Arc<B>, volume: Uuid) {
+    let mut lower = MemoryLower::empty();
+    lower.add_file(1, b"lower", 2, 8);
+    let lower = Arc::new(lower);
+    let keys = EntityKeys::new(volume, Uuid::new_v4());
+    let ns = attach_with_ttl(backend, lower, keys, 60_000_000_000)
+        .await
+        .ns;
+    let create = |name: &[u8], mode| CreateRequest {
+        mode,
+        ..request(1, name, EntityKind::File)
+    };
+    let root = root();
+    let user = user(101);
+    ns.chmod(1, 0o777, root.clone()).await.unwrap();
+    let (inode, handle) = ns
+        .create_open(create(b"private", 0), user.clone(), 6)
+        .await
+        .unwrap();
+    assert_eq!(inode.mode, 0);
+    assert_eq!(ns.validate_handle(&handle, 6), Ok(inode.ino));
+    assert!(matches!(
+        ns.open_inode(inode.ino, 4, &user).await,
+        Err(EntityError::Permission)
+    ));
+    assert_eq!(ns.getattr(inode.ino, &user).await.unwrap().ino, inode.ino);
+    assert!(matches!(
+        ns.create_open(create(b"private", 0), user.clone(), 6).await,
+        Err(EntityError::Exists)
+    ));
+    ns.unlink(1, b"lower".to_vec(), false, root.clone())
+        .await
+        .unwrap();
+    let entries = ns.readdir(1, &user).await.unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|(name, _)| name.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"private".as_slice()]
+    );
+    ns.unlink(1, b"private".to_vec(), false, user.clone())
+        .await
+        .unwrap();
+    assert_eq!(ns.validate_handle(&handle, 6), Ok(inode.ino));
+    assert_eq!(ns.getattr(inode.ino, &user).await.unwrap().nlink, 0);
+    assert!(matches!(
+        ns.open_inode(inode.ino, 4, &root).await,
+        Err(EntityError::NotFound)
+    ));
+    ns.close(handle).unwrap();
+    assert!(ns.readdir(1, &root).await.unwrap().is_empty());
+
+    exclusive_creates(ns.clone(), true).await;
+    assert_eq!(ns.readdir(1, &root).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn memory_entity_mount_namespace_operations() {
+    mount_contract(Arc::new(MemoryEntityBackend::new(1)), Uuid::new_v4()).await;
 }
 
 #[tokio::test]
@@ -920,7 +999,6 @@ async fn inject_dentry(fixture: &Fixture<MemoryEntityBackend>, name: &[u8], row:
             key: keys[0].clone(),
             expected: snapshot.rows[0].clone(),
         }],
-        None,
         None,
     )
     .unwrap();
@@ -1700,42 +1778,8 @@ async fn redis_entity_namespace_contract() {
         )
         .await;
         assert_eq!(fixture.ns.lookup(1, b"base", &root()).await.unwrap().ino, 2);
-        let barrier = Arc::new(Barrier::new(33));
-        let mut tasks = Vec::new();
-        for _ in 0..32 {
-            let ns = fixture.ns.clone();
-            let barrier = barrier.clone();
-            tasks.push(tokio::spawn(async move {
-                barrier.wait().await;
-                ns.create(request(1, b"exclusive", EntityKind::File), root())
-                    .await
-            }));
-        }
-        barrier.wait().await;
-        // Join every task before asserting, so cleanup never races unfinished
-        // test writers if one of the outcomes was unexpected.
-        let results = futures::future::join_all(tasks).await;
-        let mut winners = Vec::new();
-        let mut exists = 0;
-        for result in results {
-            match result.unwrap() {
-                Ok(inode) => winners.push(inode),
-                Err(EntityError::Exists) => exists += 1,
-                other => panic!("unexpected Redis O_EXCL outcome: {other:?}"),
-            }
-        }
-        assert_eq!(winners.len(), 1);
-        assert_eq!(exists, 31);
-        let ino = winners[0].ino;
-        assert_eq!(
-            fixture
-                .ns
-                .lookup(1, b"exclusive", &root())
-                .await
-                .unwrap()
-                .ino,
-            ino
-        );
+        mount_contract(backend.clone(), volume).await;
+        let ino = exclusive_creates(fixture.ns.clone(), false).await.ino;
         fixture
             .ns
             .link(ino, 1, b"alias".to_vec(), root())
@@ -1859,7 +1903,6 @@ async fn redis_entity_namespace_contract() {
                 key: key.clone(),
                 expected: Some(value.clone()),
             }],
-            None,
             None,
         )?;
         let checks = rows

@@ -21,7 +21,7 @@ use super::lifecycle::{
     LeaseIdentity, Lifecycle, MaintenanceToken, OperationGuard, WriterSession, checked_rows,
     committed, put,
 };
-use super::model::{ChunkMap, EntityDentry, UpperInode};
+use super::model::ChunkMap;
 use super::{EntityError, Result};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -89,12 +89,8 @@ pub struct SliceMembership {
 
 #[derive(Clone, Debug)]
 pub struct UploadToken {
-    namespace_id: Uuid,
     namespace_prefix: Vec<u8>,
     slice_id: u64,
-    upload_id: Uuid,
-    lease: LeaseIdentity,
-    pending_key: Vec<u8>,
     pending_bytes: Vec<u8>,
     _admission: Arc<OperationGuard>,
 }
@@ -205,12 +201,8 @@ impl<B: EntityBackend> Ownership<B> {
                 let row = allocation.pending(slice_id, position);
                 row.validate(&self.keys, slice_id)?;
                 Ok(UploadToken {
-                    namespace_id: self.keys.namespace_id(),
                     namespace_prefix: self.keys.prefix().to_vec(),
                     slice_id,
-                    upload_id: allocation.upload_id,
-                    lease: allocation.lease,
-                    pending_key: self.keys.slice(slice_id),
                     pending_bytes: encode(&row)?,
                     _admission: admission.clone(),
                 })
@@ -315,38 +307,16 @@ impl<B: EntityBackend> Ownership<B> {
         maintenance: &MaintenanceToken,
         token: &DeletionToken,
     ) -> Result<()> {
-        if token.namespace_id != self.keys.namespace_id()
-            || token.namespace_prefix != self.keys.prefix()
-        {
-            return Err(EntityError::Fenced);
-        }
-        let authority = self.lifecycle.maintenance_authority(maintenance).await?;
-        let keys = vec![self.keys.slice(token.slice_id)];
-        let snapshot = self.backend.read(&keys).await?;
-        let mut row: SliceOwnership =
-            decode(snapshot.rows[0].as_deref().ok_or(EntityError::NotFound)?)?;
-        row.validate(&self.keys, token.slice_id)?;
-        match row.state {
-            SliceState::Deleted { reservation } if reservation == token.reservation => {
-                return Ok(());
-            }
-            SliceState::Deleting { reservation } if reservation == token.reservation => {}
-            _ => return Err(EntityError::Fenced),
+        let (authority, mut row, mut plan) = self.deletion_plan(maintenance, token).await?;
+        if matches!(row.state, SliceState::Deleted { .. }) {
+            return Ok(());
         }
         row.state = SliceState::Deleted {
             reservation: token.reservation,
         };
-        committed(
-            self.backend
-                .commit(
-                    &authority,
-                    &EntityPlan {
-                        checks: checked_rows(&keys, snapshot.rows),
-                        writes: vec![put(keys[0].clone(), &row)?],
-                    },
-                )
-                .await?,
-        )
+        plan.writes
+            .push(put(self.keys.slice(token.slice_id), &row)?);
+        committed(self.backend.commit(&authority, &plan).await?)
     }
 
     /// Validate the exact namespace and durable reservation before transport
@@ -358,6 +328,15 @@ impl<B: EntityBackend> Ownership<B> {
         maintenance: &MaintenanceToken,
         token: &DeletionToken,
     ) -> Result<()> {
+        let (authority, _, plan) = self.deletion_plan(maintenance, token).await?;
+        committed(self.backend.commit(&authority, &plan).await?)
+    }
+
+    async fn deletion_plan(
+        &self,
+        maintenance: &MaintenanceToken,
+        token: &DeletionToken,
+    ) -> Result<(TransactionAuthority, SliceOwnership, EntityPlan)> {
         if token.namespace_id != self.keys.namespace_id()
             || token.namespace_prefix != self.keys.prefix()
         {
@@ -374,132 +353,14 @@ impl<B: EntityBackend> Ownership<B> {
         {
             return Err(EntityError::Fenced);
         }
-        committed(
-            self.backend
-                .commit(
-                    &authority,
-                    &EntityPlan {
-                        checks: checked_rows(&keys, snapshot.rows),
-                        writes: Vec::new(),
-                    },
-                )
-                .await?,
-        )
-    }
-
-    /// One recoverable, atomic cleanup step after session quiescence. This
-    /// bounded reference walker supports at most 4096 rows per scanned prefix;
-    /// larger namespaces fail closed until a paginated walker is qualified.
-    /// Returns true once the orphan is gone. Removing each chunk and advancing
-    /// its cursor share the membership/refcount transaction, preventing replay
-    /// from releasing an owner twice. Lower data is never treated as upper-owned.
-    pub async fn recover_orphan_step(
-        &self,
-        maintenance: &MaintenanceToken,
-        ino: i64,
-    ) -> Result<bool> {
-        if ino <= 0 {
-            return Err(EntityError::Invalid("invalid orphan inode".into()));
-        }
-        let authority = self.lifecycle.maintenance_authority(maintenance).await?;
-        let keys = vec![
-            self.keys.orphan(ino),
-            self.keys.inode(ino),
-            self.keys.truncate(ino),
-        ];
-        let snapshot = self.backend.read(&keys).await?;
-        if snapshot.rows[2].is_some() {
-            return Err(EntityError::Busy);
-        }
-        let Some(bytes) = snapshot.rows[0].as_deref() else {
-            return Ok(true);
-        };
-        let mut orphan: OrphanRecord = decode(bytes)?;
-        if orphan.namespace_id != self.keys.namespace_id() || orphan.ino != ino {
-            return Err(EntityError::Corrupt("invalid orphan identity".into()));
-        }
-        let inode: UpperInode = decode(
-            snapshot.rows[1]
-                .as_deref()
-                .ok_or_else(|| EntityError::Corrupt("orphan missing inode".into()))?,
-        )?;
-        let UpperInode::Present(inode) = inode else {
-            return Err(EntityError::Corrupt(
-                "orphan inode already tombstoned".into(),
-            ));
-        };
-        inode.validate()?;
-        if inode.ino != ino || inode.nlink != 0 {
-            return Err(EntityError::Corrupt("orphan still linked".into()));
-        }
-        let chunk_prefix = [self.keys.prefix(), format!("chunk/{ino}/").as_bytes()].concat();
-        let chunks = self.backend.scan_prefix(&chunk_prefix, 4096).await?;
-        let mut ordered_chunks = Vec::with_capacity(chunks.len());
-        for (key, value) in chunks {
-            let suffix = std::str::from_utf8(&key[chunk_prefix.len()..])
-                .map_err(|_| EntityError::Corrupt("invalid chunk index".into()))?;
-            let index: u64 = suffix
-                .parse()
-                .map_err(|_| EntityError::Corrupt("invalid chunk index".into()))?;
-            if key != self.keys.chunk(ino, index) || index < orphan.cleanup_chunk {
-                return Err(EntityError::Corrupt(
-                    "orphan cleanup cursor skipped a chunk".into(),
-                ));
-            }
-            ordered_chunks.push((index, key, value));
-        }
-        ordered_chunks.sort_by_key(|(index, _, _)| *index);
-        let mut plan = EntityPlan {
-            checks: checked_rows(&keys, snapshot.rows),
-            writes: Vec::new(),
-        };
-        if let Some((index, key, bytes)) = ordered_chunks.into_iter().next() {
-            let old: ChunkMap = decode(&bytes)?;
-            let empty = ChunkMap::holes(old.chunk_size)?;
-            let membership =
-                plan_chunk_membership(self.backend.as_ref(), &self.keys, ino, index, &old, &empty)
-                    .await?;
-            plan.checks.extend(membership.checks);
-            plan.writes.extend(membership.writes);
-            plan.checks.push(RowCheck {
-                key: key.clone(),
-                expected: Some(bytes),
-            });
-            plan.writes.push(RowWrite::Delete { key });
-            orphan.cleanup_chunk = index.checked_add(1).ok_or(EntityError::Overflow)?;
-            plan.writes.push(put(self.keys.orphan(ino), &orphan)?);
-            committed(self.backend.commit(&authority, &plan).await?)?;
-            return Ok(false);
-        }
-        let xattr_prefix = [self.keys.prefix(), format!("xattr/{ino}/").as_bytes()].concat();
-        for (key, value) in self.backend.scan_prefix(&xattr_prefix, 4096).await? {
-            plan.checks.push(RowCheck {
-                key: key.clone(),
-                expected: Some(value),
-            });
-            plan.writes.push(RowWrite::Delete { key });
-        }
-        for (key, value) in self
-            .backend
-            .scan_prefix(&self.keys.dentry_prefix(ino), 4096)
-            .await?
-        {
-            if decode::<EntityDentry>(&value)? != EntityDentry::Whiteout {
-                return Err(EntityError::NotEmpty);
-            }
-            plan.checks.push(RowCheck {
-                key: key.clone(),
-                expected: Some(value),
-            });
-            plan.writes.push(RowWrite::Delete { key });
-        }
-        plan.writes
-            .push(put(self.keys.inode(ino), &UpperInode::Deleted)?);
-        plan.writes.push(RowWrite::Delete {
-            key: self.keys.orphan(ino),
-        });
-        committed(self.backend.commit(&authority, &plan).await?)?;
-        Ok(true)
+        Ok((
+            authority,
+            row,
+            EntityPlan {
+                checks: checked_rows(&keys, snapshot.rows),
+                writes: Vec::new(),
+            },
+        ))
     }
 }
 
@@ -584,9 +445,7 @@ pub fn plan_chunk_memberships_from_rows(
     let mut receipts = BTreeMap::new();
     for upload in uploads {
         let token = &upload.token;
-        if token.namespace_id != keys.namespace_id()
-            || token.namespace_prefix != keys.prefix()
-            || token.pending_key != keys.slice(token.slice_id)
+        if token.namespace_prefix != keys.prefix()
             || receipts.insert(token.slice_id, token).is_some()
         {
             return Err(EntityError::Invalid(
@@ -595,11 +454,7 @@ pub fn plan_chunk_memberships_from_rows(
         }
         let pending: SliceOwnership = decode(&token.pending_bytes)?;
         pending.validate(keys, token.slice_id)?;
-        if pending.state
-            != (SliceState::Pending {
-                upload_id: token.upload_id,
-                lease: token.lease,
-            })
+        if !matches!(pending.state, SliceState::Pending { .. })
             || pending.retirement_hold
             || pending.publication_refs != 0
         {

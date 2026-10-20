@@ -39,21 +39,10 @@ pub(crate) type ExperimentalNamespace<O> =
     EntityNamespace<RedisEntityBackend, ExperimentalLower<O>>;
 pub(crate) type ExperimentalData<O> = EntityData<RedisEntityBackend, ExperimentalLower<O>, O>;
 
-#[derive(Clone, Debug)]
 pub(crate) struct FreshMountOptions {
     pub namespace_id: Option<Uuid>,
     pub lease_ttl_ns: i64,
     pub chunk_size: u64,
-}
-
-impl Default for FreshMountOptions {
-    fn default() -> Self {
-        Self {
-            namespace_id: None,
-            lease_ttl_ns: 60_000_000_000,
-            chunk_size: 4 << 20,
-        }
-    }
 }
 
 pub(crate) struct RedisEntityExperiment<O: ObjectBackend + Clone> {
@@ -64,12 +53,10 @@ pub(crate) struct RedisEntityExperiment<O: ObjectBackend + Clone> {
 }
 
 pub(crate) struct ExperimentalEntityMount<O: ObjectBackend + Clone> {
-    lower: Arc<ExperimentalLower<O>>,
     namespace: Arc<ExperimentalNamespace<O>>,
     data: Arc<ExperimentalData<O>>,
     lifecycle: Arc<Lifecycle<RedisEntityBackend>>,
     session: WriterSession,
-    keys: EntityKeys,
 }
 
 fn backend_error(error: impl std::fmt::Display) -> EntityError {
@@ -91,7 +78,7 @@ impl<O: ObjectBackend + Clone + 'static> RedisEntityExperiment<O> {
         catalog_namespace: &str,
         volume_id: Uuid,
         objects: O,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<Self> {
         if volume_id.is_nil() {
             return Err(EntityError::Invalid(
                 "entity experiment requires a volume UUID".into(),
@@ -101,7 +88,7 @@ impl<O: ObjectBackend + Clone + 'static> RedisEntityExperiment<O> {
             .await
             .map_err(catalog_error)?;
         let entity = RedisEntityBackend::connect(redis_url, volume_id).await?;
-        Ok(Arc::new(Self {
+        Ok(Self {
             packed: Arc::new(
                 KvWorkspaceStore::new(packed)
                     .with_packed_reader_pin_budget(V3MountBudget::defaults()),
@@ -109,14 +96,14 @@ impl<O: ObjectBackend + Clone + 'static> RedisEntityExperiment<O> {
             entity: Arc::new(entity),
             objects,
             volume_id,
-        }))
+        })
     }
 
     /// Attach a standalone immutable graph to a never-initialized private
     /// packed catalog and never-used entity namespace. This does not transfer
     /// ownership from an existing catalog or import a mutable workspace.
     pub async fn create_fresh_from_manifest(
-        self: &Arc<Self>,
+        &self,
         manifest_key: &str,
         options: FreshMountOptions,
     ) -> Result<Arc<ExperimentalEntityMount<O>>> {
@@ -218,7 +205,7 @@ impl<O: ObjectBackend + Clone + 'static> RedisEntityExperiment<O> {
     }
 
     async fn finish_fresh(
-        self: &Arc<Self>,
+        &self,
         guard: HeadGuard,
         verified: VerifiedPackedLower,
         binding: LowerBinding,
@@ -325,12 +312,10 @@ impl<O: ObjectBackend + Clone + 'static> RedisEntityExperiment<O> {
             }
         };
         Ok(ExperimentalEntityMount {
-            lower,
             namespace,
             data,
             lifecycle,
             session,
-            keys,
         })
     }
 }
@@ -343,10 +328,10 @@ impl<O: ObjectBackend + Clone + 'static> ExperimentalEntityMount<O> {
         &self.data
     }
     pub fn keys(&self) -> &EntityKeys {
-        &self.keys
+        &self.namespace.keys
     }
     pub fn root_ino(&self) -> i64 {
-        self.lower.binding().root_ino
+        self.namespace.lower.binding().root_ino
     }
     pub async fn renew(&self, ttl_ns: i64) -> Result<()> {
         self.lifecycle.renew(&self.session, ttl_ns).await

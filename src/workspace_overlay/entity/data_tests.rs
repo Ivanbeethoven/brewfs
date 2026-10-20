@@ -162,6 +162,7 @@ struct MeteredBackend<B> {
     reads: AtomicUsize,
     commits: AtomicUsize,
     reservations: AtomicUsize,
+    scans: AtomicUsize,
 }
 
 impl<B> MeteredBackend<B> {
@@ -171,14 +172,16 @@ impl<B> MeteredBackend<B> {
             reads: AtomicUsize::new(0),
             commits: AtomicUsize::new(0),
             reservations: AtomicUsize::new(0),
+            scans: AtomicUsize::new(0),
         }
     }
 
-    fn take_counts(&self) -> (usize, usize, usize) {
+    fn take_counts(&self) -> (usize, usize, usize, usize) {
         (
             self.reads.swap(0, Ordering::SeqCst),
             self.commits.swap(0, Ordering::SeqCst),
             self.reservations.swap(0, Ordering::SeqCst),
+            self.scans.swap(0, Ordering::SeqCst),
         )
     }
 }
@@ -220,8 +223,9 @@ impl<B: EntityBackend> EntityBackend for MeteredBackend<B> {
         self.inner.reserve_slices(authority, allocation).await
     }
 
-    async fn scan_prefix(&self, _: &[u8], _: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        panic!("settled file operation unexpectedly scanned metadata");
+    async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scans.fetch_add(1, Ordering::SeqCst);
+        self.inner.scan_prefix(prefix, limit).await
     }
 }
 
@@ -238,7 +242,7 @@ async fn exercise_batched_file_io<B: EntityBackend + 'static>(
         .await
         .unwrap();
     assert_eq!((result.written, result.size), (24, 24));
-    assert_eq!(fixture.backend.take_counts(), (1, 1, 1));
+    assert_eq!(fixture.backend.take_counts(), (1, 1, 1, 0));
     assert_eq!(fixture.objects.puts.load(Ordering::SeqCst), 3);
     assert_eq!(
         fixture
@@ -249,14 +253,14 @@ async fn exercise_batched_file_io<B: EntityBackend + 'static>(
             .data_version,
         1
     );
-    assert_eq!(fixture.backend.take_counts(), (1, 1, 0));
+    assert_eq!(fixture.backend.take_counts(), (1, 1, 0, 0));
     assert_eq!(
         fixture.data.read(handle.clone(), 0, 24).await.unwrap(),
         original
     );
-    assert_eq!(fixture.backend.take_counts(), (2, 2, 0));
+    assert_eq!(fixture.backend.take_counts(), (2, 2, 0, 0));
     fixture.data.fsync(handle.clone()).await.unwrap();
-    assert_eq!(fixture.backend.take_counts(), (1, 1, 0));
+    assert_eq!(fixture.backend.take_counts(), (1, 1, 0, 0));
     assert!(
         fixture
             .data
@@ -265,14 +269,14 @@ async fn exercise_batched_file_io<B: EntityBackend + 'static>(
             .unwrap()
             .is_empty()
     );
-    assert_eq!(fixture.backend.take_counts(), (1, 1, 0));
+    assert_eq!(fixture.backend.take_counts(), (1, 1, 0, 0));
     let replacement = Bytes::from_static(b"ZYXWVUTSRQPONMLKJIHGFEDC");
     fixture
         .data
         .write(handle.clone(), 0, replacement.clone(), false)
         .await
         .unwrap();
-    assert_eq!(fixture.backend.take_counts(), (2, 1, 1));
+    assert_eq!(fixture.backend.take_counts(), (2, 1, 1, 0));
     assert_eq!(
         fixture.data.read(handle.clone(), 0, 24).await.unwrap(),
         replacement
@@ -280,7 +284,7 @@ async fn exercise_batched_file_io<B: EntityBackend + 'static>(
     fixture.backend.take_counts();
     let resized = fixture.data.truncate(handle.clone(), 32).await.unwrap();
     assert_eq!((resized.size, resized.data_version), (32, 3));
-    assert_eq!(fixture.backend.take_counts(), (1, 1, 0));
+    assert_eq!(fixture.backend.take_counts(), (1, 1, 0, 0));
     let mut expected = replacement.to_vec();
     expected.resize(32, 0);
     assert_eq!(fixture.data.read(handle, 0, 32).await.unwrap(), expected);
@@ -606,7 +610,7 @@ async fn exercise_fragmented_publication<B: EntityBackend + 'static>(
             size: expected.len() as u64
         }
     );
-    assert_eq!(fixture.backend.take_counts(), (6, 2, 1));
+    assert_eq!(fixture.backend.take_counts(), (6, 2, 1, 0));
     assert_eq!(
         fixture.objects.puts.load(Ordering::SeqCst),
         (SLICES + CHUNKS) as usize
@@ -816,11 +820,11 @@ async fn exercise_copy_up<B: EntityBackend + 'static>(fixture: &Fixture<B>) {
             .await
             .unwrap(),
     );
-    let file = fixture.data.bind(handle).unwrap();
+    let file = &fixture.data;
     let mut expected = test_lower_bytes(2, 0, 24);
-    assert_eq!(file.read(0, 40).await.unwrap(), expected);
+    assert_eq!(file.read(handle.clone(), 0, 40).await.unwrap(), expected);
     let written = file
-        .write(6, Bytes::from_static(b"WXYZ"), false)
+        .write(handle.clone(), 6, Bytes::from_static(b"WXYZ"), false)
         .await
         .unwrap();
     assert_eq!(
@@ -832,27 +836,30 @@ async fn exercise_copy_up<B: EntityBackend + 'static>(fixture: &Fixture<B>) {
         }
     );
     expected[6..10].copy_from_slice(b"WXYZ");
-    assert_eq!(file.read(0, 40).await.unwrap(), expected);
-    file.write(30, Bytes::from_static(b"tail"), false)
+    assert_eq!(file.read(handle.clone(), 0, 40).await.unwrap(), expected);
+    file.write(handle.clone(), 30, Bytes::from_static(b"tail"), false)
         .await
         .unwrap();
     expected.resize(30, 0);
     expected.extend_from_slice(b"tail");
-    assert_eq!(file.read(0, 40).await.unwrap(), expected);
+    assert_eq!(file.read(handle.clone(), 0, 40).await.unwrap(), expected);
     // The boundary chunk is a mixture of LowerRange and Data. Shrink/extend
     // must remove both kinds beyond the cut, including already present maps.
-    file.truncate(7).await.unwrap();
-    file.truncate(34).await.unwrap();
+    file.truncate(handle.clone(), 7).await.unwrap();
+    file.truncate(handle.clone(), 34).await.unwrap();
     expected.truncate(7);
     expected.resize(34, 0);
-    assert_eq!(file.read(0, 40).await.unwrap(), expected);
-    assert_eq!(file.attr().await.unwrap().lower_visible_size, 7);
-    file.write(9, Bytes::from_static(b"new"), false)
+    assert_eq!(file.read(handle.clone(), 0, 40).await.unwrap(), expected);
+    assert_eq!(
+        file.attr(handle.clone()).await.unwrap().lower_visible_size,
+        7
+    );
+    file.write(handle.clone(), 9, Bytes::from_static(b"new"), false)
         .await
         .unwrap();
     expected[9..12].copy_from_slice(b"new");
-    assert_eq!(file.read(0, 40).await.unwrap(), expected);
-    file.fsync().await.unwrap();
+    assert_eq!(file.read(handle.clone(), 0, 40).await.unwrap(), expected);
+    file.fsync(handle).await.unwrap();
     assert!(
         fixture
             .backend
@@ -1586,7 +1593,6 @@ async fn redis_entity_data_copy_up_durability_and_truncate_contract() {
                 key: key.clone(),
                 expected: Some(value.clone()),
             }],
-            None,
             None,
         )
         .unwrap();

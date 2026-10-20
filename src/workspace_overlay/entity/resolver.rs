@@ -181,50 +181,8 @@ pub async fn resolve_xattr<L: ImmutableLower + ?Sized>(
     }
 }
 
-async fn validate_lower_ranges<L: ImmutableLower + ?Sized>(
-    lower: &L,
-    binding: &LowerBinding,
-    map: &ChunkMap,
-    known_inode: Option<&EntityInode>,
-) -> Result<(), EntityError> {
-    let mut sizes = BTreeMap::new();
-    if let Some(inode) = known_inode {
-        sizes.insert(inode.ino, inode.size);
-    }
-    for span in &map.spans {
-        if let ChunkSource::LowerRange {
-            ino, file_offset, ..
-        } = &span.source
-        {
-            if !sizes.contains_key(ino) {
-                let row = resolve_inode(lower, binding, *ino, None)
-                    .await?
-                    .ok_or_else(|| {
-                        EntityError::Corrupt("lower range references a missing inode".into())
-                    })?;
-                if row.kind != EntityKind::File {
-                    return Err(EntityError::Corrupt(
-                        "lower range references a non-file inode".into(),
-                    ));
-                }
-                sizes.insert(*ino, row.size);
-            }
-            if file_offset
-                .checked_add(span.length)
-                .ok_or(EntityError::Overflow)?
-                > sizes[ino]
-            {
-                return Err(EntityError::Corrupt(
-                    "lower range exceeds immutable EOF".into(),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Resolve a complete map. The caller clips reads to the effective inode EOF,
-/// and keeps truncate admission/read coherence and object lifetime protection.
+/// Resolve a complete map. Every inherited span belongs to this same inode
+/// and logical position; the durable lower visibility boundary clips its tail.
 pub async fn resolve_chunk<L: ImmutableLower + ?Sized>(
     lower: &L,
     binding: &LowerBinding,
@@ -255,26 +213,73 @@ pub async fn resolve_chunk<L: ImmutableLower + ?Sized>(
         .lower_visible_size
         .saturating_sub(chunk_start)
         .min(chunk_size);
-    if let Some(map) = upper {
-        map.validate_binding(binding)?;
-        if map.chunk_size != chunk_size {
-            return Err(EntityError::Corrupt("upper chunk size mismatch".into()));
+    let mut original = None;
+    let map = match upper {
+        Some(map) => map.clone(),
+        None if inherited == 0 => return ChunkMap::holes(chunk_size),
+        None => {
+            let row = resolve_inode(lower, binding, inode.ino, None)
+                .await?
+                .ok_or_else(|| EntityError::Corrupt("inherited chunk has no lower inode".into()))?;
+            if row.kind != EntityKind::File || inode.lower_visible_size > row.size {
+                return Err(EntityError::Corrupt(
+                    "invalid inherited lower visibility boundary".into(),
+                ));
+            }
+            original = Some(row);
+            let map = lower
+                .chunk(inode.ino, chunk_index, chunk_size)
+                .await?
+                .unwrap_or(ChunkMap::holes(chunk_size)?);
+            check_binding(lower, binding)?;
+            map
         }
-        validate_lower_ranges(lower, binding, map, None).await?;
-        let mut spans = Vec::with_capacity(map.spans.len());
-        for span in &map.spans {
-            if let ChunkSource::LowerRange {
+    };
+    map.validate_binding(binding)?;
+    if map.chunk_size != chunk_size {
+        return Err(EntityError::Corrupt("chunk size mismatch".into()));
+    }
+    let mut spans = Vec::with_capacity(map.spans.len());
+    for span in map.spans {
+        match &span.source {
+            ChunkSource::Data { .. } if upper.is_none() => {
+                return Err(EntityError::Corrupt(
+                    "upper slice in immutable lower map".into(),
+                ));
+            }
+            ChunkSource::LowerRange {
                 ino, file_offset, ..
-            } = &span.source
-            {
+            } => {
                 if *ino != inode.ino || *file_offset != chunk_start + span.offset {
+                    return Err(EntityError::Corrupt("lower-range identity mismatch".into()));
+                }
+                if original.is_none() {
+                    original = Some(
+                        resolve_inode(lower, binding, *ino, None)
+                            .await?
+                            .ok_or_else(|| {
+                                EntityError::Corrupt(
+                                    "lower range references a missing inode".into(),
+                                )
+                            })?,
+                    );
+                }
+                let original = original.as_ref().expect("resolved immutable inode");
+                if original.kind != EntityKind::File {
                     return Err(EntityError::Corrupt(
-                        "upper lower-range identity mismatch".into(),
+                        "lower range references a non-file inode".into(),
                     ));
                 }
-                // The durable truncate boundary applies even to maps written
-                // before the shrink. Preserve later upper writes, but never
-                // resurrect immutable bytes after shrink followed by extension.
+                if file_offset
+                    .checked_add(span.length)
+                    .ok_or(EntityError::Overflow)?
+                    > original.size
+                {
+                    return Err(EntityError::Corrupt(
+                        "lower range exceeds immutable EOF".into(),
+                    ));
+                }
+                // Validate the original locator even when truncation masks it.
                 let retained = inherited.saturating_sub(span.offset).min(span.length);
                 if retained != 0 {
                     spans.push(ChunkSpan {
@@ -289,58 +294,12 @@ pub async fn resolve_chunk<L: ImmutableLower + ?Sized>(
                         source: ChunkSource::Hole,
                     });
                 }
-            } else {
-                spans.push(span.clone());
             }
-        }
-        return ChunkMap::new(chunk_size, spans);
-    }
-    if inherited == 0 {
-        return ChunkMap::holes(chunk_size);
-    }
-    let original = resolve_inode(lower, binding, inode.ino, None)
-        .await?
-        .ok_or_else(|| EntityError::Corrupt("inherited chunk has no lower inode".into()))?;
-    if original.kind != EntityKind::File || inode.lower_visible_size > original.size {
-        return Err(EntityError::Corrupt(
-            "invalid inherited lower visibility boundary".into(),
-        ));
-    }
-    let mut map = lower
-        .chunk(inode.ino, chunk_index, chunk_size)
-        .await?
-        .unwrap_or(ChunkMap::holes(chunk_size)?);
-    check_binding(lower, binding)?;
-    map.validate_binding(binding)?;
-    if map.chunk_size != chunk_size {
-        return Err(EntityError::Corrupt("immutable chunk size mismatch".into()));
-    }
-    for span in &map.spans {
-        match &span.source {
-            ChunkSource::Data { .. } => {
-                return Err(EntityError::Corrupt(
-                    "upper slice in immutable lower map".into(),
-                ));
-            }
-            ChunkSource::LowerRange {
-                ino, file_offset, ..
-            } if *ino != inode.ino || *file_offset != chunk_start + span.offset => {
-                return Err(EntityError::Corrupt(
-                    "immutable chunk point-read identity mismatch".into(),
-                ));
-            }
-            _ => {}
+            _ => spans.push(span),
         }
     }
-    validate_lower_ranges(lower, binding, &map, Some(&original)).await?;
-    if inherited < chunk_size {
-        map = map.replace(inherited, chunk_size - inherited, ChunkSource::Hole)?;
-    }
-    Ok(map)
+    ChunkMap::new(chunk_size, spans)
 }
-
-/// Merge a bounded directory's complete current upper set with its lower set.
-/// The caller validates the parent inode/type and stabilizes directory mutation.
 pub async fn merge_directory<L: ImmutableLower + ?Sized>(
     lower: &L,
     binding: &LowerBinding,

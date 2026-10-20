@@ -21,8 +21,7 @@ fn put(key: Vec<u8>, value: &[u8]) -> RowWrite {
 
 async fn initialize<B: EntityBackend>(backend: &B, keys: &EntityKeys) -> TransactionAuthority {
     let initial =
-        TransactionAuthority::from_validated(vec![check(keys.descriptor(), None)], None, None)
-            .unwrap();
+        TransactionAuthority::from_validated(vec![check(keys.descriptor(), None)], None).unwrap();
     let plan = EntityPlan {
         checks: vec![check(keys.counter("inode"), None)],
         writes: vec![
@@ -40,7 +39,6 @@ async fn initialize<B: EntityBackend>(backend: &B, keys: &EntityKeys) -> Transac
             check(keys.descriptor(), Some(b"active")),
             check(keys.lease(), Some(b"lease-1")),
         ],
-        None,
         None,
     )
     .unwrap()
@@ -166,25 +164,20 @@ async fn conformance<B: EntityBackend + 'static>(backend: Arc<B>, keys: EntityKe
 
     let snapshot = backend.read(&[]).await.unwrap();
     let expired =
-        TransactionAuthority::from_validated(authority.checks.clone(), None, Some(snapshot.now_ns))
+        TransactionAuthority::from_validated(authority.checks.clone(), Some(snapshot.now_ns))
             .unwrap();
-    let future =
-        TransactionAuthority::from_validated(authority.checks.clone(), Some(i64::MAX), None)
-            .unwrap();
-    for fenced in [expired, future] {
-        assert_eq!(
-            backend
-                .commit(
-                    &fenced,
-                    &EntityPlan {
-                        checks: vec![],
-                        writes: vec![put(other_key.clone(), b"must-not-appear")]
-                    }
-                )
-                .await,
-            Err(EntityError::Fenced)
-        );
-    }
+    assert_eq!(
+        backend
+            .commit(
+                &expired,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![put(other_key.clone(), b"must-not-appear")]
+                }
+            )
+            .await,
+        Err(EntityError::Fenced)
+    );
     assert_eq!(
         backend
             .read(std::slice::from_ref(&other_key))
@@ -227,7 +220,6 @@ async fn conformance<B: EntityBackend + 'static>(backend: Arc<B>, keys: EntityKe
             check(keys.descriptor(), Some(b"active")),
             check(keys.lease(), Some(b"lease-2")),
         ],
-        None,
         None,
     )
     .unwrap();
@@ -532,7 +524,7 @@ async fn atomic_create_conformance<B: EntityBackend + 'static>(backend: Arc<B>, 
     );
     let now = backend.read(&[]).await.unwrap().now_ns;
     let expired =
-        TransactionAuthority::from_validated(authority.checks.clone(), None, Some(now)).unwrap();
+        TransactionAuthority::from_validated(authority.checks.clone(), Some(now)).unwrap();
     assert_eq!(
         backend
             .commit_with_inode_allocation(&expired, &fresh_plan, &fresh)
@@ -709,12 +701,9 @@ async fn slice_reservation_conformance<B: EntityBackend + 'static>(
         "a later overflow must not allocate the valid first identity"
     );
 
-    let conflict = TransactionAuthority::from_validated(
-        vec![check(keys.lease(), Some(b"wrong-lease"))],
-        None,
-        None,
-    )
-    .unwrap();
+    let conflict =
+        TransactionAuthority::from_validated(vec![check(keys.lease(), Some(b"wrong-lease"))], None)
+            .unwrap();
     assert_eq!(
         backend
             .reserve_slices(&conflict, &allocation)
@@ -724,19 +713,12 @@ async fn slice_reservation_conformance<B: EntityBackend + 'static>(
     );
     let now = backend.read(&[]).await.unwrap().now_ns;
     let expired =
-        TransactionAuthority::from_validated(authority.checks.clone(), None, Some(now)).unwrap();
+        TransactionAuthority::from_validated(authority.checks.clone(), Some(now)).unwrap();
     assert_eq!(
         backend.reserve_slices(&expired, &allocation).await,
         Err(EntityError::Fenced)
     );
     assert_eq!(backend.read(&checked_keys).await.unwrap().rows, before);
-    let future =
-        TransactionAuthority::from_validated(authority.checks.clone(), Some(i64::MAX), None)
-            .unwrap();
-    assert_eq!(
-        backend.reserve_slices(&future, &allocation).await,
-        Err(EntityError::Fenced)
-    );
     for invalid in [b"01".as_slice(), b"-1", b"9223372036854775808"] {
         backend
             .commit(
@@ -793,17 +775,11 @@ async fn redis_atomic_create_allocation_conformance() {
 }
 
 #[tokio::test]
-async fn memory_authority_uses_half_open_backend_time_and_rejects_plan_before_writes() {
+async fn memory_authority_uses_backend_deadline_and_rejects_plan_before_writes() {
     let backend = MemoryEntityBackend::new(10);
     let keys = EntityKeys::new(Uuid::new_v4(), Uuid::new_v4());
     let authority = initialize(&backend, &keys).await;
-    let bounded =
-        TransactionAuthority::from_validated(authority.checks.clone(), Some(20), Some(30)).unwrap();
-    assert_eq!(
-        backend.commit(&bounded, &EntityPlan::default()).await,
-        Err(EntityError::Fenced)
-    );
-    backend.set_time(20).unwrap();
+    let bounded = TransactionAuthority::from_validated(authority.checks.clone(), Some(30)).unwrap();
     assert_eq!(
         backend
             .commit(&bounded, &EntityPlan::default())

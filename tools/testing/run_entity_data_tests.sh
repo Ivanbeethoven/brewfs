@@ -43,7 +43,7 @@ mkdir "$run_dir"
 project="brewfs-entity-$run_uuid"
 env_file="$run_dir/.compose.env"
 test_pid=""
-filters=(packed_entity_lower workspace_overlay::entity entity_vfs)
+filters=(packed_entity_lower workspace_overlay::entity)
 printf 'filter\tbucket\texit\tpassed\n' >"$run_dir/cases.tsv"
 
 # Hold both temporary sockets until the pair is selected, so they cannot be
@@ -111,8 +111,8 @@ run = pathlib.Path(sys.argv[1])
 status = int(sys.argv[2])
 with (run / 'cases.tsv').open() as source:
     rows = list(csv.DictReader(source, delimiter='\t'))
-complete = len(rows) == 3 and all(int(row['exit']) == 0 and int(row['passed']) > 0 for row in rows)
-result = 'passed' if status == 0 and complete else 'incomplete' if len(rows) < 3 else 'failed'
+complete = len(rows) == 2 and all(int(row['exit']) == 0 and int(row['passed']) > 0 for row in rows)
+result = 'passed' if status == 0 and complete else 'incomplete' if len(rows) < 2 else 'failed'
 (run / 'summary.json').write_text(json.dumps({'status': result, 'exit': status, 'cases': rows}, indent=2) + '\n')
 print(f'entity-data: {result}; artifacts={run}')
 sys.exit(0 if status == 0 and complete else 1)

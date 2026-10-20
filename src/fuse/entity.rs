@@ -24,10 +24,12 @@ use futures_util::stream::{self, BoxStream};
 
 use crate::cadapter::client::ObjectBackend;
 use crate::workspace_overlay::entity::backend::EntityBackend;
-use crate::workspace_overlay::entity::data::{EntityData, EntityFileIo};
+use crate::workspace_overlay::entity::data::EntityData;
 use crate::workspace_overlay::entity::diagnostics;
 use crate::workspace_overlay::entity::model::{EntityInode, EntityKind};
-use crate::workspace_overlay::entity::namespace::{CreateRequest, Credentials, EntityNamespace};
+use crate::workspace_overlay::entity::namespace::{
+    CreateRequest, Credentials, EntityHandle, EntityNamespace,
+};
 use crate::workspace_overlay::entity::resolver::ImmutableLowerData;
 use crate::workspace_overlay::entity::{EntityError, Result};
 
@@ -36,7 +38,7 @@ use crate::workspace_overlay::entity::{EntityError, Result};
 pub const MAX_WRITE: u32 = 1024 * 1024;
 
 struct OpenFile {
-    io: Arc<dyn EntityFileIo>,
+    handle: Arc<EntityHandle>,
     read: bool,
     write: bool,
     append: bool,
@@ -271,7 +273,7 @@ where
         handles
             .files
             .get(&fh)
-            .filter(|file| file.io.ino() == ino)
+            .filter(|file| file.handle.ino() == ino)
             .cloned()
             .ok_or(Errno::from(libc::EBADF))
     }
@@ -349,16 +351,19 @@ where
                 }
                 Err(error) => return Err(errno(error)),
             };
-            let io = self.state.data.bind(handle).map_err(errno)?;
             let inode = if !created && flags & libc::O_TRUNC as u32 != 0 {
-                io.truncate(0).await.map_err(errno)?
+                self.state
+                    .data
+                    .truncate(handle.clone(), 0)
+                    .await
+                    .map_err(errno)?
             } else {
                 inode
             };
             self.store_file(
                 fh,
                 OpenFile {
-                    io,
+                    handle,
                     read,
                     write,
                     append: flags & libc::O_APPEND as u32 != 0,
@@ -435,7 +440,12 @@ where
             let ino = self.ino(inode)?;
             let attr = if let Some(fh) = fh {
                 match self.file(inode, fh) {
-                    Ok(file) => file.io.attr().await.map_err(errno)?,
+                    Ok(file) => self
+                        .state
+                        .data
+                        .attr(file.handle.clone())
+                        .await
+                        .map_err(errno)?,
                     Err(_) => {
                         self.directory(inode, fh)?;
                         self.state
@@ -480,12 +490,12 @@ where
         }
         let credentials = credentials(request, 0)?;
         if let Some(size) = attr.size {
-            let io = if let Some(fh) = fh {
+            let handle = if let Some(fh) = fh {
                 let file = self.file(inode, fh)?;
                 if !file.write {
                     return Err(libc::EACCES.into());
                 }
-                file.io.clone()
+                file.handle.clone()
             } else {
                 let handle = self
                     .state
@@ -493,9 +503,14 @@ where
                     .open_inode(ino, 2, &credentials)
                     .await
                     .map_err(errno)?;
-                self.state.data.bind(Arc::new(handle)).map_err(errno)?
+                Arc::new(handle)
             };
-            let inode = io.truncate(size).await.map_err(errno)?;
+            let inode = self
+                .state
+                .data
+                .truncate(handle, size)
+                .await
+                .map_err(errno)?;
             return Ok(ReplyAttr {
                 ttl: Duration::ZERO,
                 attr: self.attr(&inode),
@@ -528,14 +543,18 @@ where
                 .open_inode(ino, access, &credentials(request, 0)?)
                 .await
                 .map_err(errno)?;
-            let io = self.state.data.bind(Arc::new(handle)).map_err(errno)?;
+            let handle = Arc::new(handle);
             if flags & libc::O_TRUNC as u32 != 0 {
-                io.truncate(0).await.map_err(errno)?;
+                self.state
+                    .data
+                    .truncate(handle.clone(), 0)
+                    .await
+                    .map_err(errno)?;
             }
             self.store_file(
                 fh,
                 OpenFile {
-                    io,
+                    handle,
                     read,
                     write,
                     append: flags & libc::O_APPEND as u32 != 0,
@@ -589,7 +608,13 @@ where
                 return Err(libc::EACCES.into());
             }
             Ok(ReplyData {
-                data: Bytes::from(file.io.read(offset, size as usize).await.map_err(errno)?),
+                data: Bytes::from(
+                    self.state
+                        .data
+                        .read(file.handle.clone(), offset, size as usize)
+                        .await
+                        .map_err(errno)?,
+                ),
             })
         })
         .await
@@ -617,9 +642,15 @@ where
             if !file.write {
                 return Err(libc::EACCES.into());
             }
-            let written = file
-                .io
-                .write(offset, Bytes::copy_from_slice(data), file.append)
+            let written = self
+                .state
+                .data
+                .write(
+                    file.handle.clone(),
+                    offset,
+                    Bytes::copy_from_slice(data),
+                    file.append,
+                )
                 .await
                 .map_err(errno)?;
             Ok(ReplyWrite {
@@ -632,7 +663,11 @@ where
     async fn flush(&self, _request: Request, inode: u64, fh: u64, _owner: u64) -> FuseResult<()> {
         diagnostics::with_operation("flush", async {
             let _span = diagnostics::Span::start("fuse.flush");
-            self.file(inode, fh)?.io.fsync().await.map_err(errno)
+            self.state
+                .data
+                .fsync(self.file(inode, fh)?.handle.clone())
+                .await
+                .map_err(errno)
         })
         .await
     }
@@ -646,7 +681,11 @@ where
     ) -> FuseResult<()> {
         diagnostics::with_operation("fsync", async {
             let _span = diagnostics::Span::start("fuse.fsync");
-            self.file(inode, fh)?.io.fsync().await.map_err(errno)
+            self.state
+                .data
+                .fsync(self.file(inode, fh)?.handle.clone())
+                .await
+                .map_err(errno)
         })
         .await
     }
@@ -664,7 +703,11 @@ where
             let _span = diagnostics::Span::start("fuse.release");
             let file = self.file(inode, fh)?;
             let result = if flush {
-                file.io.fsync().await.map_err(errno)
+                self.state
+                    .data
+                    .fsync(file.handle.clone())
+                    .await
+                    .map_err(errno)
             } else {
                 Ok(())
             };

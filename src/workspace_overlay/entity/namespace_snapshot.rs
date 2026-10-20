@@ -93,43 +93,34 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
 
     pub(super) async fn operation_keys(
         &self,
-        operation: &Operation,
+        request: &Request,
         ids: &BTreeSet<i64>,
     ) -> Result<Vec<Vec<u8>>> {
         let mut keys = BTreeSet::new();
         for ino in ids {
-            keys.extend([
-                self.keys.inode(*ino),
-                self.keys.xattr(*ino, ACCESS_XATTR),
-                self.keys.truncate(*ino),
-            ]);
-            if matches!(
-                operation,
-                Operation::Unlink { .. } | Operation::Rename { .. }
-            ) {
+            keys.insert(self.keys.inode(*ino));
+            if !matches!(request, Request::Stat(Target::Inode(_))) {
+                keys.insert(self.keys.xattr(*ino, ACCESS_XATTR));
+            }
+            if request.mutation() {
+                keys.insert(self.keys.truncate(*ino));
+            }
+            if matches!(request, Request::Unlink { .. } | Request::Rename { .. }) {
                 keys.insert(self.keys.orphan(*ino));
             }
         }
-        match operation {
-            Operation::Link { parent, name, .. } => {
-                self.parent_keys(*parent, &mut keys).await?;
-                keys.insert(self.keys.dentry(*parent, name));
+        for (parent, name) in request.paths() {
+            keys.extend(self.path_keys(parent, name).await?);
+        }
+        match request {
+            Request::Create(request, _) => {
+                keys.insert(self.keys.xattr(request.parent, DEFAULT_XATTR));
             }
-            Operation::Unlink { parent, .. } => {
-                self.parent_keys(*parent, &mut keys).await?;
-            }
-            Operation::Rename {
-                parent,
-                destination,
-                ..
-            } => {
-                self.parent_keys(*parent, &mut keys).await?;
-                self.parent_keys(*destination, &mut keys).await?;
-            }
-            Operation::Xattr { ino, name, .. } => {
+            Request::Readdir { ino } => self.parent_keys(*ino, &mut keys).await?,
+            Request::Xattr { ino, name, .. } => {
                 keys.insert(self.keys.xattr(*ino, name));
             }
-            Operation::Chmod { .. } => {}
+            _ => {}
         }
         Ok(keys.into_iter().collect())
     }

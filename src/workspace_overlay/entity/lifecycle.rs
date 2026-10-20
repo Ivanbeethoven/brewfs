@@ -341,7 +341,7 @@ impl<B: EntityBackend> Lifecycle<B> {
         };
         let initialize_slice_counter = snapshot.rows[7].is_none();
         let checks = checked_rows(&keys, snapshot.rows);
-        let authority = TransactionAuthority::from_validated(checks.clone(), None, None)?;
+        let authority = TransactionAuthority::from_validated(checks.clone(), None)?;
         let mut plan = EntityPlan {
             checks,
             writes: vec![
@@ -438,7 +438,7 @@ impl<B: EntityBackend> Lifecycle<B> {
         }
         let keys = self.authority_keys(session)?;
         let (_, lease, checks, _) = self.decode_runtime_rows(session, &keys, snapshot)?;
-        TransactionAuthority::from_validated(checks, None, Some(lease.expires_ns))
+        TransactionAuthority::from_validated(checks, Some(lease.expires_ns))
     }
 
     pub async fn authority(&self, session: &WriterSession) -> Result<TransactionAuthority> {
@@ -498,7 +498,7 @@ impl<B: EntityBackend> Lifecycle<B> {
         current.state = NamespaceState::Active;
         let checks = checked_rows(&keys, snapshot.rows);
         let authority =
-            TransactionAuthority::from_validated(checks.clone(), None, Some(lease.expires_ns))?;
+            TransactionAuthority::from_validated(checks.clone(), Some(lease.expires_ns))?;
         committed(
             self.backend
                 .commit(
@@ -531,7 +531,7 @@ impl<B: EntityBackend> Lifecycle<B> {
         }
         let (_, mut lease, checks, now_ns) = self.runtime_rows(session).await?;
         let authority =
-            TransactionAuthority::from_validated(checks.clone(), None, Some(lease.expires_ns))?;
+            TransactionAuthority::from_validated(checks.clone(), Some(lease.expires_ns))?;
         lease.expires_ns = now_ns.checked_add(ttl_ns).ok_or(EntityError::Overflow)?;
         committed(
             self.backend
@@ -587,7 +587,7 @@ impl<B: EntityBackend> Lifecycle<B> {
             expected: None,
         });
         let authority =
-            TransactionAuthority::from_validated(checks.clone(), None, Some(lease.expires_ns))?;
+            TransactionAuthority::from_validated(checks.clone(), Some(lease.expires_ns))?;
         descriptor.state = NamespaceState::Quiescent;
         descriptor.active_lease = None;
         committed(
@@ -649,7 +649,7 @@ impl<B: EntityBackend> Lifecycle<B> {
         }
         validate_pin(&snapshot.rows[3], &snapshot.rows[4], &descriptor)?;
         validate_registry(&snapshot.rows[5], &descriptor)?;
-        TransactionAuthority::from_validated(checked_rows(&keys, snapshot.rows), None, None)
+        TransactionAuthority::from_validated(checked_rows(&keys, snapshot.rows), None)
     }
 
     /// Bounded final discard for an already empty reference namespace. A general
@@ -836,7 +836,6 @@ impl<B: EntityBackend> Lifecycle<B> {
         descriptor.state = NamespaceState::Active;
         let authority = TransactionAuthority::from_validated(
             maintenance.checks.clone(),
-            None,
             Some(lease.expires_ns),
         )?;
         committed(

@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use super::{
     EntityError, Result,
     backend::{
-        CommitOutcome, CreateAllocation, EntityBackend, EntityPlan, RowCheck, RowSnapshot,
-        RowWrite, SliceAllocation, TransactionAuthority, add_bytes, next_counter, prepare_create,
+        CommitOutcome, CreateAllocation, EntityBackend, EntityPlan, RowSnapshot, RowWrite,
+        SliceAllocation, TransactionAuthority, add_bytes, next_counter, prepare_create,
         prepare_slices, validate_keys, validate_plan, validate_scan,
     },
 };
@@ -45,10 +45,53 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> EntityError {
     EntityError::Backend("memory entity backend lock poisoned".into())
 }
 
-fn matches(rows: &BTreeMap<Vec<u8>, Vec<u8>>, checks: &[RowCheck]) -> bool {
-    checks
-        .iter()
-        .all(|check| rows.get(&check.key) == check.expected.as_ref())
+impl State {
+    /// Check stored bounds and authority before any allocation or write. Keep
+    /// the byte count so generated keys participate in the same bound.
+    fn preflight(
+        &self,
+        authority: &TransactionAuthority,
+        plan: &EntityPlan,
+        extra_keys: &[&[u8]],
+    ) -> Result<Option<usize>> {
+        let mut stored_bytes = 0;
+        for key in authority
+            .checks
+            .iter()
+            .chain(&plan.checks)
+            .map(|check| check.key.as_slice())
+            .chain(plan.writes.iter().map(RowWrite::key))
+            .chain(extra_keys.iter().copied())
+        {
+            add_bytes(
+                &mut stored_bytes,
+                key,
+                self.rows.get(key).map(Vec::as_slice),
+            )?;
+        }
+        if !authority.allows_time(self.now_ns) {
+            return Err(EntityError::Fenced);
+        }
+        Ok(authority
+            .checks
+            .iter()
+            .chain(&plan.checks)
+            .all(|check| self.rows.get(&check.key) == check.expected.as_ref())
+            .then_some(stored_bytes))
+    }
+
+    fn apply(&mut self, writes: impl IntoIterator<Item = RowWrite>) {
+        for write in writes {
+            match write {
+                RowWrite::Put { key, value } => {
+                    self.rows.insert(key, value);
+                }
+                RowWrite::Delete { key } => {
+                    self.rows.remove(&key);
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -79,36 +122,10 @@ impl EntityBackend for MemoryEntityBackend {
     ) -> Result<CommitOutcome> {
         validate_plan(authority, plan)?;
         let mut state = self.state.lock().map_err(poisoned)?;
-        let mut stored_bytes = 0;
-        for key in authority
-            .checks
-            .iter()
-            .chain(&plan.checks)
-            .map(|check| check.key.as_slice())
-            .chain(plan.writes.iter().map(RowWrite::key))
-        {
-            add_bytes(
-                &mut stored_bytes,
-                key,
-                state.rows.get(key).map(Vec::as_slice),
-            )?;
-        }
-        if !authority.allows_time(state.now_ns) {
-            return Err(EntityError::Fenced);
-        }
-        if !matches(&state.rows, &authority.checks) || !matches(&state.rows, &plan.checks) {
+        if state.preflight(authority, plan, &[])?.is_none() {
             return Ok(CommitOutcome::Conflict);
         }
-        for write in &plan.writes {
-            match write {
-                RowWrite::Put { key, value } => {
-                    state.rows.insert(key.clone(), value.clone());
-                }
-                RowWrite::Delete { key } => {
-                    state.rows.remove(key);
-                }
-            }
-        }
+        state.apply(plan.writes.iter().cloned());
         Ok(CommitOutcome::Committed)
     }
 
@@ -120,30 +137,14 @@ impl EntityBackend for MemoryEntityBackend {
     ) -> Result<Option<i64>> {
         let prepared = prepare_create(authority, plan, create)?;
         let mut state = self.state.lock().map_err(poisoned)?;
-        let mut stored_bytes = 0;
-        for key in authority
-            .checks
-            .iter()
-            .chain(&plan.checks)
-            .map(|check| check.key.as_slice())
-            .chain(plan.writes.iter().map(RowWrite::key))
-            .chain([
-                prepared.counter_key.as_slice(),
-                prepared.dentry_key.as_slice(),
-            ])
-        {
-            add_bytes(
-                &mut stored_bytes,
-                key,
-                state.rows.get(key).map(Vec::as_slice),
-            )?;
-        }
-        if !authority.allows_time(state.now_ns) {
-            return Err(EntityError::Fenced);
-        }
-        if !matches(&state.rows, &authority.checks) || !matches(&state.rows, &plan.checks) {
+        let Some(mut stored_bytes) = state.preflight(
+            authority,
+            plan,
+            &[&prepared.counter_key, &prepared.dentry_key],
+        )?
+        else {
             return Ok(None);
-        }
+        };
         let current = state
             .rows
             .get(&prepared.counter_key)
@@ -171,16 +172,7 @@ impl EntityBackend for MemoryEntityBackend {
         });
         combined.writes.extend(generated);
         validate_plan(authority, &combined)?;
-        for write in combined.writes {
-            match write {
-                RowWrite::Put { key, value } => {
-                    state.rows.insert(key, value);
-                }
-                RowWrite::Delete { key } => {
-                    state.rows.remove(&key);
-                }
-            }
-        }
+        state.apply(combined.writes);
         Ok(Some(ino))
     }
 
@@ -191,25 +183,11 @@ impl EntityBackend for MemoryEntityBackend {
     ) -> Result<Option<Vec<u64>>> {
         let prepared = prepare_slices(authority, allocation)?;
         let mut state = self.state.lock().map_err(poisoned)?;
-        let mut stored_bytes = 0;
-        for key in authority
-            .checks
-            .iter()
-            .map(|check| check.key.as_slice())
-            .chain(std::iter::once(prepared.counter_key.as_slice()))
-        {
-            add_bytes(
-                &mut stored_bytes,
-                key,
-                state.rows.get(key).map(Vec::as_slice),
-            )?;
-        }
-        if !authority.allows_time(state.now_ns) {
-            return Err(EntityError::Fenced);
-        }
-        if !matches(&state.rows, &authority.checks) {
+        let Some(mut stored_bytes) =
+            state.preflight(authority, &EntityPlan::default(), &[&prepared.counter_key])?
+        else {
             return Ok(None);
-        }
+        };
         let mut counter = state
             .rows
             .get(&prepared.counter_key)
@@ -231,12 +209,7 @@ impl EntityBackend for MemoryEntityBackend {
         // The bounded canonical templates were validated before locking; every
         // generated identity/row has now been checked before the first mutation.
         state.rows.insert(prepared.counter_key, counter);
-        for write in writes {
-            let RowWrite::Put { key, value } = write else {
-                unreachable!()
-            };
-            state.rows.insert(key, value);
-        }
+        state.apply(writes);
         Ok(Some(ids))
     }
 
