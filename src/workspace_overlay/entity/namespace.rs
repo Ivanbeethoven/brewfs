@@ -30,6 +30,9 @@ const MAX_RETRIES: usize = 16;
 const MAX_ANCESTORS: usize = 256;
 const MAX_DIRECTORY_ROWS: usize = 4096;
 
+#[path = "namespace_mount.rs"]
+mod mount_ops;
+
 #[derive(Clone, Debug)]
 pub struct Credentials {
     pub uid: u32,
