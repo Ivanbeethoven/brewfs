@@ -9,7 +9,7 @@ a design supersession, not a measured performance rejection.
 
 The replacement is specified as **proposed, not implemented** in the
 [architecture](../../architecture/workspace-overlay.md) and
-[implementation spec](../specs/2026-08-23-brewfs-workspace-overlay-implementation-spec.md).
+[implementation spec](../specs/overlay-workspace.md).
 No large refactor is part of this documentation change.
 
 The experiment branch is `codex/overlay-write-r32-20261019`, based on `6b54270`.

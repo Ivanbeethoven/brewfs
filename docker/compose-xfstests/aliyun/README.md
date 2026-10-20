@@ -1,4 +1,4 @@
-<p align="center"><a href="https://github.com/juicedata/juicefs"><img alt="JuiceFS Logo" src="docs/en/images/juicefs-logo-new.svg" width="50%" /></a></p>
+<p align="center"><a href="https://github.com/juicedata/juicefs"><img alt="JuiceFS Logo" src="https://raw.githubusercontent.com/juicedata/juicefs/main/docs/en/images/juicefs-logo-new.svg" width="50%" /></a></p>
 <p align="center">
     <a href="https://github.com/juicedata/juicefs/releases/latest"><img alt="Latest Stable Release" src="https://img.shields.io/github/v/release/juicedata/juicefs" /></a>
     <a href="https://github.com/juicedata/juicefs/actions/workflows/unittests.yml"><img alt="GitHub Workflow Status" src="https://img.shields.io/github/actions/workflow/status/juicedata/juicefs/unittests.yml?branch=main&label=Unit%20Testing" /></a>
@@ -41,15 +41,15 @@ JuiceFS consists of three parts:
 2. **Data Storage**: Stores data, with supports of a variety of data storage media, e.g., local disk, public or private cloud Object Storage, and HDFS.
 3. **Metadata Engine**: Stores the corresponding metadata that contains information of file name, file size, permission group, creation and modification time and directory structure, etc., with supports of different metadata engines, e.g., Redis, MySQL, SQLite and TiKV.
 
-![JuiceFS Architecture](docs/en/images/juicefs-arch-new.png)
+![JuiceFS Architecture](https://raw.githubusercontent.com/juicedata/juicefs/main/docs/en/images/juicefs-arch-new.png)
 
 JuiceFS can store the metadata of file system on different metadata engines, like Redis, which is a fast, open-source, in-memory key-value data storage, particularly suitable for storing metadata; meanwhile, all the data will be stored in Object Storage through JuiceFS client. [Learn more](https://juicefs.com/docs/community/architecture)
 
-![data-structure-diagram](docs/en/images/data-structure-diagram.svg)
+![data-structure-diagram](https://raw.githubusercontent.com/juicedata/juicefs/main/docs/en/images/data-structure-diagram.svg)
 
 Each file stored in JuiceFS is split into **"Chunk"** s at a fixed size with the default upper limit of 64 MiB. Each Chunk is composed of one or more **"Slice"**(s), and the length of the slice varies depending on how the file is written. Each slice is composed of size-fixed **"Block"** s, which are 4 MiB by default. These blocks will be stored in Object Storage in the end; at the same time, the metadata information of the file and its Chunks, Slices, and Blocks will be stored in metadata engines via JuiceFS. [Learn more](https://juicefs.com/docs/community/architecture/#how-juicefs-store-files)
 
-![How JuiceFS stores your files](docs/en/images/how-juicefs-stores-files.svg)
+![How JuiceFS stores your files](https://raw.githubusercontent.com/juicedata/juicefs/main/docs/en/images/how-juicefs-stores-files.svg)
 
 When using JuiceFS, files will eventually be split into Chunks, Slices and Blocks and stored in Object Storage. Therefore, the source files stored in JuiceFS cannot be found in the file browser of the Object Storage platform; instead, there are only a chunks directory and a bunch of digitally numbered directories and files in the bucket. Don't panic! This is just the secret of the high-performance operation of JuiceFS!
 
@@ -123,13 +123,13 @@ Aside from the POSIX features covered by pjdfstest, JuiceFS also provides:
 
 JuiceFS provides a subcommand that can run a few basic benchmarks to help you understand how it works in your environment:
 
-![JuiceFS Bench](docs/en/images/juicefs-bench.png)
+![JuiceFS Bench](https://raw.githubusercontent.com/juicedata/juicefs/main/docs/en/images/juicefs-bench.png)
 
 ### Throughput
 
 A sequential read/write benchmark has also been performed on JuiceFS, [EFS](https://aws.amazon.com/efs) and [S3FS](https://github.com/s3fs-fuse/s3fs-fuse) by [fio](https://github.com/axboe/fio).
 
-![Sequential Read Write Benchmark](docs/en/images/sequential-read-write-benchmark.svg)
+![Sequential Read Write Benchmark](https://raw.githubusercontent.com/juicedata/juicefs/main/docs/en/images/sequential-read-write-benchmark.svg)
 
 Above result figure shows that JuiceFS can provide 10X more throughput than the other two (see [more details](https://juicefs.com/docs/community/fio)).
 
@@ -137,7 +137,7 @@ Above result figure shows that JuiceFS can provide 10X more throughput than the 
 
 A simple mdtest benchmark has been performed on JuiceFS, [EFS](https://aws.amazon.com/efs) and [S3FS](https://github.com/s3fs-fuse/s3fs-fuse) by [mdtest](https://github.com/hpc/ior).
 
-![Metadata Benchmark](docs/en/images/metadata-benchmark.svg)
+![Metadata Benchmark](https://raw.githubusercontent.com/juicedata/juicefs/main/docs/en/images/metadata-benchmark.svg)
 
 The result shows that JuiceFS can provide significantly more metadata IOPS than the other two (see [more details](https://juicefs.com/docs/community/mdtest)).
 
@@ -188,7 +188,7 @@ Welcome to join the [Discussions](https://github.com/juicedata/juicefs/discussio
 
 ## Usage Tracking
 
-JuiceFS collects **anonymous** usage data by default to help us better understand how the community is using JuiceFS. Only core metrics (e.g. version number) will be reported, and user data and any other sensitive data will not be included. The related code can be viewed [here](pkg/usage/usage.go).
+JuiceFS collects **anonymous** usage data by default to help us better understand how the community is using JuiceFS. Only core metrics (e.g. version number) will be reported, and user data and any other sensitive data will not be included. The related code can be viewed [here](https://github.com/juicedata/juicefs/blob/main/pkg/usage/usage.go).
 
 You could also disable reporting easily by command line option `--no-usage-report`:
 

@@ -32,7 +32,7 @@
 | upper/lower composition / packed lower 接线与发布 | 原语已实现 / P5 未完成 | `compose_overlay_plan` 单测不是 workspace+packed FUSE 端到端证据 |
 | symlink/xattr/ACL/hardlink placement | 未完成或不完整 | 不能把完整 POSIX 能力作为本阶段已验收前提 |
 
-参考代码：`src/workspace_overlay/packed_v3/{layout,group,meta,catalog,remote,readonly}.rs`、`src/chunk/read_plan.rs`。normative target 是 `doc/superpowers/specs/2026-09-27-brewfs-packed-metadata-v3-readonly-smallfiles.md`，以真实实现与检查表为准。
+参考代码：`src/workspace_overlay/packed_v3/{layout,group,meta,catalog,remote,readonly}.rs`、`src/chunk/read_plan.rs`。normative target 是 `doc/superpowers/specs/packed-meta.md`，以真实实现与检查表为准。
 
 ## 2. 优先解释 dynamic block 与 packed metadata 的耦合
 
