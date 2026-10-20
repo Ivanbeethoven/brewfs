@@ -11,10 +11,11 @@ documentation on `codex/packed-metadata-aliyun-20260930`.
 Its actual design, validation gaps and reproduction commands remain in the
 [r31 delivery handoff](../superpowers/plans/2026-10-17-overlay-no-seal-handoff.md).
 The unvalidated r32 candidate has been dropped in favor of this direction.
-The isolated `workspace-entity-v1` reference implementation lives on
+The isolated `workspace-entity-v1` implementation lives on
 `codex/overlay-entity-namespace-20261019`, branched from `b6f297e`.
 The integration branch remains unchanged. See the
 [stage 2 checkpoint](../superpowers/plans/2026-10-19-overlay-entity-stage2.md)
+and [file-I/O continuation](../superpowers/plans/2026-10-20-overlay-entity-data.md)
 for implemented APIs, exact gates and remaining admission requirements.
 There is no conversion, production mount or replacement performance result.
 
@@ -25,6 +26,21 @@ Missing upper entries fall through to the lower; explicit tombstones suppress
 that fallback. Metadata changes and new data slices belong to the upper.
 Creating a workspace pins its lower and creates an empty namespace; it does
 not copy the lower's metadata or data.
+
+The experimental packed adapter authenticates the manifest key/digest, root
+inode and maximum inode before exposing metadata or payloads. First attach
+promotes a live packed reader pin into a durable owner for the volume and
+namespace; reopening reconstructs that owner from persistent metadata. These
+owners participate in the existing packed/native collector census and its root
+generation CAS. They survive reader-lease expiry and are released only with a
+terminal deletion proof after upper cleanup. The current bridge admits at most
+256 active owners per store and retains terminal owner tombstones; creating a
+new owner still requires a live source reader pin.
+
+The experimental SDK uses trusted adapter composition. Callers must pair the
+packed owner with the same volume, namespace, lower binding and authoritative
+metadata backends used by the entity lifecycle. A production factory enforcing
+that pairing and reader quiescence remains an admission requirement.
 
 Keep sole-writer lease safety, atomic namespace operations, crash consistency,
 correct object reclamation and fsync durability. Preserve ordinary permissions,
@@ -223,6 +239,19 @@ configured metadata/object-store persistence policy. A successful Redis reply
 alone is not a universal power-loss guarantee. Lost commit replies require
 reconciliation or a proven idempotent operation, never blind replay.
 
+Strict entity uploads use the production S3 adapter's conditional-create
+capability. The new packed-lower, upper-data and VFS object-I/O tests use an
+isolated RustFS service through the shared `entity/test_objects.rs` helper.
+Memory backends remain suitable for metadata transactions and fault injection;
+temporary local files hold producer metadata spools only. These service tests
+are ignored in the default suite and must be selected with `--include-ignored`;
+missing explicit service configuration fails the test. The real-service gate
+passes six packed-lower, 78 entity and two VFS tests; exact evidence and remaining
+qualification gaps are in the file-I/O continuation.
+Metadata recovery oracles and actual object-I/O tests have separate coverage;
+they do not yet qualify a complete Redis entity + real packed lower + VFS
+stack, physical packed-graph retirement, or recovery after process/host failure.
+
 ## Export, diff and lifecycle
 
 Pin one immutable lower when creating a workspace. Discard first fences the
@@ -252,11 +281,13 @@ a canonical writable-layer digest is no longer an identity contract.
    atomic namespace operations behind explicit new-format dispatch. Establish
    lower pins, pending uploads, object ownership, deletion reservations and
    orphan recovery before admitting writes. Keep old format operational.
-   The current experiment implements a bounded reference namespace and Redis
-   substrate. Its lower registry is not yet connected to legacy packed-object
-   collectors, and its lower interface is not a production packed adapter.
-   Consequently production mount/write admission stays closed. Reference
-   operations require their namespace lower owner and active writer authority.
+   The experiment includes a bounded namespace/Redis substrate, an authenticated
+   packed adapter and durable lower owners in the existing collector census.
+   Its file-I/O continuation adds write-through current maps, an explicit VFS
+   handle dispatch and bounded truncate/discard/orphan recovery. Production
+   mount admission stays closed: external crash-takeover authority, paginated
+   production cleanup and full mounted qualification remain outstanding.
+   Operations require their namespace lower owner and active writer authority.
 3. **Correctness before conversion.** Validate O_EXCL, rename/hardlinks,
    permissions, same-inode overlap, shrink/extend, fsync, cancellation, lease
    expiry and GC/reference races with crash injection. Qualify every supported

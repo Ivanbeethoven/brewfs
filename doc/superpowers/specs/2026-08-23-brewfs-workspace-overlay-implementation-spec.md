@@ -1,11 +1,12 @@
 # BrewFS Workspace Overlay implementation specification
 
-Updated 2026-10-20. **Status: stage 2 reference implementation on an experiment
+Updated 2026-10-20. **Status: stage 2 implementation on an experiment
 branch; production mount admission remains disabled.**
 This specification replaces the previous mutable-layer log design as the target
 for staged implementation. The
-[stage 2 checkpoint](../plans/2026-10-19-overlay-entity-stage2.md) distinguishes
-implemented reference APIs from the remaining production behavior below.
+[stage 2 checkpoint](../plans/2026-10-19-overlay-entity-stage2.md) and
+[file-I/O continuation](../plans/2026-10-20-overlay-entity-data.md) distinguish
+implemented APIs from the remaining production behavior below.
 No completed schema migration or new mounted data path is claimed.
 
 The shipped baseline remains r31, PR #41 (`0d4e36c`), with its delivery documents
@@ -354,6 +355,15 @@ lower owners. Removing 99 of 100 workspace owners cannot free the shared lower.
 Namespace destruction releases its lower owner only after its upper references,
 open handles, pending reads and recovery obligations are resolved.
 
+The experimental SDK's trusted constructors require the packed owner's volume
+and namespace IDs to match `EntityKeys`, with the same lower binding and
+authoritative entity/packed backend pairing. Terminal deletion proof must come
+from that same entity namespace backend. The generic lower trait checks the
+manifest binding but does not enforce owner namespace identity. A production
+factory must enforce these preconditions before admission. Standalone packed
+adapter reads outside an entity session must be quiesced by their caller before
+releasing the owner.
+
 If publication includes upper data in a new lower, establish the new immutable
 owner **before** dropping any old upper owner. Record and recover that transfer
 with a bounded durable publication intent. Never briefly drive the object's
@@ -454,11 +464,26 @@ The fsync barrier is scoped to the file, or to an explicitly documented
 directory durability boundary. It is not a flush/order barrier across unrelated
 workspace files and must not recreate the removed global serialization point.
 
+The experiment uses synchronous upload-before-publication, one current chunk
+per transaction. A multi-chunk write returns only its acknowledged prefix;
+upload/publication uncertainty remains a session-shared file error for fsync,
+including after caller cancellation or constructing another adapter. A rejected
+pre-effect argument does not poison fsync. File operations retain the same
+inode lock through I/O and use owned tasks once effects can begin. Ordinary
+close releases a handle; it is not a durability acknowledgment for a canceled
+operation, whose task and admission remain alive independently.
+
+Strict entity PUT is a separate backend capability. S3 must support conditional creation;
+the legacy OSS unconditional overwrite fallback is forbidden here. The configured
+S3 durability and Redis persistence/replication policy remain external contracts.
+Standalone Redis tests with persistence disabled prove transactions/replay, not
+host-power-loss durability.
+
 | Failure point | Required result |
 | --- | --- |
-| Upload succeeds; metadata fails/fences | No live map references it; durable staging/orphan owner enables eventual cleanup |
+| Upload succeeds; metadata explicitly aborts/fences | No live map references it; durable staging/orphan owner enables eventual cleanup |
 | Map/refcount transaction aborts | Both old map and old ownership remain authoritative |
-| Commit result is uncertain | Resolve using operation/entity identity or return uncertainty; never blindly replay refcount deltas |
+| Commit result is uncertain | The map may already reference the durable object; resolve using operation/entity identity or return uncertainty, never blindly replay refcount deltas |
 | Crash after map/refcount commit | New mapping and its owners recover together |
 | Crash during truncate | Visible cut remains authoritative; cleanup resumes before extension/write |
 | Crash after GC reservation | New owners remain excluded; physical deletion resumes idempotently |
@@ -513,8 +538,10 @@ Expose operations in terms of current entities and ownership, not
 `VersionedMutation` templates tied to an expected layer pair. The implementation
 should have bounded point reads and operation-specific atomic mutations for
 namespace, inode/ACL, chunk replacement, ownership and lifecycle state.
-The stage 2 `EntityBackend` provides bounded row transactions for the reference
-namespace. Production operation/VFS integration remains a separate stage.
+The stage 2 `EntityBackend` provides bounded row transactions for the namespace.
+`EntityData` implements current-map file operations and the existing VFS file
+APIs dispatch explicitly through `EntityFileIo`. Mount admission remains a
+separate qualification.
 
 Redis is the primary implementation target, using bounded binary-safe scripts
 in one volume hash slot and backend `TIME` for lease checks. TiKV must implement
@@ -524,9 +551,15 @@ unimplemented and unqualified. Unsupported capabilities must fail
 explicitly rather than run an unsafe partial protocol. Live Redis validation
 does not imply TiKV or SQLite migration support is complete.
 
-Continue using the existing neutral prepared/unified read-plan seam for upper
-slice, packed LowerRange and Hole execution. Plans preserve logical and object
-offsets, hardlinks, raw names and bounded memory. Fully covered upper reads need
+The current implementation uses the existing authenticated packed reader for
+LowerRange and a separate current-map executor for upper Data and Hole spans.
+The legacy unified provider's generation type contains head/sequence fields;
+entity handles do not manufacture those fields. The explicit handle dispatch
+preserves logical and object offsets, hardlinks, raw names and bounded memory.
+Entity handles stay outside native inode-number indexes; unsupported fallocate
+and copy-file-range handle operations fail closed. FUSE callbacks accepting live
+entity handles reject them before native inode/cache/lock effects; this SDK seam
+does not admit entity mounts. Fully covered upper reads need
 no lower payload fetch. Zero spans perform no object request. The ordinary flat
 slice cache/compactor must not reinterpret these workspace plans.
 
@@ -540,8 +573,9 @@ not justification for reinstating a workspace-wide CAS on every write.
 Each stage has its own reviewable result. Stage 2 is now an isolated experiment
 on `codex/overlay-entity-namespace-20261019` from `b6f297e`; see the
 [implementation checkpoint](../plans/2026-10-19-overlay-entity-stage2.md).
-The reference namespace and Redis transaction substrate do not admit production
-mounts. The production stage 3 path and stages 4–7 remain unimplemented.
+The namespace, Redis transactions, packed adapter and experimental VFS file
+dispatch do not admit production mounts. Stage 3's full mount integration and
+qualification, and stages 4–7, remain unfinished.
 
 1. **Preserve the baseline and finish design review.** Keep r31 code/format and
    accepted artifacts. Drop unvalidated r32 code; preserve diagnostics and
@@ -589,6 +623,31 @@ version. Migration journals/checkpoints and exported-object checksums do not
 restore a global runtime mutation log or digest.
 
 ## 16. Validation and performance evidence
+
+New object-I/O tests use the production `S3Backend` against an isolated RustFS
+service through `entity/test_objects.rs`. The helper requires an explicit
+loopback `BREWFS_PACKED_GRAPH_TEST_S3_ENDPOINT`, a UUID-named isolated
+`BREWFS_PACKED_GRAPH_TEST_S3_BUCKET`, and runner-provided AWS credentials;
+Redis integration also requires `BREWFS_TEST_REDIS_URL`. It disables mutation
+replay and gives fixtures unique object keys in the runner-owned bucket.
+Memory metadata backends provide deterministic transaction/fault injection;
+local temporary directories are limited to producer metadata spools. LocalFS
+does not supply the new entity durability capability or its object-I/O evidence.
+Service tests are ignored by default and must run with `--include-ignored` in
+the real-service gate. Selecting them without configuration fails explicitly.
+The RustFS/Redis gate passes six packed-lower, 78 entity and two VFS tests, with
+zero failed or ignored in those selected suites. The
+[file-I/O continuation](../plans/2026-10-20-overlay-entity-data.md) records the
+source snapshot, exact commands, artifacts and remaining qualification gaps.
+
+The recovery fault oracles exercise metadata and simulated byte/deletion
+state; separate RustFS fixtures exercise object requests. Packed-lower tests
+use memory entity metadata even when their packed owner/census is in Redis;
+Redis entity data/VFS tests use a synthetic lower. This is not qualification of
+the combined Redis entity, real packed lower and VFS stack, physical packed
+graph retirement, or process/host crash recovery. Local maintenance tokens
+prove a drain in the surviving process only. External process-takeover
+authority remains unimplemented, and lease expiry alone cannot supply it.
 
 Before acceptance, prove at least:
 
@@ -654,8 +713,11 @@ total-order-replay contract and removes live mutable-layer digest identity.
 Upper-only diff candidates remain available. These are explicit tradeoffs;
 they do not assert that the shipped layout was a complete replay log.
 
-The stage 2 experiment adds a separately dispatched `workspace-entity-v1`
-reference namespace. Existing-format runtime behavior and integration history
-remain unchanged. Production packed ownership, VFS data publication, truncate
-recovery, fsync and conversion remain future work with separate evidence;
-neither the reference model nor its gates are performance acceptance.
+The stage 2 experiment adds separately dispatched `workspace-entity-v1`
+namespace and file APIs. Packed ownership joins the existing collector census;
+entity writes use current maps and strict durable uploads, and truncate has a
+replayable inode-local intent. The experimental VFS handle path keeps entity
+handles out of native inode indexes and rejects unsupported handle operations.
+CLI mounts remain disabled. External crash-takeover authority, production
+pagination, full mounted/POSIX qualification and conversion still require
+separate work. These correctness gates are not performance acceptance.

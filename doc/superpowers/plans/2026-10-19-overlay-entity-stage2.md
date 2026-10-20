@@ -2,6 +2,11 @@
 
 Updated 2026-10-20 (Asia/Shanghai).
 
+Historical checkpoint for `1c55148`. The
+[file-I/O continuation](2026-10-20-overlay-entity-data.md) records subsequent
+packed-object integration, file operations and recovery; the evidence and
+unimplemented boundaries below describe this earlier snapshot.
+
 Experiment branch: `codex/overlay-entity-namespace-20261019`, based on `b6f297e`.
 Integration branch: `codex/packed-metadata-aliyun-20260930`, unchanged.
 This is correctness work. No performance benchmark or performance claim belongs
