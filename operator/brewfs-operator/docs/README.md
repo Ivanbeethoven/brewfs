@@ -4,7 +4,7 @@
 
 ## 文档导航
 
-- `../../../doc/superpowers/specs/2026-09-03-brewfs-workspace-operator-lifecycle-spec.md`
+- `../../../doc/superpowers/specs/overlay-workspace.md#operator-lifecycle-reference`
   - Workspace Operator 的 CRD、生命周期、lower 不可变保护、finalizer 和实现验收规范。
 
 - `architecture.md`

@@ -2,7 +2,7 @@
 
 Status: **entity experiment with opt-in benchmark mount wiring; production
 mount remains disabled** (2026-10-20).
-This document and the [implementation spec](../superpowers/specs/2026-08-23-brewfs-workspace-overlay-implementation-spec.md)
+This document and the [implementation spec](../superpowers/specs/overlay-workspace.md)
 now specify an ordinary per-entity writable namespace over one immutable packed
 lower. They supersede the previous mutation/version architecture as the target,
 not as a claim about the current binary.

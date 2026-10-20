@@ -221,10 +221,10 @@ gate05 的 overlay 4 项真实失败已保留并经两处测试修正、定向�
 
 | 规范 | 必须关闭的出口 | 当前可引用的证据 / 未完成边界 |
 | --- | --- | --- |
-| [workspace-overlay implementation](../specs/2026-08-23-brewfs-workspace-overlay-implementation-spec.md) | 适用于 v3 的生命周期 DoD：Redis/TiKV 独立实例 CAS、真实 sibling mounts、POSIX、fencing、seal/commit crash、reachability GC | native 生命周期已有代码与库测试；需接 v3 binding/fallback/publication；旧 default-flat 兼容不再验收 |
-| [operator lifecycle](../specs/2026-09-03-brewfs-workspace-operator-lifecycle-spec.md) | v3 workspace/mount/snapshot、权限/lease/finalizer/audit、Redis/TiKV Kubernetes E2E 和文件系统回归 | 必需 v3 capability/binding/conditions 与后端证据开放；旧 flat CR 兼容移出范围 |
-| [large-directory](../specs/2026-09-22-brewfs-packed-metadata-large-directory.md) | v3 restart/raw names、union/collision、稳定 cookie eviction/refetch、hot protection、活动 inode生命周期和有界扫描 | IP06 prefix rank/weighted select 已实现，库 GET-budget 与历史36k分页/重启子项已有证据；真实 cookie eviction/refetch、typed GET、hot protection、更大规模与完整内存出口仍开放 |
-| [packed v3 readonly smallfiles](../specs/2026-09-27-brewfs-packed-metadata-v3-readonly-smallfiles.md) | §12、P0–P6 与 G01–G17 中 v3 全部要求；source/POSIX/sparse/large、认证、metrics/budget、同 executor、pipeline、binding/fence/publication/recovery/GC、布局控制/runner/性能与交付 | bounded namespace和external已签收；完整POSIX/frozen view、读取预算与mutable packed继续开放；历史 wire 兼容不再必需 |
+| [workspace-overlay implementation](../specs/overlay-workspace.md) | 适用于 v3 的生命周期 DoD：Redis/TiKV 独立实例 CAS、真实 sibling mounts、POSIX、fencing、seal/commit crash、reachability GC | native 生命周期已有代码与库测试；需接 v3 binding/fallback/publication；旧 default-flat 兼容不再验收 |
+| [operator lifecycle](../specs/overlay-workspace.md#operator-lifecycle-reference) | v3 workspace/mount/snapshot、权限/lease/finalizer/audit、Redis/TiKV Kubernetes E2E 和文件系统回归 | 必需 v3 capability/binding/conditions 与后端证据开放；旧 flat CR 兼容移出范围 |
+| [large-directory](../specs/packed-meta.md#historical-large-directory-design) | v3 restart/raw names、union/collision、稳定 cookie eviction/refetch、hot protection、活动 inode生命周期和有界扫描 | IP06 prefix rank/weighted select 已实现，库 GET-budget 与历史36k分页/重启子项已有证据；真实 cookie eviction/refetch、typed GET、hot protection、更大规模与完整内存出口仍开放 |
+| [packed v3 readonly smallfiles](../specs/packed-meta.md) | §12、P0–P6 与 G01–G17 中 v3 全部要求；source/POSIX/sparse/large、认证、metrics/budget、同 executor、pipeline、binding/fence/publication/recovery/GC、布局控制/runner/性能与交付 | bounded namespace和external已签收；完整POSIX/frozen view、读取预算与mutable packed继续开放；历史 wire 兼容不再必需 |
 
 v2 的 archive adapters、Data Seal、独立 WAL/session、multipart resume 和 v2 FUSE/规模
 出口移出目标；v3 自身的一致 source、持久 publication/recovery 和预算要求仍必须完成。

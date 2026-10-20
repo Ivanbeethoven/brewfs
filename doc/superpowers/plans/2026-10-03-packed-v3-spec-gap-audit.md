@@ -113,7 +113,7 @@ data blocks、overlay workspace 三个创新点的实验。本文是完成清单
 接口记为端到端实现。对应实验见
 [三创新实验方案](2026-10-03-brewfs-three-innovations-experiment-plan.md)。
 
-主规范为 [packed-v3 SPEC](../specs/2026-09-27-brewfs-packed-metadata-v3-readonly-smallfiles.md)，
+主规范为 [packed-v3 SPEC](../specs/packed-meta.md)，
 关联large-directory、workspace/operator的v3完成契约也在审计范围。独立v2产品与
 旧wire/bincode/CR兼容不再是出口；历史版本记录不能约束当前v3实现。
 
