@@ -170,7 +170,11 @@ done <<<"$service_ids" >"$run_dir/backend-image-ids.txt"
 for filter in "${filters[@]}"; do
     export BREWFS_PACKED_GRAPH_TEST_S3_BUCKET="brewfs-graph-test-$(python3 -c 'import uuid; print(uuid.uuid4())')"
     slug="${filter//::/-}"
-    command=(cargo test -p brewfs --features workspace-overlay --lib "$filter" -- --include-ignored --test-threads=1)
+    # Match the mandatory workspace test target/feature graph. Selecting only
+    # brewfs omits brewfs-stats -> crossterm -> mio default/log features and
+    # produces a second full library test executable. Other targets have no
+    # matching cases; the parser below permits their empty suite summaries.
+    command=(cargo test --workspace --features workspace-overlay --lib --bins "$filter" -- --include-ignored --test-threads=1)
     printf '%q ' "${command[@]}" >>"$run_dir/commands.log"
     printf '\n' >>"$run_dir/commands.log"
     printf '[entity-data] running %s; log=%s/%s.log\n' "$filter" "$run_dir" "$slug"
@@ -183,10 +187,17 @@ for filter in "${filters[@]}"; do
         if passed="$(python3 - "$run_dir/$slug.log" <<'PY'
 import pathlib, re, sys
 text = pathlib.Path(sys.argv[1]).read_text()
-matches = re.findall(r'test result: ok\. (\d+) passed; 0 failed; 0 ignored;', text)
-if len(matches) != 1 or int(matches[0]) == 0:
-    sys.exit('expected one nonempty test suite with no failed or ignored tests')
-print(matches[0])
+summaries = re.findall(r'^test result:.*$', text, re.MULTILINE)
+matches = re.findall(
+    r'^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; '
+    r'\d+ measured; \d+ filtered out; finished in \d+(?:\.\d+)?s$', text, re.MULTILINE,
+)
+positive = [int(passed) for _, passed, _, _ in matches if int(passed) > 0]
+if (len(matches) != len(summaries) or len(positive) != 1
+        or any(status != 'ok' or int(failed) or int(ignored)
+               for status, _, failed, ignored in matches)):
+    sys.exit('expected one nonempty successful suite and only empty successful companions, with no failed or ignored tests')
+print(positive[0])
 PY
 )"; then :; else result=1; passed=0; fi
     fi
