@@ -5,6 +5,7 @@
 
 pub mod backend;
 pub mod codec;
+pub mod data;
 pub mod keys;
 pub mod lifecycle;
 pub mod memory;
@@ -17,6 +18,8 @@ pub mod resolver;
 
 #[cfg(test)]
 mod namespace_tests;
+#[cfg(test)]
+pub(crate) mod test_objects;
 
 pub type Result<T> = std::result::Result<T, EntityError>;
 
