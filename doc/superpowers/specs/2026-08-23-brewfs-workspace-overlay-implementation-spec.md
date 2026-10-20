@@ -1,13 +1,16 @@
 # BrewFS Workspace Overlay implementation specification
 
-Updated 2026-10-20. **Status: stage 2 implementation on an experiment
-branch; production mount admission remains disabled.**
+Updated 2026-10-20. **Status: entity experiment with opt-in benchmark mount
+wiring; production mount admission remains disabled.**
 This specification replaces the previous mutable-layer log design as the target
 for staged implementation. The
 [stage 2 checkpoint](../plans/2026-10-19-overlay-entity-stage2.md) and
 [file-I/O continuation](../plans/2026-10-20-overlay-entity-data.md) distinguish
-implemented APIs from the remaining production behavior below.
-No completed schema migration or new mounted data path is claimed.
+implemented APIs from the remaining production behavior below. The
+[mount experiment checkpoint](../plans/2026-10-20-overlay-entity-mount.md) records
+the subsequent fresh-fixture bootstrap and dedicated FUSE adapter, including
+their separate validation status. No completed schema migration or qualified
+production mount is claimed.
 
 The shipped baseline remains r31, PR #41 (`0d4e36c`), with its delivery documents
 in `6b54270` on `codex/packed-metadata-aliyun-20260930`. That implementation uses
@@ -359,10 +362,13 @@ The experimental SDK's trusted constructors require the packed owner's volume
 and namespace IDs to match `EntityKeys`, with the same lower binding and
 authoritative entity/packed backend pairing. Terminal deletion proof must come
 from that same entity namespace backend. The generic lower trait checks the
-manifest binding but does not enforce owner namespace identity. A production
-factory must enforce these preconditions before admission. Standalone packed
+manifest binding but does not enforce owner namespace identity. Enforced
+production factory pairing is absent from the experiment. Standalone packed
 adapter reads outside an entity session must be quiesced by their caller before
-releasing the owner.
+releasing the owner. The crate-private benchmark bootstrap passes one supplied
+volume/namespace/binding to the existing constructors and uses the supplied
+Redis URL for both adapters. This is trusted fixture wiring; it does not add
+enforced backend pairing, an owner-identity hook or an external-writer check.
 
 If publication includes upper data in a new lower, establish the new immutable
 owner **before** dropping any old upper owner. Record and recover that transfer
@@ -500,6 +506,40 @@ Mount selects the explicit upper layout, validates its descriptor and immutable
 lower, acquires the sole-writer authority, recovers pending obligations, then
 admits operations. Partial mount failure releases only resources it owns.
 
+The minimal mounted experiment is narrower than that production contract.
+`entity/experiment.rs` exposes crate-private `RedisEntityExperiment` and
+`ExperimentalEntityMount` wiring for an unused packed catalog and fresh entity
+namespace. The CLI selects `--volume-format workspace-entity-v1` with
+`--experimental-entity-mount`, a packed manifest key, a non-nil
+`--entity-volume-id` and a non-nil workspace UUID. Manifest/workspace inputs
+may use their existing configuration sources. `--workspace-namespace` is
+optional and defaults to `brewfs`; the selected scope must be unused, and the
+isolated harness supplies a fresh scope explicitly. Without opt-in, entity
+mount dispatch fails closed.
+The caller supplies a standalone packed graph in a dedicated experimental
+object bucket and unused metadata scopes. These are fixture preconditions, not
+evidence that another catalog's writers/readers have stopped.
+
+Bootstrap uses the existing authenticated manifest/max-inode reader, creates a
+private packed catalog, takes its setup lease, installs the packed lower and
+acquires a source reader pin. `PackedLower::open` promotes that pin to the
+existing durable lower owner for the selected volume and namespace. The source
+pin is released, `Lifecycle` provisions/acquires the entity writer, and the
+setup lease is released before exposing namespace/data handles. The retained
+source catalog is an administrative lower root, not a shared head on the entity
+write path. Uncertain failures retain protection conservatively; this wrapper
+does not implement general rollback/cleanup reconciliation.
+
+The mount renews the writer lease through the existing lifecycle API. Orderly
+unmount first stops FUSE request admission and drops the adapter's handle
+registry, then calls the existing session drain/maintenance transition. This
+wrapper retains upper data, lower ownership and source catalog records and
+provides no reopen, resume or discard operation. The isolated benchmark harness
+owns teardown of its services, volumes and bucket. No crash takeover, combined
+stack fault qualification, offline conversion, cutover, pairing enforcement or
+production pagination is added by this wiring. Ordinary production admission
+remains disabled.
+
 Fork from an existing immutable lower creates a descriptor, empty upper and
 lower owner in a bounded metadata operation. Fork from an active mutable
 workspace is not introduced. Discard uses the fenced namespace-deletion process
@@ -559,7 +599,10 @@ preserves logical and object offsets, hardlinks, raw names and bounded memory.
 Entity handles stay outside native inode-number indexes; unsupported fallocate
 and copy-file-range handle operations fail closed. FUSE callbacks accepting live
 entity handles reject them before native inode/cache/lock effects; this SDK seam
-does not admit entity mounts. Fully covered upper reads need
+does not admit entity mounts. A separate experimental `EntityFuse` adapter
+accepts the explicitly supplied entity namespace/data/root for the benchmark
+mount; it does not reinterpret the SDK/native FUSE callbacks as entity-safe or
+enforce production admission. Fully covered upper reads need
 no lower payload fetch. Zero spans perform no object request. The ordinary flat
 slice cache/compactor must not reinterpret these workspace plans.
 
@@ -568,55 +611,40 @@ scan an entire namespace for each call or substitute fabricated zero usage.
 Until supported, retain an explicit unsupported result. Usage accounting is
 not justification for reinstating a workspace-wide CAS on every write.
 
-## 15. Staged migration and removal
+## 15. Experiment stages and deferred migration
 
 Each stage has its own reviewable result. Stage 2 is now an isolated experiment
 on `codex/overlay-entity-namespace-20261019` from `b6f297e`; see the
 [implementation checkpoint](../plans/2026-10-19-overlay-entity-stage2.md).
 The namespace, Redis transactions, packed adapter and experimental VFS file
-dispatch do not admit production mounts. Stage 3's full mount integration and
-qualification, and stages 4–7, remain unfinished.
+dispatch do not admit production mounts. Stage 3 now has a minimal fresh-fixture
+mount experiment, tracked in its own checkpoint. This stage is fresh-only:
+importer, ownership migration and cutover are explicitly deferred. The remaining
+production-admission limits below are not tasks for this benchmark stage.
 
-1. **Preserve the baseline and finish design review.** Keep r31 code/format and
-   accepted artifacts. Drop unvalidated r32 code; preserve diagnostics and
-   incomplete gate evidence. Agree on namespace placement, ownership units,
-   quiescence/retirement proofs, transaction limits and the new format marker.
-2. **Reference model and schema.** Implement current entity/map resolution and
-   ownership transitions behind a new capability/layout, disabled for existing
-   workspaces. Prove holes, truncate, hardlinks, refcount idempotency and lease
-   fencing with fault injection before a production mount uses it.
-3. **Plain backend/VFS path.** Implement operation-specific transactions and
-   the existing read/write seam, without old group-commit/head-CAS adapters.
-   Validate Redis first; separately implement/validate other backend contracts.
-   Complete correctness/local gates and real-mount checks before performance.
-4. **Offline importer.** Hold the workspace's own administrative lease, reject
-   mounts and drain pending writes. Read the old effective union with the old
-   resolver, decoding old sequences only inside this importer. Produce current
-   inodes/dentries/whiteouts/xattrs and complete normalized chunk maps in a fresh
-   namespace. Reuse immutable data objects; do not re-upload lower/file payloads
-   merely to change metadata representation.
-5. **Ownership-first validation.** Seed all new upper owners and the lower pin
-   before the new namespace can be selected or old owners released. Record
-   resumable migration progress. Compare effective namespace, attributes,
-   hardlinks, holes/truncate behavior, normalized ranges and payload bytes at
-   documented coverage. Counts or old/new digest equality alone are insufficient.
-6. **Atomic cutover and acceptance.** With no mounted writer/readers, atomically
-   select the validated new namespace/layout under administrative authority.
-   Old binaries must reject it. Keep the old namespace and its GC protection
-   until acceptance and the rollback boundary are explicitly resolved. Run the
-   concurrency/lease/GC oracles, CI, actual mount and matched performance gates.
-7. **Retire old ownership and code.** Fence old writers/collectors, release old
-   owners in bounded idempotent cleanup, then delete old namespace records.
-   Remove sequence log/digest/head-CAS/group-commit/census code from the new path;
-   keep any remaining legacy reader/importer support explicitly isolated until
-   no format needs it. Do not remove the old GC proof before ownership migration.
-
-Before new-format writes, an offline rollback may restore the preserved old
-namespace after fencing the new one and releasing only its verified extra
-owners. **After any new-format writes, pointer rewind would lose data.** Rollback
-then requires a separately validated reverse export/migration of current state,
-or remains unsupported. Recovery never guesses which namespace contains the
-latest accepted mutation.
+1. **Preserved baseline and format boundary.** R31 code/format and accepted
+   artifacts remain the baseline. Unvalidated r32 source was dropped; its
+   diagnostics and incomplete gate evidence remain archived.
+2. **Reference model and schema.** Current entity/map resolution and ownership
+   transitions are implemented behind separate format dispatch. The stage 2
+   and file-I/O checkpoints record their reference-model, metadata and service
+   test coverage; those API-stage results do not qualify a production mount.
+3. **Fresh-only backend/FUSE experiment: current scope.** The dedicated adapter
+   uses operation-specific namespace/data APIs without old group-commit/head-CAS
+   adapters. Its normal mounted probe, local gate and matched performance runs
+   have their own checkpoint. This stage adds no fault-injection or broader
+   production-admission work.
+4. **Offline importer: DEFERRED.** No importer or adoption of existing mutable
+   workspaces is implemented. The experiment bootstraps only fresh fixtures.
+5. **Ownership migration/validation: DEFERRED.** No transfer from an old catalog,
+   migration checkpoint or old/new semantic comparison is implemented.
+6. **Atomic cutover/rollback: DEFERRED.** There is no descriptor format switch,
+   migration recovery or reverse export. **After new-format writes, pointer
+   rewind would lose data.** This experiment provides no rollback to r31.
+7. **Production qualification and retirement: DEFERRED.** Enforced pairing,
+   external crash-takeover authority, paginated production cleanup, full
+   mounted/POSIX qualification and retirement of old owners remain limitations.
+   The experiment leaves existing ownership and legacy code in place.
 
 The schema/namespace selector is administrative identity, not a new hot head
 version. Migration journals/checkpoints and exported-object checksums do not
@@ -635,10 +663,13 @@ local temporary directories are limited to producer metadata spools. LocalFS
 does not supply the new entity durability capability or its object-I/O evidence.
 Service tests are ignored by default and must run with `--include-ignored` in
 the real-service gate. Selecting them without configuration fails explicitly.
-The RustFS/Redis gate passes six packed-lower, 78 entity and two VFS tests, with
-zero failed or ignored in those selected suites. The
+The RustFS/Redis gate passed six packed-lower, 78 entity and two VFS tests at its
+recorded API-stage source snapshot, with zero failed or ignored in those
+selected suites. The
 [file-I/O continuation](../plans/2026-10-20-overlay-entity-data.md) records the
 source snapshot, exact commands, artifacts and remaining qualification gaps.
+Those results do not validate the subsequent bootstrap or dedicated FUSE
+adapter; their checks and mounted probes are tracked in the mount checkpoint.
 
 The recovery fault oracles exercise metadata and simulated byte/deletion
 state; separate RustFS fixtures exercise object requests. Packed-lower tests
@@ -649,7 +680,9 @@ graph retirement, or process/host crash recovery. Local maintenance tokens
 prove a drain in the surviving process only. External process-takeover
 authority remains unimplemented, and lease expiry alone cannot supply it.
 
-Before acceptance, prove at least:
+The following target requirements remain unqualified as a complete production
+stack. They describe known limits, not additional tasks for the current
+fresh-only benchmark stage:
 
 - two siblings share lower bytes but isolate create/write/chmod/rename/unlink;
 - concurrent O_EXCL has one winner, same-file size/maps retain all valid writes,
@@ -671,13 +704,28 @@ Before acceptance, prove at least:
 - default flat behavior, feature isolation, backend contracts, POSIX and the
   repository's required fmt/clippy/build/test gates remain valid.
 
-Performance comparisons use matched compose runners and preserved executables.
-Measure 16 and 32 workers with build order swapped; report overlay and native
+Future performance acceptance uses matched compose runners and preserved executables.
+Measure 16 and 32 workers with arm order swapped; report overlay and native
 files/s, sample counts/spread, raw and normalized deltas, errors and teardown.
 Retain readback/mixed correctness and latency, object amplification, fsync/close
 and writeback-debt checks. Broader randrw/metadata and flat regressions remain
 gates. Diagnostic logging/profiling is separate from acceptance measurements.
 Do not interpret overlapping concurrent hold timers as exclusive occupancy.
+Those broader acceptance requirements are deferred for the current experiment.
+Its scope is one minimal smoke per available arm, then WRITE/READBACK at
+1/16/32 workers in opposite arm orders using Redis and RustFS. The requested
+arms are native, entity over frozen native, and entity over packed-v3; a missing
+arm is explicitly skipped with no substitute.
+
+The [mount checkpoint](../plans/2026-10-20-overlay-entity-mount.md) records all
+24 completed available phase rows, zero workload errors, two samples per cell
+and clean smoke/teardown evidence. Preliminary packed-overlay WRITE medians
+at 1/16/32 workers were 20.08/111.90/135.00 files/s, versus native
+51.63/351.03/419.83. READBACK medians were 32.04/173.05/199.05, versus native
+113.40/602.50/616.47. `overlay-native` was skipped because its entity-compatible
+native lower adapter, binding and mount bootstrap are missing. These results
+measure newly created upper bytes; they are not lower-read/copy-up or
+acceptance results and do not establish a win or removal of the write plateau.
 
 Historical **r31**, not target-design, overlay/native ratios are:
 
@@ -692,7 +740,8 @@ The completed 16/32-worker WRITE means were 216.892/236.892 overlay versus
 sweep was interrupted; its partial stat/full rows are not completed acceptance.
 Known baseline feature-test failures and flaky/source/operator checks remain
 documented in the handoff. Neither those historical gates nor the r32 partial
-gate validate this target design. **There are no target-design measurements.**
+gate validate this target design. **The entity measurements above are preliminary;
+there is no target-design performance acceptance result.**
 
 ## 17. Remaining tradeoffs and delivery boundary
 
@@ -704,10 +753,11 @@ when many entities share the same object. Lower pins retain whole lower
 ownership until the last owner is gone, which can delay reclamation of bytes
 unused by a particular workspace.
 
-Offline migration requires downtime and additional metadata/ownership retention
-during validation. Live namespaces retain retired bytes until quiescent
+Offline migration is deferred and has no implementation in this stage. Live
+namespaces retain retired bytes until quiescent
 maintenance/discard, which deliberately trades reclamation latency for a simple
-read path. Proving quiescence and crash-safe owner accounting remains required.
+read path. Complete quiescence and crash-safe owner accounting are not qualified
+for production.
 The target deliberately gives no cheap arbitrary-workspace incremental-diff or
 total-order-replay contract and removes live mutable-layer digest identity.
 Upper-only diff candidates remain available. These are explicit tradeoffs;
@@ -718,6 +768,8 @@ namespace and file APIs. Packed ownership joins the existing collector census;
 entity writes use current maps and strict durable uploads, and truncate has a
 replayable inode-local intent. The experimental VFS handle path keeps entity
 handles out of native inode indexes and rejects unsupported handle operations.
-CLI mounts remain disabled. External crash-takeover authority, production
-pagination, full mounted/POSIX qualification and conversion still require
-separate work. These correctness gates are not performance acceptance.
+Only the explicit fresh-fixture benchmark opt-in can select the dedicated
+entity mount adapter. Production mounts remain disabled. External
+crash-takeover authority, enforced backend/owner pairing, production pagination,
+full mounted/POSIX qualification and conversion remain known limitations.
+These correctness gates are not performance acceptance.
