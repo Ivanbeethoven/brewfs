@@ -904,4 +904,63 @@ async fn redis_entity_rejects_wrong_type_and_oversize_before_any_write_or_decode
             .await,
         Err(EntityError::Invalid(_))
     ));
+
+    // A permission error from STRLEN is not evidence of a corrupt row.
+    // Keep the default user intact; this test runs in an owned Redis instance.
+    let user = format!("entity-strlen-{}", Uuid::new_v4());
+    let password = Uuid::new_v4().to_string();
+    let mut restricted_url = url::Url::parse(&url).unwrap();
+    restricted_url.set_username(&user).unwrap();
+    restricted_url.set_password(Some(&password)).unwrap();
+    let observed = [keys.descriptor(), keys.inode(13)];
+    let before = backend.read(&observed).await.unwrap().rows;
+    assert_eq!(before, vec![Some(b"active".to_vec()), None]);
+    redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg(&user)
+        .arg("reset")
+        .arg("on")
+        .arg(format!(">{password}"))
+        .arg(format!(
+            "~{}*",
+            String::from_utf8_lossy(keys.volume_prefix())
+        ))
+        .arg("+@all")
+        .arg("-strlen")
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+    let outcomes = async {
+        let restricted = RedisEntityBackend::connect(restricted_url.as_str(), volume).await?;
+        let read = restricted.read(&observed[..1]).await;
+        let commit = restricted
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![put(observed[1].clone(), b"must-not-appear")],
+                },
+            )
+            .await;
+        Ok::<_, EntityError>((read, commit))
+    }
+    .await;
+    // Clean up before asserting either result, including failed authentication.
+    let deleted = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&user)
+        .query_async::<usize>(&mut connection)
+        .await;
+    let after = backend.read(&observed).await;
+    assert_eq!(deleted.unwrap(), 1);
+    let (read, commit) = outcomes.unwrap();
+    for outcome in [read.map(|_| ()), commit.map(|_| ())] {
+        assert!(
+            matches!(&outcome, Err(EntityError::Backend(message))
+                if message.contains("strlen")
+                    && (message.contains("ACL") || message.contains("NOPERM"))),
+            "{outcome:?}"
+        );
+    }
+    assert_eq!(after.unwrap().rows, before);
 }

@@ -20,11 +20,13 @@ const READ_LUA: &str = r#"
 local max_key, max_row, max_total = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
 local total = 0
 for _, key in ipairs(KEYS) do
-    local kind = redis.call('TYPE', key).ok
-    if kind ~= 'none' and kind ~= 'string' then
-        return redis.error_reply('ENTITY_CORRUPT invalid row type')
+    local size = redis.pcall('STRLEN', key)
+    if type(size) == 'table' then
+        if string.sub(size.err, 1, 10) == 'WRONGTYPE ' then
+            return redis.error_reply('ENTITY_CORRUPT invalid row type')
+        end
+        return size
     end
-    local size = redis.call('STRLEN', key)
     total = total + #key + size
     if #key > max_key or size > max_row or total > max_total then
         return redis.error_reply('ENTITY_INVALID read exceeds byte bound')
@@ -87,11 +89,13 @@ for _, key in ipairs(KEYS) do
     if #key == 0 or #key > 1024 or string.sub(key, 1, #prefix) ~= prefix then
         return redis.error_reply('ENTITY_INVALID invalid entity key')
     end
-    local kind = redis.call('TYPE', key).ok
-    if kind ~= 'none' and kind ~= 'string' then
-        return redis.error_reply('ENTITY_CORRUPT invalid row type')
+    local size = redis.pcall('STRLEN', key)
+    if type(size) == 'table' then
+        if string.sub(size.err, 1, 10) == 'WRONGTYPE ' then
+            return redis.error_reply('ENTITY_CORRUPT invalid row type')
+        end
+        return size
     end
-    local size = redis.call('STRLEN', key)
     total_stored = total_stored + #key + size
     if size > 4194304 or total_stored > 16777216 then
         return redis.error_reply('ENTITY_INVALID stored rows exceed byte bound')
