@@ -10,6 +10,7 @@
 | 测试对象、标准、绝对结果、图表与不利结果 | [Evaluation](brewfs-rustfs/evaluation.md) |
 | 上游关系、受测版本、合并与后续更新方法 | [Maintenance](brewfs-rustfs/maintenance.md) |
 | 并发修复、撤回的预取方案与仍未达标的性能维度 | [Adverse-dimension maintenance](brewfs-rustfs/adverse-maintenance.md) |
+| Agent 混合负载、FUSE 端到端与 no-dynamic-block 对照方案 | [Agent mixed FUSE plan](brewfs-rustfs/agent-mixed-fuse-plan.md) |
 | 完整机器可读统计及版本指纹 | [Evidence](brewfs-rustfs/evidence/README.md) |
 
 本轮测试入口是 **BrewFS 的真实 FUSE 挂载目录**。应用执行完整文件写入和读取，经 BrewFS 缓存、Redis 元数据与 S3 接口访问 RustFS；运行环境为 Aliyun ACS。单独的 RustFS HTTP 测试用于校验协议及布局，不能代替这些文件系统性能结果。
