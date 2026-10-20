@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 pub struct EntityKeys {
+    volume_id: Uuid,
     namespace_id: Uuid,
     volume: Vec<u8>,
     namespace: Vec<u8>,
@@ -18,6 +19,7 @@ impl EntityKeys {
         ]
         .concat();
         Self {
+            volume_id,
             namespace_id,
             volume,
             namespace,
@@ -26,6 +28,9 @@ impl EntityKeys {
 
     pub fn namespace_id(&self) -> Uuid {
         self.namespace_id
+    }
+    pub fn volume_id(&self) -> Uuid {
+        self.volume_id
     }
     pub fn volume_prefix(&self) -> &[u8] {
         &self.volume
@@ -69,6 +74,22 @@ impl EntityKeys {
     }
     pub fn chunk(&self, ino: i64, index: u64) -> Vec<u8> {
         self.key(&format!("chunk/{ino}/{index}"))
+    }
+    pub fn chunk_prefix(&self, ino: i64) -> Vec<u8> {
+        self.key(&format!("chunk/{ino}/"))
+    }
+    pub fn truncate(&self, ino: i64) -> Vec<u8> {
+        self.key(&format!("truncate/{ino}"))
+    }
+    /// Physical immutable objects never reuse the legacy slice object domain.
+    pub fn object(&self, slice: u64) -> String {
+        format!(
+            "workspace-entity-v1/{}/{}/{slice}",
+            self.volume_id, self.namespace_id
+        )
+    }
+    pub fn object_descriptor(&self, slice: u64) -> Vec<u8> {
+        self.volume_key(&format!("object/{slice}"))
     }
     pub fn slice(&self, id: u64) -> Vec<u8> {
         self.volume_key(&format!("slice/{id}"))

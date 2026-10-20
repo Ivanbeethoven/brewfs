@@ -187,10 +187,7 @@ async fn one_hundred_lower_owners_minus_ninety_nine_preserves_the_last_owner() {
         let writer = lifecycle.acquire(Uuid::new_v4(), 100).await.unwrap();
         let token = lifecycle.enter_maintenance(&writer).await.unwrap();
         lifecycle.discard_empty(&token).await.unwrap();
-        assert!(matches!(
-            lifecycle.discard_empty(&token).await,
-            Err(EntityError::Fenced)
-        ));
+        lifecycle.discard_empty(&token).await.unwrap();
     }
     assert_eq!(
         read_count(backend.read(&[registry_key]).await.unwrap().rows),
@@ -447,4 +444,43 @@ async fn provision_refuses_stray_upper_rows_without_a_descriptor() {
         Err(EntityError::Corrupt(_))
     ));
     assert!(backend.read(&[keys.descriptor()]).await.unwrap().rows[0].is_none());
+}
+
+#[tokio::test]
+async fn lost_resume_reply_never_reconstructs_a_second_admission_session() {
+    let backend = Arc::new(LostReplyBackend {
+        inner: MemoryEntityBackend::new(10),
+        lose_next_commit: AtomicBool::new(false),
+    });
+    let keys = EntityKeys::new(Uuid::new_v4(), Uuid::new_v4());
+    let lifecycle = Lifecycle::new(backend.clone(), keys);
+    lifecycle.provision(&lower()).await.unwrap();
+    let old = lifecycle.acquire(Uuid::new_v4(), 100).await.unwrap();
+    let maintenance = lifecycle.enter_maintenance(&old).await.unwrap();
+    let new_id = Uuid::new_v4();
+    backend.lose_next_commit.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        lifecycle
+            .resume_after_maintenance(&maintenance, new_id, 100)
+            .await,
+        Err(EntityError::Backend(_))
+    ));
+    assert_eq!(
+        lifecycle.descriptor().await.unwrap().active_lease,
+        Some(LeaseIdentity {
+            lease_id: new_id,
+            holder_generation: old.identity().holder_generation + 1,
+        })
+    );
+    assert!(old.is_closed());
+    assert!(matches!(
+        lifecycle.authority(&old).await,
+        Err(EntityError::Fenced)
+    ));
+    assert!(matches!(
+        lifecycle
+            .resume_after_maintenance(&maintenance, new_id, 100)
+            .await,
+        Err(EntityError::Fenced)
+    ));
 }

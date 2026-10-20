@@ -10,8 +10,8 @@ use async_trait::async_trait;
 
 use super::EntityError;
 use super::model::{
-    ChunkMap, ChunkSource, EntityDentry, EntityInode, EntityKind, EntityValue, LowerBinding,
-    MAX_XATTR_BYTES, UpperInode, validate_name, validate_xattr_name,
+    ChunkMap, ChunkSource, ChunkSpan, EntityDentry, EntityInode, EntityKind, EntityValue,
+    LowerBinding, MAX_XATTR_BYTES, UpperInode, validate_name, validate_xattr_name,
 };
 
 /// Initial bounded directory interface; larger directories require a paged
@@ -39,6 +39,18 @@ pub trait ImmutableLower: Send + Sync {
     ) -> Result<Option<ChunkMap>, EntityError>;
     /// Current names only, no whiteouts or duplicates; bounded before materialization.
     async fn readdir(&self, ino: i64) -> Result<Vec<(Vec<u8>, EntityDentry)>, EntityError>;
+}
+
+/// Implementations return exactly the requested authenticated bytes, or an
+/// error. The caller has already clipped the locator to immutable inode EOF.
+#[async_trait]
+pub trait ImmutableLowerData: ImmutableLower {
+    async fn read_range(
+        &self,
+        ino: i64,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, EntityError>;
 }
 
 fn check_binding<L: ImmutableLower + ?Sized>(
@@ -239,18 +251,50 @@ pub async fn resolve_chunk<L: ImmutableLower + ?Sized>(
     chunk_start
         .checked_add(chunk_size)
         .ok_or(EntityError::Overflow)?;
+    let inherited = inode
+        .lower_visible_size
+        .saturating_sub(chunk_start)
+        .min(chunk_size);
     if let Some(map) = upper {
         map.validate_binding(binding)?;
         if map.chunk_size != chunk_size {
             return Err(EntityError::Corrupt("upper chunk size mismatch".into()));
         }
         validate_lower_ranges(lower, binding, map, None).await?;
-        return Ok(map.clone());
+        let mut spans = Vec::with_capacity(map.spans.len());
+        for span in &map.spans {
+            if let ChunkSource::LowerRange {
+                ino, file_offset, ..
+            } = &span.source
+            {
+                if *ino != inode.ino || *file_offset != chunk_start + span.offset {
+                    return Err(EntityError::Corrupt(
+                        "upper lower-range identity mismatch".into(),
+                    ));
+                }
+                // The durable truncate boundary applies even to maps written
+                // before the shrink. Preserve later upper writes, but never
+                // resurrect immutable bytes after shrink followed by extension.
+                let retained = inherited.saturating_sub(span.offset).min(span.length);
+                if retained != 0 {
+                    spans.push(ChunkSpan {
+                        length: retained,
+                        ..span.clone()
+                    });
+                }
+                if retained < span.length {
+                    spans.push(ChunkSpan {
+                        offset: span.offset + retained,
+                        length: span.length - retained,
+                        source: ChunkSource::Hole,
+                    });
+                }
+            } else {
+                spans.push(span.clone());
+            }
+        }
+        return ChunkMap::new(chunk_size, spans);
     }
-    let inherited = inode
-        .lower_visible_size
-        .saturating_sub(chunk_start)
-        .min(chunk_size);
     if inherited == 0 {
         return ChunkMap::holes(chunk_size);
     }
@@ -758,6 +802,63 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn stored_map_cannot_resurrect_lower_tail_or_move_lower_bytes() {
+        let lower = Lower::new();
+        let mut copied = lower.file.clone();
+        copied.lower_visible_size = 4;
+        copied.size = 16;
+        let old = ChunkMap::inherited(16, lower.binding(), 2, 0, lower.file.size)
+            .unwrap()
+            .replace(
+                8,
+                2,
+                ChunkSource::Data {
+                    slice_id: 7,
+                    slice_offset: 0,
+                },
+            )
+            .unwrap();
+        let resolved = resolve_chunk(&lower, lower.binding(), &copied, 0, 16, Some(&old))
+            .await
+            .unwrap();
+        let expected = ChunkMap::inherited(16, lower.binding(), 2, 0, 4)
+            .unwrap()
+            .replace(
+                8,
+                2,
+                ChunkSource::Data {
+                    slice_id: 7,
+                    slice_offset: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(resolved, expected);
+
+        let moved = ChunkMap::holes(16)
+            .unwrap()
+            .replace(
+                1,
+                2,
+                ChunkSource::LowerRange {
+                    binding_digest: lower.binding().manifest_digest,
+                    ino: 2,
+                    file_offset: 0,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            resolve_chunk(&lower, lower.binding(), &copied, 0, 16, Some(&moved)).await,
+            Err(EntityError::Corrupt(_))
+        ));
+        let mut other_inode = copied;
+        other_inode.ino = 3;
+        assert!(matches!(
+            resolve_chunk(&lower, lower.binding(), &other_inode, 0, 16, Some(&old)).await,
+            Err(EntityError::Corrupt(_))
+        ));
     }
 
     #[tokio::test]

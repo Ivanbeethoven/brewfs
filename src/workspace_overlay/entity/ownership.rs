@@ -50,7 +50,7 @@ pub struct SliceOwnership {
 }
 
 impl SliceOwnership {
-    fn validate(&self, keys: &EntityKeys, slice_id: u64) -> Result<()> {
+    pub(super) fn validate(&self, keys: &EntityKeys, slice_id: u64) -> Result<()> {
         if self.namespace_id != keys.namespace_id()
             || self.slice_id != slice_id
             || slice_id == 0
@@ -355,6 +355,44 @@ impl<B: EntityBackend> Ownership<B> {
         )
     }
 
+    /// Validate the exact namespace and durable reservation before transport
+    /// receives an object DELETE. Validation after DELETE would be too late to
+    /// reject a token from another volume/namespace. Deleted IDs stay reserved,
+    /// making an uncertain physical DELETE safely repeatable.
+    pub async fn validate_delete(
+        &self,
+        maintenance: &MaintenanceToken,
+        token: &DeletionToken,
+    ) -> Result<()> {
+        if token.namespace_id != self.keys.namespace_id()
+            || token.namespace_prefix != self.keys.prefix()
+        {
+            return Err(EntityError::Fenced);
+        }
+        let authority = self.lifecycle.maintenance_authority(maintenance).await?;
+        let keys = vec![self.keys.slice(token.slice_id)];
+        let snapshot = self.backend.read(&keys).await?;
+        let row: SliceOwnership =
+            decode(snapshot.rows[0].as_deref().ok_or(EntityError::NotFound)?)?;
+        row.validate(&self.keys, token.slice_id)?;
+        if !matches!(row.state, SliceState::Deleting { reservation } | SliceState::Deleted { reservation }
+            if reservation == token.reservation)
+        {
+            return Err(EntityError::Fenced);
+        }
+        committed(
+            self.backend
+                .commit(
+                    &authority,
+                    &EntityPlan {
+                        checks: checked_rows(&keys, snapshot.rows),
+                        writes: Vec::new(),
+                    },
+                )
+                .await?,
+        )
+    }
+
     /// One recoverable, atomic cleanup step after session quiescence. This
     /// bounded reference walker supports at most 4096 rows per scanned prefix;
     /// larger namespaces fail closed until a paginated walker is qualified.
@@ -370,8 +408,15 @@ impl<B: EntityBackend> Ownership<B> {
             return Err(EntityError::Invalid("invalid orphan inode".into()));
         }
         let authority = self.lifecycle.maintenance_authority(maintenance).await?;
-        let keys = vec![self.keys.orphan(ino), self.keys.inode(ino)];
+        let keys = vec![
+            self.keys.orphan(ino),
+            self.keys.inode(ino),
+            self.keys.truncate(ino),
+        ];
         let snapshot = self.backend.read(&keys).await?;
+        if snapshot.rows[2].is_some() {
+            return Err(EntityError::Busy);
+        }
         let Some(bytes) = snapshot.rows[0].as_deref() else {
             return Ok(true);
         };

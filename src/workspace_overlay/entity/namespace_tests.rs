@@ -101,6 +101,114 @@ async fn fixture(lower: MemoryLower) -> Fixture<MemoryEntityBackend> {
     .await
 }
 
+#[tokio::test]
+async fn data_handles_keep_open_access_and_reject_foreign_namespaces() {
+    let mut lower = MemoryLower::empty();
+    lower.add_file(1, b"file", 2, 10);
+    let first = fixture(lower).await;
+    let handle = first.ns.open(1, b"file", 4, &root()).await.unwrap();
+    assert_eq!(first.ns.validate_handle(&handle, 4), Ok(2));
+    assert_eq!(
+        first.ns.validate_handle(&handle, 2),
+        Err(EntityError::Permission)
+    );
+    // An already opened descriptor remains usable after a permission change
+    // and unlink, until its last close releases the orphan's admission pin.
+    first.ns.chmod(2, 0, root()).await.unwrap();
+    first
+        .ns
+        .unlink(1, b"file".to_vec(), false, root())
+        .await
+        .unwrap();
+    assert_eq!(first.ns.validate_handle(&handle, 4), Ok(2));
+    let second = fixture(MemoryLower::empty()).await;
+    assert!(matches!(
+        second.ns.validate_handle(&handle, 4),
+        Err(EntityError::Invalid(_))
+    ));
+}
+
+#[tokio::test]
+async fn inode_data_guard_retains_registry_identity_without_a_handle() {
+    let fixture = fixture(MemoryLower::empty()).await;
+    let first = fixture.ns.lock_inode(2).await;
+    let reopened_wrapper = EntityNamespace::new(
+        fixture.backend.clone(),
+        fixture.lower.clone(),
+        fixture.keys.clone(),
+        fixture.ns.session.clone(),
+    );
+    let waiting = reopened_wrapper.lock_inode(2);
+    tokio::pin!(waiting);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+            .await
+            .is_err()
+    );
+    // A different inode is independent while the same-inode operation waits.
+    let other = fixture.ns.lock_inode(3).await;
+    drop(first);
+    let _second = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .unwrap();
+    drop(other);
+}
+
+#[tokio::test]
+async fn interrupted_truncate_fences_namespace_mutations_until_cleanup_finishes() {
+    use super::recovery::{Recovery, prepare_resize};
+    let mut lower = MemoryLower::empty();
+    lower.add_file(1, b"file", 2, 20);
+    let fixture = fixture(lower).await;
+    let inode = current_inode(&fixture, 2).await;
+    let authority = fixture.ns.authority().await.unwrap();
+    let cut = prepare_resize(&fixture.keys, 2, None, &inode, 3, 8, 1000).unwrap();
+    assert_eq!(
+        fixture.backend.commit(&authority, &cut).await.unwrap(),
+        CommitOutcome::Committed
+    );
+    assert_eq!(
+        fixture.ns.chmod(2, 0o600, root()).await,
+        Err(EntityError::Busy)
+    );
+    assert_eq!(
+        fixture
+            .ns
+            .set_xattr(2, b"user.test".to_vec(), Some(vec![1]), root())
+            .await,
+        Err(EntityError::Busy)
+    );
+    assert_eq!(
+        fixture.ns.link(2, 1, b"alias".to_vec(), root()).await,
+        Err(EntityError::Busy)
+    );
+    assert_eq!(
+        fixture.ns.unlink(1, b"file".to_vec(), false, root()).await,
+        Err(EntityError::Busy)
+    );
+    assert_eq!(
+        fixture
+            .ns
+            .rename(1, b"file".to_vec(), 1, b"moved".to_vec(), false, root())
+            .await,
+        Err(EntityError::Busy)
+    );
+    assert_eq!(current_inode(&fixture, 2).await.size, 3);
+    assert!(
+        Recovery::new(fixture.backend.clone(), fixture.keys.clone())
+            .truncate_step(&authority, 2)
+            .await
+            .unwrap()
+    );
+    fixture.ns.chmod(2, 0o600, root()).await.unwrap();
+    fixture
+        .ns
+        .link(2, 1, b"alias".to_vec(), root())
+        .await
+        .unwrap();
+    assert_eq!(current_inode(&fixture, 2).await.nlink, 2);
+}
+
 async fn current_inode<B: EntityBackend + 'static>(fixture: &Fixture<B>, ino: i64) -> EntityInode {
     let snapshot = fixture
         .backend

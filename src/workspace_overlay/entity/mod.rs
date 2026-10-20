@@ -11,6 +11,7 @@ pub mod memory;
 pub mod model;
 pub mod namespace;
 pub mod ownership;
+pub mod recovery;
 pub mod redis;
 pub mod resolver;
 

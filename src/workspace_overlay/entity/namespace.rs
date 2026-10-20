@@ -48,8 +48,8 @@ pub struct CreateRequest {
     pub symlink_target: Option<Vec<u8>>,
 }
 
-#[derive(Default)]
-struct InodeLock {
+#[derive(Debug, Default)]
+pub(super) struct InodeLock {
     mutex: Arc<AsyncMutex<()>>,
     handles: AtomicUsize,
 }
@@ -57,6 +57,7 @@ struct InodeLock {
 pub struct EntityHandle {
     ino: i64,
     namespace: Vec<u8>,
+    access: u32,
     state: Arc<InodeLock>,
     _admission: OperationGuard,
 }
@@ -74,12 +75,19 @@ impl Drop for EntityHandle {
 }
 
 pub struct EntityNamespace<B, L> {
-    backend: Arc<B>,
-    lower: Arc<L>,
-    keys: EntityKeys,
-    lifecycle: Lifecycle<B>,
-    session: WriterSession,
-    locks: Mutex<BTreeMap<i64, Weak<InodeLock>>>,
+    pub(super) backend: Arc<B>,
+    pub(super) lower: Arc<L>,
+    pub(super) keys: EntityKeys,
+    pub(super) lifecycle: Lifecycle<B>,
+    pub(super) session: WriterSession,
+    locks: Arc<Mutex<BTreeMap<i64, Weak<InodeLock>>>>,
+}
+
+/// Retain the registry entry as well as its mutex. Keeping only the mutex guard
+/// would allow the weak registry to create a second lock for the same inode.
+pub(super) struct InodeGuard {
+    _state: Arc<InodeLock>,
+    _guard: OwnedMutexGuard<()>,
 }
 
 #[derive(Clone)]
@@ -121,24 +129,26 @@ struct Prepared<'a, B, L> {
 }
 
 impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B, L> {
-    /// The reference-only lifecycle must already own its lower and writer lease.
+    /// The lifecycle must already own its lower and writer lease. Production
+    /// attach additionally authenticates and retains the packed lower graph.
     pub fn new(
         backend: Arc<B>,
         lower: Arc<L>,
         keys: EntityKeys,
         session: WriterSession,
     ) -> Arc<Self> {
+        let locks = session.inode_locks.clone();
         Arc::new(Self {
             lifecycle: Lifecycle::new(backend.clone(), keys.clone()),
             backend,
             lower,
             keys,
             session,
-            locks: Mutex::new(BTreeMap::new()),
+            locks,
         })
     }
 
-    async fn authority(&self) -> Result<TransactionAuthority> {
+    pub(super) async fn authority(&self) -> Result<TransactionAuthority> {
         if self.session.namespace_id() != self.keys.namespace_id() {
             return Err(EntityError::Fenced);
         }
@@ -161,6 +171,25 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         let lock = Arc::new(InodeLock::default());
         locks.insert(ino, Arc::downgrade(&lock));
         lock
+    }
+
+    pub(super) async fn lock_inode(&self, ino: i64) -> InodeGuard {
+        let state = self.inode_lock(ino);
+        let guard = state.mutex.clone().lock_owned().await;
+        InodeGuard {
+            _state: state,
+            _guard: guard,
+        }
+    }
+
+    pub(super) fn validate_handle(&self, handle: &EntityHandle, access: u32) -> Result<i64> {
+        if handle.namespace != self.keys.prefix() {
+            return Err(EntityError::Invalid("foreign handle".into()));
+        }
+        if access & !7 != 0 || handle.access & access != access {
+            return Err(EntityError::Permission);
+        }
+        Ok(handle.ino)
     }
 
     async fn lock_all(
@@ -293,7 +322,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
     }
 
     /// Explicit noatime. The final read predicate validation has no writes.
-    /// O_TRUNC is deliberately a separate data-publication operation in stage 3.
+    /// O_TRUNC is a separate EntityData truncate operation after authorized open.
     pub async fn open(
         &self,
         parent: i64,
@@ -358,6 +387,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
                 return Ok(EntityHandle {
                     ino,
                     namespace: self.keys.prefix().to_vec(),
+                    access,
                     state: state.clone(),
                     _admission: admission,
                 });
@@ -662,6 +692,12 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
         Ok(parent)
     }
     async fn store_inode(&mut self, mut inode: EntityInode) -> Result<()> {
+        // The durable cut owns the inode until all stale maps are retired.
+        // Namespace mutations must not change its cleanup fence in between
+        // bounded recovery steps, even after an interrupted truncate caller.
+        if self.raw(self.ns.keys.truncate(inode.ino)).await?.is_some() {
+            return Err(EntityError::Busy);
+        }
         inode.data_version = inode
             .data_version
             .checked_add(1)

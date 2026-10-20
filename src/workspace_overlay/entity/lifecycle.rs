@@ -3,7 +3,8 @@
 //! An expired lease fences mutations, but does not prove that old readers have
 //! stopped. There is deliberately no timeout-only takeover or reclamation API.
 
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, Weak};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
@@ -88,6 +89,9 @@ pub struct WriterSession {
     namespace_prefix: Vec<u8>,
     identity: LeaseIdentity,
     admission: Arc<Admission>,
+    /// All wrappers for this writer share affected-inode coordination.
+    pub(super) inode_locks: Arc<Mutex<BTreeMap<i64, Weak<super::namespace::InodeLock>>>>,
+    io_failures: Arc<Mutex<BTreeMap<i64, String>>>,
 }
 
 #[derive(Debug)]
@@ -110,6 +114,20 @@ impl Drop for OperationGuard {
 }
 
 impl WriterSession {
+    pub(super) fn remember_io_failure(&self, ino: i64, message: String) {
+        self.io_failures
+            .lock()
+            .expect("I/O failure registry poisoned")
+            .entry(ino)
+            .or_insert(message);
+    }
+    pub(super) fn io_failure(&self, ino: i64) -> Option<String> {
+        self.io_failures
+            .lock()
+            .expect("I/O failure registry poisoned")
+            .get(&ino)
+            .cloned()
+    }
     pub(super) fn matches_keys(&self, keys: &EntityKeys) -> bool {
         self.namespace_id == keys.namespace_id() && self.namespace_prefix == keys.prefix()
     }
@@ -170,6 +188,33 @@ pub struct MaintenanceToken {
     namespace_id: Uuid,
     namespace_prefix: Vec<u8>,
     record: MaintenanceRecord,
+}
+
+/// Terminal proof for releasing the corresponding collector-visible packed
+/// lower owner. The namespace cannot reopen, and its upper objects are already
+/// retired/deleted. The packed collector must still transact its own owner/root
+/// predicates; this value is not permission to delete immutable objects directly.
+#[derive(Clone, Debug)]
+pub struct DeletedLowerOwnerProof {
+    volume_id: Uuid,
+    namespace_id: Uuid,
+    namespace_prefix: Vec<u8>,
+    binding: LowerBinding,
+}
+
+impl DeletedLowerOwnerProof {
+    pub fn volume_id(&self) -> Uuid {
+        self.volume_id
+    }
+    pub fn namespace_id(&self) -> Uuid {
+        self.namespace_id
+    }
+    pub fn namespace_prefix(&self) -> &[u8] {
+        &self.namespace_prefix
+    }
+    pub fn binding(&self) -> &LowerBinding {
+        &self.binding
+    }
 }
 
 pub struct Lifecycle<B> {
@@ -431,6 +476,8 @@ impl<B: EntityBackend> Lifecycle<B> {
             namespace_prefix: self.keys.prefix().to_vec(),
             identity,
             admission: Arc::default(),
+            inode_locks: Arc::default(),
+            io_failures: Arc::default(),
         })
     }
 
@@ -565,6 +612,9 @@ impl<B: EntityBackend> Lifecycle<B> {
     /// Zero lower owners is retained in the registry: this API never authorizes
     /// physical deletion of the immutable graph or a legacy packed object.
     pub async fn discard_empty(&self, token: &MaintenanceToken) -> Result<()> {
+        if self.discard_completed(token).await? {
+            return Ok(());
+        }
         let authority = self.maintenance_authority(token).await?;
         let mut descriptor = self.descriptor().await?;
         let allowed = [
@@ -581,10 +631,11 @@ impl<B: EntityBackend> Lifecycle<B> {
         let slice_prefix = [self.keys.volume_prefix(), b"slice/"].concat();
         for (_, value) in self.backend.scan_prefix(&slice_prefix, 4096).await? {
             let row: super::ownership::SliceOwnership = decode(&value)?;
-            if row.namespace_id == self.keys.namespace_id()
-                && !matches!(row.state, super::ownership::SliceState::Deleted { .. })
-            {
-                return Err(EntityError::Busy);
+            if row.namespace_id == self.keys.namespace_id() {
+                row.validate(&self.keys, row.slice_id)?;
+                if !matches!(row.state, super::ownership::SliceState::Deleted { .. }) {
+                    return Err(EntityError::Busy);
+                }
             }
         }
         let keys = vec![
@@ -628,9 +679,6 @@ impl<B: EntityBackend> Lifecycle<B> {
                                 key: self.keys.lower_pin(),
                             },
                             RowWrite::Delete {
-                                key: self.keys.maintenance(),
-                            },
-                            RowWrite::Delete {
                                 key: self.keys.counter("inode"),
                             },
                         ],
@@ -638,6 +686,190 @@ impl<B: EntityBackend> Lifecycle<B> {
                 )
                 .await?,
         )
+    }
+
+    /// Persist discard admission before any namespace sweep. The same exact
+    /// maintenance receipt remains usable across uncertain transaction replies.
+    pub async fn begin_discard(&self, token: &MaintenanceToken) -> Result<()> {
+        let authority = self.maintenance_authority(token).await?;
+        let keys = vec![self.keys.descriptor()];
+        let snapshot = self.backend.read(&keys).await?;
+        let mut descriptor =
+            self.decode_descriptor(snapshot.rows[0].as_deref().ok_or(EntityError::Fenced)?)?;
+        if descriptor.state == NamespaceState::Deleting {
+            return Ok(());
+        }
+        if descriptor.state != NamespaceState::Quiescent {
+            return Err(EntityError::Fenced);
+        }
+        descriptor.state = NamespaceState::Deleting;
+        committed(
+            self.backend
+                .commit(
+                    &authority,
+                    &EntityPlan {
+                        checks: checked_rows(&keys, snapshot.rows),
+                        writes: vec![put(self.keys.descriptor(), &descriptor)?],
+                    },
+                )
+                .await?,
+        )
+    }
+
+    /// Orderly reopen from a locally proven drained session. This does not
+    /// manufacture quiescence after a process crash or lease expiry. Recovery
+    /// must finish pending inode/upload/deletion obligations first. Retired
+    /// objects may keep conservative holds across the new writer incarnation.
+    pub async fn resume_after_maintenance(
+        &self,
+        token: &MaintenanceToken,
+        new_lease_id: Uuid,
+        ttl_ns: i64,
+    ) -> Result<WriterSession> {
+        if new_lease_id.is_nil() || ttl_ns <= 0 {
+            return Err(EntityError::Invalid("invalid resumed lease request".into()));
+        }
+        let maintenance = self.maintenance_authority(token).await?;
+        let keys = vec![self.keys.descriptor(), self.keys.lease()];
+        let snapshot = self.backend.read(&keys).await?;
+        let mut descriptor =
+            self.decode_descriptor(snapshot.rows[0].as_deref().ok_or(EntityError::Fenced)?)?;
+        if descriptor.state != NamespaceState::Quiescent || snapshot.rows[1].is_some() {
+            return Err(EntityError::Fenced);
+        }
+        for suffix in [b"truncate/".as_slice(), b"orphan/"] {
+            let prefix = [self.keys.prefix(), suffix].concat();
+            if !self.backend.scan_prefix(&prefix, 4096).await?.is_empty() {
+                return Err(EntityError::Busy);
+            }
+        }
+        let mut checks = checked_rows(&keys, snapshot.rows);
+        let slice_prefix = [self.keys.volume_prefix(), b"slice/"].concat();
+        for (key, bytes) in self.backend.scan_prefix(&slice_prefix, 4096).await? {
+            let row: super::ownership::SliceOwnership = decode(&bytes)?;
+            if row.namespace_id != self.keys.namespace_id() {
+                continue;
+            }
+            row.validate(&self.keys, row.slice_id)?;
+            if key != self.keys.slice(row.slice_id) {
+                return Err(EntityError::Corrupt(
+                    "mismatched slice on namespace resume".into(),
+                ));
+            }
+            if row.staging_hold
+                || matches!(
+                    row.state,
+                    super::ownership::SliceState::Pending { .. }
+                        | super::ownership::SliceState::Deleting { .. }
+                )
+            {
+                return Err(EntityError::Busy);
+            }
+            checks.push(RowCheck {
+                key,
+                expected: Some(bytes),
+            });
+        }
+        let identity = LeaseIdentity {
+            lease_id: new_lease_id,
+            holder_generation: descriptor
+                .generation
+                .checked_add(1)
+                .ok_or(EntityError::Exhausted)?,
+        };
+        let lease = WriterLease {
+            namespace_id: self.keys.namespace_id(),
+            identity,
+            expires_ns: snapshot
+                .now_ns
+                .checked_add(ttl_ns)
+                .ok_or(EntityError::Overflow)?,
+        };
+        descriptor.generation = identity.holder_generation;
+        descriptor.active_lease = Some(identity);
+        descriptor.state = NamespaceState::Active;
+        let authority = TransactionAuthority::from_validated(
+            maintenance.checks.clone(),
+            None,
+            Some(lease.expires_ns),
+        )?;
+        committed(
+            self.backend
+                .commit(
+                    &authority,
+                    &EntityPlan {
+                        checks,
+                        writes: vec![
+                            put(self.keys.descriptor(), &descriptor)?,
+                            put(self.keys.lease(), &lease)?,
+                            RowWrite::Delete {
+                                key: self.keys.maintenance(),
+                            },
+                        ],
+                    },
+                )
+                .await?,
+        )?;
+        Ok(WriterSession {
+            namespace_id: self.keys.namespace_id(),
+            namespace_prefix: self.keys.prefix().to_vec(),
+            identity,
+            admission: Arc::default(),
+            inode_locks: Arc::default(),
+            io_failures: Arc::default(),
+        })
+    }
+
+    /// A retained terminal receipt makes a lost final-discard reply reconcilable
+    /// without ever decrementing the lower owner count twice.
+    pub async fn discard_completed(&self, token: &MaintenanceToken) -> Result<bool> {
+        if token.namespace_id != self.keys.namespace_id()
+            || token.namespace_prefix != self.keys.prefix()
+        {
+            return Err(EntityError::Fenced);
+        }
+        let keys = vec![
+            self.keys.descriptor(),
+            self.keys.maintenance(),
+            self.keys.lease(),
+            self.keys.lower_pin(),
+        ];
+        let snapshot = self.backend.read(&keys).await?;
+        let descriptor =
+            self.decode_descriptor(snapshot.rows[0].as_deref().ok_or(EntityError::Fenced)?)?;
+        if snapshot.rows[1].as_deref() != Some(encode(&token.record)?.as_slice())
+            || snapshot.rows[2].is_some()
+        {
+            return Err(EntityError::Fenced);
+        }
+        if descriptor.state != NamespaceState::Deleted {
+            return Ok(false);
+        }
+        let owner_key = self
+            .keys
+            .lower_owner(&descriptor.lower.manifest_digest, self.keys.namespace_id());
+        if snapshot.rows[3].is_some() || self.backend.read(&[owner_key]).await?.rows[0].is_some() {
+            return Err(EntityError::Corrupt(
+                "deleted namespace retains a lower owner".into(),
+            ));
+        }
+        Ok(true)
+    }
+
+    pub async fn deleted_lower_owner_proof(
+        &self,
+        token: &MaintenanceToken,
+    ) -> Result<DeletedLowerOwnerProof> {
+        if !self.discard_completed(token).await? {
+            return Err(EntityError::Busy);
+        }
+        let descriptor = self.descriptor().await?;
+        Ok(DeletedLowerOwnerProof {
+            volume_id: self.keys.volume_id(),
+            namespace_id: self.keys.namespace_id(),
+            namespace_prefix: self.keys.prefix().to_vec(),
+            binding: descriptor.lower,
+        })
     }
 }
 
