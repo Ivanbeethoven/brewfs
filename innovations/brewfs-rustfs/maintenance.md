@@ -1,5 +1,11 @@
 # Upstream maintenance and integration
 
+2026-10-20 的最新混合文件结果见 [Agent mixed FUSE results](agent-mixed-fuse-results.md)。
+固定相同二进制，三种读写比例、六档混合文件、36 次真实 FUSE 运行；编辑验证有效吞吐
+提升 7.5%，但浏览定位的整体保存 p95 置信区间仍未通过门槛（共 44/45 项通过）。
+本次仅同步结果、图表与下一步瓶颈假设，没有新增或接受性能代码，没有修改 auto 规则。
+不要将该运行时消融描述为改变 EC 块大小的独立收益：两边实际 EC 均为 1 MiB。
+
 2026-10-20 后续瓶颈归因见 [Bottleneck attribution](bottleneck-attribution.md)：
 三个上传并发候选和一个SDK响应直通候选均因性能门槛失败撤回。纯TCP对照
 复现了当前ACS规格的持续传输平台期和重传；本轮只维护证据与后续方案，

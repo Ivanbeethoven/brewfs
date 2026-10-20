@@ -1,6 +1,8 @@
 # Agent-like mixed I/O through BrewFS FUSE
 
-2026-10-20，方案已收敛，**尚未执行本方案的性能测试**。
+2026-10-20，测量前冻结的实验方案。36 次正式运行现已完成，结果见
+[Agent mixed FUSE results](agent-mixed-fuse-results.md)。44/45 项性能门槛通过，
+整套验收仍未通过。此状态更新不改变冻结的输入、配置或统计门槛。
 
 目标：在大小不同的文件同时读写时，优化 agent 从挂载目录读取上下文、保存修改、
 生成产物的完成时间，并与明确关闭动态联动的 `no-dynamic-block` 对照。
@@ -84,9 +86,11 @@
 
 ## 单一部署与计时口径
 
-计划在杭州一个独占 ACS 测试环境运行：BrewFS 与 RustFS 各 performance 16 vCPU /
-32 GiB，Redis 1 vCPU / 2 GiB；RustFS 四块 40 GiB ESSD PL1、EC 2+2。
-启动前核对可用规格、实际 Pod 和网络上限；若该规格不支持，更新计划再启动测量。
+原拟在杭州独占 ACS 环境使用 BrewFS 与 RustFS 各 performance 16 vCPU / 32 GiB。
+测量前，两种 16 核客户端的 FUSE 设备预检失败，实际固定为 BrewFS 通用型 4 vCPU /
+8 GiB、RustFS performance 16 vCPU / 32 GiB、Redis 1 vCPU / 2 GiB；RustFS 使用
+四块 40 GiB ESSD PL1、EC 2+2。实际规格在正式采集前已写入 execution-bindings，
+两组完全一致；结果文档保留预检失败、客户端网络上限和环境检查。
 只做一次简短容量检查，作为环境记录，不加入产品主结果。旧环境结果不混入新统计。
 
 固定 BrewFS 读内存 64 MiB、读 SSD 缓存 0、写内存 64 MiB、写暂存容量 1 GiB、
@@ -149,10 +153,9 @@ compose 混合读写及 direct=0/1 守卫。它们单独放在回归附录，不
 改动。现有证据提示优先看小文件上传排队、整对象响应收集，以及混合流量下的传输
 竞争；不预先重新启用此前失败的上传并发和 SDK 直通候选。
 
-本方案覆盖并取代旧 NEXT_EXPERIMENT 的大矩阵执行顺序；旧结果仍保留。当前没有
-新集群、云盘或正在运行的测试。实验结束导出并校验数据后，删除独占 Pod、PVC、
+本方案覆盖并取代旧 NEXT_EXPERIMENT 的大矩阵执行顺序；旧结果仍保留。实验结束
+导出并校验数据后，删除独占 Pod、PVC、
 四块云盘、集群及专用端点，核实删除结果，保留共享网络。
 
-上轮四块云盘、EIP、SLB 已再次确认不存在；专用安全组 sg-bp10h35ptv4j9009zxzf
-仍被云平台报告 DependencyViolation，关联 ECS/ENI/ECI 查询为空。该残留没有被
-谎报为已清理，后续只针对它检查，不触碰共享资源。
+上轮四块云盘、EIP、SLB 和延迟释放的专用安全组现已全部确认删除。本轮资源独立
+标识，导出后单独核验清理，不触碰共享网络。实际清理回执随本轮交付物保留。
