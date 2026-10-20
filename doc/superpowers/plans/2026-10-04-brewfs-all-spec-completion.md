@@ -30,12 +30,12 @@ followup04已精确接入严格TiKV冲突处理、typed fork mount/clean publica
 已终态为119通过、0失败、1 ignored，source/Git不变；stores04已终态326/0。
 reason04实际0/1，三次reason2的key/primary/TS全匹配；四类ExecDetailsV2需Lock专用解析。
 metadata-followup05六文件已精确接入且fmt/diff通过，尚未编译/真实验收。
-详见[当前元数据增量](../../performance/packed-v3-metadata-followup-validation-2026-10-08.md)。
+详见[当前元数据增量](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-metadata-followup-validation-2026-10-08.md)。
 FUSE后端重验待执行；operator中央leader GC独立缺口仍开放。
 真实生产CLI/FUSE/operator、发布后原会话完成证明与Pod退出前PVC保留仍须实测，
 完整仓库门禁仍开放。
 目标保持active；先完成系统正确性与完整门禁，再冻结三创新实验。
-最新边界见[carrier/runtime验证](../../performance/packed-v3-carrier-fork-bootstrap-validation-2026-10-08.md)。
+最新边界见[carrier/runtime验证](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-carrier-fork-bootstrap-validation-2026-10-08.md)。
 
 2026-10-08 当前状态：仅 packed-v3，继续完成全部必需 SPEC；尚未关闭目标。
 当前代码收尾集中在 Redis/TiKV 发布、恢复、reader pins 和 GC。前一轮真实后端
@@ -111,7 +111,7 @@ freeze receipt为f55daab064de60c96224caf8ce38b8c5f11398060de7cb0952d7490e6fb5e47
 receipt为6f58f599d07ef60bb7edbb911b25eb10f965b58d7f1e7b587c1975946b0ccb9a，原tests/config/env/git/argv相同。
 新完整gate10+串行supp09在parent1330运行，554 canonical source为
 335b8d51333e6cfcf19cddda8c1c8ff487d29ccc2f8cb2b4eb532824e25c01ab，未到终态不签完整门禁。
-详见[GC验证报告](../../performance/packed-v3-gc-grace-fork-validation-2026-10-06.md)。
+详见[GC验证报告](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-gc-grace-fork-validation-2026-10-06.md)。
 仅catalog native子项focused GREEN，不关闭packed graphGC、真实后端、CONTROL总量预算与全部SPEC/S/X。
 
 最新批次（2026-10-05）：完整FS/reply-failure race一Box修复后session57703实际exit0，
@@ -162,14 +162,14 @@ replyGroup/native join/client-close fence候选仅在外部准备，未接active
 全SPEC/S/X仍OPEN；同源门禁不是客户端RELEASE或原生线程完整join证明。
 
 当前源码批次见
-[reply retirement 验证](../../performance/packed-v3-reply-retirement-validation-2026-10-05.md)：
+[reply retirement 验证](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-reply-retirement-validation-2026-10-05.md)：
 两项ownership、两项closed/discarded-response、两项真实wire close-admission均已实际
 compile→预期RED→GREEN。新socket终态回归io-uring60/Tokio28通过，async-io编译通过；
 实际VFS preparation大小136B在原512Roots内。完整gate06运行中，supplement05待串行，
 全reply/native join、真实pending-body SIGTERM及全部SPEC/S/X仍OPEN。下段为已冻结前驱。
 
 最新 checkpoint 已更新为
-[Plans admission 验证](../../performance/packed-v3-plans-admission-validation-2026-10-05.md)：
+[Plans admission 验证](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-plans-admission-validation-2026-10-05.md)：
 gate04/supplement03 的49+17项及两runtime冻结通过，532输入一致；fresh挂载01被9p拒绝，
 改Linux目录后的normal02首个inline read为ENOMEM，两次失败保留且清理无残留。
 4项现有API真实RED已复现Plans满池自耗尽；两入口最小修复及strict4MiB/minimum2MiB
@@ -262,7 +262,7 @@ lookup 两种名称接口统一读认证 blocks；single-file fixture 同时捕�
 十次真实源挂载复测已通过：40项最终本地checks、122 packed、1,305 overlay lib通过，
 10次FUSE零错误/正常卸载。原fixture build私有模块引用失败保留且单列修正后重建。
 具体证据与属性覆盖边界见
-[source-stat报告](../../performance/packed-v3-source-stat-validation-2026-10-04.md)。
+[source-stat报告](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-source-stat-validation-2026-10-04.md)。
 本批只签收root/allocated-block子项，不关闭 G02/G03/G04。
 
 ## 目标状态
@@ -332,7 +332,7 @@ adapter行为red、2项LoggingFileSystem真实worker/control red及1项Admission
 当前14文件/366 pinned输入的green03通过6 adapter、3registry、4实际worker/control，
 fmt/diff通过；manifest为`3ed951c111affab5e0c2081dbdd8543222f1fc6e55ddd93cf4c58be7193e6557`。
 完整新源码gate/FUSE、关闭未完成readonly任务、有界拒绝reply及minimum Control仍待验收。
-详见[本轮进度证据](../../performance/packed-v3-observer-cancel-progress-2026-10-04.md)。
+详见[本轮进度证据](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-observer-cancel-progress-2026-10-04.md)。
 
 有限最大observer快照、4MiB正常read与两个1MiB reply allowance要求Output至少
 31,902,976 bytes，default32MiB够用；旧30,854,400计算少算一个allowance，不能沿用。
@@ -353,7 +353,7 @@ delta均已冻结和D保护，仅静态验证。下一批以最新common按hunk�
 
 最新readonly内部v3-only和有界producer spool事务批次已通过47项完整gate、8次真实
 FUSE及3项真实Btrfs；366源码仅4文件变化，固定binary/cleanup已核对，见
-[spool/readonly报告](../../performance/packed-v3-spool-readonly-validation-2026-10-04.md)。
+[spool/readonly报告](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-spool-readonly-validation-2026-10-04.md)。
 第三次36k仍600秒未挂载：source完整36,003但只分配29,571编号，producer尚未开始。
 下一批补source库存有界事务；三次失败证据全部保留，G05与S/X继续开放。
 
@@ -504,7 +504,7 @@ lib/bin/fixture 为 1567/1658/8 passed，lib/bin 各 235 ignored，均 0 failed�
 无源变化。该范围不是全部 CI；all-features/vendor/operator/真实后端等仍未执行。
 随后仅 KV 测试辅助代码两项 clippy 样式修正另存 style-delta，stores 再次 59/7，
 fmt/diff 和前后 hash 通过；原门禁不事后升级。详见
-[候选验证报告](../../performance/packed-v3-sidecar-candidate-validation-2026-10-05.md)。
+[候选验证报告](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-sidecar-candidate-validation-2026-10-05.md)。
 
 仍须完成完整 mount/recovery/PWB3 publication、mutation/generation fence、
 reachability GC 和 operator capabilities，运行同源完整门禁与真实后端/FUSE
@@ -526,7 +526,7 @@ normal-sampler03 有 135 样本且无 sampling error，omission 有同 owned Pop
 复核 C 可用 249.58 GiB、D 48.80 GiB，Ubuntu 根盘约 675 GiB；这是快照而非保证。
 # 2026-10-05 current reply-retirement batch (OPEN)
 
-The [reply retirement checkpoint](../../performance/packed-v3-reply-retirement-validation-2026-10-05.md)
+The [reply retirement checkpoint](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-reply-retirement-validation-2026-10-05.md)
 records two actual compile→behavior RED→GREEN tests and the subsequent vendor
 55-pass regression. The new closed/discarded-response negative tests then
 compiled and exposed the still-open terminal-failure defect. The current tree

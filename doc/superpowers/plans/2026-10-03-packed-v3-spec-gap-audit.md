@@ -32,10 +32,10 @@ source/Git不变；原28个普通失败（含26项root故障控制）均通过�
 119通过、0失败、1 ignored，source/Git不变；stores04已完成上述326/0。
 reason04已确认三次冲突的key/primary/TS全匹配且含四类ExecDetailsV2；该测试仍0/1。
 metadata-followup05六文件已精确接入且fmt/diff通过，尚未编译/真实验收。
-详见[当前元数据增量](../../performance/packed-v3-metadata-followup-validation-2026-10-08.md)。
+详见[当前元数据增量](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-metadata-followup-validation-2026-10-08.md)。
 FUSE后端重验待执行；operator中央leader GC仍是独立生产缺口。
 真实生产CLI/FUSE/operator及完整门禁未通过，全部SPEC及S/X仍开放。
-最新计数与边界见[carrier/runtime验证](../../performance/packed-v3-carrier-fork-bootstrap-validation-2026-10-08.md)。
+最新计数与边界见[carrier/runtime验证](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-carrier-fork-bootstrap-validation-2026-10-08.md)。
 
 2026-10-08 当前收尾重点是 Redis/TiKV 的发布、恢复、reader pins 和 GC。
 此前真实后端 26 阶段的 64 项测试全部执行，56 通过、8 失败；失败均遇到
@@ -65,7 +65,7 @@ TiKV Get 锁错误，部分尚未到达目标故障注入断言，不能签收�
 只说明对应的源码与验证范围，不能作为当前树或全 SPEC 的签收。
 
 2026-10-07 最新签收子项为 G12 物理依赖审计，见
-[physical dependency validation](../../performance/packed-v3-physical-dependency-validation-2026-10-07.md)。
+[physical dependency validation](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-physical-dependency-validation-2026-10-07.md)。
 bounded HEAD、GC05/LD05 完整物理认证、SQLite 库存及七根/全部子页遍历已实现。
 gate13 实际结束 48/49、564 输入不变，唯一严格 Clippy 的两处问题已修；独立复核
 另发现 SQLx 查询取消后预算提前释放，三个真实后台 barrier RED 均复现。修复后的
@@ -82,7 +82,7 @@ journal/原子旋转/pins/packed GC 仍开放，不关闭完整 G12/G13 或全�
 候选仅在仓库外准备，未应用/运行，不把设计或DDL检查记为完整graph proof。
 
 2026-10-07 当前源码批次见
-[G12/G13 catalog safety](../../performance/packed-v3-g12-g13-catalog-safety-validation-2026-10-07.md)。
+[G12/G13 catalog safety](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-g12-g13-catalog-safety-validation-2026-10-07.md)。
 G10旧successor02反向应用无需恢复；现v3 bounded-open/attach及G11/G13保留。
 新publication retry、首次扩张inode预留检查、PWB3根代数与finalize预扫/层集合代数
 正在同源完整门禁验证；开发期117项stores中105通过、3个新增finalize竞态按预期RED、
@@ -158,7 +158,7 @@ data blocks、overlay workspace 三个创新点的实验。本文是完成清单
 
 2026-10-04 source-stat批次已通过40项最终本地gate与10次真实源FUSE；PM08认证根属性
 及SI05 allocated blocks不再仅在provenance中保存，见
-[source-stat checkpoint](../../performance/packed-v3-source-stat-validation-2026-10-04.md)。
+[source-stat checkpoint](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-source-stat-validation-2026-10-04.md)。
 下表G02/G03仅关闭这一子项，完整namespace/POSIX/external-large仍开放。全部SPEC目标
 及v2/operator独立出口见[扩展清单](2026-10-04-brewfs-all-spec-completion.md)。
 
@@ -261,7 +261,7 @@ profile 的两次提交只发生一次 GET、两个 waiter 收到同一 `Arc`。
 
 005 pipeline 定向套件现为 **22 passed, 0 failed**；`fmt --check` 与
 `git diff --check` 通过。证据见
-[G09 pipeline checkpoint](../../performance/packed-v3-g09-pipeline-validation-2026-10-06.md)。
+[G09 pipeline checkpoint](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-g09-pipeline-validation-2026-10-06.md)。
 本批只新增测试和证据文档，没有修改 production pipeline code。
 
 这只关闭 G09 的窄 singleflight/profile/cancel/join 子契约。完整 G09 仍需真实
@@ -330,7 +330,7 @@ passes 18 tests and shell/Python syntax checks pass.
 This closes only the local resource-accounting and cleanup-proof sub-contract.
 It does not close cloud dispatch, Redis/TiKV lifecycle, real FUSE failure
 recovery, release reproducibility, or G17 paired acceptance.
-Evidence: [`packed-v3-g16-resource-journal-validation-2026-10-10.md`](../../performance/packed-v3-g16-resource-journal-validation-2026-10-10.md).
+Evidence: [`packed-v3-g16-resource-journal-validation-2026-10-10.md`](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-g16-resource-journal-validation-2026-10-10.md).
 
 ## 2026-10-10 delta: G11 wire-005 generation fence
 

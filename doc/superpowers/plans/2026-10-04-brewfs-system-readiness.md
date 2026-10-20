@@ -24,7 +24,7 @@
 最新用户将“完成所有SPEC”的持续目标收敛为v3；相关operator/large-directory契约
 纳入[全部SPEC清单](2026-10-04-brewfs-all-spec-completion.md)。本文保留首次readiness
 复核的哈希与范围记录；后续PM08 root/allocated-block代码与验收见
-[source-stat checkpoint](../../performance/packed-v3-source-stat-validation-2026-10-04.md)。
+[source-stat checkpoint](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-source-stat-validation-2026-10-04.md)。
 后续目录批次已通过40项最终gate与raw/zstd各540 entries真实挂载：
 [namespace checkpoint](../../performance/packed-v3-namespace-validation-2026-10-04.md)。
 随后byte xattrs/源.stats/removexattr通过独立40项gate与四次真实FUSE，见
@@ -39,7 +39,7 @@ S/X仍未通过，不因这些子项补齐而签收系统。
 36k导入仍两次600秒超时、未挂载，G05规模出口开放；G06/G07、可写ACL、G08–G17继续
 按清单推进，历史S1/S3表记录的是首次复核状态，以当前gap audit及checkpoint为准。
 
-最新[spool/readonly checkpoint](../../performance/packed-v3-spool-readonly-validation-2026-10-04.md)
+最新[spool/readonly checkpoint](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-spool-readonly-validation-2026-10-04.md)
 已核对47项完整gate、8次真实FUSE、3项真实Btrfs及366源码/固定binary身份与cleanup。
 第三次36k仍600秒未挂载，库存完整36,003项但编号只完成29,571项，producer尚未开始。
 source capture/assignment有界事务为下一批；三次失败都保留。S/X仍未签收。
