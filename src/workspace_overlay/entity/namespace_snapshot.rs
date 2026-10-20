@@ -1,10 +1,8 @@
 //! Per-operation observed rows. Advisory topology chooses a bounded read set;
-//! exact observations and lifecycle authority still authorize the final commit.
+//! exact observations and lifecycle authority authorize reads and mutation commits.
 
 use super::*;
-use crate::workspace_overlay::entity::backend::{
-    MAX_TRANSACTION_ROWS, RowSnapshot, add_bytes, validate_keys,
-};
+use crate::workspace_overlay::entity::backend::{MAX_TRANSACTION_ROWS, RowSnapshot, add_bytes};
 
 impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B, L> {
     pub(in crate::workspace_overlay::entity) async fn snapshot(
@@ -42,11 +40,12 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         for (key, expected) in read_keys.into_iter().skip(authority_keys.len()).zip(rows) {
             prepared.add(RowCheck { key, expected })?;
         }
+        prepared.read_covered = true;
         Ok((authority, prepared))
     }
 
     /// Hints only nominate rows to fetch. The actual parent walk resolves the
-    /// observed rows and fetches any newly discovered ancestors before commit.
+    /// observed rows and fetches any newly discovered ancestors before validation.
     pub(super) async fn parent_keys(
         &self,
         parent: i64,
@@ -163,6 +162,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'_, B, L>
         add_bytes(&mut bytes, &check.key, check.expected.as_deref())?;
         self.bytes = bytes;
         self.rows.insert(check.key, check.expected);
+        self.read_covered = false;
         Ok(())
     }
 
@@ -179,20 +179,61 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'_, B, L>
         if keys.is_empty() {
             return Ok(());
         }
-        validate_keys(&keys)?;
         if self.rows.len().saturating_add(keys.len()) > MAX_TRANSACTION_ROWS {
             return Err(EntityError::Invalid(
                 "operation read set exceeds row bound".into(),
             ));
         }
-        let snapshot = self.ns.backend.read(&keys).await?;
-        if snapshot.rows.len() != keys.len() || snapshot.now_ns < 0 {
-            return Err(EntityError::Corrupt("invalid operation snapshot".into()));
-        }
-        self.now = snapshot.now_ns;
-        for (key, expected) in keys.into_iter().zip(snapshot.rows) {
+        let (_, mut snapshot) = self
+            .ns
+            .snapshot(
+                self.rows
+                    .keys()
+                    .cloned()
+                    .chain(keys.iter().cloned())
+                    .collect(),
+            )
+            .await?;
+        let covered = self
+            .rows
+            .iter()
+            .all(|(key, expected)| snapshot.rows.get(key) == Some(expected));
+        self.now = snapshot.now;
+        // Keep old observations even when the fresh batch disagrees. The
+        // unchanged mutation commit or final read validation must reject that
+        // mixed view; preparation does not introduce a new conflict exit.
+        for key in keys {
+            let expected = snapshot
+                .rows
+                .remove(&key)
+                .ok_or_else(|| EntityError::Corrupt("missing prefetched row".into()))?;
             self.add(RowCheck { key, expected })?;
         }
+        self.read_covered = covered;
+        Ok(())
+    }
+
+    /// Complete a read from its atomic batch; force a new batch after object
+    /// transport. This only validates observations and never publishes writes.
+    pub(in crate::workspace_overlay::entity) async fn validate_read(
+        &mut self,
+        force: bool,
+    ) -> Result<()> {
+        if !force && self.read_covered {
+            return Ok(());
+        }
+        self.read_covered = false;
+        // Validate the entire view together, including fresh authority and
+        // backend TIME. Mixed dependent reads must never authorize a result.
+        let (_, snapshot) = self
+            .ns
+            .snapshot(self.rows.keys().cloned().collect())
+            .await?;
+        if self.rows != snapshot.rows {
+            return Err(EntityError::Conflict);
+        }
+        self.now = snapshot.now;
+        self.read_covered = true;
         Ok(())
     }
 

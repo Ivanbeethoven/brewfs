@@ -1156,6 +1156,21 @@ impl PausingBackend {
     fn pause_after_read(&self, key: Vec<u8>) {
         *self.pause_read_key.lock().unwrap() = Some(key);
     }
+    async fn after_read(&self, keys: &[Vec<u8>]) {
+        let pause = {
+            let mut target = self.pause_read_key.lock().unwrap();
+            if target.as_ref().is_some_and(|key| keys.contains(key)) {
+                target.take();
+                true
+            } else {
+                false
+            }
+        };
+        if pause {
+            self.entered.notify_one();
+            self.resume.notified().await;
+        }
+    }
     async fn entered(&self) {
         tokio::time::timeout(Duration::from_secs(5), self.entered.notified())
             .await
@@ -1211,19 +1226,7 @@ impl EntityBackend for PausingBackend {
     async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         let snapshot = self.inner.read(keys).await?;
-        let pause = {
-            let mut target = self.pause_read_key.lock().unwrap();
-            if target.as_ref().is_some_and(|key| keys.contains(key)) {
-                target.take();
-                true
-            } else {
-                false
-            }
-        };
-        if pause {
-            self.entered.notify_one();
-            self.resume.notified().await;
-        }
+        self.after_read(keys).await;
         Ok(snapshot)
     }
     async fn commit(
@@ -1260,7 +1263,9 @@ impl EntityBackend for PausingBackend {
         Ok(inode)
     }
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.inner.scan_prefix(prefix, limit).await
+        let rows = self.inner.scan_prefix(prefix, limit).await?;
+        self.after_read(&[prefix.to_vec()]).await;
+        Ok(rows)
     }
 }
 
@@ -1333,15 +1338,15 @@ async fn known_inode_and_warm_path_operations_batch_authority_and_observed_rows(
 
     backend.reset_counts();
     assert_eq!(fixture.ns.getattr(inode.ino, &root()).await.unwrap(), inode);
-    backend.assert_requests(1, 1);
+    backend.assert_requests(1, 0);
 
     backend.reset_counts();
     fixture.ns.access(inode.ino, 6, &root()).await.unwrap();
-    backend.assert_requests(1, 1);
+    backend.assert_requests(1, 0);
 
     backend.reset_counts();
     let handle = fixture.ns.open_inode(inode.ino, 6, &root()).await.unwrap();
-    backend.assert_requests(1, 1);
+    backend.assert_requests(1, 0);
     fixture.ns.close(handle).unwrap();
 
     backend.reset_counts();
@@ -1352,12 +1357,12 @@ async fn known_inode_and_warm_path_operations_batch_authority_and_observed_rows(
         .unwrap();
     assert_eq!(attr, inode);
     assert_eq!(handle.ino(), inode.ino);
-    backend.assert_requests(1, 1);
+    backend.assert_requests(2, 0);
     fixture.ns.close(handle).unwrap();
 
     backend.reset_counts();
     assert_eq!(fixture.ns.lookup(1, b"file", &root()).await.unwrap(), inode);
-    backend.assert_requests(1, 1);
+    backend.assert_requests(1, 0);
 
     backend.reset_counts();
     fixture.ns.chmod(inode.ino, 0o600, root()).await.unwrap();
@@ -1426,6 +1431,11 @@ async fn operation_snapshot_preserves_old_observations_and_conflicts_after_mutat
     );
     assert_eq!(prepared.observed(&key), Some(&None));
     assert_eq!(
+        prepared.validate_read(true).await,
+        Err(EntityError::Conflict)
+    );
+    assert_eq!(prepared.observed(&key), Some(&None));
+    assert_eq!(
         fixture
             .backend
             .commit(&authority, &prepared.read_plan())
@@ -1434,6 +1444,107 @@ async fn operation_snapshot_preserves_old_observations_and_conflicts_after_mutat
         CommitOutcome::Conflict
     );
     assert_eq!(fixture.ns.getattr(2, &root()).await.unwrap().mode, 0o600);
+}
+
+#[tokio::test]
+async fn dependent_prefetch_covers_matching_rows_but_preserves_changed_observations() {
+    let mut lower = MemoryLower::empty();
+    lower.add_file(1, b"file", 2, 10);
+    let backend = Arc::new(PausingBackend::new());
+    let fixture = attach(
+        backend.clone(),
+        Arc::new(lower),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+    let key = fixture.keys.inode(2);
+    for changed in [false, true] {
+        let (_, mut prepared) = fixture.ns.snapshot(vec![key.clone()]).await.unwrap();
+        if changed {
+            fixture.ns.chmod(2, 0o600, root()).await.unwrap();
+        }
+        backend.reset_counts();
+        prepared
+            .prefetch(vec![fixture.keys.xattr(2, ACCESS_XATTR)])
+            .await
+            .unwrap();
+        assert_eq!(prepared.observed(&key), Some(&None));
+        if changed {
+            assert_eq!(
+                prepared.validate_read(false).await,
+                Err(EntityError::Conflict)
+            );
+            backend.assert_requests(2, 0);
+        } else {
+            prepared.validate_read(false).await.unwrap();
+            backend.assert_requests(1, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn appended_absence_predicate_requires_fresh_validation() {
+    let fixture = fixture(MemoryLower::empty()).await;
+    let (_, mut prepared) = fixture
+        .ns
+        .snapshot(vec![fixture.keys.inode(1)])
+        .await
+        .unwrap();
+    let key = fixture.keys.dentry(1, b"created");
+    prepared
+        .add(RowCheck {
+            key: key.clone(),
+            expected: None,
+        })
+        .unwrap();
+    fixture
+        .ns
+        .create(request(1, b"created", EntityKind::File), root())
+        .await
+        .unwrap();
+    assert_eq!(
+        prepared.validate_read(false).await,
+        Err(EntityError::Conflict)
+    );
+    assert_eq!(prepared.observed(&key), Some(&None));
+}
+
+#[tokio::test]
+async fn forced_read_validation_accepts_renewal_but_checks_backend_expiry() {
+    let fixture = fixture(MemoryLower::empty()).await;
+    let (_, mut prepared) = fixture
+        .ns
+        .snapshot(vec![fixture.keys.inode(1)])
+        .await
+        .unwrap();
+    let lifecycle = Lifecycle::new(fixture.backend.clone(), fixture.keys.clone());
+    fixture.backend.set_time(1100).unwrap();
+    lifecycle.renew(&fixture.ns.session, 2000).await.unwrap();
+    prepared.validate_read(true).await.unwrap();
+    assert_eq!(prepared.now_ns(), 1100);
+    fixture.backend.set_time(3100).unwrap();
+    assert_eq!(prepared.validate_read(true).await, Err(EntityError::Fenced));
+}
+
+#[tokio::test]
+async fn empty_directory_scan_rechecks_ancestor_permissions() {
+    let mut lower = MemoryLower::empty();
+    add_directory(&mut lower, 1, b"parent", 2, 0o777);
+    add_directory(&mut lower, 2, b"empty", 3, 0o777);
+    let backend = Arc::new(PausingBackend::new());
+    let fixture = attach(
+        backend.clone(),
+        Arc::new(lower),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+    backend.pause_after_read(fixture.keys.dentry_prefix(3));
+    let ns = fixture.ns.clone();
+    let pending = tokio::spawn(async move { ns.readdir(3, &user(2000)).await });
+    backend.entered().await;
+    fixture.ns.chmod(2, 0o700, root()).await.unwrap();
+    backend.resume();
+    assert_eq!(pending.await.unwrap(), Err(EntityError::Permission));
 }
 
 #[tokio::test]
@@ -1507,7 +1618,7 @@ async fn stale_dentry_hint_fetches_actual_target_and_its_current_permissions() {
         fixture.ns.open(1, b"file", 4, &user(2000)).await,
         Err(EntityError::Permission)
     ));
-    backend.assert_requests(2, 1);
+    backend.assert_requests(2, 0);
     assert_eq!(
         fixture.ns.getattr(first.ino, &root()).await.unwrap().nlink,
         0
@@ -1522,7 +1633,7 @@ async fn stale_dentry_hint_fetches_actual_target_and_its_current_permissions() {
         .unwrap();
     assert_eq!(inode.ino, replacement.ino);
     assert_eq!(handle.ino(), replacement.ino);
-    backend.assert_requests(1, 1);
+    backend.assert_requests(2, 0);
     fixture.ns.close(handle).unwrap();
 }
 

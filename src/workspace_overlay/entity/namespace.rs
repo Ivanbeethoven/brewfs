@@ -241,6 +241,8 @@ pub(super) struct Prepared<'a, B, L> {
     now: i64,
     bytes: usize,
     inodes: BTreeMap<i64, EntityInode>,
+    /// Every observation was checked together by the latest atomic read.
+    read_covered: bool,
 }
 
 impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B, L> {
@@ -446,7 +448,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         .map(Reply::inode)
     }
 
-    /// Noatime open; path and inode opens use the same preparation and commit.
+    /// Noatime open; path and inode opens validate an operation-local read view.
     pub async fn open(
         &self,
         parent: i64,
@@ -566,6 +568,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
                             }
                         }
                         _guards = self.lock_all(&ids).await;
+                        p.read_covered = false;
                         p.prefetch(self.operation_keys(&request, &ids).await?)
                             .await?;
                     }
@@ -578,10 +581,18 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
                     Err(error) => {
                         // Denials also need a stable view. Never publish partially
                         // prepared writes when validation found an error.
-                        if self.backend.commit(&authority, &p.read_plan()).await?
-                            == CommitOutcome::Conflict
-                        {
-                            continue;
+                        if request.mutation() {
+                            if self.backend.commit(&authority, &p.read_plan()).await?
+                                == CommitOutcome::Conflict
+                            {
+                                continue;
+                            }
+                        } else {
+                            match p.validate_read(false).await {
+                                Ok(()) => {}
+                                Err(EntityError::Conflict) => continue,
+                                Err(error) => return Err(error),
+                            }
                         }
                         return Err(error);
                     }
@@ -610,10 +621,18 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
                         Reply::Inode(inode)
                     }
                     reply => {
-                        if self.backend.commit(&authority, &p.plan()).await?
-                            == CommitOutcome::Conflict
-                        {
-                            continue;
+                        if request.mutation() {
+                            if self.backend.commit(&authority, &p.plan()).await?
+                                == CommitOutcome::Conflict
+                            {
+                                continue;
+                            }
+                        } else {
+                            match p.validate_read(false).await {
+                                Ok(()) => {}
+                                Err(EntityError::Conflict) => continue,
+                                Err(error) => return Err(error),
+                            }
                         }
                         reply
                     }
@@ -646,6 +665,7 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
             now: 0,
             bytes: 0,
             inodes: BTreeMap::new(),
+            read_covered: false,
         }
     }
     pub(super) async fn raw(&mut self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
@@ -914,6 +934,7 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
         // The directory inode predicate fences the scan: every namespace mutation
         // changes that parent, including deletion/recreation of an existing name.
         self.inode(ino).await?;
+        self.read_covered = false;
         let prefix = self.ns.keys.dentry_prefix(ino);
         let rows = self
             .ns

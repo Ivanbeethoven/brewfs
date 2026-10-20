@@ -253,12 +253,14 @@ async fn exercise_batched_file_io<B: EntityBackend + 'static>(
             .data_version,
         1
     );
-    assert_eq!(fixture.backend.take_counts(), (1, 1, 0, 0));
+    assert_eq!(fixture.backend.take_counts(), (1, 0, 0, 0));
     assert_eq!(
         fixture.data.read(handle.clone(), 0, 24).await.unwrap(),
         original
     );
-    assert_eq!(fixture.backend.take_counts(), (2, 2, 0, 0));
+    // Map/ownership rows are batched before transport; the final read retains
+    // the post-transport lease and exact-row fence without a transaction.
+    assert_eq!(fixture.backend.take_counts(), (3, 0, 0, 0));
     fixture.data.fsync(handle.clone()).await.unwrap();
     assert_eq!(fixture.backend.take_counts(), (1, 1, 0, 0));
     assert!(
@@ -269,7 +271,7 @@ async fn exercise_batched_file_io<B: EntityBackend + 'static>(
             .unwrap()
             .is_empty()
     );
-    assert_eq!(fixture.backend.take_counts(), (1, 1, 0, 0));
+    assert_eq!(fixture.backend.take_counts(), (1, 0, 0, 0));
     let replacement = Bytes::from_static(b"ZYXWVUTSRQPONMLKJIHGFEDC");
     fixture
         .data
@@ -1298,7 +1300,7 @@ async fn discard_reserves_before_delete_and_reconciles_an_ambiguous_reply() {
 #[tokio::test]
 async fn chunk_geometry_is_fixed_and_expired_empty_io_is_fenced() {
     let fixture = attach_objects(
-        Arc::new(MemoryEntityBackend::new(1000)),
+        Arc::new(MeteredBackend::new(MemoryEntityBackend::new(1000))),
         EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
         1_000_000,
         Arc::new(NoObjectIo),
@@ -1310,7 +1312,23 @@ async fn chunk_geometry_is_fixed_and_expired_empty_io_is_fenced() {
         Err(EntityError::Invalid(_))
     ));
     let handle = new_file(&fixture, b"empty").await;
-    fixture.backend.set_time(2_000_000).unwrap();
+    fixture.backend.take_counts();
+    assert_eq!(fixture.data.attr(handle.clone()).await.unwrap().size, 0);
+    assert_eq!(fixture.backend.take_counts(), (1, 0, 0, 0));
+    assert!(
+        fixture
+            .data
+            .read(handle.clone(), 0, 8)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fixture.backend.take_counts(), (1, 0, 0, 0));
+    fixture.backend.inner.set_time(2_000_000).unwrap();
+    assert_eq!(
+        fixture.data.attr(handle.clone()).await.unwrap_err(),
+        EntityError::Fenced
+    );
     assert_eq!(
         fixture.data.read(handle.clone(), 0, 0).await.unwrap_err(),
         EntityError::Fenced
