@@ -1,0 +1,89 @@
+{
+  "passed_data_audit": true,
+  "full_file_hash_checks": 144,
+  "baseline_syscalls": {
+    "write": {
+      "madvise": {
+        "calls": 22,
+        "traced_cpu_seconds": 0.010159
+      },
+      "munmap": {
+        "calls": 36,
+        "traced_cpu_seconds": 0.005752
+      },
+      "mmap": {
+        "calls": 71,
+        "traced_cpu_seconds": 0.000631
+      },
+      "brk": {
+        "calls": 16,
+        "traced_cpu_seconds": 4.7e-05
+      }
+    },
+    "read": {
+      "mremap": {
+        "calls": 13795,
+        "traced_cpu_seconds": 0.060837
+      },
+      "madvise": {
+        "calls": 50,
+        "traced_cpu_seconds": 0.013444
+      },
+      "munmap": {
+        "calls": 42,
+        "traced_cpu_seconds": 0.008343
+      },
+      "mmap": {
+        "calls": 78,
+        "traced_cpu_seconds": 0.000891
+      },
+      "brk": {
+        "calls": 16,
+        "traced_cpu_seconds": 6.1e-05
+      }
+    }
+  },
+  "candidate_syscalls": {
+    "write": {
+      "madvise": {
+        "calls": 26,
+        "traced_cpu_seconds": 0.015522
+      },
+      "munmap": {
+        "calls": 36,
+        "traced_cpu_seconds": 0.006855
+      },
+      "mmap": {
+        "calls": 69,
+        "traced_cpu_seconds": 0.001566
+      },
+      "brk": {
+        "calls": 16,
+        "traced_cpu_seconds": 0.000176
+      }
+    },
+    "read": {
+      "madvise": {
+        "calls": 27,
+        "traced_cpu_seconds": 0.012106
+      },
+      "mremap": {
+        "calls": 355,
+        "traced_cpu_seconds": 0.006611
+      },
+      "munmap": {
+        "calls": 41,
+        "traced_cpu_seconds": 0.005609
+      },
+      "mmap": {
+        "calls": 77,
+        "traced_cpu_seconds": 0.000712
+      },
+      "brk": {
+        "calls": 16,
+        "traced_cpu_seconds": 6.2e-05
+      }
+    }
+  },
+  "scope": "Separate diagnostic runs, identical fixed server and resources, complete files. Original baseline diagnostics reused; not paired confidence intervals. Traced times excluded from acceptance."
+}

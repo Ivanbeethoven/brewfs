@@ -1,0 +1,188 @@
+{
+  "passed_data_audit": true,
+  "rows": [
+    {
+      "direction": "download",
+      "streams": 1,
+      "whole_transfer_mib_s": 193.74781573223237,
+      "whole_transfer_seconds": 10.57044174800103,
+      "interval_edges_seconds": [
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
+        7.0,
+        8.0,
+        9.0,
+        10.0,
+        10.56966802200077
+      ],
+      "one_second_mib_s": [
+        291.12004986835905,
+        249.02103126972168,
+        154.1231629733652,
+        187.4101125753233,
+        171.7725686783226,
+        181.34829077294125,
+        186.7845887997198,
+        194.93377125960865,
+        163.91691532975824,
+        176.55835869759562,
+        159.76173185154087
+      ],
+      "after_two_seconds_mib_s": 175.95301416470483,
+      "sides": {
+        "client": {
+          "process_cpu_seconds": 6.409077122,
+          "retransmissions": 0,
+          "timeouts": 0
+        },
+        "server": {
+          "process_cpu_seconds": 0.460980350999999,
+          "retransmissions": 15896,
+          "timeouts": 18
+        }
+      }
+    },
+    {
+      "direction": "download",
+      "streams": 4,
+      "whole_transfer_mib_s": 193.7944171067256,
+      "whole_transfer_seconds": 10.56789989400022,
+      "interval_edges_seconds": [
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
+        7.0,
+        8.0,
+        9.0,
+        10.0,
+        10.566132502000983
+      ],
+      "one_second_mib_s": [
+        345.0439581882507,
+        196.42053545809506,
+        179.32840631570116,
+        179.3450330048355,
+        176.7635235118729,
+        186.79722851421457,
+        178.28738501846965,
+        179.87267615087967,
+        169.6207629436708,
+        180.60760534905103,
+        134.09031503516678
+      ],
+      "after_two_seconds_mib_s": 175.87114208211688,
+      "sides": {
+        "client": {
+          "process_cpu_seconds": 9.849065851,
+          "retransmissions": 0,
+          "timeouts": 0
+        },
+        "server": {
+          "process_cpu_seconds": 0.5481529260000002,
+          "retransmissions": 50253,
+          "timeouts": 89
+        }
+      }
+    },
+    {
+      "direction": "upload",
+      "streams": 1,
+      "whole_transfer_mib_s": 205.45499121050938,
+      "whole_transfer_seconds": 9.968119966000813,
+      "interval_edges_seconds": [
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
+        7.0,
+        8.0,
+        9.0,
+        9.967439346999527
+      ],
+      "one_second_mib_s": [
+        303.3461259795629,
+        246.39695997107674,
+        164.8620919098105,
+        203.74572892539732,
+        187.57873486121298,
+        186.85384606465163,
+        204.39971340620286,
+        190.75039841307853,
+        184.38746190243864,
+        181.59168232244113
+      ],
+      "after_two_seconds_mib_s": 188.04748286080041,
+      "sides": {
+        "client": {
+          "process_cpu_seconds": 0.401522731,
+          "retransmissions": 10348,
+          "timeouts": 15
+        },
+        "server": {
+          "process_cpu_seconds": 6.747060716,
+          "retransmissions": 0,
+          "timeouts": 0
+        }
+      }
+    },
+    {
+      "direction": "upload",
+      "streams": 4,
+      "whole_transfer_mib_s": 205.5677903315522,
+      "whole_transfer_seconds": 9.962650261000817,
+      "interval_edges_seconds": [
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
+        7.0,
+        8.0,
+        9.0,
+        9.961192195998592
+      ],
+      "one_second_mib_s": [
+        381.6748624311705,
+        183.13458549388872,
+        189.54685028564006,
+        186.2729868721391,
+        187.34492168141924,
+        184.38841035436462,
+        184.80124800434464,
+        189.77050710485173,
+        190.73742596004627,
+        177.20514432098514
+      ],
+      "after_two_seconds_mib_s": 186.30256820334188,
+      "sides": {
+        "client": {
+          "process_cpu_seconds": 0.5086654110000026,
+          "retransmissions": 42031,
+          "timeouts": 52
+        },
+        "server": {
+          "process_cpu_seconds": 9.183633163000001,
+          "retransmissions": 0,
+          "timeouts": 0
+        }
+      }
+    }
+  ],
+  "full_stream_sha256_checks": 10,
+  "bytes_transferred": 8589934592,
+  "scope": "Single diagnostic per direction/concurrency, no performance CI and no accepted application change. Full transfer includes every byte. One-second rates interpolate 8MiB receive progress; flow starts are independently timed with a common barrier. After-two-second rate is a descriptive view of the same full stream, not a filtered acceptance measurement. SHA256 runs inside receive timing; CPU recorded."
+}

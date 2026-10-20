@@ -1,5 +1,10 @@
 # Upstream maintenance and integration
 
+2026-10-20 后续瓶颈归因见 [Bottleneck attribution](bottleneck-attribution.md)：
+三个上传并发候选和一个SDK响应直通候选均因性能门槛失败撤回。纯TCP对照
+复现了当前ACS规格的持续传输平台期和重传；本轮只维护证据与后续方案，
+没有新增可合入的性能代码，也没有修改auto hint策略。
+
 2026-10-20 后续维护见 [Adverse-dimension maintenance](adverse-maintenance.md)：修复缓存发布与合并下载的交接，以及孤立预取任务等待；跨块片段预取因尾延迟退步撤回。主矩阵仍有 20 项未通过严格性能门槛，不能将本次缺陷修复表述为全场景性能验收完成。本次修复基于 `5c952b7`，按授权直接快进上游和维护分支；下文的 PR #167 和仅文档合并说明记录此前 2026-10-19 的集成。
 
 ## 维护对象与版本

@@ -1,0 +1,40 @@
+{
+  "passed": true,
+  "stages": [
+    {
+      "stage": "screen",
+      "groups": 76,
+      "comparisons": 47,
+      "full_file_hash_checks": 81984,
+      "plan_sha256": "103cc740ad3502c39ef1c96dedcef57b3418afb678bc21cce45956a9bb0ab459"
+    },
+    {
+      "stage": "size-screen",
+      "groups": 40,
+      "comparisons": 24,
+      "full_file_hash_checks": 41184,
+      "plan_sha256": "49f062d9c20f922fecf40c9b2e15dfd437f4b84e9ed07a5a2d15b54ec4269555"
+    },
+    {
+      "stage": "causal",
+      "groups": 24,
+      "comparisons": 20,
+      "full_file_hash_checks": 31008,
+      "plan_sha256": "75abb0536214c4791f57edac62faa5e7df079428e99dc03e79fdf56d199455c9"
+    },
+    {
+      "stage": "tiny-screen",
+      "groups": 44,
+      "comparisons": 27,
+      "full_file_hash_checks": 45280,
+      "plan_sha256": "92a28c2dafc3975ec8f3d97a68d123d8f443b8317df7accbd0c49e3e2e1323a7"
+    },
+    {
+      "stage": "body-stream-screen",
+      "groups": 52,
+      "comparisons": 33,
+      "full_file_hash_checks": 45856,
+      "plan_sha256": "8ac093369d9a42d991aafff11fce33aae17d817829cf48a6ddb89dacde226ba4"
+    }
+  ]
+}
