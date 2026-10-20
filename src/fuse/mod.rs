@@ -299,6 +299,16 @@ where
     S: BlockStore + Send + Sync + 'static,
     M: MetaLayer + Send + Sync + 'static,
 {
+    // Experimental entity handles are SDK-only. Reject them before any FUSE
+    // inode-side operation can touch a colliding native inode or lock owner.
+    fn reject_entity_fuse_handle(&self, _fh: u64) -> FuseResult<()> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.is_entity_handle(_fh) {
+            return Err(libc::EOPNOTSUPP.into());
+        }
+        Ok(())
+    }
+
     async fn fuse_read_data(
         &self,
         req: Request,
@@ -909,6 +919,7 @@ where
         offset: u64,
         size: u32,
     ) -> FuseResult<ReplyData> {
+        self.reject_entity_fuse_handle(fh)?;
         // Virtual .stats file
         if ino == STATS_INODE {
             let snapshot = self
@@ -1018,6 +1029,7 @@ where
         write_flags: u32,
         _flags: u32,
     ) -> FuseResult<ReplyWrite> {
+        self.reject_entity_fuse_handle(fh)?;
         #[cfg(test)]
         let diagnostic = |stage: &str, error: Option<Errno>| {
             if data.len() != 57 {
@@ -1165,6 +1177,7 @@ where
         fh: Option<u64>,
         _flags: u32,
     ) -> FuseResult<ReplyAttr> {
+        self.reject_entity_fuse_handle(fh.unwrap_or(0))?;
         // Virtual .stats file
         if ino == STATS_INODE {
             let snapshot = match fh {
@@ -1247,6 +1260,7 @@ where
         fh: Option<u64>,
         set_attr: SetAttr,
     ) -> FuseResult<ReplyAttr> {
+        self.reject_entity_fuse_handle(fh.unwrap_or(0))?;
         debug!(unique = req.unique, ino, set_attr = ?set_attr, "fuse.setattr");
         let setattr_start = std::time::Instant::now();
 
@@ -1390,6 +1404,7 @@ where
         fh: u64,
         offset: i64,
     ) -> FuseResult<ReplyDirectory<BoxStream<'a, FuseResult<DirectoryEntry>>>> {
+        self.reject_entity_fuse_handle(fh)?;
         debug!(ino, fh, offset, "fuse.readdir");
         // A packed page has at most 256 children. Admit its independent FUSE
         // entry/name copies before allocation and retain both owners in the
@@ -1531,6 +1546,7 @@ where
         offset: u64,
         _lock_owner: u64,
     ) -> FuseResult<ReplyDirectoryPlus<BoxStream<'a, FuseResult<DirectoryEntryPlus>>>> {
+        self.reject_entity_fuse_handle(fh)?;
         debug!(unique = req.unique, ino, fh, offset, "fuse.readdirplus");
         let ttl = self.permission_cache_ttl();
         let reply_guard = Filesystem::reserve_reply_memory(self, 256 * 1024)?;
@@ -1995,6 +2011,7 @@ where
         lock_owner: u64,
         flush: bool,
     ) -> FuseResult<()> {
+        self.reject_entity_fuse_handle(fh)?;
         let kind = if inode == STATS_INODE {
             crate::vfs::fuse_read_cancel::ClientKind::Stats
         } else {
@@ -2045,6 +2062,7 @@ where
     // Flush file data to backend (called on every close of a file descriptor).
     // Must actually persist dirty data so that close() semantics are honored.
     async fn flush(&self, req: Request, inode: u64, fh: u64, lock_owner: u64) -> FuseResult<()> {
+        self.reject_entity_fuse_handle(fh)?;
         // Virtual .stats file: nothing to flush.
         if inode == STATS_INODE {
             return Ok(());
@@ -2071,6 +2089,7 @@ where
 
     // Sync file content to backend
     async fn fsync(&self, req: Request, inode: u64, fh: u64, datasync: bool) -> FuseResult<()> {
+        self.reject_entity_fuse_handle(fh)?;
         debug!(fh, datasync, "fuse.fsync");
         self.wait_for_prior_fuse_writes(inode as i64, req.unique)
             .await;
@@ -2086,6 +2105,7 @@ where
         length: u64,
         mode: u32,
     ) -> FuseResult<()> {
+        self.reject_entity_fuse_handle(fh)?;
         debug!(inode, fh, offset, length, mode, "fuse.fallocate");
         #[cfg(feature = "workspace-overlay")]
         let workspace_hole_mode = {
@@ -2142,6 +2162,7 @@ where
         offset: u64,
         whence: u32,
     ) -> FuseResult<ReplyLSeek> {
+        self.reject_entity_fuse_handle(_fh)?;
         debug!(inode, offset, whence, "fuse.lseek");
         let Some(attr) = self.stat_ino(inode as i64).await else {
             return Err(libc::ENOENT.into());
@@ -2192,6 +2213,8 @@ where
         length: u64,
         flags: u64,
     ) -> FuseResult<ReplyCopyFileRange> {
+        self.reject_entity_fuse_handle(fh_in)?;
+        self.reject_entity_fuse_handle(fh_out)?;
         debug!(
             inode,
             fh_in, off_in, inode_out, fh_out, off_out, length, flags, "fuse.copy_file_range"
@@ -2223,6 +2246,7 @@ where
         in_data: &[u8],
         _out_size: u32,
     ) -> FuseResult<ReplyIoctl> {
+        self.reject_entity_fuse_handle(_fh)?;
         debug!(
             inode,
             flags,
@@ -2485,6 +2509,7 @@ where
 
     // Close directory handle
     async fn releasedir(&self, _req: Request, inode: u64, fh: u64, _flags: u32) -> FuseResult<()> {
+        self.reject_entity_fuse_handle(fh)?;
         let client = self.begin_fuse_client_release(
             inode,
             fh,
@@ -2529,6 +2554,7 @@ where
         _fh: u64,
         _datasync: bool,
     ) -> FuseResult<()> {
+        self.reject_entity_fuse_handle(_fh)?;
         Ok(())
     }
 
@@ -2544,6 +2570,7 @@ where
         lock_type: u32,
         _pid: u32,
     ) -> FuseResult<ReplyLock> {
+        self.reject_entity_fuse_handle(_fh)?;
         debug!(inode, lock_owner, start, end, lock_type, "fuse.getlk");
         // Convert FUSE lock type to our internal type
         let fl_type = match lock_type {
@@ -2594,6 +2621,7 @@ where
         pid: u32,
         block: bool,
     ) -> FuseResult<()> {
+        self.reject_entity_fuse_handle(fh)?;
         debug!(
             inode,
             lock_owner, start, end, lock_type, pid, block, "fuse.setlk"
