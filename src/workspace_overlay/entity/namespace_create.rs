@@ -3,79 +3,23 @@
 //! stale hint can require extra reads; all observed rows remain exact predicates.
 
 use super::*;
-use crate::workspace_overlay::entity::backend::{CreateAllocation, RowSnapshot};
+use crate::workspace_overlay::entity::backend::CreateAllocation;
 
 impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B, L> {
     async fn create_snapshot(
         &self,
         request: &CreateRequest,
     ) -> Result<(TransactionAuthority, Prepared<'_, B, L>)> {
-        if self.session.namespace_id() != self.keys.namespace_id()
-            || self.session.lower_binding() != self.lower.binding()
-        {
-            return Err(EntityError::Fenced);
-        }
-        let authority_keys = self.lifecycle.authority_keys(&self.session)?;
-        let mut keys = BTreeSet::from([
-            self.keys.dentry(request.parent, &request.name),
+        let mut keys: BTreeSet<_> = self
+            .path_keys(request.parent, &request.name)
+            .await?
+            .into_iter()
+            .collect();
+        keys.extend([
             self.keys.xattr(request.parent, DEFAULT_XATTR),
             self.keys.truncate(request.parent),
         ]);
-        let mut current = request.parent;
-        let mut seen = BTreeSet::new();
-        while current > 0 && seen.insert(current) && seen.len() <= MAX_ANCESTORS {
-            keys.insert(self.keys.inode(current));
-            keys.insert(self.keys.xattr(current, ACCESS_XATTR));
-            if current == self.lower.binding().root_ino {
-                break;
-            }
-            if let Some(parent) = self.directory_hints.get(&current) {
-                current = parent;
-            } else if current <= self.lower.binding().max_ino {
-                // Immutable prefetch/memo supplies lower ancestry locally after
-                // warmup. Fresh upper rows below still override this hint.
-                match self.lower.inode(current).await? {
-                    Some(inode) if inode.kind == EntityKind::Directory => {
-                        if let Some(parent) = inode.parent_hint {
-                            self.directory_hints.insert(current, parent);
-                            current = parent;
-                        } else {
-                            break;
-                        }
-                    }
-                    _ => break,
-                }
-            } else {
-                break;
-            }
-        }
-        let mut read_keys = authority_keys.clone();
-        read_keys.extend(keys);
-        let mut snapshot = self.backend.read(&read_keys).await?;
-        if snapshot.rows.len() != read_keys.len() {
-            return Err(EntityError::Corrupt("short create snapshot".into()));
-        }
-        let rows = snapshot.rows.split_off(authority_keys.len());
-        let authority = self.lifecycle.authority_from_snapshot(
-            &self.session,
-            RowSnapshot {
-                now_ns: snapshot.now_ns,
-                rows: snapshot.rows,
-            },
-        )?;
-        Ok((
-            authority,
-            Prepared {
-                ns: self,
-                rows: read_keys
-                    .into_iter()
-                    .skip(authority_keys.len())
-                    .zip(rows)
-                    .collect(),
-                writes: BTreeMap::new(),
-                now: snapshot.now_ns,
-            },
-        ))
+        self.snapshot(keys.into_iter().collect()).await
     }
 
     /// The caller retains admission and the affected parent lock across retries
@@ -111,6 +55,8 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
                 if inode.kind == EntityKind::Directory {
                     self.directory_hints.insert(ino, request.parent);
                 }
+                self.dentry_hints
+                    .insert((request.parent, request.name.clone()), ino);
                 return Ok(inode);
             }
         }

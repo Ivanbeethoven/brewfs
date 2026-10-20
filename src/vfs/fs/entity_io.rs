@@ -116,9 +116,8 @@ where
             });
         }
         let io = self.entity_file(fh).ok_or(VfsError::InvalidInput)?;
-        io.truncate(size).await.map_err(error)?;
+        let inode = io.truncate(size).await.map_err(error)?;
         if let Some(handle) = self.file_handle(fh) {
-            let inode = io.attr().await.map_err(error)?;
             let mut attr = handle.attr();
             attr.size = inode.size;
             attr.blocks = inode.size.div_ceil(512);

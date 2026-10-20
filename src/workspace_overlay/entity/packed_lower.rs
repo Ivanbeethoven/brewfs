@@ -316,7 +316,7 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K
         let _span = Span::start("packed.inode_inner");
         let value = self
             .memo
-            .get(memo::Key::Inode(ino), async {
+            .get(memo::Key::Inode(ino), || async {
                 Ok(memo::Value::Inode(
                     self.load_inode(ino).await?.map(Arc::new),
                 ))
@@ -331,7 +331,7 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K
     async fn cold_inner(&self, ino: i64) -> Result<Option<Arc<V3ColdAttributes>>> {
         let value = self
             .memo
-            .get(memo::Key::Cold(ino), async {
+            .get(memo::Key::Cold(ino), || async {
                 let cold = self
                     .snapshot
                     .cold_attributes(&self.client, &self.reader, ino as u64)
@@ -473,7 +473,7 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLower
         let admission = self.begin_call().await?;
         let value = self
             .memo
-            .get(memo::Key::Dentry(parent, name.to_vec()), async {
+            .get(memo::Key::Dentry(parent, name.to_vec()), || async {
                 self.require_directory(parent).await?;
                 // A retained complete immutable directory proves both presence
                 // and absence without fetching a group page for each new name.
@@ -535,7 +535,7 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLower
         let admission = self.begin_call().await?;
         let value = self
             .memo
-            .get(memo::Key::Chunk(ino, chunk_index, chunk_size), async {
+            .get(memo::Key::Chunk(ino, chunk_index, chunk_size), || async {
                 let row = self.inode_inner(ino).await?.ok_or(EntityError::NotFound)?;
                 if row.kind != EntityKind::File {
                     return Err(EntityError::IsDirectory);
@@ -573,7 +573,7 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K
     async fn directory_inner(&self, ino: i64) -> Result<Arc<Vec<(Vec<u8>, EntityDentry)>>> {
         let value = self
             .memo
-            .get(memo::Key::Directory(ino), async {
+            .get(memo::Key::Directory(ino), || async {
                 Ok(memo::Value::Directory(Arc::new(
                     self.load_directory(ino).await?,
                 )))

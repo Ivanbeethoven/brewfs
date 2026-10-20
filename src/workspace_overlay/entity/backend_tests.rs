@@ -66,10 +66,6 @@ async fn conformance<B: EntityBackend + 'static>(backend: Arc<B>, keys: EntityKe
         Err(EntityError::Invalid(_))
     ));
     assert_eq!(backend.read(&[protected]).await.unwrap().rows, vec![None]);
-    assert!(matches!(
-        backend.allocate(&authority, &foreign).await,
-        Err(EntityError::Invalid(_))
-    ));
     let contested = keys.dentry(1, b"exclusive");
     let mut tasks = tokio::task::JoinSet::new();
     for candidate in 1..=32 {
@@ -94,19 +90,6 @@ async fn conformance<B: EntityBackend + 'static>(backend: Arc<B>, keys: EntityKe
         committed += usize::from(outcome.unwrap() == CommitOutcome::Committed);
     }
     assert_eq!(committed, 1, "exclusive create has exactly one winner");
-
-    let mut allocations = tokio::task::JoinSet::new();
-    for _ in 0..32 {
-        let backend = backend.clone();
-        let authority = authority.clone();
-        let counter = keys.counter("inode");
-        allocations.spawn(async move { backend.allocate(&authority, &counter).await.unwrap() });
-    }
-    let mut ids = BTreeSet::new();
-    while let Some(id) = allocations.join_next().await {
-        assert!(ids.insert(id.unwrap()));
-    }
-    assert_eq!(ids, (9007199254740992..9007199254741024).collect());
 
     let empty_key = keys.inode(2);
     let other_key = keys.inode(3);
@@ -201,10 +184,6 @@ async fn conformance<B: EntityBackend + 'static>(backend: Arc<B>, keys: EntityKe
                 .await,
             Err(EntityError::Fenced)
         );
-        assert_eq!(
-            backend.allocate(&fenced, &keys.counter("inode")).await,
-            Err(EntityError::Fenced)
-        );
     }
     assert_eq!(
         backend
@@ -214,47 +193,6 @@ async fn conformance<B: EntityBackend + 'static>(backend: Arc<B>, keys: EntityKe
             .rows,
         vec![None]
     );
-
-    assert_eq!(
-        backend
-            .commit(
-                &authority,
-                &EntityPlan {
-                    checks: vec![],
-                    writes: vec![put(keys.counter("inode"), b"9223372036854775807")]
-                }
-            )
-            .await
-            .unwrap(),
-        CommitOutcome::Committed
-    );
-    assert_eq!(
-        backend.allocate(&authority, &keys.counter("inode")).await,
-        Err(EntityError::Exhausted)
-    );
-    assert_eq!(
-        backend.read(&[keys.counter("inode")]).await.unwrap().rows,
-        vec![Some(b"9223372036854775807".to_vec())]
-    );
-    for invalid in [b"01".as_slice(), b"-1", b"9223372036854775808"] {
-        assert_eq!(
-            backend
-                .commit(
-                    &authority,
-                    &EntityPlan {
-                        checks: vec![],
-                        writes: vec![put(keys.counter("inode"), invalid)]
-                    }
-                )
-                .await
-                .unwrap(),
-            CommitOutcome::Committed
-        );
-        assert!(matches!(
-            backend.allocate(&authority, &keys.counter("inode")).await,
-            Err(EntityError::Corrupt(_))
-        ));
-    }
 
     assert_eq!(
         backend
@@ -280,10 +218,6 @@ async fn conformance<B: EntityBackend + 'static>(backend: Arc<B>, keys: EntityKe
             )
             .await,
         Ok(CommitOutcome::Conflict)
-    );
-    assert_eq!(
-        backend.allocate(&authority, &keys.counter("inode")).await,
-        Err(EntityError::Conflict)
     );
     // A heartbeat changes exact lease bytes without changing writer identity.
     // Only a fresh lifecycle read may create replacement authority; a caller
@@ -505,6 +439,32 @@ async fn atomic_create_conformance<B: EntityBackend + 'static>(backend: Arc<B>, 
     // advancement or publication of parent/name/inode rows.
     let fresh = create_request(&keys, 1001, b"must-not-appear");
     let fresh_plan = create_plan(&fresh, b"updated-parent", None);
+    for invalid in [b"01".as_slice(), b"-1", b"9223372036854775808"] {
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![put(counter.clone(), invalid)],
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            backend
+                .commit_with_inode_allocation(&authority, &fresh_plan, &fresh)
+                .await,
+            Err(EntityError::Corrupt(_))
+        ));
+        assert_eq!(
+            backend
+                .read(&[counter.clone(), keys.dentry(1001, &fresh.name)])
+                .await
+                .unwrap()
+                .rows,
+            vec![Some(invalid.to_vec()), None]
+        );
+    }
     for (value, occupied) in [
         (b"100".as_slice(), keys.inode(101)),
         (b"101".as_slice(), keys.xattr(102, b"user.identity")),
@@ -586,6 +546,236 @@ async fn memory_atomic_create_allocation_conformance() {
     atomic_create_conformance(
         Arc::new(MemoryEntityBackend::new(100)),
         EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+}
+
+async fn slice_reservation_conformance<B: EntityBackend + 'static>(
+    backend: Arc<B>,
+    keys: EntityKeys,
+) {
+    let authority = initialize(backend.as_ref(), &keys).await;
+    let allocation = SliceAllocation {
+        keys: keys.clone(),
+        sizes: vec![8, 16, 32],
+        upload_id: Uuid::new_v4(),
+        lease: LeaseIdentity {
+            lease_id: Uuid::new_v4(),
+            holder_generation: 1,
+        },
+    };
+    let mut foreign = allocation.clone();
+    foreign.keys = EntityKeys::new(Uuid::new_v4(), Uuid::new_v4());
+    assert!(matches!(
+        backend.reserve_slices(&authority, &foreign).await,
+        Err(EntityError::Invalid(_))
+    ));
+    assert_eq!(
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![put(keys.counter("slice"), b"9007199254740991")],
+                }
+            )
+            .await
+            .unwrap(),
+        CommitOutcome::Committed,
+    );
+    let ids = backend
+        .reserve_slices(&authority, &allocation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ids,
+        vec![9007199254740992, 9007199254740993, 9007199254740994]
+    );
+    let rows = backend
+        .read(&ids.iter().map(|id| keys.slice(*id)).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    for (position, (id, bytes)) in ids.iter().zip(rows.rows).enumerate() {
+        let expected = allocation.pending(*id, position);
+        assert_eq!(
+            bytes,
+            Some(codec::encode(&expected).unwrap()),
+            "exact decimal identity in Pending row"
+        );
+    }
+
+    let mut reservations = tokio::task::JoinSet::new();
+    for _ in 0..16 {
+        let backend = backend.clone();
+        let authority = authority.clone();
+        let mut allocation = allocation.clone();
+        allocation.upload_id = Uuid::new_v4();
+        reservations.spawn(async move {
+            backend
+                .reserve_slices(&authority, &allocation)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+    }
+    let mut concurrent_ids = BTreeSet::new();
+    while let Some(batch) = reservations.join_next().await {
+        let batch = batch.unwrap();
+        assert!(batch.windows(2).all(|pair| pair[0] + 1 == pair[1]));
+        for id in batch {
+            assert!(concurrent_ids.insert(id));
+        }
+    }
+    assert_eq!(
+        concurrent_ids.len(),
+        48,
+        "no allocator CAS conflict or reused ID"
+    );
+
+    let checked_keys = vec![
+        keys.counter("slice"),
+        keys.slice(101),
+        keys.slice(102),
+        keys.slice(103),
+        keys.object_descriptor(102),
+    ];
+    for collision in [keys.slice(102), keys.object_descriptor(102)] {
+        assert_eq!(
+            backend
+                .commit(
+                    &authority,
+                    &EntityPlan {
+                        checks: vec![],
+                        writes: vec![
+                            put(keys.counter("slice"), b"100"),
+                            put(collision.clone(), b"occupied")
+                        ],
+                    }
+                )
+                .await
+                .unwrap(),
+            CommitOutcome::Committed
+        );
+        let before = backend.read(&checked_keys).await.unwrap().rows;
+        assert!(matches!(
+            backend.reserve_slices(&authority, &allocation).await,
+            Err(EntityError::Corrupt(_))
+        ));
+        assert_eq!(
+            backend.read(&checked_keys).await.unwrap().rows,
+            before,
+            "a later collision must not allocate or register any prefix"
+        );
+        assert_eq!(
+            backend
+                .commit(
+                    &authority,
+                    &EntityPlan {
+                        checks: vec![],
+                        writes: vec![RowWrite::Delete { key: collision }],
+                    }
+                )
+                .await
+                .unwrap(),
+            CommitOutcome::Committed
+        );
+    }
+
+    let counter = keys.counter("slice");
+    let final_id = keys.slice(i64::MAX as u64);
+    assert_eq!(
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![put(counter.clone(), b"9223372036854775806")],
+                }
+            )
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    let checked_keys = vec![counter.clone(), final_id];
+    let before = backend.read(&checked_keys).await.unwrap().rows;
+    assert_eq!(
+        backend.reserve_slices(&authority, &allocation).await,
+        Err(EntityError::Exhausted)
+    );
+    assert_eq!(
+        backend.read(&checked_keys).await.unwrap().rows,
+        before,
+        "a later overflow must not allocate the valid first identity"
+    );
+
+    let conflict = TransactionAuthority::from_validated(
+        vec![check(keys.lease(), Some(b"wrong-lease"))],
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        backend
+            .reserve_slices(&conflict, &allocation)
+            .await
+            .unwrap(),
+        None
+    );
+    let now = backend.read(&[]).await.unwrap().now_ns;
+    let expired =
+        TransactionAuthority::from_validated(authority.checks.clone(), None, Some(now)).unwrap();
+    assert_eq!(
+        backend.reserve_slices(&expired, &allocation).await,
+        Err(EntityError::Fenced)
+    );
+    assert_eq!(backend.read(&checked_keys).await.unwrap().rows, before);
+    let future =
+        TransactionAuthority::from_validated(authority.checks.clone(), Some(i64::MAX), None)
+            .unwrap();
+    assert_eq!(
+        backend.reserve_slices(&future, &allocation).await,
+        Err(EntityError::Fenced)
+    );
+    for invalid in [b"01".as_slice(), b"-1", b"9223372036854775808"] {
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![put(counter.clone(), invalid)],
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            backend.reserve_slices(&authority, &allocation).await,
+            Err(EntityError::Corrupt(_))
+        ));
+        assert_eq!(
+            backend.read(&checked_keys).await.unwrap().rows,
+            vec![Some(invalid.to_vec()), None]
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_atomic_slice_reservation_conformance() {
+    slice_reservation_conformance(
+        Arc::new(MemoryEntityBackend::new(10)),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires BREWFS_TEST_REDIS_URL pointing to an isolated local Redis"]
+async fn redis_atomic_slice_reservation_conformance() {
+    let url = std::env::var("BREWFS_TEST_REDIS_URL").expect("BREWFS_TEST_REDIS_URL");
+    let volume = Uuid::new_v4();
+    slice_reservation_conformance(
+        Arc::new(RedisEntityBackend::connect(&url, volume).await.unwrap()),
+        EntityKeys::new(volume, Uuid::new_v4()),
     )
     .await;
 }

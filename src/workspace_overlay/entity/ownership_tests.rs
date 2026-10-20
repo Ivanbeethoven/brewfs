@@ -41,21 +41,43 @@ impl Fixture {
         }
     }
 
-    async fn upload(&self) -> u64 {
-        let token = self
-            .ownership
-            .allocate_upload(&self.session, 16)
-            .await
-            .unwrap();
-        self.ownership
-            .uploaded(&self.session, &token)
-            .await
-            .unwrap();
-        self.ownership
-            .uploaded(&self.session, &token)
-            .await
-            .unwrap();
-        token.slice_id()
+    /// Typed starting state for membership/reclamation tests, independent of
+    /// the upload protocol (tested with durable receipts below).
+    async fn seed_available_slice(&self) -> u64 {
+        let row = SliceOwnership {
+            namespace_id: self.keys.namespace_id(),
+            slice_id: 1,
+            size: 16,
+            state: SliceState::Available,
+            current_refs: 0,
+            staging_hold: true,
+            retirement_hold: false,
+            publication_refs: 0,
+        };
+        let authority = self.lifecycle.authority(&self.session).await.unwrap();
+        assert_eq!(
+            self.backend
+                .commit(
+                    &authority,
+                    &EntityPlan {
+                        checks: vec![RowCheck {
+                            key: self.keys.slice(1),
+                            expected: None
+                        }],
+                        writes: vec![
+                            put(self.keys.slice(1), &row).unwrap(),
+                            RowWrite::Put {
+                                key: self.keys.counter("slice"),
+                                value: b"1".to_vec(),
+                            }
+                        ],
+                    }
+                )
+                .await
+                .unwrap(),
+            CommitOutcome::Committed
+        );
+        1
     }
 
     async fn row(&self, id: u64) -> SliceOwnership {
@@ -118,9 +140,245 @@ fn map(id: u64) -> ChunkMap {
 }
 
 #[tokio::test]
+async fn durable_receipt_publishes_pending_owner_and_membership_in_one_transaction() {
+    let fixture = Fixture::new().await;
+    let authority = fixture.lifecycle.authority(&fixture.session).await.unwrap();
+    let token = fixture
+        .ownership
+        .reserve_uploads(&fixture.session, &authority, &[16])
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let id = token.slice_id();
+    let pending = RowCheck {
+        key: token.pending_key.clone(),
+        expected: Some(token.pending_bytes.clone()),
+    };
+    let receipt = token.confirm_durable_put();
+    let holes = ChunkMap::holes(16).unwrap();
+    let data = map(id);
+    let mut plan = plan_chunk_membership_from_rows(
+        &fixture.keys,
+        3,
+        0,
+        &holes,
+        &data,
+        &BTreeMap::new(),
+        Some(&receipt),
+    )
+    .unwrap();
+    assert!(plan.checks.contains(&pending));
+    assert!(plan.checks.contains(&RowCheck {
+        key: fixture.keys.owner(id, 3, 0),
+        expected: None
+    }));
+    assert!(matches!(
+        fixture.row(id).await.state,
+        SliceState::Pending { .. }
+    ));
+    plan.checks.push(RowCheck {
+        key: fixture.keys.chunk(3, 0),
+        expected: None,
+    });
+    plan.writes
+        .push(put(fixture.keys.chunk(3, 0), &data).unwrap());
+    assert_eq!(
+        fixture.backend.commit(&authority, &plan).await.unwrap(),
+        CommitOutcome::Committed
+    );
+    let row = fixture.row(id).await;
+    assert_eq!(row.state, SliceState::Available);
+    assert_eq!(row.current_refs, 1);
+    assert!(!row.staging_hold);
+    assert_eq!(
+        fixture.backend.commit(&authority, &plan).await.unwrap(),
+        CommitOutcome::Conflict
+    );
+
+    let changed = BTreeMap::from([(fixture.keys.slice(id), Some(encode(&row).unwrap()))]);
+    assert_eq!(
+        plan_chunk_membership_from_rows(
+            &fixture.keys,
+            3,
+            0,
+            &holes,
+            &data,
+            &changed,
+            Some(&receipt),
+        ),
+        Err(EntityError::Conflict)
+    );
+    let foreign = EntityKeys::new(fixture.volume_id, Uuid::new_v4());
+    assert!(matches!(
+        plan_chunk_membership_from_rows(
+            &foreign,
+            3,
+            0,
+            &holes,
+            &data,
+            &BTreeMap::new(),
+            Some(&receipt),
+        ),
+        Err(EntityError::Invalid(_))
+    ));
+    let duplicate = DurableUpload {
+        token: receipt.token.clone(),
+    };
+    assert!(matches!(
+        plan_chunk_memberships_from_rows(
+            &fixture.keys,
+            3,
+            &[(0, holes, data)],
+            &BTreeMap::new(),
+            &[receipt, duplicate],
+        ),
+        Err(EntityError::Invalid(_))
+    ));
+}
+
+#[tokio::test]
+async fn batch_memberships_aggregate_shared_slices_and_keep_retirement_on_net_zero_change() {
+    let fixture = Fixture::new().await;
+    let id = fixture.seed_available_slice().await;
+    let holes = ChunkMap::holes(16).unwrap();
+    let data = map(id);
+    fixture.publish(3, 0, &holes, &data).await;
+    fixture.publish(3, 1, &holes, &data).await;
+    let replacements = vec![
+        (0, data.clone(), holes.clone()),
+        (1, data.clone(), holes.clone()),
+        (2, holes.clone(), data.clone()),
+        (3, holes.clone(), data.clone()),
+    ];
+    let mut row_keys = BTreeSet::new();
+    for (index, old, new) in &replacements {
+        row_keys.extend(chunk_membership_keys(&fixture.keys, 3, *index, old, new).unwrap());
+    }
+    let row_keys: Vec<_> = row_keys.into_iter().collect();
+    let snapshot = fixture.backend.read(&row_keys).await.unwrap();
+    let rows: BTreeMap<_, _> = row_keys.into_iter().zip(snapshot.rows).collect();
+    let mut plan =
+        plan_chunk_memberships_from_rows(&fixture.keys, 3, &replacements, &rows, &[]).unwrap();
+    assert_eq!(
+        plan.writes
+            .iter()
+            .filter(|write| write.key() == fixture.keys.slice(id))
+            .count(),
+        1
+    );
+    for (index, _, new) in &replacements {
+        let key = fixture.keys.chunk(3, *index);
+        let current = fixture
+            .backend
+            .read(std::slice::from_ref(&key))
+            .await
+            .unwrap()
+            .rows
+            .pop()
+            .unwrap();
+        plan.checks.push(RowCheck {
+            key: key.clone(),
+            expected: current,
+        });
+        plan.writes.push(put(key, new).unwrap());
+    }
+    let authority = fixture.lifecycle.authority(&fixture.session).await.unwrap();
+    assert_eq!(
+        fixture.backend.commit(&authority, &plan).await.unwrap(),
+        CommitOutcome::Committed
+    );
+    let row = fixture.row(id).await;
+    assert_eq!(row.current_refs, 2);
+    assert!(row.retirement_hold);
+
+    let mut undercounted = rows;
+    let mut row: SliceOwnership = decode(
+        undercounted
+            .get(&fixture.keys.slice(id))
+            .unwrap()
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    row.current_refs = 1;
+    undercounted.insert(fixture.keys.slice(id), Some(encode(&row).unwrap()));
+    assert!(matches!(
+        plan_chunk_memberships_from_rows(&fixture.keys, 3, &replacements, &undercounted, &[],),
+        Err(EntityError::Corrupt(_))
+    ));
+}
+
+struct CountingBackend {
+    inner: Arc<MemoryEntityBackend>,
+    reads: std::sync::atomic::AtomicUsize,
+    mutations: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl EntityBackend for CountingBackend {
+    async fn read(&self, keys: &[Vec<u8>]) -> Result<super::super::backend::RowSnapshot> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.read(keys).await
+    }
+    async fn commit(
+        &self,
+        authority: &TransactionAuthority,
+        plan: &EntityPlan,
+    ) -> Result<CommitOutcome> {
+        self.mutations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.commit(authority, plan).await
+    }
+    async fn reserve_slices(
+        &self,
+        authority: &TransactionAuthority,
+        allocation: &SliceAllocation,
+    ) -> Result<Option<Vec<u64>>> {
+        self.mutations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.reserve_slices(authority, allocation).await
+    }
+    async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.scan_prefix(prefix, limit).await
+    }
+}
+
+#[tokio::test]
+async fn supplied_authority_reserves_all_pending_owners_in_one_backend_call() {
+    let fixture = Fixture::new().await;
+    let authority = fixture.lifecycle.authority(&fixture.session).await.unwrap();
+    let backend = Arc::new(CountingBackend {
+        inner: fixture.backend.clone(),
+        reads: 0.into(),
+        mutations: 0.into(),
+    });
+    let ownership = Ownership::new(backend.clone(), fixture.keys.clone());
+    let uploads = ownership
+        .reserve_uploads(&fixture.session, &authority, &[8, 16, 32])
+        .await
+        .unwrap();
+    assert_eq!(uploads.len(), 3);
+    assert_eq!(backend.reads.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(
+        backend.mutations.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    for upload in uploads {
+        let row = fixture.row(upload.slice_id()).await;
+        assert!(matches!(row.state, SliceState::Pending { .. }));
+        assert!(row.staging_hold);
+        assert_eq!(row.current_refs, 0);
+    }
+}
+
+#[tokio::test]
 async fn memberships_count_distinct_chunks_and_replay_cannot_double_release() {
     let fixture = Fixture::new().await;
-    let id = fixture.upload().await;
+    let id = fixture.seed_available_slice().await;
     let holes = ChunkMap::holes(16).unwrap();
     let data = map(id);
     fixture.publish(3, 0, &holes, &data).await;
@@ -157,10 +415,13 @@ async fn memberships_count_distinct_chunks_and_replay_cannot_double_release() {
 #[tokio::test]
 async fn pending_and_unpublished_uploads_block_reclamation_and_upload_token_drains() {
     let fixture = Fixture::new().await;
+    let authority = fixture.lifecycle.authority(&fixture.session).await.unwrap();
     let token = fixture
         .ownership
-        .allocate_upload(&fixture.session, 16)
+        .reserve_uploads(&fixture.session, &authority, &[16])
         .await
+        .unwrap()
+        .pop()
         .unwrap();
     let id = token.slice_id();
     let holes = ChunkMap::holes(16).unwrap();
@@ -234,7 +495,17 @@ async fn pending_and_unpublished_uploads_block_reclamation_and_upload_token_drai
 #[tokio::test]
 async fn uploaded_but_unpublished_object_keeps_staging_owner() {
     let fixture = Fixture::new().await;
-    let id = fixture.upload().await;
+    let authority = fixture.lifecycle.authority(&fixture.session).await.unwrap();
+    let receipt = fixture
+        .ownership
+        .reserve_uploads(&fixture.session, &authority, &[16])
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+        .confirm_durable_put();
+    let id = receipt.slice_id();
+    drop(receipt);
     let maintenance = fixture
         .lifecycle
         .enter_maintenance(&fixture.session)
@@ -250,7 +521,7 @@ async fn uploaded_but_unpublished_object_keeps_staging_owner() {
 #[tokio::test]
 async fn retired_object_waits_for_reader_then_deletion_excludes_stale_publication() {
     let fixture = Fixture::new().await;
-    let id = fixture.upload().await;
+    let id = fixture.seed_available_slice().await;
     let holes = ChunkMap::holes(16).unwrap();
     let data = map(id);
     fixture.publish(3, 0, &holes, &data).await;
@@ -302,7 +573,7 @@ async fn retired_object_waits_for_reader_then_deletion_excludes_stale_publicatio
 #[tokio::test]
 async fn cross_namespace_missing_membership_and_underflow_fail_without_map_changes() {
     let fixture = Fixture::new().await;
-    let id = fixture.upload().await;
+    let id = fixture.seed_available_slice().await;
     let holes = ChunkMap::holes(16).unwrap();
     let data = map(id);
     let foreign_keys = EntityKeys::new(fixture.volume_id, Uuid::new_v4());
@@ -349,7 +620,7 @@ async fn cross_namespace_missing_membership_and_underflow_fail_without_map_chang
 #[tokio::test]
 async fn orphan_cleanup_advances_with_memberships_and_is_idempotent() {
     let fixture = Fixture::new().await;
-    let id = fixture.upload().await;
+    let id = fixture.seed_available_slice().await;
     let holes = ChunkMap::holes(16).unwrap();
     let data = map(id);
     fixture.publish(3, 0, &holes, &data).await;

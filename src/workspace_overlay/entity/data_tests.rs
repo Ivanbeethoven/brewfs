@@ -14,7 +14,7 @@ use super::*;
 use crate::cadapter::client::ObjectByteStream;
 use crate::cadapter::s3::S3Backend;
 use crate::workspace_overlay::entity::backend::{
-    CreateAllocation, RowSnapshot, TransactionAuthority,
+    CreateAllocation, RowSnapshot, SliceAllocation, TransactionAuthority,
 };
 use crate::workspace_overlay::entity::keys::EntityKeys;
 use crate::workspace_overlay::entity::lifecycle::{Lifecycle, WriterLease, WriterSession};
@@ -155,6 +155,577 @@ struct Fixture<B, O = Objects> {
     objects: Arc<O>,
 }
 
+/// Count calls at the metadata boundary while executing actual file semantics.
+/// Object I/O still goes through the shared real RustFS client.
+struct MeteredBackend<B> {
+    inner: B,
+    reads: AtomicUsize,
+    commits: AtomicUsize,
+    reservations: AtomicUsize,
+}
+
+impl<B> MeteredBackend<B> {
+    fn new(inner: B) -> Self {
+        Self {
+            inner,
+            reads: AtomicUsize::new(0),
+            commits: AtomicUsize::new(0),
+            reservations: AtomicUsize::new(0),
+        }
+    }
+
+    fn take_counts(&self) -> (usize, usize, usize) {
+        (
+            self.reads.swap(0, Ordering::SeqCst),
+            self.commits.swap(0, Ordering::SeqCst),
+            self.reservations.swap(0, Ordering::SeqCst),
+        )
+    }
+}
+
+#[async_trait]
+impl<B: EntityBackend> EntityBackend for MeteredBackend<B> {
+    async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.read(keys).await
+    }
+
+    async fn commit(
+        &self,
+        authority: &TransactionAuthority,
+        plan: &EntityPlan,
+    ) -> Result<CommitOutcome> {
+        self.commits.fetch_add(1, Ordering::SeqCst);
+        self.inner.commit(authority, plan).await
+    }
+
+    async fn commit_with_inode_allocation(
+        &self,
+        authority: &TransactionAuthority,
+        plan: &EntityPlan,
+        create: &CreateAllocation,
+    ) -> Result<Option<i64>> {
+        self.commits.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .commit_with_inode_allocation(authority, plan, create)
+            .await
+    }
+
+    async fn reserve_slices(
+        &self,
+        authority: &TransactionAuthority,
+        allocation: &SliceAllocation,
+    ) -> Result<Option<Vec<u64>>> {
+        self.reservations.fetch_add(1, Ordering::SeqCst);
+        self.inner.reserve_slices(authority, allocation).await
+    }
+
+    async fn scan_prefix(&self, _: &[u8], _: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        panic!("settled file operation unexpectedly scanned metadata");
+    }
+}
+
+async fn exercise_batched_file_io<B: EntityBackend + 'static>(
+    fixture: &Fixture<MeteredBackend<B>>,
+) {
+    let handle = new_file(fixture, b"batched").await;
+    fixture.backend.take_counts();
+    // Three chunks still use one reservation and one atomic publication.
+    let original = Bytes::from_static(b"abcdefghijklmnopqrstuvwx");
+    let result = fixture
+        .data
+        .write(handle.clone(), 0, original.clone(), false)
+        .await
+        .unwrap();
+    assert_eq!((result.written, result.size), (24, 24));
+    assert_eq!(fixture.backend.take_counts(), (1, 1, 1));
+    assert_eq!(fixture.objects.puts.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        fixture
+            .data
+            .attr(handle.clone())
+            .await
+            .unwrap()
+            .data_version,
+        1
+    );
+    assert_eq!(fixture.backend.take_counts(), (1, 1, 0));
+    assert_eq!(
+        fixture.data.read(handle.clone(), 0, 24).await.unwrap(),
+        original
+    );
+    assert_eq!(fixture.backend.take_counts(), (2, 2, 0));
+    fixture.data.fsync(handle.clone()).await.unwrap();
+    assert_eq!(fixture.backend.take_counts(), (1, 1, 0));
+    assert!(
+        fixture
+            .data
+            .read(handle.clone(), 24, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fixture.backend.take_counts(), (1, 1, 0));
+    let replacement = Bytes::from_static(b"ZYXWVUTSRQPONMLKJIHGFEDC");
+    fixture
+        .data
+        .write(handle.clone(), 0, replacement.clone(), false)
+        .await
+        .unwrap();
+    assert_eq!(fixture.backend.take_counts(), (2, 1, 1));
+    assert_eq!(
+        fixture.data.read(handle.clone(), 0, 24).await.unwrap(),
+        replacement
+    );
+    fixture.backend.take_counts();
+    let resized = fixture.data.truncate(handle.clone(), 32).await.unwrap();
+    assert_eq!((resized.size, resized.data_version), (32, 3));
+    assert_eq!(fixture.backend.take_counts(), (1, 1, 0));
+    let mut expected = replacement.to_vec();
+    expected.resize(32, 0);
+    assert_eq!(fixture.data.read(handle, 0, 32).await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn eof_after_visible_cut_ignores_oversized_invisible_tail_metadata() {
+    use crate::workspace_overlay::entity::{backend::MAX_TRANSACTION_BYTES, model::ChunkSpan};
+
+    const CHUNK_SIZE: u64 = 4096;
+    const CHUNKS: u64 = 64;
+    let backend = Arc::new(MemoryEntityBackend::new(1000));
+    let keys = EntityKeys::new(Uuid::new_v4(), Uuid::new_v4());
+    let mut lower = MemoryLower::empty();
+    lower.add_file(1, b"base", 2, 24);
+    let lower = Arc::new(lower);
+    let digest = lower.binding().manifest_digest;
+    let lifecycle = Lifecycle::new(backend.clone(), keys.clone());
+    lifecycle.provision(lower.binding()).await.unwrap();
+    let session = lifecycle.acquire(Uuid::new_v4(), 1_000_000).await.unwrap();
+    let namespace = EntityNamespace::new(backend.clone(), lower, keys.clone(), session.clone());
+    let objects = Arc::new(NoObjectIo);
+    let data = EntityData::new(namespace.clone(), objects.clone(), CHUNK_SIZE)
+        .await
+        .unwrap();
+    let fixture = Fixture {
+        backend,
+        keys,
+        session,
+        namespace,
+        data,
+        objects,
+    };
+    let handle = new_file(&fixture, b"cut").await;
+    let authority = lifecycle.authority(&fixture.session).await.unwrap();
+    let mut inode = fixture.data.attr(handle.clone()).await.unwrap();
+    let before = codec::encode(&UpperInode::Present(inode.clone())).unwrap();
+    inode.size = CHUNKS * CHUNK_SIZE;
+    inode.data_version += 1;
+    let grown = codec::encode(&UpperInode::Present(inode.clone())).unwrap();
+    assert_eq!(
+        fixture
+            .backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![RowCheck {
+                        key: fixture.keys.inode(inode.ino),
+                        expected: Some(before)
+                    }],
+                    writes: vec![RowWrite::Put {
+                        key: fixture.keys.inode(inode.ino),
+                        value: grown.clone()
+                    }],
+                }
+            )
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+
+    // Valid immutable lower ranges alternate with holes. No upper object is
+    // involved, and every individual map fits its row/transaction limits.
+    let map = ChunkMap::new(
+        CHUNK_SIZE,
+        (0..CHUNK_SIZE)
+            .map(|offset| ChunkSpan {
+                offset,
+                length: 1,
+                source: if offset % 2 == 0 {
+                    ChunkSource::LowerRange {
+                        binding_digest: digest,
+                        ino: 2,
+                        file_offset: 0,
+                    }
+                } else {
+                    ChunkSource::Hole
+                },
+            })
+            .collect(),
+    )
+    .unwrap();
+    let bytes = codec::encode(&map).unwrap();
+    assert!(bytes.len() * CHUNKS as usize > MAX_TRANSACTION_BYTES);
+    let chunk_keys: Vec<_> = (0..CHUNKS)
+        .map(|index| fixture.keys.chunk(inode.ino, index))
+        .collect();
+    for batch in chunk_keys.chunks(4) {
+        assert_eq!(
+            fixture
+                .backend
+                .commit(
+                    &authority,
+                    &EntityPlan {
+                        checks: batch
+                            .iter()
+                            .map(|key| RowCheck {
+                                key: key.clone(),
+                                expected: None
+                            })
+                            .collect(),
+                        writes: batch
+                            .iter()
+                            .map(|key| RowWrite::Put {
+                                key: key.clone(),
+                                value: bytes.clone()
+                            })
+                            .collect(),
+                    }
+                )
+                .await
+                .unwrap(),
+            CommitOutcome::Committed
+        );
+    }
+    // The normal shrink protocol exposes its cut before bounded map cleanup.
+    let cut = prepare_resize(
+        &fixture.keys,
+        inode.ino,
+        Some(grown),
+        &inode,
+        0,
+        CHUNK_SIZE,
+        1000,
+    )
+    .unwrap();
+    assert_eq!(
+        fixture.backend.commit(&authority, &cut).await.unwrap(),
+        CommitOutcome::Committed
+    );
+    assert!(matches!(
+        fixture.backend.read(&chunk_keys).await,
+        Err(EntityError::Invalid(_))
+    ));
+    assert!(
+        fixture
+            .data
+            .read(handle, 0, (CHUNKS * CHUNK_SIZE) as usize)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS via BREWFS_PACKED_GRAPH_TEST_S3_ENDPOINT/BUCKET and AWS credentials"]
+async fn batched_file_io_has_one_publication_and_preserves_bytes() {
+    let fixture = attach(
+        Arc::new(MeteredBackend::new(MemoryEntityBackend::new(1000))),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+        1_000_000,
+    )
+    .await;
+    exercise_batched_file_io(&fixture).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and RustFS via the entity data test harness"]
+async fn redis_batched_file_io_has_one_publication_and_preserves_bytes() {
+    let url = std::env::var("BREWFS_TEST_REDIS_URL").expect("BREWFS_TEST_REDIS_URL");
+    let volume = Uuid::new_v4();
+    let backend = RedisEntityBackend::connect(&url, volume).await.unwrap();
+    let fixture = attach(
+        Arc::new(MeteredBackend::new(backend)),
+        EntityKeys::new(volume, Uuid::new_v4()),
+        60_000_000_000,
+    )
+    .await;
+    exercise_batched_file_io(&fixture).await;
+}
+
+async fn exercise_fragmented_publication<B: EntityBackend + 'static>(
+    fixture: &Fixture<MeteredBackend<B>>,
+) {
+    use crate::workspace_overlay::entity::{
+        model::ChunkSpan,
+        ownership::{SliceState, chunk_membership_keys},
+    };
+    use std::collections::BTreeSet;
+
+    const CHUNKS: u64 = 64;
+    const SLICES: u64 = 32;
+    let handle = new_file(fixture, b"fragmented").await;
+    let lifecycle = Lifecycle::new(fixture.backend.clone(), fixture.keys.clone());
+    let authority = lifecycle.authority(&fixture.session).await.unwrap();
+    let ownership = Ownership::new(fixture.backend.clone(), fixture.keys.clone());
+    let tokens = ownership
+        .reserve_uploads(&fixture.session, &authority, &[1; SLICES as usize])
+        .await
+        .unwrap();
+    let mut receipts = Vec::new();
+    let mut descriptors = Vec::new();
+    for (position, token) in tokens.into_iter().enumerate() {
+        let bytes = [b'a' + position as u8 % 26];
+        fixture
+            .objects
+            .put_object_create_only_durable(&fixture.keys.object(token.slice_id()), &bytes)
+            .await
+            .unwrap();
+        descriptors.push(ObjectDescriptor {
+            namespace_id: fixture.keys.namespace_id(),
+            slice_id: token.slice_id(),
+            size: 1,
+            sha256: Sha256::digest(bytes).into(),
+        });
+        receipts.push(token.confirm_durable_put());
+    }
+    let old_ids: Vec<_> = receipts.iter().map(DurableUpload::slice_id).collect();
+    let fragmented = ChunkMap::new(
+        SLICES,
+        old_ids
+            .iter()
+            .enumerate()
+            .map(|(offset, id)| ChunkSpan {
+                offset: offset as u64,
+                length: 1,
+                source: ChunkSource::Data {
+                    slice_id: *id,
+                    slice_offset: 0,
+                },
+            })
+            .collect(),
+    )
+    .unwrap();
+    let holes = ChunkMap::holes(SLICES).unwrap();
+    let mut inode = fixture.data.attr(handle.clone()).await.unwrap();
+    // Build a valid shared-slice fixture through ordinary bounded publication:
+    // Pending precedes each real PUT; every map/refcount/descriptor is atomic.
+    for start in (0..CHUNKS).step_by(8) {
+        let authority = lifecycle.authority(&fixture.session).await.unwrap();
+        let replacements: Vec<_> = (start..start + 8)
+            .map(|index| (index, holes.clone(), fragmented.clone()))
+            .collect();
+        let mut keys = BTreeSet::new();
+        for (index, old, new) in &replacements {
+            keys.extend(chunk_membership_keys(&fixture.keys, inode.ino, *index, old, new).unwrap());
+        }
+        let keys: Vec<_> = keys.into_iter().collect();
+        let snapshot = fixture.backend.read(&keys).await.unwrap();
+        let rows = keys.into_iter().zip(snapshot.rows).collect();
+        let mut plan = plan_chunk_memberships_from_rows(
+            &fixture.keys,
+            inode.ino,
+            &replacements,
+            &rows,
+            if start == 0 { &receipts } else { &[] },
+        )
+        .unwrap();
+        for (index, _, new) in &replacements {
+            let key = fixture.keys.chunk(inode.ino, *index);
+            plan.checks.push(RowCheck {
+                key: key.clone(),
+                expected: None,
+            });
+            plan.writes.push(RowWrite::Put {
+                key,
+                value: codec::encode(new).unwrap(),
+            });
+        }
+        if start == 0 {
+            for descriptor in &descriptors {
+                let key = fixture.keys.object_descriptor(descriptor.slice_id);
+                plan.checks.push(RowCheck {
+                    key: key.clone(),
+                    expected: None,
+                });
+                plan.writes.push(RowWrite::Put {
+                    key,
+                    value: codec::encode(descriptor).unwrap(),
+                });
+            }
+        }
+        let old = codec::encode(&UpperInode::Present(inode.clone())).unwrap();
+        inode.size = (start + 8) * SLICES;
+        inode.data_version += 1;
+        plan.checks.push(RowCheck {
+            key: fixture.keys.inode(inode.ino),
+            expected: Some(old),
+        });
+        plan.checks
+            .push(absent_intent_check(&fixture.keys, inode.ino));
+        plan.writes.push(RowWrite::Put {
+            key: fixture.keys.inode(inode.ino),
+            value: codec::encode(&UpperInode::Present(inode.clone())).unwrap(),
+        });
+        assert_eq!(
+            fixture.backend.commit(&authority, &plan).await.unwrap(),
+            CommitOutcome::Committed
+        );
+    }
+    drop(receipts);
+    let old_rows = fixture
+        .backend
+        .read(
+            &old_ids
+                .iter()
+                .map(|id| fixture.keys.slice(*id))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    for row in old_rows.rows {
+        let row: SliceOwnership = codec::decode(row.as_deref().unwrap()).unwrap();
+        assert_eq!(row.current_refs, CHUNKS);
+        assert!(!row.retirement_hold);
+    }
+    assert_eq!(fixture.objects.puts.load(Ordering::SeqCst), SLICES as usize);
+    fixture.backend.take_counts();
+
+    // All 2048 old edges need checks and deletion: one transaction cannot fit
+    // the 4096-row limit, but two 32-chunk publications fit without re-upload.
+    let expected = Bytes::from(vec![b'Z'; (CHUNKS * SLICES) as usize]);
+    let outcome = fixture
+        .data
+        .write(handle.clone(), 0, expected.clone(), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        WriteOutcome {
+            offset: 0,
+            written: expected.len(),
+            size: expected.len() as u64
+        }
+    );
+    assert_eq!(fixture.backend.take_counts(), (6, 2, 1));
+    assert_eq!(
+        fixture.objects.puts.load(Ordering::SeqCst),
+        (SLICES + CHUNKS) as usize
+    );
+    assert_eq!(
+        fixture
+            .data
+            .attr(handle.clone())
+            .await
+            .unwrap()
+            .data_version,
+        inode.data_version + 2
+    );
+    fixture.data.fsync(handle.clone()).await.unwrap();
+    assert_eq!(
+        fixture.data.read(handle, 0, expected.len()).await.unwrap(),
+        expected
+    );
+
+    let old_rows = fixture
+        .backend
+        .read(
+            &old_ids
+                .iter()
+                .map(|id| fixture.keys.slice(*id))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    for row in old_rows.rows {
+        let row: SliceOwnership = codec::decode(row.as_deref().unwrap()).unwrap();
+        assert_eq!(row.state, SliceState::Available);
+        assert_eq!(row.current_refs, 0);
+        assert!(row.retirement_hold);
+    }
+    let old_edges: Vec<_> = (0..CHUNKS)
+        .flat_map(|index| {
+            old_ids
+                .iter()
+                .map(move |id| fixture.keys.owner(*id, inode.ino, index))
+        })
+        .collect();
+    assert!(
+        fixture
+            .backend
+            .read(&old_edges)
+            .await
+            .unwrap()
+            .rows
+            .iter()
+            .all(Option::is_none)
+    );
+    let maps = fixture
+        .backend
+        .read(
+            &(0..CHUNKS)
+                .map(|index| fixture.keys.chunk(inode.ino, index))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    let mut new_ids = BTreeSet::new();
+    for row in maps.rows {
+        let map: ChunkMap = codec::decode(row.as_deref().unwrap()).unwrap();
+        let ids = map.upper_slices().unwrap();
+        assert_eq!(ids.len(), 1);
+        new_ids.extend(ids);
+    }
+    assert_eq!(new_ids.len(), CHUNKS as usize);
+    let new_rows = fixture
+        .backend
+        .read(
+            &new_ids
+                .into_iter()
+                .map(|id| fixture.keys.slice(id))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    for row in new_rows.rows {
+        let row: SliceOwnership = codec::decode(row.as_deref().unwrap()).unwrap();
+        assert_eq!(row.state, SliceState::Available);
+        assert_eq!(row.current_refs, 1);
+        assert!(!row.staging_hold);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS via the entity data test harness"]
+async fn fragmented_write_splits_publication_without_reupload_or_lost_refs() {
+    let fixture = attach_objects(
+        Arc::new(MeteredBackend::new(MemoryEntityBackend::new(1000))),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+        60_000_000_000,
+        Arc::new(Objects::new(test_objects::backend().await)),
+        32,
+    )
+    .await;
+    exercise_fragmented_publication(&fixture).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and RustFS via the entity data test harness"]
+async fn redis_fragmented_write_splits_publication_without_reupload_or_lost_refs() {
+    let url = std::env::var("BREWFS_TEST_REDIS_URL").expect("BREWFS_TEST_REDIS_URL");
+    let volume = Uuid::new_v4();
+    let fixture = attach_objects(
+        Arc::new(MeteredBackend::new(
+            RedisEntityBackend::connect(&url, volume).await.unwrap(),
+        )),
+        EntityKeys::new(volume, Uuid::new_v4()),
+        60_000_000_000,
+        Arc::new(Objects::new(test_objects::backend().await)),
+        32,
+    )
+    .await;
+    exercise_fragmented_publication(&fixture).await;
+}
+
 fn root() -> Credentials {
     Credentials {
         uid: 0,
@@ -174,6 +745,7 @@ async fn attach<B: EntityBackend + 'static>(
         keys,
         ttl_ns,
         Arc::new(Objects::new(test_objects::backend().await)),
+        8,
     )
     .await
 }
@@ -183,6 +755,7 @@ async fn attach_objects<B: EntityBackend + 'static, O: ObjectBackend + 'static>(
     keys: EntityKeys,
     ttl_ns: i64,
     objects: Arc<O>,
+    chunk_size: u64,
 ) -> Fixture<B, O> {
     let mut lower = MemoryLower::empty();
     lower.add_file(1, b"base", 2, 24);
@@ -191,7 +764,7 @@ async fn attach_objects<B: EntityBackend + 'static, O: ObjectBackend + 'static>(
     lifecycle.provision(lower.binding()).await.unwrap();
     let session = lifecycle.acquire(Uuid::new_v4(), ttl_ns).await.unwrap();
     let namespace = EntityNamespace::new(backend.clone(), lower, keys.clone(), session.clone());
-    let data = EntityData::new(namespace.clone(), objects.clone(), 8)
+    let data = EntityData::new(namespace.clone(), objects.clone(), chunk_size)
         .await
         .unwrap();
     Fixture {
@@ -722,6 +1295,7 @@ async fn chunk_geometry_is_fixed_and_expired_empty_io_is_fenced() {
         EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
         1_000_000,
         Arc::new(NoObjectIo),
+        8,
     )
     .await;
     assert!(matches!(
@@ -782,8 +1356,12 @@ impl EntityBackend for RenewDuringAllocationBackend {
             .await
     }
 
-    async fn allocate(&self, authority: &TransactionAuthority, key: &[u8]) -> Result<u64> {
-        if key == self.keys.counter("slice") {
+    async fn reserve_slices(
+        &self,
+        authority: &TransactionAuthority,
+        allocation: &SliceAllocation,
+    ) -> Result<Option<Vec<u64>>> {
+        {
             self.allocations.fetch_add(1, Ordering::SeqCst);
             if self
                 .renew_allocations
@@ -817,7 +1395,7 @@ impl EntityBackend for RenewDuringAllocationBackend {
                 );
             }
         }
-        self.inner.allocate(authority, key).await
+        self.inner.reserve_slices(authority, allocation).await
     }
 
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -837,7 +1415,7 @@ impl EntityBackend for RenewDuringAllocationBackend {
 async fn reservation_contention_is_bounded_and_does_not_poison_fsync() {
     let keys = EntityKeys::new(Uuid::new_v4(), Uuid::new_v4());
     let backend = Arc::new(RenewDuringAllocationBackend::new(keys.clone()));
-    let fixture = attach_objects(backend.clone(), keys, 1_000_000, Arc::new(NoObjectIo)).await;
+    let fixture = attach_objects(backend.clone(), keys, 1_000_000, Arc::new(NoObjectIo), 8).await;
     let handle = new_file(&fixture, b"contention").await;
     backend
         .renew_allocations
@@ -907,8 +1485,12 @@ impl EntityBackend for LostReplyBackend {
             .commit_with_inode_allocation(authority, plan, create)
             .await
     }
-    async fn allocate(&self, authority: &TransactionAuthority, key: &[u8]) -> Result<u64> {
-        self.inner.allocate(authority, key).await
+    async fn reserve_slices(
+        &self,
+        authority: &TransactionAuthority,
+        allocation: &SliceAllocation,
+    ) -> Result<Option<Vec<u64>>> {
+        self.inner.reserve_slices(authority, allocation).await
     }
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.inner.scan_prefix(prefix, limit).await

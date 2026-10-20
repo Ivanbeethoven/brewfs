@@ -23,6 +23,10 @@ tracks the fresh fixture bootstrap, dedicated FUSE adapter and their own
 validation; earlier API results do not validate those additions.
 There is no conversion, production mount or accepted replacement performance
 result. The mount checkpoint records preliminary measurements for available arms.
+The [entity batching checkpoint](../superpowers/plans/2026-10-20-overlay-entity-batching.md)
+records the subsequently frozen diagnostic baseline and the current request
+batching refactor. That refactor and its correctness gates are in progress;
+there are no measured candidate results yet.
 
 ## Contract and boundaries
 
@@ -133,6 +137,51 @@ same script, then installs the inode, dentry, inherited ACLs and parent update.
 The script validates generated keys and bounds before its first write and uses
 exact decimal IDs above 2^53. It does not compare-and-swap the allocator counter.
 Only the affected parent is locally locked; unrelated parents remain independent.
+
+### Operation snapshots and grouped publication (candidate)
+
+The current refactor shares one operation-scoped `Prepared` observation set
+between namespace and data operations. A single initial read combines the five
+authority rows with the known inode, ACL, dentry, truncate and chunk rows needed
+by that operation. Directory-parent and dentry-to-inode hints are bounded to
+4,096 entries each and nominate keys only: fresh rows determine permissions and
+identity, and the final transaction checks every observed value or absence.
+Missing or stale hints can require additional bounded reads. Conflicts rebuild
+the decision; incompatible observations cannot overwrite one another.
+
+Path open retains its observed ancestry and name while acquiring the discovered
+inode lock, then validates that same read set before returning the handle. It
+does not repeat the entire path walk. Open fallback and truncate return the
+attributes established by their own operation so the FUSE reply need not start
+another attribute read. This is same-operation reuse, not an authoritative
+cross-operation cache of mutable attributes or permissions.
+
+Data writes reuse the operation's authority to allocate slice IDs and register
+all Pending upload owners for an admitted group in one transaction, before any
+object PUT. A successful conditional durable PUT produces a local receipt; it
+does not require a separate Uploaded metadata transaction. Final publication
+checks the exact Pending bytes, aggregates slice membership/refcount changes
+across the group's chunk maps, and atomically installs those maps, immutable
+object descriptors and the inode size/times/data version. The same inode lock
+still covers the work, and an uncertain reservation/publication is never blindly
+replayed. Only an acknowledged prefix can be returned after partial work.
+
+Each publication group must honor row, byte and fragmentation limits before its
+commit. Known aggregate preparation limits split a group using fresh observations;
+uncertain commit results never trigger a split or retry. Bounded grouping is
+implemented and still pending validation; the
+current code is not yet qualified as a replacement for the prior partial-write
+path. Unused standalone allocation, upload registration and Uploaded APIs are
+removed. Truncate/discard/orphan cleanup retains its asynchronous membership
+wrapper over the shared pure planner and its existing durable cleanup state.
+
+Fsync still waits on the shared FIFO inode lock, retains admission, reports
+sticky errors and validates live lease/backend-time predicates. Its initial
+snapshot includes the truncate marker: observed absence takes the validated
+read-only commit path, while an actual intent invokes the existing recovery
+walker and then refreshes the snapshot. Ordinary I/O no longer performs an
+unconditional empty-intent recovery walk. These are candidate implementation
+changes, not measured request reductions or accepted performance results.
 
 ## Audit of the current design
 

@@ -141,7 +141,7 @@ unset BREWFS_WORKSPACE_ROW_CACHE_TTL_MS
 stop_monitor() {
     [[ -n "$monitor_pid" ]] || return 0
     local monitor_exit=0
-    for _ in {1..100}; do kill -0 "$monitor_pid" 2>/dev/null || break; sleep .05; done
+    for _ in {1..600}; do kill -0 "$monitor_pid" 2>/dev/null || break; sleep .05; done
     # Normal capture exits after observing the phase's final ECHO. This signal
     # only stops an interrupted/incomplete capture; the helper returns failure.
     kill -TERM "$monitor_pid" 2>/dev/null || true

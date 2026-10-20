@@ -4,13 +4,18 @@
 //! Removing a membership creates a retirement hold even when other current
 //! memberships remain. Only a drained namespace may clear that reader hold.
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::backend::{EntityBackend, EntityPlan, RowCheck, RowWrite};
-use super::codec::decode;
+use super::backend::{
+    EntityBackend, EntityPlan, RowCheck, RowWrite, SliceAllocation, TransactionAuthority,
+};
+use super::codec::{decode, encode};
 use super::keys::EntityKeys;
 use super::lifecycle::{
     LeaseIdentity, Lifecycle, MaintenanceToken, OperationGuard, WriterSession, checked_rows,
@@ -89,7 +94,15 @@ pub struct UploadToken {
     slice_id: u64,
     upload_id: Uuid,
     lease: LeaseIdentity,
+    pending_key: Vec<u8>,
+    pending_bytes: Vec<u8>,
     _admission: Arc<OperationGuard>,
+}
+
+/// Local evidence that the storage adapter acknowledged the durable PUT. The
+/// durable row stays Pending until its first map publication consumes this token.
+pub struct DurableUpload {
+    token: UploadToken,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +116,15 @@ pub struct DeletionToken {
 impl UploadToken {
     pub fn slice_id(&self) -> u64 {
         self.slice_id
+    }
+    /// Call only after a successful durable create-only object PUT.
+    pub(super) fn confirm_durable_put(self) -> DurableUpload {
+        DurableUpload { token: self }
+    }
+}
+impl DurableUpload {
+    pub fn slice_id(&self) -> u64 {
+        self.token.slice_id()
     }
 }
 impl DeletionToken {
@@ -126,105 +148,74 @@ impl<B: EntityBackend> Ownership<B> {
         }
     }
 
-    /// Uses the volume's plain unique-ID allocator; allocation gaps are safe.
-    pub async fn allocate_upload(&self, session: &WriterSession, size: u64) -> Result<UploadToken> {
-        let _diagnostic = super::diagnostics::Span::start("ownership.allocate_upload");
-        let _guard = session.admit()?;
-        let authority = self.lifecycle.authority(session).await?;
-        let slice_id = self
-            .backend
-            .allocate(&authority, &self.keys.counter("slice"))
-            .await?;
-        self.register_upload(session, slice_id, size).await
-    }
-
-    /// Register before PUT. Retain this token until upload and any attempted
-    /// publication finish; it owns an admission guard, including across clones.
-    pub async fn register_upload(
+    /// Reuse the operation's authority; this performs exactly one backend call
+    /// and never starts transport after an ambiguous reservation response.
+    pub(super) async fn reserve_uploads(
         &self,
         session: &WriterSession,
-        slice_id: u64,
-        size: u64,
-    ) -> Result<UploadToken> {
-        let _diagnostic = super::diagnostics::Span::start("ownership.register_upload");
+        authority: &TransactionAuthority,
+        sizes: &[u64],
+    ) -> Result<Vec<UploadToken>> {
+        let _diagnostic = super::diagnostics::Span::start("ownership.reserve_uploads");
         let admission = Arc::new(session.admit()?);
-        if slice_id == 0 || slice_id > i64::MAX as u64 || size == 0 {
-            return Err(EntityError::Invalid("invalid upload identity".into()));
-        }
-        let authority = self.lifecycle.authority(session).await?;
-        let token = UploadToken {
-            namespace_id: self.keys.namespace_id(),
-            namespace_prefix: self.keys.prefix().to_vec(),
-            slice_id,
-            upload_id: Uuid::new_v4(),
-            lease: session.identity(),
-            _admission: admission,
-        };
-        let row = SliceOwnership {
-            namespace_id: token.namespace_id,
-            slice_id,
-            size,
-            state: SliceState::Pending {
-                upload_id: token.upload_id,
-                lease: token.lease,
-            },
-            current_refs: 0,
-            staging_hold: true,
-            retirement_hold: false,
-            publication_refs: 0,
-        };
-        committed(
-            self.backend
-                .commit(
-                    &authority,
-                    &EntityPlan {
-                        checks: vec![RowCheck {
-                            key: self.keys.slice(slice_id),
-                            expected: None,
-                        }],
-                        writes: vec![put(self.keys.slice(slice_id), &row)?],
-                    },
-                )
-                .await?,
-        )?;
-        Ok(token)
-    }
-
-    /// The storage adapter calls this only after its durable PUT acknowledgment.
-    /// It is not itself evidence that any transport or VFS fsync has completed.
-    pub async fn uploaded(&self, session: &WriterSession, token: &UploadToken) -> Result<()> {
-        let _diagnostic = super::diagnostics::Span::start("ownership.uploaded");
-        let _guard = session.admit()?;
-        if token.namespace_id != self.keys.namespace_id()
-            || token.namespace_prefix != self.keys.prefix()
-            || token.lease != session.identity()
-        {
+        if !session.matches_keys(&self.keys) {
             return Err(EntityError::Fenced);
         }
-        let authority = self.lifecycle.authority(session).await?;
-        let keys = vec![self.keys.slice(token.slice_id)];
-        let snapshot = self.backend.read(&keys).await?;
-        let mut row: SliceOwnership =
-            decode(snapshot.rows[0].as_deref().ok_or(EntityError::NotFound)?)?;
-        row.validate(&self.keys, token.slice_id)?;
-        match row.state {
-            SliceState::Pending { upload_id, lease }
-                if upload_id == token.upload_id && lease == token.lease => {}
-            SliceState::Available => return Ok(()),
-            _ => return Err(EntityError::Fenced),
+        // Supplied authority must be the same session's complete lower/lease
+        // snapshot. This is a local structural check, never another read.
+        let authority_keys = self.lifecycle.authority_keys(session)?;
+        let authority_rows = authority_keys
+            .iter()
+            .map(|key| {
+                authority
+                    .checks
+                    .iter()
+                    .find(|check| &check.key == key)
+                    .map(|check| check.expected.clone())
+                    .ok_or(EntityError::Fenced)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let checked = self.lifecycle.authority_from_snapshot(
+            session,
+            super::backend::RowSnapshot {
+                now_ns: 0,
+                rows: authority_rows,
+            },
+        )?;
+        if checked.expires_before_ns != authority.expires_before_ns {
+            return Err(EntityError::Fenced);
         }
-        row.state = SliceState::Available;
-        committed(
-            self.backend
-                .commit(
-                    &authority,
-                    &EntityPlan {
-                        checks: checked_rows(&keys, snapshot.rows),
-                        writes: vec![put(keys[0].clone(), &row)?],
-                    },
-                )
-                .await?,
-        )
+        let allocation = SliceAllocation {
+            keys: self.keys.clone(),
+            sizes: sizes.to_vec(),
+            upload_id: Uuid::new_v4(),
+            lease: session.identity(),
+        };
+        let ids = self
+            .backend
+            .reserve_slices(authority, &allocation)
+            .await?
+            .ok_or(EntityError::Conflict)?;
+        if ids.len() != sizes.len() {
+            return Err(EntityError::Corrupt("short upload reservation".into()));
+        }
+        ids.into_iter()
+            .enumerate()
+            .map(|(position, slice_id)| {
+                let row = allocation.pending(slice_id, position);
+                row.validate(&self.keys, slice_id)?;
+                Ok(UploadToken {
+                    namespace_id: self.keys.namespace_id(),
+                    namespace_prefix: self.keys.prefix().to_vec(),
+                    slice_id,
+                    upload_id: allocation.upload_id,
+                    lease: allocation.lease,
+                    pending_key: self.keys.slice(slice_id),
+                    pending_bytes: encode(&row)?,
+                    _admission: admission.clone(),
+                })
+            })
+            .collect()
     }
 
     /// An upload can be abandoned only after all its local publishers drained.
@@ -523,6 +514,25 @@ pub async fn plan_chunk_membership<B: EntityBackend>(
     old: &ChunkMap,
     new: &ChunkMap,
 ) -> Result<EntityPlan> {
+    let row_keys = chunk_membership_keys(keys, ino, index, old, new)?;
+    if row_keys.is_empty() {
+        return Ok(EntityPlan::default());
+    }
+    let snapshot = backend.read(&row_keys).await?;
+    if snapshot.rows.len() != row_keys.len() {
+        return Err(EntityError::Corrupt("short ownership snapshot".into()));
+    }
+    let rows = row_keys.into_iter().zip(snapshot.rows).collect();
+    plan_chunk_membership_from_rows(keys, ino, index, old, new, &rows, None)
+}
+
+pub fn chunk_membership_keys(
+    keys: &EntityKeys,
+    ino: i64,
+    index: u64,
+    old: &ChunkMap,
+    new: &ChunkMap,
+) -> Result<Vec<Vec<u8>>> {
     old.validate()?;
     new.validate()?;
     if ino <= 0 || old.chunk_size != new.chunk_size {
@@ -532,86 +542,240 @@ pub async fn plan_chunk_membership<B: EntityBackend>(
     }
     let old_slices = old.upper_slices()?;
     let new_slices = new.upper_slices()?;
-    let ids = old_slices.union(&new_slices).copied().collect::<Vec<_>>();
-    let row_keys = ids
-        .iter()
+    Ok(old_slices
+        .union(&new_slices)
         .flat_map(|id| [keys.slice(*id), keys.owner(*id, ino, index)])
-        .collect::<Vec<_>>();
-    if row_keys.is_empty() {
-        return Ok(EntityPlan::default());
+        .collect())
+}
+
+/// Pure planning over an operation's exact observations. A durable PUT receipt
+/// supplies the already-known Pending bytes and absent new membership predicate;
+/// the final transaction checks both before making the object visible.
+pub fn plan_chunk_membership_from_rows(
+    keys: &EntityKeys,
+    ino: i64,
+    index: u64,
+    old: &ChunkMap,
+    new: &ChunkMap,
+    rows: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    upload: Option<&DurableUpload>,
+) -> Result<EntityPlan> {
+    plan_chunk_memberships_from_rows(
+        keys,
+        ino,
+        &[(index, old.clone(), new.clone())],
+        rows,
+        upload.map_or(&[], std::slice::from_ref),
+    )
+}
+
+/// Aggregate ownership once per slice across all replaced chunks. This avoids
+/// overwriting independent refcount deltas when one object spans several maps.
+pub fn plan_chunk_memberships_from_rows(
+    keys: &EntityKeys,
+    ino: i64,
+    replacements: &[(u64, ChunkMap, ChunkMap)],
+    rows: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    uploads: &[DurableUpload],
+) -> Result<EntityPlan> {
+    if ino <= 0 || replacements.len() > 64 || uploads.len() > 64 {
+        return Err(EntityError::Invalid("invalid membership batch".into()));
     }
-    let snapshot = backend.read(&row_keys).await?;
-    let mut writes = Vec::new();
-    for (position, id) in ids.iter().copied().enumerate() {
-        let mut row: SliceOwnership =
-            decode(snapshot.rows[position * 2].as_deref().ok_or_else(|| {
-                EntityError::Corrupt("chunk references an unregistered slice".into())
-            })?)?;
-        row.validate(keys, id)?;
-        if row.state != SliceState::Available {
-            return Err(EntityError::Busy);
+    let mut receipts = BTreeMap::new();
+    for upload in uploads {
+        let token = &upload.token;
+        if token.namespace_id != keys.namespace_id()
+            || token.namespace_prefix != keys.prefix()
+            || token.pending_key != keys.slice(token.slice_id)
+            || receipts.insert(token.slice_id, token).is_some()
+        {
+            return Err(EntityError::Invalid(
+                "foreign or duplicate upload receipt".into(),
+            ));
         }
-        let membership = SliceMembership {
-            namespace_id: keys.namespace_id(),
-            slice_id: id,
-            ino,
-            chunk_index: index,
-        };
-        let was_present = old_slices.contains(&id);
-        let is_present = new_slices.contains(&id);
-        match &snapshot.rows[position * 2 + 1] {
-            Some(bytes) => {
-                let actual: SliceMembership = decode(bytes)?;
-                if !was_present || actual != membership || row.current_refs == 0 {
-                    return Err(EntityError::Corrupt("inconsistent slice membership".into()));
+        let pending: SliceOwnership = decode(&token.pending_bytes)?;
+        pending.validate(keys, token.slice_id)?;
+        if pending.state
+            != (SliceState::Pending {
+                upload_id: token.upload_id,
+                lease: token.lease,
+            })
+            || pending.retirement_hold
+            || pending.publication_refs != 0
+        {
+            return Err(EntityError::Corrupt(
+                "invalid durable upload receipt".into(),
+            ));
+        }
+    }
+    struct Delta {
+        row: SliceOwnership,
+        old_memberships: u64,
+        additions: u64,
+        removals: u64,
+        promote: bool,
+    }
+    let mut slices = BTreeMap::<u64, Delta>::new();
+    let mut indices = BTreeSet::new();
+    let mut checks = BTreeMap::new();
+    let mut writes = Vec::new();
+    for (index, old, new) in replacements {
+        if !indices.insert(*index) {
+            return Err(EntityError::Invalid("duplicate chunk replacement".into()));
+        }
+        chunk_membership_keys(keys, ino, *index, old, new)?;
+        let old_slices = old.upper_slices()?;
+        let new_slices = new.upper_slices()?;
+        for id in old_slices.union(&new_slices).copied() {
+            let slice_key = keys.slice(id);
+            if let std::collections::btree_map::Entry::Vacant(entry) = slices.entry(id) {
+                let expected = if let Some(token) = receipts.get(&id) {
+                    let expected = Some(token.pending_bytes.clone());
+                    if rows
+                        .get(&slice_key)
+                        .is_some_and(|actual| actual != &expected)
+                    {
+                        return Err(EntityError::Conflict);
+                    }
+                    expected
+                } else {
+                    rows.get(&slice_key)
+                        .cloned()
+                        .ok_or_else(|| EntityError::Corrupt("missing slice observation".into()))?
+                };
+                let row: SliceOwnership = decode(expected.as_deref().ok_or_else(|| {
+                    EntityError::Corrupt("chunk references an unregistered slice".into())
+                })?)?;
+                row.validate(keys, id)?;
+                let promote = receipts.contains_key(&id);
+                if !promote && row.state != SliceState::Available {
+                    return Err(EntityError::Busy);
+                }
+                checks.insert(slice_key, expected);
+                entry.insert(Delta {
+                    row,
+                    old_memberships: 0,
+                    additions: 0,
+                    removals: 0,
+                    promote,
+                });
+            }
+            let delta = slices.get_mut(&id).expect("inserted slice delta");
+            let membership = SliceMembership {
+                namespace_id: keys.namespace_id(),
+                slice_id: id,
+                ino,
+                chunk_index: *index,
+            };
+            let was_present = old_slices.contains(&id);
+            let is_present = new_slices.contains(&id);
+            let owner_key = keys.owner(id, ino, *index);
+            let owner = if delta.promote {
+                if was_present {
+                    return Err(EntityError::Corrupt("visible Pending slice".into()));
+                }
+                if rows.get(&owner_key).is_some_and(Option::is_some) {
+                    return Err(EntityError::Conflict);
+                }
+                None
+            } else {
+                rows.get(&owner_key)
+                    .cloned()
+                    .ok_or_else(|| EntityError::Corrupt("missing membership observation".into()))?
+            };
+            match owner.as_deref() {
+                Some(bytes) => {
+                    let actual: SliceMembership = decode(bytes)?;
+                    if !was_present || actual != membership || delta.row.current_refs == 0 {
+                        return Err(EntityError::Corrupt("inconsistent slice membership".into()));
+                    }
+                }
+                None if was_present => {
+                    return Err(EntityError::Corrupt("missing slice membership".into()));
+                }
+                None => {}
+            }
+            checks.insert(owner_key.clone(), owner);
+            // Validate removed spans too: replacing corrupt bytes cannot hide an
+            // invalid object range from recovery or normal publication.
+            for span in old.spans.iter().chain(&new.spans) {
+                if let super::model::ChunkSource::Data {
+                    slice_id,
+                    slice_offset,
+                } = span.source
+                    && slice_id == id
+                    && slice_offset
+                        .checked_add(span.length)
+                        .is_none_or(|end| end > delta.row.size)
+                {
+                    return Err(EntityError::Corrupt(
+                        "chunk extends beyond immutable slice".into(),
+                    ));
                 }
             }
-            None if was_present => {
-                return Err(EntityError::Corrupt("missing slice membership".into()));
+            delta.old_memberships += u64::from(was_present);
+            if was_present == is_present {
+                continue;
             }
-            None => {}
-        }
-        // Both maps must be valid: recovery must not hide an existing corrupt
-        // object range merely because the replacement removes that range.
-        for span in old.spans.iter().chain(&new.spans) {
-            if let super::model::ChunkSource::Data {
-                slice_id,
-                slice_offset,
-            } = span.source
-                && slice_id == id
-                && slice_offset
-                    .checked_add(span.length)
-                    .is_none_or(|end| end > row.size)
-            {
-                return Err(EntityError::Corrupt(
-                    "chunk extends beyond immutable slice".into(),
-                ));
+            if is_present {
+                delta.additions += 1;
+                writes.push(put(owner_key, &membership)?);
+            } else {
+                delta.removals += 1;
+                writes.push(RowWrite::Delete { key: owner_key });
             }
         }
-        if was_present == is_present {
-            continue;
+    }
+    if receipts.keys().any(|id| !slices.contains_key(id)) {
+        return Err(EntityError::Invalid("unused upload receipt".into()));
+    }
+    for (id, delta) in slices {
+        let mut row = delta.row;
+        if row.current_refs < delta.old_memberships {
+            return Err(EntityError::Corrupt(
+                "slice refcount undercounts memberships".into(),
+            ));
         }
-        if is_present {
-            row.current_refs = row
-                .current_refs
-                .checked_add(1)
-                .ok_or(EntityError::Overflow)?;
+        row.current_refs = row
+            .current_refs
+            .checked_sub(delta.removals)
+            .ok_or_else(|| EntityError::Corrupt("slice refcount underflow".into()))?
+            .checked_add(delta.additions)
+            .ok_or(EntityError::Overflow)?;
+        if delta.additions > 0 {
             row.staging_hold = false;
-            writes.push(put(keys.owner(id, ino, index), &membership)?);
-        } else {
-            row.current_refs = row
-                .current_refs
-                .checked_sub(1)
-                .ok_or_else(|| EntityError::Corrupt("slice refcount underflow".into()))?;
-            row.retirement_hold = true;
-            writes.push(RowWrite::Delete {
-                key: keys.owner(id, ino, index),
-            });
         }
-        writes.push(put(keys.slice(id), &row)?);
+        if delta.removals > 0 {
+            row.retirement_hold = true;
+        }
+        if delta.promote {
+            row.state = SliceState::Available;
+        }
+        if delta.promote || delta.additions > 0 || delta.removals > 0 {
+            writes.push(put(keys.slice(id), &row)?);
+        }
+    }
+    if checks.len() + writes.len() > super::backend::MAX_TRANSACTION_ROWS {
+        return Err(EntityError::Invalid(
+            "membership batch exceeds row bound".into(),
+        ));
+    }
+    let mut bytes = 0;
+    for (key, value) in &checks {
+        super::backend::add_bytes(&mut bytes, key, value.as_deref())?;
+    }
+    for write in &writes {
+        let value = match write {
+            RowWrite::Put { value, .. } => Some(value.as_slice()),
+            RowWrite::Delete { .. } => None,
+        };
+        super::backend::add_bytes(&mut bytes, write.key(), value)?;
     }
     Ok(EntityPlan {
-        checks: checked_rows(&row_keys, snapshot.rows),
+        checks: checks
+            .into_iter()
+            .map(|(key, expected)| RowCheck { key, expected })
+            .collect(),
         writes,
     })
 }

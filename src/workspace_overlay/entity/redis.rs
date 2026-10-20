@@ -8,8 +8,8 @@ use super::{
     EntityError, Result,
     backend::{
         CommitOutcome, CreateAllocation, EntityBackend, EntityPlan, MAX_KEY_BYTES,
-        MAX_TRANSACTION_BYTES, MAX_TRANSACTION_ROWS, RowSnapshot, RowWrite, TransactionAuthority,
-        prepare_create, validate_key, validate_keys, validate_plan, validate_scan,
+        MAX_TRANSACTION_BYTES, RowSnapshot, RowWrite, SliceAllocation, TransactionAuthority,
+        prepare_create, prepare_slices, validate_key, validate_keys, validate_plan, validate_scan,
     },
     codec::MAX_ROW_BYTES,
     diagnostics::{self, Span},
@@ -42,7 +42,7 @@ return {redis.call('TIME'), rows}
 const TRANSACTION_LUA: &str = r#"
 local authorities, checks, writes = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
 local mode = ARGV[9]
-local extra_keys = mode == 'create' and 2 or 0
+local extra_keys = mode == 'create' and 2 or (mode == 'reserve' and 1 or 0)
 if not authorities or not checks or not writes or authorities < 1 or checks < 0 or writes < 0
     or authorities % 1 ~= 0 or checks % 1 ~= 0 or writes % 1 ~= 0
     or authorities + checks + writes > 4096
@@ -50,13 +50,21 @@ if not authorities or not checks or not writes or authorities < 1 or checks < 0 
     return redis.error_reply('ENTITY_INVALID malformed transaction')
 end
 local create_at = 10 + 2 * (authorities + checks + writes)
-local xattr_count = 0
+local xattr_count, reservation_count = 0, 0
 if mode == 'create' then
     xattr_count = tonumber(ARGV[create_at + 5])
     if not xattr_count or xattr_count < 0 or xattr_count > 2 or xattr_count % 1 ~= 0
         or authorities + checks + writes + 3 + xattr_count > 4096
         or #ARGV ~= create_at - 1 + 6 + 2 * xattr_count then
         return redis.error_reply('ENTITY_INVALID malformed create allocation')
+    end
+elseif mode == 'reserve' then
+    reservation_count = tonumber(ARGV[create_at + 3])
+    if checks ~= 0 or writes ~= 0 or not reservation_count or reservation_count < 1
+        or reservation_count > 64 or reservation_count % 1 ~= 0
+        or authorities + 1 + 2 * reservation_count > 4096
+        or #ARGV ~= create_at - 1 + 4 + reservation_count then
+        return redis.error_reply('ENTITY_INVALID malformed slice reservation')
     end
 elseif #ARGV ~= create_at - 1 then
     return redis.error_reply('ENTITY_INVALID malformed transaction')
@@ -78,11 +86,8 @@ if lower_s and upper_s and (lower_s > upper_s or (lower_s == upper_s and lower_n
     return redis.error_reply('ENTITY_INVALID invalid temporal interval')
 end
 local prefix = ARGV[8]
-if mode ~= 'commit' and mode ~= 'allocate' and mode ~= 'create' then
+if mode ~= 'commit' and mode ~= 'create' and mode ~= 'reserve' then
     return redis.error_reply('ENTITY_INVALID invalid transaction mode')
-end
-if mode == 'allocate' and (checks ~= 0 or writes ~= 1) then
-    return redis.error_reply('ENTITY_INVALID invalid allocation plan')
 end
 local total, total_stored = 0, 0
 for _, key in ipairs(KEYS) do
@@ -123,11 +128,8 @@ for i = 1, writes do
         return redis.error_reply('ENTITY_INVALID invalid or duplicate write')
     end
     seen[key] = operation
-    if mode ~= 'allocate' and operation ~= 'put' and operation ~= 'delete' then
+    if operation ~= 'put' and operation ~= 'delete' then
         return redis.error_reply('ENTITY_INVALID invalid write operation')
-    end
-    if mode == 'allocate' and (operation ~= 'allocate' or expected[key]) then
-        return redis.error_reply('ENTITY_INVALID allocation collides with authority')
     end
     total = total + #value
     cursor = cursor + 2
@@ -152,17 +154,54 @@ local function valid_counter(counter)
         and not (#counter > 1 and string.sub(counter, 1, 1) == '0')
         and (#counter < 19 or (#counter == 19 and counter <= '9223372036854775807'))
 end
-if mode == 'allocate' then
-    local counter = redis.call('GET', KEYS[#KEYS])
+local function next_decimal(counter)
+    local digits, carry = {}, 1
+    for i = #counter, 1, -1 do
+        local digit = string.byte(counter, i) - 48 + carry
+        if digit == 10 then digit, carry = 0, 1 else carry = 0 end
+        digits[i] = string.char(48 + digit)
+    end
+    return (carry == 1 and '1' or '') .. table.concat(digits)
+end
+local generated, allocated = {}, nil
+if mode == 'reserve' then
+    local slice_prefix, descriptor_prefix, row_prefix = ARGV[create_at], ARGV[create_at + 1], ARGV[create_at + 2]
+    local counter_key = KEYS[#KEYS]
+    if counter_key ~= prefix .. 'counter/slice' or expected[counter_key]
+        or slice_prefix ~= prefix .. 'slice/' or descriptor_prefix ~= prefix .. 'object/' then
+        return redis.error_reply('ENTITY_INVALID invalid slice reservation scope')
+    end
+    local counter = redis.call('GET', counter_key)
     if not valid_counter(counter) then
         return redis.error_reply('ENTITY_CORRUPT invalid or uninitialized counter')
     end
-    if counter == '9223372036854775807' then return {3, ''} end
-    redis.call('INCR', KEYS[#KEYS])
-    -- INCR's Lua reply rounds large integers. GET returns the exact decimal.
-    return {2, redis.call('GET', KEYS[#KEYS])}
+    local ids = {}
+    for i = 1, reservation_count do
+        if counter == '9223372036854775807' then return {3, ''} end
+        counter = next_decimal(counter)
+        ids[i] = counter
+        local key, descriptor = slice_prefix .. counter, descriptor_prefix .. counter
+        local suffix = ARGV[create_at + 3 + i]
+        local value = row_prefix .. counter .. suffix
+        if #key > 1024 or #descriptor > 1024 or #value > 4194304 or string.sub(suffix, 1, 1) ~= ',' then
+            return redis.error_reply('ENTITY_INVALID invalid pending row')
+        end
+        if redis.call('EXISTS', key) ~= 0 or redis.call('EXISTS', descriptor) ~= 0 then
+            return redis.error_reply('ENTITY_CORRUPT slice allocator collision')
+        end
+        total = total + #key + #descriptor + #value
+        total_stored = total_stored + #key + #descriptor
+        generated[i] = {key, value}
+    end
+    total = total + #counter
+    if total > 16777216 or total_stored > 16777216 then
+        return redis.error_reply('ENTITY_INVALID slice reservation exceeds byte bound')
+    end
+    -- Validate the entire batch before consuming even its first identity.
+    redis.call('INCRBY', counter_key, reservation_count)
+    for _, row in ipairs(generated) do redis.call('SET', row[1], row[2]) end
+    return {5, table.concat(ids, ',')}
 end
-local generated, allocated = {}, nil
 if mode == 'create' then
     local namespace, parent, lower = ARGV[create_at], ARGV[create_at + 1], ARGV[create_at + 2]
     local inode_suffix, dentry_suffix = ARGV[create_at + 3], ARGV[create_at + 4]
@@ -187,13 +226,7 @@ if mode == 'create' then
     if counter == '9223372036854775807' then return {3, ''} end
     -- Compute the exact successor without a floating point conversion. This
     -- previews generated keys for complete validation before INCR mutates state.
-    local digits, carry = {}, 1
-    for i = #counter, 1, -1 do
-        local digit = string.byte(counter, i) - 48 + carry
-        if digit == 10 then digit, carry = 0, 1 else carry = 0 end
-        digits[i] = string.char(48 + digit)
-    end
-    allocated = (carry == 1 and '1' or '') .. table.concat(digits)
+    allocated = next_decimal(counter)
     if #allocated < #lower or (#allocated == #lower and allocated <= lower) then
         return redis.error_reply('ENTITY_CORRUPT inode allocator overlaps lower')
     end
@@ -352,32 +385,34 @@ impl RedisEntityBackend {
         &self,
         authority: &TransactionAuthority,
         plan: &EntityPlan,
-        counter: Option<&[u8]>,
         create: Option<&CreateAllocation>,
+        slices: Option<&SliceAllocation>,
     ) -> Result<(i64, Vec<u8>)> {
-        if counter.is_some() && create.is_some() {
+        if create.is_some() && slices.is_some() {
             return Err(EntityError::Invalid("conflicting allocation modes".into()));
         }
         let prepared = create
             .map(|create| prepare_create(authority, plan, create))
             .transpose()?;
+        let pending = slices
+            .map(|slices| prepare_slices(authority, slices))
+            .transpose()?;
         let generated_writes = prepared
             .as_ref()
-            .map_or(0, |create| 3 + create.xattrs.len());
-        let (operation, request) = if counter.is_some() {
-            ("redis.allocate", "redis.allocate.rtt")
-        } else if plan.writes.is_empty() && create.is_none() {
+            .map_or(0, |create| 3 + create.xattrs.len())
+            + pending
+                .as_ref()
+                .map_or(0, |pending| 1 + pending.suffixes.len());
+        let (operation, request) = if plan.writes.is_empty() && create.is_none() && slices.is_none()
+        {
             ("redis.commit.read_only", "redis.commit.read_only.rtt")
         } else {
             ("redis.commit.mutation", "redis.commit.mutation.rtt")
         };
         let mut span = Span::start(operation);
         span.add_rows(
-            (authority.checks.len()
-                + plan.checks.len()
-                + plan.writes.len()
-                + usize::from(counter.is_some())
-                + generated_writes) as u64,
+            (authority.checks.len() + plan.checks.len() + plan.writes.len() + generated_writes)
+                as u64,
         );
         diagnostics::record(
             "redis.transaction.authority_rows",
@@ -395,10 +430,18 @@ impl RedisEntityBackend {
             "redis.transaction.write_rows",
             0,
             0,
-            (plan.writes.len() + usize::from(counter.is_some()) + generated_writes) as u64,
+            (plan.writes.len() + generated_writes) as u64,
         );
         if create.is_some() {
             diagnostics::record("redis.transaction.inode_allocations", 0, 0, 1);
+        }
+        if let Some(pending) = &pending {
+            diagnostics::record(
+                "redis.transaction.slice_reservations",
+                0,
+                0,
+                pending.suffixes.len() as u64,
+            );
         }
         validate_plan(authority, plan)?;
         for check in authority.checks.iter().chain(&plan.checks) {
@@ -407,17 +450,12 @@ impl RedisEntityBackend {
         for write in &plan.writes {
             self.validate_scope(write.key())?;
         }
-        if let Some(counter) = counter {
-            self.validate_scope(counter)?;
-            if authority.checks.len() >= MAX_TRANSACTION_ROWS
-                || authority.checks.iter().any(|check| check.key == counter)
-            {
-                return Err(EntityError::Invalid("invalid allocator authority".into()));
-            }
-        }
         if let Some(prepared) = &prepared {
             self.validate_scope(&prepared.counter_key)?;
             self.validate_scope(&prepared.dentry_key)?;
+        }
+        if let Some(pending) = &pending {
+            self.validate_scope(&pending.counter_key)?;
         }
         let script = redis::Script::new(TRANSACTION_LUA);
         let mut invocation = script.prepare_invoke();
@@ -427,18 +465,18 @@ impl RedisEntityBackend {
         for write in &plan.writes {
             invocation.key(write.key());
         }
-        if let Some(counter) = counter {
-            invocation.key(counter);
-        }
         if let Some(prepared) = &prepared {
             invocation
                 .key(&prepared.counter_key)
                 .key(&prepared.dentry_key);
         }
+        if let Some(pending) = &pending {
+            invocation.key(&pending.counter_key);
+        }
         invocation
             .arg(authority.checks.len())
             .arg(plan.checks.len())
-            .arg(plan.writes.len() + usize::from(counter.is_some()));
+            .arg(plan.writes.len());
         for bound in [authority.not_before_ns, authority.expires_before_ns] {
             if let Some(bound) = bound {
                 invocation
@@ -448,10 +486,10 @@ impl RedisEntityBackend {
                 invocation.arg("").arg("");
             }
         }
-        invocation.arg(&self.prefix).arg(if counter.is_some() {
-            "allocate"
-        } else if create.is_some() {
+        invocation.arg(&self.prefix).arg(if create.is_some() {
             "create"
+        } else if slices.is_some() {
+            "reserve"
         } else {
             "commit"
         });
@@ -470,9 +508,6 @@ impl RedisEntityBackend {
                 }
             }
         }
-        if counter.is_some() {
-            invocation.arg("allocate").arg("");
-        }
         if let (Some(create), Some(prepared)) = (create, &prepared) {
             invocation
                 .arg(&prepared.namespace_prefix)
@@ -483,6 +518,16 @@ impl RedisEntityBackend {
                 .arg(prepared.xattrs.len());
             for (name, value) in &prepared.xattrs {
                 invocation.arg(name).arg(value);
+            }
+        }
+        if let Some(pending) = &pending {
+            invocation
+                .arg(&pending.slice_prefix)
+                .arg(&pending.descriptor_prefix)
+                .arg(&pending.row_prefix)
+                .arg(pending.suffixes.len());
+            for suffix in &pending.suffixes {
+                invocation.arg(suffix);
             }
         }
         let mut connection = DiagnosticConnection {
@@ -561,26 +606,6 @@ impl EntityBackend for RedisEntityBackend {
         }
     }
 
-    async fn allocate(&self, authority: &TransactionAuthority, counter_key: &[u8]) -> Result<u64> {
-        let (status, bytes) = self
-            .transaction(authority, &EntityPlan::default(), Some(counter_key), None)
-            .await?;
-        match status {
-            -1 => Err(EntityError::Fenced),
-            0 => Err(EntityError::Conflict),
-            3 => Err(EntityError::Exhausted),
-            2 => {
-                let value = std::str::from_utf8(&bytes)
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .filter(|value| *value > 0 && *value <= i64::MAX as u64)
-                    .ok_or_else(|| EntityError::Corrupt("invalid allocation response".into()))?;
-                Ok(value)
-            }
-            _ => Err(EntityError::Corrupt("invalid allocation response".into())),
-        }
-    }
-
     async fn commit_with_inode_allocation(
         &self,
         authority: &TransactionAuthority,
@@ -588,7 +613,7 @@ impl EntityBackend for RedisEntityBackend {
         create: &CreateAllocation,
     ) -> Result<Option<i64>> {
         let (status, bytes) = self
-            .transaction(authority, plan, None, Some(create))
+            .transaction(authority, plan, Some(create), None)
             .await?;
         match status {
             -1 => Err(EntityError::Fenced),
@@ -609,6 +634,54 @@ impl EntityBackend for RedisEntityBackend {
             }
             _ => Err(EntityError::Corrupt(
                 "invalid create transaction response".into(),
+            )),
+        }
+    }
+
+    async fn reserve_slices(
+        &self,
+        authority: &TransactionAuthority,
+        allocation: &SliceAllocation,
+    ) -> Result<Option<Vec<u64>>> {
+        let (status, bytes) = self
+            .transaction(authority, &EntityPlan::default(), None, Some(allocation))
+            .await?;
+        match status {
+            -1 => Err(EntityError::Fenced),
+            0 => Ok(None),
+            3 => Err(EntityError::Exhausted),
+            5 => {
+                let text = std::str::from_utf8(&bytes).map_err(|_| {
+                    EntityError::Corrupt("invalid slice reservation response".into())
+                })?;
+                let mut ids = Vec::with_capacity(allocation.sizes.len());
+                for decimal in text.split(',') {
+                    let id = decimal
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|id| *id > 0 && *id <= i64::MAX as u64)
+                        .ok_or_else(|| {
+                            EntityError::Corrupt("invalid reserved slice identity".into())
+                        })?;
+                    if decimal != id.to_string()
+                        || ids.len() >= allocation.sizes.len()
+                        || ids.last().is_some_and(|previous| *previous + 1 != id)
+                    {
+                        return Err(EntityError::Corrupt(
+                            "noncanonical slice reservation response".into(),
+                        ));
+                    }
+                    ids.push(id);
+                }
+                if ids.len() != allocation.sizes.len() {
+                    return Err(EntityError::Corrupt(
+                        "short slice reservation response".into(),
+                    ));
+                }
+                Ok(Some(ids))
+            }
+            _ => Err(EntityError::Corrupt(
+                "invalid slice reservation status".into(),
             )),
         }
     }

@@ -2,8 +2,8 @@
 //!
 //! A file operation retains the namespace's inode lock through transport and
 //! publication. Other inodes remain independent. Uploads precede visibility;
-//! each chunk publishes its inode/map/memberships and authenticated object
-//! descriptor atomically. Mount admission remains a separate qualification.
+//! each bounded group publishes its inode/maps/memberships and authenticated
+//! object descriptors atomically. Mount admission remains a separate qualification.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -18,16 +18,16 @@ use uuid::Uuid;
 use crate::cadapter::client::ObjectBackend;
 
 use super::backend::{
-    CommitOutcome, EntityBackend, EntityPlan, MAX_TRANSACTION_BYTES, MAX_TRANSACTION_ROWS,
-    RowCheck, RowWrite,
+    CommitOutcome, EntityBackend, EntityPlan, RowCheck, RowWrite, TransactionAuthority,
 };
 use super::codec;
 use super::lifecycle::MaintenanceToken;
 use super::model::{ChunkMap, ChunkSource, EntityInode, EntityKind, UpperInode};
-use super::namespace::{EntityHandle, EntityNamespace};
-use super::ownership::{Ownership, SliceOwnership, plan_chunk_membership};
+use super::namespace::{EntityHandle, EntityNamespace, Prepared};
+use super::ownership::{
+    DurableUpload, Ownership, SliceOwnership, plan_chunk_memberships_from_rows,
+};
 use super::recovery::{DiscardProgress, Recovery, absent_intent_check, prepare_resize};
-use super::resolver;
 use super::{EntityError, Result};
 
 pub use super::resolver::ImmutableLowerData;
@@ -54,7 +54,7 @@ pub trait EntityFileIo: Send + Sync {
     async fn attr(&self) -> Result<EntityInode>;
     async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>>;
     async fn write(&self, offset: u64, data: Bytes, append: bool) -> Result<WriteOutcome>;
-    async fn truncate(&self, size: u64) -> Result<()>;
+    async fn truncate(&self, size: u64) -> Result<EntityInode>;
     async fn fsync(&self) -> Result<()>;
 }
 
@@ -86,70 +86,10 @@ struct BoundFile<B, L, O> {
     handle: Arc<EntityHandle>,
 }
 
-#[derive(Default)]
-struct ReadSet {
-    rows: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-    bytes: usize,
-    now_ns: i64,
-}
-
-impl ReadSet {
-    fn add(&mut self, check: RowCheck) -> Result<()> {
-        if let Some(existing) = self.rows.get(&check.key) {
-            return if existing == &check.expected {
-                Ok(())
-            } else {
-                Err(EntityError::Conflict)
-            };
-        }
-        let bytes = check.key.len() + check.expected.as_ref().map_or(0, Vec::len);
-        if self.rows.len() >= MAX_TRANSACTION_ROWS
-            || self
-                .bytes
-                .checked_add(bytes)
-                .is_none_or(|n| n > MAX_TRANSACTION_BYTES)
-        {
-            return Err(EntityError::Invalid("file read set exceeds bound".into()));
-        }
-        self.bytes += bytes;
-        self.rows.insert(check.key, check.expected);
-        Ok(())
-    }
-
-    async fn raw<B: EntityBackend>(
-        &mut self,
-        backend: &B,
-        key: Vec<u8>,
-    ) -> Result<Option<Vec<u8>>> {
-        if let Some(value) = self.rows.get(&key) {
-            return Ok(value.clone());
-        }
-        let snapshot = backend.read(std::slice::from_ref(&key)).await?;
-        self.now_ns = snapshot.now_ns;
-        let value =
-            snapshot.rows.into_iter().next().ok_or_else(|| {
-                EntityError::Corrupt("short entity file metadata response".into())
-            })?;
-        self.add(RowCheck {
-            key,
-            expected: value.clone(),
-        })?;
-        Ok(value)
-    }
-
-    fn plan(&self, writes: Vec<RowWrite>) -> EntityPlan {
-        EntityPlan {
-            checks: self
-                .rows
-                .iter()
-                .map(|(key, expected)| RowCheck {
-                    key: key.clone(),
-                    expected: expected.clone(),
-                })
-                .collect(),
-            writes,
-        }
-    }
+struct UploadedRange {
+    offset: u64,
+    length: usize,
+    descriptor: ObjectDescriptor,
 }
 
 impl<B, L, O> EntityData<B, L, O>
@@ -230,13 +170,43 @@ where
         }))
     }
 
-    fn read_set(&self) -> Result<ReadSet> {
-        let mut rows = ReadSet::default();
+    async fn snapshot(
+        &self,
+        ino: i64,
+        extra: Vec<Vec<u8>>,
+    ) -> Result<(TransactionAuthority, Prepared<'_, B, L>)> {
+        let mut keys = vec![
+            self.namespace.keys.inode(ino),
+            self.namespace.keys.truncate(ino),
+        ];
+        keys.extend(extra);
+        let (authority, mut rows) = self.namespace.snapshot(keys).await?;
         rows.add(RowCheck {
             key: self.config_key.clone(),
             expected: Some(self.config_bytes.clone()),
         })?;
-        Ok(rows)
+        Ok((authority, rows))
+    }
+
+    /// Ordinary I/O observes the inode, intent and known chunk rows together.
+    /// Only an actual outstanding shrink enters the existing bounded cleanup.
+    async fn settled_snapshot(
+        &self,
+        ino: i64,
+        extra: Vec<Vec<u8>>,
+    ) -> Result<(TransactionAuthority, Prepared<'_, B, L>)> {
+        for _ in 0..MAX_RETRIES {
+            let (authority, rows) = self.snapshot(ino, extra.clone()).await?;
+            self.check_failure(ino)?;
+            if rows
+                .observed(&self.namespace.keys.truncate(ino))
+                .is_some_and(Option::is_none)
+            {
+                return Ok((authority, rows));
+            }
+            self.recover_locked(ino).await?;
+        }
+        Err(EntityError::Busy)
     }
 
     fn remember_failure(&self, ino: i64, error: &EntityError) {
@@ -276,23 +246,18 @@ where
         Ok(end)
     }
 
-    async fn inode(&self, ino: i64, rows: &mut ReadSet) -> Result<EntityInode> {
+    fn chunk_keys(&self, ino: i64, offset: u64, length: usize) -> Vec<Vec<u8>> {
+        if length == 0 {
+            return Vec::new();
+        }
+        (offset / self.chunk_size..=(offset + length as u64 - 1) / self.chunk_size)
+            .map(|index| self.namespace.keys.chunk(ino, index))
+            .collect()
+    }
+
+    async fn inode(&self, ino: i64, rows: &mut Prepared<'_, B, L>) -> Result<EntityInode> {
         let _diagnostic = super::diagnostics::Span::start("data.resolve_inode");
-        let bytes = rows
-            .raw(
-                self.namespace.backend.as_ref(),
-                self.namespace.keys.inode(ino),
-            )
-            .await?;
-        let upper: Option<UpperInode> = bytes.as_deref().map(codec::decode).transpose()?;
-        let inode = resolver::resolve_inode(
-            self.namespace.lower.as_ref(),
-            self.namespace.lower.binding(),
-            ino,
-            upper.as_ref(),
-        )
-        .await?
-        .ok_or(EntityError::NotFound)?;
+        let inode = rows.inode(ino).await?;
         if inode.kind != EntityKind::File {
             return Err(EntityError::Unsupported(
                 "entity file I/O requires regular inode",
@@ -302,24 +267,14 @@ where
         Ok(inode)
     }
 
-    async fn chunk(&self, inode: &EntityInode, index: u64, rows: &mut ReadSet) -> Result<ChunkMap> {
+    async fn chunk(
+        &self,
+        inode: &EntityInode,
+        index: u64,
+        rows: &mut Prepared<'_, B, L>,
+    ) -> Result<ChunkMap> {
         let _diagnostic = super::diagnostics::Span::start("data.resolve_chunk");
-        let bytes = rows
-            .raw(
-                self.namespace.backend.as_ref(),
-                self.namespace.keys.chunk(inode.ino, index),
-            )
-            .await?;
-        let upper: Option<ChunkMap> = bytes.as_deref().map(codec::decode).transpose()?;
-        resolver::resolve_chunk(
-            self.namespace.lower.as_ref(),
-            self.namespace.lower.binding(),
-            inode,
-            index,
-            self.chunk_size,
-            upper.as_ref(),
-        )
-        .await
+        rows.chunk(inode, index, self.chunk_size).await
     }
 
     async fn recover_locked(&self, ino: i64) -> Result<()> {
@@ -353,13 +308,12 @@ where
         let _admission = self.namespace.session.admit()?;
         let _guard = self.namespace.lock_inode(ino).await;
         for _ in 0..MAX_RETRIES {
-            let authority = self.namespace.authority().await?;
-            let mut rows = self.read_set()?;
+            let (authority, mut rows) = self.snapshot(ino, Vec::new()).await?;
             let inode = self.inode(ino, &mut rows).await?;
             if self
                 .namespace
                 .backend
-                .commit(&authority, &rows.plan(Vec::new()))
+                .commit(&authority, &rows.read_plan())
                 .await?
                 == CommitOutcome::Committed
             {
@@ -387,10 +341,40 @@ where
         let this = self.clone();
         tokio::spawn(super::diagnostics::inherit(async move {
             let (_handle, _admission, _guard) = (handle, admission, guard);
-            this.write_locked(ino, offset, data, append).await
+            let result = this.write_locked(ino, offset, data, append).await;
+            if let Err(error) = &result {
+                this.remember_failure(ino, error);
+            }
+            result
         }))
         .await
         .map_err(|e| EntityError::Backend(format!("owned file write failed: {e}")))?
+    }
+
+    // These are aggregate read/plan bounds, never semantic Invalid errors or
+    // uncertain backend results. Redis renders extension errors as code: detail.
+    fn aggregate_metadata_bound(error: &EntityError) -> bool {
+        matches!(error, EntityError::Invalid(message) if matches!(message.as_str(),
+            "entity transaction exceeds row bound"
+                | "entity transaction exceeds byte bound"
+                | "operation read set exceeds row bound"
+                | "membership batch exceeds row bound"
+                | "ENTITY_INVALID: read exceeds byte bound"))
+    }
+
+    async fn write_snapshot(
+        &self,
+        ino: i64,
+        mut keys: Vec<Vec<u8>>,
+    ) -> Result<(TransactionAuthority, Prepared<'_, B, L>)> {
+        loop {
+            match self.settled_snapshot(ino, keys.clone()).await {
+                Err(error) if keys.len() > 1 && Self::aggregate_metadata_bound(&error) => {
+                    keys.truncate(keys.len() / 2);
+                }
+                result => return result,
+            }
+        }
     }
 
     async fn write_locked(
@@ -401,168 +385,283 @@ where
         append: bool,
     ) -> Result<WriteOutcome> {
         let _diagnostic = super::diagnostics::Span::start("data.write");
-        self.namespace.authority().await?;
-        self.check_failure(ino)?;
-        self.recover_locked(ino).await?;
-        let mut initial = self.read_set()?;
+        if !append {
+            self.check_range(offset, data.len())?;
+        }
+        let keys = if append {
+            Vec::new()
+        } else {
+            self.chunk_keys(ino, offset, data.len())
+        };
+        let (mut authority, mut initial) = self.write_snapshot(ino, keys).await?;
         let inode = self.inode(ino, &mut initial).await?;
         let offset = if append { inode.size } else { offset };
         self.check_range(offset, data.len())?;
-        let mut result = WriteOutcome {
-            offset,
-            written: 0,
-            size: inode.size,
-        };
-        while result.written < data.len() {
-            let position = offset + result.written as u64;
-            let length = (self.chunk_size - position % self.chunk_size)
-                .min((data.len() - result.written) as u64) as usize;
-            let bytes = data.slice(result.written..result.written + length);
-            match self.write_chunk_locked(ino, position, bytes).await {
-                Ok(size) => {
-                    result.written += length;
-                    result.size = size;
-                }
-                Err(error) => {
-                    self.remember_failure(ino, &error);
-                    return if result.written == 0 {
-                        Err(error)
-                    } else {
-                        Ok(result)
-                    };
-                }
+        let chunk_keys = self.chunk_keys(ino, offset, data.len());
+        if append && let Err(error) = initial.prefetch(chunk_keys.clone()).await {
+            if !Self::aggregate_metadata_bound(&error) {
+                return Err(error);
             }
+            (authority, initial) = self.write_snapshot(ino, chunk_keys.clone()).await?;
         }
         // Empty writes still validate live authority and the observed inode.
         if data.is_empty() {
-            let authority = self.namespace.authority().await?;
             if self
                 .namespace
                 .backend
-                .commit(&authority, &initial.plan(Vec::new()))
+                .commit(&authority, &initial.read_plan())
                 .await?
                 != CommitOutcome::Committed
             {
                 return Err(EntityError::Conflict);
             }
+            return Ok(WriteOutcome {
+                offset,
+                written: 0,
+                size: inode.size,
+            });
         }
-        Ok(result)
-    }
-
-    async fn write_chunk_locked(&self, ino: i64, offset: u64, data: Bytes) -> Result<u64> {
-        let _diagnostic = super::diagnostics::Span::start("data.write_chunk");
+        let mut lengths = Vec::new();
+        let mut selected = 0;
+        while selected < data.len() {
+            let position = offset + selected as u64;
+            let length = (self.chunk_size - position % self.chunk_size)
+                .min((data.len() - selected) as u64) as usize;
+            lengths.push(length as u64);
+            selected += length;
+        }
         let ownership = Ownership::new(self.namespace.backend.clone(), self.namespace.keys.clone());
         let mut reserved = None;
         for _ in 0..MAX_RETRIES {
             match ownership
-                .allocate_upload(&self.namespace.session, data.len() as u64)
+                .reserve_uploads(&self.namespace.session, &authority, &lengths)
                 .await
             {
-                Ok(token) => {
-                    reserved = Some(token);
+                Ok(tokens) => {
+                    reserved = Some(tokens);
                     break;
                 }
-                // Renewal may change exact authority after INCR but before the
-                // owner-row transaction. Gaps are safe; no PUT has started.
-                Err(EntityError::Conflict) => continue,
+                Err(EntityError::Conflict) => {
+                    (authority, initial) = self.write_snapshot(ino, chunk_keys.clone()).await?;
+                }
                 Err(error) => return Err(error),
             }
         }
-        let token = reserved.ok_or(EntityError::Busy)?;
-        let descriptor = ObjectDescriptor {
-            namespace_id: self.namespace.keys.namespace_id(),
-            slice_id: token.slice_id(),
-            size: data.len() as u64,
-            sha256: Sha256::digest(&data).into(),
-        };
-        {
+        let tokens = reserved.ok_or(EntityError::Busy)?;
+        let mut uploaded = Vec::new();
+        let mut receipts = Vec::new();
+        let mut written = 0;
+        let mut upload_error = None;
+        for (token, length) in tokens.into_iter().zip(lengths) {
+            let length = length as usize;
+            let bytes = &data[written..written + length];
+            let descriptor = ObjectDescriptor {
+                namespace_id: self.namespace.keys.namespace_id(),
+                slice_id: token.slice_id(),
+                size: length as u64,
+                sha256: Sha256::digest(bytes).into(),
+            };
             let _diagnostic = super::diagnostics::Span::start("object.put");
-            self.objects
+            if let Err(error) = self
+                .objects
                 .put_object_create_only_durable(
                     &self.namespace.keys.object(token.slice_id()),
-                    &data,
+                    bytes,
                 )
                 .await
-                .map_err(|e| EntityError::Backend(format!("entity object PUT failed: {e}")))?;
+            {
+                upload_error = Some(EntityError::Backend(format!(
+                    "entity object PUT failed: {error}"
+                )));
+                break;
+            }
+            receipts.push(token.confirm_durable_put());
+            uploaded.push(UploadedRange {
+                offset: offset + written as u64,
+                length,
+                descriptor,
+            });
+            written += length;
         }
-        let mut uploaded = false;
-        for _ in 0..MAX_RETRIES {
-            match ownership.uploaded(&self.namespace.session, &token).await {
-                Ok(()) => {
-                    uploaded = true;
+        if written == 0 {
+            let error = upload_error.expect("nonempty write failed before publication");
+            return Err(error);
+        }
+        // Ordinary writes publish once. Split only a known preparation bound;
+        // every smaller group starts with fresh, narrowly selected observations.
+        // A failed PUT's unselected tail must not inflate a prefix read set.
+        let mut first = upload_error.is_none().then_some((authority, initial));
+        let mut result = WriteOutcome {
+            offset,
+            written: 0,
+            size: inode.size,
+        };
+        let mut completed = 0;
+        let mut group = uploaded.len();
+        let mut publication_error = None;
+        while completed < uploaded.len() {
+            group = group.min(uploaded.len() - completed);
+            let end = completed + group;
+            match self
+                .publish_write(
+                    ino,
+                    &uploaded[completed..end],
+                    &receipts[completed..end],
+                    first.take(),
+                    group > 1,
+                )
+                .await
+            {
+                Ok(Some(size)) => {
+                    result.written += uploaded[completed..end]
+                        .iter()
+                        .map(|range| range.length)
+                        .sum::<usize>();
+                    result.size = size;
+                    completed = end;
+                }
+                Ok(None) => group /= 2,
+                Err(error) => {
+                    publication_error = Some(error);
                     break;
                 }
-                Err(EntityError::Conflict) => continue,
-                Err(error) => return Err(error),
             }
         }
-        if !uploaded {
-            return Err(EntityError::Busy);
+        if let Some(error) = upload_error.as_ref() {
+            self.remember_failure(ino, error);
         }
-        let index = offset / self.chunk_size;
+        if let Some(error) = publication_error {
+            self.remember_failure(ino, &error);
+            if result.written == 0 {
+                return Err(error);
+            }
+        }
+        Ok(result)
+    }
+
+    async fn publish_write<'a>(
+        &'a self,
+        ino: i64,
+        uploaded: &[UploadedRange],
+        receipts: &[DurableUpload],
+        mut first: Option<(TransactionAuthority, Prepared<'a, B, L>)>,
+        can_split: bool,
+    ) -> Result<Option<u64>> {
+        let _diagnostic = super::diagnostics::Span::start("data.publish_write");
+        let keys = uploaded
+            .iter()
+            .map(|range| {
+                self.namespace
+                    .keys
+                    .chunk(ino, range.offset / self.chunk_size)
+            })
+            .collect::<Vec<_>>();
         for _ in 0..MAX_RETRIES {
-            let authority = self.namespace.authority().await?;
-            let mut rows = self.read_set()?;
-            rows.add(absent_intent_check(&self.namespace.keys, ino))?;
-            let mut inode = self.inode(ino, &mut rows).await?;
-            let old = self.chunk(&inode, index, &mut rows).await?;
-            let new = old.replace(
-                offset % self.chunk_size,
-                data.len() as u64,
-                ChunkSource::Data {
-                    slice_id: token.slice_id(),
-                    slice_offset: 0,
-                },
-            )?;
-            let membership = plan_chunk_membership(
-                self.namespace.backend.as_ref(),
-                &self.namespace.keys,
-                ino,
-                index,
-                &old,
-                &new,
-            )
-            .await?;
-            for check in membership.checks {
-                rows.add(check)?;
-            }
-            rows.add(RowCheck {
-                key: self.namespace.keys.object_descriptor(token.slice_id()),
-                expected: None,
-            })?;
-            inode.size = inode.size.max(offset + data.len() as u64);
-            inode.data_version = inode
-                .data_version
-                .checked_add(1)
-                .ok_or(EntityError::Overflow)?;
-            inode.mtime_ns = rows.now_ns;
-            inode.ctime_ns = rows.now_ns;
-            inode.mode &= !0o6000;
-            inode.validate()?;
-            let size = inode.size;
-            let mut writes = membership.writes;
-            writes.extend([
-                RowWrite::Put {
+            let prepared = async {
+                let (authority, mut rows) = match first.take() {
+                    Some(snapshot) => snapshot,
+                    None => self.settled_snapshot(ino, keys.clone()).await?,
+                };
+                let mut inode = self.inode(ino, &mut rows).await?;
+                let mut replacements = Vec::new();
+                let mut owner_keys = Vec::new();
+                let mut writes = Vec::new();
+                for (range, receipt) in uploaded.iter().zip(receipts) {
+                    let index = range.offset / self.chunk_size;
+                    let old = self.chunk(&inode, index, &mut rows).await?;
+                    for slice_id in old.upper_slices()? {
+                        owner_keys.extend([
+                            self.namespace.keys.slice(slice_id),
+                            self.namespace.keys.owner(slice_id, ino, index),
+                        ]);
+                    }
+                    let new = old.replace(
+                        range.offset % self.chunk_size,
+                        range.length as u64,
+                        ChunkSource::Data {
+                            slice_id: receipt.slice_id(),
+                            slice_offset: 0,
+                        },
+                    )?;
+                    rows.add(RowCheck {
+                        key: self.namespace.keys.object_descriptor(receipt.slice_id()),
+                        expected: None,
+                    })?;
+                    writes.extend([
+                        RowWrite::Put {
+                            key: self.namespace.keys.chunk(ino, index),
+                            value: codec::encode(&new)?,
+                        },
+                        RowWrite::Put {
+                            key: self.namespace.keys.object_descriptor(receipt.slice_id()),
+                            value: codec::encode(&range.descriptor)?,
+                        },
+                    ]);
+                    replacements.push((index, old, new));
+                    inode.size = inode.size.max(range.offset + range.length as u64);
+                }
+                rows.prefetch(owner_keys).await?;
+                let membership = plan_chunk_memberships_from_rows(
+                    &self.namespace.keys,
+                    ino,
+                    &replacements,
+                    rows.observations(),
+                    receipts,
+                )?;
+                for check in membership.checks {
+                    rows.add(check)?;
+                }
+                inode.data_version = inode
+                    .data_version
+                    .checked_add(1)
+                    .ok_or(EntityError::Overflow)?;
+                inode.mtime_ns = rows.now_ns();
+                inode.ctime_ns = rows.now_ns();
+                inode.mode &= !0o6000;
+                inode.validate()?;
+                let size = inode.size;
+                writes.extend(membership.writes);
+                writes.push(RowWrite::Put {
                     key: self.namespace.keys.inode(ino),
                     value: codec::encode(&UpperInode::Present(inode))?,
-                },
-                RowWrite::Put {
-                    key: self.namespace.keys.chunk(ino, index),
-                    value: codec::encode(&new)?,
-                },
-                RowWrite::Put {
-                    key: self.namespace.keys.object_descriptor(token.slice_id()),
-                    value: codec::encode(&descriptor)?,
-                },
-            ]);
-            if self
-                .namespace
-                .backend
-                .commit(&authority, &rows.plan(writes))
-                .await?
-                == CommitOutcome::Committed
-            {
-                return Ok(size);
+                });
+                let plan = rows.plan_with_writes(writes);
+                super::backend::validate_plan(&authority, &plan)?;
+                // Redis also bounds existing values at every check/write position.
+                // All publication writes have exact observed predicates, including
+                // the locally known Pending reservation and new-key absence.
+                let mut stored_bytes = 0;
+                for check in authority.checks.iter().chain(&plan.checks) {
+                    super::backend::add_bytes(
+                        &mut stored_bytes,
+                        &check.key,
+                        check.expected.as_deref(),
+                    )?;
+                }
+                for write in &plan.writes {
+                    let old = rows.observed(write.key()).ok_or_else(|| {
+                        EntityError::Corrupt("publication write lacks observation".into())
+                    })?;
+                    super::backend::add_bytes(&mut stored_bytes, write.key(), old.as_deref())?;
+                }
+                Ok::<_, EntityError>((authority, plan, size))
+            }
+            .await;
+            let (authority, plan, size) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) if can_split && Self::aggregate_metadata_bound(&error) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            match self.namespace.backend.commit(&authority, &plan).await {
+                Ok(CommitOutcome::Committed) => return Ok(Some(size)),
+                // A durable PUT may outlive this snapshot's deadline while the
+                // same writer successfully renews. Refresh exact authority after
+                // a known rejection; a truly expired/fenced session fails the
+                // next snapshot. Unknown commit results are never replayed.
+                Ok(CommitOutcome::Conflict) | Err(EntityError::Fenced) => {}
+                Err(error) => return Err(error),
             }
         }
         Err(EntityError::Busy)
@@ -589,29 +688,63 @@ where
 
     async fn read_locked(&self, ino: i64, offset: u64, length: usize) -> Result<Vec<u8>> {
         let _diagnostic = super::diagnostics::Span::start("data.read");
+        let chunk_keys = self.chunk_keys(ino, offset, length);
         for _ in 0..MAX_RETRIES {
-            let authority = self.namespace.authority().await?;
-            let mut rows = self.read_set()?;
+            let mut fetch_visible_chunks = false;
+            let (authority, mut rows) = match self.snapshot(ino, chunk_keys.clone()).await {
+                Err(error) if Self::aggregate_metadata_bound(&error) => {
+                    // A visible truncate cut can leave large tail maps awaiting
+                    // cleanup. Read the inode first when eager prefetch exceeds
+                    // its bound; invisible tail rows must not make EOF fail.
+                    fetch_visible_chunks = true;
+                    self.snapshot(ino, Vec::new()).await?
+                }
+                result => result?,
+            };
             let inode = self.inode(ino, &mut rows).await?;
             let length = inode.size.saturating_sub(offset).min(length as u64) as usize;
+            if fetch_visible_chunks {
+                rows.prefetch(self.chunk_keys(ino, offset, length)).await?;
+            }
             let mut output = vec![0; length];
             let mut position = offset;
             let mut pieces = Vec::new();
             let mut descriptors = BTreeMap::new();
+            let mut maps = Vec::new();
+            let mut ownership_keys = Vec::new();
             while position < offset + length as u64 {
                 let index = position / self.chunk_size;
                 let count = (self.chunk_size - position % self.chunk_size)
                     .min(offset + length as u64 - position);
                 let map = self.chunk(&inode, index, &mut rows).await?;
-                let membership = plan_chunk_membership(
-                    self.namespace.backend.as_ref(),
+                for slice_id in map.upper_slices()? {
+                    ownership_keys.extend([
+                        self.namespace.keys.slice(slice_id),
+                        self.namespace.keys.owner(slice_id, ino, index),
+                    ]);
+                }
+                for span in map.clip(position % self.chunk_size, count)? {
+                    if let ChunkSource::Data { slice_id, .. } = span.source {
+                        ownership_keys.push(self.namespace.keys.object_descriptor(slice_id));
+                    }
+                }
+                maps.push((index, count, map));
+                position += count;
+            }
+            // Slice identities depend on decoded maps. Fetch all dependent
+            // ownership/authentication rows in one batch, never per piece.
+            rows.prefetch(ownership_keys).await?;
+            position = offset;
+            for (index, count, map) in maps {
+                let membership = super::ownership::plan_chunk_membership_from_rows(
                     &self.namespace.keys,
                     ino,
                     index,
                     &map,
                     &map,
-                )
-                .await?;
+                    rows.observations(),
+                    None,
+                )?;
                 for check in membership.checks {
                     rows.add(check)?;
                 }
@@ -625,10 +758,7 @@ where
                         && !descriptors.contains_key(&slice_id)
                     {
                         let bytes = rows
-                            .raw(
-                                self.namespace.backend.as_ref(),
-                                self.namespace.keys.object_descriptor(slice_id),
-                            )
+                            .raw(self.namespace.keys.object_descriptor(slice_id))
                             .await?
                             .ok_or_else(|| {
                                 EntityError::Corrupt(
@@ -637,8 +767,7 @@ where
                             })?;
                         let descriptor: ObjectDescriptor = codec::decode(&bytes)?;
                         let ownership: SliceOwnership = codec::decode(
-                            rows.rows
-                                .get(&self.namespace.keys.slice(slice_id))
+                            rows.observed(&self.namespace.keys.slice(slice_id))
                                 .and_then(Option::as_deref)
                                 .ok_or_else(|| {
                                     EntityError::Corrupt("missing validated slice owner".into())
@@ -660,9 +789,17 @@ where
                 }
                 position += count;
             }
-            let plan = rows.plan(Vec::new());
+            let plan = rows.read_plan();
             if self.namespace.backend.commit(&authority, &plan).await? == CommitOutcome::Conflict {
                 continue;
+            }
+            // EOF and all-hole reads are complete at this validation point.
+            // There is no transport interval requiring a second validation.
+            if pieces
+                .iter()
+                .all(|(_, span)| matches!(span.source, ChunkSource::Hole))
+            {
+                return Ok(output);
             }
             for (destination, span) in pieces {
                 let destination =
@@ -767,7 +904,11 @@ where
         Ok(bytes)
     }
 
-    pub async fn truncate(self: &Arc<Self>, handle: Arc<EntityHandle>, size: u64) -> Result<()> {
+    pub async fn truncate(
+        self: &Arc<Self>,
+        handle: Arc<EntityHandle>,
+        size: u64,
+    ) -> Result<EntityInode> {
         let ino = self.namespace.validate_handle(&handle, 2)?;
         if size > i64::MAX as u64 {
             return Err(EntityError::Invalid(
@@ -785,17 +926,12 @@ where
         .map_err(|e| EntityError::Backend(format!("owned file truncate failed: {e}")))?
     }
 
-    async fn truncate_locked(&self, ino: i64, size: u64) -> Result<()> {
-        self.namespace.authority().await?;
-        self.check_failure(ino)?;
-        self.recover_locked(ino).await?;
+    async fn truncate_locked(&self, ino: i64, size: u64) -> Result<EntityInode> {
         for _ in 0..MAX_RETRIES {
-            let authority = self.namespace.authority().await?;
-            let mut rows = self.read_set()?;
+            let (authority, mut rows) = self.settled_snapshot(ino, Vec::new()).await?;
             let inode = self.inode(ino, &mut rows).await?;
             let old = rows
-                .rows
-                .get(&self.namespace.keys.inode(ino))
+                .observed(&self.namespace.keys.inode(ino))
                 .cloned()
                 .flatten();
             let mut plan = prepare_resize(
@@ -805,18 +941,36 @@ where
                 &inode,
                 size,
                 self.chunk_size,
-                rows.now_ns,
+                rows.now_ns(),
             )?;
             for check in plan.checks.drain(..) {
                 rows.add(check)?;
             }
+            let updated = plan
+                .writes
+                .iter()
+                .find_map(|write| match write {
+                    RowWrite::Put { key, value } if key == &self.namespace.keys.inode(ino) => {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| EntityError::Corrupt("resize lacks updated inode".into()))?;
+            let UpperInode::Present(updated) = codec::decode(updated)? else {
+                return Err(EntityError::Corrupt("resize retired its inode".into()));
+            };
             match self
                 .namespace
                 .backend
-                .commit(&authority, &rows.plan(plan.writes))
+                .commit(&authority, &rows.plan_with_writes(plan.writes))
                 .await
             {
-                Ok(CommitOutcome::Committed) => return self.recover_locked(ino).await,
+                Ok(CommitOutcome::Committed) => {
+                    if size < inode.size {
+                        self.recover_locked(ino).await?;
+                    }
+                    return Ok(updated);
+                }
                 Ok(CommitOutcome::Conflict) => {}
                 Err(error) => {
                     if matches!(error, EntityError::Backend(_)) {
@@ -840,18 +994,14 @@ where
         let this = self.clone();
         tokio::spawn(super::diagnostics::inherit(async move {
             let (_handle, _admission, _guard) = (handle, admission, guard);
-            this.namespace.authority().await?;
-            this.check_failure(ino)?;
-            this.recover_locked(ino).await?;
             for _ in 0..MAX_RETRIES {
-                let authority = this.namespace.authority().await?;
-                let mut rows = this.read_set()?;
+                let (authority, mut rows) = this.settled_snapshot(ino, Vec::new()).await?;
                 this.inode(ino, &mut rows).await?;
                 rows.add(absent_intent_check(&this.namespace.keys, ino))?;
                 if this
                     .namespace
                     .backend
-                    .commit(&authority, &rows.plan(Vec::new()))
+                    .commit(&authority, &rows.read_plan())
                     .await?
                     == CommitOutcome::Committed
                 {
@@ -923,7 +1073,7 @@ where
             .write(self.handle.clone(), offset, data, append)
             .await
     }
-    async fn truncate(&self, size: u64) -> Result<()> {
+    async fn truncate(&self, size: u64) -> Result<EntityInode> {
         self.data.truncate(self.handle.clone(), size).await
     }
     async fn fsync(&self) -> Result<()> {

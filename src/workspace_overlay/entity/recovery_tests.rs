@@ -2,10 +2,14 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use super::*;
-use crate::workspace_overlay::entity::backend::{CommitOutcome, MemoryEntityBackend, RowSnapshot};
+use crate::workspace_overlay::entity::backend::{
+    CommitOutcome, MemoryEntityBackend, RowSnapshot, SliceAllocation,
+};
 use crate::workspace_overlay::entity::codec::encode;
 use crate::workspace_overlay::entity::lifecycle::{LowerRegistry, WriterSession};
-use crate::workspace_overlay::entity::ownership::plan_orphan;
+use crate::workspace_overlay::entity::ownership::{
+    chunk_membership_keys, plan_chunk_membership_from_rows, plan_orphan,
+};
 use crate::workspace_overlay::entity::redis::RedisEntityBackend;
 use crate::workspace_overlay::entity::resolver::{self, test_support::MemoryLower};
 
@@ -35,8 +39,12 @@ impl<B: EntityBackend> EntityBackend for FaultBackend<B> {
         }
         Ok(outcome)
     }
-    async fn allocate(&self, authority: &TransactionAuthority, key: &[u8]) -> Result<u64> {
-        self.inner.allocate(authority, key).await
+    async fn reserve_slices(
+        &self,
+        authority: &TransactionAuthority,
+        allocation: &SliceAllocation,
+    ) -> Result<Option<Vec<u64>>> {
+        self.inner.reserve_slices(authority, allocation).await
     }
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.inner.scan_prefix(prefix, limit).await
@@ -112,17 +120,17 @@ impl<B: EntityBackend> Fixture<B> {
             .await;
     }
     async fn upper(&mut self, index: u64, offset: u64, bytes: &[u8]) -> u64 {
+        let authority = self.authority().await;
         let upload = self
             .ownership
-            .allocate_upload(&self.session, bytes.len() as u64)
+            .reserve_uploads(&self.session, &authority, &[bytes.len() as u64])
             .await
-            .unwrap();
-        self.ownership
-            .uploaded(&self.session, &upload)
-            .await
+            .unwrap()
+            .pop()
             .unwrap();
         let id = upload.slice_id();
         self.objects.insert(id, bytes.to_vec());
+        let receipt = upload.confirm_durable_put();
         let (raw_inode, inode) = self.inode().await;
         let key = self.keys.chunk(2, index);
         let snapshot = self.backend.read(std::slice::from_ref(&key)).await.unwrap();
@@ -147,10 +155,19 @@ impl<B: EntityBackend> Fixture<B> {
                 },
             )
             .unwrap();
-        let mut plan =
-            plan_chunk_membership(self.backend.as_ref(), &self.keys, 2, index, &old, &next)
-                .await
-                .unwrap();
+        let owner_keys = chunk_membership_keys(&self.keys, 2, index, &old, &next).unwrap();
+        let owners = self.backend.read(&owner_keys).await.unwrap();
+        let owners = owner_keys.into_iter().zip(owners.rows).collect();
+        let mut plan = plan_chunk_membership_from_rows(
+            &self.keys,
+            2,
+            index,
+            &old,
+            &next,
+            &owners,
+            Some(&receipt),
+        )
+        .unwrap();
         let mut updated = inode;
         updated.data_version += 1;
         plan.checks.extend([
@@ -623,10 +640,13 @@ async fn discard_waits_for_read_pins_then_replays_pending_upload_and_delete_ackn
 async fn discard_contract<B: EntityBackend + 'static>(backend: Arc<B>, keys: EntityKeys) {
     let mut fixture = Fixture::new(backend, keys).await;
     let live_id = fixture.upper(1, 0, b"TAIL-CHUNK-DATA!").await;
+    let authority = fixture.authority().await;
     let pending = fixture
         .ownership
-        .allocate_upload(&fixture.session, 16)
+        .reserve_uploads(&fixture.session, &authority, &[16])
         .await
+        .unwrap()
+        .pop()
         .unwrap();
     let pending_id = pending.slice_id();
     drop(pending);

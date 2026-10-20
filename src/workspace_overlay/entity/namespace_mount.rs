@@ -9,8 +9,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
     pub async fn getattr(&self, ino: i64, _credentials: &Credentials) -> Result<EntityInode> {
         let _admission = self.session.admit()?;
         for _ in 0..MAX_RETRIES {
-            let authority = self.authority().await?;
-            let mut p = Prepared::new(self);
+            let (authority, mut p) = self.snapshot(vec![self.keys.inode(ino)]).await?;
             let result = p.inode(ino).await;
             if self.backend.commit(&authority, &p.read_plan()).await? == CommitOutcome::Committed {
                 return result;
@@ -25,8 +24,12 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         }
         let _admission = self.session.admit()?;
         for _ in 0..MAX_RETRIES {
-            let authority = self.authority().await?;
-            let mut p = Prepared::new(self);
+            let (authority, mut p) = self
+                .snapshot(vec![
+                    self.keys.inode(ino),
+                    self.keys.xattr(ino, ACCESS_XATTR),
+                ])
+                .await?;
             let result = async {
                 let inode = p.inode(ino).await?;
                 p.access(&inode, credentials, mask).await
@@ -53,8 +56,12 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         let state = self.inode_lock(ino);
         let _guard = state.mutex.lock().await;
         for _ in 0..MAX_RETRIES {
-            let authority = self.authority().await?;
-            let mut p = Prepared::new(self);
+            let (authority, mut p) = self
+                .snapshot(vec![
+                    self.keys.inode(ino),
+                    self.keys.xattr(ino, ACCESS_XATTR),
+                ])
+                .await?;
             let result = async {
                 let inode = p.inode(ino).await?;
                 if inode.kind != EntityKind::File {
@@ -128,8 +135,9 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         let _admission = self.session.admit()?;
         let _guard = self.lock_inode(ino).await;
         for _ in 0..MAX_RETRIES {
-            let authority = self.authority().await?;
-            let mut p = Prepared::new(self);
+            let mut keys = BTreeSet::new();
+            self.parent_keys(ino, &mut keys).await?;
+            let (authority, mut p) = self.snapshot(keys.into_iter().collect()).await?;
             let result = async {
                 p.parent(ino, credentials, 5).await?;
                 let prefix = self.keys.dentry_prefix(ino);
@@ -146,13 +154,26 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
                         return Err(EntityError::Corrupt("noncanonical dentry key".into()));
                     }
                     upper.push((name, codec::decode(&value)?));
-                    p.rows.insert(key, Some(value));
+                    p.add(RowCheck {
+                        key,
+                        expected: Some(value),
+                    })?;
                 }
                 let entries = resolver::merge_directory(
                     self.lower.as_ref(),
                     self.lower.binding(),
                     ino,
                     &upper,
+                )
+                .await?;
+                p.prefetch(
+                    entries
+                        .iter()
+                        .filter_map(|(_, entry)| match entry {
+                            EntityDentry::Present { ino, .. } => Some(self.keys.inode(*ino)),
+                            EntityDentry::Whiteout => None,
+                        })
+                        .collect(),
                 )
                 .await?;
                 let mut output = Vec::with_capacity(entries.len());

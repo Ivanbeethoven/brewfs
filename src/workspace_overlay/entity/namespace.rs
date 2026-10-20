@@ -34,6 +34,8 @@ const MAX_DIRECTORY_ROWS: usize = 4096;
 mod create_ops;
 #[path = "namespace_mount.rs"]
 mod mount_ops;
+#[path = "namespace_snapshot.rs"]
+mod snapshot;
 
 #[derive(Clone, Debug)]
 pub struct Credentials {
@@ -89,6 +91,7 @@ pub struct EntityNamespace<B, L> {
     // Advisory topology only. Every inode/ACL used for a decision is freshly
     // read and checked; stale hints can only cause additional reads/retries.
     directory_hints: moka::sync::Cache<i64, i64>,
+    dentry_hints: moka::sync::Cache<(i64, Vec<u8>), i64>,
 }
 
 /// Retain the registry entry as well as its mutex. Keeping only the mutex guard
@@ -128,11 +131,13 @@ enum Operation {
     },
 }
 
-struct Prepared<'a, B, L> {
+pub(super) struct Prepared<'a, B, L> {
     ns: &'a EntityNamespace<B, L>,
     rows: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     now: i64,
+    bytes: usize,
+    inodes: BTreeMap<i64, EntityInode>,
 }
 
 impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B, L> {
@@ -153,6 +158,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
             session,
             locks,
             directory_hints: moka::sync::Cache::new(4096),
+            dentry_hints: moka::sync::Cache::new(4096),
         })
     }
 
@@ -323,8 +329,8 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
     ) -> Result<EntityInode> {
         let _admission = self.session.admit()?;
         for _ in 0..MAX_RETRIES {
-            let authority = self.authority().await?;
-            let mut p = Prepared::new(self);
+            let keys = self.path_keys(parent, name).await?;
+            let (authority, mut p) = self.snapshot(keys).await?;
             let result = async {
                 p.parent(parent, credentials, 1).await?;
                 let (ino, _) = p.dentry(parent, name).await?.ok_or(EntityError::NotFound)?;
@@ -347,17 +353,30 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         access: u32,
         credentials: &Credentials,
     ) -> Result<EntityHandle> {
+        self.open_with_attr(parent, name, access, credentials)
+            .await
+            .map(|(_, handle)| handle)
+    }
+
+    /// Return the attributes authorized by the same validation as the handle.
+    /// FUSE create fallback can use these without starting a second attr read.
+    pub async fn open_with_attr(
+        &self,
+        parent: i64,
+        name: &[u8],
+        access: u32,
+        credentials: &Credentials,
+    ) -> Result<(EntityInode, EntityHandle)> {
         if access == 0 || access & !7 != 0 {
             return Err(EntityError::Invalid("invalid open access mask".into()));
         }
         let admission = self.session.admit()?;
         for _ in 0..MAX_RETRIES {
-            let authority = self.authority().await?;
-            let mut discovery = Prepared::new(self);
+            let keys = self.path_keys(parent, name).await?;
+            let (authority, mut p) = self.snapshot(keys).await?;
             let discovered = async {
-                discovery.parent(parent, credentials, 1).await?;
-                discovery
-                    .dentry_row(parent, name)
+                p.parent(parent, credentials, 1).await?;
+                p.dentry_row(parent, name)
                     .await?
                     .ok_or(EntityError::NotFound)
             }
@@ -365,10 +384,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
             let discovered = match discovered {
                 Ok((ino, _)) => ino,
                 Err(error) => {
-                    if self
-                        .backend
-                        .commit(&authority, &discovery.read_plan())
-                        .await?
+                    if self.backend.commit(&authority, &p.read_plan()).await?
                         == CommitOutcome::Conflict
                     {
                         continue;
@@ -378,9 +394,14 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
             };
             let state = self.inode_lock(discovered);
             let _guard = state.mutex.lock().await;
-            let mut p = Prepared::new(self);
             let result = async {
-                p.parent(parent, credentials, 1).await?;
+                // Keep discovery's exact parent/name observations through lock
+                // acquisition. Changed permissions or names conflict below.
+                p.prefetch(vec![
+                    self.keys.inode(discovered),
+                    self.keys.xattr(discovered, ACCESS_XATTR),
+                ])
+                .await?;
                 let (ino, kind) = p.dentry(parent, name).await?.ok_or(EntityError::NotFound)?;
                 if ino != discovered {
                     return Err(EntityError::Conflict);
@@ -392,22 +413,23 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
                 }
                 let inode = p.inode(ino).await?;
                 p.access(&inode, credentials, access).await?;
-                Ok(ino)
+                Ok(inode)
             }
             .await;
             if matches!(result, Err(EntityError::Conflict)) {
                 continue;
             }
             if self.backend.commit(&authority, &p.read_plan()).await? == CommitOutcome::Committed {
-                let ino = result?;
+                let inode = result?;
                 state.handles.fetch_add(1, Ordering::AcqRel);
-                return Ok(EntityHandle {
-                    ino,
+                let handle = EntityHandle {
+                    ino: inode.ino,
                     namespace: self.keys.prefix().to_vec(),
                     access,
                     state: state.clone(),
                     _admission: admission,
-                });
+                };
+                return Ok((inode, handle));
             }
         }
         Err(EntityError::Busy)
@@ -431,6 +453,21 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         let _admission = self.session.admit()?;
         for _ in 0..MAX_RETRIES {
             let mut discovery = Prepared::new(self);
+            let dentries = match &op {
+                Operation::Unlink { parent, name, .. } => vec![self.keys.dentry(*parent, name)],
+                Operation::Rename {
+                    parent,
+                    name,
+                    destination,
+                    new_name,
+                    ..
+                } => vec![
+                    self.keys.dentry(*parent, name),
+                    self.keys.dentry(*destination, new_name),
+                ],
+                _ => Vec::new(),
+            };
+            discovery.prefetch(dentries).await?;
             let mut ids = BTreeSet::new();
             match &op {
                 Operation::Link { ino, parent, .. } => {
@@ -461,8 +498,13 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
                 }
             }
             let (_states, _guards) = self.lock_all(&ids).await;
-            let authority = self.authority().await?;
-            let mut p = Prepared::new(self);
+            let keys = self.operation_keys(&op, &ids).await?;
+            let (authority, mut p) = self.snapshot(keys).await?;
+            // Name discovery selected locks. Retain those exact predicates;
+            // changing a name before the locks were acquired forces a retry.
+            for (key, expected) in discovery.rows {
+                p.add(RowCheck { key, expected })?;
+            }
             let outcome = p.prepare(&op, &credentials, &ids).await;
             let outcome = match outcome {
                 Err(EntityError::Conflict) => continue,
@@ -495,31 +537,27 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
             rows: BTreeMap::new(),
             writes: BTreeMap::new(),
             now: 0,
+            bytes: 0,
+            inodes: BTreeMap::new(),
         }
     }
-    async fn raw(&mut self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
+    pub(super) async fn raw(&mut self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
         if let Some(value) = self.writes.get(&key) {
             return Ok(value.clone());
         }
         if let Some(value) = self.rows.get(&key) {
             return Ok(value.clone());
         }
-        let snapshot = self.ns.backend.read(std::slice::from_ref(&key)).await?;
-        self.now = snapshot.now_ns;
-        let value = snapshot
-            .rows
-            .into_iter()
-            .next()
-            .ok_or_else(|| EntityError::Corrupt("short backend snapshot".into()))?;
-        self.rows.insert(key, value.clone());
-        Ok(value)
+        self.prefetch(vec![key.clone()]).await?;
+        Ok(self.rows[&key].clone())
     }
     async fn put<T: serde::Serialize>(&mut self, key: Vec<u8>, value: &T) -> Result<()> {
         self.raw(key.clone()).await?;
         self.writes.insert(key, Some(codec::encode(value)?));
+        self.inodes.clear();
         Ok(())
     }
-    fn plan(&self) -> EntityPlan {
+    pub(super) fn plan(&self) -> EntityPlan {
         EntityPlan {
             checks: self
                 .rows
@@ -542,7 +580,7 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
                 .collect(),
         }
     }
-    fn read_plan(&self) -> EntityPlan {
+    pub(super) fn read_plan(&self) -> EntityPlan {
         EntityPlan {
             checks: self
                 .rows
@@ -557,11 +595,7 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
     }
     fn append_plan(&mut self, plan: EntityPlan) -> Result<()> {
         for check in plan.checks {
-            if let Some(previous) = self.rows.insert(check.key, check.expected.clone())
-                && previous != check.expected
-            {
-                return Err(EntityError::Conflict);
-            }
+            self.add(check)?;
         }
         for write in plan.writes {
             let (key, value) = match write {
@@ -572,10 +606,14 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
                 return Err(EntityError::Invalid("duplicate prepared write".into()));
             }
         }
+        self.inodes.clear();
         Ok(())
     }
-    async fn inode(&mut self, ino: i64) -> Result<EntityInode> {
+    pub(super) async fn inode(&mut self, ino: i64) -> Result<EntityInode> {
         let _diagnostic = super::diagnostics::Span::start("namespace.resolve_inode");
+        if let Some(inode) = self.inodes.get(&ino) {
+            return Ok(inode.clone());
+        }
         let row = self.raw(self.ns.keys.inode(ino)).await?;
         let upper: Option<UpperInode> = row.as_deref().map(codec::decode).transpose()?;
         let inode = resolver::resolve_inode(
@@ -591,6 +629,7 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
         {
             self.ns.directory_hints.insert(ino, parent);
         }
+        self.inodes.insert(ino, inode.clone());
         Ok(inode)
     }
     async fn dentry_row(&mut self, parent: i64, name: &[u8]) -> Result<Option<(i64, EntityKind)>> {
@@ -598,20 +637,25 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
         validate_name(name)?;
         let row = self.raw(self.ns.keys.dentry(parent, name)).await?;
         let upper: Option<EntityDentry> = row.as_deref().map(codec::decode).transpose()?;
-        Ok(
-            match resolver::resolve_dentry(
-                self.ns.lower.as_ref(),
-                self.ns.lower.binding(),
-                parent,
-                name,
-                upper.as_ref(),
-            )
-            .await?
-            {
-                Some(EntityDentry::Present { ino, kind }) => Some((ino, kind)),
-                _ => None,
-            },
+        let entry = match resolver::resolve_dentry(
+            self.ns.lower.as_ref(),
+            self.ns.lower.binding(),
+            parent,
+            name,
+            upper.as_ref(),
         )
+        .await?
+        {
+            Some(EntityDentry::Present { ino, kind }) => Some((ino, kind)),
+            _ => None,
+        };
+        let key = (parent, name.to_vec());
+        if let Some((ino, _)) = entry {
+            self.ns.dentry_hints.insert(key, ino);
+        } else {
+            self.ns.dentry_hints.invalidate(&key);
+        }
+        Ok(entry)
     }
     async fn dentry(&mut self, parent: i64, name: &[u8]) -> Result<Option<(i64, EntityKind)>> {
         match self.dentry_row(parent, name).await? {
@@ -772,7 +816,10 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
                 return Err(EntityError::Corrupt("noncanonical dentry key".into()));
             }
             upper.push((name, codec::decode(&value)?));
-            self.rows.insert(key, Some(value));
+            self.add(RowCheck {
+                key,
+                expected: Some(value),
+            })?;
         }
         if resolver::merge_directory(self.ns.lower.as_ref(), self.ns.lower.binding(), ino, &upper)
             .await?

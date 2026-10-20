@@ -1,7 +1,13 @@
 use super::*;
 use crate::workspace_overlay::entity::backend::MemoryEntityBackend;
-use crate::workspace_overlay::entity::backend::{CreateAllocation, EntityBackend, RowSnapshot};
-use crate::workspace_overlay::entity::ownership::{Ownership, SliceOwnership, SliceState};
+use crate::workspace_overlay::entity::backend::{
+    CreateAllocation, EntityBackend, RowSnapshot, SliceAllocation,
+};
+use crate::workspace_overlay::entity::model::{ChunkMap, ChunkSource, EntityKind, UpperInode};
+use crate::workspace_overlay::entity::ownership::{
+    Ownership, SliceOwnership, SliceState, plan_chunk_membership, plan_chunk_membership_from_rows,
+};
+use crate::workspace_overlay::entity::resolver::test_support::inode_record;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn lower() -> LowerBinding {
@@ -274,18 +280,49 @@ async fn one_hundred_lower_owners_minus_ninety_nine_preserves_the_last_owner() {
 async fn allocators_preserve_lower_inode_boundary_and_volume_slice_identity() {
     let (backend, lifecycle, session) = fixture().await;
     let authority = lifecycle.authority(&session).await.unwrap();
+    let create = CreateAllocation {
+        keys: lifecycle.keys().clone(),
+        inode: inode_record(1, EntityKind::File, 0),
+        name: b"allocated".to_vec(),
+        xattrs: vec![],
+        lower_max_ino: lower().max_ino,
+    };
     assert_eq!(
         backend
-            .allocate(&authority, &lifecycle.keys().counter("inode"))
+            .commit_with_inode_allocation(
+                &authority,
+                &EntityPlan {
+                    checks: vec![
+                        RowCheck {
+                            key: lifecycle.keys().inode(1),
+                            expected: None
+                        },
+                        RowCheck {
+                            key: lifecycle.keys().dentry(1, &create.name),
+                            expected: None
+                        }
+                    ],
+                    writes: vec![
+                        put(
+                            lifecycle.keys().inode(1),
+                            &UpperInode::Present(inode_record(1, EntityKind::Directory, 0))
+                        )
+                        .unwrap()
+                    ],
+                },
+                &create
+            )
             .await
             .unwrap(),
-        101
+        Some(101)
     );
+    let ownership = Ownership::new(backend.clone(), lifecycle.keys().clone());
     assert_eq!(
-        backend
-            .allocate(&authority, &lifecycle.keys().counter("slice"))
+        ownership
+            .reserve_uploads(&session, &authority, &[16])
             .await
-            .unwrap(),
+            .unwrap()[0]
+            .slice_id(),
         1
     );
     // A second namespace in this volume cannot reset the shared slice counter.
@@ -303,11 +340,13 @@ async fn allocators_preserve_lower_inode_boundary_and_volume_slice_identity() {
     second.provision(&lower()).await.unwrap();
     let second_session = second.acquire(Uuid::new_v4(), 100).await.unwrap();
     let second_authority = second.authority(&second_session).await.unwrap();
+    let second_ownership = Ownership::new(backend.clone(), second.keys().clone());
     assert_eq!(
-        backend
-            .allocate(&second_authority, &second.keys().counter("slice"))
+        second_ownership
+            .reserve_uploads(&second_session, &second_authority, &[16])
             .await
-            .unwrap(),
+            .unwrap()[0]
+            .slice_id(),
         2
     );
 }
@@ -394,8 +433,18 @@ impl EntityBackend for LostReplyBackend {
         }
         Ok(inode)
     }
-    async fn allocate(&self, authority: &TransactionAuthority, key: &[u8]) -> Result<u64> {
-        self.inner.allocate(authority, key).await
+    async fn reserve_slices(
+        &self,
+        authority: &TransactionAuthority,
+        allocation: &SliceAllocation,
+    ) -> Result<Option<Vec<u64>>> {
+        let ids = self.inner.reserve_slices(authority, allocation).await?;
+        if ids.is_some() && self.lose_next_commit.swap(false, Ordering::SeqCst) {
+            return Err(EntityError::Backend(
+                "injected lost successful reply".into(),
+            ));
+        }
+        Ok(ids)
     }
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.inner.scan_prefix(prefix, limit).await
@@ -413,12 +462,13 @@ async fn lost_maintenance_and_object_replies_remain_recoverable_without_owner_ga
     let ownership = Ownership::new(backend.clone(), keys.clone());
     lifecycle.provision(&lower()).await.unwrap();
     let session = lifecycle.acquire(Uuid::new_v4(), 100).await.unwrap();
+    let authority = lifecycle.authority(&session).await.unwrap();
 
     // No upload can start without a registration reply. Its uncertain Pending
     // row nevertheless remains durable and cannot be mistaken for garbage.
     backend.lose_next_commit.store(true, Ordering::SeqCst);
     assert!(matches!(
-        ownership.register_upload(&session, 1, 16).await,
+        ownership.reserve_uploads(&session, &authority, &[16]).await,
         Err(EntityError::Backend(_))
     ));
     let pending: SliceOwnership = decode(
@@ -430,14 +480,67 @@ async fn lost_maintenance_and_object_replies_remain_recoverable_without_owner_ga
     assert!(matches!(pending.state, SliceState::Pending { .. }));
     assert!(pending.staging_hold);
 
-    let upload = ownership.register_upload(&session, 2, 16).await.unwrap();
+    let upload = ownership
+        .reserve_uploads(&session, &authority, &[16])
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        upload.slice_id(),
+        2,
+        "uncertain reservation was not replayed"
+    );
+    let receipt = upload.confirm_durable_put();
+    let holes = ChunkMap::holes(16).unwrap();
+    let map = holes
+        .replace(
+            0,
+            16,
+            ChunkSource::Data {
+                slice_id: 2,
+                slice_offset: 0,
+            },
+        )
+        .unwrap();
+    let mut publication = plan_chunk_membership_from_rows(
+        &keys,
+        101,
+        0,
+        &holes,
+        &map,
+        &BTreeMap::new(),
+        Some(&receipt),
+    )
+    .unwrap();
+    publication.checks.push(RowCheck {
+        key: keys.chunk(101, 0),
+        expected: None,
+    });
+    publication
+        .writes
+        .push(put(keys.chunk(101, 0), &map).unwrap());
     backend.lose_next_commit.store(true, Ordering::SeqCst);
     assert!(matches!(
-        ownership.uploaded(&session, &upload).await,
+        backend.commit(&authority, &publication).await,
         Err(EntityError::Backend(_))
     ));
-    ownership.uploaded(&session, &upload).await.unwrap();
-    drop(upload);
+    // Inspect the confirmed server state; an unknown publication is never
+    // blindly replayed or mistaken for an unowned object.
+    let published: SliceOwnership = decode(
+        backend.read(&[keys.slice(2)]).await.unwrap().rows[0]
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(published.state, SliceState::Available);
+    assert_eq!(published.current_refs, 1);
+    assert!(!published.staging_hold);
+    assert_eq!(
+        backend.read(&[keys.chunk(101, 0)]).await.unwrap().rows[0],
+        Some(encode(&map).unwrap())
+    );
+    drop(receipt);
 
     backend.lose_next_commit.store(true, Ordering::SeqCst);
     assert!(matches!(
@@ -456,10 +559,28 @@ async fn lost_maintenance_and_object_replies_remain_recoverable_without_owner_ga
             ownership.reserve_delete(&maintenance, slice_id).await,
             Err(EntityError::Busy)
         ));
-        ownership
-            .abandon_upload(&maintenance, slice_id)
-            .await
-            .unwrap();
+        if slice_id == 1 {
+            ownership
+                .abandon_upload(&maintenance, slice_id)
+                .await
+                .unwrap();
+        } else {
+            let authority = lifecycle.maintenance_authority(&maintenance).await.unwrap();
+            let mut removal = plan_chunk_membership(backend.as_ref(), &keys, 101, 0, &map, &holes)
+                .await
+                .unwrap();
+            removal.checks.push(RowCheck {
+                key: keys.chunk(101, 0),
+                expected: Some(encode(&map).unwrap()),
+            });
+            removal.writes.push(RowWrite::Delete {
+                key: keys.chunk(101, 0),
+            });
+            assert_eq!(
+                backend.commit(&authority, &removal).await.unwrap(),
+                CommitOutcome::Committed
+            );
+        }
         backend.lose_next_commit.store(true, Ordering::SeqCst);
         assert!(matches!(
             ownership.reserve_delete(&maintenance, slice_id).await,

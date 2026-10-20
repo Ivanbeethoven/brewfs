@@ -35,6 +35,12 @@ the subsequent fresh-fixture bootstrap and dedicated FUSE adapter, including
 their separate validation status. No completed schema migration or qualified
 production mount is claimed.
 
+The [entity batching checkpoint](../plans/2026-10-20-overlay-entity-batching.md)
+records the frozen request-cost baseline and current operation-snapshot/upload
+batching refactor. Implementation and correctness gates remain in progress;
+candidate command counts and throughput are pending. The paragraphs explicitly
+marked as candidate behavior below do not claim validated or accepted code.
+
 The shipped baseline remains r31, PR #41 (`0d4e36c`), with its delivery documents
 in `6b54270` on `codex/packed-metadata-aliyun-20260930`. That implementation uses
 an immutable packed lower and a non-rotating writable overlay, versioned extent
@@ -303,6 +309,22 @@ The expected warm path is one read and one commit. Cold or stale topology can
 require additional reads, and conflicts recalculate permissions from fresh rows.
 Successful create-open retains the parent lock until the open handle is installed.
 
+The current snapshot refactor extends the same bounded preparation mechanism to
+lookup/open and data I/O. One operation reads canonical authority together with
+its known entity rows into `Prepared`; namespace and data code no longer keep
+separate competing read-set implementations. Parent and dentry hints each have
+a 4,096-entry bound. They select rows to fetch, never authorize a permission or
+prove that a name still identifies an inode. Extra discovered rows are read
+only as needed, and adding a different observation for an already observed key
+is a conflict. Exact observations, including absence, remain final predicates.
+
+Candidate path open carries its observed ancestor/name predicates through inode
+lock acquisition and completes one final validation instead of rewalking the
+path. The attributes returned with a successful fallback open, or by truncate,
+are reused for that operation's FUSE reply. This does not cache mutable
+attributes across operations or permit stale permission decisions. These paths
+still need the current iteration's tests and measured before/after counts.
+
 Sticky-bit, setgid/default ACL, symlink, raw-name, special-inode/rdev and existing
 lock semantics remain required. Rename cycle detection must use a stable view
 of the affected ancestry; simplifying storage does not remove that POSIX check.
@@ -528,14 +550,48 @@ The fsync barrier is scoped to the file, or to an explicitly documented
 directory durability boundary. It is not a flush/order barrier across unrelated
 workspace files and must not recreate the removed global serialization point.
 
-The experiment uses synchronous upload-before-publication, one current chunk
-per transaction. A multi-chunk write returns only its acknowledged prefix;
+The frozen measured baseline uses synchronous upload-before-publication and one
+current chunk per publication transaction. The current candidate instead admits
+a bounded group of chunk replacements and publishes the group's completed
+prefix together. A multi-chunk write returns only its acknowledged prefix;
 upload/publication uncertainty remains a session-shared file error for fsync,
 including after caller cancellation or constructing another adapter. A rejected
 pre-effect argument does not poison fsync. File operations retain the same
 inode lock through I/O and use owned tasks once effects can begin. Ordinary
 close releases a handle; it is not a durability acknowledgment for a canceled
 operation, whose task and admission remain alive independently.
+
+Candidate upload registration reuses the operation's exact authority and combines
+slice-ID INCR allocation with all Pending ownership rows for the admitted group
+in one transaction. Validation, generated-key checks and bounds precede the
+first mutation. An ambiguous reservation does not authorize transport. Each
+successful conditional durable PUT yields a local receipt bound to the exact
+Pending bytes and session admission; the hot path does not persist a separate
+Uploaded transition. Publication checks Pending state and new membership
+absence, then installs descriptors, normalized maps, inode size/times/data
+version and ownership deltas atomically. Deltas are aggregated once per slice
+across the replaced chunks so shared objects do not receive overwritten or
+duplicated refcount changes. Reference-count underflow and deletion exclusion
+remain errors, not recoverable permission to publish.
+
+Group preparation must respect transaction row/byte bounds and fragmented-map
+limits before publication. Pending records protect uploaded objects while a
+known aggregate preparation limit splits a group with fresh observations.
+Uncertain commit results never trigger a split or retry. Bounded grouping is
+implemented with validation pending; this specification does not claim that the
+current draft already passes all partial-write cases. Unused standalone
+allocation, `register_upload`, `uploaded` and singleton reservation APIs are
+removed. The asynchronous membership wrapper remains for truncate/discard/orphan
+cleanup and uses the same pure planner. Durable cleanup state is retained.
+
+Candidate ordinary I/O reads the inode, truncate marker and known chunk rows in
+the shared snapshot. Only a present truncate intent enters the existing bounded
+recovery loop; recovery then refreshes authority and observations. Fsync retains
+the FIFO inode lock, local admission and sticky-error checks. With no intent it
+validates the observed inode/absence and live authority in a read-only commit;
+it does not skip the durability barrier or substitute a local-only success.
+No per-operation RTT reduction is considered measured until the candidate gate
+and diagnostic comparison in the batching checkpoint are complete.
 
 Strict entity PUT is a separate backend capability. S3 must support conditional creation;
 the legacy OSS unconditional overwrite fallback is forbidden here. The configured
@@ -784,6 +840,20 @@ at 1/16/32 workers were 20.08/111.90/135.00 files/s, versus native
 native lower adapter, binding and mount bootstrap are missing. These results
 measure newly created upper bytes; they are not lower-read/copy-up or
 acceptance results and do not establish a win or removal of the write plateau.
+
+The later frozen, instrumented-source baseline has a separate uninstrumented
+2,000-file comparison in the [batching checkpoint](../plans/2026-10-20-overlay-entity-batching.md).
+Its preliminary 16/32-worker WRITE medians are 114.513/140.819 entity versus
+358.388/448.404 native files/s; READBACK is 176.612/205.422 versus
+637.359/685.946. These are baseline observations, not candidate results. The
+200-file diagnostic reports roughly 114 external Redis commands per WRITE file
+and 76 per READBACK file, versus native 7.11 and 5.00 at 16/32 workers. Native
+command totals include pipelined commands and are not native network RTT counts;
+entity request/reply spans are reported separately. Entity inode-lock waits are
+negligible in that workload; repeated metadata request/validation work is the
+measured cost. The initial 16-worker MONITOR capture was interrupted and excluded;
+completed 1-worker phases and the complete 16/32 retry retain separate provenance.
+All candidate validation, command-count deltas and throughput rows remain pending.
 
 Historical **r31**, not target-design, overlay/native ratios are:
 

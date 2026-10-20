@@ -99,8 +99,9 @@ impl Memo {
 
     /// Async single-flight fill; successful immutable absence is cached, while
     /// all transport/authentication/permission errors remain errors and retryable.
-    pub(super) async fn get<F>(&self, key: Key, load: F) -> Result<Arc<Value>>
+    pub(super) async fn get<L, F>(&self, key: Key, load: L) -> Result<Arc<Value>>
     where
+        L: FnOnce() -> F,
         F: Future<Output = Result<Value>>,
     {
         if let Some(value) = self.entries.get(&key).await {
@@ -108,14 +109,20 @@ impl Memo {
             return Ok(value);
         }
         let _span = diagnostics::Span::start("packed.memo.miss");
+        // Nested inode/cold/directory loaders have large future states. Keep
+        // those states out of both this future and Moka's inline initializer,
+        // and construct a loader only if Moka selects this caller to fill.
         self.entries
-            .try_get_with(key, async {
-                let _span = diagnostics::Span::start("packed.memo.fill");
-                #[cfg(test)]
-                self.fills
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                load.await.map(Arc::new)
-            })
+            .try_get_with(
+                key,
+                Box::pin(async move {
+                    let _span = diagnostics::Span::start("packed.memo.fill");
+                    #[cfg(test)]
+                    self.fills
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    load().await.map(Arc::new)
+                }),
+            )
             .await
             .map_err(|error| error.as_ref().clone())
     }
@@ -135,5 +142,44 @@ impl Memo {
     pub(super) async fn retained_bytes(&self) -> u64 {
         self.entries.run_pending_tasks().await;
         self.entries.weighted_size()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn memo_future_does_not_embed_loader_state() {
+        let memo = Memo::new();
+        let load = || async {
+            let bytes = std::hint::black_box([0u8; 1 << 20]);
+            std::future::pending::<()>().await;
+            std::hint::black_box(bytes);
+            Ok(Value::Cold(None))
+        };
+        fn loader_bytes<F: Future>(_: &impl FnOnce() -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        assert!(loader_bytes(&load) >= 1 << 20);
+        let future = memo.get(Key::Cold(1), load);
+        assert!(std::mem::size_of_val(&future) < 64 << 10);
+    }
+
+    #[tokio::test]
+    async fn memo_hit_does_not_construct_loader() {
+        let memo = Memo::new();
+        let constructions = AtomicU64::new(0);
+        let load = || {
+            constructions.fetch_add(1, Ordering::Relaxed);
+            async { Ok(Value::Cold(None)) }
+        };
+        for _ in 0..2 {
+            let value = memo.get(Key::Cold(1), load).await.unwrap();
+            assert!(matches!(value.as_ref(), Value::Cold(None)));
+        }
+        assert_eq!(constructions.load(Ordering::Relaxed), 1);
+        assert_eq!(memo.fills(), 1);
     }
 }

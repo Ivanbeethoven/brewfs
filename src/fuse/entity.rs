@@ -338,22 +338,20 @@ where
             let (inode, handle, created) = match created {
                 Ok((inode, handle)) => (inode, Arc::new(handle), true),
                 Err(EntityError::Exists) if flags & libc::O_EXCL as u32 == 0 => {
-                    let handle = self
+                    let (inode, handle) = self
                         .state
                         .namespace
-                        .open(parent, name.as_bytes(), access, &credentials)
+                        .open_with_attr(parent, name.as_bytes(), access, &credentials)
                         .await
                         .map_err(errno)?;
                     let handle = Arc::new(handle);
-                    let inode = self.state.data.attr(handle.clone()).await.map_err(errno)?;
                     (inode, handle, false)
                 }
                 Err(error) => return Err(errno(error)),
             };
             let io = self.state.data.bind(handle).map_err(errno)?;
             let inode = if !created && flags & libc::O_TRUNC as u32 != 0 {
-                io.truncate(0).await.map_err(errno)?;
-                io.attr().await.map_err(errno)?
+                io.truncate(0).await.map_err(errno)?
             } else {
                 inode
             };
@@ -497,10 +495,10 @@ where
                     .map_err(errno)?;
                 self.state.data.bind(Arc::new(handle)).map_err(errno)?
             };
-            io.truncate(size).await.map_err(errno)?;
+            let inode = io.truncate(size).await.map_err(errno)?;
             return Ok(ReplyAttr {
                 ttl: Duration::ZERO,
-                attr: self.attr(&io.attr().await.map_err(errno)?),
+                attr: self.attr(&inode),
             });
         }
         if let Some(mode) = attr.mode {
