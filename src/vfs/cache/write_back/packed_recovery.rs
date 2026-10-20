@@ -138,7 +138,10 @@ impl FsWriteBackCache {
             Ok(metadata) => {
                 anyhow::ensure!(metadata.is_dir(), "packed recovery root is not a directory")
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.finish_recovery_inventory(&[]);
+                return Ok(Vec::new());
+            }
             Err(error) => return Err(error.into()),
         }
         let mut records = Vec::with_capacity(MAX_RECOVERY_ROWS);
@@ -167,9 +170,7 @@ impl FsWriteBackCache {
                 }
             }
         }
-        for record in &records {
-            self.recoverable_keys.insert(record.key);
-        }
+        self.finish_recovery_inventory(&records);
         Ok(records)
     }
 }

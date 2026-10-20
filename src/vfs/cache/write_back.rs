@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashSet;
@@ -95,11 +95,21 @@ pub struct FsWriteBackCache {
     allocation_unit: u64,
     created_dirs: DashSet<PathBuf>,
     recoverable_keys: DashSet<DirtySliceKey>,
+    inventory_complete: AtomicBool,
 }
 
 impl FsWriteBackCache {
     pub(crate) fn has_recoverable_data(&self) -> bool {
-        !self.recoverable_keys.is_empty()
+        // Mount recovery runs in the background. Until its initial scan finishes,
+        // an empty index says nothing about prior-session data on disk.
+        !self.inventory_complete.load(Ordering::Acquire) || !self.recoverable_keys.is_empty()
+    }
+
+    fn finish_recovery_inventory(&self, records: &[DirtySliceRecord]) {
+        for record in records {
+            self.recoverable_keys.insert(record.key);
+        }
+        self.inventory_complete.store(true, Ordering::Release);
     }
 
     #[cfg(feature = "workspace-overlay")]
@@ -137,6 +147,7 @@ impl FsWriteBackCache {
             allocation_unit: 0,
             created_dirs: DashSet::new(),
             recoverable_keys: DashSet::new(),
+            inventory_complete: AtomicBool::new(false),
         }
     }
 
@@ -147,14 +158,9 @@ impl FsWriteBackCache {
         allocation_unit: u64,
     ) -> Self {
         Self {
-            root,
-            volume_scope: None,
-            seq: AtomicU64::new(0),
-            sync_on_persist,
             read_cache_root: Some(read_cache_root),
             allocation_unit,
-            created_dirs: DashSet::new(),
-            recoverable_keys: DashSet::new(),
+            ..Self::new_with_sync(root, sync_on_persist)
         }
     }
 
@@ -650,12 +656,16 @@ impl WriteBackCache for FsWriteBackCache {
 
     async fn recover(&self) -> anyhow::Result<Vec<DirtySliceRecord>> {
         let dirty_root = self.root.join("dirty");
-        if !dirty_root.exists() {
-            return Ok(Vec::new());
-        }
+        let mut entries = match fs::read_dir(&dirty_root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.finish_recovery_inventory(&[]);
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         let mut records = Vec::new();
-        let mut entries = fs::read_dir(&dirty_root).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             let file_type = entry.file_type().await?;
@@ -685,9 +695,7 @@ impl WriteBackCache for FsWriteBackCache {
                 }
             }
         }
-        for record in &records {
-            self.recoverable_keys.insert(record.key);
-        }
+        self.finish_recovery_inventory(&records);
         Ok(records)
     }
 
@@ -750,7 +758,7 @@ impl FsWriteBackCache {
         chunk_offset: u64,
         buf: &mut [u8],
     ) -> anyhow::Result<()> {
-        if self.recoverable_keys.is_empty() {
+        if !self.has_recoverable_data() {
             return Ok(());
         }
 
@@ -791,7 +799,7 @@ impl FsWriteBackCache {
         if len == 0 {
             return Ok(Some(Vec::new()));
         }
-        if self.recoverable_keys.is_empty() {
+        if !self.has_recoverable_data() {
             return Ok(None);
         }
 
@@ -1172,6 +1180,129 @@ mod tests {
                 .is_none(),
             "a trailing gap must not be treated as covered"
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_lookup_reads_prior_session_before_inventory_with_new_seal() {
+        for sync in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let old_key = DirtySliceKey {
+                ino: 9,
+                chunk_id: 21,
+                local_seq: 2,
+                epoch: 0,
+            };
+            let previous = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), sync);
+            previous
+                .persist_slice_data(old_key, vec![Bytes::from_static(b"pending")], 0)
+                .await
+                .unwrap();
+            previous.seal_slice_record(old_key, 100, 7).await.unwrap();
+            drop(previous);
+
+            let current = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), sync);
+            let new_key = DirtySliceKey {
+                ino: 10,
+                chunk_id: 22,
+                local_seq: 3,
+                epoch: 0,
+            };
+            current
+                .persist_slice_data(new_key, vec![Bytes::from_static(b"new")], 0)
+                .await
+                .unwrap();
+            current.seal_slice_record(new_key, 0, 3).await.unwrap();
+            assert!(current.has_recoverable_data());
+
+            // Normal mounts start recovery in the background. A new seal can
+            // become visible before the prior-session inventory is complete.
+            let actual = current
+                .read_dirty_range_if_fully_covered(old_key.ino, old_key.chunk_id, 100, 7)
+                .await
+                .unwrap();
+            assert_eq!(actual.as_deref(), Some(b"pending".as_slice()));
+            let mut overlay = *b"backend";
+            current
+                .overlay_dirty_range(old_key.ino, old_key.chunk_id, 100, &mut overlay)
+                .await
+                .unwrap();
+            assert_eq!(&overlay, b"pending");
+            assert_eq!(current.recover().await.unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_lookup_keeps_prior_session_visible_before_first_inventory() {
+        for sync in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let key = DirtySliceKey {
+                ino: 12,
+                chunk_id: 31,
+                local_seq: 4,
+                epoch: 0,
+            };
+            let previous = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), sync);
+            previous
+                .persist_slice_data(key, vec![Bytes::from_static(b"pending")], 0)
+                .await
+                .unwrap();
+            previous.seal_slice_record(key, 0, 7).await.unwrap();
+            drop(previous);
+            let current = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), sync);
+            assert!(
+                current.has_recoverable_data(),
+                "unfinished recovery inventory must remain visible to the VFS fallback"
+            );
+            assert_eq!(
+                current
+                    .read_dirty_range_if_fully_covered(key.ino, key.chunk_id, 0, 7)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(b"pending".as_slice())
+            );
+            let mut overlay = *b"backend";
+            current
+                .overlay_dirty_range(key.ino, key.chunk_id, 0, &mut overlay)
+                .await
+                .unwrap();
+            assert_eq!(&overlay, b"pending");
+            assert_eq!(current.recover().await.unwrap().len(), 1);
+            current.remove(&key).await.unwrap();
+            assert!(!current.has_recoverable_data());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_lookup_stops_disk_fallback_after_empty_inventory() {
+        for create_dirty in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            if create_dirty {
+                fs::create_dir(temp.path().join("dirty")).await.unwrap();
+            }
+            let cache = FsWriteBackCache::new_with_sync_and_read_cache(
+                temp.path().to_path_buf(),
+                true,
+                temp.path().join("read-cache"),
+                4096,
+            );
+            assert!(cache.has_recoverable_data());
+            assert!(cache.recover().await.unwrap().is_empty());
+            assert!(!cache.has_recoverable_data());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_lookup_preserves_disk_fallback_after_failed_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let dirty = temp.path().join("dirty");
+        fs::write(&dirty, b"not a directory").await.unwrap();
+        let cache = FsWriteBackCache::new(temp.path().to_path_buf());
+        assert!(cache.recover().await.is_err());
+        assert!(cache.has_recoverable_data());
+        fs::remove_file(dirty).await.unwrap();
+        assert!(cache.recover().await.unwrap().is_empty());
+        assert!(!cache.has_recoverable_data());
     }
 
     #[tokio::test]

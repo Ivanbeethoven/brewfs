@@ -11,6 +11,7 @@
 | 上游关系、受测版本、合并与后续更新方法 | [Maintenance](brewfs-rustfs/maintenance.md) |
 | 并发修复、撤回的预取方案与仍未达标的性能维度 | [Adverse-dimension maintenance](brewfs-rustfs/adverse-maintenance.md) |
 | Agent 混合负载、FUSE 端到端与 no-dynamic-block 对照方案 | [Agent mixed FUSE plan](brewfs-rustfs/agent-mixed-fuse-plan.md) |
+| Hint/缓存/写回 review、恢复初始化修复与拒绝候选记录 | [Code review](brewfs-rustfs/code-review.md) |
 | 三场景六档混合文件的完整结果、图表及剩余瓶颈（44/45 项门槛通过） | [Agent mixed FUSE results](brewfs-rustfs/agent-mixed-fuse-results.md) |
 | 完整机器可读统计及版本指纹 | [Evidence](brewfs-rustfs/evidence/README.md) |
 

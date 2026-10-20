@@ -842,18 +842,6 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::validate_retained_source_binding_version;
-
-    #[test]
-    fn initial_binding_history_version_is_a_valid_retained_source() {
-        assert!(validate_retained_source_binding_version(1).is_ok());
-        assert!(validate_retained_source_binding_version(2).is_ok());
-        assert!(validate_retained_source_binding_version(0).is_err());
-    }
-}
-
 impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
     /// Logical retirement is permitted only at the child Deleting endpoint.
     /// The owned task and exact-successor clock CAS survive caller cancellation.
@@ -1195,5 +1183,17 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
             retired: true,
             source_members_released: 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_retained_source_binding_version;
+
+    #[test]
+    fn initial_binding_history_version_is_a_valid_retained_source() {
+        assert!(validate_retained_source_binding_version(1).is_ok());
+        assert!(validate_retained_source_binding_version(2).is_ok());
+        assert!(validate_retained_source_binding_version(0).is_err());
     }
 }
