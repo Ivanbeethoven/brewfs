@@ -1,7 +1,7 @@
 //! Experimental current-entity format. No legacy head, sequence or mutation gate.
 //!
-//! Stage 2 exposes a reference namespace and Redis transaction substrate. Production
-//! mounts remain closed until packed ownership and VFS durability are qualified.
+//! The experiment includes authenticated packed fallthrough, namespace transactions,
+//! file I/O and bounded recovery. Production mount admission remains closed.
 
 pub mod backend;
 pub mod codec;
@@ -12,6 +12,7 @@ pub mod memory;
 pub mod model;
 pub mod namespace;
 pub mod ownership;
+pub mod packed_lower;
 pub mod recovery;
 pub mod redis;
 pub mod resolver;

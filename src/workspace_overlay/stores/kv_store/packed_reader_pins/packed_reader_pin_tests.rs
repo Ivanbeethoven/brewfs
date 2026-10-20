@@ -7,6 +7,8 @@ mod cancelled_lower_transport_tests;
 #[path = "native_effective_export_tests.rs"]
 mod native_effective_export_tests;
 
+mod entity_lower_tests;
+
 use super::*;
 use crate::workspace_overlay::stores::binding_tests::{packed, packed_with_snapshot_id, request};
 use crate::workspace_overlay::stores::redis::RedisWorkspaceBackend;
