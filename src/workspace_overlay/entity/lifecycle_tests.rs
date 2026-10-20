@@ -1,6 +1,6 @@
 use super::*;
 use crate::workspace_overlay::entity::backend::MemoryEntityBackend;
-use crate::workspace_overlay::entity::backend::{EntityBackend, RowSnapshot};
+use crate::workspace_overlay::entity::backend::{CreateAllocation, EntityBackend, RowSnapshot};
 use crate::workspace_overlay::entity::ownership::{Ownership, SliceOwnership, SliceState};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -100,6 +100,74 @@ async fn renewal_keeps_identity_and_invalidates_old_exact_authority() {
         foreign.renew(&session, 100).await,
         Err(EntityError::Fenced)
     ));
+}
+
+#[tokio::test]
+async fn acquired_and_resumed_sessions_reject_consistent_lower_rebinding() {
+    for resume in [false, true] {
+        for component in 0..4 {
+            let (backend, lifecycle, acquired) = fixture().await;
+            let session = if resume {
+                let maintenance = lifecycle.enter_maintenance(&acquired).await.unwrap();
+                lifecycle
+                    .resume_after_maintenance(&maintenance, Uuid::new_v4(), 100)
+                    .await
+                    .unwrap()
+            } else {
+                acquired
+            };
+            let authority = lifecycle.authority(&session).await.unwrap();
+            let mut descriptor = lifecycle.descriptor().await.unwrap();
+            match component {
+                0 => descriptor.lower.manifest_key = b"another-manifest-key".to_vec(),
+                1 => descriptor.lower.manifest_digest = [8; 32],
+                2 => descriptor.lower.root_ino = 2,
+                3 => descriptor.lower.max_ino = 101,
+                _ => unreachable!(),
+            }
+            let owner = LowerOwner {
+                namespace_id: descriptor.namespace_id,
+                binding: descriptor.lower.clone(),
+            };
+            let registry = LowerRegistry {
+                binding: descriptor.lower.clone(),
+                owners: 1,
+            };
+            // Replacing only the descriptor would already fail pin validation.
+            // Even a self-consistent replacement cannot retarget this session's
+            // retained lower objects, handles or namespace inode boundary.
+            let keys = lifecycle.keys();
+            let plan = EntityPlan {
+                checks: Vec::new(),
+                writes: vec![
+                    put(keys.descriptor(), &descriptor).unwrap(),
+                    put(keys.lower_pin(), &owner).unwrap(),
+                    put(
+                        keys.lower_owner(&descriptor.lower.manifest_digest, keys.namespace_id()),
+                        &owner,
+                    )
+                    .unwrap(),
+                    put(
+                        keys.lower_registry(&descriptor.lower.manifest_digest),
+                        &registry,
+                    )
+                    .unwrap(),
+                ],
+            };
+            assert_eq!(
+                backend.commit(&authority, &plan).await.unwrap(),
+                CommitOutcome::Committed
+            );
+            assert!(matches!(
+                lifecycle.authority(&session).await,
+                Err(EntityError::Fenced)
+            ));
+            assert!(matches!(
+                lifecycle.renew(&session, 100).await,
+                Err(EntityError::Fenced)
+            ));
+        }
+    }
 }
 
 #[tokio::test]
@@ -308,6 +376,23 @@ impl EntityBackend for LostReplyBackend {
             ));
         }
         Ok(outcome)
+    }
+    async fn commit_with_inode_allocation(
+        &self,
+        authority: &TransactionAuthority,
+        plan: &EntityPlan,
+        create: &CreateAllocation,
+    ) -> Result<Option<i64>> {
+        let inode = self
+            .inner
+            .commit_with_inode_allocation(authority, plan, create)
+            .await?;
+        if inode.is_some() && self.lose_next_commit.swap(false, Ordering::SeqCst) {
+            return Err(EntityError::Backend(
+                "injected lost successful reply".into(),
+            ));
+        }
+        Ok(inode)
     }
     async fn allocate(&self, authority: &TransactionAuthority, key: &[u8]) -> Result<u64> {
         self.inner.allocate(authority, key).await

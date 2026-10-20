@@ -13,7 +13,9 @@ use tokio::sync::Notify;
 use super::*;
 use crate::cadapter::client::ObjectByteStream;
 use crate::cadapter::s3::S3Backend;
-use crate::workspace_overlay::entity::backend::{RowSnapshot, TransactionAuthority};
+use crate::workspace_overlay::entity::backend::{
+    CreateAllocation, RowSnapshot, TransactionAuthority,
+};
 use crate::workspace_overlay::entity::keys::EntityKeys;
 use crate::workspace_overlay::entity::lifecycle::{Lifecycle, WriterLease, WriterSession};
 use crate::workspace_overlay::entity::memory::MemoryEntityBackend;
@@ -769,6 +771,17 @@ impl EntityBackend for RenewDuringAllocationBackend {
         self.inner.read(keys).await
     }
 
+    async fn commit_with_inode_allocation(
+        &self,
+        authority: &TransactionAuthority,
+        plan: &EntityPlan,
+        create: &CreateAllocation,
+    ) -> Result<Option<i64>> {
+        self.inner
+            .commit_with_inode_allocation(authority, plan, create)
+            .await
+    }
+
     async fn allocate(&self, authority: &TransactionAuthority, key: &[u8]) -> Result<u64> {
         if key == self.keys.counter("slice") {
             self.allocations.fetch_add(1, Ordering::SeqCst);
@@ -881,6 +894,18 @@ struct LostReplyBackend {
 impl EntityBackend for LostReplyBackend {
     async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
         self.inner.read(keys).await
+    }
+    async fn commit_with_inode_allocation(
+        &self,
+        authority: &TransactionAuthority,
+        plan: &EntityPlan,
+        create: &CreateAllocation,
+    ) -> Result<Option<i64>> {
+        // This adapter only loses current-chunk publication replies; creating
+        // an empty inode must not consume that independently armed fault.
+        self.inner
+            .commit_with_inode_allocation(authority, plan, create)
+            .await
     }
     async fn allocate(&self, authority: &TransactionAuthority, key: &[u8]) -> Result<u64> {
         self.inner.allocate(authority, key).await

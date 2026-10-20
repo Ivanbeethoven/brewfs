@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 
 use super::{EntityError, Result, codec::MAX_ROW_BYTES};
+use super::{codec, keys::EntityKeys, model::*};
 
 pub use super::memory::MemoryEntityBackend;
 
@@ -40,6 +41,28 @@ impl RowWrite {
 pub struct EntityPlan {
     pub checks: Vec<RowCheck>,
     pub writes: Vec<RowWrite>,
+}
+
+/// A new inode's fully typed attributes; only its allocator-chosen identity is
+/// filled by the transaction. No metadata row is decoded through Lua numbers.
+#[derive(Clone, Debug)]
+pub struct CreateAllocation {
+    pub(super) keys: EntityKeys,
+    pub(super) inode: EntityInode,
+    pub(super) name: Vec<u8>,
+    pub(super) xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(super) lower_max_ino: i64,
+}
+
+pub(super) struct PreparedCreate {
+    pub namespace_prefix: Vec<u8>,
+    pub counter_key: Vec<u8>,
+    pub parent_key: Vec<u8>,
+    pub dentry_key: Vec<u8>,
+    pub inode_suffix: Vec<u8>,
+    pub dentry_suffix: Vec<u8>,
+    /// Hex-encoded name suffix and canonical EntityValue bytes.
+    pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,6 +126,17 @@ pub trait EntityBackend: Send + Sync {
         authority: &TransactionAuthority,
         plan: &EntityPlan,
     ) -> Result<CommitOutcome>;
+    /// Atomically allocate and publish an inode with the supplied parent/name
+    /// predicates. Some is the exact committed identity; None is a conflict
+    /// with no allocation or writes. An uncertain error must never be replayed.
+    async fn commit_with_inode_allocation(
+        &self,
+        _authority: &TransactionAuthority,
+        _plan: &EntityPlan,
+        _create: &CreateAllocation,
+    ) -> Result<Option<i64>> {
+        Err(EntityError::Unsupported("atomic inode allocation"))
+    }
     /// Increment an already initialized canonical decimal counter. Never replays
     /// an uncertain result; allocated IDs may have gaps and must never be reused.
     async fn allocate(&self, authority: &TransactionAuthority, counter_key: &[u8]) -> Result<u64>;
@@ -246,6 +280,151 @@ pub(super) fn validate_plan(authority: &TransactionAuthority, plan: &EntityPlan)
         add_bytes(&mut total, write.key(), value)?;
     }
     Ok(())
+}
+
+pub(super) fn prepare_create(
+    authority: &TransactionAuthority,
+    plan: &EntityPlan,
+    create: &CreateAllocation,
+) -> Result<PreparedCreate> {
+    validate_plan(authority, plan)?;
+    create.inode.validate()?;
+    validate_name(&create.name)?;
+    let parent = create
+        .inode
+        .parent_hint
+        .ok_or_else(|| EntityError::Invalid("create template lacks parent".into()))?;
+    if create.inode.ino != 1 || create.lower_max_ino < 1 || create.xattrs.len() > 2 {
+        return Err(EntityError::Invalid(
+            "invalid create allocation template".into(),
+        ));
+    }
+    let keys = &create.keys;
+    let counter_key = keys.counter("inode");
+    let parent_key = keys.inode(parent);
+    let dentry_key = keys.dentry(parent, &create.name);
+    let checks: Vec<_> = authority.checks.iter().chain(&plan.checks).collect();
+    if !checks.iter().any(|check| check.key == parent_key)
+        || !checks.iter().any(|check| check.key == dentry_key)
+        || checks.iter().any(|check| check.key == counter_key)
+        || !plan
+            .writes
+            .iter()
+            .any(|write| matches!(write, RowWrite::Put { key, .. } if key == &parent_key))
+        || plan
+            .writes
+            .iter()
+            .any(|write| write.key() == counter_key || write.key() == dentry_key)
+    {
+        return Err(EntityError::Invalid(
+            "create requires parent/name predicates and exclusive allocation writes".into(),
+        ));
+    }
+    let dentry = checks.iter().find(|check| check.key == dentry_key).unwrap();
+    if let Some(bytes) = &dentry.expected {
+        let value: EntityDentry = codec::decode(bytes)?;
+        value.validate()?;
+        if value != EntityDentry::Whiteout {
+            return Err(EntityError::Exists);
+        }
+        if *bytes != codec::encode(&EntityDentry::Whiteout)? {
+            return Err(EntityError::Corrupt("noncanonical create whiteout".into()));
+        }
+    }
+    let inode_bytes = codec::encode(&UpperInode::Present(create.inode.clone()))?;
+    let dentry_bytes = codec::encode(&EntityDentry::Present {
+        ino: 1,
+        kind: create.inode.kind,
+    })?;
+    let suffix = |bytes: Vec<u8>| -> Result<Vec<u8>> {
+        bytes
+            .strip_prefix(b"{\"Present\":{\"ino\":1")
+            .filter(|tail| tail.starts_with(b","))
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| EntityError::Invalid("unsupported create row encoding".into()))
+    };
+    let inode_suffix = suffix(inode_bytes)?;
+    let dentry_suffix = suffix(dentry_bytes)?;
+    let mut names = std::collections::BTreeSet::new();
+    let mut xattrs = Vec::with_capacity(create.xattrs.len());
+    for (name, value) in &create.xattrs {
+        validate_xattr_name(name)?;
+        if !names.insert(name) || value.len() > MAX_XATTR_BYTES {
+            return Err(EntityError::Invalid("invalid create xattrs".into()));
+        }
+        xattrs.push((
+            hex::encode(name).into_bytes(),
+            codec::encode(&EntityValue::Present(value.clone()))?,
+        ));
+    }
+    let prepared = PreparedCreate {
+        namespace_prefix: keys.prefix().to_vec(),
+        counter_key,
+        parent_key,
+        dentry_key,
+        inode_suffix,
+        dentry_suffix,
+        xattrs,
+    };
+    // Validate the largest possible rendered decimal identity before transport.
+    // The server repeats these bounds for the actual allocation and stored rows.
+    let mut bounded = plan.clone();
+    bounded.writes.push(RowWrite::Put {
+        key: prepared.counter_key.clone(),
+        value: i64::MAX.to_string().into_bytes(),
+    });
+    bounded.writes.extend(prepared.writes(i64::MAX));
+    validate_plan(authority, &bounded)?;
+    Ok(prepared)
+}
+
+impl PreparedCreate {
+    pub fn inode_key(&self, ino: i64) -> Vec<u8> {
+        [
+            self.namespace_prefix.as_slice(),
+            b"inode/",
+            ino.to_string().as_bytes(),
+        ]
+        .concat()
+    }
+
+    /// Render by inserting one canonical decimal at a verified structural
+    /// boundary. Digits in names, attributes or timestamps are never replaced.
+    pub fn writes(&self, ino: i64) -> Vec<RowWrite> {
+        let decimal = ino.to_string();
+        let value = |suffix: &[u8]| {
+            [
+                b"{\"Present\":{\"ino\":".as_slice(),
+                decimal.as_bytes(),
+                suffix,
+            ]
+            .concat()
+        };
+        let mut writes = vec![
+            RowWrite::Put {
+                key: self.inode_key(ino),
+                value: value(&self.inode_suffix),
+            },
+            RowWrite::Put {
+                key: self.dentry_key.clone(),
+                value: value(&self.dentry_suffix),
+            },
+        ];
+        for (name, value) in &self.xattrs {
+            writes.push(RowWrite::Put {
+                key: [
+                    self.namespace_prefix.as_slice(),
+                    b"xattr/",
+                    decimal.as_bytes(),
+                    b"/",
+                    name,
+                ]
+                .concat(),
+                value: value.clone(),
+            });
+        }
+        writes
+    }
 }
 
 pub(super) fn validate_scan(prefix: &[u8], limit: usize) -> Result<()> {

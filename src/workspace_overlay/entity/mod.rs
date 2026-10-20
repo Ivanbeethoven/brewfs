@@ -6,6 +6,7 @@
 pub mod backend;
 pub mod codec;
 pub mod data;
+pub mod diagnostics;
 pub(crate) mod experiment;
 pub mod keys;
 pub mod lifecycle;
@@ -25,7 +26,7 @@ pub(crate) mod test_objects;
 
 pub type Result<T> = std::result::Result<T, EntityError>;
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum EntityError {
     #[error("invalid entity operation: {0}")]
     Invalid(String),

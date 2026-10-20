@@ -98,6 +98,42 @@ catalogs sharing an object service have no writers. Enforced backend/owner
 pairing, combined-stack fault qualification and paginated production cleanup
 remain outside this benchmark wiring.
 
+### Immutable lower metadata and create requests
+
+The entity adapter retains an in-process, byte-weighted 64 MiB LRU memo for
+lower inodes, dentries (including absence), cold xattr/ACL attributes, current
+chunk maps and directory listings. It follows the shipped packed-lower memo
+approach and keeps the existing authenticated packed reader for cache fills.
+Asynchronous fills for the same key coalesce. Mount warmup loads the root and
+prefetches up to 32 children, including cold attributes and the first file chunk
+map, with at most four concurrent child loads. Payload bytes are not in this
+metadata budget. The packed index reader retains its separate 4 MiB page cache.
+
+The mount binds the memo to the exact lower identity and writer session after
+validating the durable packed owner. Each bound lookup/fill retains local session
+admission; terminal owner release requires that session to close and drain.
+Cache hits therefore need neither catalog-owner RPCs nor object requests.
+Standalone, unbound SDK access retains remote owner validation. Cold or evicted
+metadata can require authenticated I/O; the bounded cache does not promise that
+an arbitrarily large lower is entirely resident. Errors are never cached as
+absence. Upper values and tombstones resolve first. A copied-up inode can still
+inherit an absent xattr or chunk, subject to its lower visibility boundary.
+
+Runtime authority reads the five canonical descriptor/lease/pin/owner/registry
+rows in one snapshot, using the immutable lower identity retained by the session
+to choose keys. Every commit still checks the exact rows and backend-time lease
+deadline. No mutable permission result is cached.
+
+Create combines that snapshot with parent, ancestor, ACL, name and truncate
+predicates. Bounded directory-parent hints select the batch; fresh inode and ACL
+rows determine permissions. A warm create uses one read and one commit. A cold
+or stale ancestor hint can require extra reads, and conflicts recompute the full
+decision. The commit checks effective absence and allocates with INCR inside the
+same script, then installs the inode, dentry, inherited ACLs and parent update.
+The script validates generated keys and bounds before its first write and uses
+exact decimal IDs above 2^53. It does not compare-and-swap the allocator counter.
+Only the affected parent is locally locked; unrelated parents remain independent.
+
 ## Audit of the current design
 
 The current overlay is not uniformly an append-only log: dentry, inode, xattr
@@ -121,7 +157,7 @@ same head sequence, which provides a coarse version for the entire workspace.
 | Commit-view cache and cached head/derived-counter bytes | Optimization of that model | Drop |
 | Data group commit | Optional optimization | Drop from the initial target; reconsider only with measurements |
 | Lease-bound row/path/permission caches and created-path seeding | Optional optimization with coherence obligations | Not required for the initial target; add only if measured and correct |
-| Packed-lower memos, payload caching and prefetch | Optional performance policy | Existing immutable-reader facilities may remain; not mutation authority |
+| Packed-lower metadata memos and prefetch | Required hot-path policy for the entity experiment | Bound asynchronous immutable memo; not mutation authority. Payload caching remains separate |
 | Per-inode data version / directory revision | Local coherence mechanism | Keep only where reads, caches or directory cookies need it |
 | Publication/discard recovery intent | Required crash protocol when work spans transactions | Keep bounded operation state; no general mutation replay log |
 

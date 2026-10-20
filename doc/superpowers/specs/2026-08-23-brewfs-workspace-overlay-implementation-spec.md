@@ -78,7 +78,8 @@ production wire-format promise, mounted-write admission or a throughput gain.
 | Mount-wide mutation gate and generic exact-view commit packet | Old implementation machinery | Remove from the target hot path; retain entity ordering and authority checks |
 | Shipped data group commit/commit-view cache, proposed create batching | Optimizations compensating for serialized commits | Not target requirements; drop during the first implementation; create batching never shipped |
 | Sequence blocks, backend template stamping, r32 shared-admission adapter | Unvalidated optimization of the old representation | Drop; do not carry into the new schema |
-| Lease-bound row/permission caches, lower memos | Useful independent optimization | Retain only with entity-scoped invalidation and a correct uncached path |
+| Lease-bound upper row/permission caches | Optional optimization | Require entity-scoped invalidation and a correct uncached path |
+| Immutable lower metadata memos/prefetch | Required entity hot-path policy | Bound memory, asynchronous authenticated fills and session-retained lower ownership |
 | Derived reverse aliases | Optional lookup index | Retain only when needed by operations; update atomically with their dentry |
 | Recovery intent for upload, truncate, publication or deletion | Required where an operation crosses transaction/object boundaries | Bounded, idempotent lifecycle state; not a total filesystem mutation log |
 
@@ -262,10 +263,22 @@ be tested rather than inferred from the word transaction.
 | Chmod/chown/xattr/ACL | Current inode/ACL relationship and privilege rules remain consistent in one transaction |
 | Write/punch-hole | Current chunk map(s), inode size/times and slice-owner deltas publish together for the admitted write unit |
 
-ID reservation may use a separate authority-checked INCR before the namespace
-transaction. Failed attempts may leave allocator gaps; only the final atomic
-transaction may expose the inode, name and parent updates. All mutable validation
-inputs, including effective absence for O_EXCL, participate in that transaction.
+Create allocates with INCR inside its namespace publication transaction. It
+previews the exact decimal successor to validate generated keys and collisions
+before the first mutation; IDs and timestamps never round through Lua numbers.
+The allocator is not a caller-side CAS predicate. An O_EXCL conflict must not
+advance the counter. Unknown transport outcomes are returned without replay.
+The same transaction exposes inode, name, inherited ACLs and parent updates.
+All mutable validation inputs, including effective absence for O_EXCL, remain
+exact predicates. Upper name absence or a canonical tombstone is required;
+a present name cannot be overwritten by supplying its matching current bytes.
+
+Create batches the five authority rows with parent/ancestor inode and ACL rows,
+the destination dentry and the parent's truncate marker. A bounded advisory
+parent-hint cache selects this batch; it never caches permission decisions.
+The expected warm path is one read and one commit. Cold or stale topology can
+require additional reads, and conflicts recalculate permissions from fresh rows.
+Successful create-open retains the parent lock until the open handle is installed.
 
 Sticky-bit, setgid/default ACL, symlink, raw-name, special-inode/rdev and existing
 lock semantics remain required. Rename cycle detection must use a stable view
@@ -440,6 +453,28 @@ existing packed open records and reader/writeback obligations; it cannot infer
 that a disconnected process has stopped using its objects.
 
 The immutable lower is authenticated at attach and memoized by binding identity.
+The entity packed adapter uses a shared 64 MiB byte-weighted LRU budget for inode,
+dentry/negative-dentry, cold xattr/ACL, chunk-map and directory metadata, alongside
+the packed reader's existing 4 MiB index cache. Concurrent asynchronous fills of
+one key coalesce; errors are not memoized as absence. Mount warmup prefetches root
+metadata and up to 32 children with four concurrent child loads, including cold
+attributes and first-file-chunk maps. Cache hits use memory without metadata
+network/object requests. Cold and evicted entries require authenticated fills;
+neither this budget nor prefetch promises complete residency of an unbounded lower.
+
+Binding validates the durable packed owner and exact volume, namespace, manifest,
+root and maximum-inode identity against the acquired writer session. Bound hits
+and fills retain local admission until completion. The same session must close
+and drain before terminal lower-owner release, so per-key owner RPCs are redundant
+within this bound lifetime. Unbound SDK calls retain remote owner checks. Upper
+rows/tombstones take precedence at each entity key; a copied-up inode alone does
+not suppress lower inheritance for an absent xattr or chunk.
+
+Writer sessions retain the complete immutable lower binding. Runtime authority
+fetches descriptor, lease, lower pin, namespace lower owner and lower registry in
+one snapshot and verifies that binding has not changed. Every transaction still
+checks their exact bytes and the backend-time lease deadline.
+
 Upper inode/dentry/permission caches are separately bounded and authoritative
 only under the current lease. Entity invalidation occurs before/after mutation;
 an in-flight stale fetch must not repopulate a cache after invalidation.

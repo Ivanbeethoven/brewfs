@@ -411,6 +411,121 @@ async fn packed_entity_lower_real_bytes_ownership_restart_and_terminal_release()
 
 #[tokio::test]
 #[ignore = "requires isolated RustFS via BREWFS_PACKED_GRAPH_TEST_S3_* and AWS credentials"]
+async fn packed_entity_lower_bound_memos_are_local_coalesced_and_session_fenced() {
+    use crate::cadapter::read_observer::{Engine, Origin, Phase, ReadObserver};
+
+    let backend = Arc::new(PinMemoryBackend::default());
+    let fixture = fixture(backend.clone()).await;
+    let observer = Arc::new(ReadObserver::default());
+    let client = ObjectClient::new(fixture.objects.clone()).with_read_observer(
+        observer.clone(),
+        Engine::PackedV3,
+        Phase::Runtime,
+        Origin::Demand,
+    );
+    let volume = Uuid::new_v4();
+    let namespace = Uuid::new_v4();
+    let mut lower = Arc::new(
+        PackedLower::open(
+            fixture.store.clone(),
+            client,
+            volume,
+            namespace,
+            &fixture.source,
+            fixture.binding.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    Arc::get_mut(&mut lower)
+        .unwrap()
+        .set_memo_capacity_for_test(8192);
+    let keys = EntityKeys::new(volume, namespace);
+    let other_lifecycle = Lifecycle::new(Arc::new(MemoryEntityBackend::new(1)), keys.clone());
+    let mut wrong_binding = fixture.binding.clone();
+    wrong_binding.manifest_digest[0] ^= 1;
+    other_lifecycle.provision(&wrong_binding).await.unwrap();
+    let other_session = other_lifecycle
+        .acquire(Uuid::new_v4(), 1_000_000)
+        .await
+        .unwrap();
+    assert!(matches!(
+        lower.bind_session(&other_session, &keys, 8192).await,
+        Err(EntityError::Fenced)
+    ));
+
+    let lifecycle = Lifecycle::new(Arc::new(MemoryEntityBackend::new(1)), keys.clone());
+    lifecycle.provision(&fixture.binding).await.unwrap();
+    let session = lifecycle.acquire(Uuid::new_v4(), 1_000_000).await.unwrap();
+    lower.bind_session(&session, &keys, 8192).await.unwrap();
+    assert!(matches!(
+        lower.bind_session(&session, &keys, 8192).await,
+        Err(EntityError::Fenced)
+    ));
+    let reads_before = backend.bounded_reads.load(Ordering::SeqCst);
+    let object_rows_before = observer.snapshot().rows;
+    for _ in 0..16 {
+        assert_eq!(lower.inode(400).await.unwrap().unwrap().size, 4096);
+        assert!(lower.dentry(1, b"nonzero").await.unwrap().is_some());
+        assert!(lower.dentry(1, b"cached-absent").await.unwrap().is_none());
+        assert!(
+            lower
+                .xattr(400, b"system.posix_acl_access")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            lower
+                .xattr(400, b"system.posix_acl_default")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(lower.chunk(400, 0, 8192).await.unwrap().is_some());
+        assert_eq!(lower.readdir(1).await.unwrap().len(), 1);
+    }
+    assert_eq!(backend.bounded_reads.load(Ordering::SeqCst), reads_before);
+    assert_eq!(observer.snapshot().rows, object_rows_before);
+
+    // A cold entity-facing inode memo has one elected async load, even when
+    // many callers arrive concurrently. Its bytes still come from real RustFS.
+    lower.clear_memos_for_test().await;
+    let fills = lower.memo_fill_count_for_test();
+    let mut tasks = Vec::new();
+    for _ in 0..32 {
+        let lower = lower.clone();
+        tasks.push(tokio::spawn(async move { lower.inode(400).await.unwrap() }));
+    }
+    for task in tasks {
+        assert_eq!(task.await.unwrap().unwrap().ino, 400);
+    }
+    assert_eq!(lower.memo_fill_count_for_test() - fills, 1);
+    let fills = lower.memo_fill_count_for_test();
+    for _ in 0..2 {
+        assert!(matches!(
+            lower.dentry(400, b"not-a-directory").await,
+            Err(EntityError::NotDirectory)
+        ));
+    }
+    assert_eq!(lower.memo_fill_count_for_test() - fills, 2);
+    lower.readdir(1).await.unwrap();
+    for index in 0..128 {
+        let name = format!("missing-{index:03}-{}", "n".repeat(200));
+        assert!(lower.dentry(1, name.as_bytes()).await.unwrap().is_none());
+    }
+    assert!(lower.retained_memo_bytes_for_test().await <= 8192);
+    assert_eq!(lower.inode(400).await.unwrap().unwrap().size, 4096);
+    lifecycle.enter_maintenance(&session).await.unwrap();
+    assert!(matches!(lower.inode(400).await, Err(EntityError::Fenced)));
+    assert!(matches!(
+        lower.read_range(400, 0, 1).await,
+        Err(EntityError::Fenced)
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS via BREWFS_PACKED_GRAPH_TEST_S3_* and AWS credentials"]
 async fn packed_entity_lower_rejects_descriptor_and_manifest_tampering() {
     let fixture = fixture(Arc::new(PinMemoryBackend::default())).await;
     let volume = Uuid::new_v4();

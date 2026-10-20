@@ -25,6 +25,7 @@ use futures_util::stream::{self, BoxStream};
 use crate::cadapter::client::ObjectBackend;
 use crate::workspace_overlay::entity::backend::EntityBackend;
 use crate::workspace_overlay::entity::data::{EntityData, EntityFileIo};
+use crate::workspace_overlay::entity::diagnostics;
 use crate::workspace_overlay::entity::model::{EntityInode, EntityKind};
 use crate::workspace_overlay::entity::namespace::{CreateRequest, Credentials, EntityNamespace};
 use crate::workspace_overlay::entity::resolver::ImmutableLowerData;
@@ -312,64 +313,68 @@ where
         umask: u32,
         flags: u32,
     ) -> FuseResult<ReplyCreated> {
-        let parent = self.ino(parent)?;
-        let (access, read, write) = open_access(flags)?;
-        let fh = self.reserve_handle()?;
-        let credentials = credentials(request, umask)?;
-        let created = self
-            .state
-            .namespace
-            .create_open(
-                CreateRequest {
-                    parent,
-                    name: name.as_bytes().to_vec(),
-                    kind: EntityKind::File,
-                    mode: mode & 0o7777,
-                    rdev: 0,
-                    symlink_target: None,
+        diagnostics::with_operation("create", async {
+            let _span = diagnostics::Span::start("fuse.create");
+            let parent = self.ino(parent)?;
+            let (access, read, write) = open_access(flags)?;
+            let fh = self.reserve_handle()?;
+            let credentials = credentials(request, umask)?;
+            let created = self
+                .state
+                .namespace
+                .create_open(
+                    CreateRequest {
+                        parent,
+                        name: name.as_bytes().to_vec(),
+                        kind: EntityKind::File,
+                        mode: mode & 0o7777,
+                        rdev: 0,
+                        symlink_target: None,
+                    },
+                    credentials.clone(),
+                    access,
+                )
+                .await;
+            let (inode, handle, created) = match created {
+                Ok((inode, handle)) => (inode, Arc::new(handle), true),
+                Err(EntityError::Exists) if flags & libc::O_EXCL as u32 == 0 => {
+                    let handle = self
+                        .state
+                        .namespace
+                        .open(parent, name.as_bytes(), access, &credentials)
+                        .await
+                        .map_err(errno)?;
+                    let handle = Arc::new(handle);
+                    let inode = self.state.data.attr(handle.clone()).await.map_err(errno)?;
+                    (inode, handle, false)
+                }
+                Err(error) => return Err(errno(error)),
+            };
+            let io = self.state.data.bind(handle).map_err(errno)?;
+            let inode = if !created && flags & libc::O_TRUNC as u32 != 0 {
+                io.truncate(0).await.map_err(errno)?;
+                io.attr().await.map_err(errno)?
+            } else {
+                inode
+            };
+            self.store_file(
+                fh,
+                OpenFile {
+                    io,
+                    read,
+                    write,
+                    append: flags & libc::O_APPEND as u32 != 0,
                 },
-                credentials.clone(),
-                access,
-            )
-            .await;
-        let (inode, handle, created) = match created {
-            Ok((inode, handle)) => (inode, Arc::new(handle), true),
-            Err(EntityError::Exists) if flags & libc::O_EXCL as u32 == 0 => {
-                let handle = self
-                    .state
-                    .namespace
-                    .open(parent, name.as_bytes(), access, &credentials)
-                    .await
-                    .map_err(errno)?;
-                let handle = Arc::new(handle);
-                let inode = self.state.data.attr(handle.clone()).await.map_err(errno)?;
-                (inode, handle, false)
-            }
-            Err(error) => return Err(errno(error)),
-        };
-        let io = self.state.data.bind(handle).map_err(errno)?;
-        let inode = if !created && flags & libc::O_TRUNC as u32 != 0 {
-            io.truncate(0).await.map_err(errno)?;
-            io.attr().await.map_err(errno)?
-        } else {
-            inode
-        };
-        self.store_file(
-            fh,
-            OpenFile {
-                io,
-                read,
-                write,
-                append: flags & libc::O_APPEND as u32 != 0,
-            },
-        )?;
-        Ok(ReplyCreated {
-            ttl: Duration::ZERO,
-            attr: self.attr(&inode),
-            generation: 0,
-            fh,
-            flags: FOPEN_DIRECT_IO,
+            )?;
+            Ok(ReplyCreated {
+                ttl: Duration::ZERO,
+                attr: self.attr(&inode),
+                generation: 0,
+                fh,
+                flags: FOPEN_DIRECT_IO,
+            })
         })
+        .await
     }
 }
 
@@ -406,14 +411,18 @@ where
     }
 
     async fn lookup(&self, request: Request, parent: u64, name: &OsStr) -> FuseResult<ReplyEntry> {
-        let parent = self.ino(parent)?;
-        let inode = self
-            .state
-            .namespace
-            .lookup(parent, name.as_bytes(), &credentials(request, 0)?)
-            .await
-            .map_err(errno)?;
-        Ok(self.entry(&inode))
+        diagnostics::with_operation("lookup", async {
+            let _span = diagnostics::Span::start("fuse.lookup");
+            let parent = self.ino(parent)?;
+            let inode = self
+                .state
+                .namespace
+                .lookup(parent, name.as_bytes(), &credentials(request, 0)?)
+                .await
+                .map_err(errno)?;
+            Ok(self.entry(&inode))
+        })
+        .await
     }
 
     async fn getattr(
@@ -423,30 +432,34 @@ where
         fh: Option<u64>,
         _flags: u32,
     ) -> FuseResult<ReplyAttr> {
-        let ino = self.ino(inode)?;
-        let attr = if let Some(fh) = fh {
-            match self.file(inode, fh) {
-                Ok(file) => file.io.attr().await.map_err(errno)?,
-                Err(_) => {
-                    self.directory(inode, fh)?;
-                    self.state
-                        .namespace
-                        .getattr(ino, &credentials(request, 0)?)
-                        .await
-                        .map_err(errno)?
+        diagnostics::with_operation("getattr", async {
+            let _span = diagnostics::Span::start("fuse.getattr");
+            let ino = self.ino(inode)?;
+            let attr = if let Some(fh) = fh {
+                match self.file(inode, fh) {
+                    Ok(file) => file.io.attr().await.map_err(errno)?,
+                    Err(_) => {
+                        self.directory(inode, fh)?;
+                        self.state
+                            .namespace
+                            .getattr(ino, &credentials(request, 0)?)
+                            .await
+                            .map_err(errno)?
+                    }
                 }
-            }
-        } else {
-            self.state
-                .namespace
-                .getattr(ino, &credentials(request, 0)?)
-                .await
-                .map_err(errno)?
-        };
-        Ok(ReplyAttr {
-            ttl: Duration::ZERO,
-            attr: self.attr(&attr),
+            } else {
+                self.state
+                    .namespace
+                    .getattr(ino, &credentials(request, 0)?)
+                    .await
+                    .map_err(errno)?
+            };
+            Ok(ReplyAttr {
+                ttl: Duration::ZERO,
+                attr: self.attr(&attr),
+            })
         })
+        .await
     }
 
     async fn setattr(
@@ -506,32 +519,36 @@ where
     }
 
     async fn open(&self, request: Request, inode: u64, flags: u32) -> FuseResult<ReplyOpen> {
-        let ino = self.ino(inode)?;
-        let (access, read, write) = open_access(flags)?;
-        let fh = self.reserve_handle()?;
-        let handle = self
-            .state
-            .namespace
-            .open_inode(ino, access, &credentials(request, 0)?)
-            .await
-            .map_err(errno)?;
-        let io = self.state.data.bind(Arc::new(handle)).map_err(errno)?;
-        if flags & libc::O_TRUNC as u32 != 0 {
-            io.truncate(0).await.map_err(errno)?;
-        }
-        self.store_file(
-            fh,
-            OpenFile {
-                io,
-                read,
-                write,
-                append: flags & libc::O_APPEND as u32 != 0,
-            },
-        )?;
-        Ok(ReplyOpen {
-            fh,
-            flags: FOPEN_DIRECT_IO,
+        diagnostics::with_operation("open", async {
+            let _span = diagnostics::Span::start("fuse.open");
+            let ino = self.ino(inode)?;
+            let (access, read, write) = open_access(flags)?;
+            let fh = self.reserve_handle()?;
+            let handle = self
+                .state
+                .namespace
+                .open_inode(ino, access, &credentials(request, 0)?)
+                .await
+                .map_err(errno)?;
+            let io = self.state.data.bind(Arc::new(handle)).map_err(errno)?;
+            if flags & libc::O_TRUNC as u32 != 0 {
+                io.truncate(0).await.map_err(errno)?;
+            }
+            self.store_file(
+                fh,
+                OpenFile {
+                    io,
+                    read,
+                    write,
+                    append: flags & libc::O_APPEND as u32 != 0,
+                },
+            )?;
+            Ok(ReplyOpen {
+                fh,
+                flags: FOPEN_DIRECT_IO,
+            })
         })
+        .await
     }
 
     async fn create(
@@ -567,13 +584,17 @@ where
         offset: u64,
         size: u32,
     ) -> FuseResult<ReplyData> {
-        let file = self.file(inode, fh)?;
-        if !file.read {
-            return Err(libc::EACCES.into());
-        }
-        Ok(ReplyData {
-            data: Bytes::from(file.io.read(offset, size as usize).await.map_err(errno)?),
+        diagnostics::with_operation("read", async {
+            let _span = diagnostics::Span::start("fuse.read");
+            let file = self.file(inode, fh)?;
+            if !file.read {
+                return Err(libc::EACCES.into());
+            }
+            Ok(ReplyData {
+                data: Bytes::from(file.io.read(offset, size as usize).await.map_err(errno)?),
+            })
         })
+        .await
     }
 
     async fn write(
@@ -586,28 +607,36 @@ where
         write_flags: u32,
         _flags: u32,
     ) -> FuseResult<ReplyWrite> {
-        if write_flags & FUSE_WRITE_CACHE != 0 {
-            return Err(libc::EOPNOTSUPP.into());
-        }
-        if data.len() > MAX_WRITE as usize {
-            return Err(libc::EINVAL.into());
-        }
-        let file = self.file(inode, fh)?;
-        if !file.write {
-            return Err(libc::EACCES.into());
-        }
-        let written = file
-            .io
-            .write(offset, Bytes::copy_from_slice(data), file.append)
-            .await
-            .map_err(errno)?;
-        Ok(ReplyWrite {
-            written: written.written as u32,
+        diagnostics::with_operation("write", async {
+            let _span = diagnostics::Span::start("fuse.write");
+            if write_flags & FUSE_WRITE_CACHE != 0 {
+                return Err(libc::EOPNOTSUPP.into());
+            }
+            if data.len() > MAX_WRITE as usize {
+                return Err(libc::EINVAL.into());
+            }
+            let file = self.file(inode, fh)?;
+            if !file.write {
+                return Err(libc::EACCES.into());
+            }
+            let written = file
+                .io
+                .write(offset, Bytes::copy_from_slice(data), file.append)
+                .await
+                .map_err(errno)?;
+            Ok(ReplyWrite {
+                written: written.written as u32,
+            })
         })
+        .await
     }
 
     async fn flush(&self, _request: Request, inode: u64, fh: u64, _owner: u64) -> FuseResult<()> {
-        self.file(inode, fh)?.io.fsync().await.map_err(errno)
+        diagnostics::with_operation("flush", async {
+            let _span = diagnostics::Span::start("fuse.flush");
+            self.file(inode, fh)?.io.fsync().await.map_err(errno)
+        })
+        .await
     }
 
     async fn fsync(
@@ -617,7 +646,11 @@ where
         fh: u64,
         _datasync: bool,
     ) -> FuseResult<()> {
-        self.file(inode, fh)?.io.fsync().await.map_err(errno)
+        diagnostics::with_operation("fsync", async {
+            let _span = diagnostics::Span::start("fuse.fsync");
+            self.file(inode, fh)?.io.fsync().await.map_err(errno)
+        })
+        .await
     }
 
     async fn release(
@@ -629,19 +662,23 @@ where
         _owner: u64,
         flush: bool,
     ) -> FuseResult<()> {
-        let file = self.file(inode, fh)?;
-        let result = if flush {
-            file.io.fsync().await.map_err(errno)
-        } else {
-            Ok(())
-        };
-        self.state
-            .handles
-            .lock()
-            .map_err(|_| Errno::from(libc::EIO))?
-            .files
-            .remove(&fh);
-        result
+        diagnostics::with_operation("release", async {
+            let _span = diagnostics::Span::start("fuse.release");
+            let file = self.file(inode, fh)?;
+            let result = if flush {
+                file.io.fsync().await.map_err(errno)
+            } else {
+                Ok(())
+            };
+            self.state
+                .handles
+                .lock()
+                .map_err(|_| Errno::from(libc::EIO))?
+                .files
+                .remove(&fh);
+            result
+        })
+        .await
     }
 
     async fn mkdir(
@@ -652,23 +689,27 @@ where
         mode: u32,
         umask: u32,
     ) -> FuseResult<ReplyEntry> {
-        let inode = self
-            .state
-            .namespace
-            .create(
-                CreateRequest {
-                    parent: self.ino(parent)?,
-                    name: name.as_bytes().to_vec(),
-                    kind: EntityKind::Directory,
-                    mode: mode & 0o7777,
-                    rdev: 0,
-                    symlink_target: None,
-                },
-                credentials(request, umask)?,
-            )
-            .await
-            .map_err(errno)?;
-        Ok(self.entry(&inode))
+        diagnostics::with_operation("mkdir", async {
+            let _span = diagnostics::Span::start("fuse.mkdir");
+            let inode = self
+                .state
+                .namespace
+                .create(
+                    CreateRequest {
+                        parent: self.ino(parent)?,
+                        name: name.as_bytes().to_vec(),
+                        kind: EntityKind::Directory,
+                        mode: mode & 0o7777,
+                        rdev: 0,
+                        symlink_target: None,
+                    },
+                    credentials(request, umask)?,
+                )
+                .await
+                .map_err(errno)?;
+            Ok(self.entry(&inode))
+        })
+        .await
     }
 
     async fn unlink(&self, request: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
@@ -698,11 +739,15 @@ where
     }
 
     async fn access(&self, request: Request, inode: u64, mask: u32) -> FuseResult<()> {
-        self.state
-            .namespace
-            .access(self.ino(inode)?, mask, &credentials(request, 0)?)
-            .await
-            .map_err(errno)
+        diagnostics::with_operation("access", async {
+            let _span = diagnostics::Span::start("fuse.access");
+            self.state
+                .namespace
+                .access(self.ino(inode)?, mask, &credentials(request, 0)?)
+                .await
+                .map_err(errno)
+        })
+        .await
     }
 
     async fn opendir(&self, request: Request, inode: u64, flags: u32) -> FuseResult<ReplyOpen> {

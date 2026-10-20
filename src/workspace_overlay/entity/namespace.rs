@@ -30,6 +30,8 @@ const MAX_RETRIES: usize = 16;
 const MAX_ANCESTORS: usize = 256;
 const MAX_DIRECTORY_ROWS: usize = 4096;
 
+#[path = "namespace_create.rs"]
+mod create_ops;
 #[path = "namespace_mount.rs"]
 mod mount_ops;
 
@@ -84,6 +86,9 @@ pub struct EntityNamespace<B, L> {
     pub(super) lifecycle: Lifecycle<B>,
     pub(super) session: WriterSession,
     locks: Arc<Mutex<BTreeMap<i64, Weak<InodeLock>>>>,
+    // Advisory topology only. Every inode/ACL used for a decision is freshly
+    // read and checked; stale hints can only cause additional reads/retries.
+    directory_hints: moka::sync::Cache<i64, i64>,
 }
 
 /// Retain the registry entry as well as its mutex. Keeping only the mutex guard
@@ -95,7 +100,6 @@ pub(super) struct InodeGuard {
 
 #[derive(Clone)]
 enum Operation {
-    Create(CreateRequest),
     Link {
         ino: i64,
         parent: i64,
@@ -148,15 +152,16 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
             keys,
             session,
             locks,
+            directory_hints: moka::sync::Cache::new(4096),
         })
     }
 
     pub(super) async fn authority(&self) -> Result<TransactionAuthority> {
+        let _diagnostic = super::diagnostics::Span::start("namespace.authority");
         if self.session.namespace_id() != self.keys.namespace_id() {
             return Err(EntityError::Fenced);
         }
-        let descriptor = self.lifecycle.descriptor().await?;
-        if &descriptor.lower != self.lower.binding() {
+        if self.session.lower_binding() != self.lower.binding() {
             return Err(EntityError::Fenced);
         }
         self.lifecycle.authority(&self.session).await
@@ -177,6 +182,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
     }
 
     pub(super) async fn lock_inode(&self, ino: i64) -> InodeGuard {
+        let _diagnostic = super::diagnostics::Span::start("data.lock_wait");
         let state = self.inode_lock(ino);
         let guard = state.mutex.clone().lock_owned().await;
         InodeGuard {
@@ -199,6 +205,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         &self,
         ids: &BTreeSet<i64>,
     ) -> (Vec<Arc<InodeLock>>, Vec<OwnedMutexGuard<()>>) {
+        let _diagnostic = super::diagnostics::Span::start("namespace.lock_wait");
         let states: Vec<_> = ids.iter().map(|ino| self.inode_lock(*ino)).collect();
         let mut guards = Vec::with_capacity(states.len());
         for state in &states {
@@ -213,9 +220,11 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         credentials: Credentials,
     ) -> Result<Option<EntityInode>> {
         let this = self.clone();
-        tokio::spawn(async move { this.execute(operation, credentials).await })
-            .await
-            .map_err(|e| EntityError::Backend(format!("owned namespace task failed: {e}")))?
+        tokio::spawn(super::diagnostics::inherit(async move {
+            this.execute(operation, credentials).await
+        }))
+        .await
+        .map_err(|e| EntityError::Backend(format!("owned namespace task failed: {e}")))?
     }
 
     pub async fn create(
@@ -223,9 +232,14 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         request: CreateRequest,
         credentials: Credentials,
     ) -> Result<EntityInode> {
-        self.run(Operation::Create(request), credentials)
-            .await?
-            .ok_or_else(|| EntityError::Corrupt("create returned no inode".into()))
+        let this = self.clone();
+        tokio::spawn(super::diagnostics::inherit(async move {
+            let _admission = this.session.admit()?;
+            let _guard = this.lock_inode(request.parent).await;
+            this.create_locked(&request, &credentials).await
+        }))
+        .await
+        .map_err(|e| EntityError::Backend(format!("owned create task failed: {e}")))?
     }
     pub async fn link(
         self: &Arc<Self>,
@@ -419,9 +433,6 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
             let mut discovery = Prepared::new(self);
             let mut ids = BTreeSet::new();
             match &op {
-                Operation::Create(r) => {
-                    ids.insert(r.parent);
-                }
                 Operation::Link { ino, parent, .. } => {
                     ids.extend([*ino, *parent]);
                 }
@@ -452,7 +463,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
             let (_states, _guards) = self.lock_all(&ids).await;
             let authority = self.authority().await?;
             let mut p = Prepared::new(self);
-            let outcome = p.prepare(&op, &credentials, &ids, &authority).await;
+            let outcome = p.prepare(&op, &credentials, &ids).await;
             let outcome = match outcome {
                 Err(EntityError::Conflict) => continue,
                 Err(error @ EntityError::Backend(_)) => return Err(error),
@@ -564,18 +575,26 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
         Ok(())
     }
     async fn inode(&mut self, ino: i64) -> Result<EntityInode> {
+        let _diagnostic = super::diagnostics::Span::start("namespace.resolve_inode");
         let row = self.raw(self.ns.keys.inode(ino)).await?;
         let upper: Option<UpperInode> = row.as_deref().map(codec::decode).transpose()?;
-        resolver::resolve_inode(
+        let inode = resolver::resolve_inode(
             self.ns.lower.as_ref(),
             self.ns.lower.binding(),
             ino,
             upper.as_ref(),
         )
         .await?
-        .ok_or(EntityError::NotFound)
+        .ok_or(EntityError::NotFound)?;
+        if inode.kind == EntityKind::Directory
+            && let Some(parent) = inode.parent_hint
+        {
+            self.ns.directory_hints.insert(ino, parent);
+        }
+        Ok(inode)
     }
     async fn dentry_row(&mut self, parent: i64, name: &[u8]) -> Result<Option<(i64, EntityKind)>> {
+        let _diagnostic = super::diagnostics::Span::start("namespace.resolve_dentry");
         validate_name(name)?;
         let row = self.raw(self.ns.keys.dentry(parent, name)).await?;
         let upper: Option<EntityDentry> = row.as_deref().map(codec::decode).transpose()?;
@@ -613,6 +632,7 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
         }
     }
     async fn xattr(&mut self, ino: i64, name: &[u8]) -> Result<Option<Vec<u8>>> {
+        let _diagnostic = super::diagnostics::Span::start("namespace.resolve_xattr");
         let row = self.raw(self.ns.keys.xattr(ino, name)).await?;
         let upper: Option<EntityValue> = row.as_deref().map(codec::decode).transpose()?;
         resolver::resolve_xattr(
@@ -790,121 +810,9 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
         op: &Operation,
         c: &Credentials,
         ids: &BTreeSet<i64>,
-        authority: &super::backend::TransactionAuthority,
     ) -> Result<Option<EntityInode>> {
+        let _diagnostic = super::diagnostics::Span::start("namespace.prepare");
         match op {
-            Operation::Create(r) => {
-                validate_name(&r.name)?;
-                if r.mode & !0o7777 != 0 {
-                    return Err(EntityError::Invalid("invalid create mode".into()));
-                }
-                if matches!(r.kind, EntityKind::CharDevice | EntityKind::BlockDevice) && c.uid != 0
-                {
-                    return Err(EntityError::Permission);
-                }
-                let parent = self.parent(r.parent, c, 3).await?;
-                if self.dentry(r.parent, &r.name).await?.is_some() {
-                    return Err(EntityError::Exists);
-                }
-                let ino = i64::try_from(
-                    self.ns
-                        .backend
-                        .allocate(authority, &self.ns.keys.counter("inode"))
-                        .await?,
-                )
-                .map_err(|_| EntityError::Overflow)?;
-                if ino <= self.ns.lower.binding().max_ino
-                    || self.raw(self.ns.keys.inode(ino)).await?.is_some()
-                {
-                    return Err(EntityError::Corrupt("inode allocator collision".into()));
-                }
-                let default = self
-                    .xattr(r.parent, DEFAULT_XATTR)
-                    .await?
-                    .map(|v| PosixAcl::decode(&v).map_err(|e| EntityError::Corrupt(e.into())))
-                    .transpose()?;
-                let inherited = if r.kind == EntityKind::Symlink {
-                    None
-                } else {
-                    default.as_ref().map(|a| a.inherited_access(r.mode))
-                };
-                let mut mode = inherited
-                    .as_ref()
-                    .map_or(r.mode & !c.umask, |a| (r.mode & 0o7000) | a.mode_bits());
-                if r.kind == EntityKind::Symlink {
-                    mode = 0o777;
-                }
-                if parent.mode & 0o2000 != 0 && r.kind == EntityKind::Directory {
-                    mode |= 0o2000;
-                }
-                let gid = if parent.mode & 0o2000 != 0 {
-                    parent.gid
-                } else {
-                    c.gid
-                };
-                if c.uid != 0
-                    && gid != c.gid
-                    && !c.groups.contains(&gid)
-                    && r.kind != EntityKind::Directory
-                {
-                    mode &= !0o2000;
-                }
-                let inode = EntityInode {
-                    ino,
-                    kind: r.kind,
-                    size: r.symlink_target.as_ref().map_or(0, |v| v.len() as u64),
-                    mode,
-                    uid: c.uid,
-                    gid,
-                    rdev: r.rdev,
-                    nlink: if r.kind == EntityKind::Directory {
-                        2
-                    } else {
-                        1
-                    },
-                    atime_ns: self.now,
-                    mtime_ns: self.now,
-                    ctime_ns: self.now,
-                    symlink_target: r.symlink_target.clone(),
-                    parent_hint: Some(r.parent),
-                    lower_visible_size: 0,
-                    data_version: 0,
-                };
-                inode.validate()?;
-                self.put(self.ns.keys.inode(ino), &UpperInode::Present(inode.clone()))
-                    .await?;
-                self.put(
-                    self.ns.keys.dentry(r.parent, &r.name),
-                    &EntityDentry::Present { ino, kind: r.kind },
-                )
-                .await?;
-                if let Some(acl) = inherited.filter(PosixAcl::is_extended) {
-                    self.put(
-                        self.ns.keys.xattr(ino, ACCESS_XATTR),
-                        &EntityValue::Present(acl.encode()),
-                    )
-                    .await?;
-                }
-                if r.kind == EntityKind::Directory
-                    && let Some(acl) = default
-                {
-                    self.put(
-                        self.ns.keys.xattr(ino, DEFAULT_XATTR),
-                        &EntityValue::Present(acl.encode()),
-                    )
-                    .await?;
-                }
-                self.touch_parent(
-                    r.parent,
-                    if r.kind == EntityKind::Directory {
-                        1
-                    } else {
-                        0
-                    },
-                )
-                .await?;
-                return Ok(Some(inode));
-            }
             Operation::Link { ino, parent, name } => {
                 self.parent(*parent, c, 3).await?;
                 if self.dentry(*parent, name).await?.is_some() {

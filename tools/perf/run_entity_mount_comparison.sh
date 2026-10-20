@@ -6,6 +6,7 @@ umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPOSE_FILE="$ROOT/docker/compose-xfstests/docker-compose.packed-lifecycle-backends.yml"
+DIAGNOSTIC_HELPER="$ROOT/tools/perf/entity_redis_diagnostics.py"
 PRESERVED_FIXTURE=/mnt/brewfs-data/artifacts/overlay-packed-lifecycle-e980d59-20261012T153232Z/build/r31/packed_v3_snapshot_fixture
 
 usage() {
@@ -27,10 +28,40 @@ No build, full benchmark, crash test, admission qualification or GC test runs.
 Optional ENTITY_MOUNT_NATIVE_BINARY (defaults to ENTITY_MOUNT_BINARY),
 ENTITY_MOUNT_FIXTURE (default preserved packed fixture producer),
 ENTITY_MOUNT_SMOKE_ONLY=1 (no comparison), and backend image overrides.
+
+Diagnostic mode: ENTITY_MOUNT_DIAGNOSTIC=1 defaults to 200 files and captures
+Redis MONITOR, commandstats and instrumented overlay timer snapshots per phase.
+Mount process CPU and Redis INFO CPU are sampled separately from elapsed spans.
+Requires a binary supporting BREWFS_ENTITY_DIAGNOSTICS=1 and SIGUSR1 snapshots;
+the native arm is never signaled. MONITOR/timers perturb timings: diagnostic
+throughput is NOT acceptance evidence. Smokes and workload semantics are unchanged.
+ENTITY_MOUNT_FILES, ENTITY_MOUNT_WORKERS (comma/space list), and
+ENTITY_MOUNT_REPETITIONS override the profile; ordinary defaults remain
+2000 files, workers 1,16,32 and 2 repetitions. Odd/even repetitions reverse arms.
+At most 9 native cells fit the runner's distinct Redis databases.
 EOF
 }
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then usage; exit 0; fi
 [[ $# == 0 ]] || { usage >&2; exit 2; }
+diagnostic="${ENTITY_MOUNT_DIAGNOSTIC:-0}"
+settings="$(python3 - "$diagnostic" "${ENTITY_MOUNT_FILES:-}" "${ENTITY_MOUNT_WORKERS:-1,16,32}" "${ENTITY_MOUNT_REPETITIONS:-2}" <<'PY'
+import re, sys
+diagnostic, files, workers, repetitions = sys.argv[1:]
+if diagnostic not in ('0', '1'):
+    raise SystemExit('ENTITY_MOUNT_DIAGNOSTIC must be 0 or 1')
+files = files or ('200' if diagnostic == '1' else '2000')
+workers = re.split(r'[,\s]+', workers.strip())
+if not all(re.fullmatch(r'[1-9][0-9]*', value) for value in [files, repetitions, *workers]):
+    raise SystemExit('files, workers and repetitions must be positive decimal integers')
+if len(set(workers)) != len(workers) or len(workers) * int(repetitions) > 9:
+    raise SystemExit('workers must be unique and workers x repetitions must be <= 9 (fresh native Redis DBs 7..15)')
+print(files, repetitions, ','.join(workers))
+PY
+)"
+read -r file_count repetitions worker_csv <<<"$settings"
+IFS=, read -ra worker_values <<<"$worker_csv"
+measurement_kind=preliminary
+[[ "$diagnostic" != 1 ]] || measurement_kind=diagnostic
 OUT="${ENTITY_MOUNT_ARTIFACT_ROOT:?set absolute ENTITY_MOUNT_ARTIFACT_ROOT}"
 BINARY="${ENTITY_MOUNT_BINARY:?set ENTITY_MOUNT_BINARY to the existing release binary}"
 NATIVE="${ENTITY_MOUNT_NATIVE_BINARY:-$BINARY}"
@@ -66,7 +97,14 @@ mount_pid=""
 mount_path=""
 mount_art=""
 workload_pid=""
+monitor_pid=""
 all_mounts_ok=1
+python3 - "$group/run-config.json" "$diagnostic" "$file_count" "$repetitions" "$worker_csv" <<'PY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({'diagnostic': sys.argv[2] == '1',
+    'files': int(sys.argv[3]), 'repetitions': int(sys.argv[4]),
+    'workers': [int(value) for value in sys.argv[5].split(',')]}, indent=2) + '\n')
+PY
 read -r redis_port rustfs_port < <(python3 - <<'PY'
 import socket
 sockets = [socket.socket(), socket.socket()]
@@ -99,6 +137,34 @@ unset AWS_SESSION_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE
 export HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= http_proxy= https_proxy= all_proxy=
 export NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost
 unset BREWFS_WORKSPACE_ROW_CACHE_TTL_MS
+
+stop_monitor() {
+    [[ -n "$monitor_pid" ]] || return 0
+    local monitor_exit=0
+    for _ in {1..100}; do kill -0 "$monitor_pid" 2>/dev/null || break; sleep .05; done
+    # Normal capture exits after observing the phase's final ECHO. This signal
+    # only stops an interrupted/incomplete capture; the helper returns failure.
+    kill -TERM "$monitor_pid" 2>/dev/null || true
+    wait "$monitor_pid" 2>/dev/null || monitor_exit=$?
+    monitor_pid=""
+    return "$monitor_exit"
+}
+
+start_monitor() {
+    local phase="$1" end_marker="$2"
+    python3 "$DIAGNOSTIC_HELPER" capture --port "$redis_port" \
+        --output "$phase/redis-monitor.txt" --ready "$phase/monitor-ready.json" \
+        --status "$phase/monitor-capture.json" --end-marker "$end_marker" \
+        >"$phase/monitor-capture.log" 2>&1 &
+    monitor_pid=$!
+    for _ in {1..200}; do
+        [[ ! -e "$phase/monitor-ready.json" ]] || return 0
+        kill -0 "$monitor_pid" 2>/dev/null || break
+        sleep .05
+    done
+    echo "Redis MONITOR did not become ready: $phase" >&2
+    return 1
+}
 
 stop_mount() {
     [[ -n "$mount_pid" ]] || return 0
@@ -136,6 +202,7 @@ cleanup() {
         sudo -n kill -KILL -- "-$workload_pid" 2>/dev/null
         wait "$workload_pid" 2>/dev/null
     fi
+    stop_monitor || status=1
     stop_mount || status=1
     "${compose[@]}" logs --no-color >"$group/backend-services.log" 2>&1
     "${compose[@]}" down --timeout 30 -v --remove-orphans >"$group/compose-down.log" 2>&1
@@ -157,6 +224,10 @@ PY
     python3 - "$group" "$status" "${ENTITY_MOUNT_SMOKE_ONLY:-0}" <<'PY'
 import json, pathlib, statistics, sys
 group = pathlib.Path(sys.argv[1]); exit_status = int(sys.argv[2]); smoke_only = sys.argv[3] == '1'
+config = json.loads((group / 'run-config.json').read_text())
+kind = 'diagnostic' if config['diagnostic'] else 'preliminary'
+expected_files = config['files']
+phase_slots = len(config['workers']) * config['repetitions'] * 2
 rows = []
 for directory in sorted((group / 'runs').glob('*')):
     result = directory / 'result.json'
@@ -169,11 +240,14 @@ for directory in sorted((group / 'runs').glob('*')):
         summary = directory / mode / 'summary.json'
         if summary.exists():
             row = json.loads(summary.read_text())
-            row.update(status='preliminary', arm=cell['arm'], repetition=cell['repetition'], cell_exit=cell['exit'], artifact=str(summary.relative_to(group)))
+            row.update(status=kind, arm=cell['arm'], repetition=cell['repetition'], cell_exit=cell['exit'], artifact=str(summary.relative_to(group)))
+            diagnostic = directory / mode / 'redis-diagnostic.json'
+            if diagnostic.exists():
+                row['redis_diagnostic'] = str(diagnostic.relative_to(group))
             rows.append(row)
-expected = 0 if smoke_only else 24
+expected = 0 if smoke_only else phase_slots * 2
 def valid(row):
-    return row['cell_exit'] == 0 and row['errors'] == 0 and row['files'] == 2000 and row['expected_files'] == 2000
+    return row['cell_exit'] == 0 and row['errors'] == 0 and row['files'] == expected_files and row['expected_files'] == expected_files
 identity_ok = all(len({r['trace_sha256'] for r in rows if r['mode'] == mode and valid(r)}) <= 1 for mode in ('write', 'readback'))
 complete = len(rows) == expected and all(valid(r) for r in rows) and identity_ok
 smokes = {}
@@ -181,9 +255,9 @@ for arm in ('native', 'overlay-packed'):
     smoke = group / 'smoke' / arm / 'smoke.json'
     smokes[arm] = json.loads(smoke.read_text()) if smoke.exists() else {'status': 'not-completed'}
 smoke_ok = all(smoke.get('status') == 'passed' for smoke in smokes.values())
-status = 'completed-available-preliminary' if exit_status == 0 and complete and smoke_ok else 'incomplete' if len(rows) < expected else 'failed'
+status = f'completed-available-{kind}' if exit_status == 0 and complete and smoke_ok else 'incomplete' if len(rows) < expected else 'failed'
 medians = {}
-for workers in (1, 16, 32):
+for workers in config['workers']:
     for mode in ('write', 'readback'):
         values = {}
         for arm in ('native', 'overlay-native', 'overlay-packed'):
@@ -192,18 +266,19 @@ for workers in (1, 16, 32):
                                'reason': 'frozen native lower adapter, binding and runtime wiring missing'}
                 continue
             rs = [r for r in rows if r['workers'] == workers and r['mode'] == mode and r['arm'] == arm and valid(r)]
-            values[arm] = {'status': 'preliminary', 'valid': len(rs), 'files_per_sec': statistics.median(r['files_per_sec'] for r in rs) if rs else None}
+            values[arm] = {'status': kind, 'valid': len(rs), 'files_per_sec': statistics.median(r['files_per_sec'] for r in rs) if rs else None}
         medians[f'{workers}/{mode}'] = values
 result = {'schema': 'brewfs-entity-mount-preliminary-v1', 'status': status, 'exit': exit_status,
-          'requested_rows': 0 if smoke_only else 36, 'expected_available_rows': expected,
-          'skipped_overlay_native_phase_rows': 0 if smoke_only else 12,
+          'measurement_kind': kind, 'profile': config,
+          'requested_rows': 0 if smoke_only else phase_slots * 3, 'expected_available_rows': expected,
+          'skipped_overlay_native_phase_rows': 0 if smoke_only else phase_slots,
           'rows': rows, 'medians': medians, 'smoke_ok': smoke_ok, 'smokes': smokes,
           'skipped_arms': [{'arm': 'overlay-native', 'status': 'skipped',
                             'reason': 'Missing ImmutableLower and ImmutableLowerData adapter for a frozen native Redis-metadata/RustFS-data lower, immutable native-lower binding, and experimental mount bootstrap/runtime wiring. Only PackedLower is wired; no substitute arm is measured.'}],
-          'note': 'Experimental overlay-packed entity mount; not production admission, crash-recovery or GC qualification. Native and overlay-packed use 4 MiB chunks.'}
+          'note': 'Experimental overlay-packed entity mount; not production admission, crash-recovery or GC qualification. Native and overlay-packed use 4 MiB chunks. Diagnostic runs include MONITOR/timer overhead and cannot establish throughput acceptance.'}
 (group / 'summary.json').write_text(json.dumps(result, indent=2) + '\n')
 print(f'entity-mount: {status}; artifacts={group}; available_rows={len(rows)}/{expected}; overlay-native=skipped')
-sys.exit(0 if status == 'completed-available-preliminary' else 1)
+sys.exit(0 if status == f'completed-available-{kind}' else 1)
 PY
     local summary_rc=$?
     (( summary_rc == 0 )) || { (( status != 0 )) || status=1; }
@@ -227,23 +302,31 @@ for name in sorted(set(names.decode().split('\0')) - {''}):
 pathlib.Path(sys.argv[2]).write_text(json.dumps({'scope': 'tracked and nonignored untracked Rust files; null means absent', 'files': files}, indent=2) + '\n')
 PY
 sha256sum "$BINARY" "$NATIVE" "$FIXTURE" >"$group/binary.sha256"
-sha256sum "$ROOT/tools/perf/run_entity_mount_comparison.sh" "$ROOT/tools/perf/smallfiles_rw.py" "$COMPOSE_FILE" >"$group/runner.sha256"
+sha256sum "$ROOT/tools/perf/run_entity_mount_comparison.sh" "$ROOT/tools/perf/smallfiles_rw.py" "$DIAGNOSTIC_HELPER" "$COMPOSE_FILE" >"$group/runner.sha256"
 cp "$ROOT/tools/perf/run_entity_mount_comparison.sh" "$group/runner.sh"
+if [[ "$diagnostic" == 1 ]]; then
+    cp "$DIAGNOSTIC_HELPER" "$group/entity_redis_diagnostics.py"
+    python3 "$DIAGNOSTIC_HELPER" inventory --root "$ROOT" --output "$group/redis-script-inventory.json"
+fi
 cat >"$group/profile.txt" <<EOF
-status=preliminary
+status=$measurement_kind
+redis_monitor=$diagnostic
+overlay_timer_snapshots=$diagnostic
+process_and_redis_cpu_snapshots=$diagnostic
 overlay_packed_binary=$BINARY
 native_binary=$NATIVE
 fixture_binary=$FIXTURE
 fixture_role=immutable packed fixture producer only; not a measured filesystem arm
 project=$project
-workers=1,16,32
-orders=native,overlay-packed;overlay-packed,native
-requested_phase_rows=36
-expected_available_phase_rows=24
-skipped_overlay_native_phase_rows=12
+workers=$worker_csv
+repetitions=$repetitions
+orders=odd:native,overlay-packed;even:overlay-packed,native
+requested_phase_rows=$((${#worker_values[@]} * repetitions * 6))
+expected_available_phase_rows=$((${#worker_values[@]} * repetitions * 4))
+skipped_overlay_native_phase_rows=$((${#worker_values[@]} * repetitions * 2))
 overlay_native_status=skipped
 overlay_native_reason=missing frozen-native ImmutableLower/ImmutableLowerData adapter, immutable lower binding and experimental mount bootstrap/runtime wiring
-files=2000
+files=$file_count
 file_bytes=16384
 fsync_per_file=1
 workload_uid=0
@@ -352,7 +435,12 @@ EOF
     printf '%q ' "${command[@]}" >>"$group/commands.log"
     printf '\n' >>"$group/commands.log"
     mount_path="$dir/mnt"; mount_art="$art"
-    BREWFS_CACHE_TTL_MS=0 BREWFS_FUSE_READ_DIRECT_IO=1 BREWFS_FUSE_KEEP_CACHE=0 BREWFS_FUSE_WRITEBACK=0 \
+    local -a diagnostic_env=()
+    if [[ "$diagnostic" == 1 && "$arm" == overlay-packed ]]; then
+        diagnostic_env=(BREWFS_ENTITY_DIAGNOSTICS=1)
+    fi
+    env -u BREWFS_ENTITY_DIAGNOSTICS "${diagnostic_env[@]}" \
+        BREWFS_CACHE_TTL_MS=0 BREWFS_FUSE_READ_DIRECT_IO=1 BREWFS_FUSE_KEEP_CACHE=0 BREWFS_FUSE_WRITEBACK=0 \
         RUST_LOG=warn,brewfs=info "${command[@]}" >"$art/brewfs.log" 2>&1 &
     mount_pid=$!
     for _ in {1..1200}; do
@@ -407,9 +495,9 @@ done
 [[ "${ENTITY_MOUNT_SMOKE_ONLY:-0}" == 1 ]] && exit 0
 
 native_db=6
-for workers in 1 16 32; do
-    for repetition in 1 2; do
-        if (( repetition == 1 )); then arms=(native overlay-packed); else arms=(overlay-packed native); fi
+for workers in "${worker_values[@]}"; do
+    for ((repetition = 1; repetition <= repetitions; repetition++)); do
+        if (( repetition % 2 == 1 )); then arms=(native overlay-packed); else arms=(overlay-packed native); fi
         for arm in "${arms[@]}"; do
             tag="w$workers-r$repetition-$arm"
             art="$group/runs/$tag"
@@ -424,9 +512,32 @@ for workers in 1 16 32; do
                 if ! mountpoint -q "$mount_path" || ! kill -0 "$mount_pid" 2>/dev/null; then exit 1; fi
                 sync
                 sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'
-                "${compose[@]}" exec -T redis redis-cli -p "$redis_port" INFO commandstats >"$art/$mode/redis-before.txt"
+                begin_marker="brewfs-phase:$run_uuid:$tag:$mode:begin"
+                end_marker="brewfs-phase:$run_uuid:$tag:$mode:end"
+                if [[ "$diagnostic" == 1 ]]; then
+                    start_monitor "$art/$mode" "$end_marker"
+                fi
+                if [[ "$diagnostic" == 1 ]]; then
+                    python3 "$DIAGNOSTIC_HELPER" redis-snapshot --section commandstats --port "$redis_port" \
+                        --output "$art/$mode/redis-before.txt" \
+                        --timing-output "$art/$mode/redis-commandstats-before.timing.json"
+                else
+                    "${compose[@]}" exec -T redis redis-cli -p "$redis_port" INFO commandstats >"$art/$mode/redis-before.txt"
+                fi
+                if [[ "$diagnostic" == 1 ]]; then
+                    python3 "$DIAGNOSTIC_HELPER" redis-snapshot --section CPU --port "$redis_port" \
+                        --output "$art/$mode/redis-cpu-before.txt" \
+                        --timing-output "$art/$mode/redis-cpu-before.timing.json"
+                    if [[ "$arm" == overlay-packed ]]; then
+                        python3 "$DIAGNOSTIC_HELPER" snapshot --pid "$mount_pid" \
+                            --log "$art/brewfs.log" --output "$art/$mode/entity-before.json"
+                    fi
+                    python3 "$DIAGNOSTIC_HELPER" process-snapshot --pid "$mount_pid" \
+                        --output "$art/$mode/process-cpu-before.json"
+                    "${compose[@]}" exec -T redis redis-cli -p "$redis_port" ECHO "$begin_marker" >"$art/$mode/monitor-begin.txt"
+                fi
                 command=(sudo -n python3 "$ROOT/tools/perf/smallfiles_rw.py" --root "$mount_path" \
-                    --subdir rw --mode "$mode" --files 2000 --file-bytes 16384 \
+                    --subdir rw --mode "$mode" --files "$file_count" --file-bytes 16384 \
                     --workers "$workers" --seed 20261001 --label "$arm" --json-output "$art/$mode/summary.json")
                 printf '%q ' "${command[@]}" >>"$group/commands.log"
                 printf '\n' >>"$group/commands.log"
@@ -435,19 +546,51 @@ for workers in 1 16 32; do
                 if wait "$workload_pid"; then step_rc=0; else step_rc=$?; fi
                 workload_pid=""
                 if ! mountpoint -q "$mount_path" || ! kill -0 "$mount_pid" 2>/dev/null; then step_rc=1; fi
+                if [[ "$diagnostic" == 1 ]]; then
+                    "${compose[@]}" exec -T redis redis-cli -p "$redis_port" ECHO "$end_marker" >"$art/$mode/monitor-end.txt" || step_rc=1
+                    if kill -0 "$mount_pid" 2>/dev/null; then
+                        python3 "$DIAGNOSTIC_HELPER" process-snapshot --pid "$mount_pid" \
+                            --output "$art/$mode/process-cpu-after.json" || step_rc=1
+                    fi
+                    if [[ "$arm" == overlay-packed ]] && kill -0 "$mount_pid" 2>/dev/null; then
+                        python3 "$DIAGNOSTIC_HELPER" snapshot --pid "$mount_pid" \
+                            --log "$art/brewfs.log" --output "$art/$mode/entity-after.json" || step_rc=1
+                    fi
+                    python3 "$DIAGNOSTIC_HELPER" redis-snapshot --section CPU --port "$redis_port" \
+                        --output "$art/$mode/redis-cpu-after.txt" \
+                        --timing-output "$art/$mode/redis-cpu-after.timing.json" || step_rc=1
+                fi
                 printf '%s\n' "$step_rc" >"$art/$mode/exit.txt"
                 if [[ -e "$art/$mode/summary.json" ]]; then
                     sudo -n chown "$(id -u):$(id -g)" "$art/$mode/summary.json"
                 fi
-                python3 - "$art/$mode/summary.json" <<'PY'
+                python3 - "$art/$mode/summary.json" "$measurement_kind" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 if path.exists():
     row = json.loads(path.read_text())
-    row['status'] = 'preliminary'
+    row['status'] = sys.argv[2]
     path.write_text(json.dumps(row, indent=2) + '\n')
 PY
-                "${compose[@]}" exec -T redis redis-cli -p "$redis_port" INFO commandstats >"$art/$mode/redis-after.txt"
+                if [[ "$diagnostic" == 1 ]]; then
+                    python3 "$DIAGNOSTIC_HELPER" redis-snapshot --section commandstats --port "$redis_port" \
+                        --output "$art/$mode/redis-after.txt" \
+                        --timing-output "$art/$mode/redis-commandstats-after.timing.json" || step_rc=1
+                else
+                    "${compose[@]}" exec -T redis redis-cli -p "$redis_port" INFO commandstats >"$art/$mode/redis-after.txt"
+                fi
+                if [[ "$diagnostic" == 1 ]]; then
+                    stop_monitor || step_rc=1
+                    if [[ -e "$art/$mode/summary.json" ]]; then
+                        python3 "$DIAGNOSTIC_HELPER" analyze --phase "$art/$mode" \
+                            --inventory "$group/redis-script-inventory.json" \
+                            --begin-marker "$begin_marker" --end-marker "$end_marker" \
+                            >"$art/$mode/redis-analysis.log" 2>&1 || step_rc=1
+                    else
+                        step_rc=1
+                    fi
+                    printf '%s\n' "$step_rc" >"$art/$mode/exit.txt"
+                fi
                 (( step_rc == 0 )) || { rc=$step_rc; break; }
             done
             stop_mount || rc=1

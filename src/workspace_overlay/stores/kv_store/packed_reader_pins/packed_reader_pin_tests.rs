@@ -39,6 +39,8 @@ struct PinMemoryBackend {
     /// Packed mutation view reads: bounded reads of the workspace record
     /// together with at least ten more view keys.
     view_reads: Arc<AtomicI64>,
+    /// All bounded reads, used to prove a bound immutable memo hit is local.
+    bounded_reads: Arc<AtomicI64>,
 }
 impl Default for PinMemoryBackend {
     fn default() -> Self {
@@ -58,6 +60,7 @@ impl Default for PinMemoryBackend {
             timed_reads: Default::default(),
             consistent_reads: Default::default(),
             view_reads: Default::default(),
+            bounded_reads: Default::default(),
         }
     }
 }
@@ -202,6 +205,7 @@ impl WorkspaceKvBackend for PinMemoryBackend {
         keys: &[Vec<u8>],
         limits: KvReadLimits,
     ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
+        self.bounded_reads.fetch_add(1, Ordering::SeqCst);
         limits.validate_keys(keys)?;
         if keys.len() >= 11 && keys[0].starts_with(b"ws/") {
             self.view_reads.fetch_add(1, Ordering::SeqCst);

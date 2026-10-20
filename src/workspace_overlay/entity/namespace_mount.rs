@@ -94,45 +94,26 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
             return Err(EntityError::Invalid("invalid create-open request".into()));
         }
         let this = self.clone();
-        tokio::spawn(async move {
-            let admission = this.session.admit()?;
-            let ids = BTreeSet::from([request.parent]);
-            let (_states, _guards) = this.lock_all(&ids).await;
-            let operation = Operation::Create(request);
-            for _ in 0..MAX_RETRIES {
-                let authority = this.authority().await?;
-                let mut p = Prepared::new(&this);
-                let inode = match p.prepare(&operation, &credentials, &ids, &authority).await {
-                    Err(EntityError::Conflict) => continue,
-                    Err(error @ EntityError::Backend(_)) => return Err(error),
-                    Err(error) => {
-                        if this.backend.commit(&authority, &p.read_plan()).await?
-                            == CommitOutcome::Conflict
-                        {
-                            continue;
-                        }
-                        return Err(error);
-                    }
-                    Ok(Some(inode)) => inode,
-                    Ok(None) => return Err(EntityError::Corrupt("create lacks inode".into())),
-                };
-                // This new inode has not been published yet. Retain its registry
-                // state before committing, while the parent lock excludes unlink.
+        tokio::spawn(crate::workspace_overlay::entity::diagnostics::inherit(
+            async move {
+                let admission = this.session.admit()?;
+                let ids = BTreeSet::from([request.parent]);
+                let (_states, _guards) = this.lock_all(&ids).await;
+                let inode = this.create_locked(&request, &credentials).await?;
+                // The parent lock remains held from publication until the open
+                // capability is retained, excluding unlink of the new name.
                 let state = this.inode_lock(inode.ino);
-                if this.backend.commit(&authority, &p.plan()).await? == CommitOutcome::Committed {
-                    state.handles.fetch_add(1, Ordering::AcqRel);
-                    let handle = EntityHandle {
-                        ino: inode.ino,
-                        namespace: this.keys.prefix().to_vec(),
-                        access,
-                        state,
-                        _admission: admission,
-                    };
-                    return Ok((inode, handle));
-                }
-            }
-            Err(EntityError::Busy)
-        })
+                state.handles.fetch_add(1, Ordering::AcqRel);
+                let handle = EntityHandle {
+                    ino: inode.ino,
+                    namespace: this.keys.prefix().to_vec(),
+                    access,
+                    state,
+                    _admission: admission,
+                };
+                Ok((inode, handle))
+            },
+        ))
         .await
         .map_err(|e| EntityError::Backend(format!("owned create-open task failed: {e}")))?
     }

@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use super::backend::{
-    CommitOutcome, EntityBackend, EntityPlan, RowCheck, RowWrite, TransactionAuthority,
+    CommitOutcome, EntityBackend, EntityPlan, RowCheck, RowSnapshot, RowWrite, TransactionAuthority,
 };
 use super::codec::{decode, encode};
 use super::keys::EntityKeys;
@@ -88,6 +88,10 @@ pub struct WriterSession {
     namespace_id: Uuid,
     namespace_prefix: Vec<u8>,
     identity: LeaseIdentity,
+    /// Immutable identity authenticated when this writer incarnation starts.
+    /// Runtime reads may refresh authority, but cannot retarget retained handles
+    /// or lower cache entries to another manifest or inode namespace boundary.
+    lower: LowerBinding,
     admission: Arc<Admission>,
     /// All wrappers for this writer share affected-inode coordination.
     pub(super) inode_locks: Arc<Mutex<BTreeMap<i64, Weak<super::namespace::InodeLock>>>>,
@@ -136,6 +140,9 @@ impl WriterSession {
     }
     pub fn identity(&self) -> LeaseIdentity {
         self.identity
+    }
+    pub(super) fn lower_binding(&self) -> &LowerBinding {
+        &self.lower
     }
     pub fn is_closed(&self) -> bool {
         self.admission
@@ -357,28 +364,37 @@ impl<B: EntityBackend> Lifecycle<B> {
         committed(self.backend.commit(&authority, &plan).await?)
     }
 
-    async fn runtime_rows(
-        &self,
-        session: &WriterSession,
-    ) -> Result<(NamespaceDescriptor, WriterLease, Vec<RowCheck>, i64)> {
+    /// Canonical authority prefix for a combined authority/entity snapshot.
+    /// The session's immutable binding supplies the keys, so discovering them
+    /// never needs a separate descriptor read.
+    pub(super) fn authority_keys(&self, session: &WriterSession) -> Result<Vec<Vec<u8>>> {
         if !session.matches_keys(&self.keys) {
             return Err(EntityError::Fenced);
         }
-        let initial = self.backend.read(&[self.keys.descriptor()]).await?;
-        let descriptor =
-            self.decode_descriptor(initial.rows[0].as_deref().ok_or(EntityError::Fenced)?)?;
-        let keys = vec![
+        Ok(vec![
             self.keys.descriptor(),
             self.keys.lease(),
             self.keys.lower_pin(),
             self.keys
-                .lower_owner(&descriptor.lower.manifest_digest, self.keys.namespace_id()),
-            self.keys.lower_registry(&descriptor.lower.manifest_digest),
-        ];
-        let snapshot = self.backend.read(&keys).await?;
+                .lower_owner(&session.lower.manifest_digest, self.keys.namespace_id()),
+            self.keys.lower_registry(&session.lower.manifest_digest),
+        ])
+    }
+
+    fn decode_runtime_rows(
+        &self,
+        session: &WriterSession,
+        keys: &[Vec<u8>],
+        snapshot: RowSnapshot,
+    ) -> Result<(NamespaceDescriptor, WriterLease, Vec<RowCheck>, i64)> {
+        if snapshot.rows.len() != keys.len() {
+            return Err(EntityError::Corrupt(
+                "invalid authority snapshot size".into(),
+            ));
+        }
         let current =
             self.decode_descriptor(snapshot.rows[0].as_deref().ok_or(EntityError::Fenced)?)?;
-        if descriptor != current
+        if current.lower != session.lower
             || current.state != NamespaceState::Active
             || current.active_lease != Some(session.identity)
         {
@@ -396,17 +412,43 @@ impl<B: EntityBackend> Lifecycle<B> {
         Ok((
             current,
             lease,
-            checked_rows(&keys, snapshot.rows),
+            checked_rows(keys, snapshot.rows),
             snapshot.now_ns,
         ))
     }
 
-    pub async fn authority(&self, session: &WriterSession) -> Result<TransactionAuthority> {
+    async fn runtime_rows(
+        &self,
+        session: &WriterSession,
+    ) -> Result<(NamespaceDescriptor, WriterLease, Vec<RowCheck>, i64)> {
+        let keys = self.authority_keys(session)?;
+        let snapshot = self.backend.read(&keys).await?;
+        self.decode_runtime_rows(session, &keys, snapshot)
+    }
+
+    /// Validate the authority prefix from one backend snapshot. The eventual
+    /// commit still checks these exact rows and backend-time lease expiry.
+    pub(super) fn authority_from_snapshot(
+        &self,
+        session: &WriterSession,
+        snapshot: RowSnapshot,
+    ) -> Result<TransactionAuthority> {
         if session.is_closed() {
             return Err(EntityError::Fenced);
         }
-        let (_, lease, checks, _) = self.runtime_rows(session).await?;
+        let keys = self.authority_keys(session)?;
+        let (_, lease, checks, _) = self.decode_runtime_rows(session, &keys, snapshot)?;
         TransactionAuthority::from_validated(checks, None, Some(lease.expires_ns))
+    }
+
+    pub async fn authority(&self, session: &WriterSession) -> Result<TransactionAuthority> {
+        let _diagnostic = super::diagnostics::Span::start("lifecycle.authority");
+        if session.is_closed() {
+            return Err(EntityError::Fenced);
+        }
+        let keys = self.authority_keys(session)?;
+        let snapshot = self.backend.read(&keys).await?;
+        self.authority_from_snapshot(session, snapshot)
     }
 
     /// Only a never-mounted Ready namespace can be acquired. Lease expiry alone
@@ -475,6 +517,7 @@ impl<B: EntityBackend> Lifecycle<B> {
             namespace_id: self.keys.namespace_id(),
             namespace_prefix: self.keys.prefix().to_vec(),
             identity,
+            lower: current.lower,
             admission: Arc::default(),
             inode_locks: Arc::default(),
             io_failures: Arc::default(),
@@ -516,6 +559,9 @@ impl<B: EntityBackend> Lifecycle<B> {
             .await?;
         let descriptor =
             self.decode_descriptor(retry.rows[0].as_deref().ok_or(EntityError::Fenced)?)?;
+        if descriptor.lower != session.lower {
+            return Err(EntityError::Fenced);
+        }
         if descriptor.state == NamespaceState::Quiescent {
             let record: MaintenanceRecord =
                 decode(retry.rows[1].as_deref().ok_or(EntityError::Fenced)?)?;
@@ -814,6 +860,7 @@ impl<B: EntityBackend> Lifecycle<B> {
             namespace_id: self.keys.namespace_id(),
             namespace_prefix: self.keys.prefix().to_vec(),
             identity,
+            lower: descriptor.lower,
             admission: Arc::default(),
             inode_locks: Arc::default(),
             io_failures: Arc::default(),

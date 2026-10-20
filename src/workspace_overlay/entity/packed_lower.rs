@@ -4,11 +4,15 @@
 //! including its borrowed native roots. This module grants no mount admission.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use futures_util::{StreamExt, TryStreamExt, stream};
 use uuid::Uuid;
 
+use super::diagnostics::Span;
+use super::keys::EntityKeys;
+use super::lifecycle::{OperationGuard, WriterSession};
 use super::model::{
     ChunkMap, EntityDentry, EntityInode, EntityKind, LowerBinding, validate_name,
     validate_xattr_name,
@@ -20,7 +24,7 @@ use crate::workspace_overlay::error::WorkspaceError;
 use crate::workspace_overlay::packed_v3::PackedWireError;
 use crate::workspace_overlay::packed_v3::directory_key;
 use crate::workspace_overlay::packed_v3::wire005::{
-    AuthenticatedV3Snapshot, V3IndexReader, V3MountBudget,
+    AuthenticatedV3Snapshot, V3ColdAttributes, V3IndexReader, V3MountBudget,
 };
 use crate::workspace_overlay::publish::binding::VerifiedPackedLower;
 use crate::workspace_overlay::stores::kv_backend::WorkspaceKvBackend;
@@ -32,6 +36,9 @@ use crate::workspace_overlay::stores::kv_store::packed_reader_pins::{
 const ALLOCATION_LIMIT: usize = 32 << 20;
 const DIRECTORY_PAGE: usize = 256;
 
+#[path = "packed_lower_cache.rs"]
+mod memo;
+
 pub struct PackedLower<O: ObjectBackend + Clone, K> {
     store: Arc<KvWorkspaceStore<K>>,
     owner: PackedEntityLowerOwner,
@@ -39,6 +46,8 @@ pub struct PackedLower<O: ObjectBackend + Clone, K> {
     client: ObjectClient<O>,
     snapshot: AuthenticatedV3Snapshot,
     reader: V3IndexReader<O>,
+    memo: memo::Memo,
+    session: OnceLock<WriterSession>,
 }
 
 fn packed_error(error: PackedWireError) -> EntityError {
@@ -119,11 +128,33 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K
             client,
             snapshot,
             reader,
+            memo: memo::Memo::new(),
+            session: OnceLock::new(),
         })
     }
 
     pub fn owner(&self) -> &PackedEntityLowerOwner {
         &self.owner
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn clear_memos_for_test(&self) {
+        self.memo.clear().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn memo_fill_count_for_test(&self) -> u64 {
+        self.memo.fills()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_memo_capacity_for_test(&mut self, bytes: u64) {
+        self.memo = memo::Memo::with_capacity(bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn retained_memo_bytes_for_test(&self) -> u64 {
+        self.memo.retained_bytes().await
     }
 
     /// Reopen an existing durable owner without reviving its expired source
@@ -175,10 +206,91 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K
             client,
             snapshot,
             reader,
+            memo: memo::Memo::new(),
+            session: OnceLock::new(),
         })
     }
 
+    /// Bind a fresh immutable memo view to one already acquired writer session.
+    /// The durable owner is terminally releasable only after this exact session
+    /// is closed/drained and namespace deletion completes. Per-call local
+    /// admission therefore protects both cache hits and asynchronous cache fills.
+    /// Standalone SDK callers retain the conservative remote owner checks.
+    pub(crate) async fn bind_session(
+        &self,
+        session: &WriterSession,
+        keys: &EntityKeys,
+        chunk_size: u64,
+    ) -> Result<()> {
+        if self.owner.volume_id() != keys.volume_id()
+            || self.owner.namespace_id() != keys.namespace_id()
+            || !session.matches_keys(keys)
+            || session.lower_binding() != &self.binding
+            || self.session.get().is_some()
+            || chunk_size == 0
+            || chunk_size > super::data::MAX_IO_BYTES as u64
+        {
+            return Err(EntityError::Fenced);
+        }
+        let _admission = session.admit()?;
+        self.validate_owner().await?;
+        self.session
+            .set(session.clone())
+            .map_err(|_| EntityError::Fenced)?;
+        self.warm_root(chunk_size).await
+    }
+
+    async fn begin_call(&self) -> Result<Option<OperationGuard>> {
+        if let Some(session) = self.session.get() {
+            return session.admit().map(Some);
+        }
+        self.validate_owner().await?;
+        Ok(None)
+    }
+
+    async fn end_call(&self, admission: &Option<OperationGuard>) -> Result<()> {
+        if admission.is_none() {
+            self.validate_owner().await?;
+        }
+        Ok(())
+    }
+
+    /// Warm the known root and a bounded first directory page asynchronously.
+    /// Foreground demand and warmup use the same single-flight memo loaders.
+    /// No detached task can outlive this operation's session admission.
+    async fn warm_root(&self, chunk_size: u64) -> Result<()> {
+        let _span = Span::start("packed.memo.warm_root");
+        let admission = self.begin_call().await?;
+        let root = self.binding.root_ino;
+        tokio::try_join!(self.inode_inner(root), self.cold_inner(root))?;
+        let entries = match self.directory_inner(root).await {
+            Ok(entries) => entries,
+            // This optional warmup cannot turn the existing bounded readdir
+            // limit into a mount-admission limit for otherwise valid lookups.
+            Err(EntityError::Unsupported(
+                "packed directory exceeds entity entry bound"
+                | "packed directory exceeds memo byte bound",
+            )) => return self.end_call(&admission).await,
+            Err(error) => return Err(error),
+        };
+        stream::iter(entries.iter().take(32))
+            .map(|(_, entry)| async move {
+                if let EntityDentry::Present { ino, kind } = entry {
+                    tokio::try_join!(self.inode_inner(*ino), self.cold_inner(*ino))?;
+                    if *kind == EntityKind::File {
+                        self.chunk(*ino, 0, chunk_size).await?;
+                    }
+                }
+                Ok::<_, EntityError>(())
+            })
+            .buffer_unordered(4)
+            .try_collect::<Vec<_>>()
+            .await?;
+        self.end_call(&admission).await
+    }
+
     async fn validate_owner(&self) -> Result<()> {
+        let _span = Span::start("packed.owner_validation");
         self.store
             .validate_packed_entity_lower(&self.owner)
             .await
@@ -201,6 +313,40 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K
     }
 
     async fn inode_inner(&self, ino: i64) -> Result<Option<EntityInode>> {
+        let _span = Span::start("packed.inode_inner");
+        let value = self
+            .memo
+            .get(memo::Key::Inode(ino), async {
+                Ok(memo::Value::Inode(
+                    self.load_inode(ino).await?.map(Arc::new),
+                ))
+            })
+            .await?;
+        match value.as_ref() {
+            memo::Value::Inode(inode) => Ok(inode.as_deref().cloned()),
+            _ => Err(EntityError::Corrupt("lower inode memo type".into())),
+        }
+    }
+
+    async fn cold_inner(&self, ino: i64) -> Result<Option<Arc<V3ColdAttributes>>> {
+        let value = self
+            .memo
+            .get(memo::Key::Cold(ino), async {
+                let cold = self
+                    .snapshot
+                    .cold_attributes(&self.client, &self.reader, ino as u64)
+                    .await
+                    .map_err(packed_error)?;
+                Ok(memo::Value::Cold(cold.map(Arc::new)))
+            })
+            .await?;
+        match value.as_ref() {
+            memo::Value::Cold(cold) => Ok(cold.clone()),
+            _ => Err(EntityError::Corrupt("lower cold memo type".into())),
+        }
+    }
+
+    async fn load_inode(&self, ino: i64) -> Result<Option<EntityInode>> {
         if !self.checked_ino(ino)? {
             return Ok(None);
         }
@@ -245,11 +391,9 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K
         let kind = kind(hot.kind)?;
         let symlink_target = if kind == EntityKind::Symlink {
             Some(
-                self.snapshot
-                    .cold_attributes(&self.client, &self.reader, ino as u64)
-                    .await
-                    .map_err(packed_error)?
-                    .and_then(|cold| cold.symlink_target)
+                self.cold_inner(ino)
+                    .await?
+                    .and_then(|cold| cold.symlink_target.clone())
                     .ok_or_else(|| EntityError::Corrupt("packed symlink has no target".into()))?,
             )
         } else {
@@ -316,71 +460,135 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLower
     }
 
     async fn inode(&self, ino: i64) -> Result<Option<EntityInode>> {
-        self.validate_owner().await?;
+        let _span = Span::start("packed.inode");
+        let admission = self.begin_call().await?;
         let result = self.inode_inner(ino).await?;
-        self.validate_owner().await?;
+        self.end_call(&admission).await?;
         Ok(result)
     }
 
     async fn dentry(&self, parent: i64, name: &[u8]) -> Result<Option<EntityDentry>> {
+        let _span = Span::start("packed.dentry");
         validate_name(name)?;
-        self.validate_owner().await?;
-        self.require_directory(parent).await?;
-        let entry = self
-            .snapshot
-            .lookup_dentry(
-                &self.client,
-                &self.reader,
-                self.directory_key(parent),
-                name,
-                ALLOCATION_LIMIT,
-            )
-            .await
-            .map_err(packed_error)?;
-        let result = entry
-            .map(|entry| self.dentry_value(entry.inode, entry.kind))
-            .transpose()?;
-        self.validate_owner().await?;
+        let admission = self.begin_call().await?;
+        let value = self
+            .memo
+            .get(memo::Key::Dentry(parent, name.to_vec()), async {
+                self.require_directory(parent).await?;
+                // A retained complete immutable directory proves both presence
+                // and absence without fetching a group page for each new name.
+                if let Some(directory) = self.memo.peek(&memo::Key::Directory(parent)).await {
+                    let memo::Value::Directory(entries) = directory.as_ref() else {
+                        return Err(EntityError::Corrupt("lower directory memo type".into()));
+                    };
+                    return Ok(memo::Value::Dentry(
+                        entries
+                            .iter()
+                            .find(|(entry_name, _)| entry_name == name)
+                            .map(|(_, entry)| entry.clone()),
+                    ));
+                }
+                let entry = self
+                    .snapshot
+                    .lookup_dentry(
+                        &self.client,
+                        &self.reader,
+                        self.directory_key(parent),
+                        name,
+                        ALLOCATION_LIMIT,
+                    )
+                    .await
+                    .map_err(packed_error)?;
+                Ok(memo::Value::Dentry(
+                    entry
+                        .map(|entry| self.dentry_value(entry.inode, entry.kind))
+                        .transpose()?,
+                ))
+            })
+            .await?;
+        let memo::Value::Dentry(result) = value.as_ref() else {
+            return Err(EntityError::Corrupt("lower dentry memo type".into()));
+        };
+        self.end_call(&admission).await?;
+        let result = result.clone();
         Ok(result)
     }
 
     async fn xattr(&self, ino: i64, name: &[u8]) -> Result<Option<Vec<u8>>> {
+        let _span = Span::start("packed.xattr");
         validate_xattr_name(name)?;
-        self.validate_owner().await?;
+        let admission = self.begin_call().await?;
         self.inode_inner(ino).await?.ok_or(EntityError::NotFound)?;
-        let cold = self
-            .snapshot
-            .cold_attributes(&self.client, &self.reader, ino as u64)
-            .await
-            .map_err(packed_error)?;
+        let cold = self.cold_inner(ino).await?;
         let result = cold.and_then(|cold| {
             cold.xattrs
-                .into_iter()
+                .iter()
                 .find(|attr| attr.name == name)
-                .map(|attr| attr.value)
+                .map(|attr| attr.value.clone())
         });
-        self.validate_owner().await?;
+        self.end_call(&admission).await?;
         Ok(result)
     }
 
     async fn chunk(&self, ino: i64, chunk_index: u64, chunk_size: u64) -> Result<Option<ChunkMap>> {
-        self.validate_owner().await?;
-        let row = self.inode_inner(ino).await?.ok_or(EntityError::NotFound)?;
-        if row.kind != EntityKind::File {
-            return Err(EntityError::IsDirectory);
-        }
-        let start = chunk_index
-            .checked_mul(chunk_size)
-            .ok_or(EntityError::Overflow)?;
-        let map = ChunkMap::inherited(chunk_size, &self.binding, ino, start, row.size)?;
-        self.validate_owner().await?;
-        Ok(Some(map))
+        let _span = Span::start("packed.chunk");
+        let admission = self.begin_call().await?;
+        let value = self
+            .memo
+            .get(memo::Key::Chunk(ino, chunk_index, chunk_size), async {
+                let row = self.inode_inner(ino).await?.ok_or(EntityError::NotFound)?;
+                if row.kind != EntityKind::File {
+                    return Err(EntityError::IsDirectory);
+                }
+                let start = chunk_index
+                    .checked_mul(chunk_size)
+                    .ok_or(EntityError::Overflow)?;
+                Ok(memo::Value::Chunk(Arc::new(ChunkMap::inherited(
+                    chunk_size,
+                    &self.binding,
+                    ino,
+                    start,
+                    row.size,
+                )?)))
+            })
+            .await?;
+        let memo::Value::Chunk(map) = value.as_ref() else {
+            return Err(EntityError::Corrupt("lower chunk memo type".into()));
+        };
+        self.end_call(&admission).await?;
+        Ok(Some(map.as_ref().clone()))
     }
 
     async fn readdir(&self, ino: i64) -> Result<Vec<(Vec<u8>, EntityDentry)>> {
-        self.validate_owner().await?;
+        let mut span = Span::start("packed.readdir");
+        let admission = self.begin_call().await?;
+        let entries = self.directory_inner(ino).await?;
+        self.end_call(&admission).await?;
+        span.add_rows(entries.len() as u64);
+        Ok(entries.as_ref().clone())
+    }
+}
+
+impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K> {
+    async fn directory_inner(&self, ino: i64) -> Result<Arc<Vec<(Vec<u8>, EntityDentry)>>> {
+        let value = self
+            .memo
+            .get(memo::Key::Directory(ino), async {
+                Ok(memo::Value::Directory(Arc::new(
+                    self.load_directory(ino).await?,
+                )))
+            })
+            .await?;
+        match value.as_ref() {
+            memo::Value::Directory(entries) => Ok(entries.clone()),
+            _ => Err(EntityError::Corrupt("lower directory memo type".into())),
+        }
+    }
+
+    async fn load_directory(&self, ino: i64) -> Result<Vec<(Vec<u8>, EntityDentry)>> {
         self.require_directory(ino).await?;
         let mut result = Vec::new();
+        let mut retained_bytes = 0usize;
         let mut names = BTreeSet::new();
         loop {
             let limit = DIRECTORY_PAGE.min(MAX_DIRECTORY_ENTRIES + 1 - result.len());
@@ -406,6 +614,14 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLower
             }
             for entry in entries {
                 validate_name(&entry.name)?;
+                retained_bytes = retained_bytes
+                    .saturating_add(entry.name.len())
+                    .saturating_add(128);
+                if retained_bytes > memo::MAX_DIRECTORY_BYTES {
+                    return Err(EntityError::Unsupported(
+                        "packed directory exceeds memo byte bound",
+                    ));
+                }
                 if !names.insert(entry.name.clone()) {
                     return Err(EntityError::Corrupt(
                         "duplicate packed directory name".into(),
@@ -415,7 +631,6 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLower
                 result.push((entry.name, value));
             }
         }
-        self.validate_owner().await?;
         Ok(result)
     }
 }
@@ -425,12 +640,13 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLowerDa
     for PackedLower<O, K>
 {
     async fn read_range(&self, ino: i64, offset: u64, length: usize) -> Result<Vec<u8>> {
+        let _span = Span::start("packed.read_range");
         if length > ALLOCATION_LIMIT {
             return Err(EntityError::Invalid(
                 "packed lower read exceeds allocation bound".into(),
             ));
         }
-        self.validate_owner().await?;
+        let admission = self.begin_call().await?;
         let row = self.inode_inner(ino).await?.ok_or(EntityError::NotFound)?;
         if row.kind != EntityKind::File {
             return Err(EntityError::IsDirectory);
@@ -455,7 +671,7 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLowerDa
             )
             .await
             .map_err(packed_error)?;
-        self.validate_owner().await?;
+        self.end_call(&admission).await?;
         Ok(output)
     }
 }

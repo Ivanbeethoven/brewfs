@@ -323,6 +323,285 @@ async fn memory_backend_conformance() {
     .await;
 }
 
+fn create_request(keys: &EntityKeys, parent: i64, name: &[u8]) -> CreateAllocation {
+    CreateAllocation {
+        keys: keys.clone(),
+        inode: EntityInode {
+            ino: 1,
+            kind: EntityKind::File,
+            size: 0,
+            mode: 0o640,
+            uid: 123,
+            gid: 456,
+            rdev: 0,
+            nlink: 1,
+            atime_ns: 9007199254740993,
+            mtime_ns: 9007199254740995,
+            ctime_ns: 9007199254740997,
+            symlink_target: None,
+            parent_hint: Some(parent),
+            lower_visible_size: 0,
+            data_version: 0,
+        },
+        name: name.to_vec(),
+        xattrs: vec![(b"user.identity".to_vec(), b"1 9007199254740993".to_vec())],
+        lower_max_ino: 100,
+    }
+}
+
+fn create_plan(create: &CreateAllocation, parent: &[u8], dentry: Option<&[u8]>) -> EntityPlan {
+    let parent_key = create.keys.inode(create.inode.parent_hint.unwrap());
+    EntityPlan {
+        checks: vec![
+            check(parent_key.clone(), Some(parent)),
+            check(
+                create
+                    .keys
+                    .dentry(create.inode.parent_hint.unwrap(), &create.name),
+                dentry,
+            ),
+        ],
+        writes: vec![put(parent_key, b"updated-parent")],
+    }
+}
+
+async fn atomic_create_conformance<B: EntityBackend + 'static>(backend: Arc<B>, keys: EntityKeys) {
+    let authority = initialize(backend.as_ref(), &keys).await;
+    let setup = EntityPlan {
+        checks: vec![],
+        writes: (1001..=1032)
+            .map(|ino| put(keys.inode(ino), b"parent"))
+            .collect(),
+    };
+    assert_eq!(
+        backend.commit(&authority, &setup).await.unwrap(),
+        CommitOutcome::Committed
+    );
+    let mut tasks = tokio::task::JoinSet::new();
+    for parent in 1001..=1032 {
+        let backend = backend.clone();
+        let authority = authority.clone();
+        let create = create_request(&keys, parent, b"file-1");
+        tasks.spawn(async move {
+            let plan = create_plan(&create, b"parent", None);
+            let ino = backend
+                .commit_with_inode_allocation(&authority, &plan, &create)
+                .await
+                .unwrap()
+                .expect("independent parents must not conflict on allocation");
+            (ino, create)
+        });
+    }
+    let mut allocated = BTreeSet::new();
+    while let Some(result) = tasks.join_next().await {
+        let (ino, mut create) = result.unwrap();
+        assert!(allocated.insert(ino));
+        let rows = backend
+            .read(&[
+                keys.inode(ino),
+                keys.dentry(create.inode.parent_hint.unwrap(), &create.name),
+                keys.xattr(ino, b"user.identity"),
+            ])
+            .await
+            .unwrap()
+            .rows;
+        create.inode.ino = ino;
+        assert_eq!(
+            codec::decode::<UpperInode>(rows[0].as_deref().unwrap()).unwrap(),
+            UpperInode::Present(create.inode)
+        );
+        assert_eq!(
+            codec::decode::<EntityDentry>(rows[1].as_deref().unwrap()).unwrap(),
+            EntityDentry::Present {
+                ino,
+                kind: EntityKind::File
+            }
+        );
+        assert_eq!(
+            codec::decode::<EntityValue>(rows[2].as_deref().unwrap()).unwrap(),
+            EntityValue::Present(b"1 9007199254740993".to_vec())
+        );
+    }
+    assert_eq!(allocated, (9007199254740992..9007199254741024).collect());
+    let counter = keys.counter("inode");
+    let before = backend
+        .read(std::slice::from_ref(&counter))
+        .await
+        .unwrap()
+        .rows;
+    let exclusive = create_request(&keys, 1001, b"file-1");
+    assert_eq!(
+        backend
+            .commit_with_inode_allocation(
+                &authority,
+                &create_plan(&exclusive, b"updated-parent", None),
+                &exclusive,
+            )
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        backend
+            .read(std::slice::from_ref(&counter))
+            .await
+            .unwrap()
+            .rows,
+        before
+    );
+    let existing = backend
+        .read(&[keys.dentry(1001, &exclusive.name)])
+        .await
+        .unwrap()
+        .rows
+        .remove(0)
+        .unwrap();
+    assert_eq!(
+        backend
+            .commit_with_inode_allocation(
+                &authority,
+                &create_plan(&exclusive, b"updated-parent", Some(&existing)),
+                &exclusive,
+            )
+            .await,
+        Err(EntityError::Exists)
+    );
+    assert_eq!(
+        backend
+            .read(std::slice::from_ref(&counter))
+            .await
+            .unwrap()
+            .rows,
+        before
+    );
+
+    // Existing tombstones can be replaced only through their exact predicate.
+    let name = keys.dentry(1001, b"tombstone");
+    let tombstone = codec::encode(&EntityDentry::Whiteout).unwrap();
+    backend
+        .commit(
+            &authority,
+            &EntityPlan {
+                checks: vec![],
+                writes: vec![put(name, &tombstone)],
+            },
+        )
+        .await
+        .unwrap();
+    let recreated = create_request(&keys, 1001, b"tombstone");
+    assert!(
+        backend
+            .commit_with_inode_allocation(
+                &authority,
+                &create_plan(&recreated, b"updated-parent", Some(&tombstone)),
+                &recreated,
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // Collisions and exhausted counters are discovered before either allocator
+    // advancement or publication of parent/name/inode rows.
+    let fresh = create_request(&keys, 1001, b"must-not-appear");
+    let fresh_plan = create_plan(&fresh, b"updated-parent", None);
+    for (value, occupied) in [
+        (b"100".as_slice(), keys.inode(101)),
+        (b"101".as_slice(), keys.xattr(102, b"user.identity")),
+    ] {
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![put(counter.clone(), value), put(occupied, b"occupied")],
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            backend
+                .commit_with_inode_allocation(&authority, &fresh_plan, &fresh)
+                .await,
+            Err(EntityError::Corrupt(_))
+        ));
+        assert_eq!(
+            backend
+                .read(&[counter.clone(), keys.dentry(1001, &fresh.name)])
+                .await
+                .unwrap()
+                .rows,
+            vec![Some(value.to_vec()), None]
+        );
+    }
+    backend
+        .commit(
+            &authority,
+            &EntityPlan {
+                checks: vec![],
+                writes: vec![put(counter.clone(), b"9223372036854775806")],
+            },
+        )
+        .await
+        .unwrap();
+    let last = create_request(&keys, 1001, b"last-inode");
+    assert_eq!(
+        backend
+            .commit_with_inode_allocation(
+                &authority,
+                &create_plan(&last, b"updated-parent", None),
+                &last
+            )
+            .await
+            .unwrap(),
+        Some(i64::MAX)
+    );
+    assert_eq!(
+        backend
+            .commit_with_inode_allocation(&authority, &fresh_plan, &fresh)
+            .await,
+        Err(EntityError::Exhausted)
+    );
+    assert_eq!(
+        backend
+            .read(&[counter.clone(), keys.dentry(1001, &fresh.name)])
+            .await
+            .unwrap()
+            .rows,
+        vec![Some(b"9223372036854775807".to_vec()), None]
+    );
+    let now = backend.read(&[]).await.unwrap().now_ns;
+    let expired =
+        TransactionAuthority::from_validated(authority.checks.clone(), None, Some(now)).unwrap();
+    assert_eq!(
+        backend
+            .commit_with_inode_allocation(&expired, &fresh_plan, &fresh)
+            .await,
+        Err(EntityError::Fenced)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_atomic_create_allocation_conformance() {
+    atomic_create_conformance(
+        Arc::new(MemoryEntityBackend::new(100)),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires BREWFS_TEST_REDIS_URL pointing to an isolated local Redis"]
+async fn redis_atomic_create_allocation_conformance() {
+    let url = std::env::var("BREWFS_TEST_REDIS_URL").expect("BREWFS_TEST_REDIS_URL");
+    let volume = Uuid::new_v4();
+    atomic_create_conformance(
+        Arc::new(RedisEntityBackend::connect(&url, volume).await.unwrap()),
+        EntityKeys::new(volume, Uuid::new_v4()),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn memory_authority_uses_half_open_backend_time_and_rejects_plan_before_writes() {
     let backend = MemoryEntityBackend::new(10);

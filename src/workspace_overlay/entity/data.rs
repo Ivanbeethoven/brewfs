@@ -277,6 +277,7 @@ where
     }
 
     async fn inode(&self, ino: i64, rows: &mut ReadSet) -> Result<EntityInode> {
+        let _diagnostic = super::diagnostics::Span::start("data.resolve_inode");
         let bytes = rows
             .raw(
                 self.namespace.backend.as_ref(),
@@ -302,6 +303,7 @@ where
     }
 
     async fn chunk(&self, inode: &EntityInode, index: u64, rows: &mut ReadSet) -> Result<ChunkMap> {
+        let _diagnostic = super::diagnostics::Span::start("data.resolve_chunk");
         let bytes = rows
             .raw(
                 self.namespace.backend.as_ref(),
@@ -321,6 +323,7 @@ where
     }
 
     async fn recover_locked(&self, ino: i64) -> Result<()> {
+        let _diagnostic = super::diagnostics::Span::start("data.recover");
         let recovery = Recovery::new(self.namespace.backend.clone(), self.namespace.keys.clone());
         // The reference scanner admits at most 4096 chunk rows. One additional
         // step clears the intent after the final boundary/tail row.
@@ -382,10 +385,10 @@ where
         // cannot overtake an already admitted write waiting on this inode.
         let guard = self.namespace.lock_inode(ino).await;
         let this = self.clone();
-        tokio::spawn(async move {
+        tokio::spawn(super::diagnostics::inherit(async move {
             let (_handle, _admission, _guard) = (handle, admission, guard);
             this.write_locked(ino, offset, data, append).await
-        })
+        }))
         .await
         .map_err(|e| EntityError::Backend(format!("owned file write failed: {e}")))?
     }
@@ -397,6 +400,7 @@ where
         data: Bytes,
         append: bool,
     ) -> Result<WriteOutcome> {
+        let _diagnostic = super::diagnostics::Span::start("data.write");
         self.namespace.authority().await?;
         self.check_failure(ino)?;
         self.recover_locked(ino).await?;
@@ -446,6 +450,7 @@ where
     }
 
     async fn write_chunk_locked(&self, ino: i64, offset: u64, data: Bytes) -> Result<u64> {
+        let _diagnostic = super::diagnostics::Span::start("data.write_chunk");
         let ownership = Ownership::new(self.namespace.backend.clone(), self.namespace.keys.clone());
         let mut reserved = None;
         for _ in 0..MAX_RETRIES {
@@ -470,10 +475,16 @@ where
             size: data.len() as u64,
             sha256: Sha256::digest(&data).into(),
         };
-        self.objects
-            .put_object_create_only_durable(&self.namespace.keys.object(token.slice_id()), &data)
-            .await
-            .map_err(|e| EntityError::Backend(format!("entity object PUT failed: {e}")))?;
+        {
+            let _diagnostic = super::diagnostics::Span::start("object.put");
+            self.objects
+                .put_object_create_only_durable(
+                    &self.namespace.keys.object(token.slice_id()),
+                    &data,
+                )
+                .await
+                .map_err(|e| EntityError::Backend(format!("entity object PUT failed: {e}")))?;
+        }
         let mut uploaded = false;
         for _ in 0..MAX_RETRIES {
             match ownership.uploaded(&self.namespace.session, &token).await {
@@ -568,15 +579,16 @@ where
         let admission = self.namespace.session.admit()?;
         let guard = self.namespace.lock_inode(ino).await;
         let this = self.clone();
-        tokio::spawn(async move {
+        tokio::spawn(super::diagnostics::inherit(async move {
             let (_handle, _admission, _guard) = (handle, admission, guard);
             this.read_locked(ino, offset, length).await
-        })
+        }))
         .await
         .map_err(|e| EntityError::Backend(format!("owned file read failed: {e}")))?
     }
 
     async fn read_locked(&self, ino: i64, offset: u64, length: usize) -> Result<Vec<u8>> {
+        let _diagnostic = super::diagnostics::Span::start("data.read");
         for _ in 0..MAX_RETRIES {
             let authority = self.namespace.authority().await?;
             let mut rows = self.read_set()?;
@@ -710,17 +722,21 @@ where
     }
 
     async fn read_object(&self, descriptor: &ObjectDescriptor) -> Result<Vec<u8>> {
+        let _diagnostic = super::diagnostics::Span::start("object.read");
         let key = self.namespace.keys.object(descriptor.slice_id);
+        let head_diagnostic = super::diagnostics::Span::start("object.head");
         let size = self
             .objects
             .get_object_size_bounded(&key)
             .await
             .map_err(|e| EntityError::Backend(format!("entity object HEAD failed: {e}")))?;
+        drop(head_diagnostic);
         if size != Some(descriptor.size) {
             return Err(EntityError::Corrupt(
                 "entity object size or presence mismatch".into(),
             ));
         }
+        let get_diagnostic = super::diagnostics::Span::start("object.get");
         let mut stream = self
             .objects
             .get_object_range_stream(&key, 0, descriptor.size)
@@ -741,6 +757,7 @@ where
             }
             bytes.extend_from_slice(&part);
         }
+        drop(get_diagnostic);
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         if bytes.len() != descriptor.size as usize || digest != descriptor.sha256 {
             return Err(EntityError::Corrupt(
@@ -760,10 +777,10 @@ where
         let admission = self.namespace.session.admit()?;
         let guard = self.namespace.lock_inode(ino).await;
         let this = self.clone();
-        tokio::spawn(async move {
+        tokio::spawn(super::diagnostics::inherit(async move {
             let (_handle, _admission, _guard) = (handle, admission, guard);
             this.truncate_locked(ino, size).await
-        })
+        }))
         .await
         .map_err(|e| EntityError::Backend(format!("owned file truncate failed: {e}")))?
     }
@@ -821,7 +838,7 @@ where
         let admission = self.namespace.session.admit()?;
         let guard = self.namespace.lock_inode(ino).await;
         let this = self.clone();
-        tokio::spawn(async move {
+        tokio::spawn(super::diagnostics::inherit(async move {
             let (_handle, _admission, _guard) = (handle, admission, guard);
             this.namespace.authority().await?;
             this.check_failure(ino)?;
@@ -842,7 +859,7 @@ where
                 }
             }
             Err(EntityError::Busy)
-        })
+        }))
         .await
         .map_err(|e| EntityError::Backend(format!("owned file fsync failed: {e}")))?
     }
@@ -854,7 +871,7 @@ where
     pub async fn discard_step(self: &Arc<Self>, maintenance: &MaintenanceToken) -> Result<bool> {
         let this = self.clone();
         let maintenance = maintenance.clone();
-        tokio::spawn(async move {
+        tokio::spawn(super::diagnostics::inherit(async move {
             let recovery =
                 Recovery::new(this.namespace.backend.clone(), this.namespace.keys.clone());
             match recovery.discard_step(&maintenance).await? {
@@ -879,7 +896,7 @@ where
                     Ok(false)
                 }
             }
-        })
+        }))
         .await
         .map_err(|e| EntityError::Backend(format!("owned entity discard failed: {e}")))?
     }

@@ -298,6 +298,13 @@ impl<O: ObjectBackend + Clone + 'static> RedisEntityExperiment<O> {
         let session = lifecycle
             .acquire(Uuid::new_v4(), options.lease_ttl_ns)
             .await?;
+        if let Err(error) = lower
+            .bind_session(&session, &keys, options.chunk_size)
+            .await
+        {
+            let _ = lifecycle.enter_maintenance(&session).await;
+            return Err(error);
+        }
         let namespace = EntityNamespace::new(
             self.entity.clone(),
             lower.clone(),

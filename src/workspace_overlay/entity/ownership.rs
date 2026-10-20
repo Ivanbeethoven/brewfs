@@ -128,6 +128,7 @@ impl<B: EntityBackend> Ownership<B> {
 
     /// Uses the volume's plain unique-ID allocator; allocation gaps are safe.
     pub async fn allocate_upload(&self, session: &WriterSession, size: u64) -> Result<UploadToken> {
+        let _diagnostic = super::diagnostics::Span::start("ownership.allocate_upload");
         let _guard = session.admit()?;
         let authority = self.lifecycle.authority(session).await?;
         let slice_id = self
@@ -145,6 +146,7 @@ impl<B: EntityBackend> Ownership<B> {
         slice_id: u64,
         size: u64,
     ) -> Result<UploadToken> {
+        let _diagnostic = super::diagnostics::Span::start("ownership.register_upload");
         let admission = Arc::new(session.admit()?);
         if slice_id == 0 || slice_id > i64::MAX as u64 || size == 0 {
             return Err(EntityError::Invalid("invalid upload identity".into()));
@@ -191,6 +193,7 @@ impl<B: EntityBackend> Ownership<B> {
     /// The storage adapter calls this only after its durable PUT acknowledgment.
     /// It is not itself evidence that any transport or VFS fsync has completed.
     pub async fn uploaded(&self, session: &WriterSession, token: &UploadToken) -> Result<()> {
+        let _diagnostic = super::diagnostics::Span::start("ownership.uploaded");
         let _guard = session.admit()?;
         if token.namespace_id != self.keys.namespace_id()
             || token.namespace_prefix != self.keys.prefix()

@@ -12,7 +12,8 @@ use tokio::sync::{Barrier, Notify};
 use uuid::Uuid;
 
 use super::backend::{
-    CommitOutcome, EntityBackend, EntityPlan, RowCheck, RowSnapshot, RowWrite, TransactionAuthority,
+    CommitOutcome, CreateAllocation, EntityBackend, EntityPlan, RowCheck, RowSnapshot, RowWrite,
+    TransactionAuthority,
 };
 use super::codec;
 use super::keys::EntityKeys;
@@ -1050,6 +1051,10 @@ struct PausingBackend {
     resume: Notify,
     lose_reply: AtomicBool,
     mutation_commits: AtomicUsize,
+    reads: AtomicUsize,
+    commits: AtomicUsize,
+    create_commits: AtomicUsize,
+    allocations: AtomicUsize,
 }
 
 impl PausingBackend {
@@ -1061,6 +1066,10 @@ impl PausingBackend {
             resume: Notify::new(),
             lose_reply: AtomicBool::new(false),
             mutation_commits: AtomicUsize::new(0),
+            reads: AtomicUsize::new(0),
+            commits: AtomicUsize::new(0),
+            create_commits: AtomicUsize::new(0),
+            allocations: AtomicUsize::new(0),
         }
     }
     fn pause(&self, key: Vec<u8>) {
@@ -1074,24 +1083,21 @@ impl PausingBackend {
     fn resume(&self) {
         self.resume.notify_one();
     }
-}
-
-#[async_trait]
-impl EntityBackend for PausingBackend {
-    async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
-        self.inner.read(keys).await
+    fn reset_counts(&self) {
+        self.reads.store(0, Ordering::SeqCst);
+        self.commits.store(0, Ordering::SeqCst);
+        self.create_commits.store(0, Ordering::SeqCst);
+        self.allocations.store(0, Ordering::SeqCst);
     }
-    async fn commit(
-        &self,
-        authority: &TransactionAuthority,
-        plan: &EntityPlan,
-    ) -> Result<CommitOutcome> {
+    async fn before_commit(&self, plan: &EntityPlan, generated_dentry: Option<&[u8]>) {
         let pause = {
             let mut target = self.pause_key.lock().unwrap();
             if target.as_ref().is_some_and(|key| {
-                plan.writes
-                    .iter()
-                    .any(|write| write.key() == key.as_slice())
+                generated_dentry == Some(key.as_slice())
+                    || plan
+                        .writes
+                        .iter()
+                        .any(|write| write.key() == key.as_slice())
             }) {
                 target.take();
                 true
@@ -1103,23 +1109,177 @@ impl EntityBackend for PausingBackend {
             self.entered.notify_one();
             self.resume.notified().await;
         }
+    }
+    fn mutation_committed(&self) -> Result<()> {
+        self.mutation_commits.fetch_add(1, Ordering::SeqCst);
+        if self.lose_reply.swap(false, Ordering::SeqCst) {
+            return Err(EntityError::Backend(
+                "injected committed response loss".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl EntityBackend for PausingBackend {
+    async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.read(keys).await
+    }
+    async fn commit(
+        &self,
+        authority: &TransactionAuthority,
+        plan: &EntityPlan,
+    ) -> Result<CommitOutcome> {
+        self.commits.fetch_add(1, Ordering::SeqCst);
+        self.before_commit(plan, None).await;
         let outcome = self.inner.commit(authority, plan).await?;
         if outcome == CommitOutcome::Committed && !plan.writes.is_empty() {
-            self.mutation_commits.fetch_add(1, Ordering::SeqCst);
-            if self.lose_reply.swap(false, Ordering::SeqCst) {
-                return Err(EntityError::Backend(
-                    "injected committed response loss".into(),
-                ));
-            }
+            self.mutation_committed()?;
         }
         Ok(outcome)
     }
+    async fn commit_with_inode_allocation(
+        &self,
+        authority: &TransactionAuthority,
+        plan: &EntityPlan,
+        create: &CreateAllocation,
+    ) -> Result<Option<i64>> {
+        self.create_commits.fetch_add(1, Ordering::SeqCst);
+        let dentry = create
+            .keys
+            .dentry(create.inode.parent_hint.unwrap(), &create.name);
+        self.before_commit(plan, Some(&dentry)).await;
+        let inode = self
+            .inner
+            .commit_with_inode_allocation(authority, plan, create)
+            .await?;
+        if inode.is_some() {
+            self.mutation_committed()?;
+        }
+        Ok(inode)
+    }
     async fn allocate(&self, authority: &TransactionAuthority, key: &[u8]) -> Result<u64> {
+        self.allocations.fetch_add(1, Ordering::SeqCst);
         self.inner.allocate(authority, key).await
     }
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.inner.scan_prefix(prefix, limit).await
     }
+}
+
+#[tokio::test]
+async fn known_parent_create_and_create_open_use_one_read_and_one_atomic_publication() {
+    let backend = Arc::new(PausingBackend::new());
+    let fixture = attach(
+        backend.clone(),
+        Arc::new(MemoryLower::empty()),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+    let parent = fixture
+        .ns
+        .create(request(1, b"parent", EntityKind::Directory), root())
+        .await
+        .unwrap();
+    for create_open in [false, true] {
+        backend.reset_counts();
+        let name = if create_open {
+            b"opened".as_slice()
+        } else {
+            b"created".as_slice()
+        };
+        let inode = if create_open {
+            let (inode, handle) = fixture
+                .ns
+                .create_open(request(parent.ino, name, EntityKind::File), root(), 2)
+                .await
+                .unwrap();
+            assert_eq!(fixture.ns.validate_handle(&handle, 2).unwrap(), inode.ino);
+            inode
+        } else {
+            fixture
+                .ns
+                .create(request(parent.ino, name, EntityKind::File), root())
+                .await
+                .unwrap()
+        };
+        assert_eq!(backend.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.create_commits.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.commits.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.allocations.load(Ordering::SeqCst), 0);
+        assert!(inode.ino > fixture.lower.binding.max_ino);
+        assert_eq!(
+            fixture
+                .ns
+                .lookup(parent.ino, name, &root())
+                .await
+                .unwrap()
+                .ino,
+            inode.ino
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_create_topology_hint_checks_the_newly_denied_ancestor_after_rename() {
+    let mut lower = MemoryLower::empty();
+    add_directory(&mut lower, 1, b"allowed", 2, 0o777);
+    add_directory(&mut lower, 2, b"parent", 3, 0o777);
+    add_directory(&mut lower, 1, b"destination", 4, 0o777);
+    let backend = Arc::new(PausingBackend::new());
+    let fixture = attach(
+        backend.clone(),
+        Arc::new(lower),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+    fixture
+        .ns
+        .create(request(3, b"warm", EntityKind::File), user(2000))
+        .await
+        .unwrap();
+    // A second wrapper shares authoritative rows/session locks but has its own
+    // advisory topology cache. The original wrapper still hints parent 3 -> 2.
+    let other = EntityNamespace::new(
+        backend.clone(),
+        fixture.lower.clone(),
+        fixture.keys.clone(),
+        fixture.ns.session.clone(),
+    );
+    other
+        .rename(2, b"parent".to_vec(), 4, b"moved".to_vec(), false, root())
+        .await
+        .unwrap();
+    other.chmod(4, 0o700, root()).await.unwrap();
+    backend.reset_counts();
+    assert_eq!(
+        fixture
+            .ns
+            .create(request(3, b"denied", EntityKind::File), user(2000))
+            .await
+            .unwrap_err(),
+        EntityError::Permission
+    );
+    assert!(backend.reads.load(Ordering::SeqCst) > 1);
+    assert_eq!(backend.create_commits.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.allocations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        backend
+            .inner
+            .read(&[fixture.keys.dentry(3, b"denied")])
+            .await
+            .unwrap()
+            .rows,
+        vec![None]
+    );
+    other.chmod(4, 0o777, root()).await.unwrap();
+    fixture
+        .ns
+        .create(request(3, b"allowed-again", EntityKind::File), user(2000))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1264,7 +1424,7 @@ async fn cancellation_retains_operation_locks_until_submitted_create_finishes() 
         .read(&[fixture.keys.counter("inode")])
         .await
         .unwrap();
-    let allocated = std::str::from_utf8(counter.rows[0].as_deref().unwrap())
+    let before_allocation = std::str::from_utf8(counter.rows[0].as_deref().unwrap())
         .unwrap()
         .parse::<i64>()
         .unwrap();
@@ -1291,7 +1451,7 @@ async fn cancellation_retains_operation_locks_until_submitted_create_finishes() 
             .await
             .unwrap()
             .ino,
-        allocated
+        before_allocation + 1
     );
 }
 

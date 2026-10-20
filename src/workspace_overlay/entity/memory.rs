@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use super::{
     EntityError, Result,
     backend::{
-        CommitOutcome, EntityBackend, EntityPlan, MAX_TRANSACTION_ROWS, RowCheck, RowSnapshot,
-        RowWrite, TransactionAuthority, add_bytes, next_counter, validate_key, validate_keys,
-        validate_plan, validate_same_volume, validate_scan,
+        CommitOutcome, CreateAllocation, EntityBackend, EntityPlan, MAX_TRANSACTION_ROWS, RowCheck,
+        RowSnapshot, RowWrite, TransactionAuthority, add_bytes, next_counter, prepare_create,
+        validate_key, validate_keys, validate_plan, validate_same_volume, validate_scan,
     },
 };
 
@@ -161,6 +161,78 @@ impl EntityBackend for MemoryEntityBackend {
             .rows
             .insert(counter_key.to_vec(), next.to_string().into_bytes());
         Ok(next)
+    }
+
+    async fn commit_with_inode_allocation(
+        &self,
+        authority: &TransactionAuthority,
+        plan: &EntityPlan,
+        create: &CreateAllocation,
+    ) -> Result<Option<i64>> {
+        let prepared = prepare_create(authority, plan, create)?;
+        let mut state = self.state.lock().map_err(poisoned)?;
+        let mut stored_bytes = 0;
+        for key in authority
+            .checks
+            .iter()
+            .chain(&plan.checks)
+            .map(|check| check.key.as_slice())
+            .chain(plan.writes.iter().map(RowWrite::key))
+            .chain([
+                prepared.counter_key.as_slice(),
+                prepared.dentry_key.as_slice(),
+            ])
+        {
+            add_bytes(
+                &mut stored_bytes,
+                key,
+                state.rows.get(key).map(Vec::as_slice),
+            )?;
+        }
+        if !authority.allows_time(state.now_ns) {
+            return Err(EntityError::Fenced);
+        }
+        if !matches(&state.rows, &authority.checks) || !matches(&state.rows, &plan.checks) {
+            return Ok(None);
+        }
+        let current = state
+            .rows
+            .get(&prepared.counter_key)
+            .ok_or_else(|| EntityError::Corrupt("uninitialized entity counter".into()))?;
+        let ino = next_counter(current)? as i64;
+        if ino <= create.lower_max_ino {
+            return Err(EntityError::Corrupt(
+                "inode allocator overlaps lower".into(),
+            ));
+        }
+        let generated = prepared.writes(ino);
+        for write in &generated {
+            if write.key() != prepared.dentry_key.as_slice() && state.rows.contains_key(write.key())
+            {
+                return Err(EntityError::Corrupt("inode allocator collision".into()));
+            }
+            if write.key() != prepared.dentry_key.as_slice() {
+                add_bytes(&mut stored_bytes, write.key(), None)?;
+            }
+        }
+        let mut combined = plan.clone();
+        combined.writes.push(RowWrite::Put {
+            key: prepared.counter_key,
+            value: ino.to_string().into_bytes(),
+        });
+        combined.writes.extend(generated);
+        validate_plan(authority, &combined)?;
+        for write in combined.writes {
+            match write {
+                RowWrite::Put { key, value } => {
+                    state.rows.insert(key, value);
+                }
+                RowWrite::Delete { key } => {
+                    state.rows.remove(&key);
+                }
+            }
+        }
+        Ok(Some(ino))
     }
 
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
