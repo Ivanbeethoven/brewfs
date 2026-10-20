@@ -1,7 +1,7 @@
 # Workspace Overlay Architecture
 
 Status: **entity experiment with opt-in benchmark mount wiring; production
-mount remains disabled** (2026-10-20).
+mount remains disabled** (2026-10-21).
 This document and the [implementation spec](../superpowers/specs/overlay-workspace.md)
 now specify an ordinary per-entity writable namespace over one immutable packed
 lower. They supersede the previous mutation/version architecture as the target,
@@ -16,8 +16,8 @@ The unvalidated r32 candidate has been dropped in favor of this direction.
 The `workspace-entity-v1` experiment began on
 `codex/overlay-entity-namespace-20261019`, branched from `b6f297e`.
 Its WIP was merged into `main` by [PR #42](https://github.com/Ivanbeethoven/brewfs/pull/42)
-at `3cb2082500aac0476f275b107228f7dd14a087ce`. The current structural
-continuation is `codex/overlay-entity-simplification-20261020`; that merge did
+at `3cb2082500aac0476f275b107228f7dd14a087ce`. The structural
+continuation used `codex/overlay-entity-simplification-20261020`; that merge did
 not establish correctness or performance acceptance. The historical integration
 branch remains separate. See the
 [stage 2 checkpoint](../superpowers/plans/2026-10-19-overlay-entity-stage2.md)
@@ -29,12 +29,28 @@ validation; earlier API results do not validate those additions.
 There is no conversion, production mount or accepted replacement performance
 result. The mount checkpoint records preliminary measurements for available arms.
 The [entity batching checkpoint](../superpowers/plans/2026-10-20-overlay-entity-batching.md)
-records the subsequently frozen diagnostic baseline and the current request
+records the subsequently frozen diagnostic baseline and the preceding request
 batching refactor, committed as `df846766c14860ef97ea1fdb79a0bb8d3ef88179`.
 Its local correctness gate passes with the documented overlay exclusions;
 release smokes and matched measurements are complete. The comparison is
 preliminary and covers combined WIP plus refactor against frozen `cfa000a`;
 no isolated PR #42 throughput measurement exists.
+
+The [read-batching checkpoint](../superpowers/plans/2026-10-21-overlay-entity-read-batching.md)
+records the next change on `codex/overlay-entity-rtt-20261020`: `8a0f8b8`
+validates read-only operations using existing per-operation row batches;
+`49da510` aligns the service gate with the workspace test graph. The stage 1
+local gate, release smokes, diagnostics and matched comparison are complete and
+audited, with the documented test exclusions. Measurements remain preliminary.
+The separate `stage2-fsync` follow-up was rejected and reverted: it reduced
+requests, but the original comparison and adjacent matched recheck did not
+establish a consistent throughput/tail improvement. Both preliminary results
+and the unresolved original latency outlier are preserved in the checkpoint.
+The retained script follow-up, `16c2aca`, uses STRLEN to check row type and size
+without a separate TYPE command. Its full gate and fresh-control comparison
+are complete. Application request counts stay unchanged; inclusive Lua service
+time falls. The preliminary comparison improves raw entity throughput, but
+does not prove a relative 32-worker WRITE win or native parity.
 
 ## Contract and boundaries
 
@@ -173,23 +189,43 @@ The script validates generated keys and bounds before its first write and uses
 exact decimal IDs above 2^53. It does not compare-and-swap the allocator counter.
 Only the affected parent is locally locked; unrelated parents remain independent.
 
-### Operation snapshots and grouped publication (candidate)
+### Per-operation batched rows and grouped publication
 
-The current refactor shares one operation-scoped `Prepared` observation set
-between namespace and data operations. A single initial read combines the five
-authority rows with the known inode, ACL, dentry, truncate and chunk rows needed
-by that operation. Directory-parent and dentry-to-inode hints are bounded to
-4,096 entries each and nominate keys only: fresh rows determine permissions and
-identity, and the final transaction checks every observed value or absence.
-Missing or stale hints can require additional bounded reads. Conflicts rebuild
-the decision; incompatible observations cannot overwrite one another.
+Namespace and data operations use the existing operation-local `Prepared`
+read set. The existing atomic backend read batches authority, backend TIME and
+the entity rows needed by that operation; data reads include the actual stored
+geometry row. Directory-parent and dentry-to-inode hints are bounded to 4,096
+entries each and nominate keys only. A dependent read includes all prior
+observations and newly discovered keys. It preserves earlier observations on
+disagreement and marks the view uncovered. A covered read-only operation's
+result or error needs no redundant read-only commit; an uncovered view is fully
+revalidated, and conflicts recalculate the operation. Mutations retain their
+exact transaction predicates. This reuses existing reads and introduces no
+public/backend API, object type, authoritative cache, persistence/lifecycle
+protocol or snapshot feature.
 
-Path open retains its observed ancestry and name while acquiring the discovered
-inode lock, then validates that same read set before returning the handle. It
-does not repeat the entire path walk. Open fallback and truncate return the
-attributes established by their own operation so the FUSE reply need not start
-another attribute read. This is same-operation reuse, not an authoritative
+Path open retains its observed ancestry and name through inode-lock acquisition,
+then rereads authority and those predicates before returning the handle.
+Directory SCAN also invalidates coverage, including an empty result. Payload
+reads retain full validation after object transport. Open fallback and truncate
+return the attributes established by their own operation so the FUSE reply need
+not start another attribute read. This is same-operation reuse, not an authoritative
 cross-operation cache of mutable attributes or permissions.
+
+A complete atomic batch of authority and entity rows defines the read result
+and its lease check. Cold immutable lower metadata resolution can finish after
+that lease expires; the previous trailing commit could instead have returned `Fenced`.
+There is no guarantee of lease validity at the end of metadata resolution.
+Retained admission and lower ownership protect that resolution. This does not
+remove payload validation after transport or mutation-time fencing.
+
+READ_LUA and TRANSACTION_LUA preflight row types and byte bounds with protected
+STRLEN calls. WRONGTYPE maps to the existing corruption error; other Redis
+errors propagate. GET, exact predicates, backend TIME and validation before
+the first write remain. This removes one nested TYPE command per checked row,
+not an application request, and adds no feature, API, cache, persistent object
+or filesystem behavior. The Redis TYPE permission is no longer required by
+these preflights; identical ACL failure timing is not claimed.
 
 Data writes reuse the operation's authority to allocate slice IDs and register
 all Pending upload owners for an admitted group in one transaction, before any
@@ -214,13 +250,15 @@ allocation, upload registration and Uploaded APIs are
 removed. Truncate/discard/orphan cleanup retains its asynchronous membership
 wrapper over the shared pure planner and its existing durable cleanup state.
 
-Fsync still waits on the shared FIFO inode lock, retains admission, reports
-sticky errors and validates live lease/backend-time predicates. Its initial
-snapshot includes the truncate marker: observed absence takes the validated
-read-only commit path, while an actual intent invokes the existing recovery
-walker and then refreshes the snapshot. Ordinary I/O no longer performs an
-unconditional empty-intent recovery walk. The diagnostic below measures the
-combined implementation's request reductions; performance remains preliminary.
+In committed stage 1 (`8a0f8b8`), fsync still waits on the shared FIFO inode lock,
+retains admission, reports sticky errors and validates live lease/backend-time
+predicates. Its initial read includes the truncate marker: observed absence
+takes the validated read-only commit path, while an actual intent invokes the
+existing recovery walker and then refreshes the snapshot. Ordinary I/O no longer performs an
+unconditional empty-intent recovery walk. Removing the upper-fsync/flush
+read-only commit reduced each callback from two metadata requests to one in
+the rejected `stage2-fsync` diagnostic. That change is not retained; stage 1
+still uses two. The historical diagnostic below measures `df846766`.
 
 ## Audit of the current design
 
@@ -322,8 +360,8 @@ atomic-write guarantee is implied.
 
 Create reserves a unique inode ID and atomically checks parent permissions and
 effective name absence while installing inode/dentry/parent changes before
-returning. The reference implementation reserves the ID with a separate INCR;
-failed attempts may consume IDs but cannot expose partial namespace changes.
+returning. The reference implementation allocates with INCR inside the namespace
+publication transaction; O_EXCL rejection does not advance the counter.
 The immutable lower lookup may be prepared outside Lua, but its binding must be
 unchanged and the final transaction must recheck upper absence and mutable policy inputs.
 Never merge create visibility with the first data fsync.
@@ -526,8 +564,9 @@ below current native and READBACK 44.36%/40.58% below. Native control drift and
 two-sample spread are retained in the batching checkpoint; no claim isolates
 the structural cleanup or proves that a scaling plateau is eliminated.
 
-Diagnostic external commands/file fall from 113.770/114.400 to 15.720/15.780
-for WRITE and 75.880/76.640 to 16.015/16.015 for READBACK; current native uses
+For the measured `df846766` baseline, diagnostic external commands/file fall
+from 113.770/114.400 to 15.720/15.780 for WRITE and 75.880/76.640 to
+16.015/16.015 for READBACK; that comparison's native arm uses
 7.115 and 5.005 respectively. CREATE/WRITE/FSYNC/FLUSH attempt 2/3/2/2 metadata
 RTTs per operation, down from 15/25/12/12. WRITE still has a separate durable
 slice reservation before publication. READBACK retains 8.005 READ_LUA and
