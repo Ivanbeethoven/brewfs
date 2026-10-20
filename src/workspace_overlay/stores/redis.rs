@@ -562,6 +562,11 @@ impl WorkspaceKvBackend for RedisWorkspaceBackend {
     fn supports_consistent_reads(&self) -> bool {
         true
     }
+    // BOUNDED_PREFIX_LUA is one ZRANGEBYLEX ... LIMIT max_records inside a
+    // script; byte limits and index ghosts fail the call, never truncate it.
+    fn short_scan_page_is_end(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "workspace-redis"
     }
@@ -611,14 +616,11 @@ impl WorkspaceKvBackend for RedisWorkspaceBackend {
         }
         let scoped = keys.iter().map(|key| self.scoped(key)).collect::<Vec<_>>();
         let mut connection = self.connection.clone();
-        let ((seconds, micros), values): ((i64, i64), Vec<Option<Vec<u8>>>) = redis::pipe()
-            .atomic()
-            .cmd("TIME")
-            .cmd("MGET")
-            .arg(scoped)
-            .query_async(&mut connection)
-            .await
-            .map_err(backend)?;
+        let ((seconds, micros), values): ((i64, i64), Vec<Option<Vec<u8>>>) =
+            timed_mget_pipeline(scoped)
+                .query_async(&mut connection)
+                .await
+                .map_err(backend)?;
         Ok((values, redis_time_ns(seconds, micros)?))
     }
 
@@ -655,13 +657,15 @@ impl WorkspaceKvBackend for RedisWorkspaceBackend {
     ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
         let scoped = keys.iter().map(|key| self.scoped(key)).collect::<Vec<_>>();
         let mut connection = self.connection.clone();
-        let ((seconds, micros), values): ((i64, i64), Vec<Option<Vec<u8>>>) = redis::pipe()
-            .cmd("TIME")
-            .cmd("MGET")
-            .arg(scoped)
-            .query_async(&mut connection)
-            .await
-            .map_err(backend)?;
+        // TIME and MGET form one metadata read snapshot. Without MULTI/EXEC,
+        // another workspace mutation can run between the two pipelined
+        // commands, leaving the lease timestamp detached from the values used
+        // to authorize an ACL/mode mutation.
+        let ((seconds, micros), values): ((i64, i64), Vec<Option<Vec<u8>>>) =
+            timed_mget_pipeline(scoped)
+                .query_async(&mut connection)
+                .await
+                .map_err(backend)?;
         let now = redis_time_ns(seconds, micros)?;
         Ok((values, now))
     }
@@ -767,6 +771,12 @@ fn redis_time_ns(seconds: i64, micros: i64) -> Result<i64, WorkspaceError> {
         .ok_or_else(|| WorkspaceError::Backend("Redis TIME overflows i64 nanos".into()))
 }
 
+fn timed_mget_pipeline(scoped: Vec<Vec<u8>>) -> redis::Pipeline {
+    let mut pipeline = redis::pipe();
+    pipeline.atomic().cmd("TIME").cmd("MGET").arg(scoped);
+    pipeline
+}
+
 fn validate_namespace(namespace: &str) -> Result<(), WorkspaceError> {
     if namespace.is_empty()
         || !namespace
@@ -821,6 +831,18 @@ fn backend(error: impl std::fmt::Display) -> WorkspaceError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timed_metadata_reads_are_transactional() {
+        let packed =
+            super::timed_mget_pipeline(vec![b"brewfs:test".to_vec()]).get_packed_pipeline();
+        let wire = String::from_utf8_lossy(&packed);
+        assert!(
+            wire.starts_with("*1\r\n$5\r\nMULTI\r\n"),
+            "TIME/MGET metadata reads must enter MULTI/EXEC"
+        );
+        assert!(wire.ends_with("*1\r\n$4\r\nEXEC\r\n"));
+    }
+
     #[test]
     fn operator_principals_reject_shared_default_or_unbounded_identity() {
         assert!(super::validate_operator_principals("operator", "runtime").is_ok());
@@ -952,6 +974,62 @@ mod tests {
             .await;
         cleanup.unwrap();
         result.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BREWFS_TEST_REDIS_URL"]
+    async fn real_redis_short_page_is_complete_range_end() {
+        let url = std::env::var("BREWFS_TEST_REDIS_URL").unwrap();
+        let namespace = format!("kv-short-page-{}", uuid::Uuid::new_v4().simple());
+        let backend = RedisWorkspaceBackend::connect(&url, &namespace)
+            .await
+            .unwrap();
+        assert!(backend.short_scan_page_is_end());
+        let keys = (0..5)
+            .map(|index| format!("page/a/{index:03}").into_bytes())
+            .chain([b"page/a0".to_vec(), b"page/b/000".to_vec()])
+            .collect::<Vec<_>>();
+        let writes = keys
+            .iter()
+            .map(|key| KvWrite::Put {
+                key: key.clone(),
+                value: vec![1],
+            })
+            .collect::<Vec<_>>();
+        assert!(backend.compare_and_swap(&[], &writes).await.unwrap());
+        let limits = |records| KvReadLimits {
+            max_records: records,
+            max_key_bytes: 64,
+            max_value_bytes: 4,
+            max_total_bytes: 1024,
+            max_response_bytes: 4096,
+            max_data_requests: records,
+        };
+        // A full page may be followed by more rows; the short tail is the end
+        // and an explicit next page after it is indeed empty.
+        let first = backend
+            .scan_prefix_page_with_byte_limits(b"page/a/", None, limits(3))
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 3);
+        let tail = backend
+            .scan_prefix_page_with_byte_limits(b"page/a/", Some(&first[2].key), limits(3))
+            .await
+            .unwrap();
+        assert_eq!(tail.len(), 2);
+        let after = backend
+            .scan_prefix_page_with_byte_limits(b"page/a/", Some(&tail[1].key), limits(3))
+            .await
+            .unwrap();
+        assert!(after.is_empty());
+        let mut connection = backend.connection.clone();
+        let mut del = redis::cmd("DEL");
+        del.arg(backend.scoped(KEY_INDEX))
+            .arg(backend.scoped(KEY_INDEX_READY));
+        for key in &keys {
+            del.arg(backend.scoped(key));
+        }
+        let _: () = del.query_async(&mut connection).await.unwrap();
     }
 
     #[tokio::test]

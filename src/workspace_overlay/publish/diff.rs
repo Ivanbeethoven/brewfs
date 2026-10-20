@@ -289,11 +289,9 @@ mod tests {
     use crate::workspace_overlay::catalog::{CreateVolumeRoot, WorkspaceStore};
     use crate::workspace_overlay::ids::{LayerId, WorkspaceId};
     use crate::workspace_overlay::lifecycle::{
-        DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LEASE_TTL, NoopDurableRemoteBarrier,
-        WorkspaceLifecycle, WorkspaceMountSession,
+        DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LEASE_TTL, WorkspaceMountSession,
     };
     use crate::workspace_overlay::meta_layer::WorkspaceMetaLayer;
-    use crate::workspace_overlay::model::ViewContext;
     use crate::workspace_overlay::stores::database::SqliteWorkspaceStore;
 
     #[tokio::test]
@@ -345,17 +343,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let lifecycle = WorkspaceLifecycle::new(store.clone());
-        let sealed = lifecycle
-            .seal(&session.view, &NoopDurableRemoteBarrier)
-            .await
-            .unwrap();
-        meta.replace_view_context(ViewContext {
-            head_layer_id: sealed.new_head_layer_id,
-            head_epoch: sealed.head_epoch,
-            ..session.view.clone()
-        })
-        .await;
+        session.release().await.unwrap();
+        let sealed =
+            crate::workspace_overlay::test_base_fixture::install_test_base(&store, workspace_id)
+                .await;
+        let session = WorkspaceMountSession::acquire(
+            store.clone(),
+            workspace_id,
+            2,
+            DEFAULT_LEASE_TTL,
+            DEFAULT_HEARTBEAT_INTERVAL,
+        )
+        .await
+        .unwrap();
+        let meta = WorkspaceMetaLayer::new(store.clone(), session.view.clone());
         meta.rename(meta.root_ino(), "old", meta.root_ino(), "new".into())
             .await
             .unwrap();
@@ -377,7 +378,7 @@ mod tests {
         .unwrap();
 
         let changes = WorkspaceDiff::new(store.clone(), crate::chunk::DEFAULT_CHUNK_SIZE)
-            .diff(&sealed.revision, sealed.new_head_layer_id)
+            .diff(&sealed.revision, sealed.replacement_head_layer_id)
             .await
             .unwrap();
         let renamed = changes

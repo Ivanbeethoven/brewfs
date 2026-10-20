@@ -267,6 +267,18 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             merge(&mut checks, exact_checks(&root_keys, &root_values))?;
             writes.extend(keys.into_iter().map(|key| KvWrite::Delete { key }));
         }
+        if !writes.is_empty() {
+            // Deleting a packed carrier is a maintenance transition, like its
+            // publication: keep the exact catalog header in the check set so
+            // a concurrent migrate cannot interleave with the final CAS.
+            // Ordinary layer GC without a carrier still excludes CONTROL.
+            let control = [CONTROL_KEY.to_vec()];
+            let values = self.alias_values(&control).await?;
+            if values[0].is_none() {
+                return Err(WorkspaceError::Fenced);
+            }
+            merge(&mut checks, exact_checks(&control, &values))?;
+        }
         Ok(CarrierMetadataDeletion {
             checks,
             writes,
@@ -281,10 +293,21 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
     ) -> Result<WorkspaceRecord, WorkspaceError> {
         let workspace_key = hot_workspace_key(request.workspace_id);
         let head_key = hot_layer_key(request.head_layer_id);
-        for _ in 0..CAS_MAX_RETRIES {
-            let packed_fork = self
+        for attempt in 0..CAS_MAX_RETRIES {
+            let packed_fork = match self
                 .prepare_borrowed_workspace(&request, require_packed_carrier)
-                .await?;
+                .await
+            {
+                Ok(plan) => plan,
+                Err(WorkspaceError::Busy) => {
+                    // The carrier probe is a bounded, pre-submit read. A
+                    // remote KV lock can transiently reject that read, so
+                    // rebuild the complete fork plan under this retry budget.
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let mut scope = TopologyScope {
                 workspaces: vec![request.workspace_id],
                 layers: vec![request.base_revision.layer_id, request.head_layer_id],
@@ -297,9 +320,20 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             if packed_fork.next_inode.is_some() {
                 scope.allocators.push("inode".into());
             }
-            let basis = self
+            let basis = match self
                 .read_topology_scope(&scope, topology_point_limits(32))
-                .await?;
+                .await
+            {
+                Ok(basis) => basis,
+                Err(WorkspaceError::Busy) => {
+                    // A concurrent fork may invalidate the bounded point
+                    // snapshot before packet preparation. Re-read the full
+                    // topology scope under the same finite retry budget.
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let now = basis.now_ns;
             let inventory_generation = basis
                 .checks
@@ -379,17 +413,59 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             } else {
                 None
             };
-            let _native_reverse = self
+            // Native reverse/owner preparation reads the same epoch keys that
+            // the final topology packet updates. A concurrent fork can lose
+            // that read-side overlap before the packet is submitted and is
+            // reported as Busy by the preparation helpers. Treat only that
+            // transient classification as another bounded fork attempt;
+            // transport, corruption, budget, and semantic errors still
+            // propagate unchanged.
+            let _native_reverse = match self
                 .prepare_native_reverse_cas(&mut checks, &mut writes)
-                .await?;
-            let _native_holds = self
+                .await
+            {
+                Ok(owner) => owner,
+                Err(WorkspaceError::Busy) => {
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let _native_holds = match self
                 .prepare_native_owner_cas(&mut checks, &mut writes)
-                .await?;
-            let packet = self.prepare_topology_envelope(checks, writes, None).await?;
+                .await
+            {
+                Ok(owner) => owner,
+                Err(WorkspaceError::Busy) => {
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            // Native derived-index preparation can lose the shared topology
+            // epoch while another fork commits.  The final envelope is still
+            // a pre-submit operation, so rebuild the complete fork plan on
+            // the same bounded retry budget instead of surfacing a transient
+            // Busy to concurrent callers.
+            let packet = match self.prepare_topology_envelope(checks, writes, None).await {
+                Ok(packet) => packet,
+                Err(WorkspaceError::Busy) => {
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if self.commit_prepared_topology_packet(&packet).await? {
                 return Ok(workspace);
             }
-            tokio::task::yield_now().await;
+            // All concurrent forks authenticate the shared layer-inventory
+            // generation. A scheduler yield alone keeps the thundering herd
+            // synchronized and can exhaust CAS_MAX_RETRIES on remote KV
+            // backends before any loser observes the committed generation.
+            // Use the same bounded jittered backoff as other topology
+            // mutations so Redis/TiKV contention converges without changing
+            // the exact entity CAS contract.
+            retry_backoff(attempt).await;
         }
         Err(WorkspaceError::Busy)
     }
@@ -778,18 +854,6 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::validate_retained_source_binding_version;
-
-    #[test]
-    fn initial_binding_history_version_is_a_valid_retained_source() {
-        assert!(validate_retained_source_binding_version(1).is_ok());
-        assert!(validate_retained_source_binding_version(2).is_ok());
-        assert!(validate_retained_source_binding_version(0).is_err());
-    }
-}
-
 impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
     /// Logical retirement is permitted only at the child Deleting endpoint.
     /// The owned task and exact-successor clock CAS survive caller cancellation.
@@ -1131,5 +1195,17 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
             retired: true,
             source_members_released: 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_retained_source_binding_version;
+
+    #[test]
+    fn initial_binding_history_version_is_a_valid_retained_source() {
+        assert!(validate_retained_source_binding_version(1).is_ok());
+        assert!(validate_retained_source_binding_version(2).is_ok());
+        assert!(validate_retained_source_binding_version(0).is_err());
     }
 }

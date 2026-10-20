@@ -1,5 +1,8 @@
 # Native Base 实现及实验报告
 
+历史证据说明：下文以代码标记列出的 `logs/` 路径在当前 checkout 中不可用；
+保留路径用于追溯，不把这些未随仓库提供的日志当作当前可复核证据。可用文件仍保留链接。
+
 状态：PR01–PR12 全部交付并通过 focused unit tests 与 workspace CI gate；PR13 文档与能力矩阵已更新，性能实验 A–F 因缺少 FUSE 集成环境标记为 NOT_RUN。本报告按规格包模板维护，逐 PR 追加真实证据；
 不把参考模型 PASS 抄成产品验收 PASS，无环境项如实 NOT_RUN。
 
@@ -66,7 +69,7 @@ examples/ 原样复制到 `src/native_base/testdata/`。
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
 | PR02-FOCUSED | `cargo test -p brewfs --lib native_base` | 0 | PASS（73 passed / 0 failed） | [pr02-focused.log](logs/pr02-focused.log) |
-| PR02-GOLDEN-BRFDP | （上项内）4 个 .brfdp fixture byte-identical 重建 | 0 | PASS（empty/two_plain_frames/native_none/plain_magic_prefix） | [testdata/](../src/native_base/testdata/) |
+| PR02-GOLDEN-BRFDP | （上项内）4 个 .brfdp fixture byte-identical 重建 | 0 | PASS（empty/two_plain_frames/native_none/plain_magic_prefix） | [testdata/](../../src/native_base/testdata/) |
 | PR02-GOLDEN-BNCT | （上项内）kind7 envelope 104 字节 hex golden | 0 | PASS | bnct.rs tests |
 | PR02-FMT | `cargo fmt --all --check` | 0 | PASS | [pr02-gate.log](logs/pr02-gate.log) |
 | PR02-BASHN | `bash -n run_{perf_in_container,redis_perf,juicefs_perf_in_container,juicefs_perf}.sh` | 0×4 | PASS（LF 归一化副本，原件未动） | [pr02-bash-gates.log](logs/pr02-bash-gates.log) |
@@ -528,7 +531,7 @@ Redis/TiKV durability、真实 S3 per-object delete 响应分类、native-v2 run
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07-FOCUSED | `bash doc/native-base/logs/pr07-focused.sh` | 0 | PASS（942 passed, 221 ignored, 0 failed；clippy/format/default-feature-check 均通过） | [pr07-focused.log](logs/pr07-focused.log) |
+| PR07-FOCUSED | `bash doc/native-base/logs/pr07-focused.sh` | 0 | PASS（942 passed, 221 ignored, 0 failed；clippy/format/default-feature-check 均通过） | `logs/pr07-focused.log` |
 | PR07-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07-NATIVE-CHECK | `cargo check -p brewfs --features native-packed-base` | 0 | PASS（同上） | 同上 |
 | PR07-DEFAULT-CHECK | `cargo check -p brewfs`（无 native feature） | 0 | PASS（不破坏旧构建） | 同上 |
@@ -536,7 +539,7 @@ Redis/TiKV durability、真实 S3 per-object delete 响应分类、native-v2 run
 | PR07-BASELINE-OVERLAY | `bash doc/native-base/logs/pr07b-baseline-overlay.sh` | 0 | PASS（runtime io 11 passed/0 failed；native lib 959 passed, 221 ignored, 0 failed）：Packed-like baseline + loose patch + Hole 逐字节 oracle；fresh punch-hole 保留 baseline 尺寸与尾部；truncate-down 后 extend/far-write 不复活旧尾部；跨 block 局部写与多 extent 非连续写逐字节回读 | [pr07b-baseline-overlay.log](logs/pr07b-baseline-overlay.log) |
 | PR07-DIRECT-HOLE | `cargo test -p brewfs --features native-packed-base --lib native_base::runtime::io::tests` | 0 | PASS（11 passed, 0 failed）：不与 pending 写、也不与已提交 Data extent 重叠的 punch-hole 直接提交为 Hole extent；会切开已提交 Data extent 的孔回落块物化，避免留下非块对齐 extent 片段 | 同上 |
 | PR07-BASELINE-SIZE | 同上 | 0 | PASS（11 passed, 0 failed）：commit planner 携带 immutable baseline 尺寸，首次 mutation / truncate / punch-hole 不再把未修改 baseline 物化成 Hole，也不复活截断尾部 | 同上 |
-| PR07C-ORD005 | `bash doc/native-base/logs/pr07c-ord005-008.sh` | 0 | PASS（ord_005 1 passed/0 failed；runtime io 12 passed/0 failed；write 29 passed/0 failed；native lib 963 passed, 221 ignored, 0 failed） | [pr07c-ord005-008.log](logs/pr07c-ord005-008.log) |
+| PR07C-ORD005 | `bash doc/native-base/logs/pr07c-ord005-008.sh` | 0 | PASS（ord_005 1 passed/0 failed；runtime io 12 passed/0 failed；write 29 passed/0 failed；native lib 963 passed, 221 ignored, 0 failed） | `logs/pr07c-ord005-008.log` |
 | PR07C-ORD008 | 同上 | 0 | PASS（reordered_upload 1 passed/0 failed；write 29 passed/0 failed；native lib 963 passed/0 failed） | 同上 |
 
 补充（PR07C · ORD-005/ORD-008）：fsync 边界此前存在一个真实的静默丢弃缺陷。
@@ -590,7 +593,7 @@ required_features 拒绝、namespace 路径逃逸拒绝、create-only 幂等性�
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07D-FOCUSED | `bash doc/native-base/logs/pr07d-admission-gates.sh` | 0 | PASS（config::tests::native 7 passed/0 failed；bounded_drain_rejects_forgery_and_noop_write_barrier_then_recovers 1 passed/0 failed；retired_retention_options_fail_closed_without_claiming_runtime_wiring 1 passed/0 failed） | [pr07d-admission-gates.log](logs/pr07d-admission-gates.log) |
+| PR07D-FOCUSED | `bash doc/native-base/logs/pr07d-admission-gates.sh` | 0 | PASS（config::tests::native 7 passed/0 failed；bounded_drain_rejects_forgery_and_noop_write_barrier_then_recovers 1 passed/0 failed；retired_retention_options_fail_closed_without_claiming_runtime_wiring 1 passed/0 failed） | `logs/pr07d-admission-gates.log` |
 | PR07D-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07D-WRITE013 | `cargo test -p brewfs --bins config::tests::native` | 0 | PASS：`native_volume_rejects_commit_before_upload_even_for_s3` —— 即使 `data.backend=s3`，native 卷的 `cache.writeback_mode=commit_before_upload` 在挂载配置校验即被拒 | 同上 |
 | PR07D-GATE001 | 同上 | 0 | PASS：`native_release_profile_gate_admits_only_the_shipped_p1_profiles` —— 未发布 profile 被拒；`p1-retained-trial` 打开 cleanup 被拒；limits 层级不一致被拒；合法 retained-trial 配置仍可解析 | 同上 |
@@ -623,7 +626,7 @@ cleanup 只接受 close 证书 + 已验证 unversioned delete 能力。
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07E-FOCUSED | `bash doc/native-base/logs/pr07e-resource-bounds.sh` | 0 | PASS（seal::tests 32 passed/0 failed；planner::tests 3 passed/0 failed；frame::tests 9 passed/0 failed） | [pr07e-resource-bounds.log](logs/pr07e-resource-bounds.log) |
+| PR07E-FOCUSED | `bash doc/native-base/logs/pr07e-resource-bounds.sh` | 0 | PASS（seal::tests 32 passed/0 failed；planner::tests 3 passed/0 failed；frame::tests 9 passed/0 failed） | `logs/pr07e-resource-bounds.log` |
 | PR07E-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07E-RES001 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::seal::tests` | 0 | PASS：`undersized_budget_rejects_before_any_io`（单 unit 超预算 → `BudgetUnitTooLarge{needed,cap}`，0 次 GET） | 同上 |
 | PR07E-RES002 | 同上 | 0 | PASS：`a_plan_beyond_the_segment_bound_is_refused_before_any_io`（`MAX_PLAN_BLOCKS+1` 个 block → `PlanLimit`，0 次 GET、0 令牌占用） | 同上 |
@@ -651,7 +654,7 @@ cleanup 只接受 close 证书 + 已验证 unversioned delete 能力。
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07F-FOCUSED | `bash doc/native-base/logs/pr07f-ingest-verification.sh` | 0 | PASS（native_base::ingest 56 passed/0 failed） | [pr07f-ingest-verification.log](logs/pr07f-ingest-verification.log) |
+| PR07F-FOCUSED | `bash doc/native-base/logs/pr07f-ingest-verification.sh` | 0 | PASS（native_base::ingest 56 passed/0 failed） | `logs/pr07f-ingest-verification.log` |
 | PR07F-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07F-VFY001 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::ingest` | 0 | PASS：`service_composite_that_differs_from_the_local_hash_is_refused`、`service_validated_profile_uses_service_facts_not_readback`、`part_checksum_mismatch_is_refused_server_side` | 同上 |
 | PR07F-VFY004 | 同上 | 0 | PASS：`resume_with_changed_part_boundaries_is_refused_until_registered`（改写 plan → PlanMismatch、0 对象上传；显式登记后才放行）、`changed_plan_on_resume_is_refused` | 同上 |
@@ -676,7 +679,7 @@ Create 未指定算法或错误 part 校验）尚未实现——当前 `RemoteVe
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07G-FOCUSED | `bash doc/native-base/logs/pr07g-read-amortization.sh` | 0 | PASS（planner 4 passed/0 failed、io 13 passed/0 failed） | [pr07g-read-amortization.log](logs/pr07g-read-amortization.log) |
+| PR07G-FOCUSED | `bash doc/native-base/logs/pr07g-read-amortization.sh` | 0 | PASS（planner 4 passed/0 failed、io 13 passed/0 failed） | `logs/pr07g-read-amortization.log` |
 | PR07G-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07G-OPT002 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::runtime::planner::tests` | 0 | PASS：`one_hundred_concurrent_readers_share_one_fetch_and_decode`（loader 调用次数 == 1；100 个返回 buffer 两两 `Arc::ptr_eq`） | 同上 |
 | PR07G-OPT004 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::runtime::io::tests` | 0 | PASS：`metadata_only_operations_never_fetch_file_data`（`size` 返回 4096*3；对象 GET/PUT 均为 0，基线 `bytes_read` 为 0） | 同上 |
@@ -703,7 +706,7 @@ Unix-socket 共享服务仍是 PR11 preview 骨架（`probe_shared_cache()` 恒�
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07H-FOCUSED | `bash doc/native-base/logs/pr07h-feature-closure.sh` | 0 | PASS（container 11 / datapack 15 / seal 48 passed，0 failed） | [pr07h-feature-closure.log](logs/pr07h-feature-closure.log) |
+| PR07H-FOCUSED | `bash doc/native-base/logs/pr07h-feature-closure.sh` | 0 | PASS（container 11 / datapack 15 / seal 48 passed，0 failed） | `logs/pr07h-feature-closure.log` |
 | PR07H-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07H-GATE002 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::wire::datapack::tests` | 0 | PASS：`declared_plain_header_cannot_hide_a_zstd_frame`（合法 CRC/digest 但声明仅 PLAIN 的 Zstd pack 被 UnsupportedFormat 拒绝，报文含 0x2）、`shipped_goldens_declare_their_content_feature_closure`（4 个 golden 的 declared==content==closure、undeclared==0） | 同上 |
 | PR07H-GATE002-SEAL | 同上（seal 套件） | 0 | PASS：`undeclared_external_child_is_refused_before_the_seal_is_opened`（去掉 EXTERNAL_INDEX_CHILDREN 声明的 external-root seal 在 `SealSnapshot::open` 处被拒，去掉的位 0x4 出现在报文里） | 同上 |
@@ -732,7 +735,7 @@ SnapshotManifest 强制 `root_codec == None`、PagedInventory 强制
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07I-FOCUSED | `bash doc/native-base/logs/pr07i-private-cleanup.sh` | 0 | PASS（native_base::lifecycle::cleanup 18 passed/0 failed） | [pr07i-private-cleanup.log](logs/pr07i-private-cleanup.log) |
+| PR07I-FOCUSED | `bash doc/native-base/logs/pr07i-private-cleanup.sh` | 0 | PASS（native_base::lifecycle::cleanup 18 passed/0 failed） | `logs/pr07i-private-cleanup.log` |
 | PR07I-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07I-CLN001 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::lifecycle::cleanup` | 0 | PASS：`an_active_domain_never_exposes_delete_candidates` | 同上 |
 | PR07I-CLN004 | 同上 | 0 | PASS：`a_dispatch_after_the_frozen_inventory_is_refused_not_cleaned` | 同上 |
@@ -765,7 +768,7 @@ SnapshotManifest 强制 `root_codec == None`、PagedInventory 强制
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07J-FOCUSED | `bash doc/native-base/logs/pr07j-retention-locality.sh` | 0 | PASS（native_base::lifecycle:: 32 passed/0 failed） | [pr07j-retention-locality.log](logs/pr07j-retention-locality.log) |
+| PR07J-FOCUSED | `bash doc/native-base/logs/pr07j-retention-locality.sh` | 0 | PASS（native_base::lifecycle:: 32 passed/0 failed） | `logs/pr07j-retention-locality.log` |
 | PR07J-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07J-CLN007 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::lifecycle::` | 0 | PASS：`an_open_operation_blocks_the_close_before_any_private_delete` | 同上 |
 | PR07J-RET002 | 同上 | 0 | PASS：`replacing_the_latest_alias_keeps_the_old_published_revision` | 同上 |
@@ -794,7 +797,7 @@ SnapshotManifest 强制 `root_codec == None`、PagedInventory 强制
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07K-FOCUSED | `bash doc/native-base/logs/pr07k-checksum-capability.sh` | 0 | PASS（native_base::ingest 59 passed/0 failed） | [pr07k-checksum-capability.log](logs/pr07k-checksum-capability.log) |
+| PR07K-FOCUSED | `bash doc/native-base/logs/pr07k-checksum-capability.sh` | 0 | PASS（native_base::ingest 59 passed/0 failed） | `logs/pr07k-checksum-capability.log` |
 | PR07K-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07K-VFY002 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::ingest` | 0 | PASS：`echoing_metadata_hash_is_detected_and_never_becomes_remote_verified` | 同上 |
 | PR07K-VFY003 | 同上 | 0 | PASS：`service_validated_profile_is_refused_without_checksum_validation`、`honest_backend_probe_is_verified_and_memoized` | 同上 |
@@ -821,7 +824,7 @@ SnapshotManifest 强制 `root_codec == None`、PagedInventory 强制
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07L-FOCUSED | `bash doc/native-base/logs/pr07l-seal-view-pinning.sh` | 0 | PASS（native_base::seal::tests 35 passed/0 failed） | [pr07l-seal-view-pinning.log](logs/pr07l-seal-view-pinning.log) |
+| PR07L-FOCUSED | `bash doc/native-base/logs/pr07l-seal-view-pinning.sh` | 0 | PASS（native_base::seal::tests 35 passed/0 failed） | `logs/pr07l-seal-view-pinning.log` |
 | PR07L-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07L-READ005 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::seal::tests` | 0 | PASS：`nested_external_index_pages_are_located_and_loaded`（外部页 local child 按 locator 解析；每页只取一次；不可加载的页是错误而非 Ok(None)/零填充） | 同上 |
 | PR07L-READ006 | 同上 | 0 | PASS：`a_pinned_view_never_mixes_revisions_across_a_root_switch`（切换后固定视图仍返回全旧字节且不再取页；切换后新开的视图以 HashMismatch 失败关闭） | 同上 |
@@ -847,7 +850,7 @@ SnapshotManifest 强制 `root_codec == None`、PagedInventory 强制
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07M-FOCUSED | `bash doc/native-base/logs/pr07m-runtime-read-composition.sh` | 0 | PASS（runtime io 14 passed/0 failed、planner 6 passed/0 failed） | [pr07m-runtime-read-composition.log](logs/pr07m-runtime-read-composition.log) |
+| PR07M-FOCUSED | `bash doc/native-base/logs/pr07m-runtime-read-composition.sh` | 0 | PASS（runtime io 14 passed/0 failed、planner 6 passed/0 failed） | `logs/pr07m-runtime-read-composition.log` |
 | PR07M-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07M-READ001 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::runtime::io` | 0 | PASS：`packed_baseline_loose_patch_and_hole_read_back_byte_exact` | 同上 |
 | PR07M-READ007 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::runtime::planner` | 0 | PASS：`the_same_object_id_in_two_namespaces_shares_nothing` | 同上 |
@@ -881,7 +884,7 @@ FUSE 层 request 级取消（D-state/teardown）不在本项证据内。
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07N-FOCUSED | `bash doc/native-base/logs/pr07n-retention-quota.sh` | 0 | PASS（5 个聚焦测试各 1 passed/0 failed） | [pr07n-retention-quota.log](logs/pr07n-retention-quota.log) |
+| PR07N-FOCUSED | `bash doc/native-base/logs/pr07n-retention-quota.sh` | 0 | PASS（5 个聚焦测试各 1 passed/0 failed） | `logs/pr07n-retention-quota.log` |
 | PR07N-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07N-RET008 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::lifecycle::tests::retention_keeps` | 0 | PASS：`retention_keeps_the_manifest_and_every_transitive_container_permanently` | 同上 |
 | PR07N-RET011 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::frozen::tests::fixed_readonly_baseline` | 0 | PASS：`fixed_readonly_baseline_page_counts_are_fixed_and_lease_free` | 同上 |
@@ -912,7 +915,7 @@ volume 级 used/reserved 字节的采集与 runtime 常量接入属于后续集�
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07O-FOCUSED | `bash doc/native-base/logs/pr07o-variant-evidence-close.sh` | 0 | PASS（variant 4 passed/0 failed、close_evidence 1 passed/0 failed） | [pr07o-variant-evidence-close.log](logs/pr07o-variant-evidence-close.log) |
+| PR07O-FOCUSED | `bash doc/native-base/logs/pr07o-variant-evidence-close.sh` | 0 | PASS（variant 4 passed/0 failed、close_evidence 1 passed/0 failed） | `logs/pr07o-variant-evidence-close.log` |
 | PR07O-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07O-CLN022 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::lifecycle::variant` | 0 | PASS：`explicit_variant_books_new_space_separately_and_keeps_old_packs` | 同上 |
 | PR07O-CLN023 | 同上 | 0 | PASS：`an_unpublished_variant_cleans_only_its_unretained_outputs` | 同上 |
@@ -940,7 +943,7 @@ close 证据端到端路径在内存后端验证，未在 Redis/TiKV 上复跑�
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07P-FOCUSED | `bash doc/native-base/logs/pr07p-frozen-cold-cow-scan.sh` | 0 | PASS（frozen 15 passed/0 failed，含 3 个新增测试） | [pr07p-frozen-cold-cow-scan.log](logs/pr07p-frozen-cold-cow-scan.log) |
+| PR07P-FOCUSED | `bash doc/native-base/logs/pr07p-frozen-cold-cow-scan.sh` | 0 | PASS（frozen 15 passed/0 failed，含 3 个新增测试） | `logs/pr07p-frozen-cold-cow-scan.log` |
 | PR07P-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07P-FROZEN005 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::frozen::tests::cold_attribute_eviction` | 0 | PASS：`cold_attribute_eviction_reloads_identical_attributes_and_permissions` | 同上 |
 | PR07P-FROZEN006 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::frozen::tests::cow_page_reuse` | 0 | PASS：`cow_page_reuse_keeps_the_old_snapshot_readable_and_the_new_closure_complete` | 同上 |
@@ -998,13 +1001,13 @@ teardown（REGRESS-006）：四次 compose 运行（含下面那次失败的）�
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR08C-CONTROL | `PERF_LOG_TO_CONSOLE=false PERF_FIO_SIZE=64m PERF_FIO_RUNTIME=20 bash docker/compose-xfstests/run_redis_perf.sh --s3 --tools "fio-randwrite fio-randrw metaperf"` | 0 | PASS（3/3 工具 pass，0 warning） | [pr08c-control64-run.raw.log](logs/pr08c-control64-run.raw.log) → `artifacts/perf-run-1789804357-86` |
-| PR08C-CONTROL2 | 同上（同一二进制，量噪声带） | 0 | PASS（3/3 工具 pass，0 warning） | [pr08c-control64-run2.raw.log](logs/pr08c-control64-run2.raw.log) → `artifacts/perf-run-1789805052-2568` |
-| PR08C-CANDIDATE | 同上（二进制由 `--features native-packed-base` 构建） | 0 | PASS（3/3 工具 pass，0 warning） | [pr08c-native-run.raw.log](logs/pr08c-native-run.raw.log) → `artifacts/perf-run-1789803051-11108` |
-| PR08C-COMPARE | `python3 tools/perf/compare_artifacts.py <control> <candidate>` | 0 | PASS（无未解释回退/cost shift，见上表） | [pr08c-compare-control-vs-candidate.log](logs/pr08c-compare-control-vs-candidate.log) |
-| PR08C-NOISE | `python3 tools/perf/compare_artifacts.py <control> <control2>` | 0 | PASS（给出 run-to-run 噪声带） | [pr08c-compare-control-vs-control.log](logs/pr08c-compare-control-vs-control.log) |
-| PR08C-TEARDOWN | `bash doc/native-base/logs/pr08c-compose-perf-and-teardown.sh` | 0 | PASS（`ALL CHECKS PASSED`；容器/volume/mount/连接/进程/D-state 全 0） | [pr08c-compose-perf-and-teardown.log](logs/pr08c-compose-perf-and-teardown.log) |
-| PR08C-GATE | `bash doc/native-base/logs/ci-gate.sh` | 0 | PASS（workspace 988 + 730 passed；clippy/fmt/feature checks 全绿） | [pr08c-ci-gate.log](logs/pr08c-ci-gate.log) |
+| PR08C-CONTROL | `PERF_LOG_TO_CONSOLE=false PERF_FIO_SIZE=64m PERF_FIO_RUNTIME=20 bash docker/compose-xfstests/run_redis_perf.sh --s3 --tools "fio-randwrite fio-randrw metaperf"` | 0 | PASS（3/3 工具 pass，0 warning） | `logs/pr08c-control64-run.raw.log` → `artifacts/perf-run-1789804357-86` |
+| PR08C-CONTROL2 | 同上（同一二进制，量噪声带） | 0 | PASS（3/3 工具 pass，0 warning） | `logs/pr08c-control64-run2.raw.log` → `artifacts/perf-run-1789805052-2568` |
+| PR08C-CANDIDATE | 同上（二进制由 `--features native-packed-base` 构建） | 0 | PASS（3/3 工具 pass，0 warning） | `logs/pr08c-native-run.raw.log` → `artifacts/perf-run-1789803051-11108` |
+| PR08C-COMPARE | `python3 tools/perf/compare_artifacts.py <control> <candidate>` | 0 | PASS（无未解释回退/cost shift，见上表） | `logs/pr08c-compare-control-vs-candidate.log` |
+| PR08C-NOISE | `python3 tools/perf/compare_artifacts.py <control> <control2>` | 0 | PASS（给出 run-to-run 噪声带） | `logs/pr08c-compare-control-vs-control.log` |
+| PR08C-TEARDOWN | `bash doc/native-base/logs/pr08c-compose-perf-and-teardown.sh` | 0 | PASS（`ALL CHECKS PASSED`；容器/volume/mount/连接/进程/D-state 全 0） | `logs/pr08c-compose-perf-and-teardown.log` |
+| PR08C-GATE | `bash doc/native-base/logs/ci-gate.sh` | 0 | PASS（workspace 988 + 730 passed；clippy/fmt/feature checks 全绿） | `logs/pr08c-ci-gate.log` |
 
 范围说明（诚实）：AGENTS.md 的严格画像 `--writeback-throughput-profile` +
 `PERF_FIO_SIZE=512m` 在本机**没有跑完**——WSL2 的 vhdx（`D:\WSL\Ubuntu-24.04\ext4.vhdx`）
@@ -1024,24 +1027,10 @@ teardown（REGRESS-006）：四次 compose 运行（含下面那次失败的）�
 
 核心改动（测试）：
 - `shared_plain_frame_fixture()`：一个 PlainBytes frame 的 raw 把两个小文件的字节**交错**排列
-  （`A0|B0|A1|B1`）；file A（slice `0x31`）用两个 span 指向该 frame 的 `[0,|A0|)` 与
-  `|A0|+|B0|` 起的区间，file B（slice `0x32`）用另外两个 span 指向剩下两段。span 在 frame 内的
-  raw offset 刻意不相邻，所以“把 block offset 当 raw offset”的实现必然读出错误字节。
-- `one_plain_frame_serves_two_files_without_mixing_their_slices`：file A 的整块读逐字节等于
-  `A0||A1`（不含 B 的字节），file B 同理；file A 内偏移 3/长度 6 的部分读落在第一个 span 内、
-  偏移 11/长度 12 的读跨越 span 边界，都与文件字节逐字节一致；4 次读共 7 个 span，只有 4 次
-  Range GET（每次读 1 次，从不按 span 计）。
-- `decoded_budget_for_a_shared_plain_frame_counts_the_frame_once`：`decoded_payload_bytes` 每次读
-  恰好等于该 frame 的 `raw_len`（不按 span 累加、不按引用文件重复计入）；`ReadBudget::new(
-  FRAME_HEADER_LEN + stored_len, raw_len)` 恰好放行且读后 `inflight() == (0, 0)`；decoded 上限
-  少 1 字节时在任何 I/O 之前 `BudgetUnitTooLarge`，`source.gets()` 不变、令牌不泄漏。
-
-| ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
-|---|---|---:|---|---|
-| PR08B-FOCUSED | `bash doc/native-base/logs/pr08b-plain-shared-frame.sh` | 0 | PASS（两个用例各 1 passed/0 failed） | [pr08b-plain-shared-frame.log](logs/pr08b-plain-shared-frame.log) |
+  （`A0|B0|A1|B1`）；file A（slice `0x31`）用两个 span 指向该 frame 的 ``logs/pr08b-plain-shared-frame.log` |
 | PR08B-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR08B-OPT001 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::seal::tests` | 0 | PASS（seal 38 passed/0 failed） | 同上 |
-| PR08B-GATE | `bash doc/native-base/logs/ci-gate.sh` | 0 | PASS（workspace 988 + 730 passed；clippy/fmt/feature checks 全绿） | [pr08b-ci-gate.log](logs/pr08b-ci-gate.log) |
+| PR08B-GATE | `bash doc/native-base/logs/ci-gate.sh` | 0 | PASS（workspace 988 + 730 passed；clippy/fmt/feature checks 全绿） | `logs/pr08b-ci-gate.log` |
 
 范围说明（诚实）：本步验证的是 **read plan 的切片与解码记账**（fake counting backend，无真实
 S3/网络），不是 spec 06 §5 里“跨进程共享缓存服务”的端到端启用：`cache::probe_shared_cache` 仍是
@@ -1072,10 +1061,10 @@ Unix-socket 共享服务已上线；它证明的是 P3 “Plain shared frame”�
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR08A-FOCUSED | `bash doc/native-base/logs/pr08a-training-sampler-hints.sh` | 0 | PASS（sampler 5 passed/0 failed） | [pr08a-training-sampler-hints.log](logs/pr08a-training-sampler-hints.log) |
+| PR08A-FOCUSED | `bash doc/native-base/logs/pr08a-training-sampler-hints.sh` | 0 | PASS（sampler 5 passed/0 failed） | `logs/pr08a-training-sampler-hints.log` |
 | PR08A-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR08A-OPT006 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::runtime::sampler::tests` | 0 | PASS（重排/幂等/多重集不变/重复抽样不合并/两类拒绝） | 同上 |
-| PR08A-GATE | `bash doc/native-base/logs/ci-gate.sh` | 0 | PASS（workspace 986 + 730 passed；clippy/fmt/feature checks 全绿） | [pr08a-ci-gate.log](logs/pr08a-ci-gate.log) |
+| PR08A-GATE | `bash doc/native-base/logs/ci-gate.sh` | 0 | PASS（workspace 986 + 730 passed；clippy/fmt/feature checks 全绿） | `logs/pr08a-ci-gate.log` |
 
 范围说明（诚实）：本步交付的是**计划器**，不是端到端的训练读取模式：`plan_sample_issue_order` 只决定
 “哪些抽样以什么次序发出”，没有接入真实 FUSE/后端的预取执行器，也没有测量顺序化带来的吞吐收益（那属于
@@ -1106,10 +1095,10 @@ planner 预算记账覆盖，本步不重复实现；`hotset` 提示（绑定 Lo
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07Z-FOCUSED | `bash doc/native-base/logs/pr07z-lossless-repack.sh` | 0 | PASS（seal lossless_repack 1 passed/0 failed） | [pr07z-lossless-repack.log](logs/pr07z-lossless-repack.log) |
+| PR07Z-FOCUSED | `bash doc/native-base/logs/pr07z-lossless-repack.sh` | 0 | PASS（seal lossless_repack 1 passed/0 failed） | `logs/pr07z-lossless-repack.log` |
 | PR07Z-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07Z-OPT007 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::seal::tests::lossless_repack_keeps_bindings_and_logical_revision` | 0 | PASS（Bindings 不变、物理三表改变、旧对象 0 GET、变体记账、content-hash 反向拒绝） | 同上 |
-| PR07Z-GATE | `bash doc/native-base/logs/ci-gate.sh` | 0 | PASS（workspace 981 + 730 passed；clippy/fmt/feature checks 全绿） | [pr07z-ci-gate.log](logs/pr07z-ci-gate.log) |
+| PR07Z-GATE | `bash doc/native-base/logs/ci-gate.sh` | 0 | PASS（workspace 981 + 730 passed；clippy/fmt/feature checks 全绿） | `logs/pr07z-ci-gate.log` |
 
 范围说明（诚实）：本步是 **component-level** 的证据，不是一次真实的多 Pack 离线 repack 作业：测试里源/候选两个 seal 都是
 由 `SealBuilder` 在内存中构造的（块很小、单块、无压缩策略变化），没有覆盖多块/大 Pack 的构建成本、`--max-extra-bytes`
@@ -1136,12 +1125,12 @@ planner 预算记账覆盖，本步不重复实现；`hotset` 提示（绑定 Lo
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07Y-FOCUSED | `bash doc/native-base/logs/pr07y-logical-migration-roundtrip.sh` | 0 | PASS（migration 4 passed/0 failed） | [pr07y-logical-migration-roundtrip.log](logs/pr07y-logical-migration-roundtrip.log) |
+| PR07Y-FOCUSED | `bash doc/native-base/logs/pr07y-logical-migration-roundtrip.sh` | 0 | PASS（migration 4 passed/0 failed） | `logs/pr07y-logical-migration-roundtrip.log` |
 | PR07Y-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07Y-ROUNDTRIP | `cargo test -p brewfs --features native-packed-base --lib -- native_base::runtime::migration::tests::a_logical_copy_retains_the_source_and_reproduces_attributes_and_content` | 0 | PASS（源保留 + 属性/布局孪生行 + 目标 reader 同 size/字节） | 同上 |
 | PR07Y-REFUSALS | `cargo test -p brewfs --features native-packed-base --lib -- native_base::runtime::migration::tests::a_logical_copy_refuses_a_reused_id_a_moving_mode_and_a_taken_target` | 0 | PASS（VolumeIdReuse / CopyRequiresOfflineCopy / NamespaceExists / TargetVolumeNotEmpty） | 同上 |
 | PR07Y-FAILCLOSED | `cargo test -p brewfs --features native-packed-base --lib -- native_base::runtime::migration::tests::a_logical_copy_fails_closed_on_a_store_that_leaves_the_volume_prefix` | 0 | PASS（ScanOutsideVolumePrefix，且不安装目标 header） | 同上 |
-| PR07Y-GATE | `bash doc/native-base/logs/ci-gate.sh` | 0 | PASS（workspace 980 + 730 passed；clippy/fmt/feature checks 全绿） | [pr07y-ci-gate.log](logs/pr07y-ci-gate.log) |
+| PR07Y-GATE | `bash doc/native-base/logs/ci-gate.sh` | 0 | PASS（workspace 980 + 730 passed；clippy/fmt/feature checks 全绿） | `logs/pr07y-ci-gate.log` |
 
 范围说明（诚实）：这是 **component-level** 的逻辑迁移，不是挂载级迁移工具：`copy_volume_logically` 在
 一个事务里重发全部控制行，因此大卷的批处理/续传、迁移进度与限流不在本步范围内；数据对象不搬，所以
@@ -1175,13 +1164,13 @@ REGRESS-001 断言的是“native 特性关闭时旧路径不变”，REGRESS-00
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07X-FOCUSED | `bash doc/native-base/logs/pr07x-compat-known-gaps.sh` | 0 | PASS（focused 1 passed；feature-off header 5 passed；feature-off lib 934 passed/0 failed） | [pr07x-compat-known-gaps.log](logs/pr07x-compat-known-gaps.log) |
+| PR07X-FOCUSED | `bash doc/native-base/logs/pr07x-compat-known-gaps.sh` | 0 | PASS（focused 1 passed；feature-off header 5 passed；feature-off lib 934 passed/0 failed） | `logs/pr07x-compat-known-gaps.log` |
 | PR07X-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07X-REGRESS001 | `cargo test -p brewfs --no-default-features --features fuse-tokio-runtime --lib` | 0 | PASS（934 passed；0 failed；225 ignored） | 同上 |
 | PR07X-REGRESS002 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::runtime::header::tests::an_older_binary_or_a_newer_volume_is_refused_without_a_flat_fallback` | 0 | PASS（1 passed；1261 filtered out） | 同上 |
 | PR07X-REGRESS002-OFF | `cargo test -p brewfs --no-default-features --features fuse-tokio-runtime --lib -- native_base::runtime::header::tests::` | 0 | PASS（5 passed；1154 filtered out） | 同上 |
 | PR07X-REGRESS005 | `grep -n 'generic/075\|iogen01\|ENODEV' AGENTS.md; grep -n 'KnownGap' doc/native-base/known-gaps.md` | 0 | PASS（KnownGap 记录存在且注明非 PASS） | [known-gaps.md](known-gaps.md) / 同上 |
-| PR07X-GATE | `bash doc/native-base/logs/ci-gate.sh` | 0 | PASS（workspace 980 + 730 passed；clippy/fmt/feature checks 全绿） | [pr07x-ci-gate.log](logs/pr07x-ci-gate.log) |
+| PR07X-GATE | `bash doc/native-base/logs/ci-gate.sh` | 0 | PASS（workspace 980 + 730 passed；clippy/fmt/feature checks 全绿） | `logs/pr07x-ci-gate.log` |
 
 范围说明（诚实）：REGRESS-005 在矩阵中保持 **`NOT_RUN`**，不是 PASS——本步交付的是“如实记录为 KnownGap”这件事，
 而不是 buffered/direct/mmap 形态本身通过：这三种形状需要真实 FUSE 挂载加 xfstests/LTP harness
@@ -1208,7 +1197,7 @@ REGRESS-001 断言的是“native 特性关闭时旧路径不变”，REGRESS-00
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07W-FOCUSED | `bash doc/native-base/logs/pr07w-write-path-durability.sh` | 0 | PASS（focused 6 passed/0 failed；runtime::io 24 passed） | [pr07w-write-path-durability.log](logs/pr07w-write-path-durability.log) |
+| PR07W-FOCUSED | `bash doc/native-base/logs/pr07w-write-path-durability.sh` | 0 | PASS（focused 6 passed/0 failed；runtime::io 24 passed） | `logs/pr07w-write-path-durability.log` |
 | PR07W-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07W-WRITE001 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::runtime::io::tests::a_first_4k_overwrite_of_a_gib_file_touches_one_block_and_no_more` | 0 | PASS（1 GiB 基线首写只读/写 1 块，无 copy-up） | 同上 |
 | PR07W-WRITE002 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::runtime::io::tests::a_write_straddling_a_block_boundary_rewrites_only_those_two_blocks` | 0 | PASS（只读 2 块、只发布 2 条 extent、范围外仍读基线） | 同上 |
@@ -1246,7 +1235,7 @@ WRITE-001 的 4096B 与 WRITE-002 的跨块 10B 都是 block_size=4096 下的单
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07V-FOCUSED | `bash doc/native-base/logs/pr07v-fenced-writer-rollback.sh` | 0 | PASS（focused 4 passed/0 failed；write 45 passed、runtime 31 passed） | [pr07v-fenced-writer-rollback.log](logs/pr07v-fenced-writer-rollback.log) |
+| PR07V-FOCUSED | `bash doc/native-base/logs/pr07v-fenced-writer-rollback.sh` | 0 | PASS（focused 4 passed/0 failed；write 45 passed、runtime 31 passed） | `logs/pr07v-fenced-writer-rollback.log` |
 | PR07V-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07V-CONS004a | `cargo test -p brewfs --features native-packed-base --lib -- native_base::write::tests_fence::an_expired_or_superseded_lease_stops_a_dispatch_before_any_row_is_written` | 0 | PASS（过期与被顶替两种租约都整卷逐字节不变） | 同上 |
 | PR07V-CONS004b | `cargo test -p brewfs --features native-packed-base --lib -- native_base::write::tests_fence::a_fence_between_two_blocks_protects_the_uploads_that_already_landed` | 0 | PASS（落盘块 = 1 条 DataUploaded receipt，dirty 被清除） | 同上 |
@@ -1280,7 +1269,7 @@ WRITE-001 的 4096B 与 WRITE-002 的跨块 10B 都是 block_size=4096 下的单
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07U-FOCUSED | `bash doc/native-base/logs/pr07u-capture-consistency.sh` | 0 | PASS（runtime::io 19 passed/0 failed，每 ID 1 passed，CONS-006 2 passed） | [pr07u-capture-consistency.log](logs/pr07u-capture-consistency.log) |
+| PR07U-FOCUSED | `bash doc/native-base/logs/pr07u-capture-consistency.sh` | 0 | PASS（runtime::io 19 passed/0 failed，每 ID 1 passed，CONS-006 2 passed） | `logs/pr07u-capture-consistency.log` |
 | PR07U-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07U-CONS001 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::runtime::io::tests::a_commit_inside_a_read_capture_is_never_served_stale` | 0 | PASS（故障注入 store 在 extent 扫描中提交并 handoff） | 同上 |
 | PR07U-CONS002 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::runtime::io::tests::a_lost_commit_reply_hands_off_without_a_gap` | 0 | PASS（事务已应用但回包丢失 → 重试回答 AlreadyCommitted） | 同上 |
@@ -1314,18 +1303,7 @@ memory/redis/tikv 三个 lists。
   避免一个被拒输入毒化该 inode 的后续顺序槽（WRITE-010）。
 - `Replacement`（`replace.rs`）：`plan_rename_over` 读源/目标两个 view，要求源有持久记录、每个 data extent 的
   `block_count` 与长度自洽，并把每个 block 通过 `bnd/`、`plc/`、`obj/` 解析成携带用的 `CommittedBlock`；
-  `cover_whole_file` 要求新 extent 集合无缝隙、无重叠、无零长且恰好铺满 `[0, size)`——缺一段就会让目标残留旧字节，
-  因此一律拒绝。`changed_ranges()` 恒为整文件 `(0, size)`，`is_application_complete()` 恒真：rename 覆盖没有
-  “最小 patch” 形式，即使两侧同尺寸同内容也一样（WRITE-012）。
-- commit 侧 `Mutation::ReplaceInode`：同一事务删除目标全部旧 extent 行（逐行 `check_bytes`）、写入完整携带集合、
-  对每个携带 block 的 `bnd/`/`plc/` 行做 compare-then-put、把所有携带 block 纳入 registration 校验与
-  `durable_receipts`；`planned_size` 返回完整新 size（对比 `SetAttributes` 的 `None`），因此同尺寸覆盖仍会 +1 `data_version`。
-  行为测试断言：目标 extent 集合与源逐条相同（含 Hole）、旧 `ext64` 行消失、目标引用对象 = 源对象且与自身旧对象不相交、
-  receipts 解出的条目恰好覆盖全部携带对象、源 inode 完全不变；手写的“缺一段”`ReplaceInode` 在提交边界被拒且整卷快照不变。
-
-| ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
-|---|---|---:|---|---|
-| PR07T-FOCUSED | `bash doc/native-base/logs/pr07t-write-receipts-attributes-replace.sh` | 0 | PASS（write 41 passed/0 failed，每 ID 1 passed + replace 单测 4 passed） | [pr07t-write-receipts-attributes-replace.log](logs/pr07t-write-receipts-attributes-replace.log) |
+  `cover_whole_file` 要求新 extent 集合无缝隙、无重叠、无零长且恰好铺满 ``logs/pr07t-write-receipts-attributes-replace.log` |
 | PR07T-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07T-WRITE006 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::write::tests::orphan_protection::a_kv_failure_after_a_successful_upload_protects_the_receipt` | 0 | PASS（故障注入 store，走真实 overlay drain 路径） | 同上 |
 | PR07T-WRITE010 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::write::tests::memory_backend::chmod_on_a_large_file_changes_metadata_and_uploads_no_data` | 0 | PASS（场景与 memory/redis/tikv 共享） | 同上 |
@@ -1351,7 +1329,7 @@ rename 覆盖不产生新的数据 PUT（对象已按内容寻址持久化在源
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07S-FOCUSED | `bash doc/native-base/logs/pr07s-lease-fence-durability.sh` | 0 | PASS（write 23 passed/0 failed，每 ID 1 passed） | [pr07s-lease-fence-durability.log](logs/pr07s-lease-fence-durability.log) |
+| PR07S-FOCUSED | `bash doc/native-base/logs/pr07s-lease-fence-durability.sh` | 0 | PASS（write 23 passed/0 failed，每 ID 1 passed） | `logs/pr07s-lease-fence-durability.log` |
 | PR07S-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07S-WRITE007 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::write::tests::memory_backend::an_expired_or_superseded_lease_is_fenced_without_partial_metadata` | 0 | PASS（场景与 memory/redis/tikv 共享） | 同上 |
 | PR07S-KV004 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::write::lease::tests::lease_validity_comes_from_the_backend_clock` | 0 | PASS（`lease_validity_comes_from_the_backend_clock_and_ignores_client_skew`） | 同上 |
@@ -1382,7 +1360,7 @@ WRITE-007 的 fence 由 PR04 的原子事务保证，本轮把它与 lease 语�
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07R-FOCUSED | `bash doc/native-base/logs/pr07r-orphan-carry-seal-fork.sh` | 0 | PASS（orphan 3 passed/0 failed，每 ID 1 passed） | [pr07r-orphan-carry-seal-fork.log](logs/pr07r-orphan-carry-seal-fork.log) |
+| PR07R-FOCUSED | `bash doc/native-base/logs/pr07r-orphan-carry-seal-fork.sh` | 0 | PASS（orphan 3 passed/0 failed，每 ID 1 passed） | `logs/pr07r-orphan-carry-seal-fork.log` |
 | PR07R-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07R-ORD009 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::lifecycle::orphan::tests::open_unlinked_inode_survives_seal` | 0 | PASS（`open_unlinked_inode_survives_seal_and_never_enters_the_visible_baseline`） | 同上 |
 | PR07R-ORD010 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::lifecycle::orphan::tests::a_lost_seal_reply` | 0 | PASS（`a_lost_seal_reply_is_recovered_by_operation_id_without_wrong_fast_forward`） | 同上 |
@@ -1412,7 +1390,7 @@ carry 只记录 placement 与 payload hash，不复制数据本体。
 
 | ID | 原样命令 | 退出码 | 结果 | raw日志/fixture路径 |
 |---|---|---:|---|---|
-| PR07Q-FOCUSED | `bash doc/native-base/logs/pr07q-index-relocation-prune-cookies.sh` | 0 | PASS（frozen 18 passed/0 failed，3 项各 1 passed） | [pr07q-index-relocation-prune-cookies.log](logs/pr07q-index-relocation-prune-cookies.log) |
+| PR07Q-FOCUSED | `bash doc/native-base/logs/pr07q-index-relocation-prune-cookies.sh` | 0 | PASS（frozen 18 passed/0 failed，3 项各 1 passed） | `logs/pr07q-index-relocation-prune-cookies.log` |
 | PR07Q-FMT | `cargo fmt --all --check` | 0 | PASS（同上） | 同上 |
 | PR07Q-IDX003 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::frozen::tests::attribute_relocation` | 0 | PASS（`attribute_relocation_from_inline_to_external_keeps_the_canonical_bytes`） | 同上 |
 | PR07Q-IDX004 | `cargo test -p brewfs --features native-packed-base --lib -- native_base::frozen::tests::inventory_prune` | 0 | PASS（`inventory_prune_removes_only_dead_slots_of_the_repacked_pack`） | 同上 |

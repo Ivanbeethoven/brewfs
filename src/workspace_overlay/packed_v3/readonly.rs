@@ -212,6 +212,24 @@ impl<B: ObjectBackend + Clone + 'static> ObjectBackend for V3ReadonlyBackend<B> 
             .await?;
         Ok(result.value.clone())
     }
+
+    async fn get_etag_observed(
+        &self,
+        key: &str,
+        context: crate::cadapter::read_observer::ReadContext,
+        observer: Arc<crate::cadapter::read_observer::ReadObserver>,
+    ) -> anyhow::Result<String> {
+        let result = self
+            .metrics
+            .transport
+            .run(&self.budget, key.len(), 0, || {
+                let client = self.client.clone();
+                let key = key.to_owned();
+                async move { client.backend_etag_observed(&key, context, observer).await }
+            })
+            .await?;
+        Ok(result.value.clone())
+    }
     async fn delete_object(&self, _key: &str) -> anyhow::Result<()> {
         anyhow::bail!(READ_ONLY_ERROR)
     }
@@ -316,6 +334,9 @@ impl<B: ObjectBackend + Clone + 'static> std::fmt::Debug for ReadonlyPathsOwner<
 }
 
 fn map_error(error: PackedWireError) -> MetaError {
+    if matches!(error, PackedWireError::ReadViewChanged) {
+        return MetaError::Anyhow(anyhow::Error::new(crate::chunk::read_plan::ReadViewChanged));
+    }
     if matches!(error, PackedWireError::LimitExceeded(_)) {
         return MetaError::Io(std::io::Error::from_raw_os_error(libc::ENOMEM));
     }
@@ -333,6 +354,15 @@ fn map_error(error: PackedWireError) -> MetaError {
         _ => tracing::warn!(error = %error, "packed readonly metadata validation failed"),
     }
     MetaError::Internal(error.to_string())
+}
+
+fn packed_error_to_anyhow(error: PackedWireError) -> anyhow::Error {
+    match error {
+        PackedWireError::ReadViewChanged => {
+            anyhow::Error::new(crate::chunk::read_plan::ReadViewChanged)
+        }
+        error => anyhow::Error::new(error),
+    }
 }
 
 fn file_type(kind: u8, mode: u32) -> FileType {
@@ -487,7 +517,7 @@ where
                 32 * 1024 * 1024,
             )
             .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            .map_err(packed_error_to_anyhow)?;
         context
             .metrics
             .logical_bytes
@@ -586,6 +616,44 @@ pub struct PackedV3ReadonlyMeta<B: ObjectBackend + Clone + 'static> {
     root: AtomicI64,
     chunk_size: u64,
     context: Arc<V3ReadonlyContext<B>>,
+    /// The snapshot is immutable and authenticated, so a resolved attribute
+    /// never changes for the life of this reader. Memoizing it removes the
+    /// per-stat index walk (budget admission, async gate and several page
+    /// cache lookups). Bounded by entry count; misses take the normal path.
+    /// None when metadata caching is disabled (`cache_bytes == 0`): every
+    /// stat must then observe the backend, including injected faults.
+    attrs: Option<moka::sync::Cache<i64, Option<FileAttr>>>,
+    /// Resolved (parent, name) -> (inode, attr) lookups, including absence.
+    /// Same lifetime, invalidation and enablement as `attrs`: the snapshot is
+    /// immutable, so an authenticated lookup result never changes. Removes the
+    /// per-lookup GroupMeta range fetch and decode.
+    dentries: Option<DentryMemo>,
+    attrs_closed: std::sync::atomic::AtomicBool,
+}
+
+const ATTR_MEMO_ENTRIES: u64 = 1 << 20;
+
+fn attr_memo() -> moka::sync::Cache<i64, Option<FileAttr>> {
+    moka::sync::Cache::builder()
+        .max_capacity(ATTR_MEMO_ENTRIES)
+        .build()
+}
+
+/// Byte bound for the lookup memo (keys, attributes and cache overhead).
+const DENTRY_MEMO_BYTES: u64 = 64 << 20;
+
+/// (parent inode, name) -> resolved (inode, attr), or None when absent.
+type DentryMemo = moka::sync::Cache<(u64, Vec<u8>), Option<(i64, FileAttr)>>;
+
+fn dentry_memo() -> DentryMemo {
+    moka::sync::Cache::builder()
+        .weigher(|key: &(u64, Vec<u8>), _value: &Option<(i64, FileAttr)>| {
+            u32::try_from(key.1.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(192)
+        })
+        .max_capacity(DENTRY_MEMO_BYTES)
+        .build()
 }
 
 /// One authenticated reverse-index page and its memory owner.
@@ -659,6 +727,9 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
             root,
             chunk_size,
             context,
+            attrs: (metadata_bytes != 0).then(attr_memo),
+            dentries: (metadata_bytes != 0).then(dentry_memo),
+            attrs_closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -685,6 +756,12 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
 
     pub fn mount_budget(&self) -> Arc<super::wire005::V3MountBudget> {
         Arc::clone(&self.context.budget)
+    }
+
+    /// Runtime backend range GETs issued by this reader (metadata and data).
+    #[cfg(test)]
+    pub(crate) fn runtime_range_gets(&self) -> u64 {
+        self.context.metrics.range_gets.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn frozen_cold_attributes_owned(
@@ -797,6 +874,13 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
     /// Stop backend admission, join the real frame worker and wait every
     /// started response driver/body. The caller owns pin/budget retirement.
     pub(crate) async fn drain_packed_transport(&self) -> Result<(), MetaError> {
+        self.attrs_closed.store(true, Ordering::Release);
+        if let Some(attrs) = &self.attrs {
+            attrs.invalidate_all();
+        }
+        if let Some(dentries) = &self.dentries {
+            dentries.invalidate_all();
+        }
         self.context.metrics.transport.stop_admission();
         self.context.reader.close().await;
         self.context
@@ -827,6 +911,43 @@ impl<B: ObjectBackend + Clone + 'static> PackedV3ReadonlyMeta<B> {
             .transport
             .bind_reader(reader)
             .map_err(MetaError::Anyhow)
+    }
+
+    async fn stat_fresh_uncached(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
+        let inode = Self::inode(ino)?;
+        let manifest = self.context.snapshot.manifest();
+        if inode == manifest.root_inode {
+            if let Some(source) = &manifest.source {
+                return Ok(Some(attr_from_root(&source.root)));
+            }
+            return Ok(Some(FileAttr {
+                ino,
+                size: 0,
+                blocks: 0,
+                kind: FileType::Dir,
+                mode: 0o040755,
+                rdev: 0,
+                uid: 0,
+                gid: 0,
+                atime: 0,
+                mtime: 0,
+                ctime: 0,
+                nlink: 2,
+            }));
+        }
+        // II05 carries the complete hot attribute set.  Use it directly for
+        // getattr/open so a metadata-only operation does not fetch or clone a
+        // GroupMeta page merely to reconstruct FileAttr.
+        if let Some(index) = self.index_entry(inode).await? {
+            return Ok(Some(
+                self.with_source_blocks(attr_from_inode_index(&index))
+                    .await?,
+            ));
+        }
+        match self.entry(inode).await? {
+            Some(entry) => Ok(Some(self.with_source_blocks(attr(inode, &entry)).await?)),
+            None => Ok(None),
+        }
     }
 
     async fn index_entry(&self, inode: u64) -> Result<Option<PackedInodeIndexEntry>, MetaError> {
@@ -1046,40 +1167,21 @@ where
         self.stat_fresh(ino).await
     }
     async fn stat_fresh(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
-        let inode = Self::inode(ino)?;
-        let manifest = self.context.snapshot.manifest();
-        if inode == manifest.root_inode {
-            if let Some(source) = &manifest.source {
-                return Ok(Some(attr_from_root(&source.root)));
-            }
-            return Ok(Some(FileAttr {
-                ino,
-                size: 0,
-                blocks: 0,
-                kind: FileType::Dir,
-                mode: 0o040755,
-                rdev: 0,
-                uid: 0,
-                gid: 0,
-                atime: 0,
-                mtime: 0,
-                ctime: 0,
-                nlink: 2,
-            }));
+        // A closed mount budget fences every lower read; the memo must not
+        // outlive that fence. The uncached path reports the closed error.
+        if !self.attrs_closed.load(Ordering::Acquire)
+            && !self.context.budget.state().closed
+            && let Some(attr) = self.attrs.as_ref().and_then(|attrs| attrs.get(&ino))
+        {
+            return Ok(attr);
         }
-        // II05 carries the complete hot attribute set.  Use it directly for
-        // getattr/open so a metadata-only operation does not fetch or clone a
-        // GroupMeta page merely to reconstruct FileAttr.
-        if let Some(index) = self.index_entry(inode).await? {
-            return Ok(Some(
-                self.with_source_blocks(attr_from_inode_index(&index))
-                    .await?,
-            ));
+        let attr = self.stat_fresh_uncached(ino).await?;
+        if !self.attrs_closed.load(Ordering::Acquire)
+            && let Some(attrs) = &self.attrs
+        {
+            attrs.insert(ino, attr.clone());
         }
-        match self.entry(inode).await? {
-            Some(entry) => Ok(Some(self.with_source_blocks(attr(inode, &entry)).await?)),
-            None => Ok(None),
-        }
+        Ok(attr)
     }
     async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
         let parent = Self::inode(parent)?;
@@ -1118,15 +1220,35 @@ where
         name: &[u8],
     ) -> Result<Option<(i64, FileAttr)>, MetaError> {
         let parent = Self::inode(parent)?;
-        let Some(entry) = self.lookup_entry(self.parent_key(parent), name).await? else {
-            return Ok(None);
+        // Same closed-budget fence as the attribute memo: a retired mount
+        // reports its error from the uncached path, never a memoized entry.
+        let memo = self
+            .dentries
+            .as_ref()
+            .filter(|_| !self.attrs_closed.load(Ordering::Acquire));
+        let key = (parent, name.to_vec());
+        if !self.context.budget.state().closed
+            && let Some(found) = memo.and_then(|memo| memo.get(&key))
+        {
+            return Ok(found);
+        }
+        let found = match self.lookup_entry(self.parent_key(parent), name).await? {
+            None => None,
+            Some(entry) => {
+                let inode = i64::try_from(entry.inode)
+                    .map_err(|_| MetaError::Internal("packed inode exceeds i64".into()))?;
+                Some((
+                    inode,
+                    self.with_source_blocks(attr(entry.inode, &entry)).await?,
+                ))
+            }
         };
-        let inode = i64::try_from(entry.inode)
-            .map_err(|_| MetaError::Internal("packed inode exceeds i64".into()))?;
-        Ok(Some((
-            inode,
-            self.with_source_blocks(attr(entry.inode, &entry)).await?,
-        )))
+        if !self.attrs_closed.load(Ordering::Acquire)
+            && let Some(memo) = &self.dentries
+        {
+            memo.insert(key, found.clone());
+        }
+        Ok(found)
     }
     async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError> {
         if path.is_empty() || !path.starts_with('/') {

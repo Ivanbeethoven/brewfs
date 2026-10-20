@@ -22,6 +22,8 @@ enum Fault {
     MutationAppliedReplyLost,
     MutationAppliedReplyLostThenExpire,
     MutationAppliedReplyLostThenChangePwa,
+    HoldMismatch,
+    HoldMismatchHotAdvanced,
 }
 
 struct BoundedReadTrace {
@@ -89,6 +91,37 @@ impl WorkspaceKvBackend for MovingRootBackend {
                 .lock()
                 .await
                 .insert(PACKED_ROOT_GENERATION_KEY.to_vec(), encode(&2u64).unwrap());
+        }
+        if keys.len() == 1
+            && keys[0].starts_with(HOLD_PREFIX)
+            && matches!(
+                self.fault,
+                Fault::HoldMismatch | Fault::HoldMismatchHotAdvanced
+            )
+        {
+            // Simulate an independently changed derived hold after the
+            // packet's source and epoch reads. The source advance variant
+            // models a lease heartbeat committing both rows together.
+            let mut rows = self.inner.rows.lock().await;
+            let raw = rows.get(&keys[0]).cloned().expect("fixture native hold");
+            let mut hold = NativeHold::decode(&raw).unwrap();
+            if let NativeHold::Lease { generation, .. } = &mut hold {
+                *generation += 1;
+            } else {
+                panic!("fixture native hold must be a lease");
+            }
+            rows.insert(keys[0].clone(), hold.encode().unwrap());
+            if matches!(self.fault, Fault::HoldMismatchHotAdvanced) {
+                let source = rows
+                    .iter()
+                    .find(|(key, _)| key.starts_with(HOT_LEASE_PREFIX))
+                    .map(|(key, raw)| (key.clone(), raw.clone()))
+                    .expect("fixture hot lease");
+                let mut lease: SnapshotLease = decode(&source.1).unwrap();
+                lease.holder_generation += 1;
+                lease.updated_at_ns += 1;
+                rows.insert(source.0, encode(&lease).unwrap());
+            }
         }
         if keys.iter().any(|key| key.as_slice() == CONTROL_KEY) {
             self.reads.lock().await.push(keys.to_vec());
@@ -584,6 +617,52 @@ async fn clean_finish_never_retries_false_or_unknown_final_mutation() {
         assert_eq!(fixture.backend.mutations.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.backend.scans.load(Ordering::SeqCst), 2);
     }
+}
+
+#[tokio::test]
+async fn native_owner_hold_mismatch_rebuilds_when_hot_source_advanced() {
+    let mut fixture = fixture(Fault::HoldMismatchHotAdvanced).await;
+    let original_writes = fixture.writes.clone();
+    let (epochs_match, owner) = fixture
+        .store
+        .prepare_native_owner_cas_with_epoch_status(&mut fixture.checks, &mut fixture.writes)
+        .await
+        .unwrap();
+    assert!(!epochs_match);
+    assert!(owner.is_none());
+    assert_eq!(fixture.writes, original_writes);
+    let source = fixture
+        .checks
+        .iter()
+        .find(|row| row.key.starts_with(HOT_LEASE_PREFIX))
+        .unwrap();
+    assert_ne!(
+        fixture.backend.inner.rows.lock().await.get(&source.key),
+        source.expected.as_ref()
+    );
+}
+
+#[tokio::test]
+async fn native_owner_hold_mismatch_stays_fenced_when_hot_source_is_unchanged() {
+    let mut fixture = fixture(Fault::HoldMismatch).await;
+    let original_writes = fixture.writes.clone();
+    assert!(matches!(
+        fixture
+            .store
+            .prepare_native_owner_cas(&mut fixture.checks, &mut fixture.writes)
+            .await,
+        Err(WorkspaceError::Fenced)
+    ));
+    assert_eq!(fixture.writes, original_writes);
+    let source = fixture
+        .checks
+        .iter()
+        .find(|row| row.key.starts_with(HOT_LEASE_PREFIX))
+        .unwrap();
+    assert_eq!(
+        fixture.backend.inner.rows.lock().await.get(&source.key),
+        source.expected.as_ref()
+    );
 }
 
 #[tokio::test]

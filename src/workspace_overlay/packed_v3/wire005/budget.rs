@@ -79,6 +79,10 @@ pub struct V3MountBudget {
     changed: tokio::sync::Notify,
     observer: Mutex<Weak<crate::cadapter::read_observer::ReadObserver>>,
 }
+/// Longest a waiting arena admission queues behind sibling owners before it
+/// fails closed with the ordinary exhaustion error.
+const ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl V3MountBudget {
     pub const REPLY_ALLOCATION_ALLOWANCE_BYTES: u64 = 1 << 20;
     pub const STATS_EXTENSION_RENDER_MAX_BYTES: usize = 32768;
@@ -295,13 +299,16 @@ impl V3MountBudget {
                             .is_none_or(|n| n > self.limits.bytes[*i])
                     })
                     .expect("failed admission has an exhausted pool");
-                format!(
+                let reason = format!(
                     "mount {} budget temporarily exhausted: used={}, requested={}, limit={}",
                     V3BudgetPool::ALL[index].name(),
                     state.used[index],
                     bytes,
                     self.limits.bytes[index]
-                )
+                );
+                // ENOMEM at the FUSE boundary carries no pool; record it here.
+                tracing::debug!(target: "brewfs::packed_v3_budget", %reason, "admission rejected");
+                reason
             }));
         }
         for (i, bytes) in totals.iter().enumerate() {
@@ -358,6 +365,95 @@ impl V3MountBudget {
                     changed.await;
                 }
                 Err(error) => return Err(error),
+            }
+        }
+    }
+    /// Admit a read-preparation arena from Plans, waiting (without holding any
+    /// partial charge) while concurrent preparations occupy the pool. Plans
+    /// preparation arenas shrink to their real size before execution and are
+    /// released when a read finishes, so this wait always makes progress.
+    pub(super) async fn admit_waiting_for_plans(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> PackedResult<V3OwnedPermit> {
+        // read_preparation_limit already leaves the recipe reserve out of the
+        // arena; an extra headroom wait would starve a same-frame follower at
+        // the minimum supported Plans capacity.
+        self.admit_waiting_for(V3BudgetPool::Plans, bytes).await
+    }
+    /// Admit one short-lived scratch arena from a single pool, waiting while
+    /// sibling requests hold it. Callers must admit before holding any other
+    /// charge in the same pool and release the arena when the request ends,
+    /// so a waiter only depends on other requests' progress.
+    pub(crate) async fn admit_waiting_for(
+        self: &Arc<Self>,
+        pool: V3BudgetPool,
+        bytes: u64,
+    ) -> PackedResult<V3OwnedPermit> {
+        if bytes > self.limits.bytes[pool as usize] {
+            return Err(PackedWireError::LimitExceeded(format!(
+                "requested {} arena exceeds mount capacity",
+                pool.name()
+            )));
+        }
+        let deadline = tokio::time::Instant::now() + ADMISSION_WAIT;
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match self.admit(&[(pool, bytes)]) {
+                Ok(permit) => return Ok(permit),
+                Err(error) if self.state().closed => return Err(error),
+                Err(error @ PackedWireError::LimitExceeded(_)) => {
+                    // Bounded: a pool that never drains (for example one
+                    // pinned by a long-lived owner) fails closed with ENOMEM.
+                    if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    /// Like `admit_waiting_for`, but a new arena is only admitted while
+    /// `headroom` bytes remain free afterwards. In-progress reads take small
+    /// non-waiting charges (recipes, drivers) from the same pool; new arenas
+    /// must not starve them into ENOMEM.
+    pub(crate) async fn admit_waiting_with_headroom(
+        self: &Arc<Self>,
+        pool: V3BudgetPool,
+        bytes: u64,
+        headroom: u64,
+    ) -> PackedResult<V3OwnedPermit> {
+        let capacity = self.limits.bytes[pool as usize];
+        if bytes.saturating_add(headroom) > capacity {
+            return Err(PackedWireError::LimitExceeded(format!(
+                "requested {} arena exceeds mount capacity",
+                pool.name()
+            )));
+        }
+        let deadline = tokio::time::Instant::now() + ADMISSION_WAIT;
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let fits = {
+                let state = self.state.lock().unwrap();
+                if state.closed {
+                    return Err(PackedWireError::LimitExceeded("mount budget closed".into()));
+                }
+                state.used[pool as usize] + bytes + headroom <= capacity
+            };
+            if fits {
+                match self.admit(&[(pool, bytes)]) {
+                    Ok(permit) => return Ok(permit),
+                    Err(error) if self.state().closed => return Err(error),
+                    Err(PackedWireError::LimitExceeded(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                return self.admit(&[(pool, bytes)]);
             }
         }
     }
@@ -690,6 +786,38 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert_eq!(budget.state().used, [0; 8]);
+    }
+
+    #[tokio::test]
+    async fn headroom_arena_waits_instead_of_taking_the_small_charge_reserve() {
+        let mut limits = V3BudgetLimits::default();
+        limits.bytes[V3BudgetPool::Metadata as usize] = 64;
+        let budget = V3MountBudget::new(limits).unwrap();
+        // 32 used: an arena of 16 with headroom 24 would leave 16 < 24 free.
+        let held = budget.admit(&[(V3BudgetPool::Metadata, 32)]).unwrap();
+        let waiting = tokio::spawn({
+            let budget = budget.clone();
+            async move {
+                budget
+                    .admit_waiting_with_headroom(V3BudgetPool::Metadata, 16, 24)
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "arena must wait for headroom");
+        // A small non-waiting charge still fits in the protected reserve.
+        let small = budget.admit(&[(V3BudgetPool::Metadata, 8)]).unwrap();
+        drop(small);
+        // Releasing the holder lets the arena in with the reserve intact.
+        drop(held);
+        let arena = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.state().used[V3BudgetPool::Metadata as usize], 16);
+        drop(arena);
+        assert_eq!(budget.state().used[V3BudgetPool::Metadata as usize], 0);
     }
 }
 

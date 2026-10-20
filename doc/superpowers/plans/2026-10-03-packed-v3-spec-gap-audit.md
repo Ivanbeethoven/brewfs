@@ -32,10 +32,10 @@ source/Git不变；原28个普通失败（含26项root故障控制）均通过�
 119通过、0失败、1 ignored，source/Git不变；stores04已完成上述326/0。
 reason04已确认三次冲突的key/primary/TS全匹配且含四类ExecDetailsV2；该测试仍0/1。
 metadata-followup05六文件已精确接入且fmt/diff通过，尚未编译/真实验收。
-详见[当前元数据增量](../../performance/packed-v3-metadata-followup-validation-2026-10-08.md)。
+详见[当前元数据增量](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-metadata-followup-validation-2026-10-08.md)。
 FUSE后端重验待执行；operator中央leader GC仍是独立生产缺口。
 真实生产CLI/FUSE/operator及完整门禁未通过，全部SPEC及S/X仍开放。
-最新计数与边界见[carrier/runtime验证](../../performance/packed-v3-carrier-fork-bootstrap-validation-2026-10-08.md)。
+最新计数与边界见[carrier/runtime验证](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-carrier-fork-bootstrap-validation-2026-10-08.md)。
 
 2026-10-08 当前收尾重点是 Redis/TiKV 的发布、恢复、reader pins 和 GC。
 此前真实后端 26 阶段的 64 项测试全部执行，56 通过、8 失败；失败均遇到
@@ -65,7 +65,7 @@ TiKV Get 锁错误，部分尚未到达目标故障注入断言，不能签收�
 只说明对应的源码与验证范围，不能作为当前树或全 SPEC 的签收。
 
 2026-10-07 最新签收子项为 G12 物理依赖审计，见
-[physical dependency validation](../../performance/packed-v3-physical-dependency-validation-2026-10-07.md)。
+[physical dependency validation](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-physical-dependency-validation-2026-10-07.md)。
 bounded HEAD、GC05/LD05 完整物理认证、SQLite 库存及七根/全部子页遍历已实现。
 gate13 实际结束 48/49、564 输入不变，唯一严格 Clippy 的两处问题已修；独立复核
 另发现 SQLx 查询取消后预算提前释放，三个真实后台 barrier RED 均复现。修复后的
@@ -82,7 +82,7 @@ journal/原子旋转/pins/packed GC 仍开放，不关闭完整 G12/G13 或全�
 候选仅在仓库外准备，未应用/运行，不把设计或DDL检查记为完整graph proof。
 
 2026-10-07 当前源码批次见
-[G12/G13 catalog safety](../../performance/packed-v3-g12-g13-catalog-safety-validation-2026-10-07.md)。
+[G12/G13 catalog safety](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-g12-g13-catalog-safety-validation-2026-10-07.md)。
 G10旧successor02反向应用无需恢复；现v3 bounded-open/attach及G11/G13保留。
 新publication retry、首次扩张inode预留检查、PWB3根代数与finalize预扫/层集合代数
 正在同源完整门禁验证；开发期117项stores中105通过、3个新增finalize竞态按预期RED、
@@ -113,7 +113,7 @@ data blocks、overlay workspace 三个创新点的实验。本文是完成清单
 接口记为端到端实现。对应实验见
 [三创新实验方案](2026-10-03-brewfs-three-innovations-experiment-plan.md)。
 
-主规范为 [packed-v3 SPEC](../specs/2026-09-27-brewfs-packed-metadata-v3-readonly-smallfiles.md)，
+主规范为 [packed-v3 SPEC](../specs/packed-meta.md)，
 关联large-directory、workspace/operator的v3完成契约也在审计范围。独立v2产品与
 旧wire/bincode/CR兼容不再是出口；历史版本记录不能约束当前v3实现。
 
@@ -158,7 +158,7 @@ data blocks、overlay workspace 三个创新点的实验。本文是完成清单
 
 2026-10-04 source-stat批次已通过40项最终本地gate与10次真实源FUSE；PM08认证根属性
 及SI05 allocated blocks不再仅在provenance中保存，见
-[source-stat checkpoint](../../performance/packed-v3-source-stat-validation-2026-10-04.md)。
+[source-stat checkpoint](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-source-stat-validation-2026-10-04.md)。
 下表G02/G03仅关闭这一子项，完整namespace/POSIX/external-large仍开放。全部SPEC目标
 及v2/operator独立出口见[扩展清单](2026-10-04-brewfs-all-spec-completion.md)。
 
@@ -191,12 +191,12 @@ data blocks、overlay workspace 三个创新点的实验。本文是完成清单
 | G08 / P3 | C：native/packed 统一实验执行路径（same-snapshot unified executor 子契约已补） | NativePackedPlacementProvider 与 PackedV3ReadonlyMeta 共享 UnifiedReadPlan/Fetcher；同 snapshot 计划/字节回读与真实 adapter read 各 1 passed | native与packed metadata可引用同一个immutable placement，并进入同executor；完整四格、真实FUSE/外部后端和实验矩阵仍开放 |
 | G09 / P4 | C：005跨请求pipeline（coordinator shutdown/JoinError 子契约已补） | V3 coordinator 已有共享有界flight、同帧唯一物理fetch、取消和慢消费者背压；本轮补真实 worker handle 关闭等待、取消后恢复 join 与 JoinError 留存测试（15 passed） | 005接共享有界singleflight/coalescing、signal、取消/卸载；支持profile矩阵和同frame唯一fetch验证；仍缺完整生产/FUSE 与 G08 统一路径 |
 | G10 / P5 | B：binding/open/attach基础已实现，完整生命周期开放 | PWB3独立版本化manifest、SQLite/KV初次install、catalog authority与缺失binding拒绝、workspace-scoped bounded open；已有lower fallback/Absent与explicit Hole库回归 | 全量native/packed namespace、hot/cold与full/partial覆盖实挂载；fork→mutation→seal→remount及真实Redis/TiKV组合验收；不把基础attach当完整发布 |
-| G11 / P5 | A：可见sequence与typed stale子契约已实现 | ReadGeneration新增workspace_mutation_sequence；捕获head/base原始记录并权威验证，same-epoch mutation/lease/head/binding变化映射StaleView与整体重试 | 真实并发FUSE与native/packed生命周期验证有限整体retry、输出全丢弃且无混合视图；完整S/X仍开放 |
+| G11 / P5 | A：可见sequence与typed stale子契约已实现 | ReadGeneration新增workspace_mutation_sequence；旧004 helper与当前005 `FetchedSources`均在计划执行前后绑定generation，跨代映射typed `ReadViewChanged`/`StaleView`，readonly FUSE adapter保留retryable error | 真实并发FUSE与native/packed生命周期验证有限整体retry、输出全丢弃且无混合视图；完整S/X仍开放 |
 | G12 / P5 | B：same-head原子发布与精确重试已实现，seal/recovery开放 | SQLite事务/KV timed CAS同时更新PWB3 history/current、epoch/sequence/allocator；本轮补提交后重试与首次inode扩张碰撞检查；producer依赖先行、readback与manifest-last已有 | 全部IP06/FD/cold/container/external图证明、durable candidate journal与staging roots、effective view捕获及head/base旋转原子提交、崩溃/reopen恢复；fsync不隐式repack |
 | G13 / P5 | B：native层PWB根保护已实现，packed对象图GC开放 | 既有grace/fork phantom回归；本轮新增PWB root generation、SQLite finalize同事务复检、KV扫描前Deleting与层集合generation，含byte-identical ABA RED→GREEN；真实G13竞态后端仍待验证 | durable reader pins、受保护history退休、snapshots/workspaces/leases/journals/staging roots闭合；005 container/index/cold/descriptor/external共享对象mark/sweep与上传orphan回收；无误删 |
 | G14 / P5 | B：能力/status基础与CRD生成修复已有，真实operator生命周期开放 | 显式v3 capability/binding条件，缺失能力不得推导Ready；本轮修实际binding-status结构化schema panic并重生成CRD，GREEN与完整新gate状态见checkpoint | Kubernetes API-server接受新schema/CEL、Redis/TiKV E2E、conditions/finalizer/lease与真实packed binding；Ready不能替代storage验收；旧CR兼容移出范围 |
-| G15 / P1,P6 | C：static/dynamic/inline/p90实验控制 | fixture有005 raw/zstd选择，但无完整static frame/inline-off/p90控制；size range限4MiB | offline builder显式控制并保存policy/provenance；同内容/group/container规则；p90只用训练trace；真实输出统计证明参数生效 |
-| G16 / P0,P6 | C：runner与工具契约 | local runner固定小语料；partial scanner有discovery；cloud Python控制面是未跟踪原型，尚非完整已验收dispatch | release构建/新wire/metadata codec/data codec传递、三端同trace；阶段计时与未测字段=null；10k有界先行、资源journal/cleanup核验 |
+| G15 / P1,P6 | C：static/dynamic/inline/p90实验控制窄契约已补 | fixture支持005 raw/zstd、static frame、inline-off和带认证训练trace的p90 policy；policy输入有边界与溢出拒绝，runner传递并绑定manifest | offline builder完整分布/provenance；同内容/group/container规则；p90只用训练trace；真实输出统计证明参数生效 |
+| G16 / P0,P6 | C：runner与工具契约窄契约已补 | local runner记录toolchain、固定trace控制及durable owned-resource journal；partial scanner有discovery；cloud Python控制面尚非完整已验收dispatch | release构建/新wire/metadata codec/data codec传递、三端同trace；阶段计时与未测字段=null；10k有界真实FUSE、cloud dispatch和paired acceptance仍开放 |
 | G17 / P6 | C：新的匹配性能与交付闭合 | 历史1M有TTL/inline口径限制；005 debug/zstd正确性没有raw paired性能对照；代码仍未提交 | 同迭代完整AGENTS gate、消融/生命周期/paired对照；接受/拒绝记录；源码vendor可复现；最后coherent commit/push并更新交接 |
 
 ### 审计阶段诊断的精确范围（历史，已被后续修复接续）
@@ -261,7 +261,7 @@ profile 的两次提交只发生一次 GET、两个 waiter 收到同一 `Arc`。
 
 005 pipeline 定向套件现为 **22 passed, 0 failed**；`fmt --check` 与
 `git diff --check` 通过。证据见
-[G09 pipeline checkpoint](../../performance/packed-v3-g09-pipeline-validation-2026-10-06.md)。
+[G09 pipeline checkpoint](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-g09-pipeline-validation-2026-10-06.md)。
 本批只新增测试和证据文档，没有修改 production pipeline code。
 
 这只关闭 G09 的窄 singleflight/profile/cancel/join 子契约。完整 G09 仍需真实
@@ -301,3 +301,49 @@ See G06 HTTP evidence in the performance directory.
 ## 2026-10-10 delta: G16 runner module invocation
 
 The bounded Python performance helpers now support both package-qualified invocation from the repository root and direct invocation from tools/perf. tools/perf/__init__.py marks the helper directory as a package; packed_partial_scan.py and its focused tests use relative imports with a direct-execution fallback. The repository-root suite (python3 -m unittest tools.perf.test_packed_local_runner tools.perf.test_packed_run_manifest tools.perf.test_packed_partial_scan tools.perf.test_smallfiles_scan) passes 18 tests, and the direct tools/perf runner-manifest/partial-scan suite passes 9 tests. This closes only the import/reproducibility sub-contract; cloud dispatch, release/toolchain provenance, resource journals, cleanup proof, and G17 paired acceptance remain open.
+
+## 2026-10-10 delta: G16 local toolchain provenance
+
+The packed-v3 local RustFS runner now emits `toolchain.json` and the manifest
+requires it for a successful run. The record binds `rustc -Vv`, Cargo version,
+host target, binary profile, Git revision, and the SHA-256 of the complete dirty
+diff. Malformed or incomplete provenance fails manifest finalization, while
+failed runs remain recordable without claiming measurements. The focused Python
+runner/manifest suite passes 19 tests (and 7 direct-invocation tests).
+
+This closes only the local build-provenance sub-contract. It does not certify a
+release build, cloud dispatch, Redis/TiKV lifecycle, resource journals, cleanup
+proof, or G17 paired acceptance.
+
+## 2026-10-10 delta: G16 owned-resource journal
+
+`tools/perf/run_packed_local.sh` now creates a durable
+`packed-v3-resource-journal-v1` beside every run manifest and records the owned
+Compose project, mount, worker process, and temporary work directory through
+init, startup, mount-ready, unmount, service-stop, work-removal, and final
+events. `packed_run_manifest.py finalize` validates the journal for both
+successful and failed runs; a successful artifact is rejected if any owned
+resource remains live, while a failed artifact must still contain a terminal
+cleanup decision. The focused resource-journal, manifest, and runner suite
+passes 18 tests and shell/Python syntax checks pass.
+
+This closes only the local resource-accounting and cleanup-proof sub-contract.
+It does not close cloud dispatch, Redis/TiKV lifecycle, real FUSE failure
+recovery, release reproducibility, or G17 paired acceptance.
+Evidence: [`packed-v3-g16-resource-journal-validation-2026-10-10.md`](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-g16-resource-journal-validation-2026-10-10.md).
+
+## 2026-10-10 delta: G11 wire-005 generation fence
+
+The production packed-v3/005 path now binds `FetchedSources` to the
+manifest-derived `ReadGeneration`. The executor rejects a plan from another
+generation before filling the caller buffer, and both the pre/post checks and
+the readonly FUSE adapter preserve typed `ReadViewChanged` through
+`PackedWireError` and `anyhow`, so retry classification remains available.
+The older 004 helper keeps the same fence, but it is not used as v3 evidence.
+
+Formatting, diff checks, and the focused typed retry test pass (`1 passed` with
+`CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`). The broader feature test
+binary did not reach a runtime result in this WSL session after two
+resource-bounded compile attempts; no full FUSE generation claim is made here.
+
+2026-10-10 incremental: G06 typed ETag HEAD observation is wired through ObjectClient, S3 ObservedHttpClient, and packed-v3 readonly transport; scripted success/403 ledger tests are included. fmt, cargo check --tests, and diff check passed; full focused test-binary codegen was stopped after exceeding the resource window, so its runtime result is not claimed. Remaining startup/retry/union/raw/decoded and FUSE evidence stays open.

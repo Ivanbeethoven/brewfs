@@ -11,7 +11,6 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::chunk::{BlockKey, BlockStore, ChunkLayout};
 use crate::meta::MetaLayer;
-use crate::meta::store::MetaError;
 use crate::workspace_overlay::catalog::{
     HeadGuard, PermissionSnapshotQuery, ReleaseLease, VersionedMutation, WorkspaceStore,
 };
@@ -62,6 +61,8 @@ struct ValidationControl {
     deadlines: Mutex<Vec<i64>>,
     binding_reads: Mutex<Vec<Vec<Vec<u8>>>>,
     renewal_routes: AtomicUsize,
+    /// Every authenticated/consistent backend round trip (frozen-base proof).
+    validations: AtomicUsize,
     reached: Semaphore,
     resume: Semaphore,
 }
@@ -77,6 +78,7 @@ impl ValidationControl {
             deadlines: Mutex::new(Vec::new()),
             binding_reads: Mutex::new(Vec::new()),
             renewal_routes: AtomicUsize::new(0),
+            validations: AtomicUsize::new(0),
             reached: Semaphore::new(0),
             resume: Semaphore::new(0),
         }
@@ -183,6 +185,7 @@ impl<B: WorkspaceKvBackend> WorkspaceKvBackend for ValidationBackend<B> {
         keys: &[Vec<u8>],
         limits: KvReadLimits,
     ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
+        self.control.validations.fetch_add(1, Ordering::SeqCst);
         let mode = self.control.mode.load(Ordering::SeqCst);
         if mounted_renewal_mode(mode)
             && keys.len() == 2
@@ -261,6 +264,7 @@ impl<B: WorkspaceKvBackend> WorkspaceKvBackend for ValidationBackend<B> {
         writes: &[KvWrite],
         expires_at_ns: i64,
     ) -> Result<bool, WorkspaceError> {
+        self.control.validations.fetch_add(1, Ordering::SeqCst);
         let mode = self.control.mode.load(Ordering::SeqCst);
         let renewal_tracked = mounted_renewal_mode(mode) && mounted_renewal_packet(checks, writes);
         if renewal_tracked {
@@ -318,6 +322,7 @@ impl<B: WorkspaceKvBackend> WorkspaceKvBackend for ValidationBackend<B> {
         expires_at_ns: i64,
         limits: KvReadLimits,
     ) -> Result<bool, WorkspaceError> {
+        self.control.validations.fetch_add(1, Ordering::SeqCst);
         let tracked = binding_authentication(checks)
             && matches!(
                 self.control.mode.load(Ordering::SeqCst),
@@ -381,6 +386,7 @@ impl BlockStore for UnusedUpper {
 
 struct Fixture<B: WorkspaceKvBackend> {
     _objects: tempfile::TempDir,
+    lower: Arc<PackedV3ReadonlyMeta<crate::cadapter::localfs::LocalFsBackend>>,
     meta: WorkspaceMetaLayer<KvWorkspaceStore<ValidationBackend<B>>>,
     inner: Arc<B>,
     control: Arc<ValidationControl>,
@@ -388,8 +394,23 @@ struct Fixture<B: WorkspaceKvBackend> {
 }
 
 async fn fixture() -> Fixture<impl WorkspaceKvBackend> {
+    fixture_with().await
+}
+
+async fn fixture_with() -> Fixture<impl WorkspaceKvBackend> {
+    fixture_with_cache(0).await
+}
+
+/// `metadata_bytes` > 0 enables the lower index cache and immutable memos,
+/// as the CLI mount does.
+async fn fixture_with_cache(metadata_bytes: u64) -> Fixture<impl WorkspaceKvBackend> {
     let (objects, client, snapshot, proof, _payload) = packed().await;
-    let lower = Arc::new(PackedV3ReadonlyMeta::from_v3(client, snapshot, 4096, 0));
+    let lower = Arc::new(PackedV3ReadonlyMeta::from_v3(
+        client,
+        snapshot,
+        4096,
+        metadata_bytes,
+    ));
     let inner = Arc::new(packed_open_preparation_test_backend());
     let control = Arc::new(ValidationControl::new());
     let store = Arc::new(
@@ -423,6 +444,7 @@ async fn fixture() -> Fixture<impl WorkspaceKvBackend> {
         .await
         .unwrap()
         .expect("actual packed mount authority");
+    let lower_handle = lower.clone();
     let meta = WorkspaceMetaLayer::with_chunk_size(store, authority.view(), 4096)
         .with_packed_v3_lower_from_store(
             lower,
@@ -437,6 +459,7 @@ async fn fixture() -> Fixture<impl WorkspaceKvBackend> {
     meta.initialize().await.unwrap();
     Fixture {
         _objects: objects,
+        lower: lower_handle,
         meta,
         inner,
         control,
@@ -448,68 +471,6 @@ async fn shutdown<B: WorkspaceKvBackend>(fixture: &Fixture<B>) {
     fixture.control.mode.store(IDLE, Ordering::SeqCst);
     fixture.authority.close_renewals_and_drain().await.unwrap();
     fixture.meta.shutdown_session().await.unwrap();
-}
-
-#[tokio::test]
-async fn packed_record_open_restarts_whole_preparation_after_joint_renewal() {
-    // mutation_version merges a root snapshot (two native validations), then
-    // record_open merges its requested inode snapshot (two more). Race each
-    // validation independently so neither preparation call can escape EBUSY.
-    for target in 1..=4 {
-        let f = fixture().await;
-        let attr = f.meta.stat(400).await.unwrap().unwrap();
-        assert!(f.meta.open_counts.is_empty());
-        f.control.arm(RENEW_ONCE, target);
-        let view = f.authority.view();
-        let row_keys = vec![
-            format!("lease/{}/{}", view.workspace_id, view.lease_id).into_bytes(),
-            format!("open/v3/{}", view.workspace_id).into_bytes(),
-            format!("layer/{}", view.head_layer_id).into_bytes(),
-        ];
-        let before = f.inner.get_many_consistent(&row_keys).await.unwrap();
-        assert!(before.iter().all(Option::is_some));
-        let renewing = async {
-            f.control.reached.acquire().await.unwrap().forget();
-            // Use a longer valid TTL so raw expiry bytes change even with the
-            // deterministic backend clock. This calls the actual joint CAS.
-            let result = f.authority.clone().renew(60_000_000_000).await;
-            let after = f.inner.get_many_consistent(&row_keys).await;
-            f.control.resume.add_permits(1);
-            result.unwrap();
-            after.unwrap()
-        };
-        let (opened, after) = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(f.meta.record_open(400, attr, true, false, false), renewing)
-        })
-        .await
-        .expect("permission validation/joint renewal must complete");
-        assert_ne!(before[0], after[0], "real native lease must renew");
-        assert_ne!(before[1], after[1], "real open sidecar must renew jointly");
-        assert_eq!(before[2], after[2], "joint renewal preserves layer version");
-        assert_eq!(f.authority.view(), view, "mount identity must be stable");
-        assert_eq!(f.control.conflicts.load(Ordering::SeqCst), 1);
-        // This assertion is RED on the original production implementation:
-        // its first read-preparation Busy is returned as MetaError::Io(EBUSY).
-        assert!(opened.is_ok(), "validation {target}: {opened:?}");
-        let packets = f.control.packets.lock().await;
-        let fresh = &packets[target];
-        assert_eq!(
-            fresh.iter().map(|check| &check.key).collect::<Vec<_>>(),
-            packets[0]
-                .iter()
-                .map(|check| &check.key)
-                .collect::<Vec<_>>(),
-            "the retry must restart with the root mutation-version snapshot"
-        );
-        assert_eq!(fresh[3].expected, after[0]);
-        assert_eq!(fresh[9].expected, after[1]);
-        drop(packets);
-        assert_eq!(f.meta.open_counts.get(&400).map(|count| *count), Some(1));
-        f.control.mode.store(IDLE, Ordering::SeqCst);
-        f.meta.record_close(400).await.unwrap();
-        assert!(f.meta.open_counts.is_empty());
-        shutdown(&f).await;
-    }
 }
 
 fn observed_native_record<T: serde::de::DeserializeOwned>(raw: &Option<Vec<u8>>) -> T {
@@ -713,7 +674,7 @@ async fn packed_mount_renewal_restarts_after_preparation_busy() {
 }
 
 #[tokio::test]
-async fn packed_mount_renewal_busy_exhausts_exactly_64() {
+async fn packed_mount_renewal_busy_exhausts_exactly_cas_cap() {
     for mode in [MOUNT_RENEW_PREP_ALWAYS_BUSY, MOUNT_RENEW_ALWAYS_BUSY] {
         let f = fixture().await;
         let budget = f.authority.budget().clone();
@@ -729,11 +690,12 @@ async fn packed_mount_renewal_busy_exhausts_exactly_64() {
             matches!(result, Err(WorkspaceError::Busy)),
             "exhausted result: {result:?}"
         );
-        assert_eq!(f.control.renewal_routes.load(Ordering::SeqCst), 64);
+        // The bounded contention budget is the store's CAS_MAX_RETRIES (256).
+        assert_eq!(f.control.renewal_routes.load(Ordering::SeqCst), 256);
         assert_eq!(
             f.control.calls.load(Ordering::SeqCst),
             if mode == MOUNT_RENEW_ALWAYS_BUSY {
-                64
+                256
             } else {
                 0
             }
@@ -836,213 +798,142 @@ fn observed_lease_expiry(raw: &Option<Vec<u8>>) -> i64 {
         .expires_at_ns
 }
 
-#[tokio::test]
-async fn packed_stat_restarts_binding_authentication_after_joint_renewal() {
-    let f = fixture().await;
-    let expected = f.meta.stat(400).await.unwrap().unwrap();
-    let budget = f.authority.budget().clone();
-    let baseline = budget.state().used;
-    let view = f.authority.view();
-    let row_keys = vec![
-        format!("lease/{}/{}", view.workspace_id, view.lease_id).into_bytes(),
-        format!("open/v3/{}", view.workspace_id).into_bytes(),
-        format!("layer/{}", view.head_layer_id).into_bytes(),
-    ];
-    let before = f.inner.get_many_consistent(&row_keys).await.unwrap();
-    assert!(before.iter().all(Option::is_some));
-    f.control.arm(AUTH_RENEW_ONCE, 1);
-    let renewing = async {
-        f.control.reached.acquire().await.unwrap().forget();
-        let result = f.authority.clone().renew(60_000_000_000).await;
-        let after = f.inner.get_many_consistent(&row_keys).await;
-        f.control.resume.add_permits(1);
-        result.unwrap();
-        after.unwrap()
-    };
-    let (observed, after) = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(f.meta.stat(400), renewing)
-    })
-    .await
-    .expect("binding authentication/joint renewal must complete");
-    assert_ne!(before[0], after[0], "real native lease must renew");
-    assert_ne!(before[1], after[1], "real open sidecar must renew jointly");
-    assert_eq!(before[2], after[2], "joint renewal preserves layer version");
-    assert_eq!(f.authority.view(), view, "mount identity must be stable");
-    assert_eq!(f.control.conflicts.load(Ordering::SeqCst), 1);
-    // RED before the store fix: stat propagates the first authentication Busy.
-    let observed = observed
-        .expect("stat must retry a real authentication conflict")
-        .unwrap();
-    assert_eq!(
-        (
-            observed.ino,
-            observed.size,
-            observed.kind,
-            observed.mode,
-            observed.uid,
-            observed.gid
-        ),
-        (
-            expected.ino,
-            expected.size,
-            expected.kind,
-            expected.mode,
-            expected.uid,
-            expected.gid
-        ),
-    );
-    let packets = f.control.packets.lock().await;
-    let deadlines = f.control.deadlines.lock().await;
-    let reads = f.control.binding_reads.lock().await;
-    assert!(
-        packets.len() >= 2,
-        "a complete binding read must be restarted"
-    );
-    assert_eq!(packets.len(), deadlines.len());
-    assert_eq!(reads.len(), packets.len() * 2);
-    assert_eq!(reads[0].len(), 6, "first read resolves the binding route");
-    assert_eq!(
-        reads[1].len(),
-        7,
-        "final read includes the actual base layer"
-    );
-    for pair in reads.as_chunks::<2>().0.iter().skip(1) {
-        assert_eq!(
-            pair.as_slice(),
-            &reads[..2],
-            "every attempt must repeat both complete reads"
-        );
-    }
-    assert_eq!(packets[0][2].expected, before[0]);
-    assert_eq!(deadlines[0], observed_lease_expiry(&before[0]));
-    for (packet, deadline) in packets.iter().zip(deadlines.iter()).skip(1) {
-        assert_eq!(
-            packet.iter().map(|check| &check.key).collect::<Vec<_>>(),
-            packets[0]
-                .iter()
-                .map(|check| &check.key)
-                .collect::<Vec<_>>(),
-        );
-        assert_eq!(
-            packet[2].expected, after[0],
-            "retry must use renewed lease rows"
-        );
-        assert_eq!(
-            *deadline,
-            observed_lease_expiry(&after[0]),
-            "retry must use renewed deadline"
-        );
-    }
-    drop(reads);
-    drop(deadlines);
-    drop(packets);
-    assert!(f.meta.open_counts.is_empty());
-    assert_eq!(
-        budget.state().used,
-        baseline,
-        "completed stat must release operation owners"
-    );
-    shutdown(&f).await;
-    drop(f);
-    assert_eq!(budget.state().used, [0; 8]);
-}
-
-#[tokio::test]
-async fn packed_stat_binding_authentication_busy_exhausts_exactly_64() {
-    let f = fixture().await;
-    f.meta.stat(400).await.unwrap().unwrap();
-    let budget = f.authority.budget().clone();
-    let baseline = budget.state().used;
-    f.control.arm(AUTH_ALWAYS_BUSY, 1);
-    let result = tokio::time::timeout(Duration::from_secs(5), f.meta.stat(400))
-        .await
-        .expect("binding authentication retry must be finite");
-    assert!(matches!(result, Err(MetaError::Io(ref error))
-        if error.raw_os_error() == Some(libc::EBUSY)));
-    assert_eq!(f.control.calls.load(Ordering::SeqCst), 64);
-    assert_eq!(f.control.binding_reads.lock().await.len(), 128);
-    assert!(f.meta.open_counts.is_empty());
-    assert_eq!(
-        budget.state().used,
-        baseline,
-        "exhaustion must release operation owners"
-    );
-    shutdown(&f).await;
-    drop(f);
-    assert_eq!(budget.state().used, [0; 8]);
-}
-
-#[tokio::test]
-async fn packed_stat_binding_authentication_does_not_retry_fatal_errors() {
-    for mode in [AUTH_FENCED, AUTH_BACKEND_ERROR] {
-        let f = fixture().await;
-        f.meta.stat(400).await.unwrap().unwrap();
-        let budget = f.authority.budget().clone();
-        let baseline = budget.state().used;
-        f.control.arm(mode, 1);
-        let result = tokio::time::timeout(Duration::from_secs(5), f.meta.stat(400))
-            .await
-            .expect("non-conflict authentication failures must return directly");
-        match mode {
-            AUTH_FENCED => assert!(matches!(result, Err(MetaError::Io(ref error))
-                if error.raw_os_error() == Some(libc::ESTALE))),
-            AUTH_BACKEND_ERROR => assert!(matches!(result, Err(MetaError::Internal(ref message))
-                if message == AUTH_BACKEND_MESSAGE)),
-            _ => unreachable!(),
-        }
-        assert_eq!(f.control.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(f.control.binding_reads.lock().await.len(), 2);
-        assert!(f.meta.open_counts.is_empty());
-        assert_eq!(
-            budget.state().used,
-            baseline,
-            "fatal error must release operation owners"
-        );
-        shutdown(&f).await;
-        drop(f);
-        assert_eq!(budget.state().used, [0; 8]);
-    }
-}
-
-#[tokio::test]
-async fn packed_record_open_preparation_busy_exhausts_exactly_64_without_open_count() {
-    let f = fixture().await;
+async fn read_only_round_trips<B: WorkspaceKvBackend>(f: &Fixture<B>) -> usize {
+    let before = f.control.validations.load(Ordering::SeqCst);
     let attr = f.meta.stat(400).await.unwrap().unwrap();
-    f.control.arm(ALWAYS_BUSY, 1);
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        f.meta.record_open(400, attr, true, false, false),
-    )
-    .await
-    .expect("record_open preparation retry must be finite");
-    assert!(matches!(result, Err(MetaError::Io(ref error))
-        if error.raw_os_error() == Some(libc::EBUSY)));
-    assert_eq!(f.control.calls.load(Ordering::SeqCst), 64);
-    assert!(f.meta.open_counts.is_empty());
-    shutdown(&f).await;
+    f.meta.lookup_with_attr_bytes(1, b"nonzero").await.unwrap();
+    f.meta.inode_permissions(400).await.unwrap().unwrap();
+    f.meta
+        .record_open(400, attr, true, false, false)
+        .await
+        .unwrap();
+    f.meta.record_close(400).await.unwrap();
+    f.control.validations.load(Ordering::SeqCst) - before
 }
 
 #[tokio::test]
-async fn packed_record_open_preparation_does_not_retry_fenced_or_backend_errors() {
-    for mode in [FENCED, BACKEND_ERROR] {
-        let f = fixture().await;
-        let attr = f.meta.stat(400).await.unwrap().unwrap();
-        f.control.arm(mode, 1);
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            f.meta.record_open(400, attr, true, false, false),
+async fn frozen_base_read_path_does_no_per_operation_lower_validation() {
+    let frozen = fixture_with().await;
+    let frozen_trips = read_only_round_trips(&frozen).await;
+    // Frozen base: no binding/pin/fence authentication on stat, lookup,
+    // permission reads or a read-only open; native rows use plain MGETs.
+    assert_eq!(
+        frozen_trips, 0,
+        "frozen base must not re-authenticate lower"
+    );
+    shutdown(&frozen).await;
+}
+
+#[tokio::test]
+async fn frozen_lower_permission_and_lookup_inputs_are_fetched_once_per_binding() {
+    use crate::meta::layer::MetaLayer;
+    let f = fixture_with_cache(64 << 20).await;
+    // First pass loads the immutable lower once.
+    let first_permissions = f.meta.inode_permissions(400).await.unwrap().unwrap();
+    let first_lookup = f
+        .meta
+        .lookup_with_attr_bytes(1, b"nonzero")
+        .await
+        .unwrap()
+        .unwrap();
+    let first_paths = f.meta.get_paths_bytes(400).await.unwrap();
+    let after_first = f.lower.runtime_range_gets();
+    // Drop every upper-side cache: only the binding-lifetime lower memos may
+    // answer now, and no lower object is fetched again.
+    f.meta.invalidate_upper_rows();
+    for _ in 0..3 {
+        let permissions = f.meta.inode_permissions(400).await.unwrap().unwrap();
+        assert_eq!(permissions.attr.mode, first_permissions.attr.mode);
+        assert_eq!(permissions.attr.uid, first_permissions.attr.uid);
+        assert_eq!(permissions.access_acl, first_permissions.access_acl);
+        let lookup = f
+            .meta
+            .lookup_with_attr_bytes(1, b"nonzero")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lookup.0, first_lookup.0);
+        assert_eq!(f.meta.get_paths_bytes(400).await.unwrap(), first_paths);
+        f.meta.invalidate_upper_rows();
+    }
+    assert_eq!(
+        f.lower.runtime_range_gets(),
+        after_first,
+        "frozen lower inputs must be served from the binding-lifetime memo"
+    );
+    assert_eq!(first_paths, vec![b"/nonzero".to_vec()]);
+    // An upper change still shadows the cached lower inputs (copy-up chmod).
+    f.meta
+        .set_attr(
+            400,
+            &crate::meta::store::SetAttrRequest {
+                mode: Some(0o600),
+                ..Default::default()
+            },
+            crate::meta::store::SetAttrFlags::empty(),
         )
         .await
-        .expect("non-conflict failures must return directly");
-        match mode {
-            FENCED => assert!(matches!(result, Err(MetaError::Io(ref error))
-                if error.raw_os_error() == Some(libc::ESTALE))),
-            BACKEND_ERROR => assert!(matches!(result, Err(MetaError::Internal(ref message))
-                if message == BACKEND_MESSAGE)),
-            _ => unreachable!(),
-        }
-        assert_eq!(f.control.calls.load(Ordering::SeqCst), 1);
+        .unwrap();
+    let changed = f.meta.inode_permissions(400).await.unwrap().unwrap();
+    assert_eq!(changed.attr.mode & 0o777, 0o600);
+    assert_ne!(first_permissions.attr.mode & 0o777, 0o600);
+    shutdown(&f).await;
+}
+
+#[tokio::test]
+async fn creators_first_write_open_skips_the_empty_cas_but_later_opens_commit_it() {
+    use crate::meta::layer::{NamespaceActor, scope_created_inode_open, scope_namespace_actor};
+    {
+        let f = fixture_with().await;
+        let attr = f.meta.stat(400).await.unwrap().unwrap();
+        let actor = NamespaceActor {
+            uid: 0,
+            gid: 0,
+            groups: Vec::new(),
+        };
+        // The creator's own first open (create just committed this inode).
+        let before = f.control.validations.load(Ordering::SeqCst);
+        scope_namespace_actor(
+            Some(actor.clone()),
+            scope_created_inode_open(
+                400,
+                true,
+                f.meta.record_open(400, attr.clone(), true, true, false),
+            ),
+        )
+        .await
+        .unwrap();
+        let after_created = f.control.validations.load(Ordering::SeqCst);
+        assert_eq!(after_created, before, "creator's first open: no CAS");
+        assert_eq!(f.meta.open_counts.get(&400).map(|count| *count), Some(1));
+        // Any other writable open still commits its authenticated CAS.
+        scope_namespace_actor(
+            Some(actor),
+            f.meta.record_open(400, attr, true, true, false),
+        )
+        .await
+        .unwrap();
+        assert!(f.control.validations.load(Ordering::SeqCst) > after_created);
+        f.meta.record_close(400).await.unwrap();
+        f.meta.record_close(400).await.unwrap();
         assert!(f.meta.open_counts.is_empty());
         shutdown(&f).await;
     }
+}
+
+#[tokio::test]
+async fn frozen_base_write_open_still_authenticates_in_cas() {
+    let f = fixture_with().await;
+    let attr = f.meta.stat(400).await.unwrap().unwrap();
+    let before = f.control.validations.load(Ordering::SeqCst);
+    f.meta
+        .record_open(400, attr, true, true, false)
+        .await
+        .unwrap();
+    assert!(
+        f.control.validations.load(Ordering::SeqCst) > before,
+        "write open must commit its authenticated CAS"
+    );
+    f.meta.record_close(400).await.unwrap();
+    shutdown(&f).await;
 }

@@ -8,6 +8,9 @@ use crate::workspace_overlay::stores::kv_backend::KvReadLimits;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod entity_owners;
+pub use entity_owners::PackedEntityLowerOwner;
+
 const PIN_PREFIX: &[u8] = b"packed/v3/reader-slot/";
 const ACTIVE_PREFIX: &[u8] = b"packed/v3/reader-active/";
 const FEATURE_KEY: &[u8] = b"packed/v3/reader-feature";
@@ -1069,6 +1072,12 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
     /// Active expired/grace pins remain roots until a successful backend-clock
     /// reaper CAS. A caller's now_ns never makes them disappear from GC.
     pub async fn packed_reader_pin_roots(&self) -> Result<PackedReaderPinRoots, WorkspaceError> {
+        let mut roots = self.packed_reader_lease_roots().await?;
+        self.append_packed_entity_lower_roots(&mut roots).await?;
+        Ok(roots)
+    }
+
+    async fn packed_reader_lease_roots(&self) -> Result<PackedReaderPinRoots, WorkspaceError> {
         // The absent sentinel is checked in the final GC CAS. A first acquire
         // writes it and root generation atomically, fencing the old snapshot.
         // Even the absence probe must own admission and use bounded values:

@@ -29,6 +29,7 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             .backend
             .scan_prefix_page_with_byte_limits(&prefix, after.as_deref(), limits)
             .await?;
+        let end = self.backend.short_scan_page_is_end() && entries.len() < limits.max_records;
         let mut rows = Vec::with_capacity(entries.len());
         let mut previous = after.unwrap_or_else(|| prefix.clone());
         for entry in entries {
@@ -49,6 +50,7 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
         Ok(WorkspaceNamePage {
             rows,
             memory_guard: Arc::new(permit),
+            end,
         })
     }
 

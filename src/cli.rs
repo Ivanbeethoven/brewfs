@@ -11,6 +11,8 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::config::*;
 use crate::console;
 #[cfg(feature = "workspace-overlay")]
+mod entity_mount;
+#[cfg(feature = "workspace-overlay")]
 mod mount_store;
 #[cfg(feature = "workspace-overlay")]
 mod native_reverse_maintenance;
@@ -83,8 +85,7 @@ use crate::workspace_overlay::gc::WorkspaceGc;
 use crate::workspace_overlay::ids::{LayerId, WorkspaceId};
 #[cfg(feature = "workspace-overlay")]
 use crate::workspace_overlay::lifecycle::{
-    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LEASE_TTL, NoopDurableRemoteBarrier, WorkspaceLifecycle,
-    WorkspaceMountSession,
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LEASE_TTL, WorkspaceLifecycle, WorkspaceMountSession,
 };
 #[cfg(feature = "workspace-overlay")]
 use crate::workspace_overlay::meta_layer::WorkspaceMetaLayer;
@@ -104,6 +105,12 @@ use crate::workspace_overlay::stores::redis::RedisWorkspaceBackend;
 use crate::workspace_overlay::stores::tikv::TiKvWorkspaceBackend;
 #[cfg(feature = "native-packed-base")]
 use sha2::{Digest, Sha256};
+
+/// Working-set lifetime of the lease-bound upper row/namespace caches. Not a
+/// staleness bound: those caches stop serving as soon as the mount's lease
+/// can no longer be proven held (see `LeaseValidity`).
+#[cfg(feature = "workspace-overlay")]
+const LEASE_BOUND_ROW_CACHE_TTL: Duration = Duration::from_secs(60);
 
 pub async fn run() -> anyhow::Result<()> {
     init_tracing();
@@ -369,6 +376,10 @@ fn init_tracing() {
 }
 
 async fn mount_cmd(mut args: MountConfig) -> anyhow::Result<()> {
+    #[cfg(feature = "workspace-overlay")]
+    if args.volume_format == VolumeFormat::WorkspaceEntityV1 && args.experimental_entity_mount {
+        return entity_mount::mount(args).await;
+    }
     validate_volume_format_support(args.volume_format)?;
     if !args.mount_point.exists() {
         std::fs::create_dir_all(&args.mount_point)?;
@@ -822,6 +833,7 @@ async fn gateway_webdav_cmd(args: WebDavGatewayArgs) -> anyhow::Result<()> {
 fn validate_volume_format_support(format: VolumeFormat) -> anyhow::Result<()> {
     match format {
         VolumeFormat::FlatV1 => Ok(()),
+        VolumeFormat::WorkspaceEntityV1 => validate_entity_mount_support(),
         #[cfg(feature = "workspace-overlay")]
         VolumeFormat::WorkspaceV1 => Ok(()),
         #[cfg(not(feature = "workspace-overlay"))]
@@ -847,11 +859,21 @@ fn validate_volume_format_support(format: VolumeFormat) -> anyhow::Result<()> {
     }
 }
 
+fn validate_entity_mount_support() -> anyhow::Result<()> {
+    #[cfg(feature = "workspace-overlay")]
+    anyhow::bail!(
+        "workspace-entity-v1 requires --experimental-entity-mount for a fresh namespace; production admission and process-crash takeover remain disabled"
+    );
+    #[cfg(not(feature = "workspace-overlay"))]
+    anyhow::bail!("feature not compiled: workspace-overlay");
+}
+
 async fn dispatch_mount<S>(layout: ChunkLayout, store: S, args: &MountConfig) -> anyhow::Result<()>
 where
     S: BlockStore + Send + Sync + 'static,
 {
     match args.volume_format {
+        VolumeFormat::WorkspaceEntityV1 => validate_entity_mount_support(),
         VolumeFormat::FlatV1 => {
             let meta_store = create_meta_store(args).await?;
             tracing::info!("mount startup meta store ready");
@@ -1275,11 +1297,6 @@ where
         );
     }
 
-    if !args.workspace_operator_managed {
-        WorkspaceLifecycle::new(workspace_store.clone())
-            .recover_incomplete_seals()
-            .await?;
-    }
     let generation = new_workspace_holder_generation();
     let session = WorkspaceMountSession::acquire(
         workspace_store.clone(),
@@ -1810,8 +1827,9 @@ where
         MetaBackendKind::Redis => {
             let backend =
                 RedisWorkspaceBackend::connect(&args.meta_url, &args.workspace_namespace).await?;
-            let catalog =
-                KvWorkspaceStore::new(backend).with_packed_reader_pin_budget(packed_budget.clone());
+            let catalog = KvWorkspaceStore::new(backend)
+                .with_packed_reader_pin_budget(packed_budget.clone())
+                .with_inode_id_blocks();
             let catalog = Arc::new(if args.workspace_operator_managed {
                 catalog.into_runtime()
             } else {
@@ -1827,8 +1845,9 @@ where
                 args.meta_tikv_tls.as_ref(),
             )
             .await?;
-            let catalog =
-                KvWorkspaceStore::new(backend).with_packed_reader_pin_budget(packed_budget.clone());
+            let catalog = KvWorkspaceStore::new(backend)
+                .with_packed_reader_pin_budget(packed_budget.clone())
+                .with_inode_id_blocks();
             let catalog = Arc::new(if args.workspace_operator_managed {
                 catalog.into_runtime()
             } else {
@@ -1869,7 +1888,6 @@ where
         anyhow::anyhow!("--workspace is required when volume_format is workspace-v1")
     })?;
     let packed_header = workspace_store.packed_mount_header(workspace_id).await?;
-    let packed_startup = packed_header.is_some();
     let header = match packed_header {
         Some(header) => header,
         None => workspace_store.load_volume_header().await?.ok_or_else(|| {
@@ -1887,11 +1905,6 @@ where
             "unsupported workspace schema version {}",
             header.schema_version
         )
-    }
-    if !args.workspace_operator_managed && !packed_startup {
-        WorkspaceLifecycle::new(workspace_store.clone())
-            .recover_incomplete_seals()
-            .await?;
     }
 
     let generation = new_workspace_holder_generation();
@@ -1995,6 +2008,23 @@ where
         if let Some(max_weight) = args.meta_read_plan_cache_max_weight {
             meta_layer = meta_layer.with_read_plan_cache_max_weight(max_weight);
         }
+        // This mount holds the exclusive workspace lease, so it is the only
+        // upper writer. The caches are bound to that lease: they serve rows
+        // only while a renewal proves it is held and are cleared once it
+        // lapses or fails, so the TTL here is a working-set bound, not the
+        // staleness bound.
+        let row_cache_ttl = std::env::var("BREWFS_WORKSPACE_ROW_CACHE_TTL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(LEASE_BOUND_ROW_CACHE_TTL);
+        let lease_validity = session
+            .as_ref()
+            .expect("mount session acquired")
+            .lease_validity();
+        meta_layer = meta_layer
+            .with_upper_row_cache(row_cache_ttl)
+            .with_lease_bound_row_cache(lease_validity);
         let meta_layer = Arc::new(meta_layer);
         let packed = meta_layer.packed_reader_session().is_some();
         if packed {
@@ -2016,8 +2046,9 @@ where
                 .workspace_writeback_root(writeback_root)
                 .workspace_writer_epoch(mount_view.holder_generation);
         session.as_ref().expect("mount session retained").initialize_packed_writeback_identity(&vfs_config).await?;
-        let fs = VFS::from_workspace_components(vfs_config, block_store, meta_layer)?;
+        let fs = VFS::from_workspace_components(vfs_config, block_store, meta_layer.clone())?;
         if packed {
+            meta_layer.install_packed_lower_stats(fs.stats());
             packed_vfs = Some(fs.clone());
         }
         let concurrency = FuseConcurrencyConfig {
@@ -2453,6 +2484,150 @@ async fn workspace_cmd(args: WorkspaceArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Create a workspace-v1 volume whose default workspace's sealed base is an
+/// authenticated packed-v3 lower. The manifest is opened and verified through
+/// the selected object store before any binding is written; the install lease
+/// is released afterwards so a normal mount can acquire the workspace.
+#[cfg(feature = "workspace-overlay")]
+async fn init_packed_volume<W>(
+    store: Arc<W>,
+    manifest_key: &str,
+    data_config: &std::path::Path,
+    owner: Option<String>,
+) -> anyhow::Result<crate::workspace_overlay::model::WorkspaceRecord>
+where
+    W: WorkspaceStore + 'static,
+{
+    use crate::workspace_overlay::catalog::{AcquireLease, HeadGuard, ReleaseLease};
+    use crate::workspace_overlay::ids::LeaseId;
+    use crate::workspace_overlay::model::BaseRevision;
+    use crate::workspace_overlay::packed_v3::wire005::{
+        AuthenticatedV3Snapshot, V3IndexReader, V3ObjectKind, V3ObjectRef,
+    };
+    use crate::workspace_overlay::publish::binding::{
+        InstallPackedLowerBinding, VerifiedPackedLower,
+    };
+
+    if store.load_volume_header().await?.is_some() {
+        anyhow::bail!("workspace volume is already initialized")
+    }
+    let component = manifest_key.rsplit('/').next().unwrap_or_default();
+    let digest: [u8; 32] = hex::decode(component)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("manifest key must end in its 64-hex SHA-256 content address")
+        })?;
+    // Reuse the mount configuration parser; only the data section matters.
+    let cli = Cli::try_parse_from([
+        std::ffi::OsStr::new("brewfs"),
+        std::ffi::OsStr::new("mount"),
+        std::ffi::OsStr::new("--config"),
+        data_config.as_os_str(),
+        std::ffi::OsStr::new("/nonexistent-init-packed-volume"),
+    ])?;
+    let Command::Mount(args) = cli.cmd else {
+        anyhow::bail!("internal: mount argument parsing produced another command")
+    };
+    let config = MountConfig::from_sources(*args)?;
+
+    async fn verify<B: crate::cadapter::client::ObjectBackend + Clone + 'static>(
+        client: ObjectClient<B>,
+        key: &str,
+        digest: [u8; 32],
+    ) -> anyhow::Result<VerifiedPackedLower> {
+        let object_len = client
+            .typed_object_size(
+                crate::cadapter::read_observer::ReadClass::ManifestProbe,
+                key,
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("packed manifest object is absent"))?;
+        let reference = V3ObjectRef {
+            key: key.to_owned(),
+            kind: V3ObjectKind::Manifest,
+            object_len,
+            digest,
+        };
+        let snapshot = AuthenticatedV3Snapshot::open(&client, &reference).await?;
+        Ok(VerifiedPackedLower::from_authenticated_snapshot(
+            &snapshot,
+            &V3IndexReader::new(client.clone(), 0),
+        )
+        .await?)
+    }
+    let lower = match config.data_backend {
+        DataBackendKind::LocalFs => {
+            verify(create_localfs_client(&config)?, manifest_key, digest).await?
+        }
+        DataBackendKind::S3 => {
+            verify(create_s3_client(&config).await?, manifest_key, digest).await?
+        }
+    };
+
+    store.initialize_workspace_schema().await?;
+    let workspace = store
+        .create_volume_root(CreateVolumeRoot {
+            volume_format: "workspace-v1".into(),
+            schema_version: WORKSPACE_SCHEMA_VERSION,
+            volume_id: uuid::Uuid::now_v7(),
+            workspace_id: WorkspaceId::new(),
+            root_layer_id: LayerId::new(),
+            writable_layer_id: LayerId::new(),
+            owner_id: owner,
+        })
+        .await?;
+    let lease = store
+        .acquire_lease(AcquireLease {
+            workspace_id: workspace.workspace_id,
+            lease_id: LeaseId::new(),
+            holder_generation: 1,
+            ttl_ns: 60_000_000_000,
+        })
+        .await?;
+    let expected_layers: [crate::workspace_overlay::model::LayerRecord; 2] = store
+        .load_layer_chain(workspace.head_layer_id)
+        .await?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("new workspace head is not a two-layer view"))?;
+    let base = &expected_layers[1];
+    let expected_base = BaseRevision {
+        layer_id: base.layer_id,
+        sealed_version: base
+            .sealed_version
+            .ok_or_else(|| anyhow::anyhow!("new sealed base has no version"))?,
+        root_hash: base
+            .root_hash
+            .ok_or_else(|| anyhow::anyhow!("new sealed base has no root hash"))?,
+    };
+    let guard = HeadGuard {
+        workspace_id: workspace.workspace_id,
+        expected_head_layer_id: workspace.head_layer_id,
+        expected_head_epoch: workspace.head_epoch,
+        lease_id: lease.lease_id,
+        holder_generation: lease.holder_generation,
+    };
+    let installed = store
+        .install_packed_lower_binding(InstallPackedLowerBinding {
+            guard,
+            expected_layers,
+            expected_base,
+            expected_binding: None,
+            lower,
+        })
+        .await;
+    // Always end the install lease; a failed install must not strand it.
+    let released = store
+        .release_lease(ReleaseLease {
+            lease_id: lease.lease_id,
+            holder_generation: lease.holder_generation,
+        })
+        .await;
+    installed?;
+    released?;
+    Ok(store.load_workspace(workspace.workspace_id).await?)
+}
+
 #[cfg(feature = "workspace-overlay")]
 async fn workspace_cmd_with_catalog<W>(
     command: WorkspaceCommand,
@@ -2490,6 +2665,14 @@ where
                 .await?;
             print_json(&workspace)?;
         }
+        WorkspaceCommand::InitPackedVolume {
+            manifest_key,
+            data_config,
+            owner,
+        } => {
+            let workspace = init_packed_volume(store, &manifest_key, &data_config, owner).await?;
+            print_json(&workspace)?;
+        }
         #[cfg(feature = "native-packed-base")]
         WorkspaceCommand::InitNative => {
             anyhow::bail!("native initialization must use the backend-aware command path")
@@ -2519,18 +2702,6 @@ where
                 .await?;
             print_json(&created.remove(0))?;
         }
-        WorkspaceCommand::Snapshot {
-            workspace,
-            name,
-            owner,
-        } => {
-            validate_workspace_header(&store).await?;
-            let revision = seal_workspace(store.clone(), workspace).await?;
-            let snapshot = WorkspaceLifecycle::new(store)
-                .snapshot_revision(revision, name, owner)
-                .await?;
-            print_json(&snapshot)?;
-        }
         WorkspaceCommand::Fork {
             source,
             count,
@@ -2540,17 +2711,7 @@ where
             if count == 0 {
                 anyhow::bail!("--count must be greater than zero")
             }
-            let revision = match source.parse() {
-                Ok(revision) => revision,
-                Err(_) => {
-                    let workspace = source.parse::<WorkspaceId>().map_err(|error| {
-                        anyhow::anyhow!(
-                            "source must be a workspace UUID or exact revision: {error}"
-                        )
-                    })?;
-                    seal_workspace(store.clone(), workspace).await?
-                }
-            };
+            let revision = source;
             let created = WorkspaceLifecycle::new(store)
                 .fork_revision(revision, count, owner)
                 .await?;
@@ -2585,19 +2746,6 @@ where
                 .discard(workspace, force)
                 .await?;
             println!("discarded {workspace}");
-        }
-        WorkspaceCommand::Commit { workspace, target } => {
-            validate_workspace_header(&store).await?;
-            let source = store.load_workspace(workspace).await?;
-            let fork_base = source.fork_base.clone().ok_or_else(|| {
-                anyhow::anyhow!("source workspace has no exact fork-base revision")
-            })?;
-            let revision = seal_workspace(store.clone(), workspace).await?;
-            let target = store.load_workspace(target).await?;
-            let result = WorkspaceLifecycle::new(store)
-                .fast_forward(revision, fork_base, &target)
-                .await?;
-            print_json(&result)?;
         }
     }
     Ok(())
@@ -2655,32 +2803,6 @@ async fn validate_workspace_header<W: WorkspaceStore + ?Sized>(
         )
     }
     Ok(())
-}
-
-#[cfg(feature = "workspace-overlay")]
-async fn seal_workspace<W>(
-    store: Arc<W>,
-    workspace_id: WorkspaceId,
-) -> anyhow::Result<crate::workspace_overlay::model::BaseRevision>
-where
-    W: WorkspaceStore + 'static,
-{
-    let generation = new_workspace_holder_generation();
-    let session = WorkspaceMountSession::acquire(
-        store.clone(),
-        workspace_id,
-        generation,
-        DEFAULT_LEASE_TTL,
-        DEFAULT_HEARTBEAT_INTERVAL,
-    )
-    .await?;
-    let result = WorkspaceLifecycle::new(store)
-        .seal(&session.view, &NoopDurableRemoteBarrier)
-        .await;
-    let release_result = session.release().await;
-    let revision = result?.revision;
-    release_result?;
-    Ok(revision)
 }
 
 #[cfg(feature = "workspace-overlay")]
@@ -2938,6 +3060,23 @@ fn database_type_from_url(url: &str) -> DatabaseType {
 #[cfg(test)]
 mod volume_format_tests {
     use super::*;
+
+    #[test]
+    fn entity_format_is_explicit_and_mount_fails_closed() {
+        use clap::ValueEnum;
+        assert_eq!(
+            VolumeFormat::from_str("workspace-entity-v1", false).unwrap(),
+            VolumeFormat::WorkspaceEntityV1
+        );
+        assert_eq!(VolumeFormat::default(), VolumeFormat::FlatV1);
+        let error = validate_volume_format_support(VolumeFormat::WorkspaceEntityV1)
+            .unwrap_err()
+            .to_string();
+        #[cfg(feature = "workspace-overlay")]
+        assert!(error.contains("--experimental-entity-mount"), "{error}");
+        #[cfg(not(feature = "workspace-overlay"))]
+        assert!(error.contains("feature not compiled"), "{error}");
+    }
 
     #[test]
     fn flat_format_is_always_supported() {

@@ -14,6 +14,8 @@ use tokio::sync::Mutex;
 
 use super::kv_backend::{KvCheck, KvEntry, KvReadLimits, KvWrite, WorkspaceKvBackend};
 use crate::workspace_overlay::catalog::*;
+#[cfg(test)]
+use crate::workspace_overlay::catalog::{InstallTestBase, TestBaseResult};
 use crate::workspace_overlay::digest::{CanonicalLayerDelta, delta_digest, root_hash};
 use crate::workspace_overlay::error::{ConflictDetail, WorkspaceError};
 use crate::workspace_overlay::ids::{JournalId, LayerId, LeaseId, SnapshotId, WorkspaceId};
@@ -75,7 +77,11 @@ const CONTROL_MAGIC: &[u8; 8] = b"BWSCT002";
 const CATALOG_FORMAT: u32 = 2;
 const TOPOLOGY_GENERATION_KEY: &[u8] = b"packed/v3/topology-generation";
 
-const CAS_MAX_RETRIES: usize = 64;
+// TiKV can hold a bounded transaction lock across several scheduler ticks
+// while concurrent mounts are flushing writes. Keep this finite, but give
+// remote backends enough attempts to observe the next generation rather than
+// surfacing a transient Busy to the caller.
+const CAS_MAX_RETRIES: usize = 256;
 const VOLUME_FORMAT: &str = "workspace-v1";
 const PACKED_CLAIM: &[u8] = b"PWC3";
 const PACKED_ROOT_GENERATION_KEY: &[u8] = b"packed/v3/root-generation";
@@ -128,7 +134,10 @@ const GENERIC_SCAN_MAX_BYTES: usize = 64 << 20;
 fn generic_scan_limits() -> KvReadLimits {
     KvReadLimits {
         max_records: GENERIC_SCAN_PAGE_RECORDS,
-        max_key_bytes: 2048,
+        // All backends share the 1024-byte logical key schema for bounded
+        // keyset pages. Larger values are rejected before reaching a
+        // backend, so keep generic scans within that contract.
+        max_key_bytes: 1024,
         max_value_bytes: 256 << 10,
         max_total_bytes: 4 << 20,
         max_response_bytes: 4 << 20,
@@ -375,7 +384,69 @@ pub struct KvWorkspaceStore<B> {
         std::sync::OnceLock<Arc<crate::workspace_overlay::packed_v3::wire005::V3MountBudget>>,
     native_auxiliary_budget:
         std::sync::OnceLock<Arc<crate::workspace_overlay::packed_v3::wire005::V3MountBudget>>,
+    slice_ids: IdBlock,
+    inode_ids: IdBlock,
+    /// Opt-in: a mounted runtime store reserves inode IDs in blocks. Admin,
+    /// publication and test stores keep dense one-at-a-time allocation.
+    inode_blocks: bool,
+    /// Last head record this store committed through a packed versioned
+    /// mutation. A hint only: callers use it as an expected version and the
+    /// CAS fails with Busy if anything changed since.
+    committed_head: Arc<std::sync::Mutex<Option<LayerRecord>>>,
+    /// Post-commit image of the packed writer's view keys; see
+    /// `packed_permissions::CommitViewCache`. Shared with mutation drivers.
+    commit_view: Arc<std::sync::Mutex<Option<packed_permissions::CommitViewCache>>>,
 }
+
+tokio::task_local! {
+    /// Values a commit already read in its own consistent view read, keyed
+    /// by exact key. Derived-CAS preparation consults it instead of issuing a
+    /// second point read. Each value is still a CAS check, so staleness can
+    /// only fail the commit (Busy -> bounded retry), never apply wrong state.
+    static PREFETCHED_POINTS: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+}
+
+/// All requested keys from the commit's prefetch, or None to read normally.
+pub(super) fn prefetched_points(keys: &[Vec<u8>]) -> Option<Vec<Option<Vec<u8>>>> {
+    PREFETCHED_POINTS
+        .try_with(|points| {
+            keys.iter()
+                .map(|key| points.get(key).cloned())
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok()
+        .flatten()
+}
+
+pub(super) async fn with_prefetched_points<F: std::future::Future>(
+    points: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    future: F,
+) -> F::Output {
+    PREFETCHED_POINTS.scope(points, future).await
+}
+
+/// Per-store reserved range of slice IDs, `[next, end)`.
+#[derive(Default)]
+struct IdBlock(std::sync::Mutex<(i64, i64)>);
+
+impl IdBlock {
+    fn take(&self) -> Option<i64> {
+        let mut range = self.0.lock().unwrap();
+        (range.0 < range.1).then(|| {
+            range.0 += 1;
+            range.0 - 1
+        })
+    }
+    fn refill(&self, first: i64, count: i64) {
+        let mut range = self.0.lock().unwrap();
+        if range.0 >= range.1 {
+            *range = (first, first + count);
+        }
+    }
+}
+
+const SLICE_ID_BLOCK: i64 = 64;
+const INODE_ID_BLOCK: i64 = 64;
 
 struct TopologyTxn<'a, B> {
     store: &'a KvWorkspaceStore<B>,
@@ -403,18 +474,40 @@ impl<'a, B: WorkspaceKvBackend> TopologyTxn<'a, B> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        if self.checks.len().saturating_add(unread.len()) > 1024 {
+        // Keep scoped compaction and other bounded topology transitions in
+        // the same 4096-record envelope as the administrative census. A
+        // freshly materialized layer may legitimately carry more than one
+        // thousand delta rows; rejecting it at 1024 would make the scoped
+        // path less capable than the legacy full-census path it replaces.
+        if self.checks.len().saturating_add(unread.len()) > 4096 {
             return Err(WorkspaceError::InvalidReadPlan(
                 "topology transaction authority limit".into(),
             ));
         }
         let mut values = Vec::new();
         for part in unread.chunks(32) {
-            let (rows, _) = self
-                .store
-                .backend
-                .get_many_consistent_with_time_bounded(part, topology_point_limits(part.len()))
-                .await?;
+            // A bounded TiKV point read may report a pre-submit key-lock
+            // conflict after it has exhausted its per-request data slots.
+            // The backend maps that case to Busy and guarantees that no write
+            // was submitted. Rebuild this read packet before the surrounding
+            // topology CAS continues; otherwise seal/fork callers would
+            // surface a transient lock as a terminal operation failure.
+            let mut attempt = 0;
+            let (rows, _) = loop {
+                let result = self
+                    .store
+                    .backend
+                    .get_many_consistent_with_time_bounded(part, topology_point_limits(part.len()))
+                    .await;
+                match result {
+                    Err(WorkspaceError::Busy) if attempt + 1 < CAS_MAX_RETRIES => {
+                        retry_backoff(attempt).await;
+                        attempt += 1;
+                    }
+                    Err(WorkspaceError::Busy) => return Err(WorkspaceError::Busy),
+                    other => break other?,
+                }
+            };
             values.extend(rows);
         }
         if values.len() != unread.len() {
@@ -557,11 +650,32 @@ impl<'a, B: WorkspaceKvBackend> TopologyTxn<'a, B> {
             .map(|(key, expected)| KvCheck { key, expected })
             .collect::<Vec<_>>();
         let writes = self.writes.into_values().collect::<Vec<_>>();
-        let packet = self
+        // Every Busy reachable here is pre-submit: packet preparation saw a
+        // shared root/inventory/topology epoch move (a sibling seal or fork),
+        // or the backend rolled back before commit (TiKV exhausted key-lock
+        // retries). No mutation exists, so report it as an ordinary CAS
+        // conflict. Each caller's bounded retry loop then rebuilds from fresh
+        // reads instead of every caller having to special-case Busy; only
+        // exhausting that whole budget surfaces `workspace is busy`.
+        let packet = match self
             .store
             .prepare_topology_packet(checks, writes, self.deadline)
-            .await?;
-        self.store.commit_prepared_topology_packet(&packet).await
+            .await
+        {
+            Ok(packet) => packet,
+            Err(WorkspaceError::Busy) => {
+                tracing::debug!("topology packet preparation conflict; rebuilding");
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        match self.store.commit_prepared_topology_packet(&packet).await {
+            Err(WorkspaceError::Busy) => {
+                tracing::debug!("topology commit rolled back before submit; rebuilding");
+                Ok(false)
+            }
+            result => result,
+        }
     }
 }
 
@@ -569,13 +683,54 @@ impl<B> KvWorkspaceStore<B>
 where
     B: WorkspaceKvBackend,
 {
+    async fn allocate_id_block(&self, count: i64) -> Result<i64, WorkspaceError> {
+        self.allocate_id_block_named("slice", count).await
+    }
+
+    /// Advance a durable allocator by `count` in one CAS and return the
+    /// first reserved ID.
+    async fn allocate_id_block_named(&self, name: &str, count: i64) -> Result<i64, WorkspaceError> {
+        let key = hot_allocator_key(name);
+        for _ in 0..CAS_MAX_RETRIES {
+            let (raw, value) = self.load_hot::<i64>(key.clone()).await?;
+            let current = value.unwrap_or(1);
+            let next = current
+                .checked_add(count)
+                .ok_or_else(|| WorkspaceError::CorruptMetadata("allocator overflows".into()))?;
+            let writes = [put(key.clone(), &next)?];
+            let checks = [KvCheck {
+                key: key.clone(),
+                expected: raw,
+            }];
+            let packet = self
+                .prepare_topology_envelope(checks.to_vec(), writes.to_vec(), None)
+                .await?;
+            if self.commit_prepared_topology_packet(&packet).await? {
+                return Ok(current);
+            }
+            tokio::task::yield_now().await;
+        }
+        Err(WorkspaceError::Busy)
+    }
+
     pub fn new(backend: B) -> Self {
         Self {
             backend: Arc::new(backend),
             runtime_only: false,
             packed_reader_pin_budget: std::sync::OnceLock::new(),
             native_auxiliary_budget: std::sync::OnceLock::new(),
+            slice_ids: IdBlock::default(),
+            inode_ids: IdBlock::default(),
+            inode_blocks: false,
+            committed_head: Arc::default(),
+            commit_view: Arc::default(),
         }
+    }
+
+    /// Mounted runtime only: reserve inode IDs 64 per allocator CAS.
+    pub fn with_inode_id_blocks(mut self) -> Self {
+        self.inode_blocks = true;
+        self
     }
 
     pub fn from_arc(backend: Arc<B>) -> Self {
@@ -584,6 +739,11 @@ where
             runtime_only: false,
             packed_reader_pin_budget: std::sync::OnceLock::new(),
             native_auxiliary_budget: std::sync::OnceLock::new(),
+            slice_ids: IdBlock::default(),
+            inode_ids: IdBlock::default(),
+            inode_blocks: false,
+            committed_head: Arc::default(),
+            commit_view: Arc::default(),
         }
     }
 
@@ -978,7 +1138,7 @@ where
             &mut Vec<KvWrite>,
         ) -> Result<R, WorkspaceError>,
     {
-        for _ in 0..CAS_MAX_RETRIES {
+        for attempt in 0..CAS_MAX_RETRIES {
             // Capture before hydration. Layer creation/removal advances this
             // durable fence in the same CAS, even if CONTROL later byte-ABAs.
             let inventory_generation = self.backend.get(LAYER_INVENTORY_GENERATION_KEY).await?;
@@ -989,13 +1149,27 @@ where
                 } else {
                     (BTreeSet::new(), Vec::new(), Vec::new())
                 };
-            let (raw, mut state, hot) = self.load_control_raw().await?;
+            let (raw, mut state, hot) = match self.load_control_raw().await {
+                Ok(census) => census,
+                Err(WorkspaceError::Busy) if native_grant_workspace.is_none() => {
+                    // No mutation has been submitted. A concurrent topology
+                    // change invalidated the census authentication; rebuild it
+                    // before evaluating the operation and retained authorities.
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             // Finalization must retain both the pre-scan authorities and
             // their inventory incarnation across every retry. Raw layer
             // bytes alone cannot distinguish deletion and identical recreation.
             for check in extra_checks {
                 let current = if check.key.as_slice() == LAYER_INVENTORY_GENERATION_KEY {
                     inventory_generation.clone()
+                } else if check.key.as_slice() == CONTROL_KEY {
+                    // Packed carrier deletion retains the exact catalog
+                    // header; compare it with this attempt's census read.
+                    raw.clone()
                 } else if check.key.starts_with(HOT_LAYER_PREFIX) {
                     hot.get(&check.key).cloned().unwrap_or(None)
                 } else if self.is_carrier_deletion_check(&check.key)
@@ -1099,7 +1273,17 @@ where
                     });
                 }
             }
-            let packet = self.prepare_topology_packet(checks, writes, None).await?;
+            let packet = match self.prepare_topology_packet(checks, writes, None).await {
+                Ok(packet) => packet,
+                Err(WorkspaceError::Busy) if native_grant_workspace.is_none() => {
+                    // Native derived-index preparation can lose its read-side
+                    // epoch overlap. Only this pre-submission Busy rebuilds;
+                    // an uncertain mutation response must propagate unchanged.
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if self.commit_prepared_topology_packet(&packet).await? {
                 return Ok(result);
             }
@@ -1108,7 +1292,11 @@ where
                 // native call grants nothing and never retries across its birth.
                 return Err(WorkspaceError::Busy);
             }
-            tokio::task::yield_now().await;
+            // Layer membership updates contend on the shared inventory and
+            // topology generations. A bare yield retries all concurrent
+            // compactions in lockstep and can exhaust the bounded CAS budget
+            // before Redis/TiKV has a chance to serialize the writers.
+            retry_backoff(attempt).await;
         }
         Err(WorkspaceError::Busy)
     }
@@ -2038,6 +2226,75 @@ where
         Ok(())
     }
 
+    fn supports_fused_read_fence(&self) -> bool {
+        self.backend.supports_consistent_reads()
+    }
+
+    fn take_committed_head(&self, head: LayerId) -> Option<LayerRecord> {
+        self.committed_head
+            .lock()
+            .unwrap()
+            .take()
+            .filter(|record| record.layer_id == head)
+    }
+
+    async fn validate_inode_read_fence(
+        &self,
+        guard: HeadGuard,
+        base: LayerRecord,
+        ino: i64,
+        expected: Vec<InodeDelta>,
+    ) -> Result<(), WorkspaceError> {
+        let (_, rows) = self.read_fenced_inode(guard, base, ino).await?;
+        if rows != expected {
+            return Err(WorkspaceError::Busy);
+        }
+        Ok(())
+    }
+
+    async fn read_fenced_inode(
+        &self,
+        guard: HeadGuard,
+        base: LayerRecord,
+        ino: i64,
+    ) -> Result<(LayerRecord, Vec<InodeDelta>), WorkspaceError> {
+        let keys = vec![
+            hot_workspace_key(guard.workspace_id),
+            hot_layer_key(guard.expected_head_layer_id),
+            hot_lease_key(guard.workspace_id, guard.lease_id),
+            inode_identity_key(guard.expected_head_layer_id, ino),
+            inode_identity_key(base.layer_id, ino),
+        ];
+        let (values, now) = self.backend.get_many_consistent_with_time(&keys).await?;
+        if values.len() != keys.len() {
+            return Err(WorkspaceError::Backend(
+                "short KV fused inode read-fence read".into(),
+            ));
+        }
+        let workspace: WorkspaceRecord = decode_required(&values[0])?;
+        let head: LayerRecord = decode_required(&values[1])?;
+        let lease: SnapshotLease = decode_required(&values[2])?;
+        checked_hot_guard(&workspace, &head, &lease, &guard, now)?;
+        if head.parent_layer_id != Some(base.layer_id) {
+            return Err(WorkspaceError::Fenced);
+        }
+        let mut rows = Vec::with_capacity(2);
+        for (value, layer) in values[3..]
+            .iter()
+            .zip([guard.expected_head_layer_id, base.layer_id])
+        {
+            let Some(value) = value else { continue };
+            let row: InodeDelta = decode(value)?;
+            if row.layer_id != layer || row.ino != ino {
+                return Err(WorkspaceError::CorruptMetadata(
+                    "fused inode key/record identity mismatch".into(),
+                ));
+            }
+            rows.push(row);
+        }
+        Ok((head, rows))
+    }
+
     async fn get_extent_deltas_bounded(
         &self,
         request: ExtentQuery,
@@ -2640,27 +2897,31 @@ where
                 "unknown workspace allocator {name}"
             )));
         }
-        let key = hot_allocator_key(name);
-        for _ in 0..CAS_MAX_RETRIES {
-            let (raw, value) = self.load_hot::<i64>(key.clone()).await?;
-            let current = value.unwrap_or(1);
-            let next = current
-                .checked_add(1)
-                .ok_or_else(|| WorkspaceError::CorruptMetadata("allocator overflows".into()))?;
-            let writes = [put(key.clone(), &next)?];
-            let checks = [KvCheck {
-                key: key.clone(),
-                expected: raw,
-            }];
-            let packet = self
-                .prepare_topology_envelope(checks.to_vec(), writes.to_vec(), None)
-                .await?;
-            if self.commit_prepared_topology_packet(&packet).await? {
-                return Ok(current);
+        if name == "slice" {
+            // Slice IDs only need uniqueness (no publication floor reads
+            // them). Reserve a block per durable CAS; unused IDs in a block
+            // are simply skipped after a restart.
+            if let Some(id) = self.slice_ids.take() {
+                return Ok(id);
             }
-            tokio::task::yield_now().await;
+            let first = self.allocate_id_block(SLICE_ID_BLOCK).await?;
+            self.slice_ids.refill(first, SLICE_ID_BLOCK);
+            return self.slice_ids.take().ok_or(WorkspaceError::Busy);
         }
-        Err(WorkspaceError::Busy)
+        if name == "inode" && self.inode_blocks {
+            // Packed publication takes max(allocator, highest native inode +
+            // 1) as its floor, so a reserved block only leaves gaps; the
+            // durable counter already covers every ID handed out from it.
+            if let Some(id) = self.inode_ids.take() {
+                return Ok(id);
+            }
+            let first = self
+                .allocate_id_block_named("inode", INODE_ID_BLOCK)
+                .await?;
+            self.inode_ids.refill(first, INODE_ID_BLOCK);
+            return self.inode_ids.take().ok_or(WorkspaceError::Busy);
+        }
+        self.allocate_id_block_named(name, 1).await
     }
 
     async fn create_volume_root(
@@ -2977,7 +3238,8 @@ where
             txn.put_workspace(&workspace)?;
             txn.put_lease(&lease)?;
             txn.put(lease_index_key(request.lease_id), &request.workspace_id)?;
-            if txn.commit().await? {
+            let committed = txn.commit().await?;
+            if committed {
                 return Ok(lease);
             }
             retry_backoff(attempt).await;
@@ -4006,351 +4268,6 @@ where
         self.layer_delta_unchecked(layer_id).await
     }
 
-    async fn begin_seal(&self, request: BeginSeal) -> Result<SealJournal, WorkspaceError> {
-        self.require_admin_access()?;
-        if request.new_head_layer_id == request.guard.expected_head_layer_id {
-            return Err(WorkspaceError::CorruptMetadata(
-                "seal new head must differ from old head".into(),
-            ));
-        }
-        let now = self.now_ns().await?;
-        for attempt in 0..CAS_MAX_RETRIES {
-            let mut txn = self.topology_txn();
-            let mut workspace = txn
-                .read_workspace(request.guard.workspace_id)
-                .await?
-                .ok_or(WorkspaceError::Fenced)?;
-            let mut layer = txn
-                .read_layer(request.guard.expected_head_layer_id)
-                .await?
-                .ok_or(WorkspaceError::Fenced)?;
-            let lease = txn
-                .read_lease(request.guard.workspace_id, request.guard.lease_id)
-                .await?
-                .ok_or(WorkspaceError::Fenced)?;
-            checked_hot_guard(&workspace, &layer, &lease, &request.guard, now)?;
-            txn.deadline = Some(lease.expires_at_ns);
-            if txn.read_journal_index(request.journal_id).await?.is_some()
-                || txn
-                    .read_journal(request.guard.workspace_id, request.journal_id)
-                    .await?
-                    .is_some()
-            {
-                return Err(conflict("seal journal already exists"));
-            }
-            let parent = layer.parent_layer_id.ok_or_else(|| {
-                WorkspaceError::CorruptMetadata("writable head has no parent".into())
-            })?;
-            let base = txn
-                .read_layer(parent)
-                .await?
-                .ok_or(WorkspaceError::LayerNotFound(parent))?;
-            Self::sealed_ancestry(&mut txn, base).await?;
-            workspace.state = WorkspaceState::Sealing;
-            workspace.updated_at_ns = now;
-            layer.state = LayerState::Sealing;
-            let journal = SealJournal {
-                journal_id: request.journal_id,
-                workspace_id: request.guard.workspace_id,
-                old_head_layer_id: request.guard.expected_head_layer_id,
-                expected_head_epoch: request.guard.expected_head_epoch,
-                phase: SealPhase::Prepare,
-                pending_bytes: 0,
-                delta_digest: None,
-                root_hash: None,
-                new_head_layer_id: Some(request.new_head_layer_id),
-                last_error: None,
-                created_at_ns: now,
-                updated_at_ns: now,
-            };
-            txn.put_workspace(&workspace)?;
-            txn.put_layer(&layer)?;
-            txn.put_journal(&journal)?;
-            txn.put(
-                journal_index_key(request.journal_id),
-                &request.guard.workspace_id,
-            )?;
-            if txn.commit().await? {
-                return Ok(journal);
-            }
-            retry_backoff(attempt).await;
-        }
-        Err(WorkspaceError::Busy)
-    }
-
-    async fn advance_seal(&self, request: AdvanceSeal) -> Result<SealJournal, WorkspaceError> {
-        self.require_admin_access()?;
-        let allowed = matches!(
-            (request.expected_phase, request.next_phase),
-            (SealPhase::Prepare, SealPhase::Quiesced)
-                | (SealPhase::Quiesced, SealPhase::DataDrained)
-                | (SealPhase::HeadSwitched, SealPhase::Completed)
-        );
-        if !allowed {
-            return Err(invalid_transition(
-                request.expected_phase,
-                request.next_phase,
-            ));
-        }
-        let now = self.now_ns().await?;
-        let workspace_id = self.journal_workspace(request.journal_id).await?;
-        for attempt in 0..CAS_MAX_RETRIES {
-            let mut txn = self.topology_txn();
-            let mut journal = txn
-                .read_journal(workspace_id, request.journal_id)
-                .await?
-                .ok_or_else(|| {
-                    WorkspaceError::Backend(format!(
-                        "seal journal not found: {}",
-                        request.journal_id
-                    ))
-                })?;
-            if journal.phase != request.expected_phase {
-                return Err(invalid_transition(journal.phase, request.next_phase));
-            }
-            journal.phase = request.next_phase;
-            if let Some(bytes) = request.pending_bytes {
-                journal.pending_bytes = bytes;
-            }
-            journal.last_error = request.last_error.clone();
-            journal.updated_at_ns = now;
-            txn.put_journal(&journal)?;
-            if txn.commit().await? {
-                return Ok(journal);
-            }
-            retry_backoff(attempt).await;
-        }
-        Err(WorkspaceError::Busy)
-    }
-
-    async fn hash_seal(&self, journal_id: JournalId) -> Result<SealJournal, WorkspaceError> {
-        self.require_admin_access()?;
-        let initial = self.load_seal_journal(journal_id).await?;
-        if initial.phase != SealPhase::DataDrained {
-            return Err(invalid_transition(initial.phase, SealPhase::Hashed));
-        }
-        let delta = self
-            .layer_delta_unchecked(initial.old_head_layer_id)
-            .await?;
-        let digest = delta_digest(&delta)?;
-        let old = self.load_layer(initial.old_head_layer_id).await?;
-        let parent_hash = match old.parent_layer_id {
-            Some(parent) => self.load_layer(parent).await?.root_hash.ok_or_else(|| {
-                WorkspaceError::CorruptMetadata("sealed parent has no root hash".into())
-            })?,
-            None => [0; 32],
-        };
-        let root = root_hash(parent_hash, digest);
-        let now = self.now_ns().await?;
-        for attempt in 0..CAS_MAX_RETRIES {
-            let mut txn = self.topology_txn();
-            let mut journal = txn
-                .read_journal(initial.workspace_id, journal_id)
-                .await?
-                .ok_or(WorkspaceError::Fenced)?;
-            if journal.phase != SealPhase::DataDrained
-                || journal.old_head_layer_id != initial.old_head_layer_id
-            {
-                return Err(WorkspaceError::Fenced);
-            }
-            let current = txn
-                .read_layer(initial.old_head_layer_id)
-                .await?
-                .ok_or(WorkspaceError::Fenced)?;
-            if current != old {
-                retry_backoff(attempt).await;
-                continue;
-            }
-            if let Some(parent) = old.parent_layer_id {
-                txn.read_layer(parent).await?;
-            }
-            journal.phase = SealPhase::Hashed;
-            journal.delta_digest = Some(digest);
-            journal.root_hash = Some(root);
-            journal.updated_at_ns = now;
-            txn.put_journal(&journal)?;
-            if txn.commit().await? {
-                return Ok(journal);
-            }
-            retry_backoff(attempt).await;
-        }
-        Err(WorkspaceError::Busy)
-    }
-
-    async fn commit_seal(&self, journal_id: JournalId) -> Result<SealResult, WorkspaceError> {
-        self.require_admin_access()?;
-        let now = self.now_ns().await?;
-        let workspace_id = self.journal_workspace(journal_id).await?;
-        for attempt in 0..CAS_MAX_RETRIES {
-            let mut txn = self.topology_txn();
-            let mut journal = txn
-                .read_journal(workspace_id, journal_id)
-                .await?
-                .ok_or_else(|| {
-                    WorkspaceError::Backend(format!("seal journal not found: {journal_id}"))
-                })?;
-            let mut old = txn
-                .read_layer(journal.old_head_layer_id)
-                .await?
-                .ok_or(WorkspaceError::Fenced)?;
-            let mut workspace = txn
-                .read_workspace(workspace_id)
-                .await?
-                .ok_or(WorkspaceError::Fenced)?;
-            if matches!(
-                journal.phase,
-                SealPhase::Completed | SealPhase::HeadSwitched
-            ) {
-                let revision = revision_from_layer(&old)?;
-                if journal.phase == SealPhase::HeadSwitched {
-                    journal.phase = SealPhase::Completed;
-                    journal.updated_at_ns = now;
-                    txn.put_journal(&journal)?;
-                    if !txn.commit().await? {
-                        retry_backoff(attempt).await;
-                        continue;
-                    }
-                }
-                return Ok(SealResult {
-                    revision,
-                    new_head_layer_id: workspace.head_layer_id,
-                    head_epoch: workspace.head_epoch,
-                });
-            }
-            if journal.phase != SealPhase::Hashed {
-                return Err(invalid_transition(journal.phase, SealPhase::HeadSwitched));
-            }
-            let digest = journal.delta_digest.ok_or_else(|| {
-                WorkspaceError::CorruptMetadata("hashed journal lacks digest".into())
-            })?;
-            let root = journal.root_hash.ok_or_else(|| {
-                WorkspaceError::CorruptMetadata("hashed journal lacks root hash".into())
-            })?;
-            let new_head = journal.new_head_layer_id.ok_or_else(|| {
-                WorkspaceError::CorruptMetadata("seal journal lacks new head".into())
-            })?;
-            if txn.read_layer(new_head).await?.is_some() {
-                return Err(conflict("seal replacement head already exists"));
-            }
-            if old.state != LayerState::Sealing
-                || workspace.head_layer_id != old.layer_id
-                || workspace.head_epoch != journal.expected_head_epoch
-                || workspace.state != WorkspaceState::Sealing
-            {
-                return Err(WorkspaceError::Fenced);
-            }
-            let new_depth = old
-                .depth
-                .checked_add(1)
-                .ok_or_else(|| WorkspaceError::CorruptMetadata("layer depth overflows".into()))?;
-            check_depth(new_depth)?;
-            let next = txn.read_allocator("sealed_version").await?.ok_or_else(|| {
-                WorkspaceError::CorruptMetadata("sealed version allocator missing".into())
-            })?;
-            let sealed_version = u64::try_from(next)
-                .map_err(|_| WorkspaceError::CorruptMetadata("negative sealed version".into()))?;
-            let updated = next
-                .checked_add(1)
-                .ok_or_else(|| WorkspaceError::CorruptMetadata("allocator overflows".into()))?;
-            txn.put_allocator("sealed_version", updated)?;
-            old.state = LayerState::Sealed;
-            old.sealed_version = Some(sealed_version);
-            old.delta_digest = Some(digest);
-            old.root_hash = Some(root);
-            old.owner_workspace_id = None;
-            old.sealed_at_ns = Some(now);
-            txn.put_layer(&old)?;
-            txn.put_layer(&writable_layer(
-                new_head,
-                old.layer_id,
-                new_depth,
-                workspace_id,
-                now,
-            ))?;
-            let new_epoch = workspace
-                .head_epoch
-                .checked_add(1)
-                .ok_or_else(|| WorkspaceError::CorruptMetadata("head epoch overflows".into()))?;
-            workspace.head_layer_id = new_head;
-            workspace.head_epoch = new_epoch;
-            workspace.state = WorkspaceState::Active;
-            workspace.updated_at_ns = now;
-            txn.put_workspace(&workspace)?;
-            let revision = BaseRevision {
-                layer_id: old.layer_id,
-                sealed_version,
-                root_hash: root,
-            };
-            if let Some(lease_id) = workspace.active_lease
-                && let Some(mut lease) = txn.read_lease(workspace_id, lease_id).await?
-                && lease.state == LeaseState::Active
-            {
-                lease.base_revision = revision.clone();
-                lease.updated_at_ns = now;
-                txn.put_lease(&lease)?;
-            }
-            journal.phase = SealPhase::Completed;
-            journal.updated_at_ns = now;
-            txn.put_journal(&journal)?;
-            if txn.commit().await? {
-                return Ok(SealResult {
-                    revision,
-                    new_head_layer_id: new_head,
-                    head_epoch: new_epoch,
-                });
-            }
-            retry_backoff(attempt).await;
-        }
-        Err(WorkspaceError::Busy)
-    }
-
-    async fn abort_recoverable_seal(&self, request: AbortSeal) -> Result<(), WorkspaceError> {
-        self.require_admin_access()?;
-        let now = self.now_ns().await?;
-        let workspace_id = self.journal_workspace(request.journal_id).await?;
-        for attempt in 0..CAS_MAX_RETRIES {
-            let mut txn = self.topology_txn();
-            let mut journal = txn
-                .read_journal(workspace_id, request.journal_id)
-                .await?
-                .ok_or_else(|| {
-                    WorkspaceError::Backend(format!(
-                        "seal journal not found: {}",
-                        request.journal_id
-                    ))
-                })?;
-            if !matches!(
-                journal.phase,
-                SealPhase::Prepare | SealPhase::Quiesced | SealPhase::DataDrained
-            ) {
-                return Err(invalid_transition(journal.phase, SealPhase::Aborted));
-            }
-            if let Some(mut layer) = txn.read_layer(journal.old_head_layer_id).await?
-                && layer.state == LayerState::Sealing
-            {
-                layer.state = LayerState::Writable;
-                txn.put_layer(&layer)?;
-            }
-            if let Some(mut workspace) = txn.read_workspace(workspace_id).await?
-                && workspace.head_layer_id == journal.old_head_layer_id
-                && workspace.head_epoch == journal.expected_head_epoch
-            {
-                workspace.state = WorkspaceState::Active;
-                workspace.updated_at_ns = now;
-                txn.put_workspace(&workspace)?;
-            }
-            journal.phase = SealPhase::Aborted;
-            journal.last_error = Some(request.reason.clone());
-            journal.updated_at_ns = now;
-            txn.put_journal(&journal)?;
-            if txn.commit().await? {
-                return Ok(());
-            }
-            retry_backoff(attempt).await;
-        }
-        Err(WorkspaceError::Busy)
-    }
-
     async fn load_seal_journal(
         &self,
         journal_id: JournalId,
@@ -4362,14 +4279,6 @@ where
             .ok_or_else(|| WorkspaceError::Backend(format!("seal journal not found: {journal_id}")))
     }
 
-    async fn list_incomplete_seal_journals(&self) -> Result<Vec<SealJournal>, WorkspaceError> {
-        self.current_control().await?;
-        let mut rows: Vec<SealJournal> = self.scan(JOURNAL_PREFIX.to_vec()).await?;
-        rows.retain(|journal| !matches!(journal.phase, SealPhase::Completed | SealPhase::Aborted));
-        rows.sort_by_key(|journal| journal.created_at_ns);
-        Ok(rows)
-    }
-
     async fn list_seal_journals(
         &self,
         workspace_id: WorkspaceId,
@@ -4378,107 +4287,6 @@ where
         let mut rows: Vec<SealJournal> = self.scan(journal_prefix(workspace_id)).await?;
         rows.sort_by_key(|journal| (journal.created_at_ns, journal.journal_id));
         Ok(rows)
-    }
-
-    async fn fast_forward_commit(
-        &self,
-        request: FastForwardCommit,
-    ) -> Result<CommitResult, WorkspaceError> {
-        self.require_admin_access()?;
-        let now = self.now_ns().await?;
-        for attempt in 0..CAS_MAX_RETRIES {
-            let mut txn = self.topology_txn();
-            let source = txn
-                .read_layer(request.source_revision.layer_id)
-                .await?
-                .ok_or(WorkspaceError::LayerNotFound(
-                    request.source_revision.layer_id,
-                ))?;
-            if Self::sealed_ancestry(&mut txn, source.clone()).await? != request.source_revision {
-                return Err(commit_conflict("source revision changed"));
-            }
-            let mut target = txn
-                .read_workspace(request.target_workspace_id)
-                .await?
-                .ok_or(WorkspaceError::WorkspaceNotFound(
-                    request.target_workspace_id,
-                ))?;
-            if target.head_layer_id != request.target_expected_head_layer_id
-                || target.head_epoch != request.target_expected_head_epoch
-                || target.state != WorkspaceState::Active
-                || target.fork_base.as_ref() != Some(&request.source_fork_base)
-            {
-                return Err(commit_conflict("target revision changed"));
-            }
-            let mut old_head = txn
-                .read_layer(target.head_layer_id)
-                .await?
-                .ok_or_else(|| commit_conflict("target head is not writable"))?;
-            if old_head.state != LayerState::Writable
-                || old_head.owner_workspace_id != Some(target.workspace_id)
-                || old_head.next_sequence != 1
-            {
-                return Err(commit_conflict("target writable head is not empty"));
-            }
-            let parent = old_head
-                .parent_layer_id
-                .ok_or_else(|| commit_conflict("target head has no base"))?;
-            let base = txn
-                .read_layer(parent)
-                .await?
-                .ok_or(WorkspaceError::LayerNotFound(parent))?;
-            if Self::sealed_ancestry(&mut txn, base).await? != request.source_fork_base {
-                return Err(commit_conflict("target base revision changed"));
-            }
-            if let Some(id) = target.active_lease {
-                if txn
-                    .read_lease(target.workspace_id, id)
-                    .await?
-                    .is_some_and(|lease| {
-                        lease.state == LeaseState::Active && lease.expires_at_ns > now
-                    })
-                {
-                    return Err(commit_conflict("target has an active writable lease"));
-                }
-                target.active_lease = None;
-            }
-            if txn.read_layer(request.new_head_layer_id).await?.is_some() {
-                return Err(commit_conflict("replacement head already exists"));
-            }
-            let depth = source
-                .depth
-                .checked_add(1)
-                .ok_or_else(|| WorkspaceError::CorruptMetadata("layer depth overflows".into()))?;
-            check_depth(depth)?;
-            txn.put_layer(&writable_layer(
-                request.new_head_layer_id,
-                source.layer_id,
-                depth,
-                target.workspace_id,
-                now,
-            ))?;
-            let epoch = target
-                .head_epoch
-                .checked_add(1)
-                .ok_or_else(|| WorkspaceError::CorruptMetadata("head epoch overflows".into()))?;
-            target.head_layer_id = request.new_head_layer_id;
-            target.head_epoch = epoch;
-            target.fork_base = Some(request.source_revision.clone());
-            target.updated_at_ns = now;
-            txn.put_workspace(&target)?;
-            old_head.state = LayerState::Deleting;
-            old_head.owner_workspace_id = None;
-            txn.put_layer(&old_head)?;
-            if txn.commit().await? {
-                return Ok(CommitResult {
-                    revision: request.source_revision.clone(),
-                    target_head_layer_id: request.new_head_layer_id,
-                    target_head_epoch: epoch,
-                });
-            }
-            retry_backoff(attempt).await;
-        }
-        Err(WorkspaceError::Busy)
     }
 
     async fn mark_workspace_deleting(&self, request: MarkDeleting) -> Result<(), WorkspaceError> {
@@ -4982,10 +4790,11 @@ where
         Ok(())
     }
 
-    async fn install_compaction(
+    #[cfg(test)]
+    async fn install_test_base(
         &self,
-        request: InstallCompaction,
-    ) -> Result<CompactionResult, WorkspaceError> {
+        request: InstallTestBase,
+    ) -> Result<TestBaseResult, WorkspaceError> {
         self.require_admin_access()?;
         if request.compacted_layer_id == request.replacement_head_layer_id {
             return Err(WorkspaceError::CorruptMetadata(
@@ -5024,11 +4833,11 @@ where
             .checked_add(1)
             .ok_or_else(|| WorkspaceError::CorruptMetadata("sequence overflows".into()))?;
         let now = self.now_ns().await?;
-        self.update_control(|state, writes| {
-            let workspace = state
-                .workspaces
-                .get(&request.workspace_id)
-                .cloned()
+        for attempt in 0..CAS_MAX_RETRIES {
+            let mut txn = self.topology_txn();
+            let mut workspace = txn
+                .read_workspace(request.workspace_id)
+                .await?
                 .ok_or(WorkspaceError::WorkspaceNotFound(request.workspace_id))?;
             if workspace.head_layer_id != request.expected_head_layer_id
                 || workspace.head_epoch != request.expected_head_epoch
@@ -5036,119 +4845,125 @@ where
             {
                 return Err(WorkspaceError::Fenced);
             }
-            let head = state
-                .layers
-                .get(&request.expected_head_layer_id)
+            let mut head = txn
+                .read_layer(request.expected_head_layer_id)
+                .await?
                 .ok_or(WorkspaceError::Fenced)?;
             if head.state != LayerState::Writable
                 || head.owner_workspace_id != Some(request.workspace_id)
                 || head.parent_layer_id != Some(request.expected_parent_layer_id)
-                || head.next_sequence != 1
             {
                 return Err(WorkspaceError::Fenced);
             }
-            let parent = state
-                .layers
-                .get(&request.expected_parent_layer_id)
+            let parent = txn
+                .read_layer(request.expected_parent_layer_id)
+                .await?
                 .ok_or(WorkspaceError::Fenced)?;
-            revision_from_layer(parent)?;
-            if state.layers.contains_key(&request.compacted_layer_id)
-                || state
-                    .layers
-                    .contains_key(&request.replacement_head_layer_id)
+            revision_from_layer(&parent)?;
+            if txn.read_layer(request.compacted_layer_id).await?.is_some()
+                || txn
+                    .read_layer(request.replacement_head_layer_id)
+                    .await?
+                    .is_some()
             {
                 return Err(conflict("compaction output layer already exists"));
             }
-            let sealed_version = u64::try_from(allocate_id_state(state, "sealed_version")?)
+            let next = txn.read_allocator("sealed_version").await?.ok_or_else(|| {
+                WorkspaceError::CorruptMetadata("sealed version allocator missing".into())
+            })?;
+            let sealed_version = u64::try_from(next)
                 .map_err(|_| WorkspaceError::CorruptMetadata("negative sealed version".into()))?;
-            state.layers.insert(
-                request.compacted_layer_id,
-                LayerRecord {
-                    layer_id: request.compacted_layer_id,
-                    parent_layer_id: None,
-                    state: LayerState::Sealed,
-                    schema_version: WORKSPACE_SCHEMA_VERSION,
-                    sealed_version: Some(sealed_version),
-                    delta_digest: Some(digest),
-                    root_hash: Some(root),
-                    depth: 1,
-                    owner_workspace_id: None,
-                    next_sequence,
-                    owned_slice_count: 0,
-                    owned_bytes: 0,
-                    created_at_ns: now,
-                    sealed_at_ns: Some(now),
-                },
-            );
-            state.layers.insert(
+            txn.put_allocator(
+                "sealed_version",
+                next.checked_add(1)
+                    .ok_or_else(|| WorkspaceError::CorruptMetadata("allocator overflows".into()))?,
+            )?;
+            let compacted = LayerRecord {
+                layer_id: request.compacted_layer_id,
+                parent_layer_id: None,
+                state: LayerState::Sealed,
+                schema_version: WORKSPACE_SCHEMA_VERSION,
+                sealed_version: Some(sealed_version),
+                delta_digest: Some(digest),
+                root_hash: Some(root),
+                depth: 1,
+                owner_workspace_id: None,
+                next_sequence,
+                owned_slice_count: 0,
+                owned_bytes: 0,
+                created_at_ns: now,
+                sealed_at_ns: Some(now),
+            };
+            txn.put_layer(&compacted)?;
+            txn.put_layer(&writable_layer(
                 request.replacement_head_layer_id,
-                writable_layer(
-                    request.replacement_head_layer_id,
-                    request.compacted_layer_id,
-                    2,
-                    request.workspace_id,
-                    now,
-                ),
-            );
+                request.compacted_layer_id,
+                2,
+                request.workspace_id,
+                now,
+            ))?;
             let epoch = workspace
                 .head_epoch
                 .checked_add(1)
                 .ok_or_else(|| WorkspaceError::CorruptMetadata("head epoch overflows".into()))?;
-            let workspace = state
-                .workspaces
-                .get_mut(&request.workspace_id)
-                .expect("workspace exists");
             workspace.head_layer_id = request.replacement_head_layer_id;
             workspace.head_epoch = epoch;
-            workspace.fork_base = Some(BaseRevision {
+            let revision = BaseRevision {
                 layer_id: request.compacted_layer_id,
                 sealed_version,
                 root_hash: root,
-            });
+            };
+            workspace.fork_base = Some(revision.clone());
             workspace.updated_at_ns = now;
-            let revision = workspace
-                .fork_base
-                .clone()
-                .expect("compaction installs a fork base");
-            for lease in state.leases.values_mut() {
-                if lease.workspace_id == request.workspace_id && lease.state == LeaseState::Active {
-                    lease.base_revision = revision.clone();
-                    lease.updated_at_ns = now;
-                }
+            if let Some(id) = workspace.active_lease
+                && let Some(mut lease) = txn.read_lease(request.workspace_id, id).await?
+                && lease.state == LeaseState::Active
+            {
+                lease.base_revision = revision.clone();
+                lease.updated_at_ns = now;
+                txn.put_lease(&lease)?;
             }
-            let old_head = state
-                .layers
-                .get_mut(&request.expected_head_layer_id)
-                .expect("head exists");
-            old_head.state = LayerState::Deleting;
-            old_head.owner_workspace_id = None;
-
+            txn.put_workspace(&workspace)?;
+            head.state = LayerState::Deleting;
+            head.owner_workspace_id = None;
+            txn.put_layer(&head)?;
+            let mut delta_writes = Vec::new();
             for row in &request.delta.dentries {
-                writes.push(put(dentry_key(row), row)?);
+                delta_writes.push(put(dentry_key(row), row)?);
             }
             for row in &request.delta.inodes {
-                writes.push(put(inode_key(row), row)?);
+                delta_writes.push(put(inode_key(row), row)?);
             }
             for row in &request.delta.xattrs {
-                writes.push(put(xattr_key(row), row)?);
+                delta_writes.push(put(xattr_key(row), row)?);
             }
             for row in &request.delta.acls {
-                writes.push(put(acl_key(row), row)?);
+                delta_writes.push(put(acl_key(row), row)?);
             }
             for row in &request.delta.extents {
-                writes.push(put(extent_key(row), row)?);
+                delta_writes.push(put(extent_key(row), row)?);
             }
-            Ok(CompactionResult {
-                revision: BaseRevision {
-                    layer_id: request.compacted_layer_id,
-                    sealed_version,
-                    root_hash: root,
-                },
-                replacement_head_layer_id: request.replacement_head_layer_id,
-                head_epoch: epoch,
-            })
-        })
-        .await
+            let keys = delta_writes
+                .iter()
+                .map(|write| match write {
+                    KvWrite::Put { key, .. } | KvWrite::Delete { key } => key.clone(),
+                })
+                .collect::<Vec<_>>();
+            txn.read_many_raw(&keys).await?;
+            for write in delta_writes {
+                txn.put_checked(write)?;
+            }
+            let committed = txn.commit().await?;
+            if committed {
+                return Ok(TestBaseResult {
+                    revision,
+                    replacement_head_layer_id: request.replacement_head_layer_id,
+                    head_epoch: epoch,
+                });
+            }
+            retry_backoff(attempt).await;
+        }
+        Err(WorkspaceError::Busy)
     }
 }
 
@@ -6085,8 +5900,6 @@ mod tests {
         denied(runtime.reap_expired_leases().await);
         denied(runtime.reap_packed_reader_sessions().await);
         denied(runtime.gc_snapshot(1, 1).await);
-        denied(runtime.hash_seal(JournalId::new()).await);
-        denied(runtime.commit_seal(JournalId::new()).await);
         denied(runtime.finalize_layer_metadata_deletion(Vec::new()).await);
         assert_eq!(*backend.records.lock().await, before);
         assert!(backend.cas_checks.lock().await.is_empty());
@@ -6108,10 +5921,10 @@ mod tests {
 
     use super::*;
     use crate::workspace_overlay::catalog::{
-        AcquireLease, AdvanceSeal, AppendDataExtent, BeginSeal, CreateVolumeRoot, CreateWorkspace,
-        DentryQuery, HeadGuard, NamespaceMutation, WorkspaceStore,
+        AcquireLease, AppendDataExtent, CreateVolumeRoot, CreateWorkspace, DentryQuery, HeadGuard,
+        NamespaceMutation, WorkspaceStore,
     };
-    use crate::workspace_overlay::ids::{JournalId, LeaseId, SnapshotId};
+    use crate::workspace_overlay::ids::{LeaseId, SnapshotId};
     use crate::workspace_overlay::packed_v3::wire005::{
         V3_FOOTER_LEN, V3_HEADER_LEN, V3ObjectKind, V3ObjectRef,
     };
@@ -6125,6 +5938,8 @@ mod tests {
         cas_write_keys: Arc<Mutex<Vec<Vec<Vec<u8>>>>>,
         scans: Arc<AtomicU64>,
         fail_cas_once: Arc<std::sync::atomic::AtomicBool>,
+        fail_busy_once: Arc<std::sync::atomic::AtomicBool>,
+        fail_bounded_read_busy_once: Arc<std::sync::atomic::AtomicBool>,
         clock: Arc<AtomicI64>,
         advance_on_cas_ns: Arc<AtomicI64>,
         mutate_on_cas: Arc<Mutex<Vec<KvWrite>>>,
@@ -6233,6 +6048,9 @@ mod tests {
             {
                 return Ok(false);
             }
+            if self.fail_busy_once.swap(false, Ordering::SeqCst) {
+                return Err(WorkspaceError::Busy);
+            }
             let advance = self.advance_on_cas_ns.swap(0, Ordering::SeqCst);
             if advance != 0 {
                 self.clock.fetch_add(advance, Ordering::SeqCst);
@@ -6322,6 +6140,12 @@ mod tests {
             limits: super::super::kv_backend::KvReadLimits,
         ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
             limits.validate_keys(keys)?;
+            if self
+                .fail_bounded_read_busy_once
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(WorkspaceError::Busy);
+            }
             let mut records = self.records.lock().await;
             let remaining = self.timed_reads_until_mutation.load(Ordering::SeqCst);
             if remaining > 0
@@ -7065,35 +6889,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kv_v3_open_sidecar_requires_recovery_for_an_incomplete_seal() {
-        let (store, workspace, _lease, guard) = initialized().await;
-        store
-            .begin_seal(BeginSeal {
-                guard,
-                journal_id: JournalId::from_uuid(id(401)),
-                new_head_layer_id: LayerId::from_uuid(id(402)),
-            })
-            .await
-            .unwrap();
-        let token = store
-            .open_workspace_v3(workspace.workspace_id, "recovery", Duration::from_secs(30))
-            .await
-            .unwrap();
-        assert_eq!(token.state, V3OpenState::Recovering);
-        assert!(token.recovery_required);
-        assert!(matches!(
-            store.mark_workspace_v3_ready(&token).await,
-            Err(WorkspaceError::Busy)
-        ));
-        assert!(
-            store
-                .renew_workspace_v3(&token, Duration::from_secs(30))
-                .await
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
     async fn kv_v3_open_sidecar_expiry_during_cas_never_writes_or_revives_an_owner() {
         for operation in 0..5 {
             let (store, workspace, _lease, _guard) = initialized().await;
@@ -7144,31 +6939,6 @@ mod tests {
                 "operation {operation}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn kv_v3_open_sidecar_reopen_detects_a_new_seal_under_the_same_owner() {
-        let (store, workspace, _lease, guard) = initialized().await;
-        let token = store
-            .open_workspace_v3(workspace.workspace_id, "owner", Duration::from_secs(30))
-            .await
-            .unwrap();
-        assert_eq!(token.state, V3OpenState::Ready);
-        store
-            .begin_seal(BeginSeal {
-                guard,
-                journal_id: JournalId::new(),
-                new_head_layer_id: LayerId::new(),
-            })
-            .await
-            .unwrap();
-        let reopened = store
-            .open_workspace_v3(workspace.workspace_id, "owner", Duration::from_secs(30))
-            .await
-            .unwrap();
-        assert_eq!(reopened.generation, token.generation);
-        assert_eq!(reopened.state, V3OpenState::Recovering);
-        assert!(reopened.recovery_required);
     }
 
     #[tokio::test]
@@ -7471,7 +7241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kv_catalog_round_trips_mutations_and_full_seal() {
+    async fn kv_catalog_round_trips_mutations() {
         let (store, workspace, _lease, guard) = initialized().await;
         let mutation = store
             .apply_namespace_mutation(NamespaceMutation {
@@ -7507,47 +7277,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
+    }
 
-        let journal = store
-            .begin_seal(BeginSeal {
-                guard,
-                journal_id: JournalId::from_uuid(id(6)),
-                new_head_layer_id: LayerId::from_uuid(id(7)),
-            })
-            .await
-            .unwrap();
+    #[tokio::test]
+    async fn every_topology_transition_rebuilds_after_presubmit_busy() {
+        // One shared rule: a pre-submit Busy from TopologyTxn::commit is an
+        // ordinary CAS conflict. Exercise several distinct transitions with
+        // their own retry loops; none may surface the transient Busy.
+        let (store, workspace, lease, _guard) = initialized().await;
+        let busy = || store.backend.fail_busy_once.store(true, Ordering::SeqCst);
+        // release_lease builds its packet directly (not via TopologyTxn) and
+        // keeps its own semantics; release without injection.
         store
-            .advance_seal(AdvanceSeal {
-                journal_id: journal.journal_id,
-                expected_phase: SealPhase::Prepare,
-                next_phase: SealPhase::Quiesced,
-                pending_bytes: None,
-                last_error: None,
+            .release_lease(ReleaseLease {
+                lease_id: lease.lease_id,
+                holder_generation: lease.holder_generation,
             })
             .await
             .unwrap();
+        busy();
         store
-            .advance_seal(AdvanceSeal {
-                journal_id: journal.journal_id,
-                expected_phase: SealPhase::Quiesced,
-                next_phase: SealPhase::DataDrained,
-                pending_bytes: Some(0),
-                last_error: None,
+            .mark_workspace_deleting(MarkDeleting {
+                workspace_id: workspace.workspace_id,
+                force_fence_lease: false,
             })
             .await
-            .unwrap();
-        store.hash_seal(journal.journal_id).await.unwrap();
-        let sealed = store.commit_seal(journal.journal_id).await.unwrap();
-        assert_eq!(sealed.revision.layer_id, workspace.head_layer_id);
-        assert_eq!(sealed.head_epoch, 1);
+            .expect("mark_workspace_deleting rebuilds");
+        assert!(!store.backend.fail_busy_once.load(Ordering::SeqCst));
         assert_eq!(
             store
-                .load_layer_delta(sealed.revision.layer_id)
+                .load_workspace(workspace.workspace_id)
                 .await
                 .unwrap()
-                .extents
-                .len(),
-            1
+                .state,
+            WorkspaceState::Deleting
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_lease_retries_busy_returned_by_topology_commit() {
+        let (store, workspace, lease, _guard) = initialized().await;
+        store
+            .release_lease(ReleaseLease {
+                lease_id: lease.lease_id,
+                holder_generation: lease.holder_generation,
+            })
+            .await
+            .unwrap();
+        // A sibling seal/fork can advance the shared root epoch so packet
+        // preparation returns Busy before the acquire packet is submitted.
+        store.backend.fail_busy_once.store(true, Ordering::SeqCst);
+        let acquired = store
+            .acquire_lease(AcquireLease {
+                workspace_id: workspace.workspace_id,
+                lease_id: LeaseId::from_uuid(id(621)),
+                holder_generation: lease.holder_generation + 1,
+                ttl_ns: 120_000_000_000,
+            })
+            .await
+            .expect("transient acquire Busy should be retried");
+        assert!(!store.backend.fail_busy_once.load(Ordering::SeqCst));
+        assert_eq!(acquired.state, LeaseState::Active);
+        assert_eq!(
+            store
+                .load_workspace(workspace.workspace_id)
+                .await
+                .unwrap()
+                .active_lease,
+            Some(acquired.lease_id)
         );
     }
 
@@ -7697,6 +7494,29 @@ mod tests {
             store_b.load_layer(second_head).await.unwrap().next_sequence,
             33
         );
+    }
+
+    #[tokio::test]
+    async fn slice_ids_are_reserved_in_blocks_and_unique_across_stores() {
+        let backend = MemoryBackend::default();
+        let first = budgeted_kv_store(backend.clone());
+        first.initialize_workspace_schema().await.unwrap();
+        first.create_volume_root(create_request(210)).await.unwrap();
+        let second = budgeted_kv_store(backend.clone());
+        backend.cas_write_keys.lock().await.clear();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..SLICE_ID_BLOCK {
+            assert!(seen.insert(first.allocate_id("slice").await.unwrap()));
+        }
+        // One durable allocator CAS covers the whole block.
+        assert_eq!(backend.cas_write_keys.lock().await.len(), 1);
+        for _ in 0..3 {
+            assert!(seen.insert(second.allocate_id("slice").await.unwrap()));
+            assert!(seen.insert(first.allocate_id("slice").await.unwrap()));
+        }
+        // Inode IDs stay dense: no block reservation.
+        let inode = first.allocate_id("inode").await.unwrap();
+        assert_eq!(first.allocate_id("inode").await.unwrap(), inode + 1);
     }
 
     #[tokio::test]
@@ -8401,6 +8221,50 @@ mod tests {
         assert_eq!(
             after.layers[0].next_sequence,
             before.layers[0].next_sequence + 2
+        );
+    }
+
+    #[tokio::test]
+    async fn update_control_retries_transient_census_busy_before_mutation() {
+        let (store, workspace, _lease, _guard) = initialized().await;
+        let generation_key = LAYER_INVENTORY_GENERATION_KEY.to_vec();
+        let current = store
+            .backend
+            .get(&generation_key)
+            .await
+            .unwrap()
+            .as_deref()
+            .map(decode::<u64>)
+            .transpose()
+            .unwrap()
+            .unwrap();
+        // The first census authentication observes a concurrent inventory
+        // generation change and returns Busy before the operation runs.
+        // Generic control updates must rebuild the census and retry; this
+        // mutation is deliberately outside the operation's write set.
+        store.backend.mutate_on_cas.lock().await.push(KvWrite::Put {
+            key: generation_key,
+            value: encode(&(current + 1)).unwrap(),
+        });
+        let workspace_id = workspace.workspace_id;
+        store
+            .update_control(|state, _writes| {
+                state
+                    .workspaces
+                    .get_mut(&workspace_id)
+                    .ok_or(WorkspaceError::WorkspaceNotFound(workspace_id))?
+                    .updated_at_ns += 1;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_workspace(workspace_id)
+                .await
+                .unwrap()
+                .updated_at_ns,
+            workspace.updated_at_ns + 1
         );
     }
 

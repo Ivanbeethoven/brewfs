@@ -14,6 +14,11 @@ const MAX_PENDING_BYTES: usize = 2 << 20;
 // ancestor component vector. Admission precedes construction and follows the
 // returned paths through every awaited permission lookup.
 const PATHS_OUTPUT_BYTES: u64 = 1 << 20;
+const WALK_ARENA_BYTES: u64 = 16 << 20;
+// Metadata kept free for non-waiting FUSE request (2 MiB), frozen mutation
+// version (2 MiB) and commit-bound (~2 MiB) charges while walks wait: about
+// ten such operations in flight, a quarter of the default 256 MiB pool.
+const WALK_HEADROOM_BYTES: u64 = 64 << 20;
 
 struct PathsOutputOwner {
     _permit: V3OwnedPermit,
@@ -68,6 +73,36 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         inode: i64,
         limits: &mut Limits,
     ) -> Result<Vec<Name>, MetaError> {
+        let cache = self.namespace_row_cache();
+        if let Some(super::row_cache::RowValue::Aliases(aliases)) =
+            cache.and_then(|cache| cache.get(&super::row_cache::RowKey::Aliases(inode)))
+        {
+            for _ in aliases.iter() {
+                limits.work()?;
+            }
+            return Ok((*aliases).clone());
+        }
+        let ticket = cache.map(super::row_cache::UpperRowCache::ticket);
+        let effective = self
+            .packed_reverse_aliases_uncached(lower, authority, inode, limits)
+            .await?;
+        if let (Some(cache), Some(ticket)) = (cache, ticket) {
+            cache.insert(
+                ticket,
+                super::row_cache::RowKey::Aliases(inode),
+                super::row_cache::RowValue::Aliases(Arc::new(effective.clone())),
+            );
+        }
+        Ok(effective)
+    }
+
+    async fn packed_reverse_aliases_uncached(
+        &self,
+        lower: &WorkspacePackedLower,
+        authority: &crate::workspace_overlay::catalog::WorkspaceNativeReverseAuthority,
+        inode: i64,
+        limits: &mut Limits,
+    ) -> Result<Vec<Name>, MetaError> {
         let mut candidates = BTreeSet::new();
         for layer in self.chain().await? {
             let mut cursor: Option<Name> = None;
@@ -100,33 +135,19 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                     candidates.insert(next.clone());
                     cursor = Some(next);
                 }
+                // A backend-proven short page needs no empty confirmation
+                // page; completeness is still re-authenticated at the end.
+                if page.end {
+                    break;
+                }
             }
         }
-        let mut after = None;
-        loop {
-            limits.page()?;
-            self.validate_packed_metadata(lower).await?;
-            let page = lower
-                .metadata
-                .frozen_reverse_names_page_owned(inode, after.as_deref())
-                .await?;
-            if page.rows.is_empty() {
-                break;
-            }
-            if page
-                .after
-                .as_ref()
-                .is_none_or(|next| after.as_ref().is_some_and(|old| next <= old))
-            {
-                return Err(MetaError::Internal(
-                    "packed reverse cursor did not advance".into(),
-                ));
-            }
-            for (parent, name) in &page.rows {
-                limits.work()?;
-                candidates.insert((*parent, name.clone()));
-            }
-            after = page.after.clone();
+        // The immutable lower's complete alias list is memoized
+        // for the binding lifetime; page limits apply on the first load.
+        let lower_aliases = lower.reverse_aliases(inode, || limits.page()).await?;
+        for (parent, name) in lower_aliases.iter() {
+            limits.work()?;
+            candidates.insert((*parent, name.clone()));
         }
         let mut effective = Vec::new();
         for (parent, name) in candidates {
@@ -155,16 +176,77 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         Ok(self.packed_paths_bytes_owned(target).await?.paths)
     }
 
+    /// A path walk spans many reads under one head/lease view. A concurrent
+    /// local commit (for example another file's create) advances the head
+    /// and fences the walk with Busy; restart it from a fresh view a bounded
+    /// number of times, like every mutation retry. Other errors stay fatal.
     pub(super) async fn packed_paths_bytes_owned(
         &self,
         target: i64,
     ) -> Result<OwnedPaths, MetaError> {
+        // The path walk reads many upper rows; the opt-in namespace cache
+        // memoizes its complete result. Only namespace-changing commits
+        // (dentry writes, inode deletion) invalidate it.
+        let cache = self.namespace_row_cache();
+        if let Some(super::row_cache::RowValue::Paths(paths)) =
+            cache.and_then(|cache| cache.get(&super::row_cache::RowKey::Paths(target)))
+        {
+            return Ok(OwnedPaths {
+                paths: (*paths).clone(),
+                guard: None,
+            });
+        }
+        let ticket = cache.map(super::row_cache::UpperRowCache::ticket);
+        const ATTEMPTS: usize = 64;
+        for attempt in 1..=ATTEMPTS {
+            match self.packed_paths_bytes_owned_attempt(target).await {
+                Ok(owned) => {
+                    if let (Some(cache), Some(ticket)) = (cache, ticket) {
+                        cache.insert(
+                            ticket,
+                            super::row_cache::RowKey::Paths(target),
+                            super::row_cache::RowValue::Paths(Arc::new(owned.paths.clone())),
+                        );
+                    }
+                    return Ok(owned);
+                }
+                Err(MetaError::Io(ref error))
+                    if error.raw_os_error() == Some(libc::EBUSY) && attempt < ATTEMPTS =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("bounded path walk retry always returns")
+    }
+
+    async fn packed_paths_bytes_owned_attempt(&self, target: i64) -> Result<OwnedPaths, MetaError> {
         let lower = self
             .packed_lower()
             .ok_or_else(|| MetaError::Internal("missing packed path lower".into()))?;
+        // A bounded number of walks own their 16 MiB arena at once; others
+        // queue here instead of failing with ENOMEM. The FUSE request charge
+        // a caller may hold is never part of this wait.
+        let _walk = lower
+            .path_walks
+            .acquire()
+            .await
+            .map_err(|_| MetaError::Io(std::io::Error::from_raw_os_error(libc::ENOMEM)))?;
+        // Waits (bounded by ADMISSION_WAIT) while the pool is busy and only
+        // takes the arena if WALK_HEADROOM_BYTES stay free, so the small
+        // non-waiting per-request and commit charges in the same pool are
+        // not starved into ENOMEM. The only Metadata a waiting walk holds is
+        // its caller's 2 MiB request charge; arenas are released when walks
+        // finish, so waiters make progress or fail closed at the deadline.
         let _permit: V3OwnedPermit = lower
             .budget
-            .admit(&[(V3BudgetPool::Metadata, 16 << 20)])
+            .admit_waiting_with_headroom(
+                V3BudgetPool::Metadata,
+                WALK_ARENA_BYTES,
+                WALK_HEADROOM_BYTES,
+            )
+            .await
             .map_err(packed_lower::budget_to_meta)?;
         let output_permit = lower
             .budget
@@ -178,7 +260,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             _permit: output_permit,
             _reader: output_reader,
         });
-        let fence = self.packed_metadata_fence().await?;
+        let fence = self.packed_enumeration_fence().await?;
         let mut limits = Limits { pages: 0, work: 0 };
         if self.stat(target).await?.is_none() {
             lower

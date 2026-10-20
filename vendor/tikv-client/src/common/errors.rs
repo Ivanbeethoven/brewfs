@@ -138,6 +138,20 @@ impl Error {
         matches!(self, Self::GrpcAPI(status) if crate::bounded_codec::is_lock_conflict(status))
     }
 
+    /// True only for the bounded Get diagnostic that reports a key-level
+    /// lock. Callers may use this to spend a bounded read retry at the same
+    /// timestamp; it never permits lock resolution or write replay.
+    pub fn is_bounded_read_retryable_key_lock(&self) -> bool {
+        matches!(self, Self::GrpcAPI(status) if crate::bounded_codec::is_retryable_key_lock(status))
+    }
+
+    /// True only for a bounded-read EpochNotMatch diagnostic.  The caller may
+    /// refresh region routing and retry the same read-only request under its
+    /// own finite budget.
+    pub fn is_bounded_read_retryable_region(&self) -> bool {
+        matches!(self, Self::GrpcAPI(status) if crate::bounded_codec::is_retryable_region(status))
+    }
+
     /// Bytes in a locally validated normal-mode Lock WriteConflict response,
     /// certified against the actual key, primary, start TS and for-update TS.
     /// This is not success and never authorizes prewrite/commit replay.

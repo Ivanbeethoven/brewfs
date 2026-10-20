@@ -38,6 +38,7 @@ cargo bench --bench brewfs_bench
 | `BREWFS_BENCH_META_URL`（`sqlite::memory:`） | 当后端为 `sqlx` / `redis` 时使用的元数据 URL         |
 | `BREWFS_BENCH_META_ETCD_URLS`（空）          | 当 `META_BACKEND=etcd` 时必须指定的 etcd endpoints   |
 
+```bash
 BREWFS_BENCH_BIG_FILE_MB=256 \
 cargo bench --bench brewfs_bench -- --warm-up-time 1 --profile-time 5
 ```

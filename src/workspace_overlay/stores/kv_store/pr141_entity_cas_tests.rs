@@ -186,6 +186,49 @@ async fn topology_transaction_checks_only_declared_entities() {
 }
 
 #[tokio::test]
+async fn fork_retries_busy_from_initial_bounded_carrier_probe() {
+    let backend = MemoryBackend::default();
+    let store = budgeted_kv_store(backend.clone());
+    store.initialize_workspace_schema().await.unwrap();
+    let root = store
+        .create_volume_root(create_request(1700))
+        .await
+        .unwrap();
+    let chain = store.load_layer_chain(root.head_layer_id).await.unwrap();
+    let base = &chain[1];
+    let revision = BaseRevision {
+        layer_id: base.layer_id,
+        sealed_version: base.sealed_version.unwrap(),
+        root_hash: base.root_hash.unwrap(),
+    };
+
+    backend
+        .fail_bounded_read_busy_once
+        .store(true, Ordering::SeqCst);
+    let workspace_id = WorkspaceId::from_uuid(id(1701));
+    let head_layer_id = LayerId::from_uuid(id(1702));
+    let workspace = store
+        .create_workspace(CreateWorkspace {
+            workspace_id,
+            head_layer_id,
+            base_revision: revision,
+            owner_id: None,
+        })
+        .await
+        .expect("a transient bounded carrier probe Busy should be retried");
+
+    assert_eq!(store.load_workspace(workspace_id).await.unwrap(), workspace);
+    assert_eq!(
+        store
+            .load_layer(head_layer_id)
+            .await
+            .unwrap()
+            .owner_workspace_id,
+        Some(workspace_id)
+    );
+}
+
+#[tokio::test]
 async fn concurrent_forks_from_one_revision_have_distinct_heads() {
     let store = Arc::new(budgeted_kv_store(MemoryBackend::default()));
     store.initialize_workspace_schema().await.unwrap();

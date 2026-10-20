@@ -26,14 +26,10 @@ should not be treated as current behavior without checking the source.
 | [operations/](operations/) | Runtime configuration, control plane, observability, profiling, SDK, and stats tooling. |
 | [testing/](testing/) | Benchmark, compose, fuzz, lock, xfstests, and CI-oriented test guidance. |
 | [performance/](performance/) | Current packed metadata performance evidence and reproducible cold-read rules. |
-| [meta-api/](meta-api/) | Meta client API audit, mapping, extension plan, and read/write follow-up work. |
-| [juicefs/](juicefs/) | JuiceFS internals notes used for cross-project comparison. |
-| [gap/](gap/) | BrewFS/JuiceFS module gap analysis and iteration roadmap. |
 | [protocols/](protocols/) | Multi-protocol gateway specs (S3, WebDAV, NFS), shared conventions, and the milestone roadmap. |
 | [vfs/](vfs/) | VFS module-specific implementation guide. |
 | [bugfix/](bugfix/) | Historical bug investigations and fix notes that remain useful for regression context. |
 | [superpowers/](superpowers/) | Dated agent plans and specs. Treat these as historical execution records unless a plan is explicitly current. |
-| [wechat/](wechat/) | Draft public-facing material and evidence checklist for the BrewFS introduction article. |
 
 ## Architecture
 
@@ -80,8 +76,6 @@ should not be treated as current behavior without checking the source.
 | Topic | Document |
 |---|---|
 | Current packed validation | [performance/native-packed-base-large-scale-validation-2026-09-24.md](performance/native-packed-base-large-scale-validation-2026-09-24.md) |
-| JuiceFS internals | [juicefs/README.md](juicefs/README.md) |
-| Gap analysis | [gap/README.md](gap/README.md) |
 
 ## Historical Plans
 

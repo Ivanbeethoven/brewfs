@@ -1,5 +1,5 @@
 //! The real catalog/final CAS protocol on the existing atomic test substrate.
-use super::super::native_slice_deletion::{EXTENT_GENERATION_KEY, slice_deletion_key};
+use super::super::native_slice_deletion::slice_deletion_key;
 use super::super::*;
 use super::tests::JournalMemoryBackend;
 use crate::workspace_overlay::packed_v3::wire005::{V3BudgetPool, V3MountBudget};
@@ -53,13 +53,17 @@ async fn orphan(
         .await
 }
 
+/// Sum of every per-layer extent generation: any extent change in any layer
+/// advances it.
 async fn epoch(backend: &JournalMemoryBackend) -> u64 {
     backend
-        .get(EXTENT_GENERATION_KEY)
+        .rows
+        .lock()
         .await
-        .unwrap()
-        .map(|raw| decode(&raw).unwrap())
-        .unwrap_or(0)
+        .iter()
+        .filter(|(key, _)| key.starts_with(b"packed/v3/native-extent-generation/"))
+        .map(|(_, raw)| decode::<u64>(raw).unwrap())
+        .sum()
 }
 
 #[tokio::test]
@@ -372,39 +376,6 @@ async fn native_slice_orphan_unknown_reply_commits_one_complete_packet_without_r
 }
 
 #[tokio::test]
-async fn native_slice_public_compaction_rejects_reserved_sid_and_preserves_topology() {
-    let (backend, store, budget) = catalog().await;
-    orphan(&store, layer(141), 251).await.unwrap();
-    store
-        .reserve_gc_slice_deletion(251, 6, &[layer(141)])
-        .await
-        .unwrap();
-    let workspace = store
-        .load_workspace(WorkspaceId::from_uuid(Uuid::from_u128(32)))
-        .await
-        .unwrap();
-    let before = backend.rows.lock().await.clone();
-    let used = budget.state().used;
-    let result = store
-        .install_compaction(InstallCompaction {
-            workspace_id: workspace.workspace_id,
-            expected_head_layer_id: workspace.head_layer_id,
-            expected_head_epoch: workspace.head_epoch,
-            expected_parent_layer_id: layer(33),
-            compacted_layer_id: layer(142),
-            replacement_head_layer_id: layer(143),
-            delta: crate::workspace_overlay::digest::CanonicalLayerDelta {
-                extents: vec![extent(layer(142), 9, 251)],
-                ..Default::default()
-            },
-        })
-        .await;
-    assert!(matches!(result, Err(WorkspaceError::Busy)));
-    assert_eq!(*backend.rows.lock().await, before);
-    assert_eq!(budget.state().used, used);
-}
-
-#[tokio::test]
 async fn native_slice_public_packed_mutation_rejects_reserved_sid_and_preserves_sequences() {
     let backend = Arc::new(JournalMemoryBackend::at_time(100));
     let budget = V3MountBudget::defaults();
@@ -465,4 +436,50 @@ async fn native_slice_public_packed_mutation_rejects_reserved_sid_and_preserves_
     ));
     assert_eq!(*backend.rows.lock().await, before);
     assert_eq!(budget.state().used, used);
+}
+
+/// Phantom insertion: a live extent referencing the SID commits behind the
+/// reservation's scan cursor (after the scan passed its key position, before
+/// the reservation CAS). The reservation must not be granted, whatever fence
+/// protocol replaces the global extent generation.
+#[tokio::test]
+async fn native_slice_extent_landing_behind_the_scan_cursor_blocks_the_reservation() {
+    let (backend, store, _) = catalog().await;
+    // Orphan on layer 0x5b; the live extent goes on layer 0x22, which sorts
+    // before it. Scan one row per page and inject only once the cursor is
+    // past every row (the orphan was the last), so the scan never sees it.
+    orphan(&store, layer(91), 191).await.unwrap();
+    let extent_rows = backend
+        .rows
+        .lock()
+        .await
+        .keys()
+        .filter(|key| key.starts_with(b"delta/extent/"))
+        .count() as i64;
+    let live = extent(layer(34), 1, 191);
+    let mut checks = Vec::new();
+    let mut writes = vec![put(extent_key(&live), &live).unwrap()];
+    let _owner = store
+        .prepare_native_extent_cas(&mut checks, &mut writes)
+        .await
+        .unwrap();
+    backend.page_size.store(1, Ordering::SeqCst);
+    *backend.after_extent_page.lock().unwrap() = Some((extent_rows, writes.clone()));
+    let result = store.reserve_gc_slice_deletion(191, 6, &[layer(91)]).await;
+    assert!(
+        backend.after_extent_page.lock().unwrap().is_none(),
+        "the concurrent commit was not injected during the scan"
+    );
+    assert!(backend.get(&extent_key(&live)).await.unwrap().is_some());
+    assert!(
+        matches!(result, Err(WorkspaceError::Busy)),
+        "reservation granted over a live extent: {result:?}"
+    );
+    assert!(
+        backend
+            .get(&slice_deletion_key(191))
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

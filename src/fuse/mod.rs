@@ -15,6 +15,8 @@
 pub(crate) mod adapter;
 #[cfg(all(test, feature = "workspace-overlay", target_os = "linux"))]
 mod cancel_tests;
+#[cfg(feature = "workspace-overlay")]
+pub mod entity;
 pub mod mount;
 use crate::chunk::store::BlockStore;
 use crate::control::protocol::{CONTROL_ACL_XATTR_NAME, ControlAclEntry};
@@ -299,6 +301,16 @@ where
     S: BlockStore + Send + Sync + 'static,
     M: MetaLayer + Send + Sync + 'static,
 {
+    // Experimental entity handles are SDK-only. Reject them before any FUSE
+    // inode-side operation can touch a colliding native inode or lock owner.
+    fn reject_entity_fuse_handle(&self, _fh: u64) -> FuseResult<()> {
+        #[cfg(feature = "workspace-overlay")]
+        if self.is_entity_handle(_fh) {
+            return Err(libc::EOPNOTSUPP.into());
+        }
+        Ok(())
+    }
+
     async fn fuse_read_data(
         &self,
         req: Request,
@@ -870,6 +882,7 @@ where
         let pending = self
             .begin_fuse_client_open(ino, kind, req.unique)
             .inspect_err(|_error| {
+                debug!(ino, error = ?_error, "fuse.open register failed");
                 #[cfg(test)]
                 eprintln!(
                     "[packed-v3-native-kernel-read-diag] stage=fuse-open-register unique={} inode={ino} flags={flags} error={_error}",
@@ -877,6 +890,9 @@ where
                 );
             })?;
         let result = self.open_client_untracked(req, ino, flags).await;
+        if let Err(error) = &result {
+            debug!(ino, error = ?error, "fuse.open failed");
+        }
         self.finish_client_open(pending, kind, result)
             .await
             .inspect_err(|_error| {
@@ -905,6 +921,7 @@ where
         offset: u64,
         size: u32,
     ) -> FuseResult<ReplyData> {
+        self.reject_entity_fuse_handle(fh)?;
         // Virtual .stats file
         if ino == STATS_INODE {
             let snapshot = self
@@ -1014,6 +1031,7 @@ where
         write_flags: u32,
         _flags: u32,
     ) -> FuseResult<ReplyWrite> {
+        self.reject_entity_fuse_handle(fh)?;
         #[cfg(test)]
         let diagnostic = |stage: &str, error: Option<Errno>| {
             if data.len() != 57 {
@@ -1161,6 +1179,7 @@ where
         fh: Option<u64>,
         _flags: u32,
     ) -> FuseResult<ReplyAttr> {
+        self.reject_entity_fuse_handle(fh.unwrap_or(0))?;
         // Virtual .stats file
         if ino == STATS_INODE {
             let snapshot = match fh {
@@ -1243,6 +1262,7 @@ where
         fh: Option<u64>,
         set_attr: SetAttr,
     ) -> FuseResult<ReplyAttr> {
+        self.reject_entity_fuse_handle(fh.unwrap_or(0))?;
         debug!(unique = req.unique, ino, set_attr = ?set_attr, "fuse.setattr");
         let setattr_start = std::time::Instant::now();
 
@@ -1386,6 +1406,7 @@ where
         fh: u64,
         offset: i64,
     ) -> FuseResult<ReplyDirectory<BoxStream<'a, FuseResult<DirectoryEntry>>>> {
+        self.reject_entity_fuse_handle(fh)?;
         debug!(ino, fh, offset, "fuse.readdir");
         // A packed page has at most 256 children. Admit its independent FUSE
         // entry/name copies before allocation and retain both owners in the
@@ -1527,6 +1548,7 @@ where
         offset: u64,
         _lock_owner: u64,
     ) -> FuseResult<ReplyDirectoryPlus<BoxStream<'a, FuseResult<DirectoryEntryPlus>>>> {
+        self.reject_entity_fuse_handle(fh)?;
         debug!(unique = req.unique, ino, fh, offset, "fuse.readdirplus");
         let ttl = self.permission_cache_ttl();
         let reply_guard = Filesystem::reserve_reply_memory(self, 256 * 1024)?;
@@ -1991,6 +2013,7 @@ where
         lock_owner: u64,
         flush: bool,
     ) -> FuseResult<()> {
+        self.reject_entity_fuse_handle(fh)?;
         let kind = if inode == STATS_INODE {
             crate::vfs::fuse_read_cancel::ClientKind::Stats
         } else {
@@ -2041,6 +2064,7 @@ where
     // Flush file data to backend (called on every close of a file descriptor).
     // Must actually persist dirty data so that close() semantics are honored.
     async fn flush(&self, req: Request, inode: u64, fh: u64, lock_owner: u64) -> FuseResult<()> {
+        self.reject_entity_fuse_handle(fh)?;
         // Virtual .stats file: nothing to flush.
         if inode == STATS_INODE {
             return Ok(());
@@ -2067,6 +2091,7 @@ where
 
     // Sync file content to backend
     async fn fsync(&self, req: Request, inode: u64, fh: u64, datasync: bool) -> FuseResult<()> {
+        self.reject_entity_fuse_handle(fh)?;
         debug!(fh, datasync, "fuse.fsync");
         self.wait_for_prior_fuse_writes(inode as i64, req.unique)
             .await;
@@ -2082,6 +2107,7 @@ where
         length: u64,
         mode: u32,
     ) -> FuseResult<()> {
+        self.reject_entity_fuse_handle(fh)?;
         debug!(inode, fh, offset, length, mode, "fuse.fallocate");
         #[cfg(feature = "workspace-overlay")]
         let workspace_hole_mode = {
@@ -2138,6 +2164,7 @@ where
         offset: u64,
         whence: u32,
     ) -> FuseResult<ReplyLSeek> {
+        self.reject_entity_fuse_handle(_fh)?;
         debug!(inode, offset, whence, "fuse.lseek");
         let Some(attr) = self.stat_ino(inode as i64).await else {
             return Err(libc::ENOENT.into());
@@ -2188,6 +2215,8 @@ where
         length: u64,
         flags: u64,
     ) -> FuseResult<ReplyCopyFileRange> {
+        self.reject_entity_fuse_handle(fh_in)?;
+        self.reject_entity_fuse_handle(fh_out)?;
         debug!(
             inode,
             fh_in, off_in, inode_out, fh_out, off_out, length, flags, "fuse.copy_file_range"
@@ -2219,6 +2248,7 @@ where
         in_data: &[u8],
         _out_size: u32,
     ) -> FuseResult<ReplyIoctl> {
+        self.reject_entity_fuse_handle(_fh)?;
         debug!(
             inode,
             flags,
@@ -2481,6 +2511,7 @@ where
 
     // Close directory handle
     async fn releasedir(&self, _req: Request, inode: u64, fh: u64, _flags: u32) -> FuseResult<()> {
+        self.reject_entity_fuse_handle(fh)?;
         let client = self.begin_fuse_client_release(
             inode,
             fh,
@@ -2525,6 +2556,7 @@ where
         _fh: u64,
         _datasync: bool,
     ) -> FuseResult<()> {
+        self.reject_entity_fuse_handle(_fh)?;
         Ok(())
     }
 
@@ -2540,6 +2572,7 @@ where
         lock_type: u32,
         _pid: u32,
     ) -> FuseResult<ReplyLock> {
+        self.reject_entity_fuse_handle(_fh)?;
         debug!(inode, lock_owner, start, end, lock_type, "fuse.getlk");
         // Convert FUSE lock type to our internal type
         let fl_type = match lock_type {
@@ -2590,6 +2623,7 @@ where
         pid: u32,
         block: bool,
     ) -> FuseResult<()> {
+        self.reject_entity_fuse_handle(fh)?;
         debug!(
             inode,
             lock_owner, start, end, lock_type, pid, block, "fuse.setlk"
@@ -2864,6 +2898,19 @@ where
         pid: u32,
         mask: u32,
     ) -> FuseResult<()> {
+        // Writable-ACL layers answer existence, attributes and ACLs from one
+        // atomic permission snapshot; a separate stat would be a redundant
+        // round trip whose attributes the decision must not use anyway.
+        if mask != 0 && self.meta_layer().permission_snapshot_answers_access() {
+            let permissions = self
+                .meta_layer()
+                .inode_permissions(ino)
+                .await
+                .map_err(posix_acl_errno)?
+                .ok_or_else(|| Errno::from(libc::ENOENT))?;
+            let mode = self.access_mode_for_permissions(&permissions, uid, gid, pid, mask & 7)?;
+            return check_requested_access(mask, mode);
+        }
         let Some(attr) = self.stat_ino_checked(ino).await.map_err(Errno::from)? else {
             return Err(libc::ENOENT.into());
         };
@@ -3764,6 +3811,75 @@ where
         }
     }
 
+    /// Mode bits granted by one atomic permission snapshot (POSIX ACL,
+    /// control ACL, then owner/group/other), with the root execute rule.
+    fn access_mode_for_permissions(
+        &self,
+        permissions: &crate::meta::layer::InodePermissions,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+        requested: u32,
+    ) -> FuseResult<u32> {
+        let attr = &permissions.attr;
+        if uid == 0 {
+            return Ok(
+                if requested & libc::X_OK as u32 == 0
+                    || attr.kind == VfsFileType::Dir
+                    || attr.mode & 0o111 != 0
+                {
+                    requested
+                } else {
+                    0
+                },
+            );
+        }
+        if let Some(raw) = &permissions.access_acl {
+            let acl = crate::meta::posix_acl::PosixAcl::decode(raw)
+                .map_err(|_| Errno::from(libc::EIO))?;
+            if acl.mode_bits() != attr.mode & 0o777 {
+                return Err(libc::EIO.into());
+            }
+            let groups = if acl.user_access_mode(attr.uid, uid).is_some() {
+                Vec::new()
+            } else {
+                verified_request_group_ids(pid, uid, gid)?
+            };
+            return Ok(
+                if acl.allows_access(attr.uid, attr.gid, uid, &groups, requested) {
+                    requested
+                } else {
+                    0
+                },
+            );
+        }
+        if let Some(raw) = &permissions.control_acl {
+            let entries: Vec<ControlAclEntry> =
+                serde_json::from_slice(raw).map_err(|_| Errno::from(libc::EIO))?;
+            crate::control::protocol::validate_acl_entries(&entries)
+                .map_err(|_| Errno::from(libc::EIO))?;
+            let groups = if uid == attr.uid {
+                Vec::new()
+            } else {
+                verified_request_group_ids(pid, uid, gid)?
+            };
+            if let Some(allowed) = crate::meta::posix_acl::control_acl_allows_access(
+                &entries, attr.uid, attr.gid, uid, &groups, requested,
+            ) {
+                return Ok(if allowed { requested } else { 0 });
+            }
+        }
+        if uid == attr.uid {
+            return Ok((attr.mode >> 6) & 7);
+        }
+        let groups = verified_request_group_ids(pid, uid, gid)?;
+        Ok(if groups.contains(&attr.gid) {
+            (attr.mode >> 3) & 7
+        } else {
+            attr.mode & 7
+        })
+    }
+
     async fn access_mode_for_attr(
         &self,
         ino: i64,
@@ -3782,63 +3898,7 @@ where
                 .await
                 .map_err(posix_acl_errno)?
                 .ok_or_else(|| Errno::from(libc::ENOENT))?;
-            let attr = &permissions.attr;
-            if uid == 0 {
-                return Ok(
-                    if requested & libc::X_OK as u32 == 0
-                        || attr.kind == VfsFileType::Dir
-                        || attr.mode & 0o111 != 0
-                    {
-                        requested
-                    } else {
-                        0
-                    },
-                );
-            }
-            if let Some(raw) = permissions.access_acl {
-                let acl = crate::meta::posix_acl::PosixAcl::decode(&raw)
-                    .map_err(|_| Errno::from(libc::EIO))?;
-                if acl.mode_bits() != attr.mode & 0o777 {
-                    return Err(libc::EIO.into());
-                }
-                let groups = if acl.user_access_mode(attr.uid, uid).is_some() {
-                    Vec::new()
-                } else {
-                    verified_request_group_ids(pid, uid, gid)?
-                };
-                return Ok(
-                    if acl.allows_access(attr.uid, attr.gid, uid, &groups, requested) {
-                        requested
-                    } else {
-                        0
-                    },
-                );
-            }
-            if let Some(raw) = permissions.control_acl {
-                let entries: Vec<ControlAclEntry> =
-                    serde_json::from_slice(&raw).map_err(|_| Errno::from(libc::EIO))?;
-                crate::control::protocol::validate_acl_entries(&entries)
-                    .map_err(|_| Errno::from(libc::EIO))?;
-                let groups = if uid == attr.uid {
-                    Vec::new()
-                } else {
-                    verified_request_group_ids(pid, uid, gid)?
-                };
-                if let Some(allowed) = crate::meta::posix_acl::control_acl_allows_access(
-                    &entries, attr.uid, attr.gid, uid, &groups, requested,
-                ) {
-                    return Ok(if allowed { requested } else { 0 });
-                }
-            }
-            if uid == attr.uid {
-                return Ok((attr.mode >> 6) & 7);
-            }
-            let groups = verified_request_group_ids(pid, uid, gid)?;
-            return Ok(if groups.contains(&attr.gid) {
-                (attr.mode >> 3) & 7
-            } else {
-                attr.mode & 7
-            });
+            return self.access_mode_for_permissions(&permissions, uid, gid, pid, requested);
         }
 
         // This legacy control-ACL path predates the capability-aware
@@ -4096,6 +4156,17 @@ fn vfs_kind_to_fuse(k: VfsFileType) -> FuseFileType {
         VfsFileType::CharDevice => FuseFileType::CharDevice,
         VfsFileType::BlockDevice => FuseFileType::BlockDevice,
     }
+}
+
+fn check_requested_access(mask: u32, mode: u32) -> FuseResult<()> {
+    // mask uses libc constants: F_OK=0, X_OK=1, W_OK=2, R_OK=4
+    if ((mask & libc::R_OK as u32) != 0 && (mode & 0o4) == 0)
+        || ((mask & libc::W_OK as u32) != 0 && (mode & 0o2) == 0)
+        || ((mask & libc::X_OK as u32) != 0 && (mode & 0o1) == 0)
+    {
+        return Err(libc::EACCES.into());
+    }
+    Ok(())
 }
 
 fn vfs_to_fuse_attr(

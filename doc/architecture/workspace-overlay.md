@@ -1,277 +1,478 @@
 # Workspace Overlay Architecture
 
-- Status: implemented, maintained with `src/workspace_overlay/`
-- Cargo feature: `workspace-overlay` (off by default)
-- Volume format: `workspace-v1`
-- Catalog format: 2 (entity-key layout; `control` keeps only the volume header)
-- Production metadata backends: Redis and TiKV
+Status: **entity experiment with opt-in benchmark mount wiring; production
+mount remains disabled** (2026-10-20).
+This document and the [implementation spec](../superpowers/specs/overlay-workspace.md)
+now specify an ordinary per-entity writable namespace over one immutable packed
+lower. They supersede the previous mutation/version architecture as the target,
+not as a claim about the current binary.
 
-This document is the maintained architecture reference for BrewFS agent
-workspaces. The detailed API, state-machine fields, and implementation checklist
-remain in the
-[workspace overlay implementation spec](../superpowers/specs/2026-08-23-brewfs-workspace-overlay-implementation-spec.md).
-Changes to persisted records, transaction boundaries, fencing, layer reachability,
-or mount integration must update this document in the same pull request.
+The shipped code remains r31, `0d4e36c` / PR #41; `6b54270` delivered its
+documentation on `codex/packed-metadata-aliyun-20260930`.
+Its actual design, validation gaps and reproduction commands remain in the
+[r31 delivery handoff](../superpowers/plans/2026-10-17-overlay-no-seal-handoff.md).
+The unvalidated r32 candidate has been dropped in favor of this direction.
+The isolated `workspace-entity-v1` implementation lives on
+`codex/overlay-entity-namespace-20261019`, branched from `b6f297e`.
+The integration branch remains unchanged. See the
+[stage 2 checkpoint](../superpowers/plans/2026-10-19-overlay-entity-stage2.md)
+and [file-I/O continuation](../superpowers/plans/2026-10-20-overlay-entity-data.md)
+for the completed API-stage gates. The
+[mount experiment checkpoint](../superpowers/plans/2026-10-20-overlay-entity-mount.md)
+tracks the fresh fixture bootstrap, dedicated FUSE adapter and their own
+validation; earlier API results do not validate those additions.
+There is no conversion, production mount or accepted replacement performance
+result. The mount checkpoint records preliminary measurements for available arms.
+The [entity batching checkpoint](../superpowers/plans/2026-10-20-overlay-entity-batching.md)
+records the subsequently frozen diagnostic baseline and the current request
+batching refactor. That refactor and its correctness gates are in progress;
+there are no measured candidate results yet.
 
-## Goals and boundaries
+## Contract and boundaries
 
-Workspace Overlay lets multiple agents share immutable base files and object
-blocks while keeping each agent's namespace, inode attributes, and data extents
-private. Forking creates metadata records and a new writable head; it does not
-copy the sealed base or clean object data.
+A workspace has one immutable packed lower and one writable upper namespace.
+Missing upper entries fall through to the lower; explicit tombstones suppress
+that fallback. Metadata changes and new data slices belong to the upper.
+Creating a workspace pins its lower and creates an empty namespace; it does
+not copy the lower's metadata or data.
 
-The feature is deliberately isolated from existing BrewFS volumes:
+The experimental packed adapter authenticates the manifest key/digest, root
+inode and maximum inode before exposing metadata or payloads. First attach
+promotes a live packed reader pin into a durable owner for the volume and
+namespace; reopening reconstructs that owner from persistent metadata. These
+owners participate in the existing packed/native collector census and its root
+generation CAS. They survive reader-lease expiry and are released only with a
+terminal deletion proof after upper cleanup. The current bridge admits at most
+256 active owners per store and retains terminal owner tombstones; creating a
+new owner still requires a live source reader pin.
 
-- flat volumes continue through the existing `MetaStore -> MetaClient -> VFS` path;
-- workspace volumes use `WorkspaceStore -> WorkspaceMetaLayer -> VFS`;
-- the default build does not compile `src/workspace_overlay/`;
-- object keys and the existing `SliceDesc` representation are unchanged;
-- a workspace error never falls back to flat-volume semantics.
+The experimental SDK uses trusted adapter composition. Callers must pair the
+packed owner with the same volume, namespace, lower binding and authoritative
+metadata backends used by the entity lifecycle. The experiment has no production
+factory enforcing that pairing and reader quiescence. The
+benchmark bootstrap is trusted wiring over those existing APIs; it adds no
+general backend-pairing or external-writer qualification.
 
-## Component architecture
+Keep sole-writer lease safety, atomic namespace operations, crash consistency,
+correct object reclamation and fsync durability. Preserve ordinary permissions,
+ACLs, hardlinks, sparse-file behavior and O_EXCL. Those filesystem semantics
+do not require a workspace-wide mutation order.
 
-```mermaid
-flowchart TB
-    AgentA[Agent A mount] --> FuseA[FUSE / VFS]
-    AgentB[Agent B mount] --> FuseB[FUSE / VFS]
+The target has no writable head/layer record, per-layer sequence allocator,
+expected-head CAS, row sequence stamps, append-only extent history, or mutable
+workspace digest. There is no live-layer seal, overlay-stack flattening or
+strict-lower mode. Publishing an immutable packed export remains a separate
+administrative operation. Packed manifests, payload checksums and immutable
+object authentication remain; removing a workspace digest does not remove
+data integrity checks.
 
-    FuseA --> MetaA[WorkspaceMetaLayer<br/>workspace A]
-    FuseB --> MetaB[WorkspaceMetaLayer<br/>workspace B]
+Default flat volumes retain their existing path. A new versioned namespace
+format and explicit dispatch separate this target from existing workspace-v1
+records. Old binaries must reject the new format. The format identifier and
+new APIs are experimental. Selecting `workspace-entity-v1` without the explicit
+`--experimental-entity-mount` opt-in fails closed. The experimental dispatch uses
+its own FUSE adapter and never falls back to the old workspace path.
 
-    MetaA --> Resolver[Layer resolver<br/>newest record wins]
-    MetaB --> Resolver
-    MetaA --> Catalog[WorkspaceStore state machine]
-    MetaB --> Catalog
+## Experimental benchmark mount
 
-    Catalog --> KV{Redis or TiKV}
-    Resolver --> KV
+`entity/experiment.rs` wires a fresh packed catalog and fresh entity namespace
+to the existing Redis, packed-owner and file-I/O APIs. Its input is a standalone
+packed manifest in a dedicated experimental bucket and unused metadata scopes.
+The bootstrap authenticates the manifest through the existing packed reader,
+installs it under a temporary setup lease, promotes a source reader pin into
+the existing durable lower owner, then provisions/acquires the entity writer.
+The source pin and setup lease are released after setup; the durable lower
+owner and source catalog remain. Legacy catalog head records serve this setup
+and lower ownership only; entity data writes use the new current-map APIs.
 
-    KV --> Control[control<br/>volume header · catalog format]
-    KV --> Entities[ws · layer<br/>lease · journal<br/>snapshot · alloc]
-    KV --> Delta[delta/dentry · inode<br/>xattr · acl · extent]
+The CLI selects `--volume-format workspace-entity-v1` with
+`--experimental-entity-mount`, a packed manifest key, a non-nil
+`--entity-volume-id` and a non-nil workspace UUID. `--workspace-namespace` is
+optional and defaults to `brewfs`; its selected metadata scope must be unused.
+Explicit bounded geometry is also needed: the runner sets 4 MiB chunks and
+blocks; the normal 64 MiB chunk default exceeds the entity API's 16 MiB maximum.
+The isolated harness supplies a fresh scope explicitly. A dedicated FUSE adapter
+uses the entity namespace and data path. Orderly unmount stops request admission,
+drops its handle registry and calls the existing local session drain. It retains
+the namespace, lower ownership and data; the isolated harness owns service,
+volume and bucket teardown. This path provides no reopen/resume, namespace
+discard wrapper, process-crash takeover, importer or atomic cutover. Dedicated
+fixture scopes are a caller/harness precondition, not proof that unrelated
+catalogs sharing an object service have no writers. Enforced backend/owner
+pairing, combined-stack fault qualification and paginated production cleanup
+remain outside this benchmark wiring.
 
-    FuseA --> Chunk[Existing chunk read/write path]
-    FuseB --> Chunk
-    Chunk --> Objects[(S3-compatible or local<br/>immutable blocks)]
+### Immutable lower metadata and create requests
 
-    Shared[Fixed sealed base] --> Resolver
-    Delta --> Resolver
-    Shared -. shared by both agents .-> Objects
-```
+The entity adapter retains an in-process, byte-weighted 64 MiB LRU memo for
+lower inodes, dentries (including absence), cold xattr/ACL attributes, current
+chunk maps and directory listings. It follows the shipped packed-lower memo
+approach and keeps the existing authenticated packed reader for cache fills.
+Asynchronous fills for the same key coalesce. Mount warmup loads the root and
+prefetches up to 32 children, including cold attributes and the first file chunk
+map, with at most four concurrent child loads. Payload bytes are not in this
+metadata budget. The packed index reader retains its separate 4 MiB page cache.
 
-Every active view contains exactly two layers: one private writable overlay and
-one flat sealed base. The base has no parent and remains fixed until an explicit
-seal publishes a replacement base. Point reads batch the two exact keys into one
-Redis `MGET` or TiKV batch-get; they never scan metadata. Whiteouts in the upper
-stop fallback to the base. Extents are clipped and combined into a read plan
-before the existing chunk reader fetches object blocks.
+The mount binds the memo to the exact lower identity and writer session after
+validating the durable packed owner. Each bound lookup/fill retains local session
+admission; terminal owner release requires that session to close and drain.
+Cache hits therefore need neither catalog-owner RPCs nor object requests.
+Standalone, unbound SDK access retains remote owner validation. Cold or evicted
+metadata can require authenticated I/O; the bounded cache does not promise that
+an arbitrarily large lower is entirely resident. Errors are never cached as
+absence. Upper values and tombstones resolve first. A copied-up inode can still
+inherit an absent xattr or chunk, subject to its lower visibility boundary.
 
-`statfs` does not enumerate inode deltas to synthesize effective usage. Such a
-scan is O(N), needs to block workspace mutations for a consistent view, and is
-unbounded on the FUSE hot path. Until Redis, TiKV, and SQLite persist usage
-counters and update them atomically with each workspace mutation, the workspace
-metadata layer returns an explicit `NotSupported` error instead of reporting
-zero usage or an inconsistent snapshot.
+Runtime authority reads the five canonical descriptor/lease/pin/owner/registry
+rows in one snapshot, using the immutable lower identity retained by the session
+to choose keys. Every commit still checks the exact rows and backend-time lease
+deadline. No mutable permission result is cached.
 
-## Persisted graph
+Create combines that snapshot with parent, ancestor, ACL, name and truncate
+predicates. Bounded directory-parent hints select the batch; fresh inode and ACL
+rows determine permissions. A warm create uses one read and one commit. A cold
+or stale ancestor hint can require extra reads, and conflicts recompute the full
+decision. The commit checks effective absence and allocates with INCR inside the
+same script, then installs the inode, dentry, inherited ACLs and parent update.
+The script validates generated keys and bounds before its first write and uses
+exact decimal IDs above 2^53. It does not compare-and-swap the allocator counter.
+Only the affected parent is locally locked; unrelated parents remain independent.
 
-```mermaid
-flowchart LR
-    WS1[Workspace A] --> HA[Writable head A]
-    WS2[Workspace B] --> HB[Writable head B]
-    HA --> Base[Sealed base revision]
-    HB --> Base
-    LeaseA[Lease A] -. fences writes .-> WS1
-    LeaseB[Lease B] -. fences writes .-> WS2
-    Snap[Snapshot] -. GC root .-> Base
-    Journal[Seal journal] -. recovery root .-> HA
+### Operation snapshots and grouped publication (candidate)
 
-    HA --> DA[Private deltas A]
-    HB --> DB[Private deltas B]
-    Base --> Blocks[Shared immutable blocks]
-```
+The current refactor shares one operation-scoped `Prepared` observation set
+between namespace and data operations. A single initial read combines the five
+authority rows with the known inode, ACL, dentry, truncate and chunk rows needed
+by that operation. Directory-parent and dentry-to-inode hints are bounded to
+4,096 entries each and nominate keys only: fresh rows determine permissions and
+identity, and the final transaction checks every observed value or absence.
+Missing or stale hints can require additional bounded reads. Conflicts rebuild
+the decision; incompatible observations cannot overwrite one another.
 
-Workspace heads, snapshots, active leases, and incomplete seal journals are GC
-roots. A layer or object slice may be deleted only after it is unreachable from
-all roots and the configured lease grace period has elapsed.
+Path open retains its observed ancestry and name while acquiring the discovered
+inode lock, then validates that same read set before returning the handle. It
+does not repeat the entire path walk. Open fallback and truncate return the
+attributes established by their own operation so the FUSE reply need not start
+another attribute read. This is same-operation reuse, not an authoritative
+cross-operation cache of mutable attributes or permissions.
 
-The active graph invariant is `writable(depth=2) -> sealed(depth=1) -> null`.
-Sealed ancestry is never exposed to the FUSE data path.
+Data writes reuse the operation's authority to allocate slice IDs and register
+all Pending upload owners for an admitted group in one transaction, before any
+object PUT. A successful conditional durable PUT produces a local receipt; it
+does not require a separate Uploaded metadata transaction. Final publication
+checks the exact Pending bytes, aggregates slice membership/refcount changes
+across the group's chunk maps, and atomically installs those maps, immutable
+object descriptors and the inode size/times/data version. The same inode lock
+still covers the work, and an uncertain reservation/publication is never blindly
+replayed. Only an acknowledged prefix can be returned after partial work.
 
-## Transaction architecture
+Each publication group must honor row, byte and fragmentation limits before its
+commit. Known aggregate preparation limits split a group using fresh observations;
+uncertain commit results never trigger a split or retry. Bounded grouping is
+implemented and still pending validation; the
+current code is not yet qualified as a replacement for the prior partial-write
+path. Unused standalone allocation, upload registration and Uploaded APIs are
+removed. Truncate/discard/orphan cleanup retains its asynchronous membership
+wrapper over the shared pure planner and its existing durable cleanup state.
 
-### Hot data path
+Fsync still waits on the shared FIFO inode lock, retains admission, reports
+sticky errors and validates live lease/backend-time predicates. Its initial
+snapshot includes the truncate marker: observed absence takes the validated
+read-only commit path, while an actual intent invokes the existing recovery
+walker and then refreshes the snapshot. Ordinary I/O no longer performs an
+unconditional empty-intent recovery walk. These are candidate implementation
+changes, not measured request reductions or accepted performance results.
 
-Ordinary namespace, inode, xattr, ACL, and extent mutations do not read or CAS
-the global `control` record. They atomically check exactly three entity records
-(`ws/<workspace-id>`, `layer/<head-layer-id>`,
-`lease/<workspace-id>/<lease-id>`) and update the current layer plus delta
-keys:
+## Audit of the current design
 
-```mermaid
-sequenceDiagram
-    participant M as Workspace mount
-    participant S as KvWorkspaceStore
-    participant K as Redis / TiKV
+The current overlay is not uniformly an append-only log: dentry, inode, xattr
+and ACL delta keys already hold their current value. Extent keys include a
+sequence and accumulate overlapping records. Every nonempty row mutation advances the
+same head sequence, which provides a coarse version for the entire workspace.
 
-    M->>S: mutation + HeadGuard
-    S->>K: batched entity records + authoritative time<br/>(Redis TIME+MGET / TiKV transaction timestamp+batch-get)
-    S->>S: validate workspace, head epoch,<br/>owner, lease generation and expiry
-    S->>K: atomic CAS(three expected values)<br/>put layer record + delta keys
-    alt CAS conflict
-        S->>K: bounded retry from fresh values
-    else committed
-        S-->>M: allocated sequence range
-    end
-```
+| Current component | Classification | Target disposition |
+| --- | --- | --- |
+| Authenticated immutable lower and fallthrough reads | Required contract | Keep the packed reader and a durable lower pin |
+| Dentry/inode/xattr whiteouts | Required contract | Keep tombstones; absence must remain distinct |
+| Lease, sole-writer authority, backend-time expiry | Required contract | Check in every metadata-changing transaction |
+| Atomic create/rename/link/unlink and permission decisions | Required contract | Transactions over affected entities; O_EXCL absence check inside create |
+| Upload-before-publication and fsync completion | Required contract | Keep; independent of workspace ordering |
+| Reachability protection, orphan recovery and deletion reservation | Required contract | Replace census fencing with object ownership and safe retirement |
+| Head record, next_sequence, expected_layers and global mutation CAS | Artifact of chosen version model | Remove from the runtime format |
+| Sequence-stamped extent keys and newest-first overlay folding | Artifact of extent history | Replace with current normalized chunk maps |
+| Layer delta digest/root hash for mutable-overlay identity | Artifact of revision model | Remove; immutable packed integrity remains |
+| Per-layer extent generation and whole-layer census fencing | Artifact of current GC proof | Remove only after per-object deletion fencing is implemented |
+| Global mutation mutex | Artifact of coarse version/cache coordination | Replace with affected-inode/parent coordination and backend atomicity |
+| Commit-view cache and cached head/derived-counter bytes | Optimization of that model | Drop |
+| Data group commit | Optional optimization | Drop from the initial target; reconsider only with measurements |
+| Lease-bound row/path/permission caches and created-path seeding | Optional optimization with coherence obligations | Not required for the initial target; add only if measured and correct |
+| Packed-lower metadata memos and prefetch | Required hot-path policy for the entity experiment | Bound asynchronous immutable memo; not mutation authority. Payload caching remains separate |
+| Per-inode data version / directory revision | Local coherence mechanism | Keep only where reads, caches or directory cookies need it |
+| Publication/discard recovery intent | Required crash protocol when work spans transactions | Keep bounded operation state; no general mutation replay log |
 
-The writable layer owns its `next_sequence`, so writers in the same workspace
-serialize correctly while sibling workspaces do not contend. Lease renewal CASes
-only `lease/<workspace-id>/<lease-id>`. Each ID allocator CASes only its own
-`alloc/<name>` record.
+The shared head was a convenient replacement for precise read sets: a changed
+head forced inode-copy, permission and namespace decisions to be recalculated.
+It also supplied ordering for overlapping extent records, read-plan fences,
+accounting and administrative empty-head checks. It was not required by the
+packed file format, lower fallback, leases or fsync.
 
-Named dentry, inode, xattr, and ACL resolution uses exact batched reads. Prefix
-enumeration is reserved for `readdir`, layer materialization, and GC. Redis keeps
-a transactionally maintained lexicographic key index so those operations read
-only the requested key range; `SCAN MATCH` is used once only to migrate an older
-catalog that lacks the index marker.
+Diff/export used delta rows, sequence-aware resolution and canonical layer
+digests. The target obtains the current effective state by walking upper keys
+and merging with the pinned lower. Sequence-based comparison/identity is removed;
+reading and exporting remain. Current scalar rows already overwrite history,
+so r31 does not provide complete historical transaction replay either.
 
-### Low-frequency topology path
+## Proposed data model
 
-Seal, fork, snapshot, commit, compaction, GC, and lease acquire/release build a
-read-tracked topology transaction. The store reads each entity it needs by exact
-key, records the original value of every read, and runs a pure closure that
-validates and modifies those entities. The check set equals the read set, the
-write set is exactly the entities the closure modified, and one multi-key CAS
-commits all checks and writes atomically; an outside observer sees either the
-pre-commit or the post-commit state. A closure cannot read an entity it did not
-declare, so an undeclared dependency fails at the interface instead of silently
-committing from an old view, and retries re-execute the closure on fresh values.
+Use workspace prefixes in one volume metadata transaction domain, for example
+`{volume}/workspace/<id>/...`. Prefer prefixes over separate Redis databases:
+chunk references and shared-object ownership must participate in the same
+transaction. Redis Cluster keys involved in such transactions share a hash slot.
+This provides independent client operations, not parallel execution of Lua on
+one Redis server. TiKV support requires equivalent transactions and separate
+qualification; it is not assumed from Redis results.
 
-Every topology operation touches only keys of the workspaces it involves. Sibling
-workspaces' seals, forks, and GC run in parallel, and heartbeats or hot writes
-from unrelated workspaces never intersect a topology transaction's check set.
-Conflicting retries use bounded exponential backoff with jitter. There is no
-process-global topology gate: concurrent topology transactions serialize through
-the backend multi-key CAS, and transactions on different workspaces proceed in
-parallel.
+| Entity | Current value |
+| --- | --- |
+| Workspace descriptor | Format, namespace identity, immutable lower manifest, lifecycle state and lease identity; changed only by administration |
+| Lease | Sole writer, holder generation, state and backend deadline |
+| Inode | Present/deleted, attributes, nlink, size, xattrs/ACLs, lower visibility boundary and any needed local data version |
+| Dentry `(parent, name)` | Inode/type or tombstone; no upper key means consult lower |
+| Xattr/ACL `(inode, name)` | Value or tombstone, so removal masks a lower value |
+| Chunk `(inode, chunk_index)` | Current complete, disjoint spatial map of upper Data slices, immutable LowerRange references and Holes |
+| Slice/object ownership | Pending-upload owner, upper reference count/edges, immutable-publication ownership, read protection and deletion state |
+| Allocators | Plain INCR/INCRBY uniqueness counters, unrelated to mutation order |
+| Recovery intent | In-progress truncate, publication or discard with an idempotent cleanup cursor |
 
-The catalog stores one key per entity — `ws/<workspace-id>`,
-`layer/<layer-id>`, `lease/<workspace-id>/<lease-id>`,
-`journal/<workspace-id>/<journal-id>`, `snapshot/<snapshot-id>`, and
-`alloc/<name>` — with entity keys as the sole copy of each record. The
-`control` key holds only the volume header and catalog format and is written
-only at volume creation and catalog migration. Lease and journal keys are
-grouped by workspace prefix so per-workspace listing stays exact.
+The stage 2 schema uses `{brewfs-entity:<volume UUID>}/workspace/<namespace UUID>/`
+for inode, dentry, xattr, chunk, orphan and lifecycle rows. Raw names are
+hex-encoded injectively; slice records and the slice allocator use the shared
+volume prefix. Rows use bounded typed JSON; allocator values are canonical
+decimal integers. The experiment is not yet a production wire-format promise.
+There is no per-commit workspace counter. A shared descriptor/lease may be read
+and checked by every operation without being rewritten by unrelated file mutations.
 
-A single active writable lease per workspace is enforced by
-`WorkspaceRecord.active_lease`: acquire CASes the field `None ->
-Some(lease_id)`, release and expiry clear it, and acquire also clears a dangling
-pointer to an already-invalid lease so no termination path can block remount.
+Inode allocation starts above imported lower IDs. Object/slice IDs are unique
+across sharing namespaces, never reused after deletion, restore or failover.
+Redis's signed-64-bit range is explicit; counters fail on exhaustion rather than
+rounding through Lua doubles. Allocation gaps are harmless.
 
-GC deletes a layer in two phases: it CAS-marks the candidate `Deleting` from the
-exact value it read, rescans the root set to confirm no new root references the
-layer (abandoning the deletion and restoring `Sealed` on a hit), and only then
-deletes the delta keys and the layer record. Root-creating operations (fork,
-snapshot, lease acquire, seal begin) CAS-check the exact value of the base layer
-they reference, including `state == Sealed`. GC also reaps `Released`/`Expired`
-leases and `Completed`/`Aborted` journals past their grace period, keeping the
-most recent journal per workspace for `inspect`, so catalog size tracks active
-entities. Expired-lease reaping lives in lease acquire, the GC cycle, and the
-start of seal recovery; the heartbeat task only renews its own lease and stops
-on renewal failure, after which writes are fenced.
+### Reads, copy-up and tombstones
 
-`initialize_workspace_schema` migrates older catalogs: it detects the previous
-document format, writes each entity to its entity key, and CAS-switches `control`
-to a header-only document with `catalog_format: 2`. The single-key CAS makes the
-migration run once and a crash mid-migration can resume. Mounting refuses an
-unmigrated catalog and points at the migration command:
+Lookup first checks the upper dentry. A tombstone returns absence; a missing key
+consults the packed lower. Inodes and xattrs follow the same rule. Hardlinks in
+either namespace resolve the same effective inode, so a copied-up inode changes
+all its aliases. Readdir merges names and removes whiteouts, with per-directory
+cookie/version semantics rather than a workspace generation.
 
-```text
-brewfs workspace --meta-backend redis --meta-url <url> migrate
-brewfs workspace --meta-backend sqlx --meta-url <url> migrate
-brewfs workspace --meta-backend tikv --meta-tikv-pd-endpoints <pd-endpoints> migrate
-```
+A missing chunk inherits the immutable file only below the inode's
+`lower_visible_size` (initially lower EOF, or zero for a new file); other bytes
+are holes or beyond EOF. On first modification,
+materialize that chunk's mapping metadata, then replace the written range with
+new slices. A present chunk map covers the entire chunk domain: gaps are explicit holes, never an
+implicit invitation to reveal lower bytes. LowerRange entries retain the
+workspace's immutable lower identity. Spatial interval order is not mutation
+history; overwritten intervals are removed from the current map.
 
-TiKV selects its PD endpoints with `--meta-tikv-pd-endpoints`; `--meta-url` is
-used only by the Redis and SQLite backends. The command selects the same
-backend, endpoint, and `workspace-namespace` as every other workspace CLI
-invocation. Migration is one-way: once `control` carries
-`catalog_format: 2`, older binaries that only understand the entity-table
-document cannot read the catalog, so the release notes must state that all
-readers must be upgraded before `migrate` runs. The operator-facing upgrade notice is in
-[`doc/releases/workspace-catalog-format-2.md`](../releases/workspace-catalog-format-2.md).
+Same-inode writes serialize their map/size changes, preserving overlap and
+append semantics. Unrelated inodes need no common ordering. Multi-chunk writes
+retain the filesystem's existing partial-write semantics; no new file-wide
+atomic-write guarantee is implied.
 
-Redis implements multi-key CAS with a binary-safe Lua script. All workspace keys
-use one fixed cluster hash tag. TiKV uses pessimistic transactions and
-`get_for_update` for the checked entity keys.
+### Namespace transactions and open/close
 
-## Authoritative lease time
+Create reserves a unique inode ID and atomically checks parent permissions and
+effective name absence while installing inode/dentry/parent changes before
+returning. The reference implementation reserves the ID with a separate INCR;
+failed attempts may consume IDs but cannot expose partial namespace changes.
+The immutable lower lookup may be prepared outside Lua, but its binding must be
+unchanged and the final transaction must recheck upper absence and mutable policy inputs.
+Never merge create visibility with the first data fsync.
 
-Lease expiry must be based on metadata-backend time, never mount-host wall time:
+Rename, link and unlink transact over the affected parents, names, inodes and
+ACL inputs. Same-entity local locks are acquired in a fixed order; stale
+client-prepared decisions use per-entity validation and full recalculation.
+Redis Lua can instead calculate from current entity rows inside the transaction.
+Neither approach requires a shared-head CAS. Every mutating transaction checks
+sole-writer authority, lifecycle admission and backend-time lease expiry.
+Checks include mutable ancestor search-permission inputs used by the operation.
+Lua errors do not roll back earlier writes: types, bounds, overflow, refcount
+underflow and key collisions must be validated before the first entity write.
 
-- Redis uses `TIME`;
-- TiKV reuses the transaction start timestamp and converts its PD TSO physical
-  millisecond component to nanoseconds with checked arithmetic;
-- SQLite is a local semantic and fault-injection backend and uses its local
-  transaction clock.
+Ordinary open checks current permissions/lease with zero metadata writes and
+retains a local handle. Linked close releases that handle locally, including
+after lease expiry. O_TRUNC still performs a data mutation. Unlink of an open
+inode records a recoverable orphan; closing its final handle allows proven
+quiescent recovery to complete retirement. The initial target uses explicit
+noatime semantics; adding a different timestamp policy is a separate decision.
 
-Every mutation also checks workspace ID, head layer ID, head epoch, lease ID,
-holder generation, writable state, and expiry. A stale mount is fenced before
-any delta or sequence update is committed.
+### Truncate, object lifetime and fsync
 
-## State transitions
+Shrinking must hide both lower bytes and old upper chunks permanently across
+later extension. Decrease `lower_visible_size` monotonically. For cleanup that
+does not fit one transaction, set the new size/mask and a durable Truncating
+intent atomically, hold same-inode mutation admission, prune the boundary and
+later chunk mappings with their reference changes in bounded transactions,
+then clear the intent. Boundary bytes beyond EOF become explicit holes. Advance
+each cleanup cursor atomically with its map/reference changes, so a crash cannot
+skip work or apply a decrement twice. Drain earlier buffered writes/uploads or
+fence their publications with a per-inode truncate generation; they cannot land
+after pruning and resurrect data. Block writes/re-extension until cleanup finishes,
+including after restart. An interrupted shrink cannot expose old data merely
+because its cleanup has not completed. Hole punching needs the same atomic
+mapping/lifetime discipline.
 
-Writable heads follow `Writable -> Sealing`; abort is permitted only before
-hashing and restores the old writable view. A successful seal materializes the
-fixed base plus the writable delta into a new flat sealed base, creates one empty
-writable overlay, and atomically switches the workspace and active lease to that
-pair. Immutable object blocks are reused rather than copied. The durable journal
-makes recovery idempotent across crashes, and mount recovery flattens a transient
-post-switch chain before admitting a writer.
+Publish a chunk replacement and its slice-reference deltas in one transaction.
+Count distinct current chunk-to-slice memberships, not file names or nlink.
+LowerRange references are protected by the immutable lower pin; zero upper
+references never authorizes deleting lower-owned data. Fork takes one manifest
+pin, not an eager increment on every lower slice.
 
-Fast-forward commit is deliberately restricted: the source revision and target
-fork base must still match, the target head must be empty, and the target must
-have no active writable lease. Conflicts preserve the child workspace for
-inspection or retry.
+Fresh upper slices initially belong to one workspace; direct sharing between
+live uppers is outside the initial target. Sharing through immutable publication
+and lower pins remains supported. Publication that reuses upper objects establishes durable immutable ownership
+before upper ownership is removed. Staged publication keeps its source protected
+until this transfer is complete.
 
-## Code map
+The initial implementation defers physical reclamation of retired upper slices
+until proven namespace quiescence or fenced discard. Stop new I/O admission,
+drain writes and active read plans (including handles retaining object pins),
+invalidate obsolete plans and exclude live/recoverable reader sessions before
+deletion. Refcounts and retirement queues update during normal operation, but
+zero references alone do not delete an object a reader may still hold. This
+avoids new per-read distributed pin traffic at the cost of retaining dead bytes
+until maintenance. A future online collector would need an explicit read-pin
+protocol; elapsed grace time alone is insufficient for stalled reads.
 
-- `src/workspace_overlay/meta_layer.rs`: POSIX-facing workspace metadata layer.
-- `src/workspace_overlay/resolver.rs`: layered namespace and extent resolution.
-- `src/workspace_overlay/catalog.rs`: backend-neutral storage contract.
-- `src/workspace_overlay/stores/kv_store.rs`: shared Redis/TiKV state machine,
-  read-tracked topology transactions, and catalog migration.
-- `src/workspace_overlay/stores/redis.rs`: Redis key scoping, Lua CAS, server time.
-- `src/workspace_overlay/stores/tikv.rs`: TiKV transactions, scans, and PD TSO.
-- `src/workspace_overlay/lifecycle.rs`: seal, fork, snapshot, commit, recovery.
-- `src/workspace_overlay/gc.rs` and `compaction.rs`: reachability and flattening.
-- `src/workspace_overlay/cache_scope.rs`: workspace-aware cache identities.
+Reclaim an upper object only after atomically reserving Live-to-Deleting with
+zero references, proven quiescence and no upload or immutable-publication protection.
+Reference birth checks the same object state and cannot resurrect Deleting.
+The durable reservation precedes object DELETE; retries are idempotent.
+Pending uploads have durable owners and are reaped only when their authority
+can no longer publish. Namespace sweeps enumerate ownership and reconcile leaks;
+they do not infer safe deletion from an unfenced SCAN.
+Collectors and crash recovery use explicitly fenced lifecycle authority, not
+an expired runtime writer lease.
 
-## Required maintenance and verification
+Complete durable object uploads before publishing their metadata references.
+File fsync waits for that file's preceding uploads and metadata publications;
+directory sync covers its documented namespace boundary. Both honor the
+configured metadata/object-store persistence policy. A successful Redis reply
+alone is not a universal power-loss guarantee. Lost commit replies require
+reconciliation or a proven idempotent operation, never blind replay.
 
-Any architecture change must preserve and test these invariants:
+Strict entity uploads use the production S3 adapter's conditional-create
+capability. The new packed-lower, upper-data and VFS object-I/O tests use an
+isolated RustFS service through the shared `entity/test_objects.rs` helper.
+Memory backends remain suitable for metadata transactions and fault injection;
+temporary local files hold producer metadata spools only. These service tests
+are ignored in the default suite and must be selected with `--include-ignored`;
+missing explicit service configuration fails the test. The real-service gate
+passed six packed-lower, 78 entity and two VFS tests at the recorded API-stage
+source snapshot; exact evidence and remaining qualification gaps are in the
+file-I/O continuation. That result does not cover the later benchmark bootstrap
+or dedicated mount adapter.
+Metadata recovery oracles and actual object-I/O tests have separate coverage;
+they do not yet qualify a complete Redis entity + real packed lower + VFS
+stack, physical packed-graph retirement, or recovery after process/host failure.
 
-1. sibling workspaces share sealed bases but never observe each other's deltas;
-2. hot mutations never CAS `control`;
-3. same-head sequence allocation is gap-safe under backend CAS retries;
-4. heartbeat and allocators remain entity-local;
-5. stale epochs and lease generations cannot partially write;
-6. active leases and incomplete journals prevent premature GC;
-7. default flat-volume behavior and serialized metadata remain unchanged;
-8. Redis and TiKV both pass the distributed two-store concurrency contract;
-9. every mounted workspace resolves exactly two layers;
-10. named point reads issue no prefix scans, regardless of backend key count;
-11. every topology transaction checks exactly the entities it read and touches no
-    other workspace's keys;
-12. GC marks a layer `Deleting` and rechecks the root set before deleting its
-    delta keys, and root-creating operations check the referenced base layer's
-    exact value;
-13. `Released`/`Expired` leases and `Completed`/`Aborted` journals past grace
-    are reaped, and the heartbeat task never reaps leases;
-14. mounting refuses an unmigrated catalog and directs the operator to the
-    migration command.
+## Export, diff and lifecycle
 
-The feature test suite, resolver oracle tests, real Redis/TiKV backend contracts,
-dual-mount isolation tests, pjdfstest, and xfstests gates are the acceptance
-evidence for this subsystem.
+Pin one immutable lower when creating a workspace. Discard first fences the
+writer, then walks upper ownership with resumable idempotent cleanup, releases
+the lower pin last and retires the namespace. Reader admission and outstanding
+read plans must also be drained/fenced before their protection is removed.
+Never FLUSHDB a shared backend.
+
+A consistent dump/export stops mutation admission, drains writes/fsync and
+walks a stable namespace while retaining its lease and lower pin. Redis SCAN
+over a live changing namespace is not a consistent snapshot. This administrative
+pause is not a lock on every ordinary mutation. Build and authenticate the new
+packed lower before publishing it; never seal or rotate a live upper.
+
+Diff becomes a semantic comparison of effective namespaces/content. An
+upper-only walk against the same fixed lower can still identify changed
+entities, but a cheap arbitrary-workspace/history diff and total-order replay
+are not provided. Export can sort records for reproducible output if desired;
+a canonical writable-layer digest is no longer an identity contract.
+
+## Experiment scope and deferred migration
+
+1. **Design and format boundary.** R31 binaries, schema and accepted benchmark
+   artifacts remain the baseline. R32's partial implementation stays archived,
+   not deployed. The entity format has separate dispatch and storage.
+2. **Isolated implementation.** Current-entity storage/resolution and atomic
+   namespace operations are implemented behind explicit new-format dispatch.
+   The experiment includes a bounded namespace/Redis substrate, an authenticated
+   packed adapter and durable lower owners in the existing collector census.
+   Its file-I/O continuation adds write-through current maps, an explicit VFS
+   handle dispatch and bounded truncate/discard/orphan recovery. Operations
+   require their namespace lower owner and active writer authority.
+3. **Fresh-only mount benchmark: current scope.** The explicit opt-in wires
+   isolated fresh fixtures. Normal mount probes, local gates and matched
+   performance evidence belong to its checkpoint. It adds no new fault-injection
+   or production-admission work. R31 gates do not validate the new path.
+4. **Offline conversion: DEFERRED.** No importer is implemented or included in
+   the current stage. The experiment does not adopt an existing mutable workspace.
+5. **Atomic cutover and recovery: DEFERRED.** No format switch, migration intent
+   or rollback is implemented. Rewinding an old pointer after entity writes
+   would lose those writes.
+6. **Production qualification and retirement: DEFERRED.** Enforced pairing,
+   external crash-takeover authority, paginated production cleanup, full
+   mounted/POSIX qualification and safe retirement of old ownership remain
+   known limitations. They are not additional work items for this benchmark.
+
+## Evidence, decision and trade-offs
+
+The r31 stage-only diagnostic measured 91.2% gate occupancy at 32 workers,
+3.703 ms of held service per file: create 60.2%, open+close 29.9%, data 9.9%.
+At 16 workers occupancy was 82.0%, with 3.785 ms/file. These are one-repetition
+attribution runs, not acceptance results for this proposal.
+
+Completed r31 acceptance means (six samples per arm at 16/32 workers):
+
+| Workers | Overlay WRITE files/s | Native WRITE files/s | Overlay/native |
+| --- | ---: | ---: | ---: |
+| 16 | 216.89 | 344.01 | 0.63 |
+| 32 | 236.89 | 414.74 | 0.57 |
+
+Completed r31 ratios for stat/full/write/readback/mixed are respectively
+1.00/0.71/0.86/1.06/1.02 at one worker,
+—/—/0.63/0.91/0.85 at 16, and —/—/0.57/0.88/0.87 at 32.
+Missing stat/full results are not filled from the interrupted final sweep.
+
+The 2026-10-20 fresh-entity mount experiment completed 24 available WRITE and
+READBACK phase rows at 1/16/32 workers, with two opposite-order samples per
+cell and zero workload errors. Preliminary packed-overlay WRITE medians were
+20.08/111.90/135.00 files/s versus native 51.63/351.03/419.83; READBACK medians
+were 32.04/173.05/199.05 versus native 113.40/602.50/616.47. `overlay-native`
+was skipped because the frozen native lower adapter, binding and mount wiring
+are missing. These are new-upper-file measurements, not lower-read/copy-up
+results or acceptance. They do not demonstrate removal of the write plateau.
+The [mount checkpoint](../superpowers/plans/2026-10-20-overlay-entity-mount.md)
+records sample values, smoke/cleanup evidence, configuration differences and
+exact reproduction commands. No historical accepted table is replaced.
+
+Native CREATE_ENTRY_LUA executes one atomic script without a client mount-wide
+mutex; the server still serializes Lua and updates a shared allocator/parent.
+Native open/close bookkeeping does not commit metadata. The r31 measured
+CREATE/record_open/record_close path also did not update atime: the separate
+legacy MetaLayer::open does. Atime is not an explanation of the measured gap.
+
+**Drop r32.** Its backend-assigned global sequences and per-key checks could
+reduce client serialization, but preserve the very sequence/head model being
+retired. Neither it nor the prefetch-only precursor has a candidate performance
+comparison. The prefetch gate was interrupted; the later atomic-sequence draft
+was never built or validated. This is a design supersession, not a measured
+performance rejection. Draft sources and evidence are preserved in the
+[r32 investigation](../superpowers/plans/2026-10-19-overlay-write-r32.md).
+
+Trade-offs are explicit: more expensive diff/export and an export pause;
+no total-order replay or mutable-layer digest; current chunk-map rewriting and
+possible fragmentation costs; per-object reference bookkeeping and crash
+recovery; retired upper-byte retention until maintenance/discard and lower-object
+retention until the last immutable pin;
+and a format migration with no instant rollback after new writes. Hot inode or
+parent transactions and Redis server execution still serialize. No throughput
+win is claimed before the replacement's correctness and matched performance
+gates pass.

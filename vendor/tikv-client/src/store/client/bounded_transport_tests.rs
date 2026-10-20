@@ -535,6 +535,38 @@ fn assert_lock_classification(error: Status, classified: bool) {
     );
 }
 
+#[test]
+fn pair_key_lock_diagnostic_is_retryable_but_other_shapes_are_not() {
+    for location in [1, 3] {
+        let status = Status::with_details(
+            Code::FailedPrecondition,
+            "bounded read returned a key or region error",
+            Bytes::from(vec![b'B', b'R', b'E', location, 2, 1, 0]),
+        );
+        assert!(crate::Error::GrpcAPI(status).is_bounded_read_retryable_key_lock());
+    }
+    let region_epoch = Status::with_details(
+        Code::FailedPrecondition,
+        "bounded read returned a key or region error",
+        Bytes::from_static(b"BRE\x02\x01\x05\x00"),
+    );
+    assert!(crate::Error::GrpcAPI(region_epoch).is_bounded_read_retryable_region());
+    for details in [
+        vec![b'B', b'R', b'E', 2, 2, 1, 0], // scan location is outside point reads
+        vec![b'B', b'R', b'E', 3, 1, 1, 0], // region family at pair location
+        vec![b'B', b'R', b'E', 2, 1, 7, 0], // non-EpochNotMatch region error
+        vec![b'B', b'R', b'E', 3, 2, 2, 0], // ambiguous key error
+        vec![b'B', b'R', b'E', 3, 2, 1, 1], // malformed key error
+    ] {
+        let status = Status::with_details(
+            Code::FailedPrecondition,
+            "bounded read returned a key or region error",
+            Bytes::from(details),
+        );
+        assert!(!crate::Error::GrpcAPI(status).is_bounded_read_retryable_key_lock());
+    }
+}
+
 #[tokio::test]
 async fn validated_get_lock_requires_explicit_policy_and_keeps_fixed_diagnostic() {
     let payload = lock_wire_response(&lock_wire_minimal(b"primary", 17, b"key"));

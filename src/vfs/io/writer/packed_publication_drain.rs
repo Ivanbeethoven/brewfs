@@ -33,7 +33,7 @@ impl PackedWriterTasks {
         }
         if self
             .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_add(1)
             })
             .is_err()
@@ -174,6 +174,24 @@ where
     ) -> anyhow::Result<PackedWriterDrain> {
         const MAX_SLICE_ROWS: usize = 4096;
         let cleanup = self.publication_cleanup.clone().lock_owned().await;
+        // Admission is closed. Reap released writers whose data is already
+        // fully committed (the periodic flush applies the same rule), so the
+        // file cap counts only writers that still own publication work.
+        let candidates: Vec<(u64, Arc<FileWriter<B, M>>)> = self
+            .files
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect();
+        for (ino, writer) in candidates {
+            if writer.shared.released.load(Ordering::Acquire)
+                && writer.released_cleanup_ready().await
+                && let Some((_, removed)) = self.files.remove_if(&ino, |_, current| {
+                    Arc::ptr_eq(current, &writer) && current.shared.released.load(Ordering::Acquire)
+                })
+            {
+                removed.clear().await;
+            }
+        }
         if !self
             .recent_pending_upload
             .packed_tasks

@@ -13,7 +13,10 @@ RUN_XFSTESTS=true
 RUN_PJDFSTEST=true
 BUILD_IMAGES=true
 PARALLEL_SUITES=false
-META_BACKEND="${BREWFS_WORKSPACE_META_BACKEND:-sqlite}"
+# Packed-v3 workspace experiments are intentionally scoped to the distributed
+# metadata catalogs. SQLite/sqlx remains available to historical code paths,
+# but must not be selected by this acceptance runner.
+META_BACKEND="${BREWFS_WORKSPACE_META_BACKEND:-redis}"
 WORKSPACE_COUNT=2
 
 log() { printf '[workspace-overlay] %s\n' "$*"; }
@@ -23,9 +26,10 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [options]
 
-Build the feature-enabled BrewFS test images, create two workspaces from one
-sealed base, verify simultaneous FUSE isolation, and run each selected POSIX
-suite against both workspaces.
+Build the feature-enabled BrewFS test images, build one immutable packed-v3
+lower from seed files, fork two workspaces from its exact revision, verify
+simultaneous FUSE isolation, and run each selected POSIX suite against both
+workspaces. There is no seal step.
 
 Options:
   --xfstests-cases "CASES"  xfstests cases (default: $XFSTESTS_CASES)
@@ -34,7 +38,7 @@ Options:
   --reuse-images            reuse existing feature-enabled images
   --parallel-suites         run workspace A and B suites concurrently
   --single-workspace        run suites only on workspace A
-  --meta-backend BACKEND    workspace catalog: sqlite, redis or tikv
+  --meta-backend BACKEND    workspace catalog: redis or tikv (default: $META_BACKEND)
   -h, --help                show this help
 EOF
 }
@@ -82,8 +86,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$META_BACKEND" in
-    sqlite|redis|tikv) ;;
-    *) die "--meta-backend must be sqlite, redis or tikv" ;;
+    redis|tikv) ;;
+    *) die "--meta-backend must be redis or tikv (sqlite/sqlx is not an acceptance backend)" ;;
 esac
 
 command -v cargo >/dev/null || die "cargo is required"
@@ -100,8 +104,8 @@ mkdir -p "$state_dir" "$run_dir/dual-mount" "$run_dir/xfstests-a" \
 network="brewfs-workspace-$ts"
 dependency_containers=()
 catalog_namespace="workspace-$ts"
-catalog_url="sqlite:///var/lib/brewfs/workspace.db?mode=rwc"
-catalog_cli_backend="sqlx"
+catalog_url="${BREWFS_WORKSPACE_META_URL:-redis://redis:6379}"
+catalog_cli_backend="$META_BACKEND"
 catalog_tikv_endpoints="pd:2379"
 harness_script="$SCRIPT_DIR/run_workspace_overlay_dual_mount_in_container.sh"
 
@@ -118,11 +122,7 @@ trap cleanup_dependencies EXIT INT TERM
 
 docker network create "$network" >/dev/null
 case "$META_BACKEND" in
-    sqlite)
-        ;;
     redis)
-        catalog_cli_backend="redis"
-        catalog_url="redis://redis:6379"
         redis_container="brewfs-workspace-redis-$ts"
         dependency_containers+=("$redis_container")
         log "starting Redis workspace catalog"
@@ -172,7 +172,7 @@ catalog_cli_args=(
     --workspace-namespace "$catalog_namespace"
 )
 case "$catalog_cli_backend" in
-    sqlx|redis) catalog_cli_args+=(--meta-url "$catalog_url") ;;
+    redis) catalog_cli_args+=(--meta-url "$catalog_url") ;;
     tikv) catalog_cli_args+=(--meta-tikv-pd-endpoints "$catalog_tikv_endpoints") ;;
 esac
 
@@ -181,9 +181,11 @@ if [[ "$BUILD_IMAGES" == true ]]; then
     (
         cd "$PROJECT_DIR"
         CARGO_PROFILE_RELEASE_DEBUG=0 cargo build --release -p brewfs --bin brewfs \
-            --features workspace-overlay
+            --bin packed_v3_snapshot_fixture --features workspace-overlay
         mkdir -p target/docker
         install -m 755 target/release/brewfs target/docker/brewfs
+        install -m 755 target/release/packed_v3_snapshot_fixture \
+            target/docker/packed_v3_snapshot_fixture
     )
     log "building xfstests image $XFSTESTS_IMAGE"
     if docker image inspect "$FALLBACK_BASE_IMAGE" >/dev/null 2>&1; then
@@ -216,12 +218,49 @@ run_cli() {
         "$XFSTESTS_IMAGE" "$@"
 }
 
+# The CLI may log before printing JSON; parse from the first top-level "{"/"[".
+json_doc() {
+    python3 -c '
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+start = next(i for i, line in enumerate(lines) if line in ("{", "["))
+print(json.dumps(json.loads("\n".join(lines[start:]))))' "$1"
+}
+
 extract_workspace_id() {
-    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["workspace_id"])' "$1"
+    json_doc "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["workspace_id"])'
+}
+
+extract_revision() {
+    json_doc "$1" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)["fork_base"]
+print("%s:%s:%s" % (r["layer_id"], r["sealed_version"], bytes(r["root_hash"]).hex()))'
 }
 
 extract_fork_ids() {
-    python3 -c 'import json,sys; print("\n".join(item["workspace_id"] for item in json.load(open(sys.argv[1]))))' "$1"
+    json_doc "$1" | python3 -c 'import json,sys; print("\n".join(item["workspace_id"] for item in json.load(sys.stdin)))'
+}
+
+# Build the shared seed content as the immutable packed lower (no seal).
+build_seed_lower() {
+    local seed="$state_dir/seed"
+    rm -rf "$seed"
+    mkdir -p "$seed" "$state_dir/data"
+    printf 'shared-base\n' >"$seed/shared-base.txt"
+    printf '0123456789abcdef' >"$seed/base-data.bin"
+    python3 -c 'import sys; open(sys.argv[1], "wb").write(b"x" * 4096)' "$seed/mmap-base.bin"
+    docker run --rm \
+        --workdir /var/lib/brewfs \
+        -v "$state_dir:/var/lib/brewfs" \
+        --entrypoint /usr/local/bin/packed_v3_snapshot_fixture \
+        "$XFSTESTS_IMAGE" --wire-version 5 --source-directory /var/lib/brewfs/seed \
+        --source-consistency best-effort-detected --source-hardlink-policy visible-links \
+        --output-dir /var/lib/brewfs/data --prefix workspace-lower \
+        --manifest-output /var/lib/brewfs/manifest-key.txt >"$run_dir/packed-fixture.log" 2>&1 \
+        || die "packed lower build failed; see $run_dir/packed-fixture.log"
+    printf 'data:\n  backend: local-fs\n  localfs:\n    data_dir: /var/lib/brewfs/data\n' \
+        >"$state_dir/packed-data.yaml"
 }
 
 run_dual_harness() {
@@ -279,7 +318,6 @@ run_suite() {
         -e BREWFS_META_TIKV_PD_ENDPOINTS="$catalog_tikv_endpoints" \
         -e BREWFS_META_TIKV_NAMESPACE="$catalog_namespace" \
         -e BREWFS_WORKSPACE_NAMESPACE="$catalog_namespace" \
-        -e BREWFS_SQLITE_PATH=/var/lib/brewfs/workspace.db \
         -e BREWFS_DATA_BACKEND=local-fs \
         -e BREWFS_DATA_DIR=/var/lib/brewfs/data \
         -e BREWFS_CACHE_ROOT="/var/lib/brewfs/suite-cache/$workspace" \
@@ -292,16 +330,18 @@ run_suite() {
         "$image"
 }
 
-log "initializing workspace volume"
-run_cli "${catalog_cli_args[@]}" init-volume --owner workspace-harness \
+log "building the shared packed lower"
+build_seed_lower
+
+log "initializing workspace volume over the packed lower"
+run_cli "${catalog_cli_args[@]}" init-packed-volume \
+    --manifest-key "$(tr -d '[:space:]' <"$state_dir/manifest-key.txt")" \
+    --data-config /var/lib/brewfs/packed-data.yaml --owner workspace-harness \
     >"$run_dir/init.json"
-root_workspace="$(extract_workspace_id "$run_dir/init.json")"
+base_revision="$(extract_revision "$run_dir/init.json")"
 
-log "seeding shared base through a real FUSE mount"
-run_dual_harness seed "$root_workspace" "" "$run_dir/dual-mount"
-
-log "sealing the base and creating $WORKSPACE_COUNT O(1) fork(s)"
-run_cli "${catalog_cli_args[@]}" fork "$root_workspace" --count "$WORKSPACE_COUNT" \
+log "creating $WORKSPACE_COUNT O(1) fork(s) of $base_revision"
+run_cli "${catalog_cli_args[@]}" fork "$base_revision" --count "$WORKSPACE_COUNT" \
     --owner workspace-harness >"$run_dir/fork.json"
 mapfile -t fork_ids < <(extract_fork_ids "$run_dir/fork.json")
 [[ ${#fork_ids[@]} -eq "$WORKSPACE_COUNT" ]] \
@@ -318,8 +358,6 @@ if (( WORKSPACE_COUNT == 2 )); then
     run_dual_harness verify "$workspace_a" "$workspace_b" "$run_dir/dual-mount"
     log "verifying concurrent forks with two mounted writers"
     run_dual_harness concurrent-fork "$workspace_a" "$workspace_b" "$run_dir/concurrent-fork"
-    log "verifying concurrent seals with two mounted writers"
-    run_dual_harness concurrent-seal "$workspace_a" "$workspace_b" "$run_dir/concurrent-seal"
 else
     log "single-workspace mode: skipping dual-workspace isolation check"
 fi

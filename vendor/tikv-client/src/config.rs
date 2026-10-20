@@ -165,7 +165,13 @@ impl Config {
         self.pd_max_decoding_message_size = 16 << 10;
         self.max_cached_regions = 0;
         self.max_cached_stores = 0;
-        self.max_cached_kv_clients = 0;
+        // Keep one live RPC channel in the bounded store endpoint cache. A zero cache avoids
+        // retained SDK state but opens a fresh TCP connection for every region
+        // request; concurrent workspace writers can then exhaust ephemeral
+        // ports before TiKV has time to recycle the sockets. The endpoint map
+        // remains explicitly bounded and retained clients share this resource
+        // owner.
+        self.max_cached_kv_clients = 1;
         self.max_cache_entry_bytes = 16 << 10;
         self.tso_max_pending_groups = 1;
         self.tso_max_batch_size = 1;

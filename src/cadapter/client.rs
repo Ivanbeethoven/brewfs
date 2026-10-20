@@ -38,6 +38,13 @@ pub trait ObjectBackend: Send + Sync {
         anyhow::bail!("object backend does not support atomic create-only PUT")
     }
 
+    /// Strict create-only publication with the backend's durability barrier.
+    /// No overwrite fallback is allowed. A buffered write or an unsynced local
+    /// directory entry is not sufficient to publish a durable entity map.
+    async fn put_object_create_only_durable(&self, _key: &str, _data: &[u8]) -> Result<()> {
+        anyhow::bail!("object backend does not support durable atomic create-only PUT")
+    }
+
     async fn get_object(&self, key: &str) -> Result<Option<Vec<u8>>>;
 
     /// Preserve a whole GET's physical request shape while streaming its body.
@@ -129,6 +136,19 @@ pub trait ObjectBackend: Send + Sync {
 
     #[allow(dead_code)]
     async fn get_etag(&self, key: &str) -> Result<String>;
+
+    /// Typed metadata route for an ETag HEAD request. Backends with a
+    /// transport observer should override this so the physical HTTP attempt
+    /// is attributed to the supplied read scope. The default keeps existing
+    /// test and local backends source-compatible.
+    async fn get_etag_observed(
+        &self,
+        key: &str,
+        _context: ReadContext,
+        _observer: Arc<ReadObserver>,
+    ) -> Result<String> {
+        self.get_etag(key).await
+    }
 
     #[allow(dead_code)]
     async fn delete_object(&self, key: &str) -> Result<()>;
@@ -499,6 +519,15 @@ impl<B: ObjectBackend> ObjectClient<B> {
             .await
     }
 
+    pub(crate) async fn backend_etag_observed(
+        &self,
+        key: &str,
+        context: ReadContext,
+        observer: Arc<ReadObserver>,
+    ) -> Result<String> {
+        self.backend.get_etag_observed(key, context, observer).await
+    }
+
     pub(crate) async fn backend_object_stream(
         &self,
         key: &str,
@@ -742,6 +771,38 @@ impl<B: ObjectBackend> ObjectClient<B> {
                     };
                     guard.fail(class);
                 }
+            }
+        }
+        result
+    }
+
+    /// Typed metadata query for an object's ETag. An observed client must use
+    /// this route; the unclassified `get_etag` method remains rejected while a
+    /// read observer is attached.
+    pub async fn typed_etag(&self, class: ReadClass, key: &str) -> Result<String> {
+        use super::read_observer::Ledger;
+        let scope = self.read_scope.as_ref().map(|(observer, context)| {
+            (
+                Arc::clone(observer),
+                self.active_context(ReadContext { class, ..*context }),
+            )
+        });
+        let fetch = scope
+            .as_ref()
+            .map(|(observer, context)| observer.start(Ledger::ValidatedFetch, *context, 0));
+        let backend = scope
+            .as_ref()
+            .map(|(observer, context)| observer.start(Ledger::BackendBody, *context, 0));
+        let result = match scope {
+            Some((observer, context)) => {
+                self.backend.get_etag_observed(key, context, observer).await
+            }
+            None => self.backend.get_etag(key).await,
+        };
+        for guard in [backend, fetch].into_iter().flatten() {
+            match &result {
+                Ok(_) => guard.succeed(),
+                Err(_) => guard.fail(FailureClass::Backend),
             }
         }
         result

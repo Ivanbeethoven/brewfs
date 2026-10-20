@@ -8,6 +8,9 @@ use crate::workspace_overlay::stores::redis::RedisWorkspaceBackend;
 use crate::workspace_overlay::stores::tikv::TiKvWorkspaceBackend;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
+/// (pages still to serve before applying, writes to apply).
+pub(super) type PendingExtentWrite = (i64, Vec<KvWrite>);
+
 #[derive(Clone)]
 pub(super) struct JournalMemoryBackend {
     pub(super) rows: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
@@ -18,6 +21,9 @@ pub(super) struct JournalMemoryBackend {
     bounded_calls: Arc<AtomicI64>,
     pub(super) page_size: Arc<AtomicI64>,
     pub(super) page_calls: Arc<AtomicI64>,
+    /// Applied (once) right after the Nth extent scan page is served, to
+    /// land a concurrent write behind the scan cursor.
+    pub(super) after_extent_page: Arc<std::sync::Mutex<Option<PendingExtentWrite>>>,
 }
 impl Default for JournalMemoryBackend {
     fn default() -> Self {
@@ -30,6 +36,7 @@ impl Default for JournalMemoryBackend {
             bounded_calls: Default::default(),
             page_size: Default::default(),
             page_calls: Default::default(),
+            after_extent_page: Default::default(),
         }
     }
 }
@@ -119,7 +126,7 @@ impl JournalMemoryBackend {
             0
         } else {
             self.lose_nth_write_reply
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     (remaining > 0).then_some(remaining - 1)
                 })
                 .unwrap_or(0)
@@ -269,6 +276,32 @@ impl WorkspaceKvBackend for JournalMemoryBackend {
     ) -> Result<Vec<KvEntry>, WorkspaceError> {
         limits.validate_scan_page(prefix, after_key_exclusive)?;
         self.page_calls.fetch_add(1, Ordering::SeqCst);
+        if prefix == b"delta/extent/" {
+            let injected = {
+                let mut hook = self.after_extent_page.lock().unwrap();
+                match hook.as_mut() {
+                    Some((0, _)) => hook.take().map(|(_, writes)| writes),
+                    Some((remaining, _)) => {
+                        *remaining -= 1;
+                        None
+                    }
+                    None => None,
+                }
+            };
+            if let Some(writes) = injected {
+                let mut rows = self.rows.lock().await;
+                for write in writes {
+                    match write {
+                        KvWrite::Put { key, value } => {
+                            rows.insert(key, value);
+                        }
+                        KvWrite::Delete { key } => {
+                            rows.remove(&key);
+                        }
+                    }
+                }
+            }
+        }
         let rows = self.rows.lock().await;
         let configured = self.page_size.load(Ordering::SeqCst);
         let cap = if configured > 0 {
@@ -534,6 +567,7 @@ async fn real_imported_graph_receipt_binds_typed_members_revision_and_recovery()
                 size_classes: SizeClassTable::default(),
                 build_policy: crate::workspace_overlay::packed_v3::wire005::V3BuildPolicy {
                     inline_data: false,
+                    p90: None,
                     ..Default::default()
                 },
                 metadata_codec: PackedCodec::Raw,
@@ -1052,6 +1086,68 @@ async fn packed_journal_commit_atomicity_with_test_only_seal_and_response_loss()
             .await
             .is_err()
     );
+
+    // A terminal journal retry must reject a retained root that still carries
+    // an outstanding PUT hold. This simulates a crash-visible partial root
+    // and prevents recovery from acknowledging incomplete publication.
+    other
+        .test_set_registry_root_pending_puts(journal.source.staging_id, 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        other
+            .commit_packed_journal(&journal, &publish, &seal, &budget)
+            .await,
+        Err(WorkspaceError::Busy)
+    ));
+}
+
+#[tokio::test]
+async fn packed_journal_abort_retry_allows_dispatched_pending_put() {
+    let backend = Arc::new(JournalMemoryBackend::default());
+    let budget = V3MountBudget::defaults();
+    let store =
+        KvWorkspaceStore::from_arc(backend.clone()).with_packed_reader_pin_budget(budget.clone());
+    let (_directory, publish) = setup(&store).await;
+    let journal = begin(&store, &publish, &budget).await;
+    let (reserved, guard) = store
+        .reserve_packed_upload(
+            &journal,
+            publish.lower.manifest_reference().clone(),
+            &budget,
+        )
+        .await
+        .unwrap();
+
+    // Dispatch is a durable single-use transition. A lost reply leaves the
+    // PUT marked dispatched while retaining its pending hold.
+    backend.lose_reply.store(true, Ordering::SeqCst);
+    assert!(
+        store
+            .dispatch_packed_upload(&reserved, &guard, &budget)
+            .await
+            .is_err()
+    );
+    let dispatched = store
+        .reopen_packed_journal(reserved.journal_id, &reserved.source, &budget)
+        .await
+        .unwrap();
+
+    // Aborting after that crash retains the pending hold. The abort CAS may
+    // also lose its reply; retry must acknowledge the exact AbortedRetained
+    // root without requiring pending_puts to reach zero.
+    backend.lose_reply.store(true, Ordering::SeqCst);
+    assert!(
+        store
+            .abort_packed_journal(&dispatched, "dispatch reply lost".into(), &budget)
+            .await
+            .is_err()
+    );
+    let aborted = store
+        .abort_packed_journal(&dispatched, "dispatch reply lost".into(), &budget)
+        .await
+        .unwrap();
+    assert_eq!(aborted.phase, PackedJournalPhase::Aborted);
 }
 
 #[tokio::test]

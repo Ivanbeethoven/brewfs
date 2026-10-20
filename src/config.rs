@@ -184,6 +184,17 @@ pub struct MountArgs {
     #[cfg_attr(not(feature = "workspace-overlay"), arg(skip))]
     pub workspace: Option<uuid::Uuid>,
 
+    /// Opt into the fresh-only experimental entity FUSE path. Production
+    /// admission and reopening an existing entity namespace remain disabled.
+    #[cfg_attr(feature = "workspace-overlay", arg(long, default_value_t = false))]
+    #[cfg_attr(not(feature = "workspace-overlay"), arg(skip))]
+    pub experimental_entity_mount: bool,
+
+    /// Fresh entity volume identity, required by --experimental-entity-mount.
+    #[cfg_attr(feature = "workspace-overlay", arg(long, value_name = "UUID"))]
+    #[cfg_attr(not(feature = "workspace-overlay"), arg(skip))]
+    pub entity_volume_id: Option<uuid::Uuid>,
+
     /// Object-store key of the immutable packed-metadata manifest.
     #[arg(long, value_name = "KEY")]
     pub packed_manifest_key: Option<String>,
@@ -288,6 +299,8 @@ pub enum VolumeFormat {
     #[default]
     FlatV1,
     WorkspaceV1,
+    /// Experimental entity namespace; production mount admission is not enabled.
+    WorkspaceEntityV1,
     WorkspaceNativeV2,
     #[cfg(feature = "native-packed-base")]
     PackedMetadataV1,
@@ -392,30 +405,37 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         owner: Option<String>,
     },
+    /// Initialize a new workspace-v1 volume whose default workspace overlays
+    /// an existing authenticated packed-v3 manifest as its read-only lower.
+    InitPackedVolume {
+        /// Content-addressed packed-v3 manifest object key (wire 005).
+        #[arg(long)]
+        manifest_key: String,
+        /// Mount configuration whose `data` section selects the object store
+        /// holding the manifest; no other section is used.
+        #[arg(long)]
+        data_config: PathBuf,
+        #[arg(long)]
+        owner: Option<String>,
+    },
     /// Add the explicit native-v2 control header for an existing workspace-v1
     /// catalog. This never rewrites the catalog header or migrates data.
     #[cfg(feature = "native-packed-base")]
     InitNative,
     /// Migrate an existing workspace catalog to the current entity format.
     Migrate,
-    /// Create a workspace from an exact sealed revision.
+    /// Create a workspace overlay on an exact immutable revision.
     Create {
         #[arg(long = "from", value_name = "REVISION")]
         revision: Option<crate::workspace_overlay::model::BaseRevision>,
         #[arg(long)]
         owner: Option<String>,
     },
-    /// Seal a workspace and create a named snapshot root.
-    Snapshot {
-        workspace: crate::workspace_overlay::ids::WorkspaceId,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long)]
-        owner: Option<String>,
-    },
-    /// Fork one or more workspaces from a workspace UUID or exact revision.
+    /// Fork one or more workspace overlays from an exact immutable revision.
+    /// A live workspace is never sealed to produce one.
     Fork {
-        source: String,
+        #[arg(value_name = "REVISION")]
+        source: crate::workspace_overlay::model::BaseRevision,
         #[arg(long, default_value_t = 1)]
         count: usize,
         #[arg(long)]
@@ -423,7 +443,7 @@ pub enum WorkspaceCommand {
     },
     /// List workspaces.
     List,
-    /// Inspect one workspace and its active lease/seal state.
+    /// Inspect one workspace and its active lease state.
     Inspect {
         workspace: crate::workspace_overlay::ids::WorkspaceId,
     },
@@ -440,12 +460,6 @@ pub enum WorkspaceCommand {
         workspace: crate::workspace_overlay::ids::WorkspaceId,
         #[arg(long)]
         force: bool,
-    },
-    /// Seal and fast-forward a target workspace if its base is unchanged.
-    Commit {
-        workspace: crate::workspace_overlay::ids::WorkspaceId,
-        #[arg(long = "to")]
-        target: crate::workspace_overlay::ids::WorkspaceId,
     },
 }
 
@@ -984,6 +998,8 @@ pub struct MountConfig {
     pub mount_point: PathBuf,
     pub volume_format: VolumeFormat,
     pub workspace: Option<uuid::Uuid>,
+    pub experimental_entity_mount: bool,
+    pub entity_volume_id: Option<uuid::Uuid>,
     pub packed_manifest_key: Option<String>,
     pub workspace_namespace: String,
     pub workspace_operator_managed: bool,
@@ -1096,6 +1112,23 @@ impl MountConfig {
         if workspace.is_none() && volume_format == VolumeFormat::WorkspaceNativeV2 {
             anyhow::bail!("workspace id is required with volume_format=workspace-native-v2");
         }
+        if workspace.is_none() && volume_format == VolumeFormat::WorkspaceEntityV1 {
+            anyhow::bail!("workspace id is required with volume_format=workspace-entity-v1");
+        }
+        if (args.experimental_entity_mount || args.entity_volume_id.is_some())
+            && volume_format != VolumeFormat::WorkspaceEntityV1
+        {
+            anyhow::bail!("experimental entity options require volume_format=workspace-entity-v1");
+        }
+        if args.experimental_entity_mount
+            && (args.entity_volume_id.is_none_or(|id| id.is_nil())
+                || workspace.is_none_or(|id| id.is_nil())
+                || packed_manifest_key.is_none())
+        {
+            anyhow::bail!(
+                "experimental entity mount requires non-nil --entity-volume-id, --workspace and --packed-manifest-key"
+            );
+        }
         #[cfg(feature = "native-packed-base")]
         if volume_format == VolumeFormat::PackedMetadataV1 {
             anyhow::bail!("packed-metadata-v1 is unsupported; use packed-metadata-v3");
@@ -1174,6 +1207,20 @@ impl MountConfig {
             .or(meta_cfg.backend)
             .unwrap_or(MetaBackendKind::Sqlx);
 
+        if args.experimental_entity_mount {
+            if !matches!(meta_backend, MetaBackendKind::Redis)
+                || !matches!(data_backend, DataBackendKind::S3)
+            {
+                anyhow::bail!("experimental entity mount requires Redis metadata and S3 objects");
+            }
+            if args.workspace_operator_managed || file_cfg.workspace_operator_managed {
+                anyhow::bail!("experimental entity mount cannot use legacy operator management");
+            }
+            if matches!(cache.writeback_mode, WriteBackMode::CommitBeforeUpload) {
+                anyhow::bail!("experimental entity mount requires upload-before-publication");
+            }
+        }
+
         if volume_format == VolumeFormat::WorkspaceNativeV2
             && !matches!(meta_backend, MetaBackendKind::Redis | MetaBackendKind::TiKv)
         {
@@ -1220,6 +1267,8 @@ impl MountConfig {
             mount_point,
             volume_format,
             workspace,
+            experimental_entity_mount: args.experimental_entity_mount,
+            entity_volume_id: args.entity_volume_id,
             packed_manifest_key,
             workspace_namespace: args
                 .workspace_namespace
@@ -1591,6 +1640,8 @@ mod tests {
             config,
             volume_format: None,
             workspace: None,
+            experimental_entity_mount: false,
+            entity_volume_id: None,
             packed_manifest_key: None,
             workspace_namespace: None,
             workspace_operator_managed: false,
@@ -1754,6 +1805,8 @@ mod tests {
             config: None,
             volume_format: None,
             workspace: None,
+            experimental_entity_mount: false,
+            entity_volume_id: None,
             packed_manifest_key: None,
             workspace_namespace: None,
             workspace_operator_managed: false,
@@ -1822,6 +1875,8 @@ mod tests {
             config: None,
             volume_format: None,
             workspace: None,
+            experimental_entity_mount: false,
+            entity_volume_id: None,
             packed_manifest_key: None,
             workspace_namespace: None,
             workspace_operator_managed: false,
@@ -2006,6 +2061,48 @@ mod tests {
         assert_eq!(
             config.packed_manifest_key.as_deref(),
             Some("snapshots/v3-manifest")
+        );
+    }
+
+    #[cfg(feature = "workspace-overlay")]
+    #[test]
+    fn experimental_entity_mount_requires_explicit_fresh_inputs() {
+        let mut args = empty_mount_args(None, Some("/unused-entity".into()));
+        assert!(
+            !MountConfig::from_sources(args.clone())
+                .unwrap()
+                .experimental_entity_mount
+        );
+        args.experimental_entity_mount = true;
+        assert!(
+            MountConfig::from_sources(args.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("volume_format")
+        );
+        args.volume_format = Some(VolumeFormat::WorkspaceEntityV1);
+        args.workspace = Some(uuid::Uuid::new_v4());
+        assert!(
+            MountConfig::from_sources(args.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("--entity-volume-id")
+        );
+        args.entity_volume_id = Some(uuid::Uuid::new_v4());
+        args.packed_manifest_key = Some("standalone/manifest".into());
+        assert!(
+            MountConfig::from_sources(args.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("Redis metadata and S3")
+        );
+        args.meta_backend = Some(MetaBackendKind::Redis);
+        args.data_backend = Some(DataBackendKind::S3);
+        args.s3_bucket = Some("isolated-experiment".into());
+        assert!(
+            MountConfig::from_sources(args)
+                .unwrap()
+                .experimental_entity_mount
         );
     }
 

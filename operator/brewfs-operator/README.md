@@ -14,7 +14,7 @@
 - `BrewFSWorkspaceSnapshot`：在 workspace quiesce 后 seal 并固定精确 revision
 
 完整生命周期、不可变 lower 保证和架构图见
-`../../doc/superpowers/specs/2026-09-03-brewfs-workspace-operator-lifecycle-spec.md`；可运行示例见
+`../../doc/superpowers/specs/overlay-workspace.md#operator-lifecycle-reference`；可运行示例见
 `manifests/example-workspace.yaml`。
 
 详细文档入口：

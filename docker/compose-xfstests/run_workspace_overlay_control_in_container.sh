@@ -9,6 +9,8 @@ catalog_backend="${BREWFS_WORKSPACE_META_BACKEND:-redis}"
 catalog_url="${BREWFS_WORKSPACE_META_URL:-redis://redis:6379/0}"
 catalog_tikv_endpoints="${BREWFS_WORKSPACE_TIKV_PD_ENDPOINTS:-pd:2379}"
 catalog_namespace="${BREWFS_WORKSPACE_NAMESPACE:-brewfs-workspace-overlay}"
+fixture="${BREWFS_PACKED_FIXTURE_BIN:-/usr/local/bin/packed_v3_snapshot_fixture}"
+data_dir="${BREWFS_DATA_DIR:-$state_dir/data}"
 
 die() {
     printf '[workspace-overlay] ERROR: %s\n' "$*" >&2
@@ -17,9 +19,8 @@ die() {
 
 [[ "$catalog_backend" == redis || "$catalog_backend" == tikv ]] \
     || die "BREWFS_WORKSPACE_META_BACKEND must be redis or tikv"
-[[ "$mode" == init || "$mode" == seed || "$mode" == fork || "$mode" == verify || \
-    "$mode" == concurrent-fork || "$mode" == concurrent-seal ]] \
-    || die "usage: $0 {init|seed|fork|verify|concurrent-fork|concurrent-seal}"
+[[ "$mode" == init || "$mode" == fork || "$mode" == verify || "$mode" == concurrent-fork ]] \
+    || die "usage: $0 {init|fork|verify|concurrent-fork}"
 
 mkdir -p "$state_dir"
 
@@ -52,29 +53,70 @@ else:
 PY
 }
 
+# The CLI may log before printing JSON; parse from the first top-level "{"/"[".
+json_body() {
+    python3 - "$1" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+lines = text.splitlines()
+start = next(i for i, line in enumerate(lines) if line in ("{", "["))
+print("\n".join(lines[start:]))
+PY
+}
+
+revision_of() {
+    python3 - "$1" <<'PY'
+import json
+import sys
+
+revision = json.load(open(sys.argv[1], encoding="utf-8"))["fork_base"]
+print(f"{revision['layer_id']}:{revision['sealed_version']}:{bytes(revision['root_hash']).hex()}")
+PY
+}
+
+# Shared seed content becomes the immutable packed lower. There is no seal:
+# a mounted workspace never turns into a new lower.
+build_seed_lower() {
+    local seed="$state_dir/seed"
+    rm -rf "$seed"
+    mkdir -p "$seed" "$data_dir"
+    printf 'shared-base\n' >"$seed/shared-base.txt"
+    printf '0123456789abcdef' >"$seed/base-data.bin"
+    python3 -c 'import sys; open(sys.argv[1], "wb").write(b"x" * 4096)' "$seed/mmap-base.bin"
+    "$fixture" --wire-version 5 --source-directory "$seed" \
+        --source-consistency best-effort-detected --source-hardlink-policy visible-links \
+        --output-dir "$data_dir" --prefix workspace-lower \
+        --manifest-output "$state_dir/manifest-key.txt" >"$state_dir/packed-fixture.log" 2>&1 \
+        || { cat "$state_dir/packed-fixture.log" >&2; die "packed lower build failed"; }
+    cat >"$state_dir/packed-data.yaml" <<YAML
+data:
+  backend: local-fs
+  localfs:
+    data_dir: $data_dir
+YAML
+}
+
 case "$mode" in
     init)
-        run_cli init-volume --owner workspace-compose \
-            >"$state_dir/workspace-init.json"
+        build_seed_lower
+        run_cli init-packed-volume --manifest-key "$(tr -d '[:space:]' <"$state_dir/manifest-key.txt")" \
+            --data-config "$state_dir/packed-data.yaml" --owner workspace-compose \
+            >"$state_dir/workspace-init.raw"
+        json_body "$state_dir/workspace-init.raw" >"$state_dir/workspace-init.json"
         workspace_id_from_json "$state_dir/workspace-init.json" \
             | head -n 1 >"$state_dir/root-workspace.id"
-        printf '[workspace-overlay] initialized root workspace %s\n' \
-            "$(tr -d '[:space:]' <"$state_dir/root-workspace.id")"
-        ;;
-    seed)
-        root_workspace="$(tr -d '[:space:]' <"$state_dir/root-workspace.id")"
-        [[ -n "$root_workspace" ]] || die "root workspace id is missing"
-        export BREWFS_WORKSPACE_HARNESS_MODE=seed
-        export BREWFS_WORKSPACE_A="$root_workspace"
-        export BREWFS_WORKSPACE_CATALOG_URL="$catalog_url"
-        unset BREWFS_WORKSPACE_B || true
-        exec /usr/local/bin/run_workspace_overlay_dual_mount_in_container.sh
+        revision_of "$state_dir/workspace-init.json" >"$state_dir/base-revision.txt"
+        printf '[workspace-overlay] initialized root workspace %s over packed lower %s\n' \
+            "$(tr -d '[:space:]' <"$state_dir/root-workspace.id")" \
+            "$(tr -d '[:space:]' <"$state_dir/base-revision.txt")"
         ;;
     fork)
-        root_workspace="$(tr -d '[:space:]' <"$state_dir/root-workspace.id")"
-        [[ -n "$root_workspace" ]] || die "root workspace id is missing"
-        run_cli fork "$root_workspace" --count 2 --owner workspace-compose \
-            >"$state_dir/workspace-fork.json"
+        revision="$(tr -d '[:space:]' <"$state_dir/base-revision.txt")"
+        [[ -n "$revision" ]] || die "base revision is missing"
+        run_cli fork "$revision" --count 2 --owner workspace-compose \
+            >"$state_dir/workspace-fork.raw"
+        json_body "$state_dir/workspace-fork.raw" >"$state_dir/workspace-fork.json"
         mapfile -t fork_ids < <(workspace_id_from_json "$state_dir/workspace-fork.json")
         [[ "${#fork_ids[@]}" -eq 2 ]] || die "expected two forked workspaces"
         printf '%s\n' "${fork_ids[0]}" >"$state_dir/workspace-a.id"
@@ -82,7 +124,7 @@ case "$mode" in
         printf '[workspace-overlay] forked workspaces %s and %s\n' \
             "${fork_ids[0]}" "${fork_ids[1]}"
         ;;
-    verify|concurrent-fork|concurrent-seal)
+    verify|concurrent-fork)
         workspace_a="$(tr -d '[:space:]' <"$state_dir/workspace-a.id")"
         workspace_b="$(tr -d '[:space:]' <"$state_dir/workspace-b.id")"
         [[ -n "$workspace_a" && -n "$workspace_b" ]] \

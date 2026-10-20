@@ -16,6 +16,35 @@ pub(crate) fn is_lock_conflict(status: &Status) -> bool {
     lock_conflict::is_status(status)
 }
 
+/// Return true for the fixed bounded-read diagnostic that identifies a
+/// per-key lock response. This classification only authorizes a bounded
+/// read retry at the caller's fixed timestamp; it never authorizes lock
+/// resolution or mutation replay. Keep it separate from the local lock
+/// certificate above, which is intentionally unforgeable by a remote status.
+pub(crate) fn is_retryable_key_lock(status: &Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status.message() == "bounded read returned a key or region error"
+        // A direct Get lock certificate uses location 1.  The regular
+        // transaction Get path returns the same per-key error nested in a
+        // KvPair, which the bounded codec tags as location 3.  Both are
+        // locally generated diagnostics; accepting only the fixed key-lock
+        // family/subtype keeps region, ambiguous, and malformed errors out
+        // of the retry path.
+        && matches!(
+            status.details(),
+            [b'B', b'R', b'E', 1 | 3, 2, 1, 0]
+        )
+}
+
+/// Return true only for the fixed bounded-read EpochNotMatch diagnostic.
+/// A region epoch refresh is safe for an unsent read-only request; the caller
+/// still owns a finite retry budget and must never replay a mutation.
+pub(crate) fn is_retryable_region(status: &Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status.message() == "bounded read returned a key or region error"
+        && matches!(status.details(), [b'B', b'R', b'E', 1 | 2, 1, 5, 0])
+}
+
 pub(crate) fn certify_authentication_write_conflict(
     status: &mut Status,
     key: &[u8],

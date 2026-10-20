@@ -5,11 +5,58 @@ import unittest
 
 try:
     from .packed_run_manifest import ArtifactError, finalize_manifest, init_manifest
+    from .packed_resource_journal import append_event, finalize_journal, init_journal
 except ImportError:  # direct execution from tools/perf
     from packed_run_manifest import ArtifactError, finalize_manifest, init_manifest
+    from packed_resource_journal import append_event, finalize_journal, init_journal
 
 
 class PackedRunManifestTests(unittest.TestCase):
+    @staticmethod
+    def _write_journal(artifact: pathlib.Path, *, status: int = 0) -> None:
+        path = artifact / "resource-journal.json"
+        manifest = json.loads((artifact / "run-manifest.json").read_text())
+        init_journal(
+            path,
+            run_id=manifest["run_id"],
+            artifact=str(artifact),
+            project="fixture-project",
+            work="/tmp/fixture-work",
+        )
+        if status == 0:
+            for name in (
+                "compose_started",
+                "mount_ready",
+                "mount_unmounted",
+                "compose_stopped",
+                "work_removed",
+            ):
+                append_event(path, name)
+        finalize_journal(
+            path,
+            status=status,
+            mount_present=False,
+            process_alive=False,
+            compose_present=False,
+            work_present=False,
+        )
+
+    @staticmethod
+    def _write_toolchain(artifact: pathlib.Path) -> None:
+        (artifact / "toolchain.json").write_text(
+            json.dumps(
+                {
+                    "rustc_verbose": "rustc 1.90.0 (fixture)",
+                    "cargo_version": "cargo 1.90.0 (fixture)",
+                    "host": "x86_64-unknown-linux-gnu",
+                    "binary_profile": "release",
+                    "revision": "d" * 40,
+                    "dirty_diff_sha256": "e" * 64,
+                }
+            )
+        )
+        PackedRunManifestTests._write_journal(artifact)
+
     def test_old_encoding_is_rejected_before_creating_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             artifact = pathlib.Path(directory) / "rejected"
@@ -44,6 +91,7 @@ class PackedRunManifestTests(unittest.TestCase):
             (artifact / "manifest-key.txt").write_text("local-validation/manifest\n")
             (artifact / "binary-sha256.txt").write_text("a" * 64 + "  brewfs\n")
             (artifact / "source-sha256.json").write_text(json.dumps({"src/lib.rs": "b" * 64}))
+            self._write_toolchain(artifact)
             (artifact / "profile.env").write_text(
                 "\n".join(
                     [
@@ -118,6 +166,7 @@ class PackedRunManifestTests(unittest.TestCase):
             (artifact / "manifest-key.txt").write_text("local-validation/manifest\n")
             (artifact / "binary-sha256.txt").write_text("a" * 64 + "  brewfs\n")
             (artifact / "source-sha256.json").write_text(json.dumps({"src/lib.rs": "b" * 64}))
+            self._write_toolchain(artifact)
             (artifact / "profile.env").write_text(
                 "packed_version=v3\nwire_version=5\nscanner_seed=2\n"
                 "fixture_prefix=local-validation\nmanifest_schema=packed-v3-run-manifest-v1\n"
@@ -154,6 +203,31 @@ class PackedRunManifestTests(unittest.TestCase):
             with self.assertRaises(ArtifactError):
                 finalize_manifest(artifact, status=0)
 
+    def test_success_manifest_rejects_invalid_toolchain_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = pathlib.Path(directory)
+            init_manifest(
+                artifact,
+                run_id="invalid-toolchain",
+                wire_version=5,
+                controls={"mode": "stat", "scanner_seed": 1},
+                fixture_prefix="local-validation",
+            )
+            (artifact / "manifest-key.txt").write_text("local-validation/manifest\n")
+            (artifact / "binary-sha256.txt").write_text("a" * 64 + "  brewfs\n")
+            (artifact / "source-sha256.json").write_text(json.dumps({"src/lib.rs": "b" * 64}))
+            (artifact / "toolchain.json").write_text(
+                json.dumps({"rustc_verbose": "rustc fixture"})
+            )
+            (artifact / "profile.env").write_text(
+                "packed_version=v3\nwire_version=5\nscanner_seed=1\n"
+                "fixture_prefix=local-validation\nmanifest_schema=packed-v3-run-manifest-v1\n"
+                "order=shuffle\nmode=stat\n"
+            )
+            (artifact / "cache-proof.env").write_text("page_cache=dropped\n")
+            with self.assertRaises(ArtifactError):
+                finalize_manifest(artifact, status=0)
+
     def test_layout_controls_are_validated_when_present(self):
         with tempfile.TemporaryDirectory() as directory:
             artifact = pathlib.Path(directory)
@@ -185,6 +259,7 @@ class PackedRunManifestTests(unittest.TestCase):
                 controls={"mode": "stat", "scanner_seed": 20261001},
                 fixture_prefix="local-validation",
             )
+            self._write_journal(artifact, status=124)
             finalize_manifest(artifact, status=124)
             manifest = json.loads((artifact / "run-manifest.json").read_text())
             self.assertEqual(manifest["status"], "failed")

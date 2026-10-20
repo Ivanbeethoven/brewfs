@@ -205,41 +205,17 @@ impl<W: WorkspaceStore + 'static> WorkspaceStore for BindingWithoutPins<W> {
     ) -> Result<CanonicalLayerDelta, WorkspaceError> {
         self.inner.load_layer_delta(layer_id).await
     }
-    async fn begin_seal(&self, request: BeginSeal) -> Result<SealJournal, WorkspaceError> {
-        self.inner.begin_seal(request).await
-    }
-    async fn advance_seal(&self, request: AdvanceSeal) -> Result<SealJournal, WorkspaceError> {
-        self.inner.advance_seal(request).await
-    }
-    async fn hash_seal(&self, journal_id: JournalId) -> Result<SealJournal, WorkspaceError> {
-        self.inner.hash_seal(journal_id).await
-    }
-    async fn commit_seal(&self, journal_id: JournalId) -> Result<SealResult, WorkspaceError> {
-        self.inner.commit_seal(journal_id).await
-    }
-    async fn abort_recoverable_seal(&self, request: AbortSeal) -> Result<(), WorkspaceError> {
-        self.inner.abort_recoverable_seal(request).await
-    }
     async fn load_seal_journal(
         &self,
         journal_id: JournalId,
     ) -> Result<SealJournal, WorkspaceError> {
         self.inner.load_seal_journal(journal_id).await
     }
-    async fn list_incomplete_seal_journals(&self) -> Result<Vec<SealJournal>, WorkspaceError> {
-        self.inner.list_incomplete_seal_journals().await
-    }
     async fn list_seal_journals(
         &self,
         workspace_id: WorkspaceId,
     ) -> Result<Vec<SealJournal>, WorkspaceError> {
         self.inner.list_seal_journals(workspace_id).await
-    }
-    async fn fast_forward_commit(
-        &self,
-        request: FastForwardCommit,
-    ) -> Result<CommitResult, WorkspaceError> {
-        self.inner.fast_forward_commit(request).await
     }
     async fn mark_workspace_deleting(&self, request: MarkDeleting) -> Result<(), WorkspaceError> {
         self.inner.mark_workspace_deleting(request).await
@@ -272,11 +248,5 @@ impl<W: WorkspaceStore + 'static> WorkspaceStore for BindingWithoutPins<W> {
         grace_ns: u64,
     ) -> Result<(), WorkspaceError> {
         self.inner.prune_terminal_records(now_ns, grace_ns).await
-    }
-    async fn install_compaction(
-        &self,
-        request: InstallCompaction,
-    ) -> Result<CompactionResult, WorkspaceError> {
-        self.inner.install_compaction(request).await
     }
 }

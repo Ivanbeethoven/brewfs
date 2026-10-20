@@ -64,6 +64,7 @@ struct Fixture {
     vfs: NativeVfs,
     guard: HeadGuard,
     payload: Vec<u8>,
+    binding: crate::workspace_overlay::publish::binding::PackedLowerBindingRecord,
 }
 
 async fn fixture(wrong_vfs_upper: bool) -> Fixture {
@@ -79,6 +80,21 @@ async fn fixture_from_packed(
         crate::workspace_overlay::publish::binding::VerifiedPackedLower,
         Vec<u8>,
     ),
+) -> Fixture {
+    fixture_with_lease(wrong_vfs_upper, input, None).await
+}
+
+/// `lease`: bind the upper row cache (60 s TTL) to this proof, as the CLI does.
+async fn fixture_with_lease(
+    wrong_vfs_upper: bool,
+    input: (
+        tempfile::TempDir,
+        ObjectClient<LocalFsBackend>,
+        AuthenticatedV3Snapshot,
+        crate::workspace_overlay::publish::binding::VerifiedPackedLower,
+        Vec<u8>,
+    ),
+    lease: Option<Arc<crate::workspace_overlay::lifecycle::LeaseValidity>>,
 ) -> Fixture {
     let (directory, client, snapshot, lower_proof, payload) = input;
     let backend = PinMemoryBackend::default();
@@ -119,21 +135,31 @@ async fn fixture_from_packed(
         store: store.clone(),
         reader: reader.clone(),
     });
-    let meta = Arc::new(
-        WorkspaceMetaLayer::with_chunk_size(
-            store.clone(),
-            ViewContext {
-                workspace_id: guard.workspace_id,
-                head_layer_id: guard.expected_head_layer_id,
-                head_epoch: guard.expected_head_epoch,
-                lease_id: guard.lease_id,
-                holder_generation: guard.holder_generation,
-            },
-            CHUNK,
-        )
-        .with_packed_v3_lower(binding.binding, lower, authority, upper.clone(), layout)
-        .unwrap(),
-    );
+    let mut meta_layer = WorkspaceMetaLayer::with_chunk_size(
+        store.clone(),
+        ViewContext {
+            workspace_id: guard.workspace_id,
+            head_layer_id: guard.expected_head_layer_id,
+            head_epoch: guard.expected_head_epoch,
+            lease_id: guard.lease_id,
+            holder_generation: guard.holder_generation,
+        },
+        CHUNK,
+    )
+    .with_packed_v3_lower(
+        binding.binding.clone(),
+        lower,
+        authority,
+        upper.clone(),
+        layout,
+    )
+    .unwrap();
+    if let Some(lease) = lease {
+        meta_layer = meta_layer
+            .with_upper_row_cache(std::time::Duration::from_secs(60))
+            .with_lease_bound_row_cache(lease);
+    }
+    let meta = Arc::new(meta_layer);
     meta.initialize().await.unwrap();
     let vfs_upper = if wrong_vfs_upper {
         Arc::new(InMemoryBlockStore::new())
@@ -159,6 +185,7 @@ async fn fixture_from_packed(
         vfs,
         guard,
         payload,
+        binding,
     }
 }
 
@@ -597,6 +624,566 @@ async fn actual_native_capture_rejects_other_vfs_upper_without_catalog_write() {
     native.validate().await.unwrap();
     drop(native);
     f.meta.shutdown_session().await.unwrap();
+}
+
+#[tokio::test]
+async fn lease_proven_read_fence_is_local_and_falls_back_to_remote_on_doubt() {
+    use crate::chunk::read_plan::{ReadViewChanged, WorkspaceReadPlanProvider};
+    use crate::workspace_overlay::lifecycle::LeaseValidity;
+    let validity = Arc::new(LeaseValidity::new(
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(60),
+    ));
+    let f = fixture_with_lease(false, packed().await, Some(validity.clone())).await;
+    // Copy inode 400 up (a real chmod), then warm its cached rows.
+    f.vfs.chmod(400, 0o644).await.unwrap();
+    let warm = f
+        .meta
+        .begin_unified_read_request(400)
+        .await
+        .unwrap()
+        .unwrap();
+    warm.ensure_current().await.unwrap();
+    drop(warm);
+    // Lease proven and rows cached: begin + ensure_current issue no fence
+    // round trip at all.
+    let before = f.backend.timed_reads.load(Ordering::SeqCst);
+    let request = f
+        .meta
+        .begin_unified_read_request(400)
+        .await
+        .unwrap()
+        .unwrap();
+    request.ensure_current().await.unwrap();
+    request.ensure_current().await.unwrap();
+    assert_eq!(f.backend.timed_reads.load(Ordering::SeqCst), before);
+    // A local commit to the inode invalidates its cached rows: the open
+    // request's fence falls back to the remote check, which sees the changed
+    // rows and asks the reader to retry.
+    f.vfs.chmod(400, 0o600).await.unwrap();
+    let error = request.ensure_current().await.unwrap_err();
+    assert!(error.downcast_ref::<ReadViewChanged>().is_some());
+    assert!(f.backend.timed_reads.load(Ordering::SeqCst) > before);
+    // Lease no longer proven: fences are remote again, and losing the real
+    // lease fails the request closed.
+    validity.revoke();
+    let request = f
+        .meta
+        .begin_unified_read_request(400)
+        .await
+        .unwrap()
+        .unwrap();
+    let remote_before = f.backend.timed_reads.load(Ordering::SeqCst);
+    request.ensure_current().await.unwrap();
+    assert!(f.backend.timed_reads.load(Ordering::SeqCst) > remote_before);
+    f.store
+        .release_lease(crate::workspace_overlay::catalog::ReleaseLease {
+            lease_id: f.guard.lease_id,
+            holder_generation: f.guard.holder_generation,
+        })
+        .await
+        .unwrap();
+    let error = request.ensure_current().await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<WorkspaceError>(),
+        Some(WorkspaceError::Fenced)
+    ));
+    f.reader.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn lease_proven_actor_checks_reuse_cached_parent_permissions_but_see_chmod() {
+    use crate::meta::layer::{NamespaceActor, scope_namespace_actor};
+    use crate::workspace_overlay::lifecycle::LeaseValidity;
+    let validity = Arc::new(LeaseValidity::new(
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(60),
+    ));
+    let f = fixture_with_lease(false, packed().await, Some(validity.clone())).await;
+    // A world-writable upper directory, so a non-root actor may create in it.
+    let dir = f.vfs.mkdir_p("/actor-dir").await.unwrap();
+    f.vfs.chmod(dir, 0o777).await.unwrap();
+    let actor = NamespaceActor {
+        uid: 4242,
+        gid: 4242,
+        groups: vec![4242],
+    };
+    let create = |name: &'static str| {
+        let vfs = f.vfs.clone();
+        let actor = actor.clone();
+        async move {
+            scope_namespace_actor(
+                Some(actor),
+                vfs.create_file_at_with_umask(dir, name, true, 0o644, 0, 4242, 4242),
+            )
+            .await
+        }
+    };
+    create("warm").await.unwrap();
+    // Parent (and root ancestor) permission rows are now cached.
+    let first = f.backend.consistent_reads.load(Ordering::SeqCst);
+    create("a").await.unwrap();
+    let cached = f.backend.consistent_reads.load(Ordering::SeqCst) - first;
+    // While the cache is authoritative, a local chmod removing write access
+    // is still enforced on the very next create: the chmod commit
+    // invalidated the cached parent rows.
+    f.vfs.chmod(dir, 0o755).await.unwrap();
+    assert!(create("denied").await.is_err());
+    f.vfs.chmod(dir, 0o777).await.unwrap();
+    create("warm-again").await.unwrap();
+    // Without the lease proof every actor check reads the store again.
+    validity.revoke();
+    let start = f.backend.consistent_reads.load(Ordering::SeqCst);
+    create("c").await.unwrap();
+    let uncached = f.backend.consistent_reads.load(Ordering::SeqCst) - start;
+    assert!(
+        cached < uncached,
+        "cached actor checks ({cached}) must read less than uncached ({uncached})"
+    );
+    f.reader.shutdown().await.unwrap();
+}
+
+/// Kept invariant: a live lease excludes a second holder (no split-brain).
+#[tokio::test]
+async fn invariant_second_mount_cannot_acquire_a_live_lease() {
+    let f = fixture(false).await;
+    let second = f
+        .store
+        .acquire_lease(crate::workspace_overlay::catalog::AcquireLease {
+            workspace_id: f.guard.workspace_id,
+            lease_id: crate::workspace_overlay::ids::LeaseId::new(),
+            holder_generation: 99,
+            ttl_ns: 30_000_000_000,
+        })
+        .await;
+    assert!(matches!(second, Err(WorkspaceError::Busy)), "{second:?}");
+    // The original holder still commits.
+    f.vfs.create_file("/still-mine").await.unwrap();
+    f.reader.shutdown().await.unwrap();
+}
+
+/// Kept invariant: once the lease has expired (backend clock), no commit by
+/// the old holder succeeds, even though nothing else changed.
+#[tokio::test]
+async fn invariant_commit_after_lease_expiry_fails_closed() {
+    let f = fixture(false).await;
+    f.vfs.create_file("/before-expiry").await.unwrap();
+    // Past the 30 s fixture lease (backend clock), with no renewal.
+    f.backend.now.fetch_add(31_000_000_000, Ordering::SeqCst);
+    assert!(f.vfs.create_file("/after-expiry").await.is_err());
+    assert!(f.vfs.stat("/after-expiry").await.is_err());
+    f.reader.shutdown().await.unwrap();
+}
+
+/// Kept invariant: losing the lease fences this mount, and while the packed
+/// open record is held no other holder can take the workspace over.
+#[tokio::test]
+async fn invariant_commit_after_lease_loss_fails_closed_and_blocks_takeover() {
+    let f = fixture(false).await;
+    f.store
+        .release_lease(crate::workspace_overlay::catalog::ReleaseLease {
+            lease_id: f.guard.lease_id,
+            holder_generation: f.guard.holder_generation,
+        })
+        .await
+        .unwrap();
+    assert!(f.vfs.create_file("/after-release").await.is_err());
+    let takeover = f
+        .store
+        .acquire_lease(crate::workspace_overlay::catalog::AcquireLease {
+            workspace_id: f.guard.workspace_id,
+            lease_id: crate::workspace_overlay::ids::LeaseId::new(),
+            holder_generation: 99,
+            ttl_ns: 30_000_000_000,
+        })
+        .await;
+    assert!(
+        matches!(takeover, Err(WorkspaceError::Busy)),
+        "{takeover:?}"
+    );
+    f.reader.shutdown().await.unwrap();
+}
+
+/// Kept invariant: no admin path rotates the head of a workspace whose
+/// writable lease is live. Head-changing publication must present the live
+/// lease itself; a foreign holder (or a fresh lease) is fenced and nothing
+/// is written, so the mount keeps committing against an unchanged head.
+#[tokio::test]
+async fn invariant_no_head_change_under_an_active_lease() {
+    let f = fixture(false).await;
+    let expected_binding = f.binding.clone();
+    let before_workspace = f.store.load_workspace(f.guard.workspace_id).await.unwrap();
+    let layers: [crate::workspace_overlay::model::LayerRecord; 2] = f
+        .store
+        .load_layer_chain(f.guard.expected_head_layer_id)
+        .await
+        .unwrap()
+        .try_into()
+        .unwrap();
+    // A genuinely new manifest, so only the lease authority can refuse it.
+    let (_new_objects, _, _, lower, _) =
+        crate::workspace_overlay::stores::binding_tests::packed_with_snapshot_id([11; 32]).await;
+    for foreign in [
+        // Another holder generation of the same lease id.
+        HeadGuard {
+            holder_generation: f.guard.holder_generation + 1,
+            ..f.guard.clone()
+        },
+        // A different lease id (an admin's own fresh lease).
+        HeadGuard {
+            lease_id: crate::workspace_overlay::ids::LeaseId::new(),
+            ..f.guard.clone()
+        },
+    ] {
+        let result = f
+            .store
+            .publish_packed_lower_binding(
+                crate::workspace_overlay::publish::binding::PublishPackedLowerBinding {
+                    guard: foreign,
+                    expected_layers: layers.clone(),
+                    expected_base: expected_binding.base_revision.clone(),
+                    expected_binding: expected_binding.clone(),
+                    lower: lower.clone(),
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(WorkspaceError::Fenced)), "{result:?}");
+    }
+    // A competing lease cannot even be acquired while this one is live.
+    let competing = f
+        .store
+        .acquire_lease(crate::workspace_overlay::catalog::AcquireLease {
+            workspace_id: f.guard.workspace_id,
+            lease_id: crate::workspace_overlay::ids::LeaseId::new(),
+            holder_generation: 99,
+            ttl_ns: 30_000_000_000,
+        })
+        .await;
+    assert!(
+        matches!(competing, Err(WorkspaceError::Busy)),
+        "{competing:?}"
+    );
+    let after_workspace = f.store.load_workspace(f.guard.workspace_id).await.unwrap();
+    assert_eq!(
+        after_workspace.head_layer_id,
+        before_workspace.head_layer_id
+    );
+    assert_eq!(after_workspace.head_epoch, before_workspace.head_epoch);
+    assert_eq!(after_workspace.active_lease, Some(f.guard.lease_id));
+    f.vfs.create_file("/head-unchanged").await.unwrap();
+    f.reader.shutdown().await.unwrap();
+}
+
+/// Sole writer: a warm commit reuses its own last commit's post-image as the
+/// CAS conditions and issues no view pre-read; a lease renewal (the only
+/// expected outside change) costs one fallback re-read, never an error.
+#[tokio::test]
+async fn sole_writer_commit_skips_the_view_pre_read_and_survives_renewal() {
+    let f = fixture(false).await;
+    f.vfs.create_file("/warm-0").await.unwrap();
+    let before = f.backend.view_reads.load(Ordering::SeqCst);
+    for index in 1..=4 {
+        f.vfs.create_file(&format!("/warm-{index}")).await.unwrap();
+    }
+    let warm = f.backend.view_reads.load(Ordering::SeqCst) - before;
+    assert_eq!(warm, 0, "warm commits must not pre-read their view");
+    // Renew the lease out of band one second later (backend clock), so the
+    // cached lease bytes really go stale.
+    f.backend.now.fetch_add(1_000_000_000, Ordering::SeqCst);
+    f.store
+        .renew_lease(crate::workspace_overlay::catalog::RenewLease {
+            lease_id: f.guard.lease_id,
+            holder_generation: f.guard.holder_generation,
+            ttl_ns: 30_000_000_000,
+        })
+        .await
+        .unwrap();
+    let before = f.backend.view_reads.load(Ordering::SeqCst);
+    f.vfs.create_file("/after-renew").await.unwrap();
+    assert!(f.vfs.stat("/after-renew").await.is_ok());
+    // The stale lease bytes fail one cached CAS; one fresh read recovers.
+    assert_eq!(f.backend.view_reads.load(Ordering::SeqCst) - before, 1);
+    for index in 0..=4 {
+        assert!(f.vfs.stat(&format!("/warm-{index}")).await.is_ok());
+    }
+    // Losing the lease still fails closed even with a warm cache.
+    f.store
+        .release_lease(crate::workspace_overlay::catalog::ReleaseLease {
+            lease_id: f.guard.lease_id,
+            holder_generation: f.guard.holder_generation,
+        })
+        .await
+        .unwrap();
+    assert!(f.vfs.create_file("/after-release").await.is_err());
+    f.reader.shutdown().await.unwrap();
+}
+
+/// A binding publication by the holder's own lease rewrites the workspace
+/// and head records, which every cached commit still checks: the next commit
+/// against the old binding cannot succeed from the cache and is fenced after
+/// its fresh re-read.
+#[tokio::test]
+async fn cached_commit_cannot_outlive_a_binding_publication() {
+    let f = fixture(false).await;
+    f.vfs.create_file("/warm").await.unwrap();
+    let layers: [crate::workspace_overlay::model::LayerRecord; 2] = f
+        .store
+        .load_layer_chain(f.guard.expected_head_layer_id)
+        .await
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let (_objects, _, _, lower, _) =
+        crate::workspace_overlay::stores::binding_tests::packed_with_snapshot_id([12; 32]).await;
+    f.store
+        .publish_packed_lower_binding(
+            crate::workspace_overlay::publish::binding::PublishPackedLowerBinding {
+                guard: f.guard.clone(),
+                expected_layers: layers,
+                expected_base: f.binding.base_revision.clone(),
+                expected_binding: f.binding.clone(),
+                lower,
+            },
+        )
+        .await
+        .unwrap();
+    let before = f.backend.view_reads.load(Ordering::SeqCst);
+    assert!(f.vfs.create_file("/after-publish").await.is_err());
+    assert!(
+        f.backend.view_reads.load(Ordering::SeqCst) > before,
+        "the stale cached view must fall back to a fresh read"
+    );
+    f.reader.shutdown().await.unwrap();
+}
+
+/// Concurrency oracle for any change to commit conflict detection: many
+/// tasks concurrently create files in one directory, write their own files
+/// and extend one shared file. No create may be lost or duplicated and no
+/// size update may be lost, whatever the commit serialization strategy.
+#[tokio::test]
+async fn concurrency_oracle_no_lost_creates_or_size_updates() {
+    use crate::chunk::SliceDesc;
+    use crate::meta::layer::MetaLayer;
+    const TASKS: u64 = 8;
+    const ROUNDS: u64 = 6;
+    let f = fixture(false).await;
+    let shared = f.meta.create_file(1, "oracle-shared".into()).await.unwrap();
+    let mut tasks = Vec::new();
+    for task in 0..TASKS {
+        let meta = f.meta.clone();
+        tasks.push(tokio::spawn(async move {
+            for round in 0..ROUNDS {
+                let ino = meta
+                    .create_file(1, format!("oracle-{task}-{round}"))
+                    .await
+                    .unwrap();
+                for (target, offset, slice) in [
+                    (ino, 0, 20_000 + task * 100 + round * 2),
+                    (
+                        shared,
+                        (task * ROUNDS + round) * 64,
+                        20_001 + task * 100 + round * 2,
+                    ),
+                ] {
+                    let chunk_id = crate::vfs::chunk_id_for(target, 0).unwrap();
+                    meta.write(
+                        target,
+                        chunk_id,
+                        SliceDesc {
+                            slice_id: slice,
+                            chunk_id,
+                            offset,
+                            length: 64,
+                        },
+                        offset + 64,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    for task in 0..TASKS {
+        for round in 0..ROUNDS {
+            let ino = f
+                .meta
+                .lookup(1, &format!("oracle-{task}-{round}"))
+                .await
+                .unwrap()
+                .expect("a committed create was lost");
+            assert_eq!(f.meta.stat(ino).await.unwrap().unwrap().size, 64);
+        }
+    }
+    assert_eq!(
+        f.meta.stat(shared).await.unwrap().unwrap().size,
+        TASKS * ROUNDS * 64,
+        "a concurrent size update to the shared file was lost"
+    );
+    f.reader.shutdown().await.unwrap();
+}
+
+/// Group commit: many concurrent writes share commits. Every write lands
+/// with its own extent and size; a write whose inode is gone fails alone
+/// without failing the writes it was batched with; a write returns only
+/// after its batch committed (so fsync after write sees it durable).
+#[tokio::test]
+async fn group_committed_writes_land_individually_and_fail_individually() {
+    use crate::chunk::SliceDesc;
+    use crate::meta::layer::MetaLayer;
+    let f = fixture(false).await;
+    let mut inodes = Vec::new();
+    for index in 0..24 {
+        inodes.push(f.meta.create_file(1, format!("gc-{index}")).await.unwrap());
+    }
+    let gone = 9_999_999;
+    let mut tasks = Vec::new();
+    for (index, ino) in inodes
+        .iter()
+        .copied()
+        .chain(std::iter::once(gone))
+        .enumerate()
+    {
+        let meta = f.meta.clone();
+        tasks.push(tokio::spawn(async move {
+            let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+            let result = meta
+                .write(
+                    ino,
+                    chunk_id,
+                    SliceDesc {
+                        slice_id: 30_000 + index as u64,
+                        chunk_id,
+                        offset: 0,
+                        length: 100 + index as u64,
+                    },
+                    100 + index as u64,
+                )
+                .await;
+            (ino, index as u64, result)
+        }));
+    }
+    for task in tasks {
+        let (ino, index, result) = task.await.unwrap();
+        if ino == gone {
+            assert!(
+                matches!(result, Err(crate::meta::store::MetaError::NotFound(_))),
+                "{result:?}"
+            );
+            continue;
+        }
+        result.unwrap();
+        // Returned => committed: visible right away with its own size.
+        assert_eq!(f.meta.stat(ino).await.unwrap().unwrap().size, 100 + index);
+    }
+    f.reader.shutdown().await.unwrap();
+}
+
+/// Writes to one file batched together keep every extent and the maximum
+/// size; the later of two overlapping writes wins on the overlap.
+#[tokio::test]
+async fn group_commit_same_file_keeps_order_and_size() {
+    use crate::chunk::SliceDesc;
+    use crate::meta::layer::MetaLayer;
+    let f = fixture(false).await;
+    let ino = f.meta.create_file(1, "gc-same".into()).await.unwrap();
+    let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+    let mut tasks = Vec::new();
+    for index in 0..16u64 {
+        let meta = f.meta.clone();
+        tasks.push(tokio::spawn(async move {
+            meta.write(
+                ino,
+                chunk_id,
+                SliceDesc {
+                    slice_id: 40_000 + index,
+                    chunk_id,
+                    offset: index * 64,
+                    length: 64,
+                },
+                index * 64 + 64,
+            )
+            .await
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    assert_eq!(f.meta.stat(ino).await.unwrap().unwrap().size, 16 * 64);
+    // Sequential overlapping writes: the second must win where they overlap.
+    for (slice_id, length) in [(41_000u64, 128u64), (41_001, 64)] {
+        f.meta
+            .write(
+                ino,
+                chunk_id,
+                SliceDesc {
+                    slice_id,
+                    chunk_id,
+                    offset: 0,
+                    length,
+                },
+                16 * 64,
+            )
+            .await
+            .unwrap();
+    }
+    use crate::workspace_overlay::model::ExtentKind;
+    let mut rows = f
+        .store
+        .get_extent_deltas(crate::workspace_overlay::catalog::ExtentQuery {
+            layer_ids: vec![f.guard.expected_head_layer_id],
+            ino,
+            chunk_index: 0,
+            range_start: 0,
+            range_end: 128,
+        })
+        .await
+        .unwrap();
+    rows.sort_by_key(|row| row.sequence);
+    let slices = rows
+        .iter()
+        .filter_map(|row| match row.kind {
+            ExtentKind::Data { slice_id, .. } if slice_id >= 41_000 => Some(slice_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // Arrival order is preserved in sequence order, so 41_001 resolves over
+    // 41_000 on their overlap (newest-wins).
+    assert_eq!(slices, vec![41_000, 41_001], "{rows:?}");
+    f.reader.shutdown().await.unwrap();
+}
+
+/// A create seeds the fresh inode's paths from its parent's cached paths;
+/// they must equal what an uncached reverse walk computes, at the root and
+/// in a subdirectory.
+#[tokio::test]
+async fn created_paths_are_seeded_exactly() {
+    use crate::meta::layer::MetaLayer;
+    let validity = Arc::new(crate::workspace_overlay::lifecycle::LeaseValidity::new(
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(30),
+    ));
+    let seeded = fixture_with_lease(false, packed().await, Some(validity)).await;
+    let dir = seeded.meta.mkdir(1, "seed-dir".into()).await.unwrap();
+    // Cache the directory's complete paths, then create under it and root.
+    let dir_paths = seeded.meta.get_paths_bytes(dir).await.unwrap();
+    let nested = seeded.meta.create_file(dir, "nested".into()).await.unwrap();
+    let top = seeded.meta.create_file(1, "top".into()).await.unwrap();
+    let nested_seeded = seeded.meta.get_paths_bytes(nested).await.unwrap();
+    let top_seeded = seeded.meta.get_paths_bytes(top).await.unwrap();
+    assert_eq!(dir_paths, vec![b"/seed-dir".to_vec()]);
+    assert_eq!(nested_seeded, vec![b"/seed-dir/nested".to_vec()]);
+    assert_eq!(top_seeded, vec![b"/top".to_vec()]);
+    // Drop every cache: a full reverse walk over the store must agree.
+    seeded.meta.invalidate_upper_rows();
+    assert_eq!(
+        seeded.meta.get_paths_bytes(nested).await.unwrap(),
+        nested_seeded
+    );
+    assert_eq!(seeded.meta.get_paths_bytes(top).await.unwrap(), top_seeded);
+    seeded.reader.shutdown().await.unwrap();
 }
 
 #[tokio::test]

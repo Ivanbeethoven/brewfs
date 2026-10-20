@@ -336,6 +336,26 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                     recovery_required: false,
                 };
                 writes.push(put(open_v3_key(open.workspace_id), &open)?);
+                // Claiming the first administrative writer is a maintenance
+                // transition: it keeps the exact catalog header in its check
+                // set so a concurrent migrate cannot interleave with Prepare.
+                if !checks
+                    .iter()
+                    .any(|check| check.key.as_slice() == CONTROL_KEY)
+                {
+                    let control = [CONTROL_KEY.to_vec()];
+                    let (values, _) = self
+                        .backend
+                        .get_many_consistent_with_time_bounded(&control, begin_limits(1))
+                        .await?;
+                    if values.len() != 1 || values[0].is_none() {
+                        return Err(WorkspaceError::Fenced);
+                    }
+                    checks.push(KvCheck {
+                        key: CONTROL_KEY.to_vec(),
+                        expected: values[0].clone(),
+                    });
+                }
                 Some(
                     self.prepare_administrative_packed_writer(
                         read.workspace.workspace_id,

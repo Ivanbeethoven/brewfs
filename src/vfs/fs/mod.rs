@@ -1,6 +1,8 @@
 //! FUSE/SDK-friendly VFS with path-based metadata ops and handle-based IO.
 
 #[cfg(feature = "workspace-overlay")]
+mod entity_io;
+#[cfg(feature = "workspace-overlay")]
 mod packed_mutation_gate;
 #[cfg(feature = "workspace-overlay")]
 use packed_mutation_gate::PackedMutationGate;
@@ -173,7 +175,7 @@ where
 
     fn next_handle(&self) -> Result<u64, VfsError> {
         self.next_fh
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 if next == 0 { None } else { next.checked_add(1) }
             })
             .map_err(|_| VfsError::Anyhow(anyhow::anyhow!("FUSE handle namespace exhausted")))
@@ -197,6 +199,11 @@ where
 
     fn release(&self, fh: u64) -> Option<(Arc<FileHandle<B, M>>, bool)> {
         let handle = self.handles.remove(&fh)?.1;
+        #[cfg(feature = "workspace-overlay")]
+        if handle.entity_io.get().is_some() {
+            // Entity handles never join the legacy inode-number index.
+            return Some((handle, true));
+        }
         let ino = handle.ino;
         let mut last = false;
         if let Some(mut entry) = self.inode_handles.get_mut(&ino) {
@@ -4313,6 +4320,10 @@ where
         notify_kernel: bool,
     ) -> Result<(), VfsError> {
         #[cfg(feature = "workspace-overlay")]
+        if self.entity_file(fh).is_some() {
+            return Err(VfsError::Unsupported);
+        }
+        #[cfg(feature = "workspace-overlay")]
         if self.packed_mutation_needs_driver() {
             let driver = self.packed_mutation_admit(&[])?;
             let vfs = self.clone();
@@ -4893,6 +4904,15 @@ where
         len: usize,
         output_reserved: bool,
     ) -> Result<Vec<u8>, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if let Some(io) = self.entity_file(fh) {
+            if !self.file_handle_required(fh)?.flags.read {
+                return Err(VfsError::PermissionDenied {
+                    path: PathHint::none(),
+                });
+            }
+            return io.read(offset, len).await.map_err(entity_io::error);
+        }
         #[cfg(not(feature = "workspace-overlay"))]
         let _ = output_reserved;
         if len == 0 {
@@ -5129,12 +5149,15 @@ where
                                 committed_len,
                             )
                             .await?;
-                        let committed = handle
-                            .read_into_unaccounted_locked(
-                                &handle_guard,
-                                offset,
-                                &mut data[..committed_len],
-                                operation.as_ref().and_then(|guard| guard.delivery_token()),
+                        let committed =
+                            crate::workspace_overlay::meta_layer::packed_lower::with_request_view(
+                                fence.as_ref(),
+                                handle.read_into_unaccounted_locked(
+                                    &handle_guard,
+                                    offset,
+                                    &mut data[..committed_len],
+                                    operation.as_ref().and_then(|guard| guard.delivery_token()),
+                                ),
                             )
                             .await;
                         match committed {
@@ -5182,6 +5205,7 @@ where
                 Ok(data)
             }
             Err(error) => {
+                tracing::debug!(ino = handle.ino, offset, len, error = %format!("{error:#}"), "packed read request failed");
                 #[cfg(test)]
                 eprintln!(
                     "[packed-v3-native-kernel-read-diag] stage=packed-request inode={} fh={} offset={offset} len={len} error={error:#}",
@@ -5205,6 +5229,26 @@ where
     /// Write data by file handle and offset.
     #[tracing::instrument(level = "trace", skip(self, data), fields(fh, offset, len = data.len()))]
     pub async fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<usize, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if let Some(io) = self.entity_file(fh) {
+            let handle = self.file_handle_required(fh)?;
+            if !handle.flags.write {
+                return Err(VfsError::PermissionDenied {
+                    path: PathHint::none(),
+                });
+            }
+            let outcome = io
+                .write(
+                    offset,
+                    bytes::Bytes::copy_from_slice(data),
+                    handle.flags.append,
+                )
+                .await
+                .map_err(entity_io::error)?;
+            handle.update_offset(outcome.offset + outcome.written as u64);
+            handle.extend_size(outcome.size);
+            return Ok(outcome.written);
+        }
         #[cfg(test)]
         write_diagnostic("vfs-entry", 0, fh, offset, data.len());
         #[cfg(feature = "workspace-overlay")]
@@ -5743,6 +5787,10 @@ where
         length: u64,
     ) -> Result<usize, VfsError> {
         #[cfg(feature = "workspace-overlay")]
+        if self.entity_file(fh_in).is_some() || self.entity_file(fh_out).is_some() {
+            return Err(VfsError::Unsupported);
+        }
+        #[cfg(feature = "workspace-overlay")]
         if self.packed_mutation_needs_driver() {
             let driver = self.packed_mutation_admit(&[])?;
             let vfs = self.clone();
@@ -6116,6 +6164,13 @@ where
     /// Release a previously allocated file handle.
     pub async fn close(&self, fh: u64) -> Result<(), VfsError> {
         #[cfg(feature = "workspace-overlay")]
+        if self.entity_file(fh).is_some() {
+            // Entity writes publish before acknowledgment. Outstanding owned
+            // tasks retain their own handle pins; linked close is local only.
+            self.state.handles.release(fh);
+            return Ok(());
+        }
+        #[cfg(feature = "workspace-overlay")]
         if self.packed_mutation_needs_driver() {
             let driver = self.packed_mutation_admit(&[])?;
             let vfs = self.clone();
@@ -6235,6 +6290,10 @@ where
 
     pub(crate) async fn flush_dirty_handle_snapshot(&self, fh: u64) -> Result<(), VfsError> {
         #[cfg(feature = "workspace-overlay")]
+        if let Some(io) = self.entity_file(fh) {
+            return io.fsync().await.map_err(entity_io::error);
+        }
+        #[cfg(feature = "workspace-overlay")]
         if self.packed_mutation_needs_driver() {
             let driver = self.packed_mutation_admit(&[])?;
             let vfs = self.clone();
@@ -6311,6 +6370,11 @@ where
     /// mmap writes via FUSE writeback (write_ino) deposit data in the shared
     /// writer and a subsequent fsync on a read-only handle must commit them.
     async fn flush_and_sync_handle(&self, fh: u64) -> Result<i64, VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if let Some(io) = self.entity_file(fh) {
+            io.fsync().await.map_err(entity_io::error)?;
+            return Ok(io.ino());
+        }
         #[cfg(feature = "workspace-overlay")]
         if self.packed_mutation_needs_driver() {
             let driver = self.packed_mutation_admit(&[])?;
@@ -6462,6 +6526,10 @@ where
     /// for earlier cached-write requests.  This flushes the current dirty
     /// snapshot without chasing writes that arrive after this fsync started.
     pub(crate) async fn fsync_snapshot(&self, fh: u64, _datasync: bool) -> Result<(), VfsError> {
+        #[cfg(feature = "workspace-overlay")]
+        if let Some(io) = self.entity_file(fh) {
+            return io.fsync().await.map_err(entity_io::error);
+        }
         #[cfg(feature = "workspace-overlay")]
         if self.packed_mutation_needs_driver() {
             let driver = self.packed_mutation_admit(&[])?;

@@ -17,8 +17,19 @@ use crate::workspace_overlay::packed_v3::wire005::{V3BudgetPool, V3MountBudget};
 
 const SCAN_BATCH_LIMIT: u32 = 1024;
 const TXN_MAX_RETRIES: usize = 10;
+// A scan response may carry a lock error in one KvPair while the transaction
+// remains read-only and safe to retry at its fixed timestamp. Keep this
+// continuation budget separate from region/page admission: exhausting it
+// returns Busy so the caller can rebuild the bounded read transaction.
+const BOUNDED_SCAN_LOCK_RETRIES: usize = 20;
+const BOUNDED_SCAN_LOCK_BACKOFF: Duration = Duration::from_millis(20);
 // This same configured timeout derives the fixed data Get-batch deadline.
 const BOUNDED_CLIENT_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+// Concurrent mounts can open several PD channels at once.  A transient
+// transport failure while establishing a client is safe to retry because no
+// transaction has been started yet; request deadlines remain unchanged.
+const CLIENT_CONNECT_RETRIES: usize = 6;
+const CLIENT_CONNECT_BACKOFF: Duration = Duration::from_millis(50);
 #[path = "tikv_bounded_read.rs"]
 mod bounded_read;
 #[path = "tikv_tls.rs"]
@@ -31,6 +42,10 @@ pub const BOUNDED_JOURNAL_MESSAGE_BYTES: usize = 64 << 10;
 /// A full Linux xattr plus its native delta envelope exceeds 64 KiB.
 pub const BOUNDED_XATTR_VALUE_BYTES: usize = 96 << 10;
 pub const BOUNDED_XATTR_MESSAGE_BYTES: usize = 128 << 10;
+/// Generic catalog pages admit larger records than native delta pages while
+/// remaining within a fixed decoder envelope.
+pub const BOUNDED_GENERIC_VALUE_BYTES: usize = 256 << 10;
+pub const BOUNDED_GENERIC_MESSAGE_BYTES: usize = 512 << 10;
 pub const BOUNDED_READ_MAX_POINT_KEYS: usize = 32;
 pub const BOUNDED_READ_MAX_SCAN_PAGES: usize = 1024;
 const CLIENT_RESIDENT_METADATA_BYTES: u64 = 4 << 20;
@@ -73,6 +88,7 @@ struct ClientSlots {
     small: Option<TransactionClient>,
     journal: Option<TransactionClient>,
     xattr: Option<TransactionClient>,
+    generic: Option<TransactionClient>,
 }
 
 impl Drop for ClientSlots {
@@ -86,6 +102,7 @@ impl Drop for ClientSlots {
             &self.small,
             &self.journal,
             &self.xattr,
+            &self.generic,
         ]
         .into_iter()
         .flatten()
@@ -156,9 +173,11 @@ fn bounded_read_message_bytes(limits: KvReadLimits) -> Result<usize, WorkspaceEr
         BOUNDED_JOURNAL_MESSAGE_BYTES
     } else if limits.max_value_bytes <= BOUNDED_XATTR_VALUE_BYTES {
         BOUNDED_XATTR_MESSAGE_BYTES
+    } else if limits.max_value_bytes <= BOUNDED_GENERIC_VALUE_BYTES {
+        BOUNDED_GENERIC_MESSAGE_BYTES
     } else {
         return Err(WorkspaceError::UnsupportedCapability(
-            "TiKV bounded read record schema larger than 96 KiB",
+            "TiKV bounded read record schema larger than 256 KiB",
         ));
     };
     if limits.max_response_bytes < message_bytes {
@@ -197,6 +216,7 @@ fn client_config_with_tls(
                 | BOUNDED_READ_MESSAGE_BYTES
                 | BOUNDED_JOURNAL_MESSAGE_BYTES
                 | BOUNDED_XATTR_MESSAGE_BYTES
+                | BOUNDED_GENERIC_MESSAGE_BYTES
         ))
         .with_bounded_read_lock_conflicts(
             if matches!(
@@ -205,6 +225,7 @@ fn client_config_with_tls(
                     | BOUNDED_READ_MESSAGE_BYTES
                     | BOUNDED_JOURNAL_MESSAGE_BYTES
                     | BOUNDED_XATTR_MESSAGE_BYTES
+                    | BOUNDED_GENERIC_MESSAGE_BYTES
             ) {
                 4096
             } else {
@@ -219,6 +240,27 @@ fn client_config_with_tls(
         Some(tls) => tls.apply(config),
         None => Ok(config),
     }
+}
+
+async fn connect_transaction_client(
+    pd_endpoints: &[String],
+    config: tikv_client::Config,
+) -> Result<TransactionClient, WorkspaceError> {
+    for attempt in 0..=CLIENT_CONNECT_RETRIES {
+        match TransactionClient::new_with_config(pd_endpoints.to_vec(), config.clone()).await {
+            Ok(client) => return Ok(client),
+            Err(error @ tikv_client::Error::Grpc(_)) if attempt < CLIENT_CONNECT_RETRIES => {
+                tokio::time::sleep(CLIENT_CONNECT_BACKOFF * (attempt as u32 + 1)).await;
+                log::debug!(
+                    "retrying TiKV client connection after transport failure (attempt {})",
+                    attempt + 1
+                );
+                drop(error);
+            }
+            Err(error) => return Err(backend(error)),
+        }
+    }
+    unreachable!("TiKV client connection loop always returns")
 }
 
 #[derive(Clone)]
@@ -345,9 +387,7 @@ impl TiKvWorkspaceBackend {
         }
         validate_namespace(namespace)?;
         let config = client_config_with_tls(&mount_budget, 4 << 20, tls.as_ref())?;
-        let client = TransactionClient::new_with_config(pd_endpoints.clone(), config)
-            .await
-            .map_err(backend)?;
+        let client = connect_transaction_client(&pd_endpoints, config).await?;
         let prefix = format!("{namespace}/ws:v1/").into_bytes();
         Ok(Self {
             clients: Arc::new(tokio::sync::Mutex::new(ClientSlots {
@@ -356,6 +396,7 @@ impl TiKvWorkspaceBackend {
                 small: None,
                 journal: None,
                 xattr: None,
+                generic: None,
             })),
             prefix,
             pd_endpoints: std::sync::Arc::new(pd_endpoints),
@@ -395,6 +436,7 @@ impl TiKvWorkspaceBackend {
             &clients.small,
             &clients.journal,
             &clients.xattr,
+            &clients.generic,
         ]
         .into_iter()
         .flatten()
@@ -406,6 +448,7 @@ impl TiKvWorkspaceBackend {
         clients.small.take();
         clients.journal.take();
         clients.xattr.take();
+        clients.generic.take();
         Ok(())
     }
 
@@ -436,11 +479,7 @@ impl TiKvWorkspaceBackend {
                 BOUNDED_JOURNAL_MESSAGE_BYTES,
                 self.tls.as_ref(),
             )?;
-            *slot = Some(
-                TransactionClient::new_with_config(self.pd_endpoints.as_ref().clone(), config)
-                    .await
-                    .map_err(backend)?,
-            );
+            *slot = Some(connect_transaction_client(self.pd_endpoints.as_ref(), config).await?);
         }
         let client = slot.as_ref().unwrap().clone();
         drop(clients);
@@ -464,17 +503,15 @@ impl TiKvWorkspaceBackend {
             &mut clients.small
         } else if message_bytes == BOUNDED_JOURNAL_MESSAGE_BYTES {
             &mut clients.journal
-        } else {
+        } else if message_bytes == BOUNDED_XATTR_MESSAGE_BYTES {
             &mut clients.xattr
+        } else {
+            &mut clients.generic
         };
         if slot.is_none() {
             let config =
                 client_config_with_tls(&self.mount_budget, message_bytes, self.tls.as_ref())?;
-            *slot = Some(
-                TransactionClient::new_with_config(self.pd_endpoints.as_ref().clone(), config)
-                    .await
-                    .map_err(backend)?,
-            );
+            *slot = Some(connect_transaction_client(self.pd_endpoints.as_ref(), config).await?);
         }
         let client = slot.as_ref().unwrap().clone();
         drop(clients);
@@ -517,15 +554,40 @@ impl TiKvWorkspaceBackend {
             .unwrap_or(Bound::Unbounded);
         let mut entries: Vec<KvEntry> = Vec::new();
         let mut total = 0usize;
-        for _ in 0..limits.max_data_requests {
+        let mut lock_retries = 0usize;
+        let mut data_requests = 0usize;
+        while data_requests < limits.max_data_requests {
             let range = BoundRange::new(Bound::Included(start.clone()), upper.clone());
             // Exactly one region and one row per data RPC. Empty regions count
             // against max_data_requests too; no unbounded seek through sparse PD
             // maps. The SDK's ordinary scan(limit) is intentionally not used.
-            let (page, continuation) = transaction
-                .scan_single_region_page(range, 1)
-                .await
-                .map_err(backend)?;
+            data_requests += 1;
+            let (page, continuation) = match transaction.scan_single_region_page(range, 1).await {
+                Ok(result) => result,
+                Err(error)
+                    if error.is_bounded_read_retryable_key_lock()
+                        || error.is_bounded_read_retryable_region() =>
+                {
+                    // Scan errors can be embedded in a returned KvPair. A
+                    // key lock and an EpochNotMatch region refresh are both
+                    // safe to retry while this transaction remains read-only;
+                    // the explicit budget prevents an unbounded wait.
+                    if lock_retries >= BOUNDED_SCAN_LOCK_RETRIES
+                        || data_requests >= limits.max_data_requests
+                    {
+                        // A failed row cannot be treated as a short page: doing
+                        // so could advance the caller cursor past the locked
+                        // key and silently omit it. Surface Busy so the
+                        // enclosing topology operation rebuilds its read
+                        // packet after the finite refresh budget is spent.
+                        return Err(WorkspaceError::Busy);
+                    }
+                    lock_retries += 1;
+                    tokio::time::sleep(BOUNDED_SCAN_LOCK_BACKOFF).await;
+                    continue;
+                }
+                Err(error) => return Err(backend(error)),
+            };
             for pair in page {
                 let (key, value): (Key, Vec<u8>) = pair.into();
                 let key: Vec<u8> = key.into();
@@ -585,65 +647,92 @@ impl TiKvWorkspaceBackend {
                 "bounded prefix scan requires a positive row limit".into(),
             ));
         }
-        let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
-        let mut transaction = self
-            .main_client()
-            .await?
-            .begin_with_options(options)
-            .await
-            .map_err(backend)?;
         let scoped_prefix = self.scoped(prefix);
         let upper = prefix_range_end(&scoped_prefix)
             .map(Key::from)
             .map(Bound::Excluded)
             .unwrap_or(Bound::Unbounded);
-        let mut lower = Bound::Included(Key::from(scoped_prefix));
-        let mut entries = Vec::new();
 
-        loop {
-            if max_records.is_some_and(|limit| entries.len() >= limit) {
-                break;
-            }
-            let batch_limit = max_records
-                .map(|limit| {
-                    let remaining = u32::try_from(limit - entries.len()).unwrap_or(u32::MAX);
-                    SCAN_BATCH_LIMIT.min(remaining)
-                })
-                .unwrap_or(SCAN_BATCH_LIMIT);
-            let range = BoundRange::new(lower.clone(), upper.clone());
-            let batch: Vec<KvPair> = transaction
-                .scan(range, batch_limit)
+        // A full layer scan is used during seal/hash and can observe a
+        // read-only key lock in one returned KvPair.  Restart the complete
+        // read transaction a finite number of times; no mutation has been
+        // submitted, so this is safe and lets the lock's secondary commit
+        // finish.  Exhaustion becomes Busy for the caller's outer CAS retry.
+        for lock_attempt in 0..=BOUNDED_SCAN_LOCK_RETRIES {
+            let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
+            let mut transaction = self
+                .main_client()
+                .await?
+                .begin_with_options(options)
                 .await
-                .map_err(backend)?
-                .collect();
-            let batch_len = batch.len();
-            if batch_len == 0 {
-                break;
-            }
-            for pair in batch {
-                let last_key: Vec<u8> = pair.key().clone().into();
-                lower = Bound::Excluded(Key::from(last_key.clone()));
-                let logical = last_key
-                    .strip_prefix(self.prefix.as_slice())
-                    .ok_or_else(|| {
-                        WorkspaceError::Backend(
-                            "TiKV workspace scan returned an out-of-namespace key".into(),
-                        )
-                    })?;
-                entries.push(KvEntry {
-                    key: logical.to_vec(),
-                    value: pair.value().to_vec(),
-                });
-            }
-            if batch_len < batch_limit as usize {
-                break;
-            }
-        }
+                .map_err(backend)?;
+            let mut lower = Bound::Included(Key::from(scoped_prefix.clone()));
+            let mut entries = Vec::new();
+            let mut retry = false;
 
-        if let Err(error) = transaction.rollback().await {
-            log::debug!("TiKV workspace scan rollback failed: {error}");
+            loop {
+                if max_records.is_some_and(|limit| entries.len() >= limit) {
+                    break;
+                }
+                let batch_limit = max_records
+                    .map(|limit| {
+                        let remaining = u32::try_from(limit - entries.len()).unwrap_or(u32::MAX);
+                        SCAN_BATCH_LIMIT.min(remaining)
+                    })
+                    .unwrap_or(SCAN_BATCH_LIMIT);
+                let range = BoundRange::new(lower.clone(), upper.clone());
+                let batch: Vec<KvPair> = match transaction.scan(range, batch_limit).await {
+                    Ok(batch) => batch.collect(),
+                    Err(error)
+                        if error.is_bounded_read_retryable_key_lock()
+                            || error.is_bounded_read_retryable_region() =>
+                    {
+                        if lock_attempt < BOUNDED_SCAN_LOCK_RETRIES {
+                            retry = true;
+                            break;
+                        }
+                        return Err(WorkspaceError::Busy);
+                    }
+                    Err(error) => return Err(backend(error)),
+                };
+                let batch_len = batch.len();
+                if batch_len == 0 {
+                    break;
+                }
+                for pair in batch {
+                    let last_key: Vec<u8> = pair.key().clone().into();
+                    lower = Bound::Excluded(Key::from(last_key.clone()));
+                    let logical =
+                        last_key
+                            .strip_prefix(self.prefix.as_slice())
+                            .ok_or_else(|| {
+                                WorkspaceError::Backend(
+                                    "TiKV workspace scan returned an out-of-namespace key".into(),
+                                )
+                            })?;
+                    entries.push(KvEntry {
+                        key: logical.to_vec(),
+                        value: pair.value().to_vec(),
+                    });
+                }
+                if batch_len < batch_limit as usize {
+                    break;
+                }
+            }
+
+            if retry {
+                if let Err(error) = transaction.rollback().await {
+                    log::debug!("TiKV workspace scan retry rollback failed: {error}");
+                }
+                tokio::time::sleep(BOUNDED_SCAN_LOCK_BACKOFF).await;
+                continue;
+            }
+            if let Err(error) = transaction.rollback().await {
+                log::debug!("TiKV workspace scan rollback failed: {error}");
+            }
+            return Ok(entries);
         }
-        Ok(entries)
+        Err(WorkspaceError::Busy)
     }
 }
 
@@ -1073,7 +1162,18 @@ impl TiKvWorkspaceBackend {
                 let current = match lock_result {
                     Ok(current) => current,
                     Err(error) => {
-                        let retryable = is_retryable(&error.to_string());
+                        // TiKV can return the certified bounded-read key-lock
+                        // envelope from get_for_update as well as from a
+                        // read-only scan. It is pre-submit and safe to retry,
+                        // but its diagnostic does not contain the legacy
+                        // "PessimisticLock" text used by is_retryable().
+                        // Classify it before mapping to a backend error so a
+                        // transient lock cannot escape the CAS retry budget.
+                        let retryable_key_lock = error.is_bounded_read_retryable_key_lock();
+                        let retryable_region = error.is_bounded_read_retryable_region();
+                        let retryable = retryable_key_lock
+                            || retryable_region
+                            || is_retryable(&error.to_string());
                         if let Err(rollback_error) = transaction.rollback().await {
                             return Err(backend(format!(
                                 "{error}; CAS check rollback failed: {rollback_error}"
@@ -1088,6 +1188,14 @@ impl TiKvWorkspaceBackend {
                             // The catalog must reread its version and rebuild
                             // sequence/policy input after sustained contention.
                             return Ok(false);
+                        }
+                        if retryable_key_lock || retryable_region {
+                            // These bounded pre-submit read conditions are
+                            // transient even when TXN_MAX_RETRIES is
+                            // exhausted. Let the topology caller rebuild its
+                            // complete read packet and preserve Busy
+                            // semantics for the outer CAS retry budget.
+                            return Err(WorkspaceError::Busy);
                         }
                         return Err(backend(error));
                     }
@@ -1415,6 +1523,7 @@ mod tests {
         let config =
             super::client_config_with_tls(&budget, super::BOUNDED_READ_MESSAGE_BYTES, None)
                 .unwrap();
+        assert_eq!(config.max_cached_kv_clients, 1);
         assert_eq!(
             budget.state().used[V3BudgetPool::Metadata as usize],
             super::CLIENT_RESIDENT_METADATA_BYTES
@@ -1848,5 +1957,13 @@ mod receipt_read_plan_tests {
             bounded_read_message_bytes(limits(96 << 10, 128 << 10)).unwrap(),
             128 << 10
         );
+        assert_eq!(
+            bounded_read_message_bytes(limits(256 << 10, 512 << 10)).unwrap(),
+            512 << 10
+        );
+        assert!(matches!(
+            bounded_read_message_bytes(limits((256 << 10) + 1, 512 << 10)),
+            Err(WorkspaceError::UnsupportedCapability(_))
+        ));
     }
 }
