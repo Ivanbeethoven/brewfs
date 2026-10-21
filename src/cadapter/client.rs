@@ -15,6 +15,11 @@ pub type ObjectByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 
 #[async_trait]
 pub trait ObjectBackend: Send + Sync {
+    /// Coalesce cold block reads when the backend layout favors whole objects.
+    fn prefers_full_object_reads(&self) -> bool {
+        false
+    }
+
     /// True only when the concrete transport/client cannot automatically
     /// resend a physical PUT/DELETE after an uncertain mutation outcome.
     fn forbids_mutation_replay(&self) -> bool {
@@ -326,6 +331,10 @@ pub struct ObjectClient<B: ObjectBackend> {
 }
 
 impl<B: ObjectBackend> ObjectClient<B> {
+    pub(crate) fn prefers_full_object_reads(&self) -> bool {
+        self.backend.prefers_full_object_reads()
+    }
+
     pub fn forbids_mutation_replay(&self) -> bool {
         self.backend.forbids_mutation_replay()
     }

@@ -10,6 +10,11 @@ data:
     part_size: 16777216
     max_concurrency: 8
     force_path_style: true
+    # Requires Cargo feature rustfs-ec-block-size-hint (disabled in default builds).
+    # Optional policy for a compatible Dynamic Block RustFS; disabled when omitted.
+    # auto: no hint for final objects <=1 MiB, otherwise request 1 MiB EC blocks.
+    # Fixed bytes: 65536, 262144, 1048576, 4194304; independent of layout.block_size.
+    # rustfs_ec_block_size_hint: auto
 
 meta:
   backend: etcd

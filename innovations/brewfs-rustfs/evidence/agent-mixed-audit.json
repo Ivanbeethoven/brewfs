@@ -1,0 +1,521 @@
+{
+  "passed": true,
+  "complete_campaign": true,
+  "jobs": [
+    {
+      "job": "agent-formal-01-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-02-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-03-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-04-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-05-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-06-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-07-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-08-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-09-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-10-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-11-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-12-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-13-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-14-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-15-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-16-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-17-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-18-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-19-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-20-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-21-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-22-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-23-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-24-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-25-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-26-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-27-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-28-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-29-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-30-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-31-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-32-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-33-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-34-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-35-dynamic-auto",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    },
+    {
+      "job": "agent-formal-36-no-dynamic-block",
+      "passed": true,
+      "stage_filesystem": {
+        "filesystems": [
+          {
+            "target": "/work",
+            "fstype": "ext4",
+            "source": "/dev/vda5[/builtin_wlayer/aliyun-system-guest-container-root-dir/kube-agent/285b9ac8-03fd-42da-b83e-a89c0875007d/volumes/kubernetes.io~empty-dir/work]",
+            "options": "rw,relatime,prjquota"
+          }
+        ]
+      }
+    }
+  ],
+  "totals": {
+    "exported_files": 1460,
+    "clean_mount_exits": 108,
+    "operations": 288000,
+    "immediate_full_read_hash_checks": 182400,
+    "remount_full_file_hash_checks": 160800,
+    "objects": 228552,
+    "physical_layout_records": 914208
+  },
+  "time": 1792479419.7347941,
+  "scope": "Frozen fingerprints, per-job exports, actual FUSE/configuration, all trace order/version/timing records, final namespaces, recorded read checks, strict drain, exits and every physical layout. No new performance measurement."
+}

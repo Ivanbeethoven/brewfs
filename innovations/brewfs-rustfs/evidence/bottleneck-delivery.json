@@ -1,0 +1,90 @@
+{
+  "date": "2026-10-20",
+  "baseline_brewfs": "7d3c3669679f279aeeb2d02d337ee4f87ad74ec8",
+  "baseline_brewfs_binary_sha256": "dd5dc764d7e9155ec7f5e2bf2d1421c7cca3e0d54550e606cdc902fabd04e7c7",
+  "rustfs": "cc4926fac1107aee76540f28bf22dbd47fcbca24",
+  "rejected_body_stream_binary_sha256": "103969a557464c0b4f05434e66e4e30e55d83eec5fff86b7e7d0d20c6261bedb",
+  "accepted_new_performance_code": false,
+  "rejected_candidates": 4,
+  "primary_groups": 236,
+  "primary_comparisons": 151,
+  "primary_full_file_hash_checks": 245312,
+  "baseline_diagnostic_full_file_hash_checks": 416,
+  "candidate_diagnostic_full_file_hash_checks": 144,
+  "network_diagnostic_full_file_hash_checks": 1088,
+  "transport_full_stream_hash_checks": 10,
+  "archive_file": "brewfs-writeback-budget/raw-records.tar.gz",
+  "archive_files": 6075,
+  "archive_sha256": "465cd2debbcd24667c9099fc805ba2cbbf2c0d3af6956e47005c1666c544f63f",
+  "archive_integrity_passed": true,
+  "archive_integrity_does_not_mean_performance_acceptance": true,
+  "removed": {
+    "pods": 3,
+    "disks": 4,
+    "disk_gib_each": 40,
+    "cluster": 1,
+    "remaining_owned_resources": 1,
+    "remaining_owned_security_groups": 1,
+    "residual_reason": "DependencyViolation: provider reports instance dependencies although scoped ECS, ENI and ECI queries are empty.",
+    "shared_network_preserved": true,
+    "cloud_verification_time": 1792473579.3380566
+  },
+  "files": [
+    {
+      "path": "evidence/bottleneck-uniform-upload.json",
+      "sha256": "dfe1506846d538107007e3dca16a95f29569f67df6befd9ef1f44a56727edf7a"
+    },
+    {
+      "path": "evidence/bottleneck-size-upload.json",
+      "sha256": "9f7618b9599aceb64baed20fcbaa973dff75c10bdacef2db13222cc757a1b9da"
+    },
+    {
+      "path": "evidence/bottleneck-upload-causal.json",
+      "sha256": "6927e52948736129c6d6ca8ada88f97bd6058ec549051bf0e21e7f9a078d4246"
+    },
+    {
+      "path": "evidence/bottleneck-tiny-upload.json",
+      "sha256": "7df0fae66091f87d27c3671d7c75dc812bb431d7400929474c0e0bf68e1432c6"
+    },
+    {
+      "path": "evidence/bottleneck-body-stream-screen.json",
+      "sha256": "034c6313791ccd156a0a111c51e3e5041cc29f5d17e30838d61f85faa9c87e07"
+    },
+    {
+      "path": "evidence/bottleneck-network.json",
+      "sha256": "f18cd748ba0b819eb635f7c86678bfa1fe43e04486e0ec9392db7b08bf2bb270"
+    },
+    {
+      "path": "evidence/bottleneck-network-timeline.json",
+      "sha256": "1b825abda04a1f4c9e1319a158be837dee66c28b3066b28d86f31ee6e6d1d8d4"
+    },
+    {
+      "path": "evidence/bottleneck-transport.json",
+      "sha256": "f171f405c2dd15384f0f63962346588414470889fcf8a943ae5db3488cae818e"
+    },
+    {
+      "path": "evidence/bottleneck-acs-specification.json",
+      "sha256": "9e328e0481658b1e88623666bc127ba2b32a68fed6736c5e5cf41c5e01d90661"
+    },
+    {
+      "path": "evidence/bottleneck-audit.json",
+      "sha256": "ce5e1eae7bd253f4dcafab59490a8f76213b662465618a34b190098025f7a75f"
+    },
+    {
+      "path": "evidence/bottleneck-body-stream-mechanism.json",
+      "sha256": "94a71980e3dc2972ae70e2cebf0bb9cee5c0f234eee29f6133890a7b5583ba9b"
+    },
+    {
+      "path": "figures/bottleneck-network-transport.png",
+      "sha256": "56e973020699645f95c6b8e90dee4ae5a62a9a60e8589879c9ff64c89311136f"
+    },
+    {
+      "path": "figures/bottleneck-network-read-tail.png",
+      "sha256": "7d45b8c960addb58c47e1bd4997275ed26f70062f73a4219979f7dbddc4a1b3b"
+    },
+    {
+      "path": "figures/bottleneck-body-stream-cold.png",
+      "sha256": "465f31fcabe9bd35de215b5bac72ab1c3bc20756f44b2186bab534c3da3b6f69"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "passed": true,
+  "stages": [
+    {
+      "stage": "screen",
+      "groups": 36,
+      "comparisons": 25,
+      "full_file_hash_checks": 21760,
+      "plan_sha256": "6df32de5ec06eb76608fdc199e3580517abe0b46f9e52a82f70886ab506a9f67"
+    },
+    {
+      "stage": "publication",
+      "groups": 136,
+      "comparisons": 49,
+      "full_file_hash_checks": 153088,
+      "plan_sha256": "19f72adfbf79dcc3af1dea975f980ef31c338a562117835123cd9b1e0836449e"
+    },
+    {
+      "stage": "publication-hot",
+      "groups": 64,
+      "comparisons": 8,
+      "full_file_hash_checks": 54944,
+      "plan_sha256": "b76eb8076f57238cd2238f04ae157aa31bc0acfa372ccbfe089a968b9f907d87"
+    }
+  ]
+}

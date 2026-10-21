@@ -1,0 +1,464 @@
+{
+  "date": "2026-10-20",
+  "environment": "Aliyun ACS, Linux, 16 CPU / 32 GiB, one Cargo job, one test thread",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "base": "947a349d387148f4520f22e64df5a8282329a9f5",
+  "source_hash_basis": "Exact uploaded bytes before Git line-ending normalization",
+  "source_sha256": {
+    "src/vfs/cache/write_back.rs": "39405a56df205badc482b87ca682b8e342045407984c2b80421cc4387ff553b7",
+    "src/vfs/cache/write_back/packed_recovery.rs": "fe998ffec473ff99a86824b8d85900ce540bda4ce55170b036b95046a272b88a",
+    "src/vfs/cache/write_back/packed_recovery/tests.rs": "8abaf92adcb46595684553abbe84c1a61c860bbc650c119fbcd3cdf0c7fc1a66",
+    "src/workspace_overlay/packed_v3/remote.rs": "07e0730fdb9f6bb0ce2600b7f12301c6d57a6d9c5de42031f6e633c416d477ea",
+    "src/workspace_overlay/packed_v3/wire005/source_layout.rs": "9d5c60aaf818e5dc1b2a8fbd07460b56c751901a8dcbcd86a8812210d2fdbb86",
+    "src/workspace_overlay/stores/kv_store/packed_journal/registry/borrowed_alias.rs": "c02b5d9a3cef5f933740708d2e5484988a10a09a301c465e90b76e30608daf79"
+  },
+  "tests": [
+    {
+      "stage": "ci-review",
+      "label": "native-dependencies",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review",
+      "label": "fmt",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review",
+      "label": "vendor-fmt",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review",
+      "label": "check-workspace",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review",
+      "label": "build-workspace",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review",
+      "label": "test-workspace",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": [
+        "test result: ok. 1194 passed; 0 failed; 225 ignored; 0 measured; 0 filtered out; finished in 66.14s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "stage": "ci-review",
+      "label": "clippy-default",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review",
+      "label": "check-fuse-tokio-runtime",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review",
+      "label": "check-fuse-tokio-runtime-workspace-overlay",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review",
+      "label": "check-fuse-io-uring-runtime",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review",
+      "label": "check-fuse-io-uring-runtime-workspace-overlay",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review",
+      "label": "clippy-overlay",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review",
+      "label": "all-features-tests-and-docs",
+      "exit_code": 101,
+      "valid_baseline_evidence": true,
+      "test_summaries": [
+        "test result: FAILED. 2278 passed; 14 failed; 376 ignored; 0 measured; 0 filtered out; finished in 191.05s"
+      ]
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "all-features-integration",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": [
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.62s",
+        "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s",
+        "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s",
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.72s",
+        "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s",
+        "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+      ]
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "all-features-bins",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": [
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "all-features-docs",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": [
+        "test result: ok. 0 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s"
+      ]
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "vendor-tokio-runtime",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "vendor-io-uring-runtime",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "vendor-async-io-runtime",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "vendor-tests",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": [
+        "test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+      ]
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "operator-check",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "operator-tests",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": [
+        "test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s"
+      ]
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "operator-clippy",
+      "exit_code": 101,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "operator-crd",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "syntax-run_perf_in_container.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "syntax-run_redis_perf.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "syntax-run_tikv_xfstests.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "syntax-run_tikv_ltp.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "syntax-run_tikv_pjdfstest.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "syntax-run_tikv_perf.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "syntax-run_juicefs_perf_in_container.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "syntax-run_juicefs_perf.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "syntax-run_workspace_overlay_dual_mount_in_container.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "syntax-run_workspace_overlay_control_in_container.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "syntax-run_workspace_overlay_suite_in_container.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "syntax-run_workspace_overlay_compose.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "syntax-run_workspace_overlay_suites.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "syntax-run_s3_git_clone_smoke.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "script-test_perf_report_delta.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "script-test_juicefs_direct_matrix.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "script-test_juicefs_perf_report.sh",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "packed-runner-syntax",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "packed-runner-ttl",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "python-test_smallfiles_scan.py",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "python-test_packed_*.py",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-followup",
+      "label": "baseline-14-failures",
+      "exit_code": 101,
+      "valid_baseline_evidence": false,
+      "test_summaries": [
+        "test result: FAILED. 0 passed; 14 failed; 0 ignored; 0 measured; 2654 filtered out; finished in 4.48s"
+      ]
+    },
+    {
+      "stage": "ci-review-baseline",
+      "label": "remove-stale-brewfs-artifacts",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    },
+    {
+      "stage": "ci-review-baseline",
+      "label": "baseline-14-failures",
+      "exit_code": 101,
+      "valid_baseline_evidence": true,
+      "test_summaries": [
+        "test result: FAILED. 0 passed; 14 failed; 0 ignored; 0 measured; 2649 filtered out; finished in 4.48s"
+      ]
+    },
+    {
+      "stage": "ci-review-baseline",
+      "label": "verify-baseline-binary",
+      "exit_code": 0,
+      "valid_baseline_evidence": true,
+      "test_summaries": []
+    }
+  ],
+  "baseline_reproduction": {
+    "selected": 14,
+    "same_assertions": [
+      "workspace_overlay::meta_layer::tests::packed_open_preparation_tests::packed_mount_renewal_busy_exhausts_exactly_64",
+      "workspace_overlay::meta_layer::tests::packed_open_preparation_tests::packed_stat_binding_authentication_busy_exhausts_exactly_64",
+      "workspace_overlay::packed_v3::wire005::source_file::tests::source_mutation_replacement_symlink_and_limits_fail_closed",
+      "workspace_overlay::packed_v3::wire005::source_file::tests::source_root_pins_real_attributes_and_detects_namespace_changes_and_replacement",
+      "workspace_overlay::stores::kv_store::packed_journal::native_publication::complete_driver::tests::quiesced_seed_takeover_tests::quiesced_seed_initial_prepare_claim_is_atomic_and_lost_reply_is_confirmed_without_replay",
+      "workspace_overlay::stores::kv_store::packed_journal::native_publication::complete_driver::tests::root_conflict_tests::actual_memory_native_producer_dispatch_root_conflict_rebuilds_and_publishes",
+      "workspace_overlay::stores::kv_store::packed_journal::native_publication::complete_driver::tests::root_conflict_tests::actual_memory_native_producer_reserve_root_conflict_rebuilds_and_publishes",
+      "workspace_overlay::stores::kv_store::packed_journal::native_publication::complete_driver::tests::root_read_conflict_tests::actual_memory_native_dispatch_phaseseed_root_read_conflict_rebuilds_and_publishes",
+      "workspace_overlay::stores::kv_store::packed_journal::native_publication::complete_driver::tests::root_read_conflict_tests::actual_memory_native_dispatch_seedstaged_root_read_conflict_rebuilds_and_publishes",
+      "workspace_overlay::stores::kv_store::packed_journal::native_publication::complete_driver::tests::root_read_conflict_tests::actual_memory_native_reserve_phaseseed_root_read_conflict_rebuilds_and_publishes",
+      "workspace_overlay::stores::kv_store::packed_journal::native_publication::complete_driver::tests::root_read_conflict_tests::actual_memory_native_reserve_seedstaged_root_read_conflict_rebuilds_and_publishes",
+      "workspace_overlay::stores::kv_store::tests::g13_gc_candidates::g13a_kv_released_lease_is_not_an_expired_recovery_root",
+      "workspace_overlay::stores::kv_store::tests::kv_v3_open_topology_rejects_binding_change_between_routing_and_final_read",
+      "workspace_overlay::stores::kv_store::tests::migration_marker_fences_entity_and_hot_native_packets_without_writes"
+    ],
+    "unreproduced": []
+  },
+  "assertions": {
+    "workspace_overlay::meta_layer::tests::packed_open_preparation_tests::packed_mount_renewal_busy_exhausts_exactly_64": "panicked at src/workspace_overlay/meta_layer/tests/packed_open_preparation_tests.rs:732:9:\nassertion `left == right` failed\n  left: 256\n right: 64",
+    "workspace_overlay::meta_layer::tests::packed_open_preparation_tests::packed_stat_binding_authentication_busy_exhausts_exactly_64": "panicked at src/workspace_overlay/meta_layer/tests/packed_open_preparation_tests.rs:962:5:\nassertion `left == right` failed\n  left: 256\n right: 64",
+    "workspace_overlay::packed_v3::wire005::source_file::tests::source_mutation_replacement_symlink_and_limits_fail_closed": "panicked at src/workspace_overlay/packed_v3/wire005/source_file.rs:655:9:\nassertion failed: source.validate_unchanged().is_err()",
+    "workspace_overlay::packed_v3::wire005::source_file::tests::source_root_pins_real_attributes_and_detects_namespace_changes_and_replacement": "panicked at src/workspace_overlay/packed_v3/wire005/source_file.rs:587:9:\nassertion failed: captured.validate_unchanged().is_err()",
+    "workspace_overlay::stores::kv_store::packed_journal::native_publication::complete_driver::tests::quiesced_seed_takeover_tests::quiesced_seed_initial_prepare_claim_is_atomic_and_lost_reply_is_confirmed_without_replay": "panicked at src/workspace_overlay/stores/kv_store/packed_journal/native_publication/complete_driver/quiesced_seed_takeover_tests.rs:1058:9:\nassertion failed: checks.iter().any(|check|\n        { check.key.as_slice() == CONTROL_KEY && check.expected.is_some() })",
+    "workspace_overlay::stores::kv_store::packed_journal::native_publication::complete_driver::tests::root_conflict_tests::actual_memory_native_producer_dispatch_root_conflict_rebuilds_and_publishes": "panicked at src/workspace_overlay/stores/kv_store/packed_journal/native_publication/complete_driver/carrier_basis_tests.rs:158:5:\nassertion failed: checks.iter().any(|check|\n        { check.key.as_slice() == CONTROL_KEY && check.expected.is_some() })",
+    "workspace_overlay::stores::kv_store::packed_journal::native_publication::complete_driver::tests::root_conflict_tests::actual_memory_native_producer_reserve_root_conflict_rebuilds_and_publishes": "panicked at src/workspace_overlay/stores/kv_store/packed_journal/native_publication/complete_driver/carrier_basis_tests.rs:158:5:\nassertion failed: checks.iter().any(|check|\n        { check.key.as_slice() == CONTROL_KEY && check.expected.is_some() })",
+    "workspace_overlay::stores::kv_store::packed_journal::native_publication::complete_driver::tests::root_read_conflict_tests::actual_memory_native_dispatch_phaseseed_root_read_conflict_rebuilds_and_publishes": "panicked at src/workspace_overlay/stores/kv_store/packed_journal/native_publication/complete_driver/carrier_basis_tests.rs:158:5:\nassertion failed: checks.iter().any(|check|\n        { check.key.as_slice() == CONTROL_KEY && check.expected.is_some() })",
+    "workspace_overlay::stores::kv_store::packed_journal::native_publication::complete_driver::tests::root_read_conflict_tests::actual_memory_native_dispatch_seedstaged_root_read_conflict_rebuilds_and_publishes": "panicked at src/workspace_overlay/stores/kv_store/packed_journal/native_publication/complete_driver/carrier_basis_tests.rs:158:5:\nassertion failed: checks.iter().any(|check|\n        { check.key.as_slice() == CONTROL_KEY && check.expected.is_some() })",
+    "workspace_overlay::stores::kv_store::packed_journal::native_publication::complete_driver::tests::root_read_conflict_tests::actual_memory_native_reserve_phaseseed_root_read_conflict_rebuilds_and_publishes": "panicked at src/workspace_overlay/stores/kv_store/packed_journal/native_publication/complete_driver/carrier_basis_tests.rs:158:5:\nassertion failed: checks.iter().any(|check|\n        { check.key.as_slice() == CONTROL_KEY && check.expected.is_some() })",
+    "workspace_overlay::stores::kv_store::packed_journal::native_publication::complete_driver::tests::root_read_conflict_tests::actual_memory_native_reserve_seedstaged_root_read_conflict_rebuilds_and_publishes": "panicked at src/workspace_overlay/stores/kv_store/packed_journal/native_publication/complete_driver/carrier_basis_tests.rs:158:5:\nassertion failed: checks.iter().any(|check|\n        { check.key.as_slice() == CONTROL_KEY && check.expected.is_some() })",
+    "workspace_overlay::stores::kv_store::tests::g13_gc_candidates::g13a_kv_released_lease_is_not_an_expired_recovery_root": "panicked at src/workspace_overlay/stores/g13_kv_gc_tests.rs:119:5:\nassertion failed: !peer.gc_snapshot(now,\n                        200).await.unwrap().root_layers.contains(&lease.base_revision.layer_id)",
+    "workspace_overlay::stores::kv_store::tests::kv_v3_open_topology_rejects_binding_change_between_routing_and_final_read": "panicked at src/workspace_overlay/stores/kv_store.rs:7141:9:\nassertion failed: matches!(store.open_workspace_v3(workspace.workspace_id, \"owner\",\n    Duration::from_secs(30)).await, Err(WorkspaceError::Busy))",
+    "workspace_overlay::stores::kv_store::tests::migration_marker_fences_entity_and_hot_native_packets_without_writes": "panicked at src/workspace_overlay/stores/kv_store.rs:8951:9:\nassertion failed: txn.read_workspace(workspace.workspace_id).await.is_err()"
+  },
+  "operator_unchanged_inputs": {
+    "files": [
+      {
+        "path": "operator/brewfs-operator/src/workspace/admin.rs",
+        "sha256": "5536ee5b5627f93e277e361c312eead17dafe8140fcc47705d046b728468132f"
+      },
+      {
+        "path": "operator/brewfs-operator/src/workspace/gc.rs",
+        "sha256": "5838563421f8f4dde201cb7715ef3271150e962aa4aee31ebfb93da04fed2e4e"
+      },
+      {
+        "path": "operator/brewfs-operator/Cargo.lock",
+        "sha256": "d8381852feb76bcbd36422b1a6b81d961399cc59097e6d26b13b507ff0fadb69"
+      },
+      {
+        "path": "operator/brewfs-operator/Cargo.toml",
+        "sha256": "0ead3e5a34ef743fd4f43f1e030aaab61f57186a4d7b6536fec6ede69805c742"
+      }
+    ],
+    "note": "Exact normalized source and dependency inputs of macro lint match base; not a second baseline operator execution."
+  },
+  "baseline_binary_proof": {
+    "valid_baseline_binary": true,
+    "sha256": "d4f46ca555522e8fc4171209a25b41c63f36b3438e262b1873b91debf12c1441",
+    "new_regression_tests_absent": true,
+    "package_recompiled": true,
+    "test_count": 2663
+  },
+  "invalid_first_baseline_attempt": {
+    "valid_baseline": false,
+    "reason": "Shared Cargo target reused the candidate test binary; base source has no new recovery test but executed binary does.",
+    "reused_binary_sha256": "75a5e40c5a7bc95b012cc1fc2fcd7bcf7291f816529fdcdfda8de744b1a89f1c"
+  },
+  "all_features_passed": false,
+  "interpretation": "Correctness review only; no new performance acceptance. Ignored tests remain ignored. Original failed checks remain failed."
+}

@@ -2111,7 +2111,14 @@ impl ChunksCache {
     }
 
     /// Creates a new ChunksCache with custom configuration
-    pub async fn new_with_config(mut config: ChunksCacheConfig) -> anyhow::Result<Self> {
+    pub async fn new_with_config(config: ChunksCacheConfig) -> anyhow::Result<Self> {
+        Self::new_with_eviction_policy(config, moka::policy::EvictionPolicy::default()).await
+    }
+
+    pub(crate) async fn new_with_eviction_policy(
+        mut config: ChunksCacheConfig,
+        eviction_policy: moka::policy::EvictionPolicy,
+    ) -> anyhow::Result<Self> {
         debug!(
             "Creating new ChunksCache with configuration: hot_cache_size={}, cold_cache_size={}, max_hot_bytes={}, max_disk_bytes={}, base_promotion_threshold={}",
             config.hot_cache_size,
@@ -2138,6 +2145,7 @@ impl ChunksCache {
         // The weigher returns the byte size of each entry (clamped to u32::MAX).
         let hot_cache_builder = moka::future::Cache::builder()
             .max_capacity(config.max_hot_bytes)
+            .eviction_policy(eviction_policy)
             .weigher(|_key: &String, value: &bytes::Bytes| -> u32 {
                 // Each entry's weight is its byte size (with overhead estimate for key + metadata)
                 (value.len() as u64 + 64).min(u32::MAX as u64) as u32
@@ -2277,6 +2285,23 @@ impl ChunksCache {
 
         self.update_utilization_metrics();
         Some(value)
+    }
+
+    /// Share memory-cache bytes without allocating a FUSE-sized output buffer.
+    pub(crate) async fn get_cached_range(
+        &self,
+        key: &String,
+        offset: usize,
+        len: usize,
+    ) -> Option<bytes::Bytes> {
+        let covers = |value: &bytes::Bytes| offset <= value.len() && len <= value.len() - offset;
+        let value = match self.write_hot_cache.get(key).filter(covers) {
+            Some(value) => value,
+            None => self.hot_cache.get(key).await.filter(covers)?,
+        };
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        self.policy.record_cache_request(true);
+        Some(value.slice(offset..offset + len))
     }
 
     pub async fn get_range_into(
@@ -2491,6 +2516,14 @@ impl ChunksCache {
         {
             self.persist_opportunistic(key, data, generation).await;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_publication(&self, key: &str) -> tokio::sync::MutexGuard<'_, ()> {
+        self.disk_storage.key_shards[DiskStorage::key_shard_index(key)]
+            .gate
+            .lock()
+            .await
     }
 
     pub async fn insert_recent_write_opportunistic(&self, key: String, data: bytes::Bytes) {
@@ -2951,6 +2984,45 @@ mod tests {
         // Wait for every task to finish
         for handle in handles {
             handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn whole_object_cache_retains_new_blocks_under_streaming_pressure() {
+        let temp_dir = tempdir().unwrap();
+        let block = bytes::Bytes::from(vec![7; 256 * 1024]);
+        let capacity = 3 * (block.len() as u64 + 64);
+        let cache = ChunksCache::new_with_eviction_policy(
+            ChunksCacheConfig::with_budgets(capacity, 0, temp_dir.path().to_path_buf()),
+            moka::policy::EvictionPolicy::lru(),
+        )
+        .await
+        .unwrap();
+
+        // Each completed block has many FUSE reads. Its accumulated frequency
+        // must not reject the next block before its remaining fragments arrive.
+        for id in 0..3 {
+            cache.insert_hot(&id.to_string(), block.clone()).await;
+        }
+        cache.hot_cache.run_pending_tasks().await;
+        for _ in 0..64 {
+            for id in 0..3 {
+                assert!(cache.get(&id.to_string()).await.is_some());
+            }
+            cache.hot_cache.run_pending_tasks().await;
+        }
+        for id in 3..12 {
+            let key = id.to_string();
+            cache.insert_opportunistic(key.clone(), block.clone()).await;
+            cache.hot_cache.run_pending_tasks().await;
+            let mut fragment = vec![0; 65536];
+            assert_eq!(
+                cache.get_range_into(&key, 65536, &mut fragment).await,
+                Some(fragment.len()),
+                "the next fragment must reuse the newly downloaded block"
+            );
+            assert_eq!(fragment, block[65536..131072]);
+            assert!(cache.hot_cache.weighted_size() <= capacity);
         }
     }
 

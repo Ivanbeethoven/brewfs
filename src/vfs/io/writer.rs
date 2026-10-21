@@ -935,6 +935,13 @@ where
 
     fn clear_recent_pending_if_complete(&self, s: &mut SliceState) {
         if s.upload_complete() {
+            // A committed slice only needs local overlay pages until its
+            // remote upload completes. Release them before waking writers;
+            // retaining them until the recent-slice timer stalls new writes.
+            if matches!(s.state, SliceStatus::Committed) {
+                s.data.release_all();
+                s.update_usage(0);
+            }
             self.clear_recent_pending_accounting(s);
         }
     }
@@ -6140,25 +6147,27 @@ where
         }
     }
 
-    pub(crate) async fn overlay_dirty_if_exists(
+    pub(crate) async fn overlay_dirty_if_exists<T: AsRef<[u8]> + AsMut<[u8]> + ?Sized>(
         &self,
         ino: u64,
         offset: u64,
-        buf: &mut [u8],
+        buf: &mut T,
     ) -> anyhow::Result<()> {
         let writer = self.files.get(&ino).map(|entry| entry.value().clone());
         match writer {
             Some(ref writer) if writer.has_overlay_state().await => {
-                writer.overlay_dirty(offset, buf).await?;
+                writer.overlay_dirty(offset, buf.as_mut()).await?;
             }
             #[cfg(not(test))]
             None => {
                 // SSD fallback: no in-memory writer exists for this inode.
                 // Covers the crash recovery window where dirty data is on
                 // SSD but hasn't been re-uploaded yet.
-                if let Some(wb) = &self.write_back {
+                if let Some(wb) = &self.write_back
+                    && wb.has_recoverable_data()
+                {
                     let layout = self.config.layout;
-                    let spans = split_chunk_spans(layout, offset, buf.len());
+                    let spans = split_chunk_spans(layout, offset, buf.as_ref().len());
                     for span in spans {
                         let cid = chunk_id_for(ino as i64, span.index)?;
                         let chunk_start = span.index * layout.chunk_size;
@@ -6169,7 +6178,7 @@ where
                                 ino as i64,
                                 cid,
                                 span.offset,
-                                &mut buf[dst_start..dst_end],
+                                &mut buf.as_mut()[dst_start..dst_end],
                             )
                             .await;
                     }
@@ -6233,7 +6242,9 @@ where
             }
             #[cfg(not(test))]
             None => {
-                if let Some(wb) = &self.write_back {
+                if let Some(wb) = &self.write_back
+                    && wb.has_recoverable_data()
+                {
                     let layout = self.config.layout;
                     let spans = split_chunk_spans(layout, offset, len);
                     if spans.is_empty() {
@@ -8783,6 +8794,8 @@ mod tests {
         .await
         .expect("blocked upload should leave one recoverable dirty record");
 
+        assert!(writer.buffer_usage.load(Ordering::Acquire) > 0);
+
         store.unblock();
         timeout(Duration::from_secs(2), async {
             loop {
@@ -8796,6 +8809,23 @@ mod tests {
         })
         .await
         .expect("dirty record should be removed after object upload completes");
+
+        assert_eq!(
+            writer.buffer_usage.load(Ordering::Acquire),
+            0,
+            "completed committed uploads must release the foreground write budget immediately"
+        );
+        assert!(!file_writer.has_overlay_state().await);
+        let slices = meta
+            .get_slices(chunk_id_for(ino, 0).unwrap())
+            .await
+            .unwrap();
+        let mut actual = vec![0u8; layout.block_size as usize];
+        store
+            .read_range((slices[0].slice_id, 0), 0, &mut actual)
+            .await
+            .unwrap();
+        assert_eq!(actual, vec![5u8; layout.block_size as usize]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,0 +1,14 @@
+{
+  "url": "https://help.aliyun.com/zh/cs/user-guide/acs-pod-instance-overview",
+  "title": "ACS Pod实例概述",
+  "checked_date": "2026-10-20",
+  "page_update": "2026-10-16 14:23:38",
+  "compute_class": "general-purpose",
+  "bandwidth_definition": "网络带宽（出+入）（Gbits/s）",
+  "client_vcpu": 4,
+  "client_gbit_s": 1.5,
+  "server_vcpu": 8,
+  "server_gbit_s": 2.5,
+  "table_rowspan_verified": true,
+  "note": "Published specification, not a measured exact per-flow limiter. Short bursts may exceed nominal bandwidth."
+}

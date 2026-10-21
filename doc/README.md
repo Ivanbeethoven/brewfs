@@ -2,7 +2,8 @@
 
 This directory is the canonical documentation tree for BrewFS. Keep current
 architecture, operations, testing, protocol, bug-fix, and workspace material
-under `doc/`. Historical execution records belong under `superpowers/` and
+under `doc/`; documented cross-repository innovations and their evidence live
+under [innovations/](../innovations/README.md). Historical execution records belong under `superpowers/` and
 should not be treated as current behavior without checking the source.
 
 ## Start Here
@@ -16,6 +17,7 @@ should not be treated as current behavior without checking the source.
 | Binary deployment | [operations/binary-deployment.md](operations/binary-deployment.md) |
 | Current packed performance evidence | [performance/native-packed-base-large-scale-validation-2026-09-24.md](performance/native-packed-base-large-scale-validation-2026-09-24.md) |
 | Docker and CI test guide | [testing/docker-compose-test-guide.md](testing/docker-compose-test-guide.md) |
+| BrewFS–RustFS cooperative I/O innovations | [../innovations/README.md](../innovations/README.md) |
 | VFS internals | [vfs/README.md](vfs/README.md) |
 
 ## Directory Layout

@@ -8,6 +8,8 @@
 分支：codex/packed-metadata-aliyun-20260930  
 当前基线：e980d592801388c3c359d7e82b966df84f636e6f；2026-10-13 轮次改动见本文首节对应 PR（分支 codex/packed-v3-busy-native-budget-split）。
 工作树：干净  
+
+CI workspace-overlay control runs may set `BREWFS_WORKSPACE_ALLOW_EXPECTED_CONTENTION=1` to record explicit `workspace is busy` contention; strict acceptance runs keep the default `0`.
 PR：历史 PR #161、#162、#164 已合并；当前收尾证据以 e980d592 云端 artifact 和 2026-10-13 ECS 本机 artifact 为准。
 
 ## 2026-10-13 overlay + packed-v3/005 统一生命周期轮次（最新，优先阅读）

@@ -29,13 +29,75 @@ use tracing::Instrument;
 
 /// Bytes and their reservation stay together through the last FUSE consumer.
 /// This owner is available to every read backend and build feature set.
-pub(crate) struct OwnedReadReply {
-    pub data: Vec<u8>,
+pub(crate) struct OwnedReadReply<T = Vec<u8>> {
+    pub data: T,
     pub _guard: Box<dyn Send + Sync>,
 }
-impl AsRef<[u8]> for OwnedReadReply {
+impl<T: AsRef<[u8]>> AsRef<[u8]> for OwnedReadReply<T> {
     fn as_ref(&self) -> &[u8] {
-        &self.data
+        self.data.as_ref()
+    }
+}
+
+/// A cache hit shares immutable bytes until a dirty overlay needs to change them.
+pub(crate) enum ReadReply {
+    Owned(Vec<u8>),
+    Cached(bytes::Bytes),
+}
+
+impl ReadReply {
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Owned(data) => data,
+            Self::Cached(data) => data.to_vec(),
+        }
+    }
+
+    pub(crate) fn into_bytes(self) -> bytes::Bytes {
+        match self {
+            Self::Owned(data) => data.into(),
+            Self::Cached(data) => data,
+        }
+    }
+}
+
+impl From<Vec<u8>> for ReadReply {
+    fn from(data: Vec<u8>) -> Self {
+        Self::Owned(data)
+    }
+}
+
+impl AsRef<[u8]> for ReadReply {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(data) => data,
+            Self::Cached(data) => data,
+        }
+    }
+}
+
+impl AsMut<[u8]> for ReadReply {
+    fn as_mut(&mut self) -> &mut [u8] {
+        if let Self::Cached(data) = self {
+            *self = Self::Owned(data.to_vec());
+        }
+        match self {
+            Self::Owned(data) => data,
+            Self::Cached(_) => unreachable!(),
+        }
+    }
+}
+
+impl std::ops::Deref for ReadReply {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+impl std::ops::DerefMut for ReadReply {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.as_mut()
     }
 }
 
@@ -532,6 +594,47 @@ where
 
     pub(crate) async fn read(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
         self.read_at(offset, len).await
+    }
+
+    pub(crate) async fn read_reply(&self, offset: u64, len: usize) -> anyhow::Result<ReadReply> {
+        // Prepared workspace reads retain their request fences and output ownership.
+        #[cfg(feature = "workspace-overlay")]
+        if self.backend.workspace_read_plan().is_some() {
+            return self.read(offset, len).await.map(ReadReply::Owned);
+        }
+        let actual_len = (len as u64).min(self.inode.file_size().saturating_sub(offset));
+        let layout = self.config.layout;
+        let chunk_offset = offset % layout.chunk_size;
+        if actual_len > 0 && actual_len <= layout.chunk_size - chunk_offset {
+            let chunk_id = chunk_id_for(self.inode.ino(), offset / layout.chunk_size)?;
+            let slices = self.chunk_slices.get(&chunk_id).map(|entry| entry.clone());
+            if let Some(slices) = slices
+                && let Some(slice) = slices.last()
+                && chunk_offset >= slice.offset
+            {
+                let relative = chunk_offset - slice.offset;
+                let block_size = u64::from(layout.block_size);
+                let block_offset = relative % block_size;
+                if actual_len <= slice.length.saturating_sub(relative)
+                    && actual_len <= block_size - block_offset
+                {
+                    self.back_pressure().await?;
+                    if let Some(data) = self
+                        .backend
+                        .store()
+                        .read_cached_range(
+                            (slice.slice_id, (relative / block_size).as_u32()),
+                            block_offset,
+                            actual_len as usize,
+                        )
+                        .await
+                    {
+                        return Ok(ReadReply::Cached(data));
+                    }
+                }
+            }
+        }
+        self.read(offset, len).await.map(ReadReply::Owned)
     }
 
     fn select_forward_session_match(
@@ -2661,6 +2764,106 @@ mod tests {
         assert!(
             after_second > after_first,
             "repeated reads must route through BlockStore/ChunksCache instead of copying SliceState.page"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_reply_keeps_slice_offsets_and_isolates_overlay_mutation() {
+        use crate::cadapter::{client::ObjectClient, localfs::LocalFsBackend};
+        use crate::chunk::cache::ChunksCacheConfig;
+        use crate::chunk::store::{BlockStoreConfig, ObjectBlockStore};
+
+        let objects = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let layout = small_layout();
+        let store = Arc::new(
+            ObjectBlockStore::new_with_configs_async(
+                ObjectClient::new(LocalFsBackend::new(objects.path())),
+                ChunksCacheConfig::with_budgets(1024 * 1024, 0, cache.path().into()),
+                BlockStoreConfig {
+                    block_size: layout.block_size as usize,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
+        let ino = 74;
+        let chunk_id = chunk_id_for(ino, 0).unwrap();
+        let slice_id = meta.next_id(SLICE_ID_KEY).await.unwrap() as u64;
+        let first = vec![3; layout.block_size as usize];
+        let second = vec![7; layout.block_size as usize - 512];
+        for (block, data) in [(0, &first), (1, &second)] {
+            store.cache_block((slice_id, block), data).await.unwrap();
+        }
+        meta.append_slice(
+            chunk_id,
+            SliceDesc {
+                slice_id,
+                chunk_id,
+                offset: 512,
+                length: (first.len() + second.len()) as u64,
+            },
+        )
+        .await
+        .unwrap();
+        let reader = DataReader::new(Arc::new(ReadConfig::new(layout)), backend);
+        let file = reader.open_for_handle(Inode::new(ino, layout.chunk_size), 1);
+        assert_eq!(file.read_reply(512, 128).await.unwrap().as_ref(), &[3; 128]);
+        let shared = store
+            .read_cached_range((slice_id, 1), 128, 128)
+            .await
+            .unwrap();
+        let mut reply = file
+            .read_reply(512 + u64::from(layout.block_size) + 128, 128)
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.as_ptr(),
+            shared.as_ptr(),
+            "hot replies should share immutable cache bytes"
+        );
+        reply[0] = 9;
+        assert_eq!(reply[0], 9);
+        assert_eq!(shared[0], 7, "dirty overlays must not mutate cached blocks");
+        assert_eq!(file.read_reply(0, 512).await.unwrap().as_ref(), &[0; 512]);
+        assert_eq!(
+            file.read_reply(layout.chunk_size - 64, 128)
+                .await
+                .unwrap()
+                .len(),
+            64
+        );
+        assert!(
+            store
+                .read_cached_range((slice_id, 1), second.len() as u64 - 1, 2)
+                .await
+                .is_none()
+        );
+
+        let replacement = meta.next_id(SLICE_ID_KEY).await.unwrap() as u64;
+        store
+            .cache_block((replacement, 0), &[11; 256])
+            .await
+            .unwrap();
+        meta.append_slice(
+            chunk_id,
+            SliceDesc {
+                slice_id: replacement,
+                chunk_id,
+                offset: 512,
+                length: 256,
+            },
+        )
+        .await
+        .unwrap();
+        file.invalidate(512, 256).await;
+        assert_eq!(
+            file.read_reply(512, 128).await.unwrap().as_ref(),
+            &[11; 128]
         );
     }
 

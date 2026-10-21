@@ -20,12 +20,28 @@ async fn packed_recovery_strict_inventory_roundtrip_tracks_remaining_real_rows()
     cache.seal_slice_record(key(1), 0, 7).await.unwrap();
     let recovered = FsWriteBackCache::new_with_sync(temp.path().to_path_buf(), false);
     assert!(!recovered.has_recoverable_records());
+    assert!(recovered.has_recoverable_data());
     let rows = recovered.recover_packed_publication().await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].key, key(1));
     assert!(recovered.has_recoverable_records());
     recovered.remove(&key(1)).await.unwrap();
     assert!(!recovered.has_recoverable_records());
+    assert!(!recovered.has_recoverable_data());
+}
+
+#[tokio::test]
+async fn packed_recovery_empty_inventory_finishes_disk_fallback() {
+    for create_dirty in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        if create_dirty {
+            fs::create_dir(temp.path().join("dirty")).await.unwrap();
+        }
+        let cache = FsWriteBackCache::new(temp.path().to_path_buf());
+        assert!(cache.has_recoverable_data());
+        assert!(cache.recover_packed_publication().await.unwrap().is_empty());
+        assert!(!cache.has_recoverable_data());
+    }
 }
 
 #[tokio::test]
@@ -40,6 +56,7 @@ async fn packed_recovery_rejects_oversized_slice_description_before_reading_data
     let error = cache.recover_packed_publication().await.unwrap_err();
     assert!(error.to_string().contains("slice byte cap"));
     assert!(!cache.has_recoverable_records());
+    assert!(cache.has_recoverable_data());
 }
 
 #[tokio::test]

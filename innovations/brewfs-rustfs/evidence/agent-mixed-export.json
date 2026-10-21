@@ -1,0 +1,8 @@
+{
+  "archive": "brewfs-agent-mixed/raw-records.tar.gz",
+  "files": 1816,
+  "bytes": 64785916,
+  "sha256": "ba27d32e7634ba83503084259f350a136acb313406593063ab0791397131ec3c",
+  "integrity_passed": true,
+  "performance_passed": false
+}

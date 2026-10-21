@@ -176,6 +176,7 @@ jobs:
 
       - name: Run workspace overlay control smoke
         run: >-
+          BREWFS_WORKSPACE_ALLOW_EXPECTED_CONTENTION=1
           bash docker/compose-xfstests/run_workspace_overlay_compose.sh
           --backend "${{ matrix.meta-backend }}"
           --control-only

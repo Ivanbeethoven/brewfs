@@ -77,6 +77,11 @@ pub trait BlockStore {
     /// corruption and must return [`IncompleteBlockRead`].
     async fn read_range(&self, key: BlockKey, offset: u64, buf: &mut [u8]) -> anyhow::Result<()>;
 
+    /// Borrow a complete range already in memory. A miss uses the normal read path.
+    async fn read_cached_range(&self, _key: BlockKey, _offset: u64, _len: usize) -> Option<Bytes> {
+        None
+    }
+
     /// Delete `block_count` blocks starting from `key.1` (block_index) for slice `key.0`.
     async fn delete_range(&self, key: BlockKey, block_count: u64) -> anyhow::Result<()>;
 
@@ -499,15 +504,33 @@ impl BlockStoreConfig {
 }
 
 impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
+    async fn cache_for_client(
+        client: &ObjectClient<B>,
+        config: ChunksCacheConfig,
+    ) -> anyhow::Result<ChunksCache> {
+        // Whole-object fetches must survive the following FUSE fragments.
+        // Frequency admission can keep completed blocks and reject a fresh
+        // download; LRU admits it within the same configured byte budget.
+        let policy = if client.prefers_full_object_reads() {
+            moka::policy::EvictionPolicy::lru()
+        } else {
+            moka::policy::EvictionPolicy::default()
+        };
+        ChunksCache::new_with_eviction_policy(config, policy).await
+    }
+
     #[allow(dead_code)]
     pub fn new(client: ObjectClient<B>) -> Self {
         let cache_dir = dirs::cache_dir().unwrap().join("brewfs");
 
         let _ = fs::create_dir_all(cache_dir.clone());
 
-        let block_cache = block_on(ChunksCache::new_with_config(ChunksCacheConfig::default()))
-            .map_err(|e| anyhow::anyhow!("Failed to create cache: {}", e))
-            .unwrap();
+        let block_cache = block_on(Self::cache_for_client(
+            &client,
+            ChunksCacheConfig::default(),
+        ))
+        .map_err(|e| anyhow::anyhow!("Failed to create cache: {}", e))
+        .unwrap();
         let config = BlockStoreConfig::default();
         config.validate().expect("default config must be valid");
         let page_cache = ReadPageCache::new(config.page_cache_capacity, config.page_size);
@@ -557,7 +580,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         let cache_dir = dirs::cache_dir().unwrap().join("brewfs");
         let _ = fs::create_dir_all(cache_dir.clone());
 
-        let block_cache = block_on(ChunksCache::new_with_config(cache_config))
+        let block_cache = block_on(Self::cache_for_client(&client, cache_config))
             .map_err(|e| anyhow::anyhow!("Failed to create cache: {}", e))?;
         let page_cache =
             ReadPageCache::new(store_config.page_cache_capacity, store_config.page_size);
@@ -586,7 +609,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         let cache_dir = dirs::cache_dir().unwrap().join("brewfs");
         let _ = fs::create_dir_all(cache_dir.clone());
 
-        let block_cache = ChunksCache::new_with_config(cache_config).await?;
+        let block_cache = Self::cache_for_client(&client, cache_config).await?;
         let page_cache =
             ReadPageCache::new(store_config.page_cache_capacity, store_config.page_size);
         Ok(Self {
@@ -948,12 +971,12 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                 object_metrics.record_read_background_prefetch_dropped();
                 return;
             };
-            if cache.get(&cache_key).await.is_some() {
-                return;
-            }
-
             let block_data = read_flight
                 .execute(key, || async move {
+                    // Another leader may have published after our first miss.
+                    if let Some(data) = cache.get(&cache_key).await {
+                        return Ok::<_, anyhow::Error>(data);
+                    }
                     bandwidth.acquire_download(block_size).await;
                     let started = Instant::now();
                     client.read_event_with_origin(
@@ -973,6 +996,9 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                     match fetched {
                         Some((stored, data)) => {
                             object_metrics.record_get(stored as u64, started.elapsed());
+                            if !data.is_empty() {
+                                cache.insert_opportunistic(cache_key, data.clone()).await;
+                            }
                             Ok::<_, anyhow::Error>(data)
                         }
                         None => {
@@ -983,15 +1009,8 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                 })
                 .await;
 
-            match block_data {
-                Ok(block_data) => {
-                    cache
-                        .insert_opportunistic(cache_key, (*block_data).clone())
-                        .await;
-                }
-                Err(err) => {
-                    tracing::debug!(error = %err, ?key, "background block prefetch failed");
-                }
+            if let Err(err) = block_data {
+                tracing::debug!(error = %err, ?key, "background block prefetch failed");
             }
         });
     }
@@ -1103,6 +1122,17 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             .map(|_| data.len() as u64)
     }
 
+    async fn read_cached_range(&self, key: BlockKey, offset: u64, len: usize) -> Option<Bytes> {
+        let data = self
+            .block_cache
+            .get_cached_range(&Self::key_for(key), offset as usize, len)
+            .await?;
+        self.client
+            .read_event(ReadClass::NativePayload, ReadEvent::CacheHit);
+        self.object_metrics.record_read_block_cache_hit();
+        Some(data)
+    }
+
     #[tracing::instrument(
         name = "ObjectBlockStore.read_range",
         level = "trace",
@@ -1183,7 +1213,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         // byte as well.  Requiring offset > 0 made every small-file read at
         // the beginning of a block download the complete block, which is
         // especially costly when the data cache is intentionally cold.
-        let can_try_object_ranges = len > 0 && len <= range_size_threshold;
+        let prefer_full_objects = self.client.prefers_full_object_reads();
+        let can_try_object_ranges = len > 0 && len <= range_size_threshold && !prefer_full_objects;
 
         if can_try_object_ranges
             && let Some(block_data) = self.read_flight.try_piggyback(&key).await
@@ -1516,7 +1547,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             return Ok(());
         }
 
-        // Large read — fetch full block via SingleFlight, then cache it.
+        // Keep cache publication inside the flight: late arrivals must see
+        // either the shared download or its cached result, without a gap.
         tracing::Span::current().record("strategy", "coalesced_full");
         let client = &self.client;
         let object_metrics = self.object_metrics.clone();
@@ -1525,17 +1557,27 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         let block_data = self
             .read_flight
             .execute(key, || async move {
+                if let Some(data) = self.block_cache.get(&key_str).await {
+                    return Ok::<_, anyhow::Error>(data);
+                }
                 let layout = match layout {
                     Some(layout) => layout,
+                    // The full response carries its own frame header. A
+                    // separate probe would read the same EC frame twice.
+                    None if prefer_full_objects => self
+                        .format_cache
+                        .get(&key)
+                        .await
+                        .unwrap_or(ObjectLayout::Versioned(Compression::None)),
                     None => self.resolve_object_layout(key).await?,
                 };
                 let object_key = Self::object_key_for(key, layout);
                 self.bandwidth
                     .acquire_download(self.config.block_size)
                     .await;
-                let started = Instant::now();
+                let mut started = Instant::now();
                 client.read_event(ReadClass::NativePayload, ReadEvent::FetchLeader);
-                let fetched = Self::observed_full(
+                let mut fetched = Self::observed_full(
                     client,
                     &object_key,
                     layout,
@@ -1544,9 +1586,32 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                 )
                 .await?;
                 object_metrics.record_read_full_get();
+                if fetched.is_none()
+                    && prefer_full_objects
+                    && !self.config.versioned_objects_only
+                    && matches!(layout, ObjectLayout::Versioned(_))
+                {
+                    object_metrics.record_get(0, started.elapsed());
+                    started = Instant::now();
+                    fetched = Self::observed_full(
+                        client,
+                        &Self::key_for(key),
+                        ObjectLayout::Legacy,
+                        compression,
+                        self.config.block_size,
+                    )
+                    .await?;
+                    object_metrics.record_read_full_get();
+                    self.format_cache.insert(key, ObjectLayout::Legacy).await;
+                }
                 match fetched {
                     Some((stored, data)) => {
                         object_metrics.record_get(stored as u64, started.elapsed());
+                        if !data.is_empty() {
+                            self.block_cache
+                                .insert_opportunistic(key_str, data.clone())
+                                .await;
+                        }
                         Ok::<_, anyhow::Error>(data)
                     }
                     None => {
@@ -1558,7 +1623,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             .await
             .map_err(|e| anyhow::anyhow!("SingleFlight read failed: {e}"))?;
 
-        // Copy data to caller's buffer first — minimize read latency.
+        // Each caller validates its own range, including shared short objects.
         let offset_usize = offset as usize;
         let end = offset_usize + len;
         let mut copy_len = 0;
@@ -1570,13 +1635,6 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         tracing::Span::current().record("read_len", copy_len);
 
         require_complete_read(key, offset, len, copy_len)?;
-
-        // Populate caches after serving the read — the hot cache insert is
-        // fast (in-memory) so we await it to ensure subsequent reads hit.
-        // Disk persistence is spawned in the background by insert_opportunistic.
-        self.block_cache
-            .insert_opportunistic(key_str.clone(), (*block_data).clone())
-            .await;
 
         Ok(())
     }
@@ -1650,6 +1708,190 @@ mod tests {
     use crate::cadapter::client::ObjectClient;
     use crate::cadapter::localfs::LocalFsBackend;
     use crate::chunk::layout::ChunkLayout;
+
+    #[tokio::test]
+    async fn whole_object_download_stays_shared_until_cache_publication() -> anyhow::Result<()> {
+        struct ImmediateBackend {
+            data: Vec<u8>,
+            gets: Arc<AtomicU64>,
+        }
+        #[async_trait]
+        impl ObjectBackend for ImmediateBackend {
+            fn prefers_full_object_reads(&self) -> bool {
+                true
+            }
+            async fn get_object(&self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                self.gets.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(self.data.clone()))
+            }
+            async fn put_object(&self, _: &str, _: &[u8]) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            async fn get_object_range(
+                &self,
+                _: &str,
+                _: u64,
+                _: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                unreachable!()
+            }
+            async fn get_etag(&self, _: &str) -> anyhow::Result<String> {
+                unreachable!()
+            }
+            async fn delete_object(&self, _: &str) -> anyhow::Result<()> {
+                unreachable!()
+            }
+        }
+        let cache_dir = tempfile::tempdir()?;
+        let raw = vec![37; 4096];
+        let gets = Arc::new(AtomicU64::new(0));
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(ImmediateBackend {
+                data: encode_persisted_block(&raw, Compression::None).to_vec(),
+                gets: gets.clone(),
+            }),
+            ChunksCacheConfig::with_budgets(65536, 0, cache_dir.path().to_path_buf()),
+            BlockStoreConfig {
+                block_size: 4096,
+                compression: Compression::None,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let key = (700, 0);
+        let cache_key = ObjectBlockStore::<ImmediateBackend>::key_for(key);
+        // Hold the real cache publication gate, not the object fetch. A caller
+        // arriving after download must still share that completed download.
+        let gate = store.block_cache.hold_publication(&cache_key).await;
+        let mut first = vec![0; 4096];
+        let mut second = vec![0; 128];
+        let mut leader = Box::pin(store.read_range(key, 0, &mut first));
+        assert!(futures::poll!(&mut leader).is_pending());
+        assert_eq!(gets.load(Ordering::SeqCst), 1);
+        let mut follower = Box::pin(store.read_range(key, 256, &mut second));
+        assert!(futures::poll!(&mut follower).is_pending());
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            1,
+            "cache publication must remain inside the shared download"
+        );
+        drop(gate);
+        let (a, b) = tokio::join!(leader, follower);
+        a?;
+        b?;
+        assert_eq!(first, raw);
+        assert_eq!(second, raw[256..384]);
+        store.read_range(key, 512, &mut second).await?;
+        assert_eq!(gets.load(Ordering::SeqCst), 1);
+        // A cached short object must not satisfy a request beyond its end.
+        assert!(store.read_range(key, 4090, &mut second).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whole_object_policy_coalesces_payload_and_header_reads() -> anyhow::Result<()> {
+        use std::sync::Mutex;
+
+        struct WholeObjectBackend {
+            inner: LocalFsBackend,
+            gets: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl ObjectBackend for WholeObjectBackend {
+            fn prefers_full_object_reads(&self) -> bool {
+                true
+            }
+            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+                self.inner.put_object(key, data).await
+            }
+            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                self.gets.lock().unwrap().push(key.to_owned());
+                tokio::task::yield_now().await;
+                self.inner.get_object(key).await
+            }
+            async fn get_object_range(
+                &self,
+                _: &str,
+                _: u64,
+                _: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                anyhow::bail!(
+                    "whole-object reads must not issue a separate header or payload Range"
+                )
+            }
+            async fn get_etag(&self, key: &str) -> anyhow::Result<String> {
+                self.inner.get_etag(key).await
+            }
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                self.inner.delete_object(key).await
+            }
+        }
+
+        let objects = tempfile::tempdir()?;
+        let cache = tempfile::tempdir()?;
+        let gets = Arc::new(Mutex::new(Vec::new()));
+        let backend = WholeObjectBackend {
+            inner: LocalFsBackend::new(objects.path()),
+            gets: gets.clone(),
+        };
+        let raw: Vec<u8> = (0..262144).map(|i| (i % 251) as u8).collect();
+        for (id, compression) in [
+            (1, Compression::None),
+            (2, Compression::Lz4),
+            (3, Compression::Zstd(1)),
+        ] {
+            backend
+                .put_object(
+                    &format!("chunks-v2/{id}/0"),
+                    &encode_persisted_block(&raw, compression),
+                )
+                .await?;
+        }
+        backend.put_object("chunks/4/0", &raw).await?;
+        backend.put_object("chunks-v2/5/0", b"bad").await?;
+        backend.put_object("chunks/5/0", &raw).await?;
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(backend),
+            ChunksCacheConfig::with_budgets(8 * 1024 * 1024, 0, cache.path().to_path_buf()),
+            BlockStoreConfig {
+                compression: Compression::None,
+                ..Default::default()
+            },
+        )
+        .await?;
+        for id in 1..=4 {
+            let mut first = vec![0; 65536];
+            let mut second = vec![0; 65536];
+            let (a, b) = tokio::join!(
+                store.read_range((id, 0), 0, &mut first),
+                store.read_range((id, 0), 65536, &mut second),
+            );
+            a?;
+            b?;
+            assert_eq!(first, raw[..65536]);
+            assert_eq!(second, raw[65536..131072]);
+            store.read_range((id, 0), 131072, &mut first).await?;
+            assert_eq!(first, raw[131072..196608]);
+        }
+        assert_eq!(
+            *gets.lock().unwrap(),
+            vec![
+                "chunks-v2/1/0",
+                "chunks-v2/2/0",
+                "chunks-v2/3/0",
+                "chunks-v2/4/0",
+                "chunks/4/0"
+            ]
+        );
+        let mut bad = [0; 1];
+        assert!(store.read_range((5, 0), 0, &mut bad).await.is_err());
+        assert_eq!(
+            gets.lock().unwrap().last().unwrap(),
+            "chunks-v2/5/0",
+            "invalid frame must not fall back to legacy data"
+        );
+        Ok(())
+    }
 
     async fn local_object_store(
         object_dir: &Path,
