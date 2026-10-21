@@ -4,13 +4,18 @@ set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
 AX_DIR="${SRC_ROOT}/ax"
-if [ ! -d "${AX_DIR}/.git" ]; then
-  git clone "${AX_REPO}" "${AX_DIR}"
+if [ ! -f "${AX_DIR}/Makefile" ]; then
+  if ! git clone --depth 1 --branch "${AX_BRANCH}" "${AX_REPO}" "${AX_DIR}"; then
+    echo "==> git clone failed; downloading the fork tarball"
+    tmp="$(mktemp -d)"
+    fetch_github "https://github.com/Ivanbeethoven/ax/archive/refs/heads/${AX_BRANCH}.tar.gz" "${tmp}/ax.tgz"
+    tar -C "${tmp}" -xzf "${tmp}/ax.tgz"
+    rm -rf "${AX_DIR}"
+    mv "${tmp}/ax-${AX_BRANCH}" "${AX_DIR}"
+    rm -rf "${tmp}"
+  fi
 fi
 cd "${AX_DIR}"
-git fetch origin
-git checkout "${AX_BRANCH}"
-git pull --ff-only origin "${AX_BRANCH}" || true
 
 make build-binaries
 install -m 0755 bin/ax "${LOCAL_BIN}/ax"
