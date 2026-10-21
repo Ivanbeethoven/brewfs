@@ -9,7 +9,8 @@ cd "${SUBSTRATE_DIR}"
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME}" \
 KUBECTL_CONTEXT="${KUBECTL_CONTEXT}" \
   ./hack/install-ate-kind.sh --deploy-ate-system \
+    --rollout-timeout 10m \
     --credential-provider='{"name":"k8s.io"}'
 
-kubectl -n ate-system rollout status deploy/ate-api-server --timeout=300s
+kubectl -n ate-system rollout status deploy/ate-api-server --timeout=600s
 kubectl -n ate-system get pods
