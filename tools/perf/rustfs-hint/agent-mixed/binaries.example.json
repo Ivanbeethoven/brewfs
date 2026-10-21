@@ -1,0 +1,16 @@
+{
+  "brewfs": {
+    "path": "/path/to/brewfs",
+    "revision": "81db962cfee71253d0012441a926578aced69877",
+    "sha256": "dd5dc764d7e9155ec7f5e2bf2d1421c7cca3e0d54550e606cdc902fabd04e7c7"
+  },
+  "candidate": {
+    "path": "/path/to/rustfs",
+    "revision": "cc4926fac1107aee76540f28bf22dbd47fcbca24",
+    "sha256": "dc5e70da04d904f5ba3ec114776eb680551a2554107b36e5521393d80a9ffc9b"
+  },
+  "compare_layout": {
+    "path": "/path/to/compare_layout",
+    "sha256": "4f9a4968ba284b28bc91523568d0803480efd9ecf4ef03e75c59b5ba8571f10a"
+  }
+}

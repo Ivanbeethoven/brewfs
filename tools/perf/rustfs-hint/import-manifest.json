@@ -1,0 +1,355 @@
+{
+  "description": "Source checksums before portability edits; published checksums are the Git blobs.",
+  "files": [
+    {
+      "source": "work/brewfs-agent-mixed/freeze_workloads.py",
+      "target": "agent-mixed/freeze_workloads.py",
+      "source_sha256": "d45ccef9eb409321714efa7753422f9415b1da10560a4e1b207f96524264bad4"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/prepare_inputs.py",
+      "target": "agent-mixed/prepare_inputs.py",
+      "source_sha256": "e452a9e5e3ddcbc9fcd5172642231600c3c9ac22dcbbb74a13e428a95763df37"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/prepare_jobs.py",
+      "target": "agent-mixed/prepare_jobs.py",
+      "source_sha256": "59efa1f0bdfb335ab8b4310155ae2e3fbc2fd278732ee129c4127b5cd364089b"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/run_core.py",
+      "target": "agent-mixed/run_core.py",
+      "source_sha256": "908926e1a3a1e127d9b0a998ad7ab94c5fb6d369827e693de627bb6b859dac10"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/run_client.py",
+      "target": "agent-mixed/run_client.py",
+      "source_sha256": "013026c51bc0540eec2a2e9149197f7f9658a7752dfe15eae9b76b110c9f827d"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/run_agent_io.py",
+      "target": "agent-mixed/run_agent_io.py",
+      "source_sha256": "3299be431b732238ce0e2096206ad71eb12a0ac2f000c517b1c07320e7ef25fb"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/server_control.py",
+      "target": "agent-mixed/server_control.py",
+      "source_sha256": "93aeaceb0bbf6d6887e7c2220682a71b2fc9190f5d6e210d15e85e7d31d7281d"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/sample_resources.py",
+      "target": "agent-mixed/sample_resources.py",
+      "source_sha256": "bb52d182fbb50a0dc791ca98e30c92277f75d1dc63040fb095283ea07736947a"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/audit_policy_layout.py",
+      "target": "agent-mixed/audit_policy_layout.py",
+      "source_sha256": "e17c08608a4d86f8da98b528e3efa65cb232bc9d7a288254d409f1ac8d51ce82"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/campaign.py",
+      "target": "agent-mixed/campaign.py",
+      "source_sha256": "1616f329d56172104176e96fef3df4922e3922949d08db2935829a9034423931"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/verify_staged.py",
+      "target": "agent-mixed/verify_staged.py",
+      "source_sha256": "c761e28554459ed81cb39ac279ed36c07228a29aff6b770bf7a845e85beeaf28"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/resume_formal.py",
+      "target": "agent-mixed/resume_formal.py",
+      "source_sha256": "05ee525351584f77a36621bdb8dcafcd87f5a6e71a99e68c2afc2437692a3b55"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/layout_background.py",
+      "target": "agent-mixed/layout_background.py",
+      "source_sha256": "bab8bf218c316de0d1025e6cdb93e48f9a84840622c8299bf274adad5d489182"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/profile_stage.py",
+      "target": "agent-mixed/profile_stage.py",
+      "source_sha256": "8830c0a7fb0cec0776b368e6353ddb3b670a77e649cce0da8d6003ce25e6d5ea"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/run_stage_profile.py",
+      "target": "agent-mixed/run_stage_profile.py",
+      "source_sha256": "6019cc97391793f3f806a76bcade1e9688ec505c7c1bf007d59f0b161917c1ca"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/transport_probe.py",
+      "target": "agent-mixed/transport_probe.py",
+      "source_sha256": "534b45f82dbe0a702bec9fd469022001563eaec5de1bcede63f02ea02490f832"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/capacity_check.py",
+      "target": "agent-mixed/capacity_check.py",
+      "source_sha256": "d592e4688f064c86b9c40f655a51ff56318a28ccfc4fd2028d882611dbb183b1"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/analyze.py",
+      "target": "agent-mixed/analyze.py",
+      "source_sha256": "160fc44dc58fc3f48d08c62214d545b0d268055f34595b06b665da73efbb1e9a"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/analyze_components.py",
+      "target": "agent-mixed/analyze_components.py",
+      "source_sha256": "e182f978017090f994f05ff41f3bd6182a45fe0c00f2511bc1891d290bc951ff"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/analyze_bottlenecks.py",
+      "target": "agent-mixed/analyze_bottlenecks.py",
+      "source_sha256": "4775b59a3c59052750e1158b4e8f7a983491b1db4e11007525cfdd00dc4a1029"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/audit_completed.py",
+      "target": "agent-mixed/audit_completed.py",
+      "source_sha256": "a44a8ee0e5854ad45cd566293aa7f9a2c48f249ac053936805562431495ad579"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/report.py",
+      "target": "agent-mixed/report.py",
+      "source_sha256": "f297b6331747d363aa16e813e6b3abd9f36631094373718759b35c7ccbecf5c0"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/export_results.py",
+      "target": "agent-mixed/export_results.py",
+      "source_sha256": "3f3a8dc44b41ea6a43fc8515a894fd92b3e8d36650a27892dfb07d2ead1453bb"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/cloud.py",
+      "target": "agent-mixed/cloud.py",
+      "source_sha256": "0a24f2d48505af066cbf289427f3c89633a9902882be418dd3058c02c443a2ef"
+    },
+    {
+      "source": "work/brewfs-agent-mixed/stage.py",
+      "target": "agent-mixed/stage.py",
+      "source_sha256": "4d066a79ff4ee86058f292eebaabb570008cc59dcc919b7dc3886c387c9d9ddb"
+    },
+    {
+      "source": "work/brewfs-io-joint/run_joint_io.py",
+      "target": "io-joint/run_joint_io.py",
+      "source_sha256": "d487ee30cd877d93a29680ee7b72c360f63391272d5cb3f86e4b1a68dc93d434"
+    },
+    {
+      "source": "work/brewfs-io-joint/run_hot_io.py",
+      "target": "io-joint/run_hot_io.py",
+      "source_sha256": "78740b65e0c9da2d2d90f0efbbe896ad35698ae2c557340d10731502f06c36f2"
+    },
+    {
+      "source": "work/brewfs-io-joint/run_policy_io.py",
+      "target": "io-joint/run_policy_io.py",
+      "source_sha256": "ac38f7b3997f108ac0a064ddbbbc72a944db655f5fadd3d7ec44380a049bfcda"
+    },
+    {
+      "source": "work/brewfs-io-joint/run_cache_probe.py",
+      "target": "io-joint/run_cache_probe.py",
+      "source_sha256": "af6b961ebf2e5c80c858fe04264aed663104289010840693e9d5595c7915ed50"
+    },
+    {
+      "source": "work/brewfs-io-joint/run_fuse_probe.py",
+      "target": "io-joint/run_fuse_probe.py",
+      "source_sha256": "732f0c6d2896c4aeec3f040a77b9b216c8c83f073a44bbc11573479a38cc9e4c"
+    },
+    {
+      "source": "work/brewfs-io-joint/run_core.py",
+      "target": "io-joint/run_core.py",
+      "source_sha256": "c0234b3d9ce7cbe3dd9274f87574eea6f8f198aae061cfa08bf58487c4acf43c"
+    },
+    {
+      "source": "work/brewfs-io-joint/run_client.py",
+      "target": "io-joint/run_client.py",
+      "source_sha256": "013026c51bc0540eec2a2e9149197f7f9658a7752dfe15eae9b76b110c9f827d"
+    },
+    {
+      "source": "work/brewfs-io-joint/audit_layout.py",
+      "target": "io-joint/audit_layout.py",
+      "source_sha256": "abc11b75927a8bb102fceae32f35774787d8b878c3418616d438e309cc1652fd"
+    },
+    {
+      "source": "work/brewfs-io-joint/audit_policy_layout.py",
+      "target": "io-joint/audit_policy_layout.py",
+      "source_sha256": "e17c08608a4d86f8da98b528e3efa65cb232bc9d7a288254d409f1ac8d51ce82"
+    },
+    {
+      "source": "work/brewfs-io-joint/analyze_closed.py",
+      "target": "io-joint/analyze_closed.py",
+      "source_sha256": "9b6085ad38ebf834ea9a26401d76dd765df5fd2df7c179e3709079bd4f53ff3b"
+    },
+    {
+      "source": "work/brewfs-io-joint/report.py",
+      "target": "io-joint/report.py",
+      "source_sha256": "ca6f0173ba7a030842aab89d4b7d4fe669bebbbfaabb2150eb0f26d406d50218"
+    },
+    {
+      "source": "work/brewfs-io-joint/cloud.py",
+      "target": "io-joint/cloud.py",
+      "source_sha256": "042f9c71d92f0791244143a973f3289dc3c75b0231faa9cf1039e6f7d4970dbf"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/run_budget_io.py",
+      "target": "writeback-budget/run_budget_io.py",
+      "source_sha256": "68c3fccaad9488ce74be6078151fbe86cd327081ac5026706477a94886714aaf"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/run_size_budget_io.py",
+      "target": "writeback-budget/run_size_budget_io.py",
+      "source_sha256": "4de000777c83a67ffaa3a9b1cc411a64a26eff80397a957021f07a142bcc01f5"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/run_fio_guard.py",
+      "target": "writeback-budget/run_fio_guard.py",
+      "source_sha256": "75c1f855d6b5e6ad316e7e5cb8a1ef399f87e67a1f2ae4875e11da6212fa2d5e"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/run_first_file_diagnostic.py",
+      "target": "writeback-budget/run_first_file_diagnostic.py",
+      "source_sha256": "2931f06f1f60f63e66f9dc0c3420b50ccef00109a5063e8d156bc258367fdb0e"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/run_network_diagnostic.py",
+      "target": "writeback-budget/run_network_diagnostic.py",
+      "source_sha256": "94e58bf20cbb908d9a80cd5164242bdb5109b44f483f45530329b16324551c70"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/run_transport_probe.py",
+      "target": "writeback-budget/run_transport_probe.py",
+      "source_sha256": "85b2d94237c516f387b6f81343a88902df1cb919080588810fca5a17a9289bd5"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/run_core.py",
+      "target": "writeback-budget/run_core.py",
+      "source_sha256": "908926e1a3a1e127d9b0a998ad7ab94c5fb6d369827e693de627bb6b859dac10"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/run_client.py",
+      "target": "writeback-budget/run_client.py",
+      "source_sha256": "013026c51bc0540eec2a2e9149197f7f9658a7752dfe15eae9b76b110c9f827d"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/transport_probe.py",
+      "target": "writeback-budget/transport_probe.py",
+      "source_sha256": "534b45f82dbe0a702bec9fd469022001563eaec5de1bcede63f02ea02490f832"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/analyze.py",
+      "target": "writeback-budget/analyze.py",
+      "source_sha256": "46bb398caf5e36526fa18020c816756347921c725956e1b43029671b4c1ba4eb"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/analyze_fio_guard.py",
+      "target": "writeback-budget/analyze_fio_guard.py",
+      "source_sha256": "2f9058c46bafe4977c4d8283e20d11ecf5bec4e2da22aaa49f0ff7bf24fb67ce"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/analyze_first_block.py",
+      "target": "writeback-budget/analyze_first_block.py",
+      "source_sha256": "2eefe6780991b8032a1bdd78d55dd05f12bbfbf318229fdd7fd6bf155428b6f7"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/analyze_first_file.py",
+      "target": "writeback-budget/analyze_first_file.py",
+      "source_sha256": "1cfbd8dc259088772dab4cd822c25523141a933a28757b9879c4d1398a17ecbe"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/analyze_first_process.py",
+      "target": "writeback-budget/analyze_first_process.py",
+      "source_sha256": "c0bafda4d5c3cd05835fc4f27c3ccaffb4f1a559bea80c8141bf851bf5f619ae"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/analyze_network.py",
+      "target": "writeback-budget/analyze_network.py",
+      "source_sha256": "8a3d129ba08985dc21d9464fb45c18bc0b9441126aa4442fb048fbc27a573620"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/analyze_path_metrics.py",
+      "target": "writeback-budget/analyze_path_metrics.py",
+      "source_sha256": "5d65b6dfe78ad5068234723a47f7d31515103d8257f1f0314dcf988369fd994c"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/analyze_resources.py",
+      "target": "writeback-budget/analyze_resources.py",
+      "source_sha256": "d51c22627ac7ad99b243375138ec66c06c6d6e34dfdd4c9595b10c84b518b8f6"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/analyze_transport.py",
+      "target": "writeback-budget/analyze_transport.py",
+      "source_sha256": "c25e5d34e9497ddef5bec6b91affb9a5c4fbb8aa482c9d354c51759903ab92a5"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/analyze_causal.py",
+      "target": "writeback-budget/analyze_causal.py",
+      "source_sha256": "edbb16eeb9da75f1a9a975543bb03c465672ef33ef360f343decf9fff7c0f2fd"
+    },
+    {
+      "source": "work/brewfs-writeback-budget/cloud.py",
+      "target": "writeback-budget/cloud.py",
+      "source_sha256": "ce87304b86ed21d680c42ba29811248ba622cfbd9f05abef6ef1cbb2d69b9ca5"
+    },
+    {
+      "source": "work/brewfs-recovery-scan/run_guard_io.py",
+      "target": "recovery-scan/run_guard_io.py",
+      "source_sha256": "101c01aae52d8dfc43de8ae8637931962fbf6b25f0db039e83a08eb091c82e72"
+    },
+    {
+      "source": "work/brewfs-recovery-scan/run_fio_guard.py",
+      "target": "recovery-scan/run_fio_guard.py",
+      "source_sha256": "55e4aa3da7fe683654e4367faf1db2e0c64fd8e8786f05840ab496f674e11ff5"
+    },
+    {
+      "source": "work/brewfs-recovery-scan/run_agent_io.py",
+      "target": "recovery-scan/run_agent_io.py",
+      "source_sha256": "3299be431b732238ce0e2096206ad71eb12a0ac2f000c517b1c07320e7ef25fb"
+    },
+    {
+      "source": "work/brewfs-recovery-scan/run_client.py",
+      "target": "recovery-scan/run_client.py",
+      "source_sha256": "013026c51bc0540eec2a2e9149197f7f9658a7752dfe15eae9b76b110c9f827d"
+    },
+    {
+      "source": "work/brewfs-recovery-scan/run_core.py",
+      "target": "recovery-scan/run_core.py",
+      "source_sha256": "908926e1a3a1e127d9b0a998ad7ab94c5fb6d369827e693de627bb6b859dac10"
+    },
+    {
+      "source": "work/brewfs-recovery-scan/analyze_candidate.py",
+      "target": "recovery-scan/analyze_candidate.py",
+      "source_sha256": "7da902e0c739bdef681e015a63ebcf2e465787775cc3dc3bd2e1e4e53d978b5d"
+    },
+    {
+      "source": "work/brewfs-recovery-scan/analyze_guards.py",
+      "target": "recovery-scan/analyze_guards.py",
+      "source_sha256": "0d9b1dcc4112a3dd54defc80ffc6f206d7b7daf2f534363a3b8a917d9c64da3c"
+    },
+    {
+      "source": "work/brewfs-recovery-scan/analyze_fio_guard.py",
+      "target": "recovery-scan/analyze_fio_guard.py",
+      "source_sha256": "ae3297d833f08c4c398de1ee085f11712b29d3dd53b30a2e7a071f6a7629ea4f"
+    },
+    {
+      "source": "work/brewfs-recovery-scan/analyze_paths.py",
+      "target": "recovery-scan/analyze_paths.py",
+      "source_sha256": "f0c73df6e09374f37792e89d3bffcf599aaef00ec72286b619e836ed9b6de9ef"
+    },
+    {
+      "source": "work/brewfs-recovery-scan/audit_guards.py",
+      "target": "recovery-scan/audit_guards.py",
+      "source_sha256": "7094b20ddc3223e8331114f9bb0160a3a5d6e2237d388b0e7a8bcf0428fe4b66"
+    },
+    {
+      "source": "work/brewfs-recovery-scan/audit_fio_guard.py",
+      "target": "recovery-scan/audit_fio_guard.py",
+      "source_sha256": "96449c33c2d24d1164943143efa3559decc5eaedc3a01727c8511a44ad08d9d6"
+    },
+    {
+      "source": "work/brewfs-recovery-scan/cloud.py",
+      "target": "recovery-scan/cloud.py",
+      "source_sha256": "4eb7dcf5cd4266a3974f2200726c65fc90c6549997ae6ed2ba32f48bf0292998"
+    },
+    {
+      "source": "work/brewfs-recovery-scan/profile_paths.py",
+      "target": "recovery-scan/profile_paths.py",
+      "source_sha256": "a5e7dd8a694bb1fd3f074fdd6a58ffe2ce3dfae9ae895a0ff647b46b880040af"
+    }
+  ]
+}
