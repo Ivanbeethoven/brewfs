@@ -1,32 +1,48 @@
 #!/usr/bin/env bash
-# Configure the host Docker daemon to use AX_DEPLOY_PROXY and a docker.io mirror.
-# Restarts Docker, so run this before creating the kind cluster.
+# Configure the host Docker daemon for the kind cluster.
+#
+# Do NOT put a proxy in the Docker daemon: kind nodes inherit it and then
+# kubelet/containerd try to reach the local registry (kind-registry:5000)
+# through 127.0.0.1, which is not reachable inside the node. Node pulls use the
+# registry mirrors configured by 02-cluster.sh instead.
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
-if [ -z "${AX_DEPLOY_PROXY}" ]; then
-  echo "AX_DEPLOY_PROXY is empty; leaving Docker network settings unchanged"
-  exit 0
+changed=0
+if [ -f /etc/systemd/system/docker.service.d/proxy.conf ]; then
+  rm -f /etc/systemd/system/docker.service.d/proxy.conf
+  changed=1
 fi
 
-mkdir -p /etc/systemd/system/docker.service.d
-cat >/etc/systemd/system/docker.service.d/proxy.conf <<EOF
-[Service]
-Environment="HTTP_PROXY=${AX_DEPLOY_PROXY}"
-Environment="HTTPS_PROXY=${AX_DEPLOY_PROXY}"
-Environment="NO_PROXY=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
-EOF
-
-if [ ! -f /etc/docker/daemon.json ]; then
-  cat >/etc/docker/daemon.json <<'EOF'
-{"registry-mirrors":["https://docker.m.daocloud.io"]}
-EOF
+if python3 - <<'PY'
+import json, os
+p = '/etc/docker/daemon.json'
+d = {}
+if os.path.exists(p):
+    try:
+        d = json.load(open(p))
+    except Exception:
+        d = {}
+mirror = 'https://docker.m.daocloud.io'
+mirrors = d.get('registry-mirrors') or []
+if mirror not in mirrors:
+    mirrors.append(mirror)
+    d['registry-mirrors'] = mirrors
+    json.dump(d, open(p, 'w'), indent=2)
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+then
+  changed=1
 fi
 
-systemctl daemon-reload
-systemctl restart docker
+if [ "${changed}" = "1" ]; then
+  systemctl daemon-reload
+  systemctl restart docker
+fi
+
 for _ in $(seq 1 30); do
   docker info >/dev/null 2>&1 && break
   sleep 1
 done
-docker info --format 'docker root={{.DockerRootDir}} proxy-ok'
+docker info --format 'root={{.DockerRootDir}} mirrors={{json .RegistryConfig.Mirrors}}'
