@@ -3,6 +3,7 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 
+"${here}/00-docker.sh"
 "${here}/01-toolchain.sh"
 "${here}/02-cluster.sh"
 "${here}/03-substrate.sh"

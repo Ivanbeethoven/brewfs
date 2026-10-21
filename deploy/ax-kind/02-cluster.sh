@@ -26,5 +26,19 @@ fi
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME}" \
   ./hack/create-kind-cluster.sh
 
+# Registry mirrors for the node's containerd (gcr.io/docker.io are often
+# unreachable from CN networks; DaoCloud mirrors are public).
+for node in $(kind get nodes --name "${KIND_CLUSTER_NAME}"); do
+  for reg in docker.io gcr.io ghcr.io quay.io registry.k8s.io; do
+    docker exec "${node}" mkdir -p "/etc/containerd/certs.d/${reg}"
+    docker exec -i "${node}" tee "/etc/containerd/certs.d/${reg}/hosts.toml" >/dev/null <<EOF
+server = "https://${reg}"
+[host."https://${reg}.m.daocloud.io"]
+  capabilities = ["pull", "resolve"]
+EOF
+  done
+  docker exec "${node}" systemctl restart containerd || true
+done
+
 kubectl config use-context "${KUBECTL_CONTEXT}"
 kubectl get nodes
