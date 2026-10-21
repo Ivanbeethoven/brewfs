@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
+use asyncfuse::raw::diagnostics as fuse_diagnostics;
+
 const MAX_METRICS: usize = 512;
 static ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var("BREWFS_ENTITY_DIAGNOSTICS").is_ok_and(|value| value == "1"));
@@ -16,9 +18,97 @@ static METRICS: [Metric; MAX_METRICS] = [const { Metric::new() }; MAX_METRICS];
 static METRIC_COUNT: AtomicUsize = AtomicUsize::new(0);
 static REGISTRATION: Mutex<()> = Mutex::new(());
 static DROPPED_REGISTRATIONS: AtomicU64 = AtomicU64::new(0);
+const MAX_TRACE_EVENTS: usize = 1_048_576;
+static TRACE_EVENTS: Mutex<Vec<TraceEvent>> = Mutex::new(Vec::new());
+static DROPPED_TRACE_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 tokio::task_local! {
     static OPERATION: &'static str;
+    static INODE: u64;
+}
+
+#[derive(serde::Serialize)]
+struct TraceEvent {
+    name: &'static str,
+    operation: Option<&'static str>,
+    unique: u64,
+    nodeid: u64,
+    opcode: u32,
+    pid: u32,
+    inode: Option<u64>,
+    start_ns: u64,
+    end_ns: u64,
+    cpu_ns: u64,
+}
+
+fn monotonic_ns() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // CLOCK_MONOTONIC matches Python time.monotonic_ns and the FUSE trace.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+    if result == 0 {
+        (time.tv_sec as u64).saturating_mul(1_000_000_000) + time.tv_nsec as u64
+    } else {
+        0
+    }
+}
+
+fn start_trace(name: &'static str) -> TraceEvent {
+    let context = fuse_diagnostics::current_context();
+    TraceEvent {
+        name,
+        operation: OPERATION.try_with(|operation| *operation).ok(),
+        unique: context.map_or(0, |context| context.unique),
+        nodeid: context.map_or(0, |context| context.nodeid),
+        opcode: context.map_or(0, |context| context.opcode),
+        pid: context.map_or(0, |context| context.pid),
+        inode: INODE.try_with(|inode| *inode).ok(),
+        start_ns: monotonic_ns(),
+        end_ns: 0,
+        cpu_ns: 0,
+    }
+}
+
+fn record_trace(event: TraceEvent) {
+    if let Ok(mut events) = TRACE_EVENTS.lock()
+        && events.len() < MAX_TRACE_EVENTS
+    {
+        events.push(event);
+    } else {
+        DROPPED_TRACE_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn thread_cpu_ns() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) };
+    if result == 0 {
+        (time.tv_sec as u64).saturating_mul(1_000_000_000) + time.tv_nsec as u64
+    } else {
+        0
+    }
+}
+
+async fn measured_task<F: Future>(future: F) -> F::Output {
+    if !enabled() {
+        return future.await;
+    }
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|context| {
+        let mut event = start_trace("client.task_poll");
+        let cpu_start = thread_cpu_ns();
+        let result = future.as_mut().poll(context);
+        event.cpu_ns = thread_cpu_ns().saturating_sub(cpu_start);
+        event.end_ns = monotonic_ns();
+        record_trace(event);
+        result
+    })
+    .await
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -111,6 +201,7 @@ struct ActiveSpan {
     start: Instant,
     round_trips: u64,
     rows: u64,
+    trace: TraceEvent,
 }
 
 /// An elapsed-time sample, recorded even on an early return or cancellation.
@@ -126,6 +217,7 @@ impl Span {
                 start: Instant::now(),
                 round_trips: 0,
                 rows: 0,
+                trace: start_trace(name),
             }),
         }
     }
@@ -147,11 +239,13 @@ impl Span {
 
 impl Drop for Span {
     fn drop(&mut self) {
-        if let Some(active) = self.active.as_ref() {
+        if let Some(mut active) = self.active.take() {
             let elapsed_ns = active.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             for metric in active.metrics.iter().flatten() {
                 metric.record(elapsed_ns, active.round_trips, active.rows);
             }
+            active.trace.end_ns = monotonic_ns();
+            record_trace(active.trace);
         }
     }
 }
@@ -173,17 +267,44 @@ pub async fn with_operation<F: Future>(operation: &'static str, future: F) -> F:
     }
 }
 
+/// Diagnostic correlation only; does not retain inode state or affect I/O.
+pub async fn with_inode<F: Future>(inode: u64, future: F) -> F::Output {
+    if enabled() {
+        INODE.scope(inode, future).await
+    } else {
+        future.await
+    }
+}
+
 /// Capture the current label before spawning: `tokio::spawn(inherit(future))`.
 /// Ordinary task locals are not inherited by newly spawned Tokio tasks.
 pub fn inherit<F: Future>(future: F) -> impl Future<Output = F::Output> {
     let operation = enabled()
         .then(|| OPERATION.try_with(|operation| *operation).ok())
         .flatten();
+    let inode = enabled()
+        .then(|| INODE.try_with(|inode| *inode).ok())
+        .flatten();
+    let context = enabled().then(fuse_diagnostics::current_context).flatten();
     async move {
-        if let Some(operation) = operation {
-            OPERATION.scope(operation, future).await
+        let scoped = async move {
+            let scoped_inode = async move {
+                if let Some(inode) = inode {
+                    INODE.scope(inode, measured_task(future)).await
+                } else {
+                    measured_task(future).await
+                }
+            };
+            if let Some(operation) = operation {
+                OPERATION.scope(operation, scoped_inode).await
+            } else {
+                scoped_inode.await
+            }
+        };
+        if let Some(context) = context {
+            fuse_diagnostics::with_context(context, scoped).await
         } else {
-            future.await
+            scoped.await
         }
     }
 }
@@ -205,17 +326,39 @@ pub fn snapshot_json() -> serde_json::Value {
             "rows": metric.rows.load(Ordering::Relaxed),
         }));
     }
+    let trace = TRACE_EVENTS
+        .lock()
+        .map(|mut events| std::mem::take(&mut *events))
+        .unwrap_or_default();
+    let fuse_trace: Vec<_> = fuse_diagnostics::drain_events()
+        .into_iter()
+        .map(|event| {
+            serde_json::json!({
+                "stage": event.stage, "start_ns": event.start_ns, "end_ns": event.end_ns,
+                "cpu_ns": event.cpu_ns, "worker": event.worker,
+                "unique": event.context.map_or(0, |context| context.unique),
+                "nodeid": event.context.map_or(0, |context| context.nodeid),
+                "opcode": event.context.map_or(0, |context| context.opcode),
+                "pid": event.context.map_or(0, |context| context.pid),
+            })
+        })
+        .collect();
     serde_json::json!({
         "schema": "brewfs-entity-diagnostics-v1",
         "enabled": enabled(),
         "samples": samples,
         "dropped_metric_registrations": DROPPED_REGISTRATIONS.load(Ordering::Relaxed),
+        "trace_events": trace,
+        "fuse_trace_events": fuse_trace,
+        "dropped_trace_events": DROPPED_TRACE_EVENTS.load(Ordering::Relaxed),
+        "dropped_fuse_trace_events": fuse_diagnostics::dropped_events(),
         "notes": [
             "Cumulative concurrent/nested timings overlap and are not exclusive occupancy.",
             "operation=null is the aggregate; operation-specific rows must not be added to it.",
             "Redis RTT includes client queue/network/server work; server time comes from Redis commandstats.",
             "Redis request counts include script cache misses/load/retry, but exclude connection-manager internal handshake/reconnect traffic.",
             "The packed owner validator uses a separate catalog connection, outside entity Redis request counts."
+            ,"Trace intervals use CLOCK_MONOTONIC nanoseconds and drain at each snapshot; intervals overlap and require union/clipping before wall-time accounting."
         ],
     })
 }

@@ -2052,9 +2052,17 @@ where
             return Ok(());
         }
         debug!(fh, inode, "fuse.flush");
+        #[cfg(feature = "workspace-overlay")]
+        let diagnostic =
+            crate::workspace_overlay::entity::diagnostics::Span::start("native.flush.prior_writes");
         self.wait_for_prior_fuse_writes(inode as i64, req.unique)
             .await;
+        #[cfg(feature = "workspace-overlay")]
+        drop(diagnostic);
         self.unlock_owner_locks(inode, lock_owner).await;
+        #[cfg(feature = "workspace-overlay")]
+        let _diagnostic =
+            crate::workspace_overlay::entity::diagnostics::Span::start("native.flush.drain");
         if fh == 0 {
             // asyncfuse can issue a stateless flush for a read-only open. There
             // is no per-handle dirty state to snapshot in that case, so flush
@@ -2074,8 +2082,16 @@ where
     // Sync file content to backend
     async fn fsync(&self, req: Request, inode: u64, fh: u64, datasync: bool) -> FuseResult<()> {
         debug!(fh, datasync, "fuse.fsync");
+        #[cfg(feature = "workspace-overlay")]
+        let diagnostic =
+            crate::workspace_overlay::entity::diagnostics::Span::start("native.fsync.prior_writes");
         self.wait_for_prior_fuse_writes(inode as i64, req.unique)
             .await;
+        #[cfg(feature = "workspace-overlay")]
+        drop(diagnostic);
+        #[cfg(feature = "workspace-overlay")]
+        let _diagnostic =
+            crate::workspace_overlay::entity::diagnostics::Span::start("native.fsync.drain");
         self.fsync_snapshot(fh, datasync).await.map_err(Errno::from)
     }
 

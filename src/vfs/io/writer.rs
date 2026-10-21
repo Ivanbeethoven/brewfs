@@ -4103,7 +4103,9 @@ where
     /// previous uploads to finish.
     fn spawn_upload_task(shared: Arc<Shared<B, M>>, slice: Arc<ParkingMutex<SliceState>>) {
         let tasks = shared.recent_pending_upload.packed_tasks.clone();
-        spawn_writer_owned(&tasks, async move {
+        #[cfg(feature = "workspace-overlay")]
+        let diagnostic_ino = shared.inode.ino() as u64;
+        let task = async move {
             // Allocate slice_id once, up front, before dispatching any blocks.
             let slice_id = {
                 let handle = SliceHandle {
@@ -4197,7 +4199,7 @@ where
                     } else {
                         UploadPriority::Foreground
                     };
-                    join_set.spawn(async move {
+                    let upload_task = async move {
                         // Persist locally only for commit-before-upload, where
                         // metadata may become visible before remote upload lands.
                         let persist = wb_ref.as_ref().map(|wb| {
@@ -4312,7 +4314,11 @@ where
                             Ok(()) => Ok((start_idx, end_idx, data_len)),
                             Err(err) => Err(anyhow::anyhow!(err)),
                         }
-                    });
+                    };
+                    #[cfg(feature = "workspace-overlay")]
+                    let upload_task =
+                        crate::workspace_overlay::entity::diagnostics::inherit(upload_task);
+                    join_set.spawn(upload_task);
                 }
 
                 // Check if we're done (no in-flight, no more blocks).
@@ -4403,7 +4409,13 @@ where
                     None => unreachable!("join_set is not empty"),
                 }
             }
-        });
+        };
+        #[cfg(feature = "workspace-overlay")]
+        let task = crate::workspace_overlay::entity::diagnostics::with_inode(
+            diagnostic_ino,
+            crate::workspace_overlay::entity::diagnostics::inherit(task),
+        );
+        spawn_writer_owned(&tasks, task);
     }
 
     async fn pop_front_slice(shared: &Arc<Shared<B, M>>, chunk_id: u64) -> bool {
@@ -4808,10 +4820,15 @@ where
 
     fn spawn_commit_task(shared: Arc<Shared<B, M>>, chunk_id: u64) {
         let tasks = shared.recent_pending_upload.packed_tasks.clone();
-        spawn_writer_owned(
-            &tasks,
-            async move { Self::commit_chunk(shared, chunk_id).await },
+        #[cfg(feature = "workspace-overlay")]
+        let diagnostic_ino = shared.inode.ino() as u64;
+        let task = async move { Self::commit_chunk(shared, chunk_id).await };
+        #[cfg(feature = "workspace-overlay")]
+        let task = crate::workspace_overlay::entity::diagnostics::with_inode(
+            diagnostic_ino,
+            crate::workspace_overlay::entity::diagnostics::inherit(task),
         );
+        spawn_writer_owned(&tasks, task);
     }
 
     /// The background thread for committing a chunk.

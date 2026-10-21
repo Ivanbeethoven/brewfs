@@ -20,6 +20,7 @@ use crate::raw::filesystem::Filesystem;
 use crate::raw::request::Request;
 use crate::{Errno, SetAttr};
 
+use super::diagnostics::CallbackFuture;
 use super::utils::{apply_direct_io, reply_error_in_worker};
 use super::worker::{DispatchCtx, WorkItem};
 
@@ -166,6 +167,7 @@ mod budget_reply_tests {
             _inflight_guard: None,
             _memory_guard: None,
             _response_registration: None,
+            diagnostic_queue_ns: None,
         }
     }
     #[tokio::test]
@@ -445,6 +447,7 @@ mod umask_tests {
             _inflight_guard: None,
             _memory_guard: None,
             _response_registration: None,
+            diagnostic_queue_ns: None,
             in_header: InHeaderLite {
                 nodeid: 1,
                 uid: 1000,
@@ -664,7 +667,12 @@ pub(super) async fn handle_lookup_inline<FS: Filesystem + Send + Sync + 'static>
     };
     let parent = item.in_header.nodeid;
     debug!(unique = item.unique, parent, ?name, "lookup (worker)");
-    let data = match ctx.fs.lookup(Request::from(&item), parent, &name).await {
+    let data = match ctx
+        .fs
+        .lookup(Request::from(&item), parent, &name)
+        .diagnostic_callback()
+        .await
+    {
         Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
         Ok(entry) => {
             let entry_out: fuse_entry_out = entry.into();
@@ -714,6 +722,7 @@ pub(super) async fn handle_forget_inline<FS: Filesystem + Send + Sync + 'static>
             item.in_header.nodeid,
             forget_in.nlookup,
         )
+        .diagnostic_callback()
         .await;
 }
 
@@ -752,6 +761,7 @@ pub(super) async fn handle_getattr_inline<FS: Filesystem + Send + Sync + 'static
             fh,
             getattr_in.getattr_flags,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
@@ -807,6 +817,7 @@ pub(super) async fn handle_open_inline<FS: Filesystem + Send + Sync + 'static>(
     let data = match ctx
         .fs
         .open(Request::from(&item), item.in_header.nodeid, open_in.flags)
+        .diagnostic_callback()
         .await
     {
         Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
@@ -864,6 +875,7 @@ pub(super) async fn handle_read_inline<FS: Filesystem + Send + Sync + 'static>(
             read_in.offset,
             read_in.size,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -942,6 +954,7 @@ pub(super) async fn handle_write_inline<FS: Filesystem + Send + Sync + 'static>(
             write_in.write_flags,
             write_in.flags,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
@@ -1014,6 +1027,7 @@ pub(super) async fn handle_readdir_inline<FS: Filesystem + Send + Sync + 'static
             read_in.fh,
             read_in.offset as i64,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -1106,6 +1120,7 @@ pub(super) async fn handle_setattr_inline<FS: Filesystem + Send + Sync + 'static
     let data = match ctx
         .fs
         .setattr(Request::from(&item), item.in_header.nodeid, fh, set_attr)
+        .diagnostic_callback()
         .await
     {
         Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
@@ -1141,6 +1156,7 @@ pub(super) async fn handle_readlink_inline<FS: Filesystem + Send + Sync + 'stati
     let data = match ctx
         .fs
         .readlink(Request::from(&item), item.in_header.nodeid)
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -1207,6 +1223,7 @@ pub(super) async fn handle_symlink_inline<FS: Filesystem + Send + Sync + 'static
     let data = match ctx
         .fs
         .symlink(Request::from(&item), parent, &name, &link_name)
+        .diagnostic_callback()
         .await
     {
         Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
@@ -1278,6 +1295,7 @@ pub(super) async fn handle_mknod_inline<FS: Filesystem + Send + Sync + 'static>(
             mknod_in._umask,
             mknod_in.rdev,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -1350,6 +1368,7 @@ pub(super) async fn handle_mkdir_inline<FS: Filesystem + Send + Sync + 'static>(
             mkdir_in.mode,
             mkdir_in.umask,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -1401,6 +1420,7 @@ pub(super) async fn handle_unlink_inline<FS: Filesystem + Send + Sync + 'static>
     let resp = if let Err(err) = ctx
         .fs
         .unlink(Request::from(&item), item.in_header.nodeid, &name)
+        .diagnostic_callback()
         .await
     {
         err
@@ -1437,6 +1457,7 @@ pub(super) async fn handle_rmdir_inline<FS: Filesystem + Send + Sync + 'static>(
     let resp = if let Err(err) = ctx
         .fs
         .rmdir(Request::from(&item), item.in_header.nodeid, &name)
+        .diagnostic_callback()
         .await
     {
         err
@@ -1509,6 +1530,7 @@ pub(super) async fn handle_rename_inline<FS: Filesystem + Send + Sync + 'static>
             rename_in.newdir,
             &new_name,
         )
+        .diagnostic_callback()
         .await
     {
         err
@@ -1565,6 +1587,7 @@ pub(super) async fn handle_link_inline<FS: Filesystem + Send + Sync + 'static>(
             item.in_header.nodeid,
             &name,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -1602,6 +1625,7 @@ pub(super) async fn handle_statfs_inline<FS: Filesystem + Send + Sync + 'static>
     let fs_stat = match ctx
         .fs
         .statfs(Request::from(&item), item.in_header.nodeid)
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -1664,6 +1688,7 @@ pub(super) async fn handle_release_inline<FS: Filesystem + Send + Sync + 'static
             release_in.lock_owner,
             flush,
         )
+        .diagnostic_callback()
         .await
     {
         err
@@ -1707,6 +1732,7 @@ pub(super) async fn handle_fsync_inline<FS: Filesystem + Send + Sync + 'static>(
             fsync_in.fh,
             data_sync,
         )
+        .diagnostic_callback()
         .await
     {
         err
@@ -1783,6 +1809,7 @@ pub(super) async fn handle_setxattr_inline<FS: Filesystem + Send + Sync + 'stati
             #[cfg(not(target_os = "macos"))]
             0,
         )
+        .diagnostic_callback()
         .await
     {
         err
@@ -1842,6 +1869,7 @@ pub(super) async fn handle_getxattr_inline<FS: Filesystem + Send + Sync + 'stati
             &name,
             getxattr_in.size,
         )
+        .diagnostic_callback()
         .await;
 
     match reply_result {
@@ -1889,6 +1917,7 @@ pub(super) async fn handle_listxattr_inline<FS: Filesystem + Send + Sync + 'stat
             item.in_header.nodeid,
             getxattr_in.size,
         )
+        .diagnostic_callback()
         .await;
 
     match reply_result {
@@ -1932,6 +1961,7 @@ pub(super) async fn handle_removexattr_inline<FS: Filesystem + Send + Sync + 'st
     let resp = if let Err(err) = ctx
         .fs
         .removexattr(Request::from(&item), item.in_header.nodeid, &name)
+        .diagnostic_callback()
         .await
     {
         err
@@ -1976,6 +2006,7 @@ pub(super) async fn handle_flush_inline<FS: Filesystem + Send + Sync + 'static>(
             flush_in.fh,
             flush_in.lock_owner,
         )
+        .diagnostic_callback()
         .await
     {
         err
@@ -2016,6 +2047,7 @@ pub(super) async fn handle_opendir_inline<FS: Filesystem + Send + Sync + 'static
     let data = match ctx
         .fs
         .opendir(Request::from(&item), item.in_header.nodeid, open_in.flags)
+        .diagnostic_callback()
         .await
     {
         Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
@@ -2075,6 +2107,7 @@ pub(super) async fn handle_releasedir_inline<FS: Filesystem + Send + Sync + 'sta
             release_in.fh,
             release_in.flags,
         )
+        .diagnostic_callback()
         .await
     {
         err
@@ -2120,6 +2153,7 @@ pub(super) async fn handle_fsyncdir_inline<FS: Filesystem + Send + Sync + 'stati
             fsync_in.fh,
             data_sync,
         )
+        .diagnostic_callback()
         .await
     {
         err
@@ -2158,6 +2192,7 @@ pub(super) async fn handle_access_inline<FS: Filesystem + Send + Sync + 'static>
     let resp = if let Err(err) = ctx
         .fs
         .access(Request::from(&item), item.in_header.nodeid, access_in.mask)
+        .diagnostic_callback()
         .await
     {
         err
@@ -2222,6 +2257,7 @@ pub(super) async fn handle_create_inline<FS: Filesystem + Send + Sync + 'static>
             create_in._umask,
             create_in.flags,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -2286,6 +2322,7 @@ pub(super) async fn handle_bmap_inline<FS: Filesystem + Send + Sync + 'static>(
             bmap_in.blocksize,
             bmap_in.block,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -2349,6 +2386,7 @@ pub(super) async fn handle_fallocate_inline<FS: Filesystem + Send + Sync + 'stat
             fallocate_in.length,
             fallocate_in.mode,
         )
+        .diagnostic_callback()
         .await
     {
         err
@@ -2402,6 +2440,7 @@ pub(super) async fn handle_readdirplus_inline<FS: Filesystem + Send + Sync + 'st
             read_in.offset,
             read_in.lock_owner,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -2590,6 +2629,7 @@ pub(super) async fn handle_lseek_inline<FS: Filesystem + Send + Sync + 'static>(
             lseek_in.offset,
             lseek_in.whence,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -2662,6 +2702,7 @@ pub(super) async fn handle_copy_file_range_inline<FS: Filesystem + Send + Sync +
             copy_file_range_in.len,
             copy_file_range_in.flags,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -2726,6 +2767,7 @@ pub(super) async fn handle_getlk_inline<FS: Filesystem + Send + Sync + 'static>(
             lk_in.lk.r#type,
             lk_in.lk.pid,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -2799,6 +2841,7 @@ pub(super) async fn handle_setlk_inline<FS: Filesystem + Send + Sync + 'static>(
             lk_in.lk.pid,
             is_blocking,
         )
+        .diagnostic_callback()
         .await
     {
         err
@@ -2853,6 +2896,7 @@ pub(super) async fn handle_poll_inline<FS: Filesystem + Send + Sync + 'static>(
             poll_in.events,
             &notify,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -2950,6 +2994,7 @@ pub(super) async fn handle_batch_forget_inline<FS: Filesystem + Send + Sync + 's
             },
             &inodes,
         )
+        .diagnostic_callback()
         .await;
     // batch_forget has no reply
 }
@@ -2959,7 +3004,10 @@ pub(super) async fn handle_destroy_inline<FS: Filesystem + Send + Sync + 'static
     item: WorkItem,
 ) {
     debug!(unique = item.unique, "destroy (worker)");
-    ctx.fs.destroy(Request::from(&item)).await;
+    ctx.fs
+        .destroy(Request::from(&item))
+        .diagnostic_callback()
+        .await;
 }
 
 pub(super) async fn handle_interrupt_inline<FS: Filesystem + Send + Sync + 'static>(
@@ -2989,6 +3037,7 @@ pub(super) async fn handle_interrupt_inline<FS: Filesystem + Send + Sync + 'stat
     let resp = match ctx
         .fs
         .interrupt(Request::from(&item), interrupt_in.unique)
+        .diagnostic_callback()
         .await
     {
         Err(err) => err,
@@ -3035,6 +3084,7 @@ pub(super) async fn handle_notify_reply_inline<FS: Filesystem + Send + Sync + 's
             notify_retrieve_in.offset,
             payload,
         )
+        .diagnostic_callback()
         .await
     {
         let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
@@ -3054,7 +3104,12 @@ pub(super) async fn handle_setvolname_inline<FS: Filesystem + Send + Sync + 'sta
 
     debug!(unique = item.unique, ?name, "setvolname (worker)");
 
-    let resp_value = if let Err(err) = ctx.fs.setvolname(Request::from(&item), &name).await {
+    let resp_value = if let Err(err) = ctx
+        .fs
+        .setvolname(Request::from(&item), &name)
+        .diagnostic_callback()
+        .await
+    {
         err.into()
     } else {
         0
@@ -3106,6 +3161,7 @@ pub(super) async fn handle_ioctl_inline<FS: Filesystem + Send + Sync + 'static>(
             ioctl_data,
             ioctl_in.out_size,
         )
+        .diagnostic_callback()
         .await
     {
         Err(err) => {
@@ -3154,6 +3210,7 @@ pub(super) async fn handle_getxtimes_inline<FS: Filesystem + Send + Sync + 'stat
     let data = match ctx
         .fs
         .getxtimes(Request::from(&item), item.in_header.nodeid)
+        .diagnostic_callback()
         .await
     {
         Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
@@ -3247,6 +3304,7 @@ pub(super) async fn handle_exchange_inline<FS: Filesystem + Send + Sync + 'stati
             &newname,
             exchange_in.options,
         )
+        .diagnostic_callback()
         .await
     {
         err.into()

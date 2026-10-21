@@ -22,6 +22,8 @@ use crate::meta::{INODE_ID_KEY, SLICE_ID_KEY};
 use async_trait::async_trait;
 use chrono::Utc;
 use redis::AsyncCommands;
+#[cfg(feature = "workspace-overlay")]
+use redis::aio::ConnectionLike;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -1713,7 +1715,7 @@ struct LuaResponse {
 /// not supported because filesystem transitions use atomic Lua scripts across
 /// multiple metadata keys, including keys allocated dynamically by a script.
 pub struct RedisMetaStore {
-    conn: ConnectionManager,
+    conn: NativeConnection,
     _config: Config,
     node_cache: moka::future::Cache<i64, Option<StoredNode>>,
     /// Current session id.  Wrapped in a Mutex so it can be updated on
@@ -1730,6 +1732,58 @@ pub struct RedisMetaStore {
     /// The async mutex also provides single-flight behavior on a cold cache:
     /// concurrent statfs callers wait for the first scan instead of duplicating it.
     stat_fs_cache: tokio::sync::Mutex<Option<(std::time::Instant, StatFsSnapshot)>>,
+}
+
+#[cfg(not(feature = "workspace-overlay"))]
+type NativeConnection = ConnectionManager;
+
+// Observe the existing request futures, including pipelines and script loads.
+// Disabled diagnostics return the ConnectionManager future directly.
+#[cfg(feature = "workspace-overlay")]
+#[derive(Clone)]
+struct NativeConnection {
+    connection: ConnectionManager,
+}
+
+#[cfg(feature = "workspace-overlay")]
+impl ConnectionLike for NativeConnection {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        command: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        use crate::workspace_overlay::entity::diagnostics;
+        if !diagnostics::enabled() {
+            return self.connection.req_packed_command(command);
+        }
+        Box::pin(async move {
+            let mut span = diagnostics::Span::start("native.redis.rtt");
+            span.add_round_trips(1);
+            self.connection.req_packed_command(command).await
+        })
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        command: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        use crate::workspace_overlay::entity::diagnostics;
+        if !diagnostics::enabled() {
+            return self.connection.req_packed_commands(command, offset, count);
+        }
+        Box::pin(async move {
+            let mut span = diagnostics::Span::start("native.redis.rtt");
+            span.add_round_trips(1);
+            self.connection
+                .req_packed_commands(command, offset, count)
+                .await
+        })
+    }
+
+    fn get_db(&self) -> i64 {
+        self.connection.get_db()
+    }
 }
 
 impl RedisMetaStore {
@@ -1845,6 +1899,8 @@ impl RedisMetaStore {
 
     async fn from_config_inner(config: Config) -> Result<Self, MetaError> {
         let conn = Self::create_connection(&config).await?;
+        #[cfg(feature = "workspace-overlay")]
+        let conn = NativeConnection { connection: conn };
         let store = Self {
             conn,
             _config: config,
@@ -2561,7 +2617,7 @@ impl RedisMetaStore {
 
     async fn refresh_session(
         session_id: Uuid,
-        mut conn: ConnectionManager,
+        mut conn: NativeConnection,
     ) -> Result<(), MetaError> {
         let session_id_string = session_id.to_string();
         let expire = (Utc::now() + chrono::Duration::minutes(5)).timestamp_millis();
@@ -2572,7 +2628,7 @@ impl RedisMetaStore {
         Ok(())
     }
 
-    async fn life_cycle(token: CancellationToken, session_id: Uuid, conn: ConnectionManager) {
+    async fn life_cycle(token: CancellationToken, session_id: Uuid, conn: NativeConnection) {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {

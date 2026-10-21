@@ -377,6 +377,8 @@ fn init_tracing() {
 
 async fn mount_cmd(mut args: MountConfig) -> anyhow::Result<()> {
     #[cfg(feature = "workspace-overlay")]
+    let _diagnostic_task = entity_mount::start_diagnostics()?;
+    #[cfg(feature = "workspace-overlay")]
     if args.volume_format == VolumeFormat::WorkspaceEntityV1 && args.experimental_entity_mount {
         return entity_mount::mount(args).await;
     }

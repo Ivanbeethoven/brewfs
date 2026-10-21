@@ -412,7 +412,7 @@ impl SliceState {
     {
         let queued_at = Instant::now();
 
-        tokio::spawn(async move {
+        let task = async move {
             let start_at = Instant::now();
             let queue_delay_ms = start_at.duration_since(queued_at).as_millis() as u64;
             let (index, (start, end), generation) = {
@@ -487,7 +487,13 @@ impl SliceState {
                 }
             }
             guard.notify.notify_waiters();
-        });
+        };
+        #[cfg(feature = "workspace-overlay")]
+        let task = crate::workspace_overlay::entity::diagnostics::with_inode(
+            ino,
+            crate::workspace_overlay::entity::diagnostics::inherit(task),
+        );
+        tokio::spawn(task);
     }
 }
 

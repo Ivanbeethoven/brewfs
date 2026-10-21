@@ -10,6 +10,7 @@ pub use filesystem::Filesystem;
 use futures_util::future::Either;
 pub use object_safe_filesystem::{DirectoryPlusStream, DirectoryStream, ObjectSafeFilesystem};
 pub use request::Request;
+pub use session::diagnostics;
 #[cfg(any(
     feature = "async-io-runtime",
     feature = "tokio-runtime",

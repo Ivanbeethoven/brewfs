@@ -341,6 +341,7 @@ fn read_item<FS: Filesystem + Send + Sync + 'static>(session: &Session<FS>) -> W
         )),
         _memory_guard: None,
         _response_registration: None,
+        diagnostic_queue_ns: None,
     }
 }
 

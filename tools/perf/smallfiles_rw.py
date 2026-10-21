@@ -24,6 +24,7 @@ import pathlib
 import random
 import statistics
 import sys
+import threading
 import time
 
 DIRS = 20
@@ -38,34 +39,66 @@ def file_path(root: pathlib.Path, index: int) -> pathlib.Path:
     return root / f"d{index % DIRS:03d}" / f"f{index:07d}"
 
 
-def write_one(root: pathlib.Path, index: int, size: int, fsync: bool) -> None:
+def write_one(root: pathlib.Path, index: int, size: int, fsync: bool, syscalls=os) -> None:
     data = payload(index, size)
-    fd = os.open(file_path(root, index), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    fd = syscalls.open(file_path(root, index), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     try:
         view = memoryview(data)
         while view:
-            view = view[os.write(fd, view):]
+            view = view[syscalls.write(fd, view):]
         if fsync:
-            os.fsync(fd)
+            syscalls.fsync(fd)
     finally:
-        os.close(fd)
+        syscalls.close(fd)
 
 
-def read_one(root: pathlib.Path, index: int, size: int) -> None:
-    fd = os.open(file_path(root, index), os.O_RDONLY)
+def read_one(root: pathlib.Path, index: int, size: int, syscalls=os) -> None:
+    fd = syscalls.open(file_path(root, index), os.O_RDONLY)
     try:
         chunks = []
         remaining = size + 1
         while remaining > 0:
-            chunk = os.read(fd, min(remaining, 1 << 20))
+            chunk = syscalls.read(fd, min(remaining, 1 << 20))
             if not chunk:
                 break
             chunks.append(chunk)
             remaining -= len(chunk)
     finally:
-        os.close(fd)
+        syscalls.close(fd)
     if b"".join(chunks) != payload(index, size):
         raise ValueError(f"content mismatch for file {index}")
+
+
+class TimedSyscalls:
+    """Observe the existing syscall sequence without adding filesystem calls."""
+
+    def __init__(self):
+        self.stages = []
+
+    def __getattr__(self, name):
+        if name not in {"open", "write", "fsync", "read", "close"}:
+            raise AttributeError(name)
+        function = getattr(os, name)
+
+        def call(*args):
+            start = time.monotonic_ns()
+            cpu_start = time.thread_time_ns()
+            result, success = None, False
+            try:
+                result = function(*args)
+                success = True
+                return result
+            finally:
+                cpu_end = time.thread_time_ns()
+                end = time.monotonic_ns()
+                stage = {"name": name, "start_monotonic_ns": start,
+                         "end_monotonic_ns": end, "elapsed_ns": end - start,
+                         "thread_cpu_ns": cpu_end - cpu_start, "success": success}
+                if success and name in {"read", "write"}:
+                    stage["bytes"] = len(result) if name == "read" else result
+                self.stages.append(stage)
+
+        return call
 
 
 def percentile(values, q):
@@ -91,6 +124,7 @@ def main() -> int:
     parser.add_argument("--label", default="rw")
     parser.add_argument("--json-output", type=pathlib.Path, required=True)
     args = parser.parse_args()
+    critical_path = os.environ.get("BREWFS_CRITICAL_PATH_DIAGNOSTICS") == "1"
 
     root = args.root / args.subdir
     fsync = not args.no_fsync
@@ -127,10 +161,40 @@ def main() -> int:
         except Exception as error:  # recorded; any error rejects the row
             return kind, None, f"{kind}{index}: {error}"
 
+    def run_timed(op):
+        kind, index = op
+        syscalls = TimedSyscalls()
+        thread_id = threading.get_native_id()
+        start = time.monotonic_ns()
+        cpu_start = time.thread_time_ns()
+        error = None
+        try:
+            if kind == "w":
+                write_one(root, index, args.file_bytes, fsync, syscalls)
+            else:
+                read_one(root, index, args.file_bytes, syscalls)
+        except Exception as caught:
+            error = f"{kind}{index}: {caught}"
+        cpu_end = time.thread_time_ns()
+        end = time.monotonic_ns()
+        timing = {"kind": kind, "file_index": index, "thread_native_id": thread_id,
+                  "start_monotonic_ns": start, "end_monotonic_ns": end,
+                  "elapsed_ns": end - start, "thread_cpu_ns": cpu_end - cpu_start,
+                  "success": error is None, "stages": syscalls.stages}
+        return kind, (end - start) / 1e6 if error is None else None, error, timing
+
+    if critical_path:
+        phase_start = time.monotonic_ns()
+        process_cpu_start = time.process_time_ns()
     begin = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(args.workers) as pool:
-        results = list(pool.map(run, ops, chunksize=8))
+        results = list(pool.map(run_timed if critical_path else run, ops, chunksize=8))
     seconds = time.perf_counter() - begin
+    if critical_path:
+        process_cpu_end = time.process_time_ns()
+        phase_end = time.monotonic_ns()
+        timings = [row[3] for row in results]
+        results = [row[:3] for row in results]
 
     latencies = [lat for _, lat, err in results if err is None]
     errors = [err for _, _, err in results if err is not None]
@@ -167,6 +231,19 @@ def main() -> int:
         "trace_sha256": hashlib.sha256(json.dumps(ops).encode()).hexdigest(),
         "checksum": len(ops) - len(errors),
     }
+    if critical_path:
+        summary["critical_path"] = {
+            "schema": "brewfs-smallfiles-critical-path-v1", "clock": "monotonic_ns",
+            "phase_start_monotonic_ns": phase_start, "phase_end_monotonic_ns": phase_end,
+            "phase_elapsed_ns": phase_end - phase_start,
+            "process_cpu_start_ns": process_cpu_start, "process_cpu_end_ns": process_cpu_end,
+            "process_cpu_ns": process_cpu_end - process_cpu_start,
+            "notes": ["Per-file elapsed_ns exactly supplies latency_mean_ms and excludes executor queue residence.",
+                      "File timers include payload/path work and readback verification; syscall stages are nested.",
+                      "Thread/process CPU overlaps elapsed time and is not an additive latency category.",
+                      "WRITE fsync behavior is unchanged; READBACK does not issue explicit fsync.",
+                      "Phase CPU/window brackets the original executor wall timer and excludes output serialization."]}
+        summary["timings"] = timings
     args.json_output.write_text(json.dumps(summary, indent=2) + "\n")
     print(
         f"smallfiles_rw label={args.label} mode={args.mode} ops={len(ops)} errors={len(errors)} "

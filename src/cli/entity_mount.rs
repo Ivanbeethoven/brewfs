@@ -13,17 +13,17 @@ const LEASE_TTL_NS: i64 = 60_000_000_000;
 
 // Only the renewal loop is abortable. Entity operations retain their existing
 // owned-task/drain semantics throughout shutdown.
-struct RenewalTask(JoinHandle<()>);
+pub(super) struct RenewalTask(JoinHandle<()>);
 impl Drop for RenewalTask {
     fn drop(&mut self) {
         self.0.abort();
     }
 }
 
-pub(super) async fn mount(args: MountConfig) -> anyhow::Result<()> {
+pub(super) fn start_diagnostics() -> anyhow::Result<Option<RenewalTask>> {
     // Diagnostic snapshots are opt-in and contain only cumulative counters.
     // Register before mounting so a runner can safely request phase boundaries.
-    let _diagnostic_task = if diagnostics::enabled() {
+    Ok(if diagnostics::enabled() {
         let mut signals =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
         Some(RenewalTask(tokio::spawn(async move {
@@ -33,7 +33,10 @@ pub(super) async fn mount(args: MountConfig) -> anyhow::Result<()> {
         })))
     } else {
         None
-    };
+    })
+}
+
+pub(super) async fn mount(args: MountConfig) -> anyhow::Result<()> {
     std::fs::create_dir_all(&args.mount_point)?;
     if !args.mount_point.is_dir() {
         anyhow::bail!("mount point must be a directory");

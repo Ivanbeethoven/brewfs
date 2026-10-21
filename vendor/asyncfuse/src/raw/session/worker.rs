@@ -55,6 +55,34 @@ pub(crate) struct WorkItem {
     pub(crate) _inflight_guard: Option<InflightGuard>,
     pub(crate) _memory_guard: Option<crate::raw::reply::ReplyMemoryGuard>,
     pub(crate) _response_registration: Option<ResponseMemoryRegistration>,
+    /// Post-read ingress, then enqueue, then dequeue timestamp. Diagnostic only.
+    pub(crate) diagnostic_queue_ns: Option<u64>,
+}
+
+impl WorkItem {
+    fn diagnostic_context(&self) -> super::diagnostics::Context {
+        super::diagnostics::Context {
+            unique: self.unique,
+            nodeid: self.in_header.nodeid,
+            opcode: self.opcode,
+            pid: self.in_header.pid,
+        }
+    }
+
+    fn diagnostic_dequeue(&mut self, worker: usize) {
+        if let (Some(start_ns), Some(end_ns)) =
+            (self.diagnostic_queue_ns, super::diagnostics::timestamp())
+        {
+            super::diagnostics::interval(
+                Some(self.diagnostic_context()),
+                "lane_queue",
+                start_ns,
+                end_ns,
+                Some(worker),
+            );
+            self.diagnostic_queue_ns = Some(end_ns);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -179,6 +207,7 @@ mod ordinary_worker_join_tests {
             _inflight_guard: None,
             _memory_guard: None,
             _response_registration: None,
+            diagnostic_queue_ns: None,
         });
         tokio::time::timeout(Duration::from_secs(1), async {
             while fs.entered.load(Ordering::Acquire) == 0 {
@@ -234,6 +263,7 @@ mod ordinary_worker_join_tests {
             _inflight_guard: None,
             _memory_guard: None,
             _response_registration: None,
+            diagnostic_queue_ns: None,
         });
         tokio::time::timeout(Duration::from_secs(1), async {
             while fs.entered.load(Ordering::Acquire) == 0 {
@@ -317,6 +347,7 @@ impl ResponseSender<'_> {
                 None => Either::Right((header, body)),
             },
         };
+        super::diagnostics::reply_enqueued(self.unique);
         let result = self.sender.unbounded_send(data);
         if result.is_err() {
             if let Some(tracker) = self.tracker {
@@ -445,7 +476,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
                     return;
                 }
                 let mut owned = FuturesUnordered::<BoxFuture<'static, ()>>::new();
-                while let Some(item) = rx.next().await {
+                while let Some(mut item) = rx.next().await {
+                    item.diagnostic_dequeue(idx);
                     // Keep every spawned ordinary handler owned by the worker
                     // until its JoinHandle is Ready. Dropping the handle here
                     // would let Session shutdown return while the handler
@@ -488,7 +520,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
                     return;
                 }
                 let mut owned = FuturesUnordered::<BoxFuture<'static, ()>>::new();
-                while let Some(item) = rx.next().await {
+                while let Some(mut item) = rx.next().await {
+                    item.diagnostic_dequeue(idx);
                     let ctx = ctx_clone.clone();
                     // Preserve the mutable cache-hit inline fast path.
                     if item.opcode == fuse_opcode::FUSE_READ as u32 {
@@ -538,6 +571,18 @@ impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
     pub(crate) fn submit(&self, mut item: WorkItem) {
         self._ctx.register_memory(&mut item);
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
+        if let (Some(start_ns), Some(end_ns)) =
+            (item.diagnostic_queue_ns, super::diagnostics::timestamp())
+        {
+            super::diagnostics::interval(
+                Some(item.diagnostic_context()),
+                "ingress",
+                start_ns,
+                end_ns,
+                Some(idx),
+            );
+            item.diagnostic_queue_ns = Some(end_ns);
+        }
         if self.senders[idx].unbounded_send(item).is_err() {
             if let Some(tracker) = &self._ctx.readonly_reply_tracker {
                 tracker.fail(&std::io::Error::from(std::io::ErrorKind::BrokenPipe));
@@ -564,6 +609,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
                 _inflight_guard: None,
                 _memory_guard: None,
                 _response_registration: None,
+                diagnostic_queue_ns: None,
             },
         );
         // Include two independent map nodes (handler and reply tracker), reply
@@ -677,7 +723,8 @@ async fn process_readonly_queue<FS: Filesystem + Send + Sync + 'static>(
         match event {
             Event::Stop | Event::Item(None) => break,
             Event::Complete => {}
-            Event::Item(Some(item)) => {
+            Event::Item(Some(mut item)) => {
+                item.diagnostic_dequeue(worker_idx);
                 if is_open_opcode(item.opcode) {
                     // Type inferred from the same complete factory boxed below;
                     // no FS poll, WorkItem move, or Box has occurred at denial.
@@ -759,6 +806,9 @@ async fn process_work_item<FS: Filesystem + Send + Sync + 'static>(
     worker_idx: usize,
     item: WorkItem,
 ) {
+    let context = item.diagnostic_context();
+    let scheduled_ns = item.diagnostic_queue_ns;
+    super::diagnostics::handler(context, worker_idx, scheduled_ns, async move {
     let opcode_result = fuse_opcode::try_from(item.opcode);
     dispatch_to_worker! {
         match opcode_result, {
@@ -844,6 +894,7 @@ async fn process_work_item<FS: Filesystem + Send + Sync + 'static>(
             }
         }
     }
+    }).await;
 }
 
 /// Macro for dispatching work items to handler functions

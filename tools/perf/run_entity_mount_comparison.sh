@@ -3,6 +3,7 @@
 # Uses the existing smallfiles_rw workload; this is not admission/GC qualification.
 set -Eeuo pipefail
 umask 077
+export GIT_OPTIONAL_LOCKS=0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPOSE_FILE="$ROOT/docker/compose-xfstests/docker-compose.packed-lifecycle-backends.yml"
@@ -39,16 +40,31 @@ ENTITY_MOUNT_FILES, ENTITY_MOUNT_WORKERS (comma/space list), and
 ENTITY_MOUNT_REPETITIONS override the profile; ordinary defaults remain
 2000 files, workers 1,16,32 and 2 repetitions. Odd/even repetitions reverse arms.
 At most 9 native cells fit the runner's distinct Redis databases.
+
+Critical-path mode: ENTITY_MOUNT_CRITICAL_PATH=1 requires DIAGNOSTIC=1. It
+disables MONITOR and its analysis, keeps timed Redis commandstats/CPU snapshots,
+and enables diagnostic counters plus SIGUSR1 snapshots for BOTH measured arms.
+Trace dumps bracket the complete WRITE/READBACK pair to avoid aging metadata
+caches between phases. Phase trace files share those dumps; use event timestamps,
+not cumulative counter differences, to attribute each phase.
+Use the same newly instrumented binary for both arms; an older native binary
+without the signal handler is incompatible. The existing workload gains per-file
+and syscall timing/CPU records via BREWFS_CRITICAL_PATH_DIAGNOSTICS=1, without
+changing its filesystem calls. Set FILES=2000, WORKERS=32, REPETITIONS=2 explicitly
+for the matched cost model. This remains diagnostic evidence, not acceptance.
 EOF
 }
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then usage; exit 0; fi
 [[ $# == 0 ]] || { usage >&2; exit 2; }
 diagnostic="${ENTITY_MOUNT_DIAGNOSTIC:-0}"
-settings="$(python3 - "$diagnostic" "${ENTITY_MOUNT_FILES:-}" "${ENTITY_MOUNT_WORKERS:-1,16,32}" "${ENTITY_MOUNT_REPETITIONS:-2}" <<'PY'
+critical_path="${ENTITY_MOUNT_CRITICAL_PATH:-0}"
+settings="$(python3 - "$diagnostic" "$critical_path" "${ENTITY_MOUNT_FILES:-}" "${ENTITY_MOUNT_WORKERS:-1,16,32}" "${ENTITY_MOUNT_REPETITIONS:-2}" <<'PY'
 import re, sys
-diagnostic, files, workers, repetitions = sys.argv[1:]
+diagnostic, critical_path, files, workers, repetitions = sys.argv[1:]
 if diagnostic not in ('0', '1'):
     raise SystemExit('ENTITY_MOUNT_DIAGNOSTIC must be 0 or 1')
+if critical_path not in ('0', '1') or (critical_path == '1' and diagnostic != '1'):
+    raise SystemExit('ENTITY_MOUNT_CRITICAL_PATH must be 0 or 1, and 1 requires ENTITY_MOUNT_DIAGNOSTIC=1')
 files = files or ('200' if diagnostic == '1' else '2000')
 workers = re.split(r'[,\s]+', workers.strip())
 if not all(re.fullmatch(r'[1-9][0-9]*', value) for value in [files, repetitions, *workers]):
@@ -60,6 +76,8 @@ PY
 )"
 read -r file_count repetitions worker_csv <<<"$settings"
 IFS=, read -ra worker_values <<<"$worker_csv"
+redis_monitor="$diagnostic"
+[[ "$critical_path" != 1 ]] || redis_monitor=0
 measurement_kind=preliminary
 [[ "$diagnostic" != 1 ]] || measurement_kind=diagnostic
 OUT="${ENTITY_MOUNT_ARTIFACT_ROOT:?set absolute ENTITY_MOUNT_ARTIFACT_ROOT}"
@@ -99,11 +117,15 @@ mount_art=""
 workload_pid=""
 monitor_pid=""
 all_mounts_ok=1
-python3 - "$group/run-config.json" "$diagnostic" "$file_count" "$repetitions" "$worker_csv" <<'PY'
+python3 - "$group/run-config.json" "$diagnostic" "$file_count" "$repetitions" "$worker_csv" "$critical_path" <<'PY'
 import json, pathlib, sys
-pathlib.Path(sys.argv[1]).write_text(json.dumps({'diagnostic': sys.argv[2] == '1',
+config = {'diagnostic': sys.argv[2] == '1',
     'files': int(sys.argv[3]), 'repetitions': int(sys.argv[4]),
-    'workers': [int(value) for value in sys.argv[5].split(',')]}, indent=2) + '\n')
+    'workers': [int(value) for value in sys.argv[5].split(',')]}
+if sys.argv[6] == '1':
+    config.update(critical_path=True, redis_monitor=False, native_timer_snapshots=True,
+                  workload_syscall_timings=True)
+pathlib.Path(sys.argv[1]).write_text(json.dumps(config, indent=2) + '\n')
 PY
 read -r redis_port rustfs_port < <(python3 - <<'PY'
 import socket
@@ -276,6 +298,11 @@ result = {'schema': 'brewfs-entity-mount-preliminary-v1', 'status': status, 'exi
           'skipped_arms': [{'arm': 'overlay-native', 'status': 'skipped',
                             'reason': 'Missing ImmutableLower and ImmutableLowerData adapter for a frozen native Redis-metadata/RustFS-data lower, immutable native-lower binding, and experimental mount bootstrap/runtime wiring. Only PackedLower is wired; no substitute arm is measured.'}],
           'note': 'Experimental overlay-packed entity mount; not production admission, crash-recovery or GC qualification. Native and overlay-packed use 4 MiB chunks. Diagnostic runs include MONITOR/timer overhead and cannot establish throughput acceptance.'}
+if config.get('critical_path'):
+    result['note'] = ('Critical-path diagnostic: MONITOR disabled; counters/SIGUSR1 snapshots on both arms, '
+                      'timed Redis commandstats/CPU and workload syscall/CPU timings. '
+                      'Timers and snapshots still add overhead. Not throughput acceptance evidence; '
+                      'nested spans/CPU/service windows must not be added as exclusive latency.')
 (group / 'summary.json').write_text(json.dumps(result, indent=2) + '\n')
 print(f'entity-mount: {status}; artifacts={group}; available_rows={len(rows)}/{expected}; overlay-native=skipped')
 sys.exit(0 if status == f'completed-available-{kind}' else 1)
@@ -310,7 +337,7 @@ if [[ "$diagnostic" == 1 ]]; then
 fi
 cat >"$group/profile.txt" <<EOF
 status=$measurement_kind
-redis_monitor=$diagnostic
+redis_monitor=$redis_monitor
 overlay_timer_snapshots=$diagnostic
 process_and_redis_cpu_snapshots=$diagnostic
 overlay_packed_binary=$BINARY
@@ -353,6 +380,16 @@ overlay_packed_noatime=1
 native_atime=existing_behavior
 cache_note=overlay-packed uses the entity synchronous direct I/O path; native uses existing VFS writeback and metadata caches; fsync per file in both arms
 EOF
+if [[ "$critical_path" == 1 ]]; then
+    cat >>"$group/profile.txt" <<EOF
+critical_path=1
+native_timer_snapshots=1
+workload_syscall_timings=1
+critical_path_note=MONITOR disabled; SIGUSR1 trace dumps bracket the WRITE/READBACK pair; per-phase CPU/Redis counters remain separate; timers still perturb timing
+timing_scope_note=file latency includes payload/path/verification; syscall spans are nested; process/thread CPU overlaps elapsed time
+fsync_scope_note=WRITE calls fsync once per file; READBACK has no explicit fsync syscall
+EOF
+fi
 printf '[entity-mount] starting owned services; artifacts=%s\n' "$group"
 "${compose[@]}" up -d --wait --wait-timeout 180 redis rustfs >"$group/backend-start.log" 2>&1
 while IFS= read -r container; do
@@ -436,7 +473,7 @@ EOF
     printf '\n' >>"$group/commands.log"
     mount_path="$dir/mnt"; mount_art="$art"
     local -a diagnostic_env=()
-    if [[ "$diagnostic" == 1 && "$arm" == overlay-packed ]]; then
+    if [[ "$diagnostic" == 1 && ( "$arm" == overlay-packed || "$critical_path" == 1 ) ]]; then
         diagnostic_env=(BREWFS_ENTITY_DIAGNOSTICS=1)
     fi
     env -u BREWFS_ENTITY_DIAGNOSTICS "${diagnostic_env[@]}" \
@@ -507,6 +544,13 @@ for workers in "${worker_values[@]}"; do
             sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'
             mount_arm "$arm" "$tag" "$native_db"
             rc=0
+            if [[ "$critical_path" == 1 ]]; then
+                # Drain only outside the WRITE/READBACK pair. A large JSON dump
+                # between phases ages native metadata caches and changes the
+                # work being measured. Raw events carry phase timestamps.
+                python3 "$DIAGNOSTIC_HELPER" snapshot --pid "$mount_pid" \
+                    --log "$art/brewfs.log" --output "$art/entity-before.json"
+            fi
             for mode in write readback; do
                 mkdir "$art/$mode"
                 if ! mountpoint -q "$mount_path" || ! kill -0 "$mount_pid" 2>/dev/null; then exit 1; fi
@@ -514,7 +558,7 @@ for workers in "${worker_values[@]}"; do
                 sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'
                 begin_marker="brewfs-phase:$run_uuid:$tag:$mode:begin"
                 end_marker="brewfs-phase:$run_uuid:$tag:$mode:end"
-                if [[ "$diagnostic" == 1 ]]; then
+                if [[ "$redis_monitor" == 1 ]]; then
                     start_monitor "$art/$mode" "$end_marker"
                 fi
                 if [[ "$diagnostic" == 1 ]]; then
@@ -528,15 +572,23 @@ for workers in "${worker_values[@]}"; do
                     python3 "$DIAGNOSTIC_HELPER" redis-snapshot --section CPU --port "$redis_port" \
                         --output "$art/$mode/redis-cpu-before.txt" \
                         --timing-output "$art/$mode/redis-cpu-before.timing.json"
-                    if [[ "$arm" == overlay-packed ]]; then
+                    if [[ "$critical_path" == 1 ]]; then
+                        ln "$art/entity-before.json" "$art/$mode/entity-before.json"
+                    elif [[ "$arm" == overlay-packed ]]; then
                         python3 "$DIAGNOSTIC_HELPER" snapshot --pid "$mount_pid" \
                             --log "$art/brewfs.log" --output "$art/$mode/entity-before.json"
                     fi
                     python3 "$DIAGNOSTIC_HELPER" process-snapshot --pid "$mount_pid" \
                         --output "$art/$mode/process-cpu-before.json"
-                    "${compose[@]}" exec -T redis redis-cli -p "$redis_port" ECHO "$begin_marker" >"$art/$mode/monitor-begin.txt"
+                    if [[ "$redis_monitor" == 1 ]]; then
+                        "${compose[@]}" exec -T redis redis-cli -p "$redis_port" ECHO "$begin_marker" >"$art/$mode/monitor-begin.txt"
+                    fi
                 fi
-                command=(sudo -n python3 "$ROOT/tools/perf/smallfiles_rw.py" --root "$mount_path" \
+                command=(sudo -n)
+                if [[ "$critical_path" == 1 ]]; then
+                    command+=(env BREWFS_CRITICAL_PATH_DIAGNOSTICS=1)
+                fi
+                command+=(python3 "$ROOT/tools/perf/smallfiles_rw.py" --root "$mount_path" \
                     --subdir rw --mode "$mode" --files "$file_count" --file-bytes 16384 \
                     --workers "$workers" --seed 20261001 --label "$arm" --json-output "$art/$mode/summary.json")
                 printf '%q ' "${command[@]}" >>"$group/commands.log"
@@ -547,12 +599,14 @@ for workers in "${worker_values[@]}"; do
                 workload_pid=""
                 if ! mountpoint -q "$mount_path" || ! kill -0 "$mount_pid" 2>/dev/null; then step_rc=1; fi
                 if [[ "$diagnostic" == 1 ]]; then
-                    "${compose[@]}" exec -T redis redis-cli -p "$redis_port" ECHO "$end_marker" >"$art/$mode/monitor-end.txt" || step_rc=1
+                    if [[ "$redis_monitor" == 1 ]]; then
+                        "${compose[@]}" exec -T redis redis-cli -p "$redis_port" ECHO "$end_marker" >"$art/$mode/monitor-end.txt" || step_rc=1
+                    fi
                     if kill -0 "$mount_pid" 2>/dev/null; then
                         python3 "$DIAGNOSTIC_HELPER" process-snapshot --pid "$mount_pid" \
                             --output "$art/$mode/process-cpu-after.json" || step_rc=1
                     fi
-                    if [[ "$arm" == overlay-packed ]] && kill -0 "$mount_pid" 2>/dev/null; then
+                    if [[ "$critical_path" != 1 && "$arm" == overlay-packed ]] && kill -0 "$mount_pid" 2>/dev/null; then
                         python3 "$DIAGNOSTIC_HELPER" snapshot --pid "$mount_pid" \
                             --log "$art/brewfs.log" --output "$art/$mode/entity-after.json" || step_rc=1
                     fi
@@ -579,7 +633,7 @@ PY
                 else
                     "${compose[@]}" exec -T redis redis-cli -p "$redis_port" INFO commandstats >"$art/$mode/redis-after.txt"
                 fi
-                if [[ "$diagnostic" == 1 ]]; then
+                if [[ "$redis_monitor" == 1 ]]; then
                     stop_monitor || step_rc=1
                     if [[ -e "$art/$mode/summary.json" ]]; then
                         python3 "$DIAGNOSTIC_HELPER" analyze --phase "$art/$mode" \
@@ -593,6 +647,23 @@ PY
                 fi
                 (( step_rc == 0 )) || { rc=$step_rc; break; }
             done
+            if [[ "$critical_path" == 1 ]] && kill -0 "$mount_pid" 2>/dev/null; then
+                python3 "$DIAGNOSTIC_HELPER" snapshot --pid "$mount_pid" \
+                    --log "$art/brewfs.log" --output "$art/entity-after.json" || rc=1
+                if [[ -f "$art/entity-after.json" ]]; then
+                    for mode in write readback; do
+                        [[ ! -d "$art/$mode" ]] || ln "$art/entity-after.json" "$art/$mode/entity-after.json"
+                    done
+                fi
+                python3 - "$art/trace-snapshot-scope.json" <<'PY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({
+    'scope': 'write_and_readback_pair',
+    'before': 'entity-before.json', 'after': 'entity-after.json',
+    'note': 'Phase links share these dumps. Attribute raw events by workload timestamps; cumulative sample differences cover both phases, not either phase alone.'
+}, indent=2) + '\n')
+PY
+            fi
             stop_mount || rc=1
             python3 - "$art/result.json" "$arm" "$workers" "$repetition" "$rc" <<'PY'
 import json, pathlib, sys

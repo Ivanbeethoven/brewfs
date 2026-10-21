@@ -157,6 +157,7 @@ fn owned_read_item(session: &Session<ReplyLifetimeFs>, fs: &ReplyLifetimeFs) -> 
         )),
         _memory_guard: Some(fs.request_owner()),
         _response_registration: None,
+        diagnostic_queue_ns: None,
     }
 }
 

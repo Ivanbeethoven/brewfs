@@ -267,6 +267,7 @@ fn item(session: &Session<ProbeFs>, fs: &ProbeFs, opcode: fuse_opcode, unique: u
         )),
         _memory_guard: memory,
         _response_registration: None,
+        diagnostic_queue_ns: None,
     }
 }
 

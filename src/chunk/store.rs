@@ -644,12 +644,17 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         offset: u64,
         target: &mut [u8],
     ) -> anyhow::Result<usize> {
+        #[cfg(feature = "workspace-overlay")]
+        let diagnostic =
+            crate::workspace_overlay::entity::diagnostics::Span::start("native.object.get");
         if client.read_observer().is_none() {
             return client.get_object_range(key, offset, target).await;
         }
         let bytes = client
             .typed_bounded_range(class, key, offset, target.len() as u64)
             .await?;
+        #[cfg(feature = "workspace-overlay")]
+        drop(diagnostic);
         target[..bytes.len()].copy_from_slice(&bytes);
         Ok(bytes.len())
     }
@@ -678,6 +683,9 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             .checked_mul(2)
             .and_then(|n| n.checked_add(1 << 20))
             .ok_or_else(|| anyhow::anyhow!("native block stored bound overflows"))?;
+        #[cfg(feature = "workspace-overlay")]
+        let diagnostic =
+            crate::workspace_overlay::entity::diagnostics::Span::start("native.object.get");
         client
             .typed_full_with_origin(
                 ReadClass::NativePayload,
@@ -686,6 +694,9 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                 None,
                 limit,
                 |bytes| {
+                    // The body is complete here; decoding is local work.
+                    #[cfg(feature = "workspace-overlay")]
+                    drop(diagnostic);
                     let stored = bytes.len();
                     let _decode = client.measure_read_work_with_origin(
                         ReadClass::NativePayload,
@@ -1046,6 +1057,9 @@ impl<B: ObjectBackend + Send + Sync + 'static> ObjectBlockStore<B> {
             .record_put_prepare(prepare_started.elapsed());
 
         let started = Instant::now();
+        #[cfg(feature = "workspace-overlay")]
+        let diagnostic =
+            crate::workspace_overlay::entity::diagnostics::Span::start("native.object.put");
         if self.config.create_only_writes {
             self.client
                 .put_object_create_only(&object_key, &upload_bytes)
@@ -1059,6 +1073,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> ObjectBlockStore<B> {
                 .await
                 .map_err(|e| anyhow::anyhow!("object store put failed: {object_key}, {e:?}"))?;
         }
+        #[cfg(feature = "workspace-overlay")]
+        drop(diagnostic);
         self.object_metrics
             .record_put(upload_len as u64, started.elapsed());
         self.format_cache

@@ -13,6 +13,7 @@
 mod close_admission_tests;
 #[cfg(all(test, target_os = "linux", feature = "io-uring-runtime"))]
 mod control_failure_tests;
+pub mod diagnostics;
 mod handlers;
 pub(crate) mod owned_open_queue;
 mod owned_prepare;
@@ -1228,6 +1229,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             let Some(response) = response else {
                 break;
             };
+            let _diagnostic_reply = diagnostics::reply_dequeued(&response);
             let (mut data, mut extend_data) = match response {
                 Either::Left(data) => (crate::raw::reply::ReplyBytes::from(data), None),
                 Either::Right((data, extend_data)) => {
@@ -1651,7 +1653,10 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     tracing::info!(target: "asyncfuse::teardown", event="backpressure_enter",
                         inflight=self.inflight.load(Ordering::Acquire), max_background=self.max_background);
                 }
+                let diagnostic_wait =
+                    waited.then(|| diagnostics::Span::new("admission_wait", None, None));
                 self.wait_before_request_read(&fs, &fuse_connection).await?;
+                drop(diagnostic_wait);
                 if teardown_diag && waited {
                     tracing::info!(target: "asyncfuse::teardown", event="backpressure_exit",
                         inflight=self.inflight.load(Ordering::Acquire));
@@ -1695,6 +1700,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             };
 
             let request = Request::from(&in_header);
+
+            // Post-read ingress only: time already spent in the kernel is unknown.
+            let diagnostic_queue_ns = diagnostics::timestamp();
 
             let opcode = match fuse_opcode::try_from(in_header.opcode) {
                 Err(err) => {
@@ -1846,6 +1854,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     _inflight_guard: inflight_guard,
                     _memory_guard: memory_guard,
                     _response_registration: None,
+                    diagnostic_queue_ns,
                 });
             } else {
                 // Will concurrency in a single-threaded context cause disorder in the sequence of operations on a single file?

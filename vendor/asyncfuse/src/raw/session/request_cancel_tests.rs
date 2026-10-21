@@ -161,6 +161,7 @@ fn read_item<FS: Filesystem + Send + Sync + 'static>(
         )),
         _memory_guard: None,
         _response_registration: None,
+        diagnostic_queue_ns: None,
     }
 }
 async fn response(receiver: &mut UnboundedReceiver<FuseData>) -> fuse_out_header {
