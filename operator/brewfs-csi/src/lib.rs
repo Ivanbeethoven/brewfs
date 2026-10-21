@@ -223,7 +223,16 @@ impl MountOps for SystemMountOps {
     }
 
     fn process_alive(&self, pid: u32) -> io::Result<bool> {
-        Ok(Path::new("/proc").join(pid.to_string()).is_dir())
+        let command_line = match fs::read(Path::new("/proc").join(pid.to_string()).join("cmdline"))
+        {
+            Ok(command_line) => command_line,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(command_line
+            .split(|byte| *byte == 0)
+            .next()
+            .is_some_and(|command| command.ends_with(b"/brewfs") || command == b"brewfs"))
     }
 
     fn start_brewfs(&self, spec: &MountSpec, target: &Path) -> io::Result<u32> {
