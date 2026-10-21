@@ -10,7 +10,6 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use uuid::Uuid;
 
-use super::diagnostics::Span;
 use super::keys::EntityKeys;
 use super::lifecycle::{OperationGuard, WriterSession};
 use super::model::{
@@ -259,7 +258,6 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K
     /// Foreground demand and warmup use the same single-flight memo loaders.
     /// No detached task can outlive this operation's session admission.
     async fn warm_root(&self, chunk_size: u64) -> Result<()> {
-        let _span = Span::start("packed.memo.warm_root");
         let admission = self.begin_call().await?;
         let root = self.binding.root_ino;
         tokio::try_join!(self.inode_inner(root), self.cold_inner(root))?;
@@ -290,7 +288,6 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K
     }
 
     async fn validate_owner(&self) -> Result<()> {
-        let _span = Span::start("packed.owner_validation");
         self.store
             .validate_packed_entity_lower(&self.owner)
             .await
@@ -313,7 +310,6 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K
     }
 
     async fn inode_inner(&self, ino: i64) -> Result<Option<EntityInode>> {
-        let _span = Span::start("packed.inode_inner");
         let value = self
             .memo
             .get(memo::Key::Inode(ino), || async {
@@ -460,7 +456,6 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLower
     }
 
     async fn inode(&self, ino: i64) -> Result<Option<EntityInode>> {
-        let _span = Span::start("packed.inode");
         let admission = self.begin_call().await?;
         let result = self.inode_inner(ino).await?;
         self.end_call(&admission).await?;
@@ -468,7 +463,6 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLower
     }
 
     async fn dentry(&self, parent: i64, name: &[u8]) -> Result<Option<EntityDentry>> {
-        let _span = Span::start("packed.dentry");
         validate_name(name)?;
         let admission = self.begin_call().await?;
         let value = self
@@ -515,7 +509,6 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLower
     }
 
     async fn xattr(&self, ino: i64, name: &[u8]) -> Result<Option<Vec<u8>>> {
-        let _span = Span::start("packed.xattr");
         validate_xattr_name(name)?;
         let admission = self.begin_call().await?;
         self.inode_inner(ino).await?.ok_or(EntityError::NotFound)?;
@@ -531,7 +524,6 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLower
     }
 
     async fn chunk(&self, ino: i64, chunk_index: u64, chunk_size: u64) -> Result<Option<ChunkMap>> {
-        let _span = Span::start("packed.chunk");
         let admission = self.begin_call().await?;
         let value = self
             .memo
@@ -560,11 +552,9 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLower
     }
 
     async fn readdir(&self, ino: i64) -> Result<Vec<(Vec<u8>, EntityDentry)>> {
-        let mut span = Span::start("packed.readdir");
         let admission = self.begin_call().await?;
         let entries = self.directory_inner(ino).await?;
         self.end_call(&admission).await?;
-        span.add_rows(entries.len() as u64);
         Ok(entries.as_ref().clone())
     }
 }
@@ -640,7 +630,6 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLowerDa
     for PackedLower<O, K>
 {
     async fn read_range(&self, ino: i64, offset: u64, length: usize) -> Result<Vec<u8>> {
-        let _span = Span::start("packed.read_range");
         if length > ALLOCATION_LIMIT {
             return Err(EntityError::Invalid(
                 "packed lower read exceeds allocation bound".into(),

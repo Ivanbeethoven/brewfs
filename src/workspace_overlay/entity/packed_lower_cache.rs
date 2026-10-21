@@ -4,7 +4,6 @@ use std::future::Future;
 use std::sync::Arc;
 
 use super::{EntityDentry, EntityInode, Result};
-use crate::workspace_overlay::entity::diagnostics;
 use crate::workspace_overlay::entity::model::ChunkMap;
 use crate::workspace_overlay::packed_v3::wire005::V3ColdAttributes;
 
@@ -105,10 +104,8 @@ impl Memo {
         F: Future<Output = Result<Value>>,
     {
         if let Some(value) = self.entries.get(&key).await {
-            diagnostics::record("packed.memo.hit", 0, 0, 1);
             return Ok(value);
         }
-        let _span = diagnostics::Span::start("packed.memo.miss");
         // Nested inode/cold/directory loaders have large future states. Keep
         // those states out of both this future and Moka's inline initializer,
         // and construct a loader only if Moka selects this caller to fill.
@@ -116,7 +113,6 @@ impl Memo {
             .try_get_with(
                 key,
                 Box::pin(async move {
-                    let _span = diagnostics::Span::start("packed.memo.fill");
                     #[cfg(test)]
                     self.fills
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -6,7 +6,6 @@ use tokio::task::JoinHandle;
 
 use super::{FuseConcurrencyConfig, MountConfig, S3Backend, S3Config, shutdown_signal};
 use crate::fuse::entity::{EntityFuse, mount_privileged, mount_unprivileged};
-use crate::workspace_overlay::entity::diagnostics;
 use crate::workspace_overlay::entity::experiment::{FreshMountOptions, RedisEntityExperiment};
 
 const LEASE_TTL_NS: i64 = 60_000_000_000;
@@ -21,19 +20,6 @@ impl Drop for RenewalTask {
 }
 
 pub(super) async fn mount(args: MountConfig) -> anyhow::Result<()> {
-    // Diagnostic snapshots are opt-in and contain only cumulative counters.
-    // Register before mounting so a runner can safely request phase boundaries.
-    let _diagnostic_task = if diagnostics::enabled() {
-        let mut signals =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
-        Some(RenewalTask(tokio::spawn(async move {
-            while signals.recv().await.is_some() {
-                println!("entity_diagnostics={}", diagnostics::snapshot_json());
-            }
-        })))
-    } else {
-        None
-    };
     std::fs::create_dir_all(&args.mount_point)?;
     if !args.mount_point.is_dir() {
         anyhow::bail!("mount point must be a directory");
@@ -157,9 +143,6 @@ pub(super) async fn mount(args: MountConfig) -> anyhow::Result<()> {
     // Join renewal before leaving the runtime; do not cancel owned data I/O.
     let mut task = renewal;
     let _ = (&mut task.0).await;
-    if diagnostics::enabled() {
-        println!("entity_diagnostics={}", diagnostics::snapshot_json());
-    }
     if drained.is_ok() {
         println!(
             "entity_stopped={}",

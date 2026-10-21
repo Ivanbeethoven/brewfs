@@ -152,7 +152,6 @@ impl<B: EntityBackend> Ownership<B> {
         authority: &TransactionAuthority,
         sizes: &[u64],
     ) -> Result<Vec<UploadToken>> {
-        let _diagnostic = super::diagnostics::Span::start("ownership.reserve_uploads");
         let admission = Arc::new(session.admit()?);
         if !session.matches_keys(&self.keys) {
             return Err(EntityError::Fenced);
