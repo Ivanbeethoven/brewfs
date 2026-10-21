@@ -13,9 +13,9 @@ use super::backend::{EntityBackend, EntityPlan, RowCheck, RowWrite, TransactionA
 use super::codec::decode;
 use super::keys::EntityKeys;
 use super::lifecycle::{Lifecycle, MaintenanceToken, checked_rows, committed, put};
-use super::model::{ChunkMap, ChunkSource, EntityInode, EntityKind, UpperInode};
+use super::model::{ChunkMap, ChunkSource, EntityDentry, EntityInode, EntityKind, UpperInode};
 use super::ownership::{
-    DeletionToken, Ownership, SliceOwnership, SliceState, plan_chunk_membership,
+    DeletionToken, OrphanRecord, Ownership, SliceOwnership, SliceState, plan_chunk_membership,
 };
 use super::{EntityError, Result};
 
@@ -263,11 +263,111 @@ impl<B: EntityBackend> Recovery<B> {
         maintenance: &MaintenanceToken,
         ino: i64,
     ) -> Result<bool> {
+        if ino <= 0 {
+            return Err(EntityError::Invalid("invalid orphan inode".into()));
+        }
         let authority = self.lifecycle.maintenance_authority(maintenance).await?;
         if !self.truncate_step(&authority, ino).await? {
             return Ok(false);
         }
-        self.ownership.recover_orphan_step(maintenance, ino).await
+        self.orphan_step(&authority, ino).await
+    }
+
+    /// One atomic orphan cleanup step after truncate recovery and quiescence.
+    /// Chunk deletion, membership changes and the durable cursor share a commit;
+    /// repeated recovery cannot release an owner twice. Prefix scans are bounded
+    /// to 4096 rows, as for truncate cleanup. Lower data is never upper-owned.
+    async fn orphan_step(&self, authority: &TransactionAuthority, ino: i64) -> Result<bool> {
+        let keys = vec![
+            self.keys.orphan(ino),
+            self.keys.inode(ino),
+            self.keys.truncate(ino),
+        ];
+        let snapshot = self.backend.read(&keys).await?;
+        if snapshot.rows[2].is_some() {
+            return Err(EntityError::Busy);
+        }
+        let Some(bytes) = snapshot.rows[0].as_deref() else {
+            return Ok(true);
+        };
+        let mut orphan: OrphanRecord = decode(bytes)?;
+        if orphan.namespace_id != self.keys.namespace_id() || orphan.ino != ino {
+            return Err(EntityError::Corrupt("invalid orphan identity".into()));
+        }
+        let inode: UpperInode = decode(
+            snapshot.rows[1]
+                .as_deref()
+                .ok_or_else(|| EntityError::Corrupt("orphan missing inode".into()))?,
+        )?;
+        let UpperInode::Present(inode) = inode else {
+            return Err(EntityError::Corrupt(
+                "orphan inode already tombstoned".into(),
+            ));
+        };
+        inode.validate()?;
+        if inode.ino != ino || inode.nlink != 0 {
+            return Err(EntityError::Corrupt("orphan still linked".into()));
+        }
+        let chunks = self.chunks(ino).await?;
+        if chunks
+            .iter()
+            .any(|(index, _, _)| *index < orphan.cleanup_chunk)
+        {
+            return Err(EntityError::Corrupt(
+                "orphan cleanup cursor skipped a chunk".into(),
+            ));
+        }
+        let mut plan = EntityPlan {
+            checks: checked_rows(&keys, snapshot.rows),
+            writes: Vec::new(),
+        };
+        if let Some((index, key, bytes)) = chunks.into_iter().next() {
+            let old: ChunkMap = decode(&bytes)?;
+            let empty = ChunkMap::holes(old.chunk_size)?;
+            let membership =
+                plan_chunk_membership(self.backend.as_ref(), &self.keys, ino, index, &old, &empty)
+                    .await?;
+            plan.checks.extend(membership.checks);
+            plan.writes.extend(membership.writes);
+            plan.checks.push(RowCheck {
+                key: key.clone(),
+                expected: Some(bytes),
+            });
+            plan.writes.push(RowWrite::Delete { key });
+            orphan.cleanup_chunk = index.checked_add(1).ok_or(EntityError::Overflow)?;
+            plan.writes.push(put(self.keys.orphan(ino), &orphan)?);
+            committed(self.backend.commit(authority, &plan).await?)?;
+            return Ok(false);
+        }
+        let xattr_prefix = [self.keys.prefix(), format!("xattr/{ino}/").as_bytes()].concat();
+        for (key, value) in self.backend.scan_prefix(&xattr_prefix, 4096).await? {
+            plan.checks.push(RowCheck {
+                key: key.clone(),
+                expected: Some(value),
+            });
+            plan.writes.push(RowWrite::Delete { key });
+        }
+        for (key, value) in self
+            .backend
+            .scan_prefix(&self.keys.dentry_prefix(ino), 4096)
+            .await?
+        {
+            if decode::<EntityDentry>(&value)? != EntityDentry::Whiteout {
+                return Err(EntityError::NotEmpty);
+            }
+            plan.checks.push(RowCheck {
+                key: key.clone(),
+                expected: Some(value),
+            });
+            plan.writes.push(RowWrite::Delete { key });
+        }
+        plan.writes
+            .push(put(self.keys.inode(ino), &UpperInode::Deleted)?);
+        plan.writes.push(RowWrite::Delete {
+            key: self.keys.orphan(ino),
+        });
+        committed(self.backend.commit(authority, &plan).await?)?;
+        Ok(true)
     }
 
     async fn chunks(&self, ino: i64) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>> {

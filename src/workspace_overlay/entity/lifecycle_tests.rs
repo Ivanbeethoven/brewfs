@@ -628,7 +628,6 @@ async fn provision_refuses_stray_upper_rows_without_a_descriptor() {
             expected: None,
         }],
         None,
-        None,
     )
     .unwrap();
     backend

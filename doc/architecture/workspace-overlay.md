@@ -1,20 +1,25 @@
 # Workspace Overlay Architecture
 
 Status: **entity experiment with opt-in benchmark mount wiring; production
-mount remains disabled** (2026-10-20).
+mount remains disabled** (2026-10-21).
 This document and the [implementation spec](../superpowers/specs/overlay-workspace.md)
 now specify an ordinary per-entity writable namespace over one immutable packed
 lower. They supersede the previous mutation/version architecture as the target,
 not as a claim about the current binary.
 
-The shipped code remains r31, `0d4e36c` / PR #41; `6b54270` delivered its
+The established production/default overlay path is r31, `0d4e36c` / PR #41;
+`6b54270` delivered its
 documentation on `codex/packed-metadata-aliyun-20260930`.
 Its actual design, validation gaps and reproduction commands remain in the
 [r31 delivery handoff](../superpowers/plans/2026-10-17-overlay-no-seal-handoff.md).
 The unvalidated r32 candidate has been dropped in favor of this direction.
-The isolated `workspace-entity-v1` implementation lives on
+The `workspace-entity-v1` experiment began on
 `codex/overlay-entity-namespace-20261019`, branched from `b6f297e`.
-The integration branch remains unchanged. See the
+Its WIP was merged into `main` by [PR #42](https://github.com/Ivanbeethoven/brewfs/pull/42)
+at `3cb2082500aac0476f275b107228f7dd14a087ce`. The structural
+continuation used `codex/overlay-entity-simplification-20261020`; that merge did
+not establish correctness or performance acceptance. The historical integration
+branch remains separate. See the
 [stage 2 checkpoint](../superpowers/plans/2026-10-19-overlay-entity-stage2.md)
 and [file-I/O continuation](../superpowers/plans/2026-10-20-overlay-entity-data.md)
 for the completed API-stage gates. The
@@ -24,9 +29,28 @@ validation; earlier API results do not validate those additions.
 There is no conversion, production mount or accepted replacement performance
 result. The mount checkpoint records preliminary measurements for available arms.
 The [entity batching checkpoint](../superpowers/plans/2026-10-20-overlay-entity-batching.md)
-records the subsequently frozen diagnostic baseline and the current request
-batching refactor. That refactor and its correctness gates are in progress;
-there are no measured candidate results yet.
+records the subsequently frozen diagnostic baseline and the preceding request
+batching refactor, committed as `df846766c14860ef97ea1fdb79a0bb8d3ef88179`.
+Its local correctness gate passes with the documented overlay exclusions;
+release smokes and matched measurements are complete. The comparison is
+preliminary and covers combined WIP plus refactor against frozen `cfa000a`;
+no isolated PR #42 throughput measurement exists.
+
+The [read-batching checkpoint](../superpowers/plans/2026-10-21-overlay-entity-read-batching.md)
+records the next change on `codex/overlay-entity-rtt-20261020`: `8a0f8b8`
+validates read-only operations using existing per-operation row batches;
+`49da510` aligns the service gate with the workspace test graph. The stage 1
+local gate, release smokes, diagnostics and matched comparison are complete and
+audited, with the documented test exclusions. Measurements remain preliminary.
+The separate `stage2-fsync` follow-up was rejected and reverted: it reduced
+requests, but the original comparison and adjacent matched recheck did not
+establish a consistent throughput/tail improvement. Both preliminary results
+and the unresolved original latency outlier are preserved in the checkpoint.
+The retained script follow-up, `16c2aca`, uses STRLEN to check row type and size
+without a separate TYPE command. Its full gate and fresh-control comparison
+are complete. Application request counts stay unchanged; inclusive Lua service
+time falls. The preliminary comparison improves raw entity throughput, but
+does not prove a relative 32-worker WRITE win or native parity.
 
 ## Contract and boundaries
 
@@ -92,8 +116,8 @@ optional and defaults to `brewfs`; its selected metadata scope must be unused.
 Explicit bounded geometry is also needed: the runner sets 4 MiB chunks and
 blocks; the normal 64 MiB chunk default exceeds the entity API's 16 MiB maximum.
 The isolated harness supplies a fresh scope explicitly. A dedicated FUSE adapter
-uses the entity namespace and data path. Orderly unmount stops request admission,
-drops its handle registry and calls the existing local session drain. It retains
+calls `EntityNamespace` and `EntityData` directly. Orderly unmount stops request
+admission, drops its handle registry and calls the existing local session drain. It retains
 the namespace, lower ownership and data; the isolated harness owns service,
 volume and bucket teardown. This path provides no reopen/resume, namespace
 discard wrapper, process-crash takeover, importer or atomic cutover. Dedicated
@@ -101,6 +125,32 @@ fixture scopes are a caller/harness precondition, not proof that unrelated
 catalogs sharing an object service have no writers. Enforced backend/owner
 pairing, combined-stack fault qualification and paginated production cleanup
 remain outside this benchmark wiring.
+
+### Direct entity mount path and shared request execution
+
+The structural continuation removes the unused SDK bridge through the native
+VFS. `EntityFuse` retains its own handle table containing `Arc<EntityHandle>`
+and access/append flags. Namespace callbacks call `EntityNamespace`; read,
+write, truncate, flush and fsync call `EntityData` with that handle directly.
+The former `src/vfs/fs/entity_io.rs`, `EntityFileIo`, `BoundFile` and native-VFS
+entity-handle slots/dispatch are removed. The native VFS no longer accepts
+entity handles; the explicit experimental mount uses only the dedicated adapter.
+Entity handles therefore do not enter native inode indexes, slice caches or
+writeback paths. The adapter retains direct I/O, zero metadata reply TTL and
+rejection of kernel writeback requests.
+
+Namespace create, lookup, getattr, access, open, directory listing and mutations
+use one typed `Request`/`Reply` execution engine in `entity/namespace.rs`.
+The separate `namespace_create.rs` and `namespace_mount.rs` implementation
+wrappers have been folded into that engine; `namespace_snapshot.rs` still
+provides shared bounded preparation. Named operations retain discovery
+observations through ordered affected-inode lock acquisition. The engine
+validates permissions and exact row/absence predicates, handles known conflicts,
+and installs open handles only after the corresponding successful validation or
+create commit. This consolidates control flow without a shared mutable head or
+global mutation gate. Current structural tests pass within the local gate's
+documented coverage; release smokes and the preliminary comparison also complete.
+Historical SDK tests do not validate the new path.
 
 ### Immutable lower metadata and create requests
 
@@ -118,7 +168,8 @@ validating the durable packed owner. Each bound lookup/fill retains local sessio
 admission; terminal owner release requires that session to close and drain.
 Cache hits therefore need neither catalog-owner RPCs nor object requests.
 Standalone, unbound SDK access retains remote owner validation. Cold or evicted
-metadata can require authenticated I/O; the bounded cache does not promise that
+metadata uses authenticated asynchronous fills that can require network/object
+I/O; the bounded cache does not promise that
 an arbitrarily large lower is entirely resident. Errors are never cached as
 absence. Upper values and tombstones resolve first. A copied-up inode can still
 inherit an absent xattr or chunk, subject to its lower visibility boundary.
@@ -138,23 +189,43 @@ The script validates generated keys and bounds before its first write and uses
 exact decimal IDs above 2^53. It does not compare-and-swap the allocator counter.
 Only the affected parent is locally locked; unrelated parents remain independent.
 
-### Operation snapshots and grouped publication (candidate)
+### Per-operation batched rows and grouped publication
 
-The current refactor shares one operation-scoped `Prepared` observation set
-between namespace and data operations. A single initial read combines the five
-authority rows with the known inode, ACL, dentry, truncate and chunk rows needed
-by that operation. Directory-parent and dentry-to-inode hints are bounded to
-4,096 entries each and nominate keys only: fresh rows determine permissions and
-identity, and the final transaction checks every observed value or absence.
-Missing or stale hints can require additional bounded reads. Conflicts rebuild
-the decision; incompatible observations cannot overwrite one another.
+Namespace and data operations use the existing operation-local `Prepared`
+read set. The existing atomic backend read batches authority, backend TIME and
+the entity rows needed by that operation; data reads include the actual stored
+geometry row. Directory-parent and dentry-to-inode hints are bounded to 4,096
+entries each and nominate keys only. A dependent read includes all prior
+observations and newly discovered keys. It preserves earlier observations on
+disagreement and marks the view uncovered. A covered read-only operation's
+result or error needs no redundant read-only commit; an uncovered view is fully
+revalidated, and conflicts recalculate the operation. Mutations retain their
+exact transaction predicates. This reuses existing reads and introduces no
+public/backend API, object type, authoritative cache, persistence/lifecycle
+protocol or snapshot feature.
 
-Path open retains its observed ancestry and name while acquiring the discovered
-inode lock, then validates that same read set before returning the handle. It
-does not repeat the entire path walk. Open fallback and truncate return the
-attributes established by their own operation so the FUSE reply need not start
-another attribute read. This is same-operation reuse, not an authoritative
+Path open retains its observed ancestry and name through inode-lock acquisition,
+then rereads authority and those predicates before returning the handle.
+Directory SCAN also invalidates coverage, including an empty result. Payload
+reads retain full validation after object transport. Open fallback and truncate
+return the attributes established by their own operation so the FUSE reply need
+not start another attribute read. This is same-operation reuse, not an authoritative
 cross-operation cache of mutable attributes or permissions.
+
+A complete atomic batch of authority and entity rows defines the read result
+and its lease check. Cold immutable lower metadata resolution can finish after
+that lease expires; the previous trailing commit could instead have returned `Fenced`.
+There is no guarantee of lease validity at the end of metadata resolution.
+Retained admission and lower ownership protect that resolution. This does not
+remove payload validation after transport or mutation-time fencing.
+
+READ_LUA and TRANSACTION_LUA preflight row types and byte bounds with protected
+STRLEN calls. WRONGTYPE maps to the existing corruption error; other Redis
+errors propagate. GET, exact predicates, backend TIME and validation before
+the first write remain. This removes one nested TYPE command per checked row,
+not an application request, and adds no feature, API, cache, persistent object
+or filesystem behavior. The Redis TYPE permission is no longer required by
+these preflights; identical ACL failure timing is not claimed.
 
 Data writes reuse the operation's authority to allocate slice IDs and register
 all Pending upload owners for an admitted group in one transaction, before any
@@ -165,23 +236,29 @@ across the group's chunk maps, and atomically installs those maps, immutable
 object descriptors and the inode size/times/data version. The same inode lock
 still covers the work, and an uncertain reservation/publication is never blindly
 replayed. Only an acknowledged prefix can be returned after partial work.
+This is one visibility publication per bounded write group, not one total
+Redis write transaction: durable slice reservation is a separate transaction
+before upload, followed by the group's map/inode/ownership publication.
 
 Each publication group must honor row, byte and fragmentation limits before its
 commit. Known aggregate preparation limits split a group using fresh observations;
-uncertain commit results never trigger a split or retry. Bounded grouping is
-implemented and still pending validation; the
-current code is not yet qualified as a replacement for the prior partial-write
-path. Unused standalone allocation, upload registration and Uploaded APIs are
+uncertain commit results never trigger a split or retry. Bounded grouping and
+the hidden-tail read fallback pass focused memory/Redis and real RustFS tests.
+Release smokes and the ordinary write/readback workload also pass; they do not
+exercise every fragmented-map case. Unused standalone
+allocation, upload registration and Uploaded APIs are
 removed. Truncate/discard/orphan cleanup retains its asynchronous membership
 wrapper over the shared pure planner and its existing durable cleanup state.
 
-Fsync still waits on the shared FIFO inode lock, retains admission, reports
-sticky errors and validates live lease/backend-time predicates. Its initial
-snapshot includes the truncate marker: observed absence takes the validated
-read-only commit path, while an actual intent invokes the existing recovery
-walker and then refreshes the snapshot. Ordinary I/O no longer performs an
-unconditional empty-intent recovery walk. These are candidate implementation
-changes, not measured request reductions or accepted performance results.
+In committed stage 1 (`8a0f8b8`), fsync still waits on the shared FIFO inode lock,
+retains admission, reports sticky errors and validates live lease/backend-time
+predicates. Its initial read includes the truncate marker: observed absence
+takes the validated read-only commit path, while an actual intent invokes the
+existing recovery walker and then refreshes the snapshot. Ordinary I/O no longer performs an
+unconditional empty-intent recovery walk. Removing the upper-fsync/flush
+read-only commit reduced each callback from two metadata requests to one in
+the rejected `stage2-fsync` diagnostic. That change is not retained; stage 1
+still uses two. The historical diagnostic below measures `df846766`.
 
 ## Audit of the current design
 
@@ -283,8 +360,8 @@ atomic-write guarantee is implied.
 
 Create reserves a unique inode ID and atomically checks parent permissions and
 effective name absence while installing inode/dentry/parent changes before
-returning. The reference implementation reserves the ID with a separate INCR;
-failed attempts may consume IDs but cannot expose partial namespace changes.
+returning. The reference implementation allocates with INCR inside the namespace
+publication transaction; O_EXCL rejection does not advance the counter.
 The immutable lower lookup may be prepared outside Lua, but its binding must be
 unchanged and the final transaction must recheck upper absence and mutable policy inputs.
 Never merge create visibility with the first data fsync.
@@ -362,8 +439,9 @@ alone is not a universal power-loss guarantee. Lost commit replies require
 reconciliation or a proven idempotent operation, never blind replay.
 
 Strict entity uploads use the production S3 adapter's conditional-create
-capability. The new packed-lower, upper-data and VFS object-I/O tests use an
-isolated RustFS service through the shared `entity/test_objects.rs` helper.
+capability. At the recorded API-stage checkpoint, packed-lower, upper-data and
+VFS object-I/O tests used an isolated RustFS service through the shared
+`entity/test_objects.rs` helper.
 Memory backends remain suitable for metadata transactions and fault injection;
 temporary local files hold producer metadata spools only. These service tests
 are ignored in the default suite and must be selected with `--include-ignored`;
@@ -371,7 +449,22 @@ missing explicit service configuration fails the test. The real-service gate
 passed six packed-lower, 78 entity and two VFS tests at the recorded API-stage
 source snapshot; exact evidence and remaining qualification gaps are in the
 file-I/O continuation. That result does not cover the later benchmark bootstrap
-or dedicated mount adapter.
+or dedicated mount adapter. The two VFS tests covered the subsequently removed
+SDK bridge and are historical evidence, not qualification of this refactor.
+The structural continuation's own service gate passes seven packed-lower and
+100 entity tests, including all four publication tests that failed in the
+pre-merge WIP gate. Its source-verified manifest records 720 present Rust files
+and four deletions; service cleanup leaves zero owned containers or volumes.
+The broad overlay run passes 2,334 library and nine binary tests, with 405
+ignored and five explicit exclusions: the three established legacy failures
+and two source-file flakes. The mandatory default workspace run passes 1,179
+tests with 225 ignored and zero filtered. Formatting, both strict all-targets
+Clippy gates, workspace checks/default build, four runtime combinations and
+tooling checks also pass. The batching checkpoint records commands, artifacts
+and the first failed Clippy attempt. Separate release evidence completes eight
+diagnostic and 16 uninstrumented phases, four smokes and 16 clean unmounts with
+zero errors and no owned mounts/containers/volumes left. These results do not
+provide production qualification or broad performance acceptance.
 Metadata recovery oracles and actual object-I/O tests have separate coverage;
 they do not yet qualify a complete Redis entity + real packed lower + VFS
 stack, physical packed-graph retirement, or recovery after process/host failure.
@@ -405,8 +498,10 @@ a canonical writable-layer digest is no longer an identity contract.
    namespace operations are implemented behind explicit new-format dispatch.
    The experiment includes a bounded namespace/Redis substrate, an authenticated
    packed adapter and durable lower owners in the existing collector census.
-   Its file-I/O continuation adds write-through current maps, an explicit VFS
-   handle dispatch and bounded truncate/discard/orphan recovery. Operations
+   Its file-I/O continuation adds write-through current maps and bounded
+   truncate/discard/orphan recovery. The structural continuation replaces the
+   former SDK VFS bridge with direct `EntityFuse` calls to `EntityNamespace` and
+   `EntityData`; its local gate passes with the coverage limits above. Operations
    require their namespace lower owner and active writer authority.
 3. **Fresh-only mount benchmark: current scope.** The explicit opt-in wires
    isolated fresh fixtures. Normal mount probes, local gates and matched
@@ -453,6 +548,35 @@ The [mount checkpoint](../superpowers/plans/2026-10-20-overlay-entity-mount.md)
 records sample values, smoke/cleanup evidence, configuration differences and
 exact reproduction commands. No historical accepted table is replaced.
 
+The later combined WIP/refactor comparison uses frozen entity `cfa000a` as its
+baseline and retains that baseline executable for the native arm. Each cell has
+two opposite-order samples of 2,000 new 16 KiB upper files with per-file fsync;
+means equal medians for two samples. All results below are preliminary.
+
+| Status | Workers | WRITE entity / native files/s | Entity/native | READBACK entity / native files/s | Entity/native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Preliminary | 16 | 272.210 / 359.643 | 0.7569 | 342.434 / 615.472 | 0.5564 |
+| Preliminary | 32 | 311.518 / 431.146 | 0.7225 | 378.386 / 636.813 | 0.5942 |
+
+Entity WRITE improves 137.71%/121.22% over the frozen entity baseline at
+16/32 workers; READBACK improves 93.89%/84.20%. WRITE remains 24.31%/27.75%
+below current native and READBACK 44.36%/40.58% below. Native control drift and
+two-sample spread are retained in the batching checkpoint; no claim isolates
+the structural cleanup or proves that a scaling plateau is eliminated.
+
+For the measured `df846766` baseline, diagnostic external commands/file fall
+from 113.770/114.400 to 15.720/15.780 for WRITE and 75.880/76.640 to
+16.015/16.015 for READBACK; that comparison's native arm uses
+7.115 and 5.005 respectively. CREATE/WRITE/FSYNC/FLUSH attempt 2/3/2/2 metadata
+RTTs per operation, down from 15/25/12/12. WRITE still has a separate durable
+slice reservation before publication. READBACK retains 8.005 READ_LUA and
+8.005 read-only validation transactions per file, with no metadata mutations
+from those validations. No packed-owner catalog calls occur in these diagnostic
+windows; cold/evicted lower fills can still require authenticated I/O. This
+quantifies reduced amplification and remaining work without assigning all
+residual throughput loss to one cause. The batching checkpoint records the
+source/binary hashes, full timers, smoke/cleanup proof and reproduction.
+
 Native CREATE_ENTRY_LUA executes one atomic script without a client mount-wide
 mutex; the server still serializes Lua and updates a shared allocator/parent.
 Native open/close bookkeeping does not commit metadata. The r31 measured
@@ -473,6 +597,6 @@ possible fragmentation costs; per-object reference bookkeeping and crash
 recovery; retired upper-byte retention until maintenance/discard and lower-object
 retention until the last immutable pin;
 and a format migration with no instant rollback after new writes. Hot inode or
-parent transactions and Redis server execution still serialize. No throughput
-win is claimed before the replacement's correctness and matched performance
-gates pass.
+parent transactions and Redis server execution still serialize. The completed
+comparison demonstrates a preliminary improvement for the combined experiment;
+broader correctness and performance acceptance remain unestablished.

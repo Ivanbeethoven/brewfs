@@ -1,15 +1,22 @@
 # Entity request batching: baseline and implementation checkpoint
 
-Date: 2026-10-20. Branch: `codex/overlay-entity-namespace-20261019`.
-**Status: refactor and correctness gates in progress. Three intermediate debug
-attempts completed zero workload phases after stack-overflow aborts. Corrected
-candidate measurements are pending; no speedup or performance acceptance is
-claimed.**
+Date: 2026-10-20. Current branch:
+`codex/overlay-entity-simplification-20261020`.
+**Status: local correctness gate passed with the documented overlay exclusions;
+release build, diagnostics and reversed-order comparison completed. Results are
+preliminary, not performance acceptance. Three earlier debug attempts completed
+zero workload phases after stack-overflow aborts; their failures remain below.**
 
-The source checkpoint is the working tree after `7dddbef` (WIP instrumentation,
-lower memo and create allocation) and `d6a8b77` (canonical docs merge). The
-batching source is now frozen for the ongoing gate; its final executable and
-matched measurement evidence are pending. The maintained contracts are
+The preceding batching experiment used `codex/overlay-entity-namespace-20261019`:
+`7dddbef` records WIP instrumentation/lower memo/create allocation, `d6a8b77`
+the canonical docs merge, and `22e697c` the batching WIP before structural
+refactoring. [PR #42](https://github.com/Ivanbeethoven/brewfs/pull/42) merged that
+branch into `main` at `3cb2082500aac0476f275b107228f7dd14a087ce`.
+The current branch starts from that merge and contains the structural
+continuation. The frozen source was committed as
+`df846766c14860ef97ea1fdb79a0bb8d3ef88179`. Its local gate, real Redis/RustFS
+service tests and matched measurements completed with the limits below.
+The maintained contracts are
 [overlay-workspace](../specs/overlay-workspace.md) and
 [workspace architecture](../../architecture/workspace-overlay.md). The earlier
 [mount experiment](2026-10-20-overlay-entity-mount.md) remains a separate result.
@@ -17,19 +24,125 @@ matched measurement evidence are pending. The maintained contracts are
 ## Owner-requested WIP merge checkpoint
 
 The owner requested committing and merging the current WIP before a separate
-structural refactor. The remote `main` branch exists and GitHub identifies it
-as the default, so it is the requested merge target rather than the historical
-integration branch. This checkpoint is not performance acceptance.
+structural refactor. That merge is complete through PR #42, with merge commit
+`3cb2082500aac0476f275b107228f7dd14a087ce` on the default branch `main`.
+It did not merge into the historical integration branch and is not performance
+acceptance. The continuation branch is
+`codex/overlay-entity-simplification-20261020`.
 
-The current gate passed formatting and the overlay workspace check. Seven
+The pre-merge WIP gate passed formatting and the overlay workspace check. Seven
 packed-lower tests passed against real Redis/RustFS. The entity suite then
 reported 97 passed and four failures: the memory and Redis variants of
 `batched_file_io_has_one_publication_and_preserves_bytes` and
 `fragmented_write_splits_publication_without_reupload_or_lost_refs` all hit
 the test wrapper's `settled file operation unexpectedly scanned metadata`
-assertion. Those failures have not yet been diagnosed or fixed. Subsequent
-gate steps and candidate measurements have not run. Their completion belongs
-to the new branch after the requested WIP merge.
+assertion. At that checkpoint those failures had not been diagnosed or fixed;
+the remaining gate steps and candidate measurements had not run. The structural
+continuation's later service gate passes all four formerly failing tests, as
+recorded below. The historical failure remains evidence for the pre-merge source;
+the later gate validates a different source snapshot.
+
+## Structural refactor checkpoint
+
+The current source gives the experimental mount one direct call path:
+`EntityFuse -> EntityNamespace / EntityData`. `EntityFuse` keeps its own handle
+table with `Arc<EntityHandle>` plus access and append flags. Namespace requests
+call `EntityNamespace`; read/write/truncate/flush/fsync call `EntityData`
+directly. The unused native-VFS SDK attachment/dispatch in
+`src/vfs/fs/entity_io.rs` is deleted together with `EntityFileIo`, `BoundFile`
+and the native handle's entity slot. Native VFS operations no longer accept
+entity handles; there is no second mounted file-I/O route to maintain. The
+existing experimental flag, direct I/O, noatime, zero metadata TTL and kernel
+writeback rejection remain. Production entity admission stays disabled.
+
+Namespace operations now enter one `Request`/`Reply` execution engine in
+`src/workspace_overlay/entity/namespace.rs`. Create, attribute/access queries,
+lookup/open, directory listing and mutations share preparation, ordered entity
+locking, exact-observation validation and conflict handling. Named operations
+carry discovery observations through lock acquisition; create preserves atomic
+allocation/name visibility and installs its handle while parent protection is
+retained. The separate `namespace_create.rs` and `namespace_mount.rs` wrappers
+are deleted and folded into that shared engine. `namespace_snapshot.rs` remains
+the shared bounded preparation code. The former `namespace_mount_tests.rs`
+assertions move into `namespace_tests.rs` and share its fixtures. The consolidated
+memory and Redis contracts pass in the service gate below.
+
+The source refactor alone does not establish a test or throughput result. The prior
+SDK VFS fixture results belong to the removed bridge and must not be presented
+as current adapter qualification. The four failed pre-merge tests remain in the
+historical record; all four pass for the structural continuation. Audited command
+counts, minimal mounted smokes and the reversed-order 16/32 comparison are
+recorded below. This checkpoint adds no conversion, cutover, admission or crash work.
+
+### Frozen structural inventory and completed local gate
+
+The source inventory captured at `2026-10-20T10:25:29.351933+00:00` compares the
+structural continuation with merged PR #42 (`3cb2082`). Across changed Rust
+files it adds 1,054 lines and deletes 1,915, removing **861 physical lines net:
+523 production and 338 test lines**.
+These counts include blank lines and comments; they are not semantic SLOC or
+proof of equivalent coverage. The entity module itself goes from 16,727 to
+16,276 physical lines and 28 to 25 Rust files: -338 production and -113 test
+lines. Exact ranges, hashes and the captured patch are
+in `refactor-inventory.{md,json,patch}` under
+`/mnt/brewfs-data/artifacts/overlay-entity-cost-20261020/simplification/`.
+All `simplification/` artifact paths below are relative to the parent of that
+directory. The captured documentation counts precede this report update.
+
+| Removed module | Disposition |
+| --- | --- |
+| `src/vfs/fs/entity_io.rs` | Unused SDK bridge and its two service tests deleted; those tests were not relocated |
+| `src/workspace_overlay/entity/namespace_create.rs` | Create preparation folded into shared request execution |
+| `src/workspace_overlay/entity/namespace_mount.rs` | Mount namespace operations folded into shared request execution |
+| `src/workspace_overlay/entity/namespace_mount_tests.rs` | Assertions moved to the shared `namespace_tests.rs::mount_contract` fixture |
+
+The consolidated mount fixture retains mode-0 create/open authorization,
+duplicate-name rejection, lower whiteout/readdir, open-unlinked handles and
+nlink behavior, and is called by both memory and Redis namespace tests. Its
+shared exclusive-create helper starts 32 writers behind a 33-party barrier,
+joins every task, and checks one winner, 31 `Exists` results and the visible
+inode for both create and create-open. Both memory and Redis contracts pass in
+the completed service gate; the removed SDK tests are not counted as relocated
+or equivalent mounted coverage.
+
+The first strict-Clippy attempt stopped with `E0599`: a packed-lower test in
+`entity_lower_tests.rs` still called the removed `EntityData::bind` bridge.
+That caller now uses the direct entity data API. The failed attempt, including
+its earlier inventory, is preserved in `simplification/attempt1-missed-test-caller/`.
+Every step in the corrected source's `simplification/gate.tsv` passed:
+
+| Command/checkpoint | Recorded result |
+| --- | --- |
+| `cargo fmt --all --check` | PASS, exit 0 |
+| `cargo check --workspace --features workspace-overlay` | PASS, exit 0 |
+| Strict all-targets Clippy, default and overlay | PASS; both use `-- -D warnings` |
+| Real Redis/RustFS entity service gate | PASS: seven packed-lower and 100 entity tests, zero failures |
+| Overlay workspace lib/bin tests | PASS: 2,334 library + nine binary tests, 405 ignored and five explicitly filtered |
+| Mandatory default `cargo test --workspace --lib --bins` | PASS: 1,179 tests, 225 ignored, zero filtered and zero failures |
+| Default workspace check/build | PASS |
+| Tokio/io-uring runtime checks, each with and without overlay | PASS: all four combinations |
+| Shell syntax, three report/matrix checks, diagnostic Python compilation and `git diff --check` | PASS |
+| Release build, mounted smoke and matched measurements | Completed; preliminary evidence below, separate from the local correctness gate |
+
+The runner sets `CARGO_INCREMENTAL=0`, dev/test debug information to zero and
+four build jobs; its exact commands and logs are in `simplification/gate.sh`
+and the same artifact directory. The overlay test command explicitly skips the
+three established legacy failures and two source-file flakes named below; those
+five cases were not rerun or repaired by this passing gate. Ignored tests also
+remain outside their respective broad runs. The default mandatory test command
+has no filters. This local gate does not establish release-mounted behavior,
+production qualification or a performance result.
+
+The real-service result is
+`simplification/services/entity-data-20261020T102913Z-78610a2d-6a91-4193-bda4-778706fddf25/`.
+Its source manifest was verified against the tested source: 720 present Rust
+files and four deleted paths. `summary.json` and both test logs record seven
+packed-lower and 100 entity passes; the four previously failing metered
+publication tests all pass, as do the EOF hidden-tail and consolidated namespace
+checks. `cleanup-proof.txt` records successful compose teardown and queries,
+with zero owned containers or volumes left. This service run is not a FUSE smoke.
+The release build and measurement sequence are separately driven by
+`simplification/measure.sh`; their completed audit is recorded below.
 
 ## Scope and evidence boundary
 
@@ -45,6 +158,11 @@ This workload creates new upper files and reads those bytes back. It measures
 neither packed-lower payload reads nor lower copy-up. The 200-file instrumented
 profile is diagnostic; MONITOR and timers perturb its timings. Only the separate
 uninstrumented profile supplies the preliminary throughput baseline below.
+
+The final comparison uses the frozen `cfa000a` baseline against the combined
+WIP plus structural continuation. There is no valid isolated PR #42 throughput
+result. The measured delta therefore covers the combined changes and cannot be
+attributed to the structural refactor alone.
 
 ## Frozen baseline provenance
 
@@ -63,7 +181,7 @@ artifacts and exact runner sources remain alongside them.
 | Compiler | rustc 1.99.0 (`b940084d7`, 2026-09-28); cargo 1.99.0 (`5f94df478`, 2026-08-27) |
 | Host | `brewfs-singapore-v2`, Linux `6.8.0-139-generic` |
 | Release build | Exit 0, 38m 56s; `CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0`, `--features workspace-overlay --bin brewfs` |
-| Candidate executable/source hash | Pending; do not reuse the baseline identity for the working candidate |
+| Candidate executable/source hash | Separate identity in the completed comparison below; the baseline binary remains the native control |
 
 The build used `CARGO_TARGET_DIR=/mnt/brewfs-data/src/brewfs/target`.
 No Cargo build or test ran concurrently with the measurements. Both compared
@@ -260,10 +378,10 @@ and boxes the selected asynchronous fill. Cache hits therefore need not construc
 the loader, and nested inode/cold/directory loader future state is kept out of
 the caller's inline future and Moka initializer. Source tests cover loader-state
 size and construction on a hit. This correction is absent from the intermediate
-binary above and **has not yet produced a measured mounted candidate**. The
-observed aborts establish an intermediate debug execution failure, not a measured
-throughput regression or proof that the corrected runtime succeeds. No more
-stack-limit retries are counted as performance evidence.
+binary above. The later corrected release completes its smokes and measurements
+below. The observed aborts remain intermediate debug execution failures, not
+measured throughput regressions. No stack-limit retry is counted as performance
+evidence or silently replaced by the later release result.
 
 ## Current refactor and retained invariants
 
@@ -272,6 +390,9 @@ fills/root-child prefetch, session-bound local admission for owner-safe cache
 hits, one-snapshot lifecycle authority, and inode allocation inside create's
 publication transaction. The current continuation removes duplicate preparation
 and publication work rather than adding another parallel authority cache.
+Memo hits are local; cold or evicted entries use authenticated asynchronous
+fills and can incur network/object I/O. The bounded memo and prefetch do not
+promise complete lower-dataset residency or zero cold traffic.
 
 | Candidate change | Removed ordinary-path work | Retained checks and limits |
 | --- | --- | --- |
@@ -292,15 +413,22 @@ outcomes are not blindly replayed. A multi-chunk operation can report only a
 prefix whose metadata publication was acknowledged. Pending/unpublished objects
 retain recovery ownership, and read pins/retirement holds are unchanged.
 
-The implementation now preflights each publication's transaction and stored-row
+One visibility publication per bounded write group does **not** mean one total
+Redis write transaction. A separate durable slice-ID/Pending reservation
+transaction precedes object upload; the publication transaction later installs
+the maps, inode and ownership deltas. Additional bounded groups or recovery
+work can add transactions.
+
+The batching implementation preflights each publication's transaction and stored-row
 byte bounds. If a group exceeds a known preparation bound, it drops that view,
 halves the group and reads only the selected rows again. Initial chunk snapshots
 also shrink on a known aggregate read bound. This retains support for writes
 whose individual chunks fit but whose combined ownership plan does not. Each
 acknowledged group contributes to the returned prefix; no uncertain commit is
 replayed or split. Uploads remain protected by their Pending records until
-publication. The final source is frozen, but gate/runtime results for this
-change remain pending.
+publication. This behavior passes the focused service gate in the structural
+continuation. The later release smokes and ordinary workload complete without
+errors; those mounted scenarios do not exercise every fragmented-map case.
 
 Reads retain an additional bounded fallback. If eager fetching of requested
 chunk maps exceeds a known aggregate metadata bound, the reader refreshes a
@@ -310,7 +438,7 @@ cleanup completes; large hidden tail maps must not turn that EOF read into an
 error. This fallback does not ignore malformed rows, arbitrary backend failures
 or genuine visible-range bounds.
 
-The new source tests are **not yet run** at this checkpoint:
+The following tests pass in the completed local/service gate:
 
 - `eof_after_visible_cut_ignores_oversized_invisible_tail_metadata` uses memory
   metadata and rejects object I/O; it installs the normal visible shrink cut
@@ -321,9 +449,9 @@ The new source tests are **not yet run** at this checkpoint:
   uses real Redis plus RustFS. Both fragmented-publication tests exercise the
   same grouping path and check published bytes, upload counts and ownership.
 
-The two RustFS tests are ignored by default and require the existing configured
-real-service gate with `--include-ignored`. A test present in the frozen source
-is not passing evidence; no new crash scenario is introduced here.
+The two RustFS tests are ignored by default and ran in the configured
+real-service gate with `--include-ignored`. Their results cover the recorded
+source and fixtures; no new crash scenario is introduced here.
 
 The unused standalone `EntityBackend::allocate`, `allocate_upload`,
 `register_upload`, `uploaded` and singleton `reserve_upload` APIs, including the
@@ -339,6 +467,8 @@ These describe the frozen source changes, not measured improvements:
 
 | Removed or replaced code/work | Replacement or retained path |
 | --- | --- |
+| Native-VFS entity SDK bridge `src/vfs/fs/entity_io.rs`, `EntityFileIo`, `BoundFile` and entity-handle attachment/dispatch | Dedicated `EntityFuse` calls `EntityNamespace` and `EntityData` directly using its own entity handles |
+| Separate `namespace_create.rs` / `namespace_mount.rs` implementation wrappers | Shared typed `Request`/`Reply` execution in `namespace.rs`, retaining `namespace_snapshot.rs` preparation and separate tests |
 | Data-local `ReadSet` and its duplicate resolution/preparation logic | Namespace `Prepared` and the shared operation snapshot, with exact observed rows and authority |
 | Full second parent/name walk during path open | Carry discovery predicates through the target inode lock and validate them once |
 | Extra attribute request after truncate or existing-file create fallback | Return the successful operation's inode attributes to the FUSE caller |
@@ -347,7 +477,7 @@ These describe the frozen source changes, not measured improvements:
 | Separate Uploaded metadata transition in ordinary writes | Final transaction promotes exact Pending rows together with map/owner/inode publication |
 | Per-chunk independent ownership publication on the ordinary multi-chunk path | Aggregate deltas once per slice; split only known preparation bounds, retaining uploaded receipts and acknowledged-prefix semantics |
 | Unconditional no-op truncate-recovery reads before ordinary I/O/fsync | Read the intent in the operation snapshot; run recovery only for a present intent |
-| Eager construction/embedding of nested lower-cache loader futures | Lazy loader factory and boxed selected fill; corrected mounted evidence remains pending |
+| Eager construction/embedding of nested lower-cache loader futures | Lazy loader factory and boxed selected fill; corrected release smokes and measurements complete below |
 
 The asynchronous `plan_chunk_membership` adapter remains for truncate,
 discard and orphan retirement; it calls the shared pure membership planner.
@@ -356,30 +486,157 @@ reference counts, reader retirement holds and sticky uncertain-I/O errors are
 retained. No head counter, global mutation gate, mutable-layer digest or old
 commit-view cache is introduced.
 
-## Candidate validation and comparison: pending
+## Completed correctness gate and preliminary comparison
 
 | Checkpoint | Status |
 | --- | --- |
 | Frozen baseline build, diagnostics and preliminary throughput | Completed with the limits above |
 | Intermediate cache/create debug checkpoint | Incomplete: three aborts, each 0/4 phase cells; no usable counts or throughput |
-| Lazy boxed memo-loader correction | In working source; corrected mounted measurement pending |
-| Snapshot/ownership/grouping implementation | Source frozen; compilation and runtime gate results pending |
-| EOF hidden-tail fallback and real RustFS fragmented-publication tests | Added to frozen source; not yet run |
-| Focused memory and real Redis/RustFS correctness checks | Pending for the final candidate source |
-| Required fmt/check/build/clippy/workspace test gates | Pending for the final candidate source |
-| Candidate source manifest and executable hash | Pending |
-| Matched 200-file diagnostic counts/timers | Pending |
-| Minimal smoke and 16/32-worker reversed-order comparison | Pending |
+| Lazy boxed memo-loader correction | Corrected release smokes and measurements complete; earlier debug failures retained |
+| Snapshot/ownership/grouping WIP | Merged by PR #42; earlier partial gate and four entity-test failures recorded above |
+| Direct entity mount/shared namespace execution refactor | Frozen inventory: net -861 Rust lines; local gate passed with documented exclusions; preliminary mounted measurements complete |
+| EOF hidden-tail fallback and real RustFS fragmented-publication tests | PASS in the completed service gate |
+| Formatting, workspace checks, strict Clippy, default build and four runtime combinations | PASS; missed test caller fixed and failed first attempt preserved |
+| Real Redis/RustFS correctness checks | PASS: seven packed-lower + 100 entity; zero owned containers/volumes after cleanup |
+| Overlay workspace test gate | PASS: 2,334 library + nine binary; 405 ignored, five known cases filtered |
+| Mandatory default workspace test gate | PASS: 1,179 tests; 225 ignored, zero filtered |
+| Shell/report/diagnostic/diff checks | PASS |
+| Candidate release source manifest and executable hash | Verified against service/build/both measurement groups and frozen source |
+| Matched 200-file diagnostic counts/timers | Eight phases complete, zero errors; MONITOR markers and timer registrations complete |
+| Minimal smoke and 16/32-worker reversed-order comparison | Four smokes across diagnostic/throughput groups; all 16 uninstrumented phases complete, zero errors |
 | Accepted performance change | None |
 
-| Preliminary comparison | Workers | Native WRITE | Entity WRITE | Native READBACK | Entity READBACK | Entity delta vs baseline |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Candidate, pending | 16 | Pending | Pending | Pending | Pending | Pending |
-| Candidate, pending | 32 | Pending | Pending | Pending | Pending | Pending |
+The authoritative reports are `simplification/final-measurement-audit.{md,json}`
+and `simplification/comparison.{md,json}` under
+`/mnt/brewfs-data/artifacts/overlay-entity-cost-20261020/`. Both supplied groups
+are complete; none of their results are partial or interrupted.
 
-| Diagnostic candidate counts | CREATE RTTs/op | WRITE RTTs/op | WRITE commands/file | READBACK commands/file |
-| --- | --- | --- | --- | --- |
-| Pending matched measurement | Pending | Pending | Pending | Pending |
+| Candidate provenance | Verified identity |
+| --- | --- |
+| Build source | `3cb2082500aac0476f275b107228f7dd14a087ce` plus frozen patch, subsequently committed as `df846766c14860ef97ea1fdb79a0bb8d3ef88179` |
+| Rust source manifest | 720 present files and four deleted paths; SHA256 `03564582684d8ff13df9e172f30f09d3efa05e63b1a26578e0c8752aca8dccb9` |
+| Captured build patch | `simplification/build-source.patch`, SHA256 `8a46b15c70bb945914640adcc398ac45f19bf4426eabc93f57661421e20af515` |
+| Entity executable | `simplification/brewfs`, SHA256 `3b279f7230be78ba896e01b9d2b8d52e0a5dfaeadde368529c9d92631e8c5db8` |
+| Native control executable | Preserved `baseline/brewfs`, SHA256 `290477da246979bdd1a1417f285ddcb20e2e01fb8354428da42a273b45ad618a` |
+| Release build | Exit 0, 44m 38s, same release flags as the baseline |
+| Diagnostic group | `simplification/diagnostic/entity-mount-20261020T121314Z-eea463eb-b5d2-4d8e-a614-7955cbcaf1bc` |
+| Throughput group | `simplification/throughput/entity-mount-20261020T121452Z-c2b502fa-93e2-44ff-9fe3-d94f7961c079` |
+
+All source-manifest entries agree across the service gate, build and both
+measurement groups. `simplification/source-commit-audit.json` also verifies
+all 720 Rust blobs and four deletions against commit `df84676`, with no extra
+or mismatched files. The native executable is unchanged between the reference
+and candidate runs; the candidate entity uses its separately frozen release.
+Cross-build workload traces match. The diagnostic group completes eight phases,
+two smokes and six clean unmounts; the throughput group completes 16 phases,
+two smokes and ten clean unmounts. File counts and byte checks match, all
+workload errors are zero, and cleanup leaves no owned mounts, containers or
+volumes. `overlay-native` remains explicitly skipped for its missing adapter,
+binding and bootstrap; no replacement arm was used.
+
+### Preliminary throughput and remaining native gap
+
+Each uninstrumented cell contains two opposite-order samples of 2,000 new
+16 KiB upper files, with fsync per file and exact readback. At each worker
+count repetition 1 runs native then entity; repetition 2 runs entity then native.
+Means and medians coincide for two samples. Values below are files/s;
+"ratio change" compares current entity/native with frozen entity/native.
+
+| Status | Workers | Phase | Frozen entity | Current entity | Entity delta | Current native | Entity/native | Ratio change |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Preliminary | 16 | WRITE | 114.513479 | 272.210461 | +137.710% | 359.643437 | 0.756890 | +136.881% |
+| Preliminary | 32 | WRITE | 140.819408 | 311.517864 | +121.218% | 431.146399 | 0.722534 | +130.073% |
+| Preliminary | 16 | READBACK | 176.611681 | 342.434098 | +93.891% | 615.472097 | 0.556376 | +100.786% |
+| Preliminary | 32 | READBACK | 205.422030 | 378.386490 | +84.200% | 636.812915 | 0.594188 | +98.412% |
+
+| Preliminary sample spread | Workers | Native min–max files/s | Entity min–max files/s |
+| --- | ---: | ---: | ---: |
+| WRITE | 16 | 348.500053–370.786822 | 270.043457–274.377465 |
+| WRITE | 32 | 431.112353–431.180444 | 304.218943–318.816785 |
+| READBACK | 16 | 599.794528–631.149665 | 340.765916–344.102279 |
+| READBACK | 32 | 616.975423–656.650407 | 372.238935–384.534045 |
+
+Native control medians move +0.35%/-3.85% in WRITE and -3.43%/-7.16% in
+READBACK at 16/32 workers, so both raw entity deltas and normalized ratio changes
+are reported. These two-sample ranges are not confidence intervals. Entity
+WRITE rises from 272.21 to 311.52 files/s at 16 to 32 workers, but remains
+24.31%/27.75% below current native; READBACK remains 44.36%/40.58% below native.
+This run exceeds the old r31 216.9/236.9 figures, but the matched comparison is
+against frozen entity `cfa000a`, not a new r31 run or proof that scaling has no
+plateau. Broader mixed-workload/POSIX/production acceptance is not established.
+
+### Diagnostic request reduction
+
+MONITOR/timer runs use 200 files per phase and are diagnostic only. External
+commands include setup/background work and are not native pipelined RTT counts.
+
+| Diagnostic phase | Workers | Frozen entity commands/file | Current entity commands/file | Reduction | Current native commands/file |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| WRITE | 16 | 113.770 | 15.720 | 86.183% | 7.115 |
+| WRITE | 32 | 114.400 | 15.780 | 86.206% | 7.115 |
+| READBACK | 16 | 75.880 | 16.015 | 78.894% | 5.005 |
+| READBACK | 32 | 76.640 | 16.015 | 79.104% | 5.005 |
+
+Current WRITE EVALSHA counts are 15.715/15.775 per file: READ_LUA
+7.355/7.385, TRANSACTION_LUA 8.355/8.385 and SCAN_LUA 0.005. READBACK
+has 16.010 EVALSHA/file: 8.005 reads and 8.005 read-only transactions;
+the latter validate observations and authority without metadata writes.
+Neither phase issues packed-owner catalog scripts. WRITE records 8.67/8.73
+lower-memo hits per file and one fill per 200-file window; READBACK records
+6.0 hits/file and no misses. These observations do not promise that cold or
+evicted metadata never performs authenticated network I/O.
+
+| Diagnostic FUSE operation | Frozen RTT attempts/op, 16/32 workers | Current RTT attempts/op, 16/32 workers |
+| --- | ---: | ---: |
+| WRITE-phase CREATE | 15 / 15 | 2 / 2 |
+| WRITE | 25 / 25 | 3 / 3 |
+| FSYNC | 12 / 12 | 2 / 2 |
+| FLUSH | 12 / 12 | 2 / 2 |
+| WRITE-phase LOOKUP | 9.587 / 9.727 | 2 / 2.019 |
+| READBACK OPEN | 6.06 / 6 | 2 / 2 |
+| READBACK READ | 7.5 / 7.52 | 3 / 3 |
+| READBACK LOOKUP | 10.19 / 10.383 | 2 / 2 |
+| RELEASE | 0 / 0 | 0 / 0 |
+
+CREATE now measures one snapshot read plus one atomic allocation/publication.
+WRITE measures a read, durable slice reservation and visibility publication;
+there are still two write transactions, separated by object PUT. READBACK
+still has three lookups, open, payload/EOF reads and flush per file; each
+performs its own validated metadata work. It issues about 3.20 times native's
+external commands; WRITE issues about 2.21–2.22 times native's. These remaining
+costs are measured, but this experiment does not assign the entire residual
+throughput gap to any single one of them.
+
+| Diagnostic WRITE elapsed time, ms/file | 16 workers | 32 workers |
+| --- | ---: | ---: |
+| Namespace preparation | 0.635 | 0.606 |
+| Namespace inode/xattr/dentry resolution, summed nested spans | 0.627 | 0.603 |
+| Redis reads | 56.848 | 124.079 |
+| Mutating transactions | 24.160 | 52.437 |
+| Read-only validation transactions | 36.587 | 84.703 |
+| Slice reservation, nested in transaction time | 7.413 | 17.167 |
+| Object PUT | 19.298 | 21.078 |
+| Visibility publication, nested in transaction time | 7.631 | 16.827 |
+| Namespace / data lock waits | 0.006013 / 0.024725 | 0.005124 / 0.027972 |
+
+Uninstrumented Redis inclusive EVAL service remains higher than native even
+after the request reduction. These server counters include script work and
+have their own recorded sampling windows; they are not client RTT duration.
+
+| Preliminary WRITE EVAL service, ms/file | 16 workers | 32 workers |
+| --- | ---: | ---: |
+| Frozen entity | 5.300316 | 5.025221 |
+| Current entity | 2.320584 | 2.340781 |
+| Current native | 0.332907 | 0.339182 |
+
+The diagnostic elapsed spans above overlap across concurrent and nested work; do not sum them
+into exclusive occupancy or an uninstrumented latency breakdown. Diagnostic
+mount CPU is 8.65/9.05 ms/file and Redis CPU 9.334/9.845 ms/file for WRITE;
+MONITOR perturbs server/client work. Full timers, script identities, sample
+windows and raw records are in `comparison.json`. No semantic CAS retry count
+is inferred from additional requests. The demonstrated result is lower request
+amplification and higher preliminary throughput for the combined WIP/refactor;
+there is no isolated PR #42 or per-optimization throughput measurement.
 
 The three inherited legacy overlay failures remain
 `g13a_kv_released_lease_is_not_an_expired_recovery_root`,
@@ -395,12 +652,12 @@ Do not label these new regressions or describe a failing broad run as green.
 
 ## Documentation audit
 
-The full repository audit covers 147 Markdown files and 526 local relative
+The full repository audit covers 148 Markdown files and 528 local relative
 links, including heading fragments: **zero broken links**. Canonical packed and
 overlay specs, workspace architecture and this checkpoint have zero heading or
 fence advisories. The 81 optional style advisories elsewhere are inherited from
 historical/vendor documents; they are not new broken links or malformed fences
-in these maintained documents. The 257 external links were classified but not
+in these maintained documents. The 260 external links were classified but not
 network-validated. `git diff --check` passed at the audit checkpoint.
 
 Results are preserved at
@@ -408,13 +665,15 @@ Results are preserved at
 The reproducible checker remains at
 `/mnt/brewfs-data/artifacts/docs-spec-consolidation-20261020/check_relative_links.py`.
 This documentation audit runs no Cargo command, service, FUSE mount or benchmark
-and does not change the pending candidate validation status above.
+and does not supply mounted or performance validation.
 
 ## Reproduction
 
 From the frozen checkout, using its preserved executable:
 
 ```bash
+export ENTITY_MOUNT_NATIVE_BINARY=/mnt/brewfs-data/artifacts/overlay-entity-cost-20261020/baseline/brewfs
+
 ENTITY_MOUNT_DIAGNOSTIC=1 ENTITY_MOUNT_FILES=200 \
 ENTITY_MOUNT_WORKERS=16,32 ENTITY_MOUNT_REPETITIONS=1 \
 ENTITY_MOUNT_ARTIFACT_ROOT=/mnt/brewfs-data/artifacts/overlay-entity-cost-20261020/baseline/diagnostic-retry \
@@ -428,8 +687,26 @@ ENTITY_MOUNT_BINARY=/mnt/brewfs-data/artifacts/overlay-entity-cost-20261020/base
 bash tools/perf/run_entity_mount_comparison.sh
 ```
 
+The completed candidate uses the same workload with separate entity/native
+executables. Reproduce into a fresh artifact directory:
+
+```bash
+export ENTITY_MOUNT_BINARY=/mnt/brewfs-data/artifacts/overlay-entity-cost-20261020/simplification/brewfs
+export ENTITY_MOUNT_NATIVE_BINARY=/mnt/brewfs-data/artifacts/overlay-entity-cost-20261020/baseline/brewfs
+export ENTITY_MOUNT_WORKERS=16,32
+
+ENTITY_MOUNT_DIAGNOSTIC=1 ENTITY_MOUNT_FILES=200 ENTITY_MOUNT_REPETITIONS=1 \
+ENTITY_MOUNT_ARTIFACT_ROOT=/mnt/brewfs-data/artifacts/entity-repro/diagnostic \
+bash tools/perf/run_entity_mount_comparison.sh
+
+ENTITY_MOUNT_DIAGNOSTIC=0 ENTITY_MOUNT_FILES=2000 ENTITY_MOUNT_REPETITIONS=2 \
+ENTITY_MOUNT_ARTIFACT_ROOT=/mnt/brewfs-data/artifacts/entity-repro/throughput \
+bash tools/perf/run_entity_mount_comparison.sh
+```
+
 Groups use fresh IDs/scopes and preserve workload trace hashes, commands,
 source/binary manifests, service configuration and cleanup evidence. Candidate
 runs must use a separately frozen executable and artifact root with matching
 release flags and workload settings. MONITOR runs and throughput runs remain
-separate; later results must fill the pending tables from their actual artifacts.
+separate. The completed comparison and its limits above come from the preserved
+artifacts, not reconstructed workload estimates.

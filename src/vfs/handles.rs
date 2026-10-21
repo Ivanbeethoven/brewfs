@@ -279,9 +279,6 @@ where
     pub(crate) ino: i64,
     pub(crate) opened_at: Instant,
     pub(crate) flags: HandleFlags,
-    #[cfg(feature = "workspace-overlay")]
-    pub(crate) entity_io:
-        std::sync::OnceLock<Arc<dyn crate::workspace_overlay::entity::data::EntityFileIo>>,
     write_dirty: AtomicU8,
     gate: Arc<HandleGate>,
     state: StdMutex<FileHandleState<B, M>>,
@@ -311,8 +308,6 @@ where
             ino,
             opened_at: Instant::now(),
             flags,
-            #[cfg(feature = "workspace-overlay")]
-            entity_io: std::sync::OnceLock::new(),
             write_dirty: AtomicU8::new(0),
             gate: Arc::new(HandleGate::new()),
             state: StdMutex::new(FileHandleState {

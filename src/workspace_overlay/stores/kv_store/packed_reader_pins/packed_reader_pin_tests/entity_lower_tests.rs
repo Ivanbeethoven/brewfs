@@ -222,26 +222,38 @@ async fn packed_copy_up_contract<B: WorkspaceKvBackend>(
     let data = EntityData::new(namespace, Arc::new(objects), 1024)
         .await
         .unwrap();
-    let file = data.bind(handle.clone()).unwrap();
-    assert_eq!(file.read(0, payload.len()).await.unwrap(), payload);
+    assert_eq!(
+        data.read(handle.clone(), 0, payload.len()).await.unwrap(),
+        payload
+    );
     let replacement = bytes::Bytes::from_static(b"cross-boundary replacement");
-    let written = file.write(1000, replacement.clone(), false).await.unwrap();
+    let written = data
+        .write(handle.clone(), 1000, replacement.clone(), false)
+        .await
+        .unwrap();
     assert_eq!(written.written, replacement.len());
     let mut expected = payload.to_vec();
     expected[1000..1000 + replacement.len()].copy_from_slice(&replacement);
-    assert_eq!(file.read(0, expected.len()).await.unwrap(), expected);
-    file.fsync().await.unwrap();
+    assert_eq!(
+        data.read(handle.clone(), 0, expected.len()).await.unwrap(),
+        expected
+    );
+    data.fsync(handle.clone()).await.unwrap();
     assert_eq!(
         lower.read_range(400, 0, payload.len()).await.unwrap(),
         payload
     );
 
-    file.truncate(1011).await.unwrap();
-    file.truncate(payload.len() as u64).await.unwrap();
+    data.truncate(handle.clone(), 1011).await.unwrap();
+    data.truncate(handle.clone(), payload.len() as u64)
+        .await
+        .unwrap();
     expected[1011..].fill(0);
-    assert_eq!(file.read(0, expected.len()).await.unwrap(), expected);
-    file.fsync().await.unwrap();
-    drop(file);
+    assert_eq!(
+        data.read(handle.clone(), 0, expected.len()).await.unwrap(),
+        expected
+    );
+    data.fsync(handle.clone()).await.unwrap();
     drop(handle);
     let maintenance = lifecycle.enter_maintenance(&session).await.unwrap();
     let mut completed = false;

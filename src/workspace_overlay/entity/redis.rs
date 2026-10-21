@@ -20,11 +20,13 @@ const READ_LUA: &str = r#"
 local max_key, max_row, max_total = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
 local total = 0
 for _, key in ipairs(KEYS) do
-    local kind = redis.call('TYPE', key).ok
-    if kind ~= 'none' and kind ~= 'string' then
-        return redis.error_reply('ENTITY_CORRUPT invalid row type')
+    local size = redis.pcall('STRLEN', key)
+    if type(size) == 'table' then
+        if string.sub(size.err, 1, 10) == 'WRONGTYPE ' then
+            return redis.error_reply('ENTITY_CORRUPT invalid row type')
+        end
+        return size
     end
-    local size = redis.call('STRLEN', key)
     total = total + #key + size
     if #key > max_key or size > max_row or total > max_total then
         return redis.error_reply('ENTITY_INVALID read exceeds byte bound')
@@ -35,13 +37,13 @@ for i, key in ipairs(KEYS) do rows[i] = redis.call('GET', key) end
 return {redis.call('TIME'), rows}
 "#;
 
-// The first seven args carry small counts and split temporal bounds. Full IDs
+// The first five args carry small counts and a split lease deadline. Full IDs
 // and timestamps never pass through Lua's floating point integer conversion.
 // All key types, predicates, operations, counters and bounds are validated
 // before the first mutating command: Lua errors cannot roll back a prior SET.
 const TRANSACTION_LUA: &str = r#"
 local authorities, checks, writes = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
-local mode = ARGV[9]
+local mode = ARGV[7]
 local extra_keys = mode == 'create' and 2 or (mode == 'reserve' and 1 or 0)
 if not authorities or not checks or not writes or authorities < 1 or checks < 0 or writes < 0
     or authorities % 1 ~= 0 or checks % 1 ~= 0 or writes % 1 ~= 0
@@ -49,7 +51,7 @@ if not authorities or not checks or not writes or authorities < 1 or checks < 0 
     or #KEYS ~= authorities + checks + writes + extra_keys then
     return redis.error_reply('ENTITY_INVALID malformed transaction')
 end
-local create_at = 10 + 2 * (authorities + checks + writes)
+local create_at = 8 + 2 * (authorities + checks + writes)
 local xattr_count, reservation_count = 0, 0
 if mode == 'create' then
     xattr_count = tonumber(ARGV[create_at + 5])
@@ -69,23 +71,16 @@ elseif mode == 'reserve' then
 elseif #ARGV ~= create_at - 1 then
     return redis.error_reply('ENTITY_INVALID malformed transaction')
 end
-local function bound(seconds_text, nanos_text)
-    if seconds_text == '' and nanos_text == '' then return nil, nil end
-    local seconds, nanos = tonumber(seconds_text), tonumber(nanos_text)
-    if not seconds or seconds < 0 or seconds > 9223372036 or seconds % 1 ~= 0
-        or not nanos or nanos < 0 or nanos >= 1000000000 or nanos % 1 ~= 0
-        or (seconds == 9223372036 and nanos > 854775807) then
-        return nil, nil, 'ENTITY_INVALID invalid temporal bound'
+local expires_s, expires_ns
+if ARGV[4] ~= '' or ARGV[5] ~= '' then
+    expires_s, expires_ns = tonumber(ARGV[4]), tonumber(ARGV[5])
+    if not expires_s or expires_s < 0 or expires_s > 9223372036 or expires_s % 1 ~= 0
+        or not expires_ns or expires_ns < 0 or expires_ns >= 1000000000 or expires_ns % 1 ~= 0
+        or (expires_s == 9223372036 and expires_ns > 854775807) then
+        return redis.error_reply('ENTITY_INVALID invalid lease deadline')
     end
-    return seconds, nanos
 end
-local lower_s, lower_ns, lower_error = bound(ARGV[4], ARGV[5])
-local upper_s, upper_ns, upper_error = bound(ARGV[6], ARGV[7])
-if lower_error or upper_error then return redis.error_reply(lower_error or upper_error) end
-if lower_s and upper_s and (lower_s > upper_s or (lower_s == upper_s and lower_ns >= upper_ns)) then
-    return redis.error_reply('ENTITY_INVALID invalid temporal interval')
-end
-local prefix = ARGV[8]
+local prefix = ARGV[6]
 if mode ~= 'commit' and mode ~= 'create' and mode ~= 'reserve' then
     return redis.error_reply('ENTITY_INVALID invalid transaction mode')
 end
@@ -94,18 +89,20 @@ for _, key in ipairs(KEYS) do
     if #key == 0 or #key > 1024 or string.sub(key, 1, #prefix) ~= prefix then
         return redis.error_reply('ENTITY_INVALID invalid entity key')
     end
-    local kind = redis.call('TYPE', key).ok
-    if kind ~= 'none' and kind ~= 'string' then
-        return redis.error_reply('ENTITY_CORRUPT invalid row type')
+    local size = redis.pcall('STRLEN', key)
+    if type(size) == 'table' then
+        if string.sub(size.err, 1, 10) == 'WRONGTYPE ' then
+            return redis.error_reply('ENTITY_CORRUPT invalid row type')
+        end
+        return size
     end
-    local size = redis.call('STRLEN', key)
     total_stored = total_stored + #key + size
     if size > 4194304 or total_stored > 16777216 then
         return redis.error_reply('ENTITY_INVALID stored rows exceed byte bound')
     end
     total = total + #key
 end
-local cursor = 10
+local cursor = 8
 local expected = {}
 for i = 1, authorities + checks do
     local present, value = ARGV[cursor], ARGV[cursor + 1]
@@ -137,11 +134,10 @@ end
 if total > 16777216 then return redis.error_reply('ENTITY_INVALID transaction exceeds byte bound') end
 local now = redis.call('TIME')
 local now_s, now_ns = tonumber(now[1]), tonumber(now[2]) * 1000
-if (lower_s and (now_s < lower_s or (now_s == lower_s and now_ns < lower_ns)))
-    or (upper_s and (now_s > upper_s or (now_s == upper_s and now_ns >= upper_ns))) then
+if expires_s and (now_s > expires_s or (now_s == expires_s and now_ns >= expires_ns)) then
     return {-1, ''}
 end
-cursor = 10
+cursor = 8
 for i = 1, authorities + checks do
     local present, value, current = ARGV[cursor], ARGV[cursor + 1], redis.call('GET', KEYS[i])
     if (present == '0' and current) or (present == '1' and current ~= value) then
@@ -477,14 +473,12 @@ impl RedisEntityBackend {
             .arg(authority.checks.len())
             .arg(plan.checks.len())
             .arg(plan.writes.len());
-        for bound in [authority.not_before_ns, authority.expires_before_ns] {
-            if let Some(bound) = bound {
-                invocation
-                    .arg(bound / 1_000_000_000)
-                    .arg(bound % 1_000_000_000);
-            } else {
-                invocation.arg("").arg("");
-            }
+        if let Some(deadline) = authority.expires_before_ns {
+            invocation
+                .arg(deadline / 1_000_000_000)
+                .arg(deadline % 1_000_000_000);
+        } else {
+            invocation.arg("").arg("");
         }
         invocation.arg(&self.prefix).arg(if create.is_some() {
             "create"

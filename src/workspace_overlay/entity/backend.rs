@@ -104,35 +104,27 @@ pub enum CommitOutcome {
 #[derive(Clone, Debug)]
 pub struct TransactionAuthority {
     pub(super) checks: Vec<RowCheck>,
-    pub(super) not_before_ns: Option<i64>,
     pub(super) expires_before_ns: Option<i64>,
 }
 
 impl TransactionAuthority {
     pub(super) fn from_validated(
         checks: Vec<RowCheck>,
-        not_before_ns: Option<i64>,
         expires_before_ns: Option<i64>,
     ) -> Result<Self> {
-        if checks.is_empty()
-            || not_before_ns.is_some_and(|value| value < 0)
-            || expires_before_ns.is_some_and(|value| value < 0)
-            || matches!((not_before_ns, expires_before_ns), (Some(start), Some(end)) if start >= end)
-        {
+        if checks.is_empty() || expires_before_ns.is_some_and(|value| value < 0) {
             return Err(EntityError::Invalid("invalid transaction authority".into()));
         }
-        validate_checks(&checks)?;
-        Ok(Self {
+        let authority = Self {
             checks,
-            not_before_ns,
             expires_before_ns,
-        })
+        };
+        validate_plan(&authority, &EntityPlan::default())?;
+        Ok(authority)
     }
 
     pub(super) fn allows_time(&self, now_ns: i64) -> bool {
-        now_ns >= 0
-            && self.not_before_ns.is_none_or(|start| now_ns >= start)
-            && self.expires_before_ns.is_none_or(|end| now_ns < end)
+        now_ns >= 0 && self.expires_before_ns.is_none_or(|end| now_ns < end)
     }
 }
 
@@ -141,7 +133,7 @@ pub trait EntityBackend: Send + Sync {
     async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot>;
     /// Exact authority-row changes (including heartbeat renewal) are conflicts.
     /// The caller must obtain fresh lifecycle authority before retrying. Backend
-    /// time outside the authorized interval is fenced, never silently extended.
+    /// time at or past the deadline is fenced, never silently extended.
     async fn commit(
         &self,
         authority: &TransactionAuthority,
@@ -235,29 +227,6 @@ pub(super) fn validate_keys(keys: &[Vec<u8>]) -> Result<()> {
     let mut total = 0;
     for key in keys {
         add_bytes(&mut total, key, None)?;
-    }
-    Ok(())
-}
-
-fn validate_checks(checks: &[RowCheck]) -> Result<()> {
-    if checks.len() > MAX_TRANSACTION_ROWS {
-        return Err(EntityError::Invalid(
-            "entity transaction exceeds row bound".into(),
-        ));
-    }
-    validate_same_volume(checks.iter().map(|check| check.key.as_slice()))?;
-    let mut total = 0;
-    let mut seen = BTreeMap::new();
-    for check in checks {
-        add_bytes(&mut total, &check.key, check.expected.as_deref())?;
-        if seen
-            .insert(&check.key, &check.expected)
-            .is_some_and(|previous| previous != &check.expected)
-        {
-            return Err(EntityError::Invalid(
-                "contradictory entity predicates".into(),
-            ));
-        }
     }
     Ok(())
 }

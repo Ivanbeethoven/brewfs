@@ -293,37 +293,116 @@ async fn lower_only_lookup_does_not_copy_up_and_siblings_isolate_recreation() {
     assert_eq!(current_inode(&first, 2).await.nlink, 0);
 }
 
-#[tokio::test]
-async fn concurrent_exclusive_creates_have_exactly_one_visible_winner() {
-    let fixture = fixture(MemoryLower::empty()).await;
+async fn exclusive_creates<B: EntityBackend + 'static>(
+    ns: Arc<EntityNamespace<B, MemoryLower>>,
+    create_open: bool,
+) -> EntityInode {
     let barrier = Arc::new(Barrier::new(33));
-    let mut tasks = Vec::new();
-    for _ in 0..32 {
-        let ns = fixture.ns.clone();
-        let barrier = barrier.clone();
-        tasks.push(tokio::spawn(async move {
-            barrier.wait().await;
-            ns.create(request(1, b"exclusive", EntityKind::File), root())
-                .await
-        }));
-    }
+    let tasks = (0..32)
+        .map(|_| {
+            let ns = ns.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let request = request(1, b"exclusive", EntityKind::File);
+                if create_open {
+                    let (inode, handle) = ns.create_open(request, root(), 6).await?;
+                    assert_eq!(ns.validate_handle(&handle, 6), Ok(inode.ino));
+                    ns.close(handle).unwrap();
+                    Ok(inode)
+                } else {
+                    ns.create(request, root()).await
+                }
+            })
+        })
+        .collect::<Vec<_>>();
     barrier.wait().await;
+    // Join every writer before assertions/cleanup, including failed outcomes.
+    let results = futures::future::join_all(tasks).await;
     let mut winners = Vec::new();
     let mut exists = 0;
-    for task in tasks {
-        match task.await.unwrap() {
+    for result in results {
+        match result.unwrap() {
             Ok(inode) => winners.push(inode),
             Err(EntityError::Exists) => exists += 1,
-            other => panic!("unexpected create outcome: {other:?}"),
+            other => panic!("unexpected O_EXCL outcome: {other:?}"),
         }
     }
     assert_eq!(winners.len(), 1);
     assert_eq!(exists, 31);
     assert_eq!(
-        fixture.ns.lookup(1, b"exclusive", &root()).await.unwrap(),
+        ns.lookup(1, b"exclusive", &root()).await.unwrap(),
         winners[0]
     );
     assert_eq!(winners[0].nlink, 1);
+    winners.pop().unwrap()
+}
+
+#[tokio::test]
+async fn concurrent_exclusive_creates_have_exactly_one_visible_winner() {
+    exclusive_creates(fixture(MemoryLower::empty()).await.ns, false).await;
+}
+
+async fn mount_contract<B: EntityBackend + 'static>(backend: Arc<B>, volume: Uuid) {
+    let mut lower = MemoryLower::empty();
+    lower.add_file(1, b"lower", 2, 8);
+    let lower = Arc::new(lower);
+    let keys = EntityKeys::new(volume, Uuid::new_v4());
+    let ns = attach_with_ttl(backend, lower, keys, 60_000_000_000)
+        .await
+        .ns;
+    let create = |name: &[u8], mode| CreateRequest {
+        mode,
+        ..request(1, name, EntityKind::File)
+    };
+    let root = root();
+    let user = user(101);
+    ns.chmod(1, 0o777, root.clone()).await.unwrap();
+    let (inode, handle) = ns
+        .create_open(create(b"private", 0), user.clone(), 6)
+        .await
+        .unwrap();
+    assert_eq!(inode.mode, 0);
+    assert_eq!(ns.validate_handle(&handle, 6), Ok(inode.ino));
+    assert!(matches!(
+        ns.open_inode(inode.ino, 4, &user).await,
+        Err(EntityError::Permission)
+    ));
+    assert_eq!(ns.getattr(inode.ino, &user).await.unwrap().ino, inode.ino);
+    assert!(matches!(
+        ns.create_open(create(b"private", 0), user.clone(), 6).await,
+        Err(EntityError::Exists)
+    ));
+    ns.unlink(1, b"lower".to_vec(), false, root.clone())
+        .await
+        .unwrap();
+    let entries = ns.readdir(1, &user).await.unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|(name, _)| name.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"private".as_slice()]
+    );
+    ns.unlink(1, b"private".to_vec(), false, user.clone())
+        .await
+        .unwrap();
+    assert_eq!(ns.validate_handle(&handle, 6), Ok(inode.ino));
+    assert_eq!(ns.getattr(inode.ino, &user).await.unwrap().nlink, 0);
+    assert!(matches!(
+        ns.open_inode(inode.ino, 4, &root).await,
+        Err(EntityError::NotFound)
+    ));
+    ns.close(handle).unwrap();
+    assert!(ns.readdir(1, &root).await.unwrap().is_empty());
+
+    exclusive_creates(ns.clone(), true).await;
+    assert_eq!(ns.readdir(1, &root).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn memory_entity_mount_namespace_operations() {
+    mount_contract(Arc::new(MemoryEntityBackend::new(1)), Uuid::new_v4()).await;
 }
 
 #[tokio::test]
@@ -921,7 +1000,6 @@ async fn inject_dentry(fixture: &Fixture<MemoryEntityBackend>, name: &[u8], row:
             expected: snapshot.rows[0].clone(),
         }],
         None,
-        None,
     )
     .unwrap();
     let plan = EntityPlan {
@@ -1078,6 +1156,21 @@ impl PausingBackend {
     fn pause_after_read(&self, key: Vec<u8>) {
         *self.pause_read_key.lock().unwrap() = Some(key);
     }
+    async fn after_read(&self, keys: &[Vec<u8>]) {
+        let pause = {
+            let mut target = self.pause_read_key.lock().unwrap();
+            if target.as_ref().is_some_and(|key| keys.contains(key)) {
+                target.take();
+                true
+            } else {
+                false
+            }
+        };
+        if pause {
+            self.entered.notify_one();
+            self.resume.notified().await;
+        }
+    }
     async fn entered(&self) {
         tokio::time::timeout(Duration::from_secs(5), self.entered.notified())
             .await
@@ -1133,19 +1226,7 @@ impl EntityBackend for PausingBackend {
     async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         let snapshot = self.inner.read(keys).await?;
-        let pause = {
-            let mut target = self.pause_read_key.lock().unwrap();
-            if target.as_ref().is_some_and(|key| keys.contains(key)) {
-                target.take();
-                true
-            } else {
-                false
-            }
-        };
-        if pause {
-            self.entered.notify_one();
-            self.resume.notified().await;
-        }
+        self.after_read(keys).await;
         Ok(snapshot)
     }
     async fn commit(
@@ -1182,7 +1263,9 @@ impl EntityBackend for PausingBackend {
         Ok(inode)
     }
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.inner.scan_prefix(prefix, limit).await
+        let rows = self.inner.scan_prefix(prefix, limit).await?;
+        self.after_read(&[prefix.to_vec()]).await;
+        Ok(rows)
     }
 }
 
@@ -1255,15 +1338,15 @@ async fn known_inode_and_warm_path_operations_batch_authority_and_observed_rows(
 
     backend.reset_counts();
     assert_eq!(fixture.ns.getattr(inode.ino, &root()).await.unwrap(), inode);
-    backend.assert_requests(1, 1);
+    backend.assert_requests(1, 0);
 
     backend.reset_counts();
     fixture.ns.access(inode.ino, 6, &root()).await.unwrap();
-    backend.assert_requests(1, 1);
+    backend.assert_requests(1, 0);
 
     backend.reset_counts();
     let handle = fixture.ns.open_inode(inode.ino, 6, &root()).await.unwrap();
-    backend.assert_requests(1, 1);
+    backend.assert_requests(1, 0);
     fixture.ns.close(handle).unwrap();
 
     backend.reset_counts();
@@ -1274,12 +1357,12 @@ async fn known_inode_and_warm_path_operations_batch_authority_and_observed_rows(
         .unwrap();
     assert_eq!(attr, inode);
     assert_eq!(handle.ino(), inode.ino);
-    backend.assert_requests(1, 1);
+    backend.assert_requests(2, 0);
     fixture.ns.close(handle).unwrap();
 
     backend.reset_counts();
     assert_eq!(fixture.ns.lookup(1, b"file", &root()).await.unwrap(), inode);
-    backend.assert_requests(1, 1);
+    backend.assert_requests(1, 0);
 
     backend.reset_counts();
     fixture.ns.chmod(inode.ino, 0o600, root()).await.unwrap();
@@ -1348,6 +1431,11 @@ async fn operation_snapshot_preserves_old_observations_and_conflicts_after_mutat
     );
     assert_eq!(prepared.observed(&key), Some(&None));
     assert_eq!(
+        prepared.validate_read(true).await,
+        Err(EntityError::Conflict)
+    );
+    assert_eq!(prepared.observed(&key), Some(&None));
+    assert_eq!(
         fixture
             .backend
             .commit(&authority, &prepared.read_plan())
@@ -1356,6 +1444,107 @@ async fn operation_snapshot_preserves_old_observations_and_conflicts_after_mutat
         CommitOutcome::Conflict
     );
     assert_eq!(fixture.ns.getattr(2, &root()).await.unwrap().mode, 0o600);
+}
+
+#[tokio::test]
+async fn dependent_prefetch_covers_matching_rows_but_preserves_changed_observations() {
+    let mut lower = MemoryLower::empty();
+    lower.add_file(1, b"file", 2, 10);
+    let backend = Arc::new(PausingBackend::new());
+    let fixture = attach(
+        backend.clone(),
+        Arc::new(lower),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+    let key = fixture.keys.inode(2);
+    for changed in [false, true] {
+        let (_, mut prepared) = fixture.ns.snapshot(vec![key.clone()]).await.unwrap();
+        if changed {
+            fixture.ns.chmod(2, 0o600, root()).await.unwrap();
+        }
+        backend.reset_counts();
+        prepared
+            .prefetch(vec![fixture.keys.xattr(2, ACCESS_XATTR)])
+            .await
+            .unwrap();
+        assert_eq!(prepared.observed(&key), Some(&None));
+        if changed {
+            assert_eq!(
+                prepared.validate_read(false).await,
+                Err(EntityError::Conflict)
+            );
+            backend.assert_requests(2, 0);
+        } else {
+            prepared.validate_read(false).await.unwrap();
+            backend.assert_requests(1, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn appended_absence_predicate_requires_fresh_validation() {
+    let fixture = fixture(MemoryLower::empty()).await;
+    let (_, mut prepared) = fixture
+        .ns
+        .snapshot(vec![fixture.keys.inode(1)])
+        .await
+        .unwrap();
+    let key = fixture.keys.dentry(1, b"created");
+    prepared
+        .add(RowCheck {
+            key: key.clone(),
+            expected: None,
+        })
+        .unwrap();
+    fixture
+        .ns
+        .create(request(1, b"created", EntityKind::File), root())
+        .await
+        .unwrap();
+    assert_eq!(
+        prepared.validate_read(false).await,
+        Err(EntityError::Conflict)
+    );
+    assert_eq!(prepared.observed(&key), Some(&None));
+}
+
+#[tokio::test]
+async fn forced_read_validation_accepts_renewal_but_checks_backend_expiry() {
+    let fixture = fixture(MemoryLower::empty()).await;
+    let (_, mut prepared) = fixture
+        .ns
+        .snapshot(vec![fixture.keys.inode(1)])
+        .await
+        .unwrap();
+    let lifecycle = Lifecycle::new(fixture.backend.clone(), fixture.keys.clone());
+    fixture.backend.set_time(1100).unwrap();
+    lifecycle.renew(&fixture.ns.session, 2000).await.unwrap();
+    prepared.validate_read(true).await.unwrap();
+    assert_eq!(prepared.now_ns(), 1100);
+    fixture.backend.set_time(3100).unwrap();
+    assert_eq!(prepared.validate_read(true).await, Err(EntityError::Fenced));
+}
+
+#[tokio::test]
+async fn empty_directory_scan_rechecks_ancestor_permissions() {
+    let mut lower = MemoryLower::empty();
+    add_directory(&mut lower, 1, b"parent", 2, 0o777);
+    add_directory(&mut lower, 2, b"empty", 3, 0o777);
+    let backend = Arc::new(PausingBackend::new());
+    let fixture = attach(
+        backend.clone(),
+        Arc::new(lower),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+    backend.pause_after_read(fixture.keys.dentry_prefix(3));
+    let ns = fixture.ns.clone();
+    let pending = tokio::spawn(async move { ns.readdir(3, &user(2000)).await });
+    backend.entered().await;
+    fixture.ns.chmod(2, 0o700, root()).await.unwrap();
+    backend.resume();
+    assert_eq!(pending.await.unwrap(), Err(EntityError::Permission));
 }
 
 #[tokio::test]
@@ -1429,7 +1618,7 @@ async fn stale_dentry_hint_fetches_actual_target_and_its_current_permissions() {
         fixture.ns.open(1, b"file", 4, &user(2000)).await,
         Err(EntityError::Permission)
     ));
-    backend.assert_requests(2, 1);
+    backend.assert_requests(2, 0);
     assert_eq!(
         fixture.ns.getattr(first.ino, &root()).await.unwrap().nlink,
         0
@@ -1444,7 +1633,7 @@ async fn stale_dentry_hint_fetches_actual_target_and_its_current_permissions() {
         .unwrap();
     assert_eq!(inode.ino, replacement.ino);
     assert_eq!(handle.ino(), replacement.ino);
-    backend.assert_requests(1, 1);
+    backend.assert_requests(2, 0);
     fixture.ns.close(handle).unwrap();
 }
 
@@ -1700,42 +1889,8 @@ async fn redis_entity_namespace_contract() {
         )
         .await;
         assert_eq!(fixture.ns.lookup(1, b"base", &root()).await.unwrap().ino, 2);
-        let barrier = Arc::new(Barrier::new(33));
-        let mut tasks = Vec::new();
-        for _ in 0..32 {
-            let ns = fixture.ns.clone();
-            let barrier = barrier.clone();
-            tasks.push(tokio::spawn(async move {
-                barrier.wait().await;
-                ns.create(request(1, b"exclusive", EntityKind::File), root())
-                    .await
-            }));
-        }
-        barrier.wait().await;
-        // Join every task before asserting, so cleanup never races unfinished
-        // test writers if one of the outcomes was unexpected.
-        let results = futures::future::join_all(tasks).await;
-        let mut winners = Vec::new();
-        let mut exists = 0;
-        for result in results {
-            match result.unwrap() {
-                Ok(inode) => winners.push(inode),
-                Err(EntityError::Exists) => exists += 1,
-                other => panic!("unexpected Redis O_EXCL outcome: {other:?}"),
-            }
-        }
-        assert_eq!(winners.len(), 1);
-        assert_eq!(exists, 31);
-        let ino = winners[0].ino;
-        assert_eq!(
-            fixture
-                .ns
-                .lookup(1, b"exclusive", &root())
-                .await
-                .unwrap()
-                .ino,
-            ino
-        );
+        mount_contract(backend.clone(), volume).await;
+        let ino = exclusive_creates(fixture.ns.clone(), false).await.ino;
         fixture
             .ns
             .link(ino, 1, b"alias".to_vec(), root())
@@ -1859,7 +2014,6 @@ async fn redis_entity_namespace_contract() {
                 key: key.clone(),
                 expected: Some(value.clone()),
             }],
-            None,
             None,
         )?;
         let checks = rows

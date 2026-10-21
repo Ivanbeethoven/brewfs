@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+#[cfg(test)]
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -46,18 +47,6 @@ pub struct WriteOutcome {
     pub size: u64,
 }
 
-/// The existing VFS handle path can dispatch through this interface without
-/// manufacturing legacy slices or a workspace-wide read generation.
-#[async_trait]
-pub trait EntityFileIo: Send + Sync {
-    fn ino(&self) -> i64;
-    async fn attr(&self) -> Result<EntityInode>;
-    async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>>;
-    async fn write(&self, offset: u64, data: Bytes, append: bool) -> Result<WriteOutcome>;
-    async fn truncate(&self, size: u64) -> Result<EntityInode>;
-    async fn fsync(&self) -> Result<()>;
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct DataConfig {
     chunk_size: u64,
@@ -79,11 +68,6 @@ pub struct EntityData<B, L, O> {
     chunk_size: u64,
     config_key: Vec<u8>,
     config_bytes: Vec<u8>,
-}
-
-struct BoundFile<B, L, O> {
-    data: Arc<EntityData<B, L, O>>,
-    handle: Arc<EntityHandle>,
 }
 
 struct UploadedRange {
@@ -162,14 +146,6 @@ where
         Err(EntityError::Busy)
     }
 
-    pub fn bind(self: &Arc<Self>, handle: Arc<EntityHandle>) -> Result<Arc<dyn EntityFileIo>> {
-        self.namespace.validate_handle(&handle, 0)?;
-        Ok(Arc::new(BoundFile {
-            data: self.clone(),
-            handle,
-        }))
-    }
-
     async fn snapshot(
         &self,
         ino: i64,
@@ -178,13 +154,15 @@ where
         let mut keys = vec![
             self.namespace.keys.inode(ino),
             self.namespace.keys.truncate(ino),
+            self.config_key.clone(),
         ];
         keys.extend(extra);
-        let (authority, mut rows) = self.namespace.snapshot(keys).await?;
-        rows.add(RowCheck {
-            key: self.config_key.clone(),
-            expected: Some(self.config_bytes.clone()),
-        })?;
+        let (authority, rows) = self.namespace.snapshot(keys).await?;
+        if rows.observed(&self.config_key).and_then(Option::as_deref)
+            != Some(self.config_bytes.as_slice())
+        {
+            return Err(EntityError::Fenced);
+        }
         Ok((authority, rows))
     }
 
@@ -308,16 +286,16 @@ where
         let _admission = self.namespace.session.admit()?;
         let _guard = self.namespace.lock_inode(ino).await;
         for _ in 0..MAX_RETRIES {
-            let (authority, mut rows) = self.snapshot(ino, Vec::new()).await?;
-            let inode = self.inode(ino, &mut rows).await?;
-            if self
-                .namespace
-                .backend
-                .commit(&authority, &rows.read_plan())
-                .await?
-                == CommitOutcome::Committed
-            {
-                return Ok(inode);
+            let result = async {
+                let (_, mut rows) = self.snapshot(ino, Vec::new()).await?;
+                let inode = self.inode(ino, &mut rows).await?;
+                rows.validate_read(false).await?;
+                Ok(inode)
+            }
+            .await;
+            match result {
+                Err(EntityError::Conflict) => continue,
+                result => return result,
             }
         }
         Err(EntityError::Busy)
@@ -688,174 +666,171 @@ where
 
     async fn read_locked(&self, ino: i64, offset: u64, length: usize) -> Result<Vec<u8>> {
         let _diagnostic = super::diagnostics::Span::start("data.read");
-        let chunk_keys = self.chunk_keys(ino, offset, length);
         for _ in 0..MAX_RETRIES {
-            let mut fetch_visible_chunks = false;
-            let (authority, mut rows) = match self.snapshot(ino, chunk_keys.clone()).await {
-                Err(error) if Self::aggregate_metadata_bound(&error) => {
-                    // A visible truncate cut can leave large tail maps awaiting
-                    // cleanup. Read the inode first when eager prefetch exceeds
-                    // its bound; invisible tail rows must not make EOF fail.
-                    fetch_visible_chunks = true;
-                    self.snapshot(ino, Vec::new()).await?
-                }
-                result => result?,
-            };
-            let inode = self.inode(ino, &mut rows).await?;
-            let length = inode.size.saturating_sub(offset).min(length as u64) as usize;
-            if fetch_visible_chunks {
-                rows.prefetch(self.chunk_keys(ino, offset, length)).await?;
-            }
-            let mut output = vec![0; length];
-            let mut position = offset;
-            let mut pieces = Vec::new();
-            let mut descriptors = BTreeMap::new();
-            let mut maps = Vec::new();
-            let mut ownership_keys = Vec::new();
-            while position < offset + length as u64 {
-                let index = position / self.chunk_size;
-                let count = (self.chunk_size - position % self.chunk_size)
-                    .min(offset + length as u64 - position);
-                let map = self.chunk(&inode, index, &mut rows).await?;
-                for slice_id in map.upper_slices()? {
-                    ownership_keys.extend([
-                        self.namespace.keys.slice(slice_id),
-                        self.namespace.keys.owner(slice_id, ino, index),
-                    ]);
-                }
-                for span in map.clip(position % self.chunk_size, count)? {
-                    if let ChunkSource::Data { slice_id, .. } = span.source {
-                        ownership_keys.push(self.namespace.keys.object_descriptor(slice_id));
-                    }
-                }
-                maps.push((index, count, map));
-                position += count;
-            }
-            // Slice identities depend on decoded maps. Fetch all dependent
-            // ownership/authentication rows in one batch, never per piece.
-            rows.prefetch(ownership_keys).await?;
-            position = offset;
-            for (index, count, map) in maps {
-                let membership = super::ownership::plan_chunk_membership_from_rows(
-                    &self.namespace.keys,
-                    ino,
-                    index,
-                    &map,
-                    &map,
-                    rows.observations(),
-                    None,
-                )?;
-                for check in membership.checks {
-                    rows.add(check)?;
-                }
-                for span in map.clip(position % self.chunk_size, count)? {
-                    if pieces.len() >= MAX_READ_PIECES {
-                        return Err(EntityError::Invalid(
-                            "entity read fragmentation exceeds bound".into(),
-                        ));
-                    }
-                    if let ChunkSource::Data { slice_id, .. } = span.source
-                        && !descriptors.contains_key(&slice_id)
-                    {
-                        let bytes = rows
-                            .raw(self.namespace.keys.object_descriptor(slice_id))
-                            .await?
-                            .ok_or_else(|| {
-                                EntityError::Corrupt(
-                                    "visible slice lacks object authentication".into(),
-                                )
-                            })?;
-                        let descriptor: ObjectDescriptor = codec::decode(&bytes)?;
-                        let ownership: SliceOwnership = codec::decode(
-                            rows.observed(&self.namespace.keys.slice(slice_id))
-                                .and_then(Option::as_deref)
-                                .ok_or_else(|| {
-                                    EntityError::Corrupt("missing validated slice owner".into())
-                                })?,
-                        )?;
-                        if descriptor.namespace_id != self.namespace.keys.namespace_id()
-                            || descriptor.slice_id != slice_id
-                            || descriptor.size != ownership.size
-                            || descriptor.size == 0
-                            || descriptor.size > MAX_IO_BYTES as u64
-                        {
-                            return Err(EntityError::Corrupt(
-                                "invalid entity object descriptor".into(),
-                            ));
-                        }
-                        descriptors.insert(slice_id, descriptor);
-                    }
-                    pieces.push((index * self.chunk_size + span.offset - offset, span));
-                }
-                position += count;
-            }
-            let plan = rows.read_plan();
-            if self.namespace.backend.commit(&authority, &plan).await? == CommitOutcome::Conflict {
-                continue;
-            }
-            // EOF and all-hole reads are complete at this validation point.
-            // There is no transport interval requiring a second validation.
-            if pieces
-                .iter()
-                .all(|(_, span)| matches!(span.source, ChunkSource::Hole))
-            {
-                return Ok(output);
-            }
-            for (destination, span) in pieces {
-                let destination =
-                    usize::try_from(destination).map_err(|_| EntityError::Overflow)?;
-                let count = usize::try_from(span.length).map_err(|_| EntityError::Overflow)?;
-                let target = &mut output[destination..destination + count];
-                match span.source {
-                    ChunkSource::Hole => {}
-                    ChunkSource::LowerRange {
-                        binding_digest,
-                        ino,
-                        file_offset,
-                    } => {
-                        if binding_digest != self.namespace.lower.binding().manifest_digest {
-                            return Err(EntityError::Fenced);
-                        }
-                        let bytes = self
-                            .namespace
-                            .lower
-                            .read_range(ino, file_offset, count)
-                            .await?;
-                        if bytes.len() != count {
-                            return Err(EntityError::Corrupt(
-                                "short authenticated lower read".into(),
-                            ));
-                        }
-                        target.copy_from_slice(&bytes);
-                    }
-                    ChunkSource::Data {
-                        slice_id,
-                        slice_offset,
-                    } => {
-                        let descriptor = descriptors
-                            .get(&slice_id)
-                            .expect("validated object descriptor");
-                        let bytes = self.read_object(descriptor).await?;
-                        let start =
-                            usize::try_from(slice_offset).map_err(|_| EntityError::Overflow)?;
-                        let source = bytes
-                            .get(start..start.checked_add(count).ok_or(EntityError::Overflow)?)
-                            .ok_or_else(|| {
-                                EntityError::Corrupt(
-                                    "slice read exceeds authenticated object".into(),
-                                )
-                            })?;
-                        target.copy_from_slice(source);
-                    }
-                }
-            }
-            // Revalidate after transport too. Old objects remain protected by
-            // the retained handle/admission even if authority expired meanwhile.
-            if self.namespace.backend.commit(&authority, &plan).await? == CommitOutcome::Committed {
-                return Ok(output);
+            match self.read_attempt(ino, offset, length).await {
+                Err(EntityError::Conflict) => continue,
+                result => return result,
             }
         }
         Err(EntityError::Busy)
+    }
+
+    async fn read_attempt(&self, ino: i64, offset: u64, length: usize) -> Result<Vec<u8>> {
+        let chunk_keys = self.chunk_keys(ino, offset, length);
+        let mut fetch_visible_chunks = false;
+        let (_, mut rows) = match self.snapshot(ino, chunk_keys).await {
+            Err(error) if Self::aggregate_metadata_bound(&error) => {
+                // A visible truncate cut can leave large tail maps awaiting
+                // cleanup. Read the inode first when eager prefetch exceeds
+                // its bound; invisible tail rows must not make EOF fail.
+                fetch_visible_chunks = true;
+                self.snapshot(ino, Vec::new()).await?
+            }
+            result => result?,
+        };
+        let inode = self.inode(ino, &mut rows).await?;
+        let length = inode.size.saturating_sub(offset).min(length as u64) as usize;
+        if fetch_visible_chunks {
+            rows.prefetch(self.chunk_keys(ino, offset, length)).await?;
+        }
+        let mut output = vec![0; length];
+        let mut position = offset;
+        let mut pieces = Vec::new();
+        let mut descriptors = BTreeMap::new();
+        let mut maps = Vec::new();
+        let mut ownership_keys = Vec::new();
+        while position < offset + length as u64 {
+            let index = position / self.chunk_size;
+            let count = (self.chunk_size - position % self.chunk_size)
+                .min(offset + length as u64 - position);
+            let map = self.chunk(&inode, index, &mut rows).await?;
+            for slice_id in map.upper_slices()? {
+                ownership_keys.extend([
+                    self.namespace.keys.slice(slice_id),
+                    self.namespace.keys.owner(slice_id, ino, index),
+                ]);
+            }
+            for span in map.clip(position % self.chunk_size, count)? {
+                if let ChunkSource::Data { slice_id, .. } = span.source {
+                    ownership_keys.push(self.namespace.keys.object_descriptor(slice_id));
+                }
+            }
+            maps.push((index, count, map));
+            position += count;
+        }
+        // Slice identities depend on decoded maps. Fetch all dependent
+        // ownership/authentication rows in one batch, never per piece.
+        rows.prefetch(ownership_keys).await?;
+        position = offset;
+        for (index, count, map) in maps {
+            let membership = super::ownership::plan_chunk_membership_from_rows(
+                &self.namespace.keys,
+                ino,
+                index,
+                &map,
+                &map,
+                rows.observations(),
+                None,
+            )?;
+            for check in membership.checks {
+                rows.add(check)?;
+            }
+            for span in map.clip(position % self.chunk_size, count)? {
+                if pieces.len() >= MAX_READ_PIECES {
+                    return Err(EntityError::Invalid(
+                        "entity read fragmentation exceeds bound".into(),
+                    ));
+                }
+                if let ChunkSource::Data { slice_id, .. } = span.source
+                    && !descriptors.contains_key(&slice_id)
+                {
+                    let bytes = rows
+                        .raw(self.namespace.keys.object_descriptor(slice_id))
+                        .await?
+                        .ok_or_else(|| {
+                            EntityError::Corrupt("visible slice lacks object authentication".into())
+                        })?;
+                    let descriptor: ObjectDescriptor = codec::decode(&bytes)?;
+                    let ownership: SliceOwnership = codec::decode(
+                        rows.observed(&self.namespace.keys.slice(slice_id))
+                            .and_then(Option::as_deref)
+                            .ok_or_else(|| {
+                                EntityError::Corrupt("missing validated slice owner".into())
+                            })?,
+                    )?;
+                    if descriptor.namespace_id != self.namespace.keys.namespace_id()
+                        || descriptor.slice_id != slice_id
+                        || descriptor.size != ownership.size
+                        || descriptor.size == 0
+                        || descriptor.size > MAX_IO_BYTES as u64
+                    {
+                        return Err(EntityError::Corrupt(
+                            "invalid entity object descriptor".into(),
+                        ));
+                    }
+                    descriptors.insert(slice_id, descriptor);
+                }
+                pieces.push((index * self.chunk_size + span.offset - offset, span));
+            }
+            position += count;
+        }
+        rows.validate_read(false).await?;
+        // EOF and all-hole reads are complete at this validation point.
+        // There is no transport interval requiring a second validation.
+        if pieces
+            .iter()
+            .all(|(_, span)| matches!(span.source, ChunkSource::Hole))
+        {
+            return Ok(output);
+        }
+        for (destination, span) in pieces {
+            let destination = usize::try_from(destination).map_err(|_| EntityError::Overflow)?;
+            let count = usize::try_from(span.length).map_err(|_| EntityError::Overflow)?;
+            let target = &mut output[destination..destination + count];
+            match span.source {
+                ChunkSource::Hole => {}
+                ChunkSource::LowerRange {
+                    binding_digest,
+                    ino,
+                    file_offset,
+                } => {
+                    if binding_digest != self.namespace.lower.binding().manifest_digest {
+                        return Err(EntityError::Fenced);
+                    }
+                    let bytes = self
+                        .namespace
+                        .lower
+                        .read_range(ino, file_offset, count)
+                        .await?;
+                    if bytes.len() != count {
+                        return Err(EntityError::Corrupt(
+                            "short authenticated lower read".into(),
+                        ));
+                    }
+                    target.copy_from_slice(&bytes);
+                }
+                ChunkSource::Data {
+                    slice_id,
+                    slice_offset,
+                } => {
+                    let descriptor = descriptors
+                        .get(&slice_id)
+                        .expect("validated object descriptor");
+                    let bytes = self.read_object(descriptor).await?;
+                    let start = usize::try_from(slice_offset).map_err(|_| EntityError::Overflow)?;
+                    let source = bytes
+                        .get(start..start.checked_add(count).ok_or(EntityError::Overflow)?)
+                        .ok_or_else(|| {
+                            EntityError::Corrupt("slice read exceeds authenticated object".into())
+                        })?;
+                    target.copy_from_slice(source);
+                }
+            }
+        }
+        // Revalidate after transport too. Old objects remain protected by
+        // the retained handle/admission even if authority expired meanwhile.
+        rows.validate_read(true).await?;
+        Ok(output)
     }
 
     async fn read_object(&self, descriptor: &ObjectDescriptor) -> Result<Vec<u8>> {
@@ -1049,35 +1024,6 @@ where
         }))
         .await
         .map_err(|e| EntityError::Backend(format!("owned entity discard failed: {e}")))?
-    }
-}
-
-#[async_trait]
-impl<B, L, O> EntityFileIo for BoundFile<B, L, O>
-where
-    B: EntityBackend + 'static,
-    L: ImmutableLowerData + 'static,
-    O: ObjectBackend + 'static,
-{
-    fn ino(&self) -> i64 {
-        self.handle.ino()
-    }
-    async fn attr(&self) -> Result<EntityInode> {
-        self.data.attr(self.handle.clone()).await
-    }
-    async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
-        self.data.read(self.handle.clone(), offset, length).await
-    }
-    async fn write(&self, offset: u64, data: Bytes, append: bool) -> Result<WriteOutcome> {
-        self.data
-            .write(self.handle.clone(), offset, data, append)
-            .await
-    }
-    async fn truncate(&self, size: u64) -> Result<EntityInode> {
-        self.data.truncate(self.handle.clone(), size).await
-    }
-    async fn fsync(&self) -> Result<()> {
-        self.data.fsync(self.handle.clone()).await
     }
 }
 

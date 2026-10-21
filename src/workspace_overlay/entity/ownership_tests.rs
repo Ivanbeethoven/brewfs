@@ -2,7 +2,8 @@ use super::*;
 use crate::workspace_overlay::entity::{
     backend::{CommitOutcome, MemoryEntityBackend},
     codec::encode,
-    model::{ChunkSource, EntityInode, EntityKind, LowerBinding},
+    model::{ChunkSource, EntityInode, EntityKind, LowerBinding, UpperInode},
+    recovery::Recovery,
 };
 
 struct Fixture {
@@ -152,7 +153,7 @@ async fn durable_receipt_publishes_pending_owner_and_membership_in_one_transacti
         .unwrap();
     let id = token.slice_id();
     let pending = RowCheck {
-        key: token.pending_key.clone(),
+        key: fixture.keys.slice(token.slice_id()),
         expected: Some(token.pending_bytes.clone()),
     };
     let receipt = token.confirm_durable_put();
@@ -620,6 +621,7 @@ async fn cross_namespace_missing_membership_and_underflow_fail_without_map_chang
 #[tokio::test]
 async fn orphan_cleanup_advances_with_memberships_and_is_idempotent() {
     let fixture = Fixture::new().await;
+    let recovery = Recovery::new(fixture.backend.clone(), fixture.keys.clone());
     let id = fixture.seed_available_slice().await;
     let holes = ChunkMap::holes(16).unwrap();
     let data = map(id);
@@ -685,13 +687,7 @@ async fn orphan_cleanup_advances_with_memberships_and_is_idempotent() {
     assert_eq!(fixture.row(id).await.current_refs, 2);
     drop(open_handle);
     let maintenance = task.await.unwrap().unwrap();
-    assert!(
-        !fixture
-            .ownership
-            .recover_orphan_step(&maintenance, 3)
-            .await
-            .unwrap()
-    );
+    assert!(!recovery.recover_orphan_step(&maintenance, 3).await.unwrap());
     assert_eq!(fixture.row(id).await.current_refs, 1);
     let cursor: OrphanRecord = decode(
         fixture
@@ -705,29 +701,11 @@ async fn orphan_cleanup_advances_with_memberships_and_is_idempotent() {
     )
     .unwrap();
     assert_eq!(cursor.cleanup_chunk, 1);
-    assert!(
-        !fixture
-            .ownership
-            .recover_orphan_step(&maintenance, 3)
-            .await
-            .unwrap()
-    );
+    assert!(!recovery.recover_orphan_step(&maintenance, 3).await.unwrap());
     assert_eq!(fixture.row(id).await.current_refs, 0);
     assert!(fixture.row(id).await.retirement_hold);
-    assert!(
-        fixture
-            .ownership
-            .recover_orphan_step(&maintenance, 3)
-            .await
-            .unwrap()
-    );
-    assert!(
-        fixture
-            .ownership
-            .recover_orphan_step(&maintenance, 3)
-            .await
-            .unwrap()
-    );
+    assert!(recovery.recover_orphan_step(&maintenance, 3).await.unwrap());
+    assert!(recovery.recover_orphan_step(&maintenance, 3).await.unwrap());
     assert_eq!(
         fixture
             .backend

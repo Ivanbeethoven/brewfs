@@ -18,7 +18,10 @@ use crate::meta::posix_acl::{ACCESS_XATTR, DEFAULT_XATTR, PosixAcl};
 
 use super::{
     EntityError, Result,
-    backend::{CommitOutcome, EntityBackend, EntityPlan, RowCheck, RowWrite, TransactionAuthority},
+    backend::{
+        CommitOutcome, CreateAllocation, EntityBackend, EntityPlan, RowCheck, RowWrite,
+        TransactionAuthority,
+    },
     codec,
     keys::EntityKeys,
     lifecycle::{Lifecycle, OperationGuard, WriterSession},
@@ -30,10 +33,6 @@ const MAX_RETRIES: usize = 16;
 const MAX_ANCESTORS: usize = 256;
 const MAX_DIRECTORY_ROWS: usize = 4096;
 
-#[path = "namespace_create.rs"]
-mod create_ops;
-#[path = "namespace_mount.rs"]
-mod mount_ops;
 #[path = "namespace_snapshot.rs"]
 mod snapshot;
 
@@ -101,8 +100,22 @@ pub(super) struct InodeGuard {
     _guard: OwnedMutexGuard<()>,
 }
 
-#[derive(Clone)]
-enum Operation {
+enum Target {
+    Inode(i64),
+    Name(i64, Vec<u8>),
+}
+
+enum Request {
+    Create(CreateRequest, Option<u32>),
+    Stat(Target),
+    Access {
+        ino: i64,
+        mask: u32,
+    },
+    Open(Target, u32),
+    Readdir {
+        ino: i64,
+    },
     Link {
         ino: i64,
         parent: i64,
@@ -131,6 +144,96 @@ enum Operation {
     },
 }
 
+enum Reply {
+    Done,
+    Inode(EntityInode),
+    Open(EntityInode, EntityHandle),
+    Directory(Vec<(Vec<u8>, EntityInode)>),
+    Create(CreateAllocation),
+}
+
+impl Reply {
+    fn inode(self) -> EntityInode {
+        let Self::Inode(inode) = self else {
+            unreachable!("inode request reply")
+        };
+        inode
+    }
+    fn open(self) -> (EntityInode, EntityHandle) {
+        let Self::Open(inode, handle) = self else {
+            unreachable!("open request reply")
+        };
+        (inode, handle)
+    }
+    fn directory(self) -> Vec<(Vec<u8>, EntityInode)> {
+        let Self::Directory(entries) = self else {
+            unreachable!("directory request reply")
+        };
+        entries
+    }
+}
+
+impl Request {
+    fn ids(&self) -> BTreeSet<i64> {
+        match self {
+            Self::Create(request, _) => BTreeSet::from([request.parent]),
+            Self::Stat(Target::Inode(ino))
+            | Self::Access { ino, .. }
+            | Self::Open(Target::Inode(ino), _)
+            | Self::Readdir { ino }
+            | Self::Chmod { ino, .. }
+            | Self::Xattr { ino, .. } => BTreeSet::from([*ino]),
+            Self::Stat(Target::Name(parent, _))
+            | Self::Open(Target::Name(parent, _), _)
+            | Self::Unlink { parent, .. } => BTreeSet::from([*parent]),
+            Self::Link { ino, parent, .. } => BTreeSet::from([*ino, *parent]),
+            Self::Rename {
+                parent,
+                destination,
+                ..
+            } => BTreeSet::from([*parent, *destination]),
+        }
+    }
+
+    fn paths(&self) -> Vec<(i64, &[u8])> {
+        match self {
+            Self::Create(request, _) => vec![(request.parent, &request.name)],
+            Self::Stat(Target::Name(parent, name))
+            | Self::Open(Target::Name(parent, name), _)
+            | Self::Link { parent, name, .. }
+            | Self::Unlink { parent, name, .. } => vec![(*parent, name)],
+            Self::Rename {
+                parent,
+                name,
+                destination,
+                new_name,
+                ..
+            } => vec![(*parent, name), (*destination, new_name)],
+            _ => Vec::new(),
+        }
+    }
+
+    fn open_access(&self) -> Option<u32> {
+        match self {
+            Self::Create(_, access) => *access,
+            Self::Open(_, access) => Some(*access),
+            _ => None,
+        }
+    }
+
+    fn mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::Create(..)
+                | Self::Link { .. }
+                | Self::Unlink { .. }
+                | Self::Rename { .. }
+                | Self::Chmod { .. }
+                | Self::Xattr { .. }
+        )
+    }
+}
+
 pub(super) struct Prepared<'a, B, L> {
     ns: &'a EntityNamespace<B, L>,
     rows: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
@@ -138,6 +241,8 @@ pub(super) struct Prepared<'a, B, L> {
     now: i64,
     bytes: usize,
     inodes: BTreeMap<i64, EntityInode>,
+    /// Every observation was checked together by the latest atomic read.
+    read_covered: bool,
 }
 
 impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B, L> {
@@ -207,27 +312,19 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         Ok(handle.ino)
     }
 
-    async fn lock_all(
-        &self,
-        ids: &BTreeSet<i64>,
-    ) -> (Vec<Arc<InodeLock>>, Vec<OwnedMutexGuard<()>>) {
+    async fn lock_all(&self, ids: &BTreeSet<i64>) -> Vec<InodeGuard> {
         let _diagnostic = super::diagnostics::Span::start("namespace.lock_wait");
-        let states: Vec<_> = ids.iter().map(|ino| self.inode_lock(*ino)).collect();
-        let mut guards = Vec::with_capacity(states.len());
-        for state in &states {
-            guards.push(state.mutex.clone().lock_owned().await);
+        let mut guards = Vec::with_capacity(ids.len());
+        for ino in ids {
+            guards.push(self.lock_inode(*ino).await);
         }
-        (states, guards)
+        guards
     }
 
-    async fn run(
-        self: &Arc<Self>,
-        operation: Operation,
-        credentials: Credentials,
-    ) -> Result<Option<EntityInode>> {
+    async fn run(self: &Arc<Self>, request: Request, credentials: Credentials) -> Result<Reply> {
         let this = self.clone();
         tokio::spawn(super::diagnostics::inherit(async move {
-            this.execute(operation, credentials).await
+            this.execute(request, credentials).await
         }))
         .await
         .map_err(|e| EntityError::Backend(format!("owned namespace task failed: {e}")))?
@@ -238,15 +335,27 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         request: CreateRequest,
         credentials: Credentials,
     ) -> Result<EntityInode> {
-        let this = self.clone();
-        tokio::spawn(super::diagnostics::inherit(async move {
-            let _admission = this.session.admit()?;
-            let _guard = this.lock_inode(request.parent).await;
-            this.create_locked(&request, &credentials).await
-        }))
-        .await
-        .map_err(|e| EntityError::Backend(format!("owned create task failed: {e}")))?
+        self.run(Request::Create(request, None), credentials)
+            .await
+            .map(Reply::inode)
     }
+
+    /// Retain the parent lock until the newly committed inode's handle exists.
+    /// Creation grants the requested access even when its mode denies later opens.
+    pub async fn create_open(
+        self: &Arc<Self>,
+        request: CreateRequest,
+        credentials: Credentials,
+        access: u32,
+    ) -> Result<(EntityInode, EntityHandle)> {
+        if request.kind != EntityKind::File || access == 0 || access & !6 != 0 {
+            return Err(EntityError::Invalid("invalid create-open request".into()));
+        }
+        self.run(Request::Create(request, Some(access)), credentials)
+            .await
+            .map(Reply::open)
+    }
+
     pub async fn link(
         self: &Arc<Self>,
         ino: i64,
@@ -254,10 +363,11 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         name: Vec<u8>,
         credentials: Credentials,
     ) -> Result<()> {
-        self.run(Operation::Link { ino, parent, name }, credentials)
+        self.run(Request::Link { ino, parent, name }, credentials)
             .await
             .map(|_| ())
     }
+
     pub async fn unlink(
         self: &Arc<Self>,
         parent: i64,
@@ -266,7 +376,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         credentials: Credentials,
     ) -> Result<()> {
         self.run(
-            Operation::Unlink {
+            Request::Unlink {
                 parent,
                 name,
                 directory,
@@ -276,6 +386,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         .await
         .map(|_| ())
     }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn rename(
         self: &Arc<Self>,
@@ -287,7 +398,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         credentials: Credentials,
     ) -> Result<()> {
         self.run(
-            Operation::Rename {
+            Request::Rename {
                 parent,
                 name,
                 destination,
@@ -299,16 +410,18 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         .await
         .map(|_| ())
     }
+
     pub async fn chmod(
         self: &Arc<Self>,
         ino: i64,
         mode: u32,
         credentials: Credentials,
     ) -> Result<()> {
-        self.run(Operation::Chmod { ino, mode }, credentials)
+        self.run(Request::Chmod { ino, mode }, credentials)
             .await
             .map(|_| ())
     }
+
     pub async fn set_xattr(
         self: &Arc<Self>,
         ino: i64,
@@ -316,7 +429,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         value: Option<Vec<u8>>,
         credentials: Credentials,
     ) -> Result<()> {
-        self.run(Operation::Xattr { ino, name, value }, credentials)
+        self.run(Request::Xattr { ino, name, value }, credentials)
             .await
             .map(|_| ())
     }
@@ -327,25 +440,15 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         name: &[u8],
         credentials: &Credentials,
     ) -> Result<EntityInode> {
-        let _admission = self.session.admit()?;
-        for _ in 0..MAX_RETRIES {
-            let keys = self.path_keys(parent, name).await?;
-            let (authority, mut p) = self.snapshot(keys).await?;
-            let result = async {
-                p.parent(parent, credentials, 1).await?;
-                let (ino, _) = p.dentry(parent, name).await?.ok_or(EntityError::NotFound)?;
-                p.inode(ino).await
-            }
-            .await;
-            if self.backend.commit(&authority, &p.read_plan()).await? == CommitOutcome::Committed {
-                return result;
-            }
-        }
-        Err(EntityError::Busy)
+        self.execute(
+            Request::Stat(Target::Name(parent, name.to_vec())),
+            credentials.clone(),
+        )
+        .await
+        .map(Reply::inode)
     }
 
-    /// Explicit noatime. The final read predicate validation has no writes.
-    /// O_TRUNC is a separate EntityData truncate operation after authorized open.
+    /// Noatime open; path and inode opens validate an operation-local read view.
     pub async fn open(
         &self,
         parent: i64,
@@ -358,8 +461,6 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
             .map(|(_, handle)| handle)
     }
 
-    /// Return the attributes authorized by the same validation as the handle.
-    /// FUSE create fallback can use these without starting a second attr read.
     pub async fn open_with_attr(
         &self,
         parent: i64,
@@ -367,76 +468,55 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         access: u32,
         credentials: &Credentials,
     ) -> Result<(EntityInode, EntityHandle)> {
-        if access == 0 || access & !7 != 0 {
-            return Err(EntityError::Invalid("invalid open access mask".into()));
-        }
-        let admission = self.session.admit()?;
-        for _ in 0..MAX_RETRIES {
-            let keys = self.path_keys(parent, name).await?;
-            let (authority, mut p) = self.snapshot(keys).await?;
-            let discovered = async {
-                p.parent(parent, credentials, 1).await?;
-                p.dentry_row(parent, name)
-                    .await?
-                    .ok_or(EntityError::NotFound)
-            }
-            .await;
-            let discovered = match discovered {
-                Ok((ino, _)) => ino,
-                Err(error) => {
-                    if self.backend.commit(&authority, &p.read_plan()).await?
-                        == CommitOutcome::Conflict
-                    {
-                        continue;
-                    }
-                    return Err(error);
-                }
-            };
-            let state = self.inode_lock(discovered);
-            let _guard = state.mutex.lock().await;
-            let result = async {
-                // Keep discovery's exact parent/name observations through lock
-                // acquisition. Changed permissions or names conflict below.
-                p.prefetch(vec![
-                    self.keys.inode(discovered),
-                    self.keys.xattr(discovered, ACCESS_XATTR),
-                ])
-                .await?;
-                let (ino, kind) = p.dentry(parent, name).await?.ok_or(EntityError::NotFound)?;
-                if ino != discovered {
-                    return Err(EntityError::Conflict);
-                }
-                if kind != EntityKind::File {
-                    return Err(EntityError::Unsupported(
-                        "reference open supports regular files",
-                    ));
-                }
-                let inode = p.inode(ino).await?;
-                p.access(&inode, credentials, access).await?;
-                Ok(inode)
-            }
-            .await;
-            if matches!(result, Err(EntityError::Conflict)) {
-                continue;
-            }
-            if self.backend.commit(&authority, &p.read_plan()).await? == CommitOutcome::Committed {
-                let inode = result?;
-                state.handles.fetch_add(1, Ordering::AcqRel);
-                let handle = EntityHandle {
-                    ino: inode.ino,
-                    namespace: self.keys.prefix().to_vec(),
-                    access,
-                    state: state.clone(),
-                    _admission: admission,
-                };
-                return Ok((inode, handle));
-            }
-        }
-        Err(EntityError::Busy)
+        self.execute(
+            Request::Open(Target::Name(parent, name.to_vec()), access),
+            credentials.clone(),
+        )
+        .await
+        .map(Reply::open)
     }
 
-    /// Linked close is local bookkeeping. Unlinked inodes remain durable orphans
-    /// for the ownership recovery walker; close never silently drops their data.
+    /// Kernel lookup already checked ancestor search; check current inode access.
+    pub async fn open_inode(
+        &self,
+        ino: i64,
+        access: u32,
+        credentials: &Credentials,
+    ) -> Result<EntityHandle> {
+        self.execute(
+            Request::Open(Target::Inode(ino), access),
+            credentials.clone(),
+        )
+        .await
+        .map(|reply| reply.open().1)
+    }
+
+    pub async fn getattr(&self, ino: i64, credentials: &Credentials) -> Result<EntityInode> {
+        self.execute(Request::Stat(Target::Inode(ino)), credentials.clone())
+            .await
+            .map(Reply::inode)
+    }
+
+    pub async fn access(&self, ino: i64, mask: u32, credentials: &Credentials) -> Result<()> {
+        if mask & !7 != 0 {
+            return Err(EntityError::Invalid("invalid access mask".into()));
+        }
+        self.execute(Request::Access { ino, mask }, credentials.clone())
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn readdir(
+        &self,
+        ino: i64,
+        credentials: &Credentials,
+    ) -> Result<Vec<(Vec<u8>, EntityInode)>> {
+        self.execute(Request::Readdir { ino }, credentials.clone())
+            .await
+            .map(Reply::directory)
+    }
+
+    /// Linked close is local. Unlinked data remains a durable recovery obligation.
     pub fn close(&self, handle: EntityHandle) -> Result<()> {
         if handle.namespace != self.keys.prefix() {
             return Err(EntityError::Invalid("foreign handle".into()));
@@ -445,91 +525,137 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         Ok(())
     }
 
-    async fn execute(
+    fn execute(
         &self,
-        op: Operation,
+        request: Request,
         credentials: Credentials,
-    ) -> Result<Option<EntityInode>> {
-        let _admission = self.session.admit()?;
-        for _ in 0..MAX_RETRIES {
-            let mut discovery = Prepared::new(self);
-            let dentries = match &op {
-                Operation::Unlink { parent, name, .. } => vec![self.keys.dentry(*parent, name)],
-                Operation::Rename {
-                    parent,
-                    name,
-                    destination,
-                    new_name,
-                    ..
-                } => vec![
-                    self.keys.dentry(*parent, name),
-                    self.keys.dentry(*destination, new_name),
-                ],
-                _ => Vec::new(),
-            };
-            discovery.prefetch(dentries).await?;
-            let mut ids = BTreeSet::new();
-            match &op {
-                Operation::Link { ino, parent, .. } => {
-                    ids.extend([*ino, *parent]);
-                }
-                Operation::Unlink { parent, name, .. } => {
-                    ids.insert(*parent);
-                    if let Some((ino, _)) = discovery.dentry_row(*parent, name).await? {
-                        ids.insert(ino);
-                    }
-                }
-                Operation::Rename {
-                    parent,
-                    name,
-                    destination,
-                    new_name,
-                    ..
-                } => {
-                    ids.extend([*parent, *destination]);
-                    for (p, n) in [(*parent, name), (*destination, new_name)] {
-                        if let Some((ino, _)) = discovery.dentry_row(p, n).await? {
-                            ids.insert(ino);
+    ) -> impl std::future::Future<Output = Result<Reply>> + Send + '_ {
+        Box::pin(async move {
+            if request
+                .open_access()
+                .is_some_and(|access| access == 0 || access & !7 != 0)
+            {
+                return Err(EntityError::Invalid("invalid open access mask".into()));
+            }
+            let admission = self.session.admit()?;
+            let named = matches!(
+                request,
+                Request::Open(Target::Name(..), _)
+                    | Request::Unlink { .. }
+                    | Request::Rename { .. }
+            );
+            for _ in 0..MAX_RETRIES {
+                let mut ids = request.ids();
+                let mut _guards =
+                    if named || matches!(request, Request::Stat(_) | Request::Access { .. }) {
+                        Vec::new()
+                    } else {
+                        self.lock_all(&ids).await
+                    };
+                let keys = self.operation_keys(&request, &ids).await?;
+                let (authority, mut p) = self.snapshot(keys).await?;
+                let outcome = async {
+                    if named {
+                        // Names select actual lock identities from this same view.
+                        // Preserve those observations through lock acquisition.
+                        if let Request::Open(Target::Name(parent, _), _) = &request {
+                            p.parent(*parent, &credentials, 1).await?;
+                            ids.clear();
                         }
+                        for (parent, name) in request.paths() {
+                            if let Some((ino, _)) = p.dentry_row(parent, name).await? {
+                                ids.insert(ino);
+                            }
+                        }
+                        _guards = self.lock_all(&ids).await;
+                        p.read_covered = false;
+                        p.prefetch(self.operation_keys(&request, &ids).await?)
+                            .await?;
                     }
+                    p.prepare(&request, &credentials, &ids).await
                 }
-                Operation::Chmod { ino, .. } | Operation::Xattr { ino, .. } => {
-                    ids.insert(*ino);
-                }
-            }
-            let (_states, _guards) = self.lock_all(&ids).await;
-            let keys = self.operation_keys(&op, &ids).await?;
-            let (authority, mut p) = self.snapshot(keys).await?;
-            // Name discovery selected locks. Retain those exact predicates;
-            // changing a name before the locks were acquired forces a retry.
-            for (key, expected) in discovery.rows {
-                p.add(RowCheck { key, expected })?;
-            }
-            let outcome = p.prepare(&op, &credentials, &ids).await;
-            let outcome = match outcome {
-                Err(EntityError::Conflict) => continue,
-                Err(error @ EntityError::Backend(_)) => return Err(error),
-                Err(error) => {
-                    // A denial/corruption decision prepared from several reads
-                    // must itself be stable; conflicting inputs are recalculated.
-                    if self.backend.commit(&authority, &p.read_plan()).await?
-                        == CommitOutcome::Conflict
-                    {
-                        continue;
+                .await;
+                let reply = match outcome {
+                    Err(EntityError::Conflict) => continue,
+                    Err(error @ EntityError::Backend(_)) => return Err(error),
+                    Err(error) => {
+                        // Denials also need a stable view. Never publish partially
+                        // prepared writes when validation found an error.
+                        if request.mutation() {
+                            if self.backend.commit(&authority, &p.read_plan()).await?
+                                == CommitOutcome::Conflict
+                            {
+                                continue;
+                            }
+                        } else {
+                            match p.validate_read(false).await {
+                                Ok(()) => {}
+                                Err(EntityError::Conflict) => continue,
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
+                    Ok(reply) => reply,
+                };
+                let reply = match reply {
+                    Reply::Create(create) => {
+                        let Some(ino) = self
+                            .backend
+                            .commit_with_inode_allocation(&authority, &p.plan(), &create)
+                            .await?
+                        else {
+                            continue;
+                        };
+                        let mut inode = create.inode;
+                        inode.ino = ino;
+                        if inode.kind == EntityKind::Directory {
+                            self.directory_hints
+                                .insert(ino, inode.parent_hint.expect("created parent"));
+                        }
+                        let Request::Create(request, _) = &request else {
+                            unreachable!("create request")
+                        };
+                        self.dentry_hints
+                            .insert((request.parent, request.name.clone()), ino);
+                        Reply::Inode(inode)
+                    }
+                    reply => {
+                        if request.mutation() {
+                            if self.backend.commit(&authority, &p.plan()).await?
+                                == CommitOutcome::Conflict
+                            {
+                                continue;
+                            }
+                        } else {
+                            match p.validate_read(false).await {
+                                Ok(()) => {}
+                                Err(EntityError::Conflict) => continue,
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        reply
+                    }
+                };
+                if let Some(access) = request.open_access() {
+                    let inode = reply.inode();
+                    let state = self.inode_lock(inode.ino);
+                    state.handles.fetch_add(1, Ordering::AcqRel);
+                    let handle = EntityHandle {
+                        ino: inode.ino,
+                        namespace: self.keys.prefix().to_vec(),
+                        access,
+                        state,
+                        _admission: admission,
+                    };
+                    return Ok(Reply::Open(inode, handle));
                 }
-                Ok(outcome) => outcome,
-            };
-            match self.backend.commit(&authority, &p.plan()).await? {
-                CommitOutcome::Committed => return Ok(outcome),
-                CommitOutcome::Conflict => continue,
+                return Ok(reply);
             }
-        }
-        Err(EntityError::Busy)
+            Err(EntityError::Busy)
+        })
     }
 }
-
 impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B, L> {
     fn new(ns: &'a EntityNamespace<B, L>) -> Self {
         Self {
@@ -539,6 +665,7 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
             now: 0,
             bytes: 0,
             inodes: BTreeMap::new(),
+            read_covered: false,
         }
     }
     pub(super) async fn raw(&mut self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
@@ -558,27 +685,19 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
         Ok(())
     }
     pub(super) fn plan(&self) -> EntityPlan {
-        EntityPlan {
-            checks: self
-                .rows
-                .iter()
-                .map(|(key, expected)| RowCheck {
+        let mut plan = self.read_plan();
+        plan.writes = self
+            .writes
+            .iter()
+            .map(|(key, value)| match value {
+                Some(value) => RowWrite::Put {
                     key: key.clone(),
-                    expected: expected.clone(),
-                })
-                .collect(),
-            writes: self
-                .writes
-                .iter()
-                .map(|(key, value)| match value {
-                    Some(value) => RowWrite::Put {
-                        key: key.clone(),
-                        value: value.clone(),
-                    },
-                    None => RowWrite::Delete { key: key.clone() },
-                })
-                .collect(),
-        }
+                    value: value.clone(),
+                },
+                None => RowWrite::Delete { key: key.clone() },
+            })
+            .collect();
+        plan
     }
     pub(super) fn read_plan(&self) -> EntityPlan {
         EntityPlan {
@@ -727,6 +846,20 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
             Err(EntityError::Permission)
         }
     }
+    async fn authorize_open(
+        &mut self,
+        inode: &EntityInode,
+        c: &Credentials,
+        access: u32,
+    ) -> Result<()> {
+        if inode.kind != EntityKind::File {
+            return Err(EntityError::Unsupported("open requires a regular file"));
+        }
+        if inode.nlink == 0 {
+            return Err(EntityError::NotFound);
+        }
+        self.access(inode, c, access).await
+    }
     async fn parent(&mut self, ino: i64, c: &Credentials, requested: u32) -> Result<EntityInode> {
         let parent = self.inode(ino).await?;
         if parent.kind != EntityKind::Directory {
@@ -797,10 +930,11 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
             Err(EntityError::Conflict)
         }
     }
-    async fn empty_directory(&mut self, ino: i64) -> Result<()> {
+    async fn directory_entries(&mut self, ino: i64) -> Result<Vec<(Vec<u8>, EntityDentry)>> {
         // The directory inode predicate fences the scan: every namespace mutation
         // changes that parent, including deletion/recreation of an existing name.
         self.inode(ino).await?;
+        self.read_covered = false;
         let prefix = self.ns.keys.dentry_prefix(ino);
         let rows = self
             .ns
@@ -821,10 +955,11 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
                 expected: Some(value),
             })?;
         }
-        if resolver::merge_directory(self.ns.lower.as_ref(), self.ns.lower.binding(), ino, &upper)
-            .await?
-            .is_empty()
-        {
+        resolver::merge_directory(self.ns.lower.as_ref(), self.ns.lower.binding(), ino, &upper)
+            .await
+    }
+    async fn empty_directory(&mut self, ino: i64) -> Result<()> {
+        if self.directory_entries(ino).await?.is_empty() {
             Ok(())
         } else {
             Err(EntityError::NotEmpty)
@@ -852,15 +987,157 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
         }
         self.store_inode(inode).await
     }
+    async fn prepare_create(
+        &mut self,
+        r: &CreateRequest,
+        c: &Credentials,
+    ) -> Result<CreateAllocation> {
+        let _diagnostic =
+            crate::workspace_overlay::entity::diagnostics::Span::start("namespace.prepare_create");
+        if r.mode & !0o7777 != 0 {
+            return Err(EntityError::Invalid("invalid create mode".into()));
+        }
+        if matches!(r.kind, EntityKind::CharDevice | EntityKind::BlockDevice) && c.uid != 0 {
+            return Err(EntityError::Permission);
+        }
+        let parent = self.parent(r.parent, c, 3).await?;
+        if self.dentry(r.parent, &r.name).await?.is_some() {
+            return Err(EntityError::Exists);
+        }
+        let default = self
+            .xattr(r.parent, DEFAULT_XATTR)
+            .await?
+            .map(|v| PosixAcl::decode(&v).map_err(|e| EntityError::Corrupt(e.into())))
+            .transpose()?;
+        let inherited = if r.kind == EntityKind::Symlink {
+            None
+        } else {
+            default.as_ref().map(|a| a.inherited_access(r.mode))
+        };
+        let mut mode = inherited
+            .as_ref()
+            .map_or(r.mode & !c.umask, |a| (r.mode & 0o7000) | a.mode_bits());
+        if r.kind == EntityKind::Symlink {
+            mode = 0o777;
+        }
+        if parent.mode & 0o2000 != 0 && r.kind == EntityKind::Directory {
+            mode |= 0o2000;
+        }
+        let gid = if parent.mode & 0o2000 != 0 {
+            parent.gid
+        } else {
+            c.gid
+        };
+        if c.uid != 0 && gid != c.gid && !c.groups.contains(&gid) && r.kind != EntityKind::Directory
+        {
+            mode &= !0o2000;
+        }
+        let inode = EntityInode {
+            // A validated template; the transaction injects the exact allocated
+            // integer without routing IDs through Lua floating-point numbers.
+            ino: 1,
+            kind: r.kind,
+            size: r.symlink_target.as_ref().map_or(0, |v| v.len() as u64),
+            mode,
+            uid: c.uid,
+            gid,
+            rdev: r.rdev,
+            nlink: if r.kind == EntityKind::Directory {
+                2
+            } else {
+                1
+            },
+            atime_ns: self.now,
+            mtime_ns: self.now,
+            ctime_ns: self.now,
+            symlink_target: r.symlink_target.clone(),
+            parent_hint: Some(r.parent),
+            lower_visible_size: 0,
+            data_version: 0,
+        };
+        inode.validate()?;
+        let mut xattrs = Vec::new();
+        if let Some(acl) = inherited.filter(PosixAcl::is_extended) {
+            xattrs.push((ACCESS_XATTR.to_vec(), acl.encode()));
+        }
+        if r.kind == EntityKind::Directory
+            && let Some(acl) = default
+        {
+            xattrs.push((DEFAULT_XATTR.to_vec(), acl.encode()));
+        }
+        self.touch_parent(r.parent, i32::from(r.kind == EntityKind::Directory))
+            .await?;
+        Ok(CreateAllocation {
+            keys: self.ns.keys.clone(),
+            inode,
+            name: r.name.clone(),
+            xattrs,
+            lower_max_ino: self.ns.lower.binding().max_ino,
+        })
+    }
+
     async fn prepare(
         &mut self,
-        op: &Operation,
+        op: &Request,
         c: &Credentials,
         ids: &BTreeSet<i64>,
-    ) -> Result<Option<EntityInode>> {
+    ) -> Result<Reply> {
         let _diagnostic = super::diagnostics::Span::start("namespace.prepare");
         match op {
-            Operation::Link { ino, parent, name } => {
+            Request::Create(request, _) => {
+                return self.prepare_create(request, c).await.map(Reply::Create);
+            }
+            Request::Access { ino, mask } => {
+                let inode = self.inode(*ino).await?;
+                self.access(&inode, c, *mask).await?;
+            }
+            Request::Stat(target) | Request::Open(target, _) => {
+                let ino = match target {
+                    Target::Inode(ino) => *ino,
+                    Target::Name(parent, name) => {
+                        self.parent(*parent, c, 1).await?;
+                        self.dentry(*parent, name)
+                            .await?
+                            .ok_or(EntityError::NotFound)?
+                            .0
+                    }
+                };
+                let inode = self.inode(ino).await?;
+                if let Some(access) = op.open_access() {
+                    Self::require_locked(ids, ino)?;
+                    self.authorize_open(&inode, c, access).await?;
+                }
+                return Ok(Reply::Inode(inode));
+            }
+            Request::Readdir { ino } => {
+                self.parent(*ino, c, 5).await?;
+                let entries = self.directory_entries(*ino).await?;
+                self.prefetch(
+                    entries
+                        .iter()
+                        .map(|(_, entry)| match entry {
+                            EntityDentry::Present { ino, .. } => self.ns.keys.inode(*ino),
+                            EntityDentry::Whiteout => unreachable!("merged directory tombstone"),
+                        })
+                        .collect(),
+                )
+                .await?;
+                let mut output = Vec::with_capacity(entries.len());
+                for (name, entry) in entries {
+                    let EntityDentry::Present { ino, kind } = entry else {
+                        unreachable!("merged directory tombstone")
+                    };
+                    let inode = self.inode(ino).await?;
+                    if inode.kind != kind || inode.nlink == 0 {
+                        return Err(EntityError::Corrupt(
+                            "directory entry disagrees with inode".into(),
+                        ));
+                    }
+                    output.push((name, inode));
+                }
+                return Ok(Reply::Directory(output));
+            }
+            Request::Link { ino, parent, name } => {
                 self.parent(*parent, c, 3).await?;
                 if self.dentry(*parent, name).await?.is_some() {
                     return Err(EntityError::Exists);
@@ -884,7 +1161,7 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
                 self.store_inode(inode).await?;
                 self.touch_parent(*parent, 0).await?;
             }
-            Operation::Unlink {
+            Request::Unlink {
                 parent,
                 name,
                 directory,
@@ -913,7 +1190,7 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
                 self.touch_parent(*parent, if *directory { -1 } else { 0 })
                     .await?;
             }
-            Operation::Rename {
+            Request::Rename {
                 parent,
                 name,
                 destination,
@@ -934,7 +1211,7 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
                     return Err(EntityError::Exists);
                 }
                 if target.is_some_and(|(target, _)| target == ino) {
-                    return Ok(None);
+                    return Ok(Reply::Done);
                 }
                 if kind == EntityKind::Directory {
                     let mut ancestor = *destination;
@@ -994,7 +1271,7 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
                 )
                 .await?;
             }
-            Operation::Chmod { ino, mode } => {
+            Request::Chmod { ino, mode } => {
                 if mode & !0o7777 != 0 {
                     return Err(EntityError::Invalid("invalid chmod mode".into()));
                 }
@@ -1021,7 +1298,7 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
                 }
                 self.store_inode(inode).await?;
             }
-            Operation::Xattr { ino, name, value } => {
+            Request::Xattr { ino, name, value } => {
                 validate_xattr_name(name)?;
                 let mut inode = self.inode(*ino).await?;
                 if !name.starts_with(b"user.") && name != ACCESS_XATTR && name != DEFAULT_XATTR {
@@ -1071,6 +1348,6 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
                 self.store_inode(inode).await?;
             }
         }
-        Ok(None)
+        Ok(Reply::Done)
     }
 }

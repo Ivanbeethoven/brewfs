@@ -567,8 +567,14 @@ async fn orphan_contract<B: EntityBackend>(backend: Arc<B>, keys: EntityKeys) {
         .enter_maintenance(&fixture.session)
         .await
         .unwrap();
+    let recovery = fixture.recovery();
+    let authority = fixture
+        .lifecycle
+        .maintenance_authority(&maintenance)
+        .await
+        .unwrap();
     assert!(matches!(
-        fixture.ownership.recover_orphan_step(&maintenance, 2).await,
+        recovery.orphan_step(&authority, 2).await,
         Err(EntityError::Busy)
     ));
     assert!(matches!(
@@ -578,7 +584,6 @@ async fn orphan_contract<B: EntityBackend>(backend: Arc<B>, keys: EntityKeys) {
             .await,
         Err(EntityError::Busy)
     ));
-    let recovery = fixture.recovery();
     for _ in 0..8 {
         if fixture
             .backend
