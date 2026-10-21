@@ -41,6 +41,12 @@ workspace lease and are unsupported. The adapter advertises only
 multi-node reader access because each node would otherwise start a distinct
 FUSE process.
 
+The lease is acquired by normal BrewFS mount startup and released by its FUSE
+shutdown when `NodeUnstageVolume` unmounts the shared path. If the CSI process
+restarts, persisted PID/reference state lets it reuse a live mount or remove a
+stale mount before retrying lease acquisition; a failed BrewFS lease
+acquisition is returned as a failed stage request.
+
 ## Kubernetes resources
 
 `manifests/` contains:
