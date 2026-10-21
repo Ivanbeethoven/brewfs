@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: brewfs-csi-example
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: brewfs-workspace
+  namespace: brewfs-csi-example
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: brewfs-workspace
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: brewfs-workspace-smoke
+  namespace: brewfs-csi-example
+spec:
+  terminationGracePeriodSeconds: 30
+  containers:
+    - name: smoke
+      image: busybox:1.36
+      command:
+        - sh
+        - -ec
+        - |
+          printf 'brewfs-csi-smoke\n' > /workspace/probe
+          test "$(cat /workspace/probe)" = 'brewfs-csi-smoke'
+          sha256sum /workspace/probe
+          sleep 3600
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+  volumes:
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: brewfs-workspace
