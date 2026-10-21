@@ -19,6 +19,101 @@ struct PackedPermissionView {
     checks: Vec<KvCheck>,
 }
 
+/// The exact post-commit bytes of a packed writer's view keys, as written or
+/// checked by its own last successful commit. The mount is the sole writer
+/// (single active lease, no seal, head never rotates under it), so these are
+/// the store's values unless something outside the mount changed them: lease
+/// renewal, an admin fence or GC. Using them as the next commit's CAS
+/// conditions only removes the pre-read; every condition is still compared
+/// atomically and the live-lease deadline is still enforced at the CAS, so a
+/// stale entry can only fail the CAS (then the commit re-reads), never commit
+/// against state the mount has not validated.
+#[derive(Clone)]
+pub(super) struct CommitViewCache {
+    guard: HeadGuard,
+    binding: PackedLowerBinding,
+    /// `view_keys(..)` + CONTROL, in order.
+    checks: Vec<KvCheck>,
+    layers: [LayerRecord; 2],
+    lease_expires_at_ns: i64,
+    /// Post-commit bytes of the derived keys this writer re-reads every
+    /// commit (head-layer reverse state, extent generation).
+    derived: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+impl CommitViewCache {
+    /// Prefetched points for this request's derived preparation: cached
+    /// derived bytes, and absence for its fresh slices' deletion keys. Every
+    /// one becomes an exact CAS check, so a wrong guess only fails the CAS.
+    fn derived_points(
+        &self,
+        request: &VersionedMutation,
+    ) -> std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+        let mut points = std::collections::BTreeMap::new();
+        for key in derived_prefetch_keys(request) {
+            if let Some(value) = self.derived.get(&key) {
+                points.insert(key, value.clone());
+            } else if key.starts_with(SLICE_DELETION_KEY_PREFIX) {
+                points.insert(key, None);
+            }
+        }
+        points
+    }
+
+    fn matches(&self, guard: &HeadGuard, binding: &PackedLowerBinding) -> bool {
+        &self.guard == guard && &self.binding == binding
+    }
+
+    /// Advance the cache across one committed packet: keys it wrote take
+    /// their new bytes; the head record is the committed one.
+    fn after_commit(mut self, writes: &[KvWrite], head: &LayerRecord) -> Option<Self> {
+        for check in &mut self.checks {
+            if let Some(write) = writes.iter().find(|write| match write {
+                KvWrite::Put { key, .. } | KvWrite::Delete { key } => *key == check.key,
+            }) {
+                check.expected = match write {
+                    KvWrite::Put { value, .. } => Some(value.clone()),
+                    KvWrite::Delete { .. } => None,
+                };
+            }
+        }
+        if self.layers[0].layer_id != head.layer_id {
+            return None;
+        }
+        for (key, value) in &mut self.derived {
+            if let Some(write) = writes.iter().find(|write| match write {
+                KvWrite::Put { key: written, .. } | KvWrite::Delete { key: written } => {
+                    written == key
+                }
+            }) {
+                *value = match write {
+                    KvWrite::Put { value, .. } => Some(value.clone()),
+                    KvWrite::Delete { .. } => None,
+                };
+            }
+        }
+        self.layers[0] = head.clone();
+        Some(self)
+    }
+}
+
+const SLICE_DELETION_KEY_PREFIX: &[u8] = b"packed/v3/native-slice-delete/";
+
+/// `view_keys` positions a cached (sole-writer) commit still compares: the
+/// workspace, head, lease, writer-authority and open records, plus CONTROL
+/// (a schema migration needs no lease). The lower layer, PWB current/claim/
+/// history and recovery rows change only through paths that must hold this
+/// workspace's single live lease; while the lease row is byte-identical and
+/// live (both checked here, the deadline at the CAS), none of them ran. Any
+/// change to a kept row fails the CAS and the retry re-reads and checks all.
+const CACHED_VIEW_CHECKS: [usize; 6] = [0, 1, 3, 8, 9, 11];
+
+/// Derived keys whose final checked bytes the next commit may reuse.
+fn cacheable_derived_key(key: &[u8], head: LayerId) -> bool {
+    key == super::native_slice_deletion::layer_extent_generation_key(head).as_slice()
+        || key == super::native_reverse::state_key(head).as_slice()
+}
+
 fn limits(records: usize) -> KvReadLimits {
     KvReadLimits {
         max_records: records,
@@ -288,22 +383,32 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             ));
         }
         let budget = self.packed_permission_budget()?;
-        let permit = budget
-            .admit(&[(V3BudgetPool::Metadata, OPERATION_BYTES)])
-            .map_err(|error| WorkspaceError::InvalidReadPlan(error.to_string()))?;
         // Refuse oversized owned templates before validation clones keys or
         // row encoding allocates a write list. Include caller Vec capacities.
-        validate_mutation_allocation_bounds(&request)?;
+        let bound = validate_mutation_allocation_bounds(&request)?;
+        let permit = budget
+            .admit(&[(V3BudgetPool::Metadata, bound)])
+            .map_err(|error| WorkspaceError::InvalidReadPlan(error.to_string()))?;
         if request.validate()? != count {
             return Err(WorkspaceError::Fenced);
         }
         let backend = self.backend.clone();
+        let committed_head = self.committed_head.clone();
+        let commit_view = self.commit_view.clone();
         let recovery_owner = packed_admin::capture_mounted_recovery_owner();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let _permit = permit;
-            let store = KvWorkspaceStore::from_arc(backend).with_packed_reader_pin_budget(budget);
+            let mut store =
+                KvWorkspaceStore::from_arc(backend).with_packed_reader_pin_budget(budget);
+            store.commit_view = commit_view;
             let commit = store.commit_packed_versioned_mutation(request, binding, count);
+            let commit = async move {
+                commit.await.map(|(result, head)| {
+                    *committed_head.lock().unwrap() = Some(head);
+                    result
+                })
+            };
             let result = match recovery_owner {
                 Some(owner) => owner.scope(commit).await,
                 None => commit.await,
@@ -320,25 +425,95 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
         request: VersionedMutation,
         binding: PackedLowerBinding,
         count: usize,
-    ) -> Result<MutationResult, WorkspaceError> {
+    ) -> Result<(MutationResult, LayerRecord), WorkspaceError> {
         let mut keys = view_keys(&request.guard, &binding)?;
         keys.push(CONTROL_KEY.to_vec());
+        let view_len = keys.len();
+        // Keys the derived native-reverse/extent preparation will read, known
+        // from the request rows alone. Reading them in this same consistent
+        // view read removes their separate round trips; every one is still a
+        // check in the final CAS, so a concurrent change fails that CAS.
+        keys.extend(derived_prefetch_keys(&request));
+        // Recovery-scoped writers authenticate a token against fresh reads;
+        // they never use the cached view.
+        let cacheable = packed_admin::capture_mounted_recovery_owner().is_none();
         for _ in 0..CAS_MAX_RETRIES {
-            let (values, now) = self
-                .backend
-                .get_many_consistent_with_time_bounded(&keys, limits(keys.len()))
-                .await?;
-            validate_current_control_raw(values.last().and_then(Option::as_deref))?;
-            let view = decode_view(
-                &keys,
-                &values,
-                now,
-                &request.guard,
-                &binding,
-                Arc::as_ptr(&self.backend) as usize,
-                self.packed_reader_pin_budget.get(),
-            )?;
+            let cached = if cacheable {
+                self.commit_view
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .filter(|cache| cache.matches(&request.guard, &binding))
+            } else {
+                None
+            };
+            let from_cache = cached.is_some();
+            // Derived bytes this writer committed earlier (create commits
+            // carry reverse state, extent commits the extent generation);
+            // keep them across commits of the other kind.
+            let mut carried = cached
+                .as_ref()
+                .map(|cache| cache.derived.clone())
+                .unwrap_or_default();
+            let (view, prefetched) = match cached {
+                // No pre-read: the cached post-commit bytes are the CAS
+                // conditions, including the derived points.
+                Some(cache) => {
+                    let points = cache.derived_points(&request);
+                    (
+                        PackedPermissionView {
+                            layers: cache.layers.clone(),
+                            lease: SnapshotLease {
+                                expires_at_ns: cache.lease_expires_at_ns,
+                                ..decode_open_value(
+                                    cache.checks[3]
+                                        .expected
+                                        .as_deref()
+                                        .ok_or(WorkspaceError::Fenced)?,
+                                    VALUE_BYTES,
+                                )?
+                            },
+                            checks: cache.checks,
+                        },
+                        Some(points),
+                    )
+                }
+                None => {
+                    let (all_values, now) = self
+                        .backend
+                        .get_many_consistent_with_time_bounded(&keys, limits(keys.len()))
+                        .await?;
+                    if all_values.len() != keys.len() {
+                        return Err(WorkspaceError::CorruptMetadata(
+                            "short packed mutation view read".into(),
+                        ));
+                    }
+                    let prefetched: std::collections::BTreeMap<_, _> = keys[view_len..]
+                        .iter()
+                        .cloned()
+                        .zip(all_values[view_len..].iter().cloned())
+                        .collect();
+                    let values = &all_values[..view_len];
+                    let keys_view = &keys[..view_len];
+                    validate_current_control_raw(values.last().and_then(Option::as_deref))?;
+                    let view = decode_view(
+                        keys_view,
+                        values,
+                        now,
+                        &request.guard,
+                        &binding,
+                        Arc::as_ptr(&self.backend) as usize,
+                        self.packed_reader_pin_budget.get(),
+                    )?;
+                    (view, Some(prefetched))
+                }
+            };
             if view.layers != request.expected_layers {
+                if from_cache {
+                    // The caller's expected head disagrees with the cache;
+                    // let the fresh read decide.
+                    continue;
+                }
                 return Err(WorkspaceError::Busy);
             }
             let mut head = view.layers[0].clone();
@@ -347,13 +522,42 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             if count != 0 {
                 writes.push(put(keys[1].clone(), &head)?);
             }
-            let mut checks = view.checks;
-            let _native_reverse = self
-                .prepare_native_reverse_cas(&mut checks, &mut writes)
-                .await?;
-            let _extent_fence = self
-                .prepare_native_extent_cas(&mut checks, &mut writes)
-                .await?;
+            let view_checks = view.checks.clone();
+            let mut checks = if from_cache {
+                CACHED_VIEW_CHECKS
+                    .iter()
+                    .map(|index| view.checks[*index].clone())
+                    .collect()
+            } else {
+                view.checks
+            };
+            let derived = async {
+                let reverse = self
+                    .prepare_native_reverse_cas(&mut checks, &mut writes)
+                    .await?;
+                let extent = self
+                    .prepare_native_extent_cas(&mut checks, &mut writes)
+                    .await?;
+                Ok::<_, WorkspaceError>((reverse, extent))
+            };
+            let derived = match prefetched {
+                Some(prefetched) => super::with_prefetched_points(prefetched, derived).await,
+                None => derived.await,
+            };
+            let (_native_reverse, _extent_fence) = match derived {
+                Ok(owners) => owners,
+                // A cached guess the derived proof rejects: re-read.
+                Err(WorkspaceError::Busy) if from_cache => continue,
+                Err(error) => return Err(error),
+            };
+            carried.retain(|key, _| cacheable_derived_key(key, head.layer_id));
+            carried.extend(
+                checks
+                    .iter()
+                    .filter(|check| cacheable_derived_key(&check.key, head.layer_id))
+                    .map(|check| (check.key.clone(), check.expected.clone())),
+            );
+            let derived_checks = carried;
             // All primary and derived entries use the original packet budget.
             if checks
                 .len()
@@ -401,20 +605,75 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             // Exact PWB current/claim/history/anchor and the native view share
             // the actual row/sequence CAS and its live-lease deadline. Backend
             // uncertainty is returned, never blindly replayed or rolled back.
-            if self
+            let committed = match self
                 .backend
                 .compare_and_swap_before(&checks, &writes, view.lease.expires_at_ns)
-                .await?
+                .await
             {
-                return Ok(result);
+                Ok(committed) => committed,
+                // A cached lease deadline may simply be older than a renewal
+                // the mount already made; re-read before reporting a fence.
+                Err(WorkspaceError::Fenced) if from_cache => false,
+                Err(error) => return Err(error),
+            };
+            if committed {
+                if cacheable {
+                    *self.commit_view.lock().unwrap() = CommitViewCache {
+                        guard: request.guard.clone(),
+                        binding: binding.clone(),
+                        checks: view_checks,
+                        layers: view.layers.clone(),
+                        lease_expires_at_ns: view.lease.expires_at_ns,
+                        derived: derived_checks,
+                    }
+                    .after_commit(&writes, &head);
+                }
+                // `head` is exactly the committed head record.
+                return Ok((result, head));
             }
-            tokio::task::yield_now().await;
+            if !from_cache {
+                tokio::task::yield_now().await;
+            }
         }
         Err(WorkspaceError::Busy)
     }
 }
 
-fn validate_mutation_allocation_bounds(request: &VersionedMutation) -> Result<(), WorkspaceError> {
+/// Returns the owned-plus-stored bytes this mutation can retain, which the
+/// commit admits instead of a fixed worst-case arena.
+/// Exact derived keys the native-reverse and extent preparation read for
+/// this request. Bounded so the combined view read stays within its byte and
+/// record limits; a request over the bound just reads them separately.
+fn derived_prefetch_keys(request: &VersionedMutation) -> Vec<Vec<u8>> {
+    const MAX_PREFETCHED_SLICES: usize = 32;
+    let mut keys = Vec::new();
+    if !request.dentries.is_empty() {
+        keys.push(super::native_reverse::state_key(
+            request.guard.expected_head_layer_id,
+        ));
+    }
+    let slices: std::collections::BTreeSet<u64> = request
+        .extents
+        .iter()
+        .filter_map(|row| match row.kind {
+            ExtentKind::Data { slice_id, .. } => Some(slice_id),
+            ExtentKind::Hole => None,
+        })
+        .collect();
+    if !request.extents.is_empty() && slices.len() <= MAX_PREFETCHED_SLICES {
+        keys.push(super::native_slice_deletion::layer_extent_generation_key(
+            request.guard.expected_head_layer_id,
+        ));
+        keys.extend(
+            slices
+                .into_iter()
+                .map(super::native_slice_deletion::slice_deletion_key),
+        );
+    }
+    keys
+}
+
+fn validate_mutation_allocation_bounds(request: &VersionedMutation) -> Result<u64, WorkspaceError> {
     fn overflow() -> WorkspaceError {
         WorkspaceError::InvalidReadPlan("packed mutation allocation limit".into())
     }
@@ -482,7 +741,16 @@ fn validate_mutation_allocation_bounds(request: &VersionedMutation) -> Result<()
     for row in &request.extents {
         encoded(&mut stored, row, extent_key(row))?;
     }
-    Ok(())
+    // Checks/derived native reverse and extent CAS entries are at most a
+    // fixed view packet plus one derived pair per row; bound them by doubling
+    // the stored bytes and adding the fixed view envelope.
+    let bound = owned
+        .checked_add(stored.checked_mul(2).ok_or_else(overflow)?)
+        .and_then(|bytes| bytes.checked_add(1 << 20))
+        .ok_or_else(overflow)?;
+    Ok(u64::try_from(bound)
+        .map_err(|_| overflow())?
+        .min(OPERATION_BYTES))
 }
 
 fn append_versioned_rows(

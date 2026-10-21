@@ -43,6 +43,13 @@ pub trait ObjectBackend: Send + Sync {
         anyhow::bail!("object backend does not support atomic create-only PUT")
     }
 
+    /// Strict create-only publication with the backend's durability barrier.
+    /// No overwrite fallback is allowed. A buffered write or an unsynced local
+    /// directory entry is not sufficient to publish a durable entity map.
+    async fn put_object_create_only_durable(&self, _key: &str, _data: &[u8]) -> Result<()> {
+        anyhow::bail!("object backend does not support durable atomic create-only PUT")
+    }
+
     async fn get_object(&self, key: &str) -> Result<Option<Vec<u8>>>;
 
     /// Preserve a whole GET's physical request shape while streaming its body.

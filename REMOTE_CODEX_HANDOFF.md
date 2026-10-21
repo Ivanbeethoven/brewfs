@@ -156,7 +156,7 @@ directory repair and fixed-stage initial/native-clock diagnostics. Related
 CONTROL/hot historical lease hydration and postsubmission fault-contract
 repairs are being prepared before the next frozen build; not yet validated.
 Current evidence and precise boundaries are in
-[metadata continuation](doc/performance/packed-v3-metadata-followup-validation-2026-10-08.md).
+[metadata continuation](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-metadata-followup-validation-2026-10-08.md).
 
 The actual TiKV Lock response probe executed 0 passed/1 failed with unchanged
 source and prebuilt library test binary. Its seven transparent response events
@@ -970,7 +970,7 @@ Complete proof, durable candidate journal/reopen, atomic seal/head/binding rotat
 reader pins/history retirement and packed graph GC remain open. Formal three-
 innovation performance work and all SPEC/S/X completion remain pending.
 Scope is v3/005 only. See
-[physical dependency validation](doc/performance/packed-v3-physical-dependency-validation-2026-10-07.md).
+[physical dependency validation](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-physical-dependency-validation-2026-10-07.md).
 
 ## Previous accepted source checkpoint: G12/G13 catalog safety and real Redis
 
@@ -1016,7 +1016,7 @@ publication contracts, deadline CAS, distributed catalog and key-index atomicity
 It does not cover G13 real races, transport response loss, object graph or journal.
 Cleanup confirms the owned container absent and owned process groups empty.
 Evidence is `g12-g13-validation-20261007/real-redis/`; see
-[catalog safety checkpoint](doc/performance/packed-v3-g12-g13-catalog-safety-validation-2026-10-07.md).
+[catalog safety checkpoint](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-g12-g13-catalog-safety-validation-2026-10-07.md).
 All SPEC/S/X and the final performance campaign remain open. Scope is v3/005
 only; the active goal's historical compatibility sentence is superseded.
 
@@ -1340,7 +1340,7 @@ No new runtime has been built or accepted for this source batch. Old complete
 gates/frozen binaries certify only their old pinned source. Do not turn packet
 drop into success, relax the strict errno oracle, increase configured budgets,
 or use external/lazy unmount as a production pass. Full SPEC/S/X stays open.
-See [reply retirement checkpoint](doc/performance/packed-v3-reply-retirement-validation-2026-10-05.md).
+See [reply retirement checkpoint](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-reply-retirement-validation-2026-10-05.md).
 
 ## Latest checkpoint: constrained Plans repair (2026-10-05)
 
@@ -1374,7 +1374,7 @@ all reply/ring joins before a fresh source batch. Cargo remains serial, jobs=1. 
 worktree changes, old failed evidence, credentials and .claude. The deletion
 confirmation was already handled; do not repeat it or remove the active image.
 Details and exact evidence are in
-[Plans admission checkpoint](doc/performance/packed-v3-plans-admission-validation-2026-10-05.md).
+[Plans admission checkpoint](https://github.com/Ivanbeethoven/brewfs/blob/cfa000af39414e14f0e0149181b92da497c1a8fb/doc/performance/packed-v3-plans-admission-validation-2026-10-05.md).
 
 G10/G12–G14, remaining system S/experiment X and the final matched campaign stay
 open. G13/G14 external candidates are uncompiled/unrun; packed operator capability

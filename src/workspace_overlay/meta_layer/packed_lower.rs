@@ -31,10 +31,15 @@ use crate::workspace_overlay::resolver::{
 };
 
 const MAX_UPPER_EXTENT_ROWS: usize = 1024;
+// 8 x 16 MiB walk arenas = half of the default 256 MiB Metadata pool.
+const MAX_CONCURRENT_PATH_WALKS: usize = 8;
 // Includes fixed-width backend rows plus sentinel, resolver intermediates,
 // upper segments, gaps and per-gap owner bookkeeping. Child plan clones are
 // admitted separately before cloning; child owners retain their own permits.
 const UPPER_PREPARATION_BYTES: u64 = 4 << 20;
+// Plans kept free for in-progress reads' non-waiting recipe/driver charges
+// while new upper arenas wait (same reserve as lower preparation arenas).
+const UPPER_ARENA_HEADROOM_BYTES: u64 = 512 << 10;
 // The request retains a fixed guard, two layer records and shared lower
 // owners. Chunk preparation keeps its separate row/segment admission.
 const REQUEST_FENCE_BYTES: u64 = 4096;
@@ -159,6 +164,8 @@ impl<W: WorkspaceStore + 'static> WorkspacePackedBindingAuthority
 
 #[async_trait]
 pub(crate) trait PackedLowerOperations: MetaLayer + WorkspaceReadPlanProvider {
+    /// Expose the lower's packed index/budget/observer metrics in `.stats`.
+    fn install_stats(&self, stats: &crate::vfs::stats::FsStats) -> bool;
     async fn drain_packed_transport(&self) -> Result<(), MetaError>;
     async fn frozen_reverse_names_page_owned(
         &self,
@@ -185,6 +192,9 @@ pub(crate) trait PackedLowerOperations: MetaLayer + WorkspaceReadPlanProvider {
 impl<B: ObjectBackend + Clone + Send + Sync + 'static> PackedLowerOperations
     for PackedV3ReadonlyMeta<B>
 {
+    fn install_stats(&self, stats: &crate::vfs::stats::FsStats) -> bool {
+        self.install_v3_stats(stats)
+    }
     async fn frozen_reverse_names_page_owned(
         &self,
         inode: i64,
@@ -229,8 +239,138 @@ pub(crate) struct WorkspacePackedLower {
     pub authority: Arc<dyn WorkspacePackedBindingAuthority>,
     pub upper: Arc<dyn UnifiedReadSourceFetcher>,
     pub budget: Arc<V3MountBudget>,
+    /// Caps concurrent 16 MiB reverse-path walks so they cannot exhaust the
+    /// Metadata pool that ordinary FUSE requests also charge.
+    pub(super) path_walks: tokio::sync::Semaphore,
+    /// The immutable lower's per-inode hot attributes and cold permission
+    /// inputs, resolved once and kept for the life of this
+    /// binding. No expiry and no re-validation: the snapshot cannot change
+    /// while bound. Upper rows still shadow these on every read.
+    pub(super) inode_hot_memo: moka::sync::Cache<i64, Option<Arc<LowerInodeHot>>>,
+    pub(super) inode_cold_memo: moka::sync::Cache<i64, Option<Arc<LowerInodeCold>>>,
+    /// The lower's authenticated reverse (parent, name) aliases of an inode, complete across pages, for the binding lifetime.
+    pub(super) reverse_names: moka::sync::Cache<i64, LowerAliases>,
     upper_identity: usize,
     upper_layout: ChunkLayout,
+}
+
+/// A lower inode's complete authenticated reverse (parent, name) aliases.
+pub(super) type LowerAliases = Arc<Vec<(i64, Vec<u8>)>>;
+
+/// One lower inode's hot attributes, copied out of the authenticated
+/// snapshot (no retained budget permit; bounded by entry count).
+#[derive(Clone, Debug)]
+pub(super) struct LowerInodeHot {
+    pub attr: crate::meta::store::FileAttr,
+    pub parent_hint: Option<i64>,
+}
+
+/// One lower inode's cold permission inputs: the symlink target and the
+/// permission xattrs present in the lower, as (name, value).
+#[derive(Clone, Debug)]
+pub(super) struct LowerInodeCold {
+    pub symlink_target: Option<Vec<u8>>,
+    pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Byte bound for each immutable-lower memo (values plus cache overhead).
+/// Eviction only costs a re-read of the immutable snapshot.
+const LOWER_MEMO_BYTES: u64 = 64 << 20;
+const PERMISSION_XATTRS: [&[u8]; 3] = [
+    crate::meta::posix_acl::ACCESS_XATTR,
+    crate::meta::posix_acl::DEFAULT_XATTR,
+    b"system.brewfs.acl",
+];
+
+impl WorkspacePackedLower {
+    /// The lower inode's hot attributes (None: no such lower inode),
+    /// memoized for the binding lifetime.
+    pub(super) async fn inode_hot(
+        &self,
+        ino: i64,
+    ) -> Result<Option<Arc<LowerInodeHot>>, MetaError> {
+        if let Some(found) = self.inode_hot_memo.get(&ino) {
+            return Ok(found);
+        }
+        let loaded = self
+            .metadata
+            .frozen_inode_metadata_owned(ino)
+            .await?
+            .map(|hot| {
+                Arc::new(LowerInodeHot {
+                    attr: hot.attr.clone(),
+                    parent_hint: hot.parent_hint,
+                })
+            });
+        self.inode_hot_memo.insert(ino, loaded.clone());
+        Ok(loaded)
+    }
+
+    /// The lower inode's cold permission inputs (None: no cold record),
+    /// memoized for the binding lifetime.
+    pub(super) async fn inode_cold(
+        &self,
+        ino: i64,
+    ) -> Result<Option<Arc<LowerInodeCold>>, MetaError> {
+        if let Some(found) = self.inode_cold_memo.get(&ino) {
+            return Ok(found);
+        }
+        let loaded = self
+            .metadata
+            .frozen_cold_attributes_owned(ino)
+            .await?
+            .map(|cold| {
+                Arc::new(LowerInodeCold {
+                    symlink_target: cold.symlink_target.clone(),
+                    xattrs: cold
+                        .xattrs
+                        .iter()
+                        .filter(|value| PERMISSION_XATTRS.contains(&value.name.as_slice()))
+                        .map(|value| (value.name.clone(), value.value.clone()))
+                        .collect(),
+                })
+            });
+        self.inode_cold_memo.insert(ino, loaded.clone());
+        Ok(loaded)
+    }
+
+    /// The lower's complete reverse aliases of `ino`, memoized for the binding
+    /// lifetime (only a complete walk is stored).
+    pub(super) async fn reverse_aliases(
+        &self,
+        ino: i64,
+        mut page: impl FnMut() -> Result<(), MetaError>,
+    ) -> Result<LowerAliases, MetaError> {
+        if let Some(found) = self.reverse_names.get(&ino) {
+            return Ok(found);
+        }
+        let mut rows = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            page()?;
+            let next = self
+                .metadata
+                .frozen_reverse_names_page_owned(ino, after.as_deref())
+                .await?;
+            if next.rows.is_empty() {
+                break;
+            }
+            if next
+                .after
+                .as_ref()
+                .is_none_or(|cursor| after.as_ref().is_some_and(|old| cursor <= old))
+            {
+                return Err(MetaError::Internal(
+                    "packed reverse cursor did not advance".into(),
+                ));
+            }
+            rows.extend(next.rows.iter().cloned());
+            after = next.after.clone();
+        }
+        let rows = Arc::new(rows);
+        self.reverse_names.insert(ino, rows.clone());
+        Ok(rows)
+    }
 }
 
 impl WorkspacePackedLower {
@@ -269,6 +409,32 @@ impl WorkspacePackedLower {
             binding,
             metadata,
             authority,
+            path_walks: tokio::sync::Semaphore::new(MAX_CONCURRENT_PATH_WALKS),
+            inode_hot_memo: moka::sync::Cache::builder()
+                .weigher(|_, _| 192)
+                .max_capacity(LOWER_MEMO_BYTES)
+                .build(),
+            inode_cold_memo: moka::sync::Cache::builder()
+                .weigher(|_, value: &Option<Arc<LowerInodeCold>>| {
+                    let bytes = value.as_ref().map_or(0, |cold| {
+                        cold.symlink_target.as_ref().map_or(0, Vec::len)
+                            + cold
+                                .xattrs
+                                .iter()
+                                .map(|(name, value)| name.len() + value.len() + 48)
+                                .sum::<usize>()
+                    });
+                    u32::try_from(bytes).unwrap_or(u32::MAX).saturating_add(128)
+                })
+                .max_capacity(LOWER_MEMO_BYTES)
+                .build(),
+            reverse_names: moka::sync::Cache::builder()
+                .weigher(|_, rows: &LowerAliases| {
+                    let bytes = rows.iter().map(|(_, name)| name.len() + 40).sum::<usize>();
+                    u32::try_from(bytes).unwrap_or(u32::MAX).saturating_add(96)
+                })
+                .max_capacity(LOWER_MEMO_BYTES)
+                .build(),
             upper_identity: Arc::as_ptr(&upper) as *const () as usize,
             upper_layout: layout,
             upper: Arc::new(NativeUpperFetcher {
@@ -298,46 +464,196 @@ async fn capture_read_fence<W: WorkspaceStore + 'static>(
     [LayerRecord; 2],
     Option<crate::workspace_overlay::packed_reader_lifecycle::PackedReaderRequestOwner>,
 )> {
-    let owner = lower
-        .authority
-        .retain_reader_request()
-        .map_err(read_workspace_error)?;
+    // Immutable lower: the base record is the mount's cached one. Only
+    // the writable head is read fresh, because same-epoch upper writes
+    // advance its sequence; the head/lease fence runs in ensure_current.
     let guard = meta.guard().await;
-    lower
-        .authority
-        .validate(&guard, &lower.binding)
+    let cached: [LayerRecord; 2] = meta
+        .chain()
+        .await?
+        .try_into()
+        .map_err(|_| read_workspace_error(WorkspaceError::Fenced))?;
+    let head = meta
+        .store
+        .load_layer(guard.expected_head_layer_id)
         .await
         .map_err(read_workspace_error)?;
-    let cached_chain = meta.chain().await?;
-    let layers = [
-        meta.store
-            .load_layer(cached_chain[0].layer_id)
-            .await
-            .map_err(read_workspace_error)?,
-        meta.store
-            .load_layer(cached_chain[1].layer_id)
-            .await
-            .map_err(read_workspace_error)?,
-    ];
-    if layers[0].layer_id != guard.expected_head_layer_id
-        || layers[1].layer_id != lower.binding.base_layer_id
-    {
+    let layers = [head, cached[1].clone()];
+    if layers[1].layer_id != lower.binding.base_layer_id {
         return Err(WorkspaceError::Fenced.into());
     }
-    meta.store
-        .validate_read_fence(guard.clone(), layers.clone())
-        .await
-        .map_err(read_workspace_error)?;
-    // A former writable head becoming sealed is a lost guard. Check
-    // authority before reporting malformed fixed-pair metadata.
     validate_fixed_layer_pair(&layers).map_err(read_workspace_error)?;
-    Ok((guard, layers, owner))
+    Ok((guard, layers, None))
+}
+
+type CapturedInodeFence = (
+    HeadGuard,
+    [LayerRecord; 2],
+    Option<crate::workspace_overlay::packed_reader_lifecycle::PackedReaderRequestOwner>,
+    Vec<crate::workspace_overlay::model::InodeDelta>,
+    bool,
+);
+
+/// Capture the read fence plus one inode's upper rows. A frozen base on a
+/// consistent store does this in one round trip that already validates the
+/// head/lease fence (`fused`); otherwise it is the separate fence sequence.
+/// A frozen-base request's view, captured atomically by `begin_request`
+/// (head/lease fence plus this inode's upper rows in one read). While a read
+/// runs inside `with_request_view`, chunk preparation reuses it instead of
+/// re-capturing, and execution skips its per-chunk fence round trips: the
+/// request's single final `ensure_current` re-validates the same inode-row
+/// fence after all bytes are read, so a lost lease or any same-epoch upper
+/// write to this file still fails the request (and the reader retries it)
+/// before bytes are returned. Work outside the scope uses the full path.
+#[derive(Clone)]
+pub struct RequestView {
+    store_identity: usize,
+    ino: i64,
+    guard: HeadGuard,
+    layers: [LayerRecord; 2],
+    inodes: Vec<crate::workspace_overlay::model::InodeDelta>,
+}
+
+tokio::task_local! {
+    static REQUEST_VIEW: RequestView;
+}
+
+/// Run a read under the request view its fence captured, if any.
+pub(crate) async fn with_request_view<F: std::future::Future>(
+    fence: &dyn UnifiedReadRequestFence,
+    future: F,
+) -> F::Output {
+    match fence.request_view() {
+        Some(view) => REQUEST_VIEW.scope(view, future).await,
+        None => future.await,
+    }
+}
+
+fn current_request_view(store_identity: usize, ino: i64) -> Option<RequestView> {
+    REQUEST_VIEW
+        .try_with(|view| {
+            (view.store_identity == store_identity && view.ino == ino).then(|| view.clone())
+        })
+        .ok()
+        .flatten()
+}
+
+async fn capture_inode_fence<W: WorkspaceStore + 'static>(
+    meta: &WorkspaceMetaLayer<W>,
+    lower: &WorkspacePackedLower,
+    ino: i64,
+) -> anyhow::Result<CapturedInodeFence> {
+    let fused = meta.store.supports_fused_read_fence();
+    if fused && let Some((layers, rows)) = meta.lease_proven_inode_rows(ino).await? {
+        // Lease-proven: this mount is the only upper writer and every local
+        // commit invalidates the rows it writes, so the cached head/base pair
+        // and inode rows are the store's. The same rows are re-checked
+        // locally (and remotely on any doubt) before bytes are returned.
+        if layers[1].layer_id != lower.binding.base_layer_id {
+            return Err(WorkspaceError::Fenced.into());
+        }
+        validate_fixed_layer_pair(&layers).map_err(read_workspace_error)?;
+        return Ok((
+            meta.guard().await,
+            layers,
+            None,
+            rows.as_ref().clone(),
+            true,
+        ));
+    }
+    Ok(if fused {
+        // Frozen base: one consistent round trip carries the head/lease fence,
+        // the fresh writable head and this inode's rows in both layers.
+        let guard = meta.guard().await;
+        let cached: [LayerRecord; 2] = meta
+            .chain()
+            .await?
+            .try_into()
+            .map_err(|_| read_workspace_error(WorkspaceError::Fenced))?;
+        if cached[1].layer_id != lower.binding.base_layer_id {
+            return Err(WorkspaceError::Fenced.into());
+        }
+        let (head, inodes) = meta
+            .store
+            .read_fenced_inode(guard.clone(), cached[1].clone(), ino)
+            .await
+            .map_err(read_workspace_error)?;
+        let layers = [head, cached[1].clone()];
+        validate_fixed_layer_pair(&layers).map_err(read_workspace_error)?;
+        (guard, layers, None, inodes, true)
+    } else {
+        let (guard, layers, reader_owner) = capture_read_fence(meta, lower).await?;
+        // Read direct upper rows before any cached EOF can suppress preparation.
+        // Only true upper absence consults the authenticated readonly lower.
+        let inodes = meta
+            .store
+            .get_inode_deltas(InodeQuery {
+                layer_ids: layers.iter().map(|layer| layer.layer_id).collect(),
+                ino,
+            })
+            .await
+            .map_err(read_workspace_error)?;
+        (guard, layers, reader_owner, inodes, false)
+    })
+}
+
+/// Frozen base on a consistent store: fence on this inode's upper rows
+/// (every data/attr mutation rewrites them with a new data_version), so
+/// writes to unrelated files do not restart this read.
+#[derive(Clone)]
+struct InodeFence {
+    ino: i64,
+    rows: Vec<crate::workspace_overlay::model::InodeDelta>,
+}
+
+/// Fence check: local when the lease-proven rows are unchanged, otherwise the
+/// remote per-inode fence. The remote fence still fails closed on any change.
+async fn validate_fence_or_local<W: WorkspaceStore + 'static>(
+    store: &W,
+    guard: &HeadGuard,
+    layers: &[LayerRecord; 2],
+    inode_fence: Option<&InodeFence>,
+    local: Option<&super::row_cache::LeaseLocalFence>,
+) -> anyhow::Result<()> {
+    if let (Some(fence), Some(local)) = (inode_fence, local)
+        && local.unchanged(fence.ino, &fence.rows)
+    {
+        return Ok(());
+    }
+    validate_fence(store, guard, layers, inode_fence).await
+}
+
+async fn validate_fence<W: WorkspaceStore + 'static>(
+    store: &W,
+    guard: &HeadGuard,
+    layers: &[LayerRecord; 2],
+    inode_fence: Option<&InodeFence>,
+) -> anyhow::Result<()> {
+    match inode_fence {
+        Some(fence) => store
+            .validate_inode_read_fence(
+                guard.clone(),
+                layers[1].clone(),
+                fence.ino,
+                fence.rows.clone(),
+            )
+            .await
+            .map_err(read_workspace_error),
+        None => store
+            .validate_read_fence(guard.clone(), layers.clone())
+            .await
+            .map_err(read_workspace_error),
+    }
 }
 
 struct PackedReadRequestFence<W> {
     store: Arc<W>,
     guard: HeadGuard,
     layers: [LayerRecord; 2],
+    inode_fence: Option<InodeFence>,
+    /// Frozen + lease-bound mounts: re-check the inode fence locally.
+    local_fence: Option<super::row_cache::LeaseLocalFence>,
+    request_view: Option<RequestView>,
     lower: Arc<WorkspacePackedLower>,
     file_size: u64,
     _reader_owner:
@@ -351,16 +667,21 @@ impl<W: WorkspaceStore + 'static> UnifiedReadRequestFence for PackedReadRequestF
         self.file_size
     }
 
+    fn request_view(&self) -> Option<RequestView> {
+        self.request_view.clone()
+    }
+
     async fn ensure_current(&self) -> anyhow::Result<()> {
-        self.lower
-            .authority
-            .validate(&self.guard, &self.lower.binding)
-            .await
-            .map_err(read_workspace_error)?;
-        self.store
-            .validate_read_fence(self.guard.clone(), self.layers.clone())
-            .await
-            .map_err(read_workspace_error)
+        // The immutable lower needs no binding authentication; the writable
+        // head/lease fence is one MGET and still applies to every read request.
+        validate_fence_or_local(
+            self.store.as_ref(),
+            &self.guard,
+            &self.layers,
+            self.inode_fence.as_ref(),
+            self.local_fence.as_ref(),
+        )
+        .await
     }
 }
 
@@ -373,17 +694,8 @@ pub(super) async fn begin_request<W: WorkspaceStore + 'static>(
         .budget
         .admit(&[(V3BudgetPool::Control, REQUEST_FENCE_BYTES)])
         .map_err(budget_to_meta)?;
-    let (guard, layers, reader_owner) = capture_read_fence(meta, &lower).await?;
-    // Read direct upper rows before any cached EOF can suppress preparation.
-    // Only true upper absence consults the authenticated readonly lower.
-    let inodes = meta
-        .store
-        .get_inode_deltas(InodeQuery {
-            layer_ids: layers.iter().map(|layer| layer.layer_id).collect(),
-            ino,
-        })
-        .await
-        .map_err(read_workspace_error)?;
+    let (guard, layers, reader_owner, inodes, fused) =
+        capture_inode_fence(meta, &lower, ino).await?;
     let file_size =
         match resolve_inode_state(&layers, &inodes, ino).map_err(read_workspace_error)? {
             Resolution::Present(inode) => {
@@ -411,16 +723,38 @@ pub(super) async fn begin_request<W: WorkspaceStore + 'static>(
                 attr.size
             }
         };
+    let inode_fence = fused.then(|| InodeFence {
+        ino,
+        rows: inodes.clone(),
+    });
+    let request_view = fused.then(|| RequestView {
+        store_identity: Arc::as_ptr(&meta.store) as *const () as usize,
+        ino,
+        guard: guard.clone(),
+        layers: layers.clone(),
+        inodes: inodes.clone(),
+    });
+    let local_fence = if fused {
+        meta.lease_local_fence()
+    } else {
+        None
+    };
     let request = Arc::new(PackedReadRequestFence {
         store: meta.store.clone(),
         guard,
         layers,
+        inode_fence,
+        local_fence,
+        request_view,
         lower,
         file_size,
         _reader_owner: reader_owner,
         _permit: permit,
     });
-    request.ensure_current().await?;
+    if !fused {
+        // The fused read already validated this exact fence atomically.
+        request.ensure_current().await?;
+    }
     Ok(request)
 }
 
@@ -465,6 +799,10 @@ struct CompositeFetcher<W> {
     store: Arc<W>,
     guard: HeadGuard,
     layers: [LayerRecord; 2],
+    inode_fence: Option<InodeFence>,
+    /// Prepared inside a request view: that request's final fence covers
+    /// this plan, so the executor's per-chunk checks need no round trip.
+    request_fenced: bool,
     generation: ReadGeneration,
     lower: Arc<WorkspacePackedLower>,
     children: Vec<PreparedUnifiedRead>,
@@ -479,15 +817,17 @@ impl<W: WorkspaceStore + 'static> UnifiedReadSourceFetcher for CompositeFetcher<
         if generation != self.generation {
             return Err(ReadViewChanged.into());
         }
-        self.lower
-            .authority
-            .validate(&self.guard, &self.lower.binding)
-            .await
-            .map_err(read_workspace_error)?;
-        self.store
-            .validate_read_fence(self.guard.clone(), self.layers.clone())
-            .await
-            .map_err(read_workspace_error)?;
+        // Head/lease fence (per inode): one round trip, unless
+        // the enclosing request's final fence already covers this plan.
+        if !self.request_fenced {
+            validate_fence(
+                self.store.as_ref(),
+                &self.guard,
+                &self.layers,
+                self.inode_fence.as_ref(),
+            )
+            .await?;
+        }
         for child in &self.children {
             child
                 .fetcher
@@ -618,27 +958,33 @@ pub(super) async fn prepare<W: WorkspaceStore + 'static>(
     let base = chunk_index
         .checked_mul(meta.chunk_size)
         .ok_or_else(|| MetaError::Internal("workspace chunk base overflows".into()))?;
-    let (guard, layers, reader_owner) = capture_read_fence(meta, &lower)
-        .await
-        .map_err(fetch_to_meta)?;
+    let scoped = current_request_view(Arc::as_ptr(&meta.store) as *const () as usize, ino);
+    let in_request = scoped.is_some();
+    let (guard, layers, reader_owner, inodes, fused) = match scoped {
+        Some(view) => (view.guard, view.layers, None, view.inodes, true),
+        None => capture_inode_fence(meta, &lower, ino)
+            .await
+            .map_err(fetch_to_meta)?,
+    };
     // Reserve all bounded upper preparation/bookkeeping before backend query.
+    // This read holds no other Plans charge yet, so it waits for sibling
+    // arenas (which shrink before lower preparation) instead of failing.
+    let mut arena = lower
+        .budget
+        .admit_waiting_with_headroom(
+            V3BudgetPool::Plans,
+            UPPER_PREPARATION_BYTES,
+            UPPER_ARENA_HEADROOM_BYTES,
+        )
+        .await
+        .map_err(budget_to_meta)?;
     let mut permits = vec![
         lower
             .budget
-            .admit(&[
-                (V3BudgetPool::Plans, UPPER_PREPARATION_BYTES),
-                (V3BudgetPool::Control, 4096),
-            ])
+            .admit(&[(V3BudgetPool::Control, 4096)])
             .map_err(budget_to_meta)?,
     ];
-    let inodes = meta
-        .store
-        .get_inode_deltas(InodeQuery {
-            layer_ids: layers.iter().map(|layer| layer.layer_id).collect(),
-            ino,
-        })
-        .await
-        .map_err(read_workspace_to_meta)?;
+    let fence_rows = inodes.clone();
     let inode_state = resolve_inode_state(&layers, &inodes, ino).map_err(read_workspace_to_meta)?;
     let mut lower_attr = None;
     let visible_size = match inode_state {
@@ -689,6 +1035,20 @@ pub(super) async fn prepare<W: WorkspaceStore + 'static>(
         .map_err(read_workspace_to_meta)?;
     let coverage = resolve_extent_coverage(&layers, &rows, ino, chunk_index, offset..end)
         .map_err(read_workspace_to_meta)?;
+    // Backend rows are dropped here. Only resolved upper segments, their gaps
+    // and per-gap bookkeeping stay live; each segment yields at most one gap.
+    let retained_rows = rows.len() as u64 + 2;
+    drop(rows);
+    arena
+        .shrink(
+            V3BudgetPool::Plans,
+            retained_rows
+                .saturating_mul(4 * std::mem::size_of::<LogicalSegment>() as u64)
+                .saturating_add(4096)
+                .min(UPPER_PREPARATION_BYTES),
+        )
+        .map_err(budget_to_meta)?;
+    permits.push(arena);
     let upper = coverage.covered.into_iter().map(|extent| LogicalSegment {
         logical_offset: extent.logical_offset,
         length: extent.length,
@@ -705,7 +1065,18 @@ pub(super) async fn prepare<W: WorkspaceStore + 'static>(
     });
     let generation = ReadGeneration {
         workspace_head_epoch: guard.expected_head_epoch,
-        workspace_mutation_sequence: layers[0].next_sequence,
+        // Frozen base: this inode's upper data version identifies its view;
+        // unrelated upper writes do not invalidate the read.
+        workspace_mutation_sequence: if fused {
+            inodes
+                .iter()
+                .filter(|row| row.layer_id == layers[0].layer_id)
+                .map(|row| row.sequence)
+                .max()
+                .unwrap_or(0)
+        } else {
+            layers[0].next_sequence
+        },
         lower_snapshot: lower.binding.manifest.digest,
     };
     let preparation = prepare_overlay_plan(generation, logical_size, offset, len, upper)
@@ -777,10 +1148,13 @@ pub(super) async fn prepare<W: WorkspaceStore + 'static>(
                 let clone_bytes = (child.plan.segments.len() as u64)
                     .checked_mul(2 * std::mem::size_of::<LogicalSegment>() as u64)
                     .ok_or_else(|| MetaError::Internal("composed plan charge overflows".into()))?;
+                // Held charges here are already shrunk to their real size, so
+                // waiting depends only on sibling arenas that shrink or finish.
                 permits.push(
                     lower
                         .budget
-                        .admit(&[(V3BudgetPool::Plans, clone_bytes)])
+                        .admit_waiting_for(V3BudgetPool::Plans, clone_bytes)
+                        .await
                         .map_err(budget_to_meta)?,
                 );
                 gap_plan.segments = child.plan.segments.clone();
@@ -794,20 +1168,39 @@ pub(super) async fn prepare<W: WorkspaceStore + 'static>(
     let plan = preparation
         .finish(gap_plans)
         .map_err(|error| MetaError::Internal(error.to_string()))?;
+    let inode_fence = fused.then_some(InodeFence {
+        ino,
+        rows: fence_rows,
+    });
     let fetcher = Arc::new(CompositeFetcher {
         store: meta.store.clone(),
         guard,
         layers,
+        inode_fence,
+        request_fenced: in_request,
         generation,
         lower,
         children,
         _reader_owner: reader_owner,
         _permits: permits,
     });
-    fetcher
-        .ensure_generation(generation)
-        .await
-        .map_err(fetch_to_meta)?;
+    if fused {
+        // The fused capture validated this exact head/lease view atomically,
+        // and execution re-checks it before and after the data. Only the
+        // retained lower children still need their own generation check.
+        for child in &fetcher.children {
+            child
+                .fetcher
+                .ensure_generation(child.plan.generation)
+                .await
+                .map_err(fetch_to_meta)?;
+        }
+    } else {
+        fetcher
+            .ensure_generation(generation)
+            .await
+            .map_err(fetch_to_meta)?;
+    }
     Ok(PreparedUnifiedRead { plan, fetcher })
 }
 

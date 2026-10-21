@@ -34,7 +34,7 @@
 - packed-smallfiles：100/100、0 errors、102400 payload bytes、p50 43.936339 ms、p95 68.252816 ms；
 - 三项共享 trace SHA-256 c86a7f80931cce89ad640ae0b222788da402093694c433174ecba369bd2c8662。
 
-canonical proof 为 [cloud-proof-summary.txt](../../../docker/compose-xfstests/artifacts/aliyun-cloud-smoke-20261011/cloud-proof-summary.txt)，原始输出为同目录 remote-output.log，本地同步目录为 work/aliyun-cloud-rerun-98f292e。该 smoke 不含 Redis/TiKV metadata lifecycle、native/packed paired、operator、GC 或三次重复的接受统计。
+历史 canonical proof 路径为 `docker/compose-xfstests/artifacts/aliyun-cloud-smoke-20261011/cloud-proof-summary.txt`（当前 checkout 不含该 artifact），原始输出为同目录 remote-output.log，本地同步目录为 work/aliyun-cloud-rerun-98f292e。该 smoke 不含 Redis/TiKV metadata lifecycle、native/packed paired、operator、GC 或三次重复的接受统计。
 
 ## SPEC 级缺口和关闭条件
 

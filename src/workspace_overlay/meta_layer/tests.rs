@@ -9,7 +9,7 @@ use crate::meta::file_lock::{FileLockQuery, FileLockRange, FileLockType};
 use crate::meta::store::{FileType, MetaError, SetAttrFlags, SetAttrRequest};
 use crate::workspace_overlay::catalog::{AcquireLease, CreateVolumeRoot, WorkspaceStore};
 use crate::workspace_overlay::ids::{LayerId, LeaseId, WorkspaceId};
-use crate::workspace_overlay::lifecycle::{NoopDurableRemoteBarrier, WorkspaceLifecycle};
+use crate::workspace_overlay::lifecycle::WorkspaceLifecycle;
 use crate::workspace_overlay::model::ViewContext;
 use crate::workspace_overlay::stores::database::SqliteWorkspaceStore;
 
@@ -707,11 +707,12 @@ async fn sibling_workspaces_share_the_base_but_isolate_namespace_and_data_change
     )
     .await
     .unwrap();
-    let revision = WorkspaceLifecycle::new(store.clone())
-        .seal(&base_view, &NoopDurableRemoteBarrier)
-        .await
-        .unwrap()
-        .revision;
+    let revision = crate::workspace_overlay::test_base_fixture::install_test_base(
+        &store,
+        base_view.workspace_id,
+    )
+    .await
+    .revision;
     let children = WorkspaceLifecycle::new(store.clone())
         .fork_revision(revision, 2, Some("agent".into()))
         .await

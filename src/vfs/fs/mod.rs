@@ -5132,12 +5132,15 @@ where
                                 committed_len,
                             )
                             .await?;
-                        let committed = handle
-                            .read_into_unaccounted_locked(
-                                &handle_guard,
-                                offset,
-                                &mut data[..committed_len],
-                                operation.as_ref().and_then(|guard| guard.delivery_token()),
+                        let committed =
+                            crate::workspace_overlay::meta_layer::packed_lower::with_request_view(
+                                fence.as_ref(),
+                                handle.read_into_unaccounted_locked(
+                                    &handle_guard,
+                                    offset,
+                                    &mut data[..committed_len],
+                                    operation.as_ref().and_then(|guard| guard.delivery_token()),
+                                ),
                             )
                             .await;
                         match committed {
@@ -5185,6 +5188,7 @@ where
                 Ok(data)
             }
             Err(error) => {
+                tracing::debug!(ino = handle.ino, offset, len, error = %format!("{error:#}"), "packed read request failed");
                 #[cfg(test)]
                 eprintln!(
                     "[packed-v3-native-kernel-read-diag] stage=packed-request inode={} fh={} offset={offset} len={len} error={error:#}",

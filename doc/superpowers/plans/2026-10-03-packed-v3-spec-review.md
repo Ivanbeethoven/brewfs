@@ -8,12 +8,12 @@
 不提交/推送，不覆盖已有用户改动。
 
 主文档：
-[packed-v3 SPEC](../specs/2026-09-27-brewfs-packed-metadata-v3-readonly-smallfiles.md)。
+[packed-v3 SPEC](../specs/packed-meta.md)。
 关联文档仅补范围和交叉链接，不改旧 wire/schema/CR 语义：
-[workspace-v1](../specs/2026-08-23-brewfs-workspace-overlay-implementation-spec.md)、
-[clustered-v2](../specs/2026-08-24-brewfs-clustered-frozen-metadata-v2.md)、
-[large-directory note](../specs/2026-09-22-brewfs-packed-metadata-large-directory.md)、
-[operator lifecycle](../specs/2026-09-03-brewfs-workspace-operator-lifecycle-spec.md)。
+[workspace-v1](../specs/overlay-workspace.md)、
+[clustered-v2](../specs/packed-meta.md#historical-clustered-frozen-metadata-v2)、
+[large-directory note](../specs/packed-meta.md#historical-large-directory-design)、
+[operator lifecycle](../specs/overlay-workspace.md#operator-lifecycle-reference)。
 
 ## Confirmed findings / incorporated revisions
 

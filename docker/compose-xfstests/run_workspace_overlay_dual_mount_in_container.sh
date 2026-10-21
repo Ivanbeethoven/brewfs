@@ -36,6 +36,18 @@ case "$allow_expected_contention" in
         exit 2
         ;;
 esac
+# Keep the retained diagnostic writer controls while allowing the recovery
+# harness to use its fixed two-writer default.
+writer_count="${BREWFS_WORKSPACE_WRITERS:-2}"
+writer_interval="${BREWFS_WORKSPACE_WRITER_INTERVAL:-0.02}"
+[[ "$writer_count" =~ ^[0-2]$ ]] || {
+    printf 'BREWFS_WORKSPACE_WRITERS must be 0, 1 or 2\n' >&2
+    exit 2
+}
+[[ "$writer_interval" =~ ^[0-9]+(\.[0-9]+)?$ ]] || {
+    printf 'BREWFS_WORKSPACE_WRITER_INTERVAL must be a non-negative number of seconds\n' >&2
+    exit 2
+}
 writer_stop_file="$artifact_dir/writers.stop"
 catalog_args=(
     --meta-backend "$catalog_backend"
@@ -243,7 +255,12 @@ PY
 start_writers() {
     local label target ready deadline
     rm -f "$writer_stop_file" "$artifact_dir/writer-a.ready" "$artifact_dir/writer-b.ready"
-    for label in a b; do
+    local labels=()
+    case "$writer_count" in
+        1) labels=(a) ;;
+        2) labels=(a b) ;;
+    esac
+    for label in "${labels[@]}"; do
         if [[ "$label" == a ]]; then target="$mount_a"; else target="$mount_b"; fi
         (
             index=0
@@ -251,14 +268,14 @@ start_writers() {
                 index=$((index + 1))
                 printf '%s-%s\n' "$label" "$index" >"$target/concurrent-$label-$index.txt"
                 : >"$artifact_dir/writer-$label.ready"
-                sleep 0.02
+                sleep "$writer_interval"
             done
             sync "$target"
         ) >"$artifact_dir/writer-$label.log" 2>&1 &
         writer_pids+=("$!")
     done
     deadline=$((SECONDS + 30))
-    for label in a b; do
+    for label in "${labels[@]}"; do
         ready="$artifact_dir/writer-$label.ready"
         until [[ -e "$ready" ]]; do
             (( SECONDS < deadline )) || { log "writer $label did not start"; return 1; }
@@ -302,6 +319,7 @@ write_concurrency_metrics() {
     local label="$1" started="$2" ended="$3"
     python3 - "$artifact_dir" "$label" "$concurrency" "$started" "$ended" <<'PY'
 import json
+import os
 import pathlib
 import sys
 
@@ -330,7 +348,7 @@ succeeded = sum(operation["exit_status"] == 0 for operation in operations)
 report = {
     "scenario": f"concurrent-{label}",
     "timed_scope": "parallel CLI operations, excluding workspace setup and writer drain",
-    "mounted_writers": 2,
+    "mounted_writers": int(os.environ.get("BREWFS_WORKSPACE_WRITERS", "2")),
     "operation_count": count,
     "success_count": succeeded,
     "batch_wall_seconds": wall_seconds,

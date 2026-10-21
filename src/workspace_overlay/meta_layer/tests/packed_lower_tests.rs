@@ -573,7 +573,7 @@ async fn public_copyup_truncate_extend_masks_lower_across_chunks() {
 }
 
 #[tokio::test]
-async fn public_prepared_rejects_same_epoch_mutation_and_binding_fence_before_io() {
+async fn public_prepared_rejects_same_epoch_mutation_before_io() {
     let f = fixture().await;
     let head = f.head().await;
     f.copy_up(vec![DataExtentDelta::hole(head, 400, 0, 0, 4096, 0)])
@@ -613,13 +613,6 @@ async fn public_prepared_rejects_same_epoch_mutation_and_binding_fence_before_io
         .await
         .unwrap_err();
     assert!(matches!(err, ReadPlanError::StaleView(ReadViewChanged)));
-    f.authority.valid.store(false, Ordering::SeqCst);
-    let err = execute_unified_into(current.fetcher.as_ref(), 0, &current.plan, &mut out)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, ReadPlanError::Backend(ref cause) if matches!(cause.downcast_ref::<WorkspaceError>(), Some(WorkspaceError::Fenced)))
-    );
     assert_eq!(f.gets.load(Ordering::SeqCst), before);
 }
 
@@ -888,42 +881,371 @@ async fn public_request_fence_rejects_same_epoch_sequence_between_chunks() {
 }
 
 #[tokio::test]
-async fn public_request_fence_keeps_binding_and_lease_fencing_fatal() {
-    for revoke_binding in [false, true] {
-        let f = fixture().await;
-        f.copy_up(Vec::new()).await;
-        let request = f
+async fn public_request_fence_keeps_lease_fencing_fatal() {
+    let f = fixture().await;
+    f.copy_up(Vec::new()).await;
+    let request = f
+        .meta
+        .begin_unified_read_request(400)
+        .await
+        .unwrap()
+        .expect("mutable packed reads must retain a whole-request fence");
+    let view = f.meta.view_context().await;
+    f.meta
+        .store()
+        .release_lease(crate::workspace_overlay::catalog::ReleaseLease {
+            lease_id: view.lease_id,
+            holder_generation: view.holder_generation,
+        })
+        .await
+        .unwrap();
+    let gets_before = f.gets.load(Ordering::SeqCst);
+    let error = request.ensure_current().await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<WorkspaceError>(),
+        Some(WorkspaceError::Fenced)
+    ));
+    assert!(error.downcast_ref::<ReadViewChanged>().is_none());
+    let next = f.meta.begin_unified_read_request(400).await;
+    let error = match next {
+        Err(error) => error,
+        Ok(_) => panic!("lost ownership must reject a new read request"),
+    };
+    assert!(error.downcast_ref::<ReadViewChanged>().is_none());
+    assert_eq!(f.gets.load(Ordering::SeqCst), gets_before);
+}
+
+#[tokio::test]
+async fn concurrent_overlay_preparations_wait_for_plans_instead_of_enomem() {
+    use crate::workspace_overlay::packed_v3::wire005::V3BudgetPool;
+    let f = fixture().await;
+    let budget = f.meta.packed_lower().unwrap().budget.clone();
+    // More simultaneous 4 MiB upper arenas than the Plans pool holds.
+    let readers = (budget.capacity(V3BudgetPool::Plans) / (4 << 20)) as usize * 2 + 4;
+    let results = futures::future::join_all((0..readers).map(|_| async {
+        let prepared = f
             .meta
-            .begin_unified_read_request(400)
+            .prepare_unified_read(400, 0, 0, 4096)
+            .await?
+            .expect("packed prepared read");
+        let mut out = vec![0u8; 4096];
+        execute_unified_into(prepared.fetcher.as_ref(), 0, &prepared.plan, &mut out)
+            .await
+            .map_err(|error| MetaError::Internal(error.to_string()))?;
+        Ok::<_, MetaError>(())
+    }))
+    .await;
+    for result in results {
+        result.expect("concurrent overlay preparation must not ENOMEM");
+    }
+    assert_eq!(budget.state().used[V3BudgetPool::Plans as usize], 0);
+}
+
+#[tokio::test]
+async fn upper_row_cache_is_frozen_only_and_commits_invalidate_it() {
+    let mut f = fixture().await;
+    let head = f.head().await;
+    f.copy_up(vec![DataExtentDelta::hole(head, 400, 0, 0, 4096, 0)])
+        .await;
+    f.meta = f
+        .meta
+        .with_upper_row_cache(std::time::Duration::from_secs(60));
+    assert!(f.meta.upper_row_cache().is_some());
+    let first = f.meta.stat(400).await.unwrap().unwrap();
+    assert_ne!(first.size, 12345);
+    // A store-direct write (impossible for a real mount, which holds the
+    // exclusive lease) is not seen while cached: proves reads are served
+    // from the cache.
+    f.set_native_file_size(12345).await;
+    assert_eq!(f.meta.stat(400).await.unwrap().unwrap().size, first.size);
+    // Every mount commit path invalidates; after it the new row is visible.
+    f.meta.invalidate_upper_rows();
+    assert_eq!(f.meta.stat(400).await.unwrap().unwrap().size, 12345);
+}
+
+#[tokio::test]
+async fn request_view_skips_chunk_fences_but_final_fence_rejects_same_epoch_write() {
+    use crate::workspace_overlay::meta_layer::packed_lower::with_request_view;
+    let f = fixture().await;
+    let head = f.head().await;
+    f.copy_up(vec![DataExtentDelta::hole(head, 400, 0, 0, 4096, 0)])
+        .await;
+    let request = f
+        .meta
+        .begin_unified_read_request(400)
+        .await
+        .unwrap()
+        .unwrap();
+    // Chunk prepared and executed inside the request view: no per-chunk
+    // re-capture, data is the upper hole.
+    let bytes = with_request_view(request.as_ref(), async {
+        let prepared = f
+            .meta
+            .prepare_unified_read(400, 0, 0, 4096)
             .await
             .unwrap()
-            .expect("mutable packed reads must retain a whole-request fence");
-        if revoke_binding {
-            f.authority.valid.store(false, Ordering::SeqCst);
+            .unwrap();
+        let mut bytes = vec![0x55; 4096];
+        execute_unified_into(prepared.fetcher.as_ref(), 0, &prepared.plan, &mut bytes)
+            .await
+            .unwrap();
+        bytes
+    })
+    .await;
+    assert_eq!(bytes, vec![0; 4096]);
+    // Untouched view: the single final fence passes.
+    request.ensure_current().await.unwrap();
+    // A same-epoch upper write to this inode after the chunk was read must
+    // fail the request's final fence (the reader then retries the request).
+    let epoch = f.meta.view_context().await.head_epoch;
+    f.set_native_file_size(8200).await;
+    assert_eq!(f.meta.view_context().await.head_epoch, epoch);
+    let error = request.ensure_current().await.unwrap_err();
+    assert!(error.downcast_ref::<ReadViewChanged>().is_some());
+}
+
+#[tokio::test]
+async fn namespace_cache_survives_data_commits_and_clears_on_namespace_commits() {
+    use super::super::row_cache::{RowKey, RowValue};
+    let mut f = fixture().await;
+    f.meta = f
+        .meta
+        .with_upper_row_cache(std::time::Duration::from_secs(60));
+    let namespace = f
+        .meta
+        .namespace_row_cache()
+        .expect("frozen namespace cache");
+    let seed = |cache: &super::super::row_cache::UpperRowCache| {
+        cache.insert(
+            cache.ticket(),
+            RowKey::Aliases(400),
+            RowValue::Aliases(std::sync::Arc::new(vec![(1, b"nonzero".to_vec())])),
+        );
+    };
+    seed(namespace);
+    let head = f.head().await;
+    // Data-only commit (no dentry rows, no deletion): path results stay.
+    let mut data = f.mutation().await;
+    data.extents
+        .push(DataExtentDelta::hole(head, 400, 0, 0, 4096, 0));
+    f.meta
+        .invalidate_rows_written(&super::super::RowsWritten::of(&data));
+    assert!(namespace.get(&RowKey::Aliases(400)).is_some());
+    // Any namespace commit clears them.
+    let mut rename = f.mutation().await;
+    rename
+        .dentries
+        .push(DentryDelta::put(head, 1, b"moved".to_vec(), 400, 0, 0));
+    f.meta
+        .invalidate_rows_written(&super::super::RowsWritten::of(&rename));
+    assert!(namespace.get(&RowKey::Aliases(400)).is_none());
+    seed(namespace);
+    // A view change or generic invalidation clears both caches.
+    f.meta.invalidate_upper_rows();
+    assert!(namespace.get(&RowKey::Aliases(400)).is_none());
+}
+
+#[tokio::test]
+async fn lease_bound_row_cache_stops_serving_once_the_lease_cannot_be_proven() {
+    use crate::workspace_overlay::lifecycle::LeaseValidity;
+    for revoke in [true, false] {
+        let mut f = fixture().await;
+        let head = f.head().await;
+        f.copy_up(vec![DataExtentDelta::hole(head, 400, 0, 0, 4096, 0)])
+            .await;
+        let ttl = if revoke {
+            std::time::Duration::from_secs(60)
         } else {
-            let view = f.meta.view_context().await;
-            f.meta
-                .store()
-                .release_lease(crate::workspace_overlay::catalog::ReleaseLease {
-                    lease_id: view.lease_id,
-                    holder_generation: view.holder_generation,
-                })
-                .await
-                .unwrap();
-        }
-        let gets_before = f.gets.load(Ordering::SeqCst);
-        let error = request.ensure_current().await.unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<WorkspaceError>(),
-            Some(WorkspaceError::Fenced)
-        ));
-        assert!(error.downcast_ref::<ReadViewChanged>().is_none());
-        let next = f.meta.begin_unified_read_request(400).await;
-        let error = match next {
-            Err(error) => error,
-            Ok(_) => panic!("lost ownership must reject a new read request"),
+            std::time::Duration::from_millis(50)
         };
-        assert!(error.downcast_ref::<ReadViewChanged>().is_none());
-        assert_eq!(f.gets.load(Ordering::SeqCst), gets_before);
+        let validity = std::sync::Arc::new(LeaseValidity::new(std::time::Instant::now(), ttl));
+        f.meta = f
+            .meta
+            .with_upper_row_cache(std::time::Duration::from_secs(600))
+            .with_lease_bound_row_cache(validity.clone());
+        let first = f.meta.stat(400).await.unwrap().unwrap();
+        // A store-direct write (impossible while this mount holds the lease)
+        // is hidden while the cache is authoritative.
+        f.set_native_file_size(first.size + 7).await;
+        assert_eq!(f.meta.stat(400).await.unwrap().unwrap().size, first.size);
+        if revoke {
+            validity.revoke();
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        }
+        // Lease lost or deadline passed: no cached upper row is served; the
+        // read goes to the store and the caches are emptied.
+        assert_eq!(
+            f.meta.stat(400).await.unwrap().unwrap().size,
+            first.size + 7
+        );
+        assert!(f.meta.upper_row_cache().is_none());
+        let rows = f.meta.upper_rows.as_ref().unwrap();
+        assert!(
+            rows.get(&super::super::row_cache::RowKey::Inode(400))
+                .is_none()
+        );
     }
+}
+
+#[tokio::test]
+async fn create_keeps_existing_paths_cached_but_other_namespace_commits_clear_them() {
+    use super::super::row_cache::{RowKey, RowValue};
+    let mut f = fixture().await;
+    f.meta = f
+        .meta
+        .with_upper_row_cache(std::time::Duration::from_secs(60));
+    let namespace = f
+        .meta
+        .namespace_row_cache()
+        .expect("frozen namespace cache");
+    let head = f.head().await;
+    let seed = |cache: &super::super::row_cache::UpperRowCache| {
+        cache.insert(
+            cache.ticket(),
+            RowKey::Paths(400),
+            RowValue::Paths(std::sync::Arc::new(vec![b"/file".to_vec()])),
+        );
+        cache.insert(
+            cache.ticket(),
+            RowKey::Aliases(400),
+            RowValue::Aliases(std::sync::Arc::new(vec![(1, b"file".to_vec())])),
+        );
+    };
+    let fresh_inode = |ino: i64, parent: i64| InodeDelta {
+        layer_id: head,
+        ino,
+        state: InodeState::Present,
+        kind: 0,
+        size: 0,
+        mode: 0o100644,
+        uid: 1,
+        gid: 2,
+        rdev: 0,
+        nlink: 1,
+        atime_ns: 0,
+        mtime_ns: 0,
+        ctime_ns: 0,
+        symlink_target: None,
+        parent_hint: Some(parent),
+        data_version: 1,
+        sequence: 0,
+    };
+    // A create of a brand-new inode 900 under / keeps unrelated paths.
+    seed(namespace);
+    let mut create = f.mutation().await;
+    create
+        .dentries
+        .push(DentryDelta::put(head, 1, b"new".to_vec(), 900, 0, 0));
+    create.inodes.push(fresh_inode(900, 1));
+    f.meta
+        .invalidate_rows_written(&super::super::RowsWritten::of_create(&create, 900));
+    assert!(namespace.get(&RowKey::Paths(400)).is_some());
+    assert!(namespace.get(&RowKey::Aliases(400)).is_some());
+    // The same commit through the generic path, a link of an existing inode
+    // (dentry naming a non-introduced inode), or a deletion clears all.
+    for written in [
+        super::super::RowsWritten::of(&create),
+        super::super::RowsWritten::of_create(&create, 400),
+        {
+            let mut link = f.mutation().await;
+            link.dentries
+                .push(DentryDelta::put(head, 1, b"alias".to_vec(), 400, 0, 0));
+            super::super::RowsWritten::of_create(&link, 400)
+        },
+        {
+            let mut deleting = create.clone();
+            let mut deleted = fresh_inode(401, 1);
+            deleted.state = InodeState::Deleted;
+            deleting.inodes.push(deleted);
+            super::super::RowsWritten::of_create(&deleting, 900)
+        },
+    ] {
+        seed(namespace);
+        f.meta.invalidate_rows_written(&written);
+        assert!(namespace.get(&RowKey::Paths(400)).is_none());
+        assert!(namespace.get(&RowKey::Aliases(400)).is_none());
+    }
+}
+
+#[tokio::test]
+async fn commit_invalidates_only_the_row_cache_keys_it_writes() {
+    use super::super::row_cache::{RowKey, RowValue};
+    let mut f = fixture().await;
+    let head = f.head().await;
+    f.copy_up(vec![DataExtentDelta::hole(head, 400, 0, 0, 4096, 0)])
+        .await;
+    f.meta = f
+        .meta
+        .with_upper_row_cache(std::time::Duration::from_secs(60));
+    let cache = f.meta.upper_row_cache().expect("frozen row cache");
+    let before = f.meta.stat(400).await.unwrap().unwrap();
+    assert!(cache.get(&RowKey::Inode(400)).is_some());
+    let unrelated = || RowValue::Inode(std::sync::Arc::new(Vec::new()));
+    cache.insert(cache.ticket(), RowKey::Inode(1), unrelated());
+    cache.insert(
+        cache.ticket(),
+        RowKey::Dentry(1, b"other".to_vec()),
+        RowValue::Dentry(std::sync::Arc::new(Vec::new())),
+    );
+    // A real mount commit writing inode 400 (extent + inode row).
+    let mut request = f.mutation().await;
+    let rows = f
+        .meta
+        .store()
+        .get_inode_deltas(crate::workspace_overlay::catalog::InodeQuery {
+            layer_ids: request
+                .expected_layers
+                .iter()
+                .map(|layer| layer.layer_id)
+                .collect(),
+            ino: 400,
+        })
+        .await
+        .unwrap();
+    let mut inode =
+        crate::workspace_overlay::resolver::resolve_inode(&request.expected_layers, &rows, 400)
+            .unwrap()
+            .unwrap()
+            .inode;
+    inode.size = before.size + 1;
+    inode.data_version = inode.data_version.checked_add(1).unwrap();
+    request.inodes.push(inode);
+    // This adapter fixture cannot persist packed commits, so the mount
+    // commit fails; an uncertain/failed commit must still drop the written
+    // keys, and only those.
+    f.meta
+        .commit_versioned_mutation(request.clone())
+        .await
+        .unwrap_err();
+    assert!(cache.get(&RowKey::Inode(400)).is_none());
+    assert!(cache.get(&RowKey::Permission(400)).is_none());
+    assert!(cache.get(&RowKey::Inode(1)).is_some());
+    assert!(cache.get(&RowKey::Dentry(1, b"other".to_vec())).is_some());
+    // Once the rows land, the written inode is re-read fresh.
+    f.meta
+        .store()
+        .apply_versioned_mutation(request)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.meta.stat(400).await.unwrap().unwrap().size,
+        before.size + 1
+    );
+    assert!(cache.get(&RowKey::Inode(1)).is_some());
+    // ACL rows have no per-key mapping and clear the whole row cache.
+    let mut acl = f.mutation().await;
+    acl.acls.push(AclDelta {
+        layer_id: head,
+        ino: 400,
+        acl_type: 0,
+        acl_id: 0,
+        op: ValueOp::Put,
+        value: Some(Vec::new()),
+        sequence: 0,
+    });
+    f.meta
+        .invalidate_rows_written(&super::super::RowsWritten::of(&acl));
+    assert!(cache.get(&RowKey::Inode(1)).is_none());
+    assert!(cache.get(&RowKey::Dentry(1, b"other".to_vec())).is_none());
 }

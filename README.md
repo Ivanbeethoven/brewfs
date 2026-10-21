@@ -42,8 +42,9 @@ parts of BrewFS itself.
 - **Tiered read and write acceleration.** Linux page cache, BrewFS memory cache,
   SSD cache, read-ahead, writeback staging, and large-write coalescing work
   together instead of treating object storage as a block device.
-- **Isolated agent sandboxes.** Workspace Overlay lets agents share one sealed
-  base while keeping namespace, inode, xattr, ACL, and extent changes private.
+- **Isolated agent sandboxes.** Workspace Overlay lets agents share one
+  immutable lower while keeping namespace, inode, xattr, ACL, and extent changes
+  private.
 - **Deployable in stages.** Start with SQLite and local data, move metadata to a
   distributed backend, then attach any supported S3-compatible store.
 - **Correctness is measured.** The repository carries Rust tests, xfstests,
@@ -56,6 +57,32 @@ parts of BrewFS itself.
 - **Observable operations.** Runtime statistics, `info`, `gc`, writeback
   accounting, and profiling hooks make performance and recovery behavior
   inspectable.
+
+On Windows, the WSLC smoke benchmark requires a WSL Containers runtime that
+provides privileged containers with `/dev/fuse`, a Linux BrewFS binary at
+`target/docker/brewfs`, and `wslc-compose` on `PATH` (or in `WSLC_COMPOSE`):
+
+```powershell
+$env:WSLC_SDK_PATH = "<path-to-wslcsdk.dll>"
+$env:WSLC_REGISTRY_MIRROR = "<docker-hub-mirror-host>" # optional
+$env:BREWFS_APT_MIRROR = "http://<debian-mirror-host>" # optional
+pwsh docker/compose-xfstests/run_redis_perf_wslc.ps1
+```
+
+The default runner executes the same seven fio profiles as
+`run_redis_perf.sh` (`bigwrite`, `bigread`, sequential read/write, random
+read/write, and mixed random I/O), verifies the FUSE mount, and writes a
+separate JSON report for every profile. `bigwrite` and `bigread` use eight
+1 GiB jobs (8 GiB total). Each profile receives its own Redis/RustFS lifecycle
+so large datasets cannot accumulate in one object-store volume. Artifacts are
+written under `docker/compose-xfstests/artifacts/`; select a smaller subset
+with, for example, `-Tools fio-seqwrite,fio-randrw`.
+
+The WSLC runner writes a constrained cache configuration to
+`brewfs-config.yaml` in the artifact directory. Its defaults are sized for the
+roughly 2 GiB WSLC guest and can be overridden with
+`BREWFS_READ_MEMORY_BYTES`, `BREWFS_WRITE_MEMORY_BYTES`, and
+`BREWFS_MEMORY_BUDGET_BYTES` when the guest has more memory.
 
 ## Quick Start
 
@@ -117,23 +144,24 @@ object capacity; sharing one writable mount weakens isolation.
 
 BrewFS Workspace Overlay provides a filesystem-native alternative:
 
-1. A **sealed base** holds the shared namespace and immutable object blocks.
-2. Each agent gets one **private writable overlay**.
-3. Forking creates metadata and a new writable head; it does not copy clean
-   object data.
-4. `diff`, snapshot, fast-forward `commit`, and lease-aware `discard`
-   make changes explicit.
-5. Backend-time leases and generation fencing prevent a stale mount from
-   writing after ownership changes.
+1. An **immutable lower** (a packed-v3 snapshot) holds the shared namespace and
+   object blocks. It never changes while bound.
+2. Each agent gets one **private writable overlay**. Its head never rotates
+   while the agent is mounted; there is no seal step.
+3. Creating or forking a workspace from an exact revision writes metadata and a
+   new writable head; it does not copy clean object data.
+4. `diff` and lease-aware `discard` make changes explicit.
+5. Backend-time leases and generation fencing keep exactly one writer per
+   workspace and prevent a stale mount from writing after ownership changes.
 
 ```mermaid
 flowchart LR
-    Base[Sealed base revision] --> A[Agent A private overlay]
+    Base[Immutable lower revision] --> A[Agent A private overlay]
     Base --> B[Agent B private overlay]
     Base --> C[Agent C private overlay]
-    A --> Commit[Review / commit]
+    A --> Diff[Review / diff]
     B --> Discard[Discard]
-    C --> Snapshot[Snapshot / fork again]
+    Base --> Fork[Fork more overlays]
     Base -. shared immutable blocks .-> Objects[(Object storage)]
 ```
 
@@ -144,11 +172,11 @@ cargo build -p brewfs --release --features workspace-overlay
 target/release/brewfs workspace --help
 ```
 
-The CLI exposes `init-volume`, `create`, `snapshot`, `fork`, `list`,
-`inspect`, `diff`, `commit`, and `discard`. Redis and TiKV are the
-distributed catalog backends; SQLite is available for local semantics and
+The CLI exposes `init-volume`, `init-packed-volume`, `create --from`,
+`fork <revision>`, `list`, `inspect`, `diff`, and `discard`. Redis and TiKV are
+the distributed catalog backends; SQLite is available for local semantics and
 development. Every mounted workspace resolves exactly two layers: one private
-writable head and one fixed sealed base.
+writable head and one immutable lower.
 
 Current boundaries are intentional: the feature is off by default,
 `workspace-v1` never falls back to flat-volume behavior, workspace

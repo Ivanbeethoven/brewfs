@@ -26,9 +26,10 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [options]
 
-Build the feature-enabled BrewFS test images, create two workspaces from one
-sealed base, verify simultaneous FUSE isolation, and run each selected POSIX
-suite against both workspaces.
+Build the feature-enabled BrewFS test images, build one immutable packed-v3
+lower from seed files, fork two workspaces from its exact revision, verify
+simultaneous FUSE isolation, and run each selected POSIX suite against both
+workspaces. There is no seal step.
 
 Options:
   --xfstests-cases "CASES"  xfstests cases (default: $XFSTESTS_CASES)
@@ -180,9 +181,11 @@ if [[ "$BUILD_IMAGES" == true ]]; then
     (
         cd "$PROJECT_DIR"
         CARGO_PROFILE_RELEASE_DEBUG=0 cargo build --release -p brewfs --bin brewfs \
-            --features workspace-overlay
+            --bin packed_v3_snapshot_fixture --features workspace-overlay
         mkdir -p target/docker
         install -m 755 target/release/brewfs target/docker/brewfs
+        install -m 755 target/release/packed_v3_snapshot_fixture \
+            target/docker/packed_v3_snapshot_fixture
     )
     log "building xfstests image $XFSTESTS_IMAGE"
     if docker image inspect "$FALLBACK_BASE_IMAGE" >/dev/null 2>&1; then
@@ -215,12 +218,49 @@ run_cli() {
         "$XFSTESTS_IMAGE" "$@"
 }
 
+# The CLI may log before printing JSON; parse from the first top-level "{"/"[".
+json_doc() {
+    python3 -c '
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+start = next(i for i, line in enumerate(lines) if line in ("{", "["))
+print(json.dumps(json.loads("\n".join(lines[start:]))))' "$1"
+}
+
 extract_workspace_id() {
-    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["workspace_id"])' "$1"
+    json_doc "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["workspace_id"])'
+}
+
+extract_revision() {
+    json_doc "$1" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)["fork_base"]
+print("%s:%s:%s" % (r["layer_id"], r["sealed_version"], bytes(r["root_hash"]).hex()))'
 }
 
 extract_fork_ids() {
-    python3 -c 'import json,sys; print("\n".join(item["workspace_id"] for item in json.load(open(sys.argv[1]))))' "$1"
+    json_doc "$1" | python3 -c 'import json,sys; print("\n".join(item["workspace_id"] for item in json.load(sys.stdin)))'
+}
+
+# Build the shared seed content as the immutable packed lower (no seal).
+build_seed_lower() {
+    local seed="$state_dir/seed"
+    rm -rf "$seed"
+    mkdir -p "$seed" "$state_dir/data"
+    printf 'shared-base\n' >"$seed/shared-base.txt"
+    printf '0123456789abcdef' >"$seed/base-data.bin"
+    python3 -c 'import sys; open(sys.argv[1], "wb").write(b"x" * 4096)' "$seed/mmap-base.bin"
+    docker run --rm \
+        --workdir /var/lib/brewfs \
+        -v "$state_dir:/var/lib/brewfs" \
+        --entrypoint /usr/local/bin/packed_v3_snapshot_fixture \
+        "$XFSTESTS_IMAGE" --wire-version 5 --source-directory /var/lib/brewfs/seed \
+        --source-consistency best-effort-detected --source-hardlink-policy visible-links \
+        --output-dir /var/lib/brewfs/data --prefix workspace-lower \
+        --manifest-output /var/lib/brewfs/manifest-key.txt >"$run_dir/packed-fixture.log" 2>&1 \
+        || die "packed lower build failed; see $run_dir/packed-fixture.log"
+    printf 'data:\n  backend: local-fs\n  localfs:\n    data_dir: /var/lib/brewfs/data\n' \
+        >"$state_dir/packed-data.yaml"
 }
 
 run_dual_harness() {
@@ -290,16 +330,18 @@ run_suite() {
         "$image"
 }
 
-log "initializing workspace volume"
-run_cli "${catalog_cli_args[@]}" init-volume --owner workspace-harness \
+log "building the shared packed lower"
+build_seed_lower
+
+log "initializing workspace volume over the packed lower"
+run_cli "${catalog_cli_args[@]}" init-packed-volume \
+    --manifest-key "$(tr -d '[:space:]' <"$state_dir/manifest-key.txt")" \
+    --data-config /var/lib/brewfs/packed-data.yaml --owner workspace-harness \
     >"$run_dir/init.json"
-root_workspace="$(extract_workspace_id "$run_dir/init.json")"
+base_revision="$(extract_revision "$run_dir/init.json")"
 
-log "seeding shared base through a real FUSE mount"
-run_dual_harness seed "$root_workspace" "" "$run_dir/dual-mount"
-
-log "sealing the base and creating $WORKSPACE_COUNT O(1) fork(s)"
-run_cli "${catalog_cli_args[@]}" fork "$root_workspace" --count "$WORKSPACE_COUNT" \
+log "creating $WORKSPACE_COUNT O(1) fork(s) of $base_revision"
+run_cli "${catalog_cli_args[@]}" fork "$base_revision" --count "$WORKSPACE_COUNT" \
     --owner workspace-harness >"$run_dir/fork.json"
 mapfile -t fork_ids < <(extract_fork_ids "$run_dir/fork.json")
 [[ ${#fork_ids[@]} -eq "$WORKSPACE_COUNT" ]] \
@@ -316,8 +358,6 @@ if (( WORKSPACE_COUNT == 2 )); then
     run_dual_harness verify "$workspace_a" "$workspace_b" "$run_dir/dual-mount"
     log "verifying concurrent forks with two mounted writers"
     run_dual_harness concurrent-fork "$workspace_a" "$workspace_b" "$run_dir/concurrent-fork"
-    log "verifying concurrent seals with two mounted writers"
-    run_dual_harness concurrent-seal "$workspace_a" "$workspace_b" "$run_dir/concurrent-seal"
 else
     log "single-workspace mode: skipping dual-workspace isolation check"
 fi

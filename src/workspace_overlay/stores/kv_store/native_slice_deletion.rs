@@ -5,7 +5,33 @@ use super::*;
 use crate::workspace_overlay::packed_v3::wire005::{V3BudgetPool, V3MountBudget, V3OwnedPermit};
 use uuid::Uuid;
 
+/// Legacy volume-wide extent generation. Still checked (never written) by
+/// reservations so an older binary's bump between scan and CAS is fenced.
 pub(super) const EXTENT_GENERATION_KEY: &[u8] = b"packed/v3/native-extent-generation";
+const LAYER_EXTENT_GENERATION_PREFIX: &str = "packed/v3/native-extent-generation/";
+
+/// Per-layer extent generation: every extent birth/overwrite/delete in a
+/// layer bumps its layer's key in the same CAS. A reservation reads and
+/// checks the key of every layer in its census, so a commit landing behind
+/// its scan cursor in any layer fails the reservation CAS. Layer births are
+/// fenced separately by the layer inventory generation.
+pub(super) fn layer_extent_generation_key(layer: LayerId) -> Vec<u8> {
+    format!("{LAYER_EXTENT_GENERATION_PREFIX}{layer}").into_bytes()
+}
+
+fn extent_layer_of_key(key: &[u8]) -> Result<LayerId, WorkspaceError> {
+    let rest = key
+        .strip_prefix(EXTENT_PREFIX)
+        .ok_or_else(|| error("native extent key prefix"))?;
+    let end = rest
+        .iter()
+        .position(|byte| *byte == b'/')
+        .ok_or_else(|| error("native extent key layer"))?;
+    std::str::from_utf8(&rest[..end])
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| error("native extent key layer identity"))
+}
 const EXTENT_PREFIX: &[u8] = b"delta/extent/";
 const DELETE_PREFIX: &str = "packed/v3/native-slice-delete/";
 const MAX_TARGETS: usize = 120;
@@ -200,15 +226,23 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                 }
             }
         }
+        let layers = primary_keys
+            .iter()
+            .map(|key| extent_layer_of_key(key))
+            .collect::<Result<BTreeSet<_>, _>>()?;
         drop(primary_keys);
-        let epoch_key = EXTENT_GENERATION_KEY.to_vec();
-        let mut epoch_values = self
-            .slice_fence_points(std::slice::from_ref(&epoch_key))
-            .await?;
-        let epoch = epoch_values.remove(0);
-        let next = extent_generation(&epoch)?
-            .checked_add(1)
-            .ok_or(WorkspaceError::Busy)?;
+        if layers.len() > 32 {
+            return Err(WorkspaceError::Busy);
+        }
+        let epoch_keys = layers
+            .iter()
+            .copied()
+            .map(layer_extent_generation_key)
+            .collect::<Vec<_>>();
+        let epochs = match super::prefetched_points(&epoch_keys) {
+            Some(values) => values,
+            None => self.slice_fence_points(&epoch_keys).await?,
+        };
         let mut window = Vec::with_capacity(32);
         for slice in slices {
             window.push(slice_deletion_key(slice));
@@ -220,19 +254,24 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
         if !window.is_empty() {
             self.prepare_slice_absences(checks, &window).await?;
         }
-        merge(
-            checks,
-            KvCheck {
-                key: epoch_key.clone(),
-                expected: epoch,
-            },
-        )?;
-        if writes.iter().any(|write| match write {
-            KvWrite::Put { key, .. } | KvWrite::Delete { key } => *key == epoch_key,
-        }) {
-            return Err(error("caller supplied native extent generation write"));
+        for (epoch_key, epoch) in epoch_keys.into_iter().zip(epochs) {
+            let next = extent_generation(&epoch)?
+                .checked_add(1)
+                .ok_or(WorkspaceError::Busy)?;
+            if writes.iter().any(|write| match write {
+                KvWrite::Put { key, .. } | KvWrite::Delete { key } => *key == epoch_key,
+            }) {
+                return Err(error("caller supplied native extent generation write"));
+            }
+            merge(
+                checks,
+                KvCheck {
+                    key: epoch_key.clone(),
+                    expected: epoch,
+                },
+            )?;
+            writes.push(put(epoch_key, &next)?);
         }
-        writes.push(put(epoch_key, &next)?);
         Ok(Some(owner))
     }
 
@@ -241,7 +280,10 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
         checks: &mut Vec<KvCheck>,
         keys: &[Vec<u8>],
     ) -> Result<(), WorkspaceError> {
-        let values = self.slice_fence_points(keys).await?;
+        let values = match super::prefetched_points(keys) {
+            Some(values) => values,
+            None => self.slice_fence_points(keys).await?,
+        };
         for (key, value) in keys.iter().zip(values) {
             if value.is_some() {
                 return Err(WorkspaceError::Busy);
@@ -368,6 +410,28 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             merge(&mut checks, next)?;
         }
         let (control, state, hot) = self.load_control_raw().await?;
+        // Every layer that can hold an extent row is in this census (births
+        // are fenced by the layer inventory generation checked above). Its
+        // extent generation is read before the scan and checked at the CAS.
+        let layer_epoch_keys = state
+            .layers
+            .keys()
+            .copied()
+            .map(layer_extent_generation_key)
+            .collect::<Vec<_>>();
+        for window in layer_epoch_keys.chunks(32) {
+            let epochs = self.slice_fence_points(window).await?;
+            for (key, epoch) in window.iter().zip(epochs) {
+                extent_generation(&epoch)?;
+                merge(
+                    &mut checks,
+                    KvCheck {
+                        key: key.clone(),
+                        expected: epoch,
+                    },
+                )?;
+            }
+        }
         let mut reachable = reachable_layers(&state, i64::MIN);
         reachable.extend(reachable_from_roots(&state, packed_roots));
         if targets.iter().any(|target| reachable.contains(target)) {

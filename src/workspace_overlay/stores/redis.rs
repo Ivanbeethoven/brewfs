@@ -562,6 +562,11 @@ impl WorkspaceKvBackend for RedisWorkspaceBackend {
     fn supports_consistent_reads(&self) -> bool {
         true
     }
+    // BOUNDED_PREFIX_LUA is one ZRANGEBYLEX ... LIMIT max_records inside a
+    // script; byte limits and index ghosts fail the call, never truncate it.
+    fn short_scan_page_is_end(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "workspace-redis"
     }
@@ -969,6 +974,62 @@ mod tests {
             .await;
         cleanup.unwrap();
         result.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BREWFS_TEST_REDIS_URL"]
+    async fn real_redis_short_page_is_complete_range_end() {
+        let url = std::env::var("BREWFS_TEST_REDIS_URL").unwrap();
+        let namespace = format!("kv-short-page-{}", uuid::Uuid::new_v4().simple());
+        let backend = RedisWorkspaceBackend::connect(&url, &namespace)
+            .await
+            .unwrap();
+        assert!(backend.short_scan_page_is_end());
+        let keys = (0..5)
+            .map(|index| format!("page/a/{index:03}").into_bytes())
+            .chain([b"page/a0".to_vec(), b"page/b/000".to_vec()])
+            .collect::<Vec<_>>();
+        let writes = keys
+            .iter()
+            .map(|key| KvWrite::Put {
+                key: key.clone(),
+                value: vec![1],
+            })
+            .collect::<Vec<_>>();
+        assert!(backend.compare_and_swap(&[], &writes).await.unwrap());
+        let limits = |records| KvReadLimits {
+            max_records: records,
+            max_key_bytes: 64,
+            max_value_bytes: 4,
+            max_total_bytes: 1024,
+            max_response_bytes: 4096,
+            max_data_requests: records,
+        };
+        // A full page may be followed by more rows; the short tail is the end
+        // and an explicit next page after it is indeed empty.
+        let first = backend
+            .scan_prefix_page_with_byte_limits(b"page/a/", None, limits(3))
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 3);
+        let tail = backend
+            .scan_prefix_page_with_byte_limits(b"page/a/", Some(&first[2].key), limits(3))
+            .await
+            .unwrap();
+        assert_eq!(tail.len(), 2);
+        let after = backend
+            .scan_prefix_page_with_byte_limits(b"page/a/", Some(&tail[1].key), limits(3))
+            .await
+            .unwrap();
+        assert!(after.is_empty());
+        let mut connection = backend.connection.clone();
+        let mut del = redis::cmd("DEL");
+        del.arg(backend.scoped(KEY_INDEX))
+            .arg(backend.scoped(KEY_INDEX_READY));
+        for key in &keys {
+            del.arg(backend.scoped(key));
+        }
+        let _: () = del.query_async(&mut connection).await.unwrap();
     }
 
     #[tokio::test]

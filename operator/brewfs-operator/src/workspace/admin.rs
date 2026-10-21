@@ -2,19 +2,16 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context as _, anyhow, bail};
+use anyhow::{anyhow, bail, Context as _};
 use async_trait::async_trait;
 use brewfs::workspace_overlay::catalog::{
     CreateSnapshot, CreateVolumeRoot, CreateWorkspace, MarkDeleting, WorkspaceStore,
 };
 use brewfs::workspace_overlay::error::WorkspaceError;
 use brewfs::workspace_overlay::ids::{LayerId, LeaseId, SnapshotId, WorkspaceId};
-use brewfs::workspace_overlay::lifecycle::{
-    NoopDurableRemoteBarrier, WorkspaceLifecycle, WorkspaceMountSession,
-};
 use brewfs::workspace_overlay::model::{
-    BaseRevision, LayerState, LeaseState, SnapshotLease, VolumeHeader, WORKSPACE_SCHEMA_VERSION,
-    WorkspaceRecord, WorkspaceState,
+    BaseRevision, LayerState, SnapshotLease, VolumeHeader, WorkspaceRecord, WorkspaceState,
+    WORKSPACE_SCHEMA_VERSION,
 };
 use brewfs::workspace_overlay::stores::kv_store::KvWorkspaceStore;
 use uuid::Uuid;
@@ -199,17 +196,8 @@ pub trait WorkspaceAdmin: Send + Sync {
     async fn inspect_workspace(&self, id: WorkspaceId) -> anyhow::Result<WorkspaceView>;
     async fn verify_revision(&self, revision: &BaseRevision) -> anyhow::Result<()>;
     async fn ensure_snapshot(&self, request: EnsureSnapshotRequest)
-    -> anyhow::Result<SnapshotView>;
+        -> anyhow::Result<SnapshotView>;
     async fn load_snapshot(&self, id: SnapshotId) -> anyhow::Result<SnapshotView>;
-    async fn seal_and_snapshot(
-        &self,
-        workspace_id: WorkspaceId,
-        expected_head_epoch: u64,
-        holder_generation: u64,
-        ttl_seconds: u32,
-        heartbeat_seconds: u32,
-        request: EnsureSnapshotRequest,
-    ) -> anyhow::Result<(WorkspaceView, SnapshotView)>;
     async fn delete_snapshot(&self, id: SnapshotId) -> anyhow::Result<()>;
     async fn mark_workspace_deleting(&self, id: WorkspaceId, force: bool) -> anyhow::Result<()>;
     async fn reap_expired_leases(&self) -> anyhow::Result<u64>;
@@ -401,55 +389,6 @@ where
             snapshot_id: snapshot.snapshot_id,
             revision: snapshot.revision,
         })
-    }
-
-    async fn seal_and_snapshot(
-        &self,
-        workspace_id: WorkspaceId,
-        expected_head_epoch: u64,
-        holder_generation: u64,
-        ttl_seconds: u32,
-        heartbeat_seconds: u32,
-        request: EnsureSnapshotRequest,
-    ) -> anyhow::Result<(WorkspaceView, SnapshotView)> {
-        let before = self.inspect_workspace(workspace_id).await?;
-        if before
-            .leases
-            .iter()
-            .any(|lease| lease.state == LeaseState::Active)
-        {
-            bail!("workspace still has an active writable lease");
-        }
-        let session = WorkspaceMountSession::acquire(
-            self.store.clone(),
-            workspace_id,
-            holder_generation,
-            std::time::Duration::from_secs(u64::from(ttl_seconds)),
-            std::time::Duration::from_secs(u64::from(heartbeat_seconds)),
-        )
-        .await?;
-        if session.view.head_epoch != expected_head_epoch {
-            let actual_head_epoch = session.view.head_epoch;
-            session.release().await?;
-            bail!(
-                "workspace head changed before seal: expected epoch {expected_head_epoch}, actual epoch {actual_head_epoch}"
-            );
-        }
-        let lifecycle = WorkspaceLifecycle::new(self.store.clone());
-        let seal_result = lifecycle
-            .seal(&session.view, &NoopDurableRemoteBarrier)
-            .await;
-        let release_result = session.release().await;
-        let revision = seal_result?.revision;
-        release_result?;
-        let snapshot = self
-            .ensure_snapshot(EnsureSnapshotRequest {
-                revision: revision.clone(),
-                ..request
-            })
-            .await?;
-        let workspace = self.inspect_workspace(workspace_id).await?;
-        Ok((workspace, snapshot))
     }
 
     async fn delete_snapshot(&self, id: SnapshotId) -> anyhow::Result<()> {
@@ -720,10 +659,16 @@ mod tests {
             WorkspaceState::Deleting
         );
 
-        admin.delete_snapshot(volume.root_snapshot_id).await.unwrap();
+        admin
+            .delete_snapshot(volume.root_snapshot_id)
+            .await
+            .unwrap();
         // A retried Kubernetes finalizer may observe a previously deleted
         // snapshot. Missing is terminal success; backend errors still fail.
-        admin.delete_snapshot(volume.root_snapshot_id).await.unwrap();
+        admin
+            .delete_snapshot(volume.root_snapshot_id)
+            .await
+            .unwrap();
     }
 
     #[test]

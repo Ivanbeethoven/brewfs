@@ -75,136 +75,6 @@ async fn bounded_raw_paths_cancelled_construction_releases_work_output_and_reade
         .unwrap();
 }
 
-struct HeldAncestorAuthority {
-    inner: PinnedCatalogPackedBindingAuthority<KvWorkspaceStore<PinMemoryBackend>>,
-    budget: Arc<V3MountBudget>,
-    armed: AtomicBool,
-    entered: tokio::sync::Notify,
-    resume: tokio::sync::Notify,
-}
-
-#[async_trait]
-impl crate::workspace_overlay::meta_layer::WorkspacePackedBindingAuthority
-    for HeldAncestorAuthority
-{
-    fn retain_reader_request(
-        &self,
-    ) -> Result<
-        Option<crate::workspace_overlay::packed_reader_lifecycle::PackedReaderRequestOwner>,
-        WorkspaceError,
-    > {
-        self.inner.reader.retain_request().map(Some)
-    }
-    fn reader_session(&self) -> Option<Arc<dyn PackedReaderSession>> {
-        Some(self.inner.reader.clone())
-    }
-    async fn validate(
-        &self,
-        guard: &HeadGuard,
-        expected: &crate::workspace_overlay::catalog::PackedLowerBinding,
-    ) -> Result<(), WorkspaceError> {
-        self.inner.validate(guard, expected).await?;
-        let state = self.budget.state();
-        // The paths output is live and its construction workspace has already
-        // dropped: this is an actual subsequent ancestor metadata read.
-        if state.used[V3BudgetPool::Output as usize] >= 1 << 20
-            && state.used[V3BudgetPool::Metadata as usize] < 16 << 20
-            && self.armed.swap(false, Ordering::SeqCst)
-        {
-            self.entered.notify_one();
-            self.resume.notified().await;
-        }
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn bounded_raw_paths_fuse_ancestor_await_retains_output_and_cancellation_releases_reader() {
-    use asyncfuse::SetAttr;
-    use asyncfuse::raw::{Filesystem, Request};
-    let f = raw_fixture().await;
-    let binding = f.reader.binding().clone();
-    let snapshot = AuthenticatedV3Snapshot::open(&f.client, &binding.manifest)
-        .await
-        .unwrap();
-    let lower = Arc::new(
-        PackedV3ReadonlyMeta::from_v3_budget(
-            f.client.clone(),
-            snapshot,
-            CHUNK,
-            0,
-            f.budget.clone(),
-        )
-        .unwrap(),
-    );
-    let authority = Arc::new(HeldAncestorAuthority {
-        inner: PinnedCatalogPackedBindingAuthority {
-            store: f.store.clone(),
-            reader: f.reader.clone(),
-        },
-        budget: f.budget.clone(),
-        armed: AtomicBool::new(true),
-        entered: tokio::sync::Notify::new(),
-        resume: tokio::sync::Notify::new(),
-    });
-    let upper = Arc::new(InMemoryBlockStore::new());
-    let layout = ChunkLayout {
-        chunk_size: CHUNK,
-        block_size: CHUNK as u32,
-    };
-    let meta = Arc::new(
-        WorkspaceMetaLayer::with_chunk_size(f.store.clone(), f.meta.view_context().await, CHUNK)
-            .with_packed_v3_lower(binding, lower, authority.clone(), upper.clone(), layout)
-            .unwrap(),
-    );
-    meta.initialize().await.unwrap();
-    let provider: Arc<dyn WorkspaceReadPlanProvider> = meta.clone();
-    let vfs = Arc::new(
-        VFS::from_readonly_components_with_provider(VFSConfig::new(layout), upper, meta, provider)
-            .unwrap(),
-    );
-    let pool = V3BudgetPool::Output as usize;
-    let baseline = f.budget.state().used[pool];
-    let task_vfs = vfs.clone();
-    let task = tokio::spawn(async move {
-        Filesystem::setattr(
-            task_vfs.as_ref(),
-            Request {
-                unique: 501,
-                uid: 1,
-                gid: 2,
-                pid: 0,
-            },
-            400,
-            None,
-            SetAttr {
-                mode: Some(0o640),
-                ..Default::default()
-            },
-        )
-        .await
-    });
-    tokio::time::timeout(Duration::from_secs(2), authority.entered.notified())
-        .await
-        .unwrap();
-    assert_eq!(f.budget.state().used[pool], baseline + (1 << 20));
-    let reader = f.reader.clone();
-    let mut shutdown = tokio::spawn(async move { reader.shutdown().await });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
-            .await
-            .is_err()
-    );
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
-    assert_eq!(f.budget.state().used[pool], baseline);
-    tokio::time::timeout(Duration::from_secs(2), shutdown)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-}
-
 #[tokio::test]
 async fn bounded_raw_paths_merge_all_upper_hardlinks_and_lower_whiteouts() {
     let f = raw_fixture().await;
@@ -426,6 +296,44 @@ async fn native_reverse_more_than_4096_unrelated_rows_only_scans_requested_inode
             && prefix.ends_with(b"8000000000000190/")
     ));
     assert_eq!(f.budget.state().used, before);
+    f.reader.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn reverse_path_walk_trusts_proven_short_page_and_stays_complete() {
+    let f = raw_fixture().await;
+    let mut mutation = raw_mutation(&f).await;
+    // 35 head aliases: one full 32-row page and a 3-row short page.
+    for index in 0..35 {
+        mutation.dentries.push(DentryDelta::put(
+            f.guard.expected_head_layer_id,
+            1,
+            format!("alias-{index:03}").into_bytes(),
+            400,
+            0,
+            0,
+        ));
+    }
+    f.store.apply_versioned_mutation(mutation).await.unwrap();
+    let reverse_pages = |pages: &[Vec<u8>]| {
+        pages
+            .iter()
+            .filter(|prefix| prefix.starts_with(b"packed/v3/native-reverse/rows/"))
+            .count()
+    };
+    // Default contract: a short page is followed by an empty proof page per
+    // layer (head: 32 + 3 + empty, base: empty).
+    f.backend.page_prefixes.lock().await.clear();
+    let paths = f.meta.get_paths_bytes(400).await.unwrap();
+    assert_eq!(paths.len(), 36);
+    assert_eq!(reverse_pages(&f.backend.page_prefixes.lock().await), 4);
+    // Single-range backend: the short page itself ends each layer's walk
+    // (head: 32 + 3, base: one empty page), with the identical result.
+    f.backend.short_page_is_end.store(true, Ordering::SeqCst);
+    f.backend.page_prefixes.lock().await.clear();
+    assert_eq!(f.meta.get_paths_bytes(400).await.unwrap(), paths);
+    assert_eq!(reverse_pages(&f.backend.page_prefixes.lock().await), 3);
+    assert!(paths.contains(&b"/alias-034".to_vec()));
     f.reader.shutdown().await.unwrap();
 }
 

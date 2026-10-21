@@ -7,6 +7,8 @@ mod cancelled_lower_transport_tests;
 #[path = "native_effective_export_tests.rs"]
 mod native_effective_export_tests;
 
+mod entity_lower_tests;
+
 use super::*;
 use crate::workspace_overlay::stores::binding_tests::{packed, packed_with_snapshot_id, request};
 use crate::workspace_overlay::stores::redis::RedisWorkspaceBackend;
@@ -27,6 +29,18 @@ struct PinMemoryBackend {
     page_prefixes: Arc<Mutex<Vec<Vec<u8>>>>,
     page_size: Arc<AtomicI64>,
     page_barrier: SharedTestBarrier,
+    /// Models Redis' single-range pages. A forced `page_size` truncation is
+    /// then a lie, so only enable this while `page_size` is unset.
+    short_page_is_end: Arc<AtomicBool>,
+    /// Consistent timed reads (head/lease and per-inode read fences).
+    timed_reads: Arc<AtomicI64>,
+    /// Consistent untimed multi-key reads (permission snapshots and rows).
+    consistent_reads: Arc<AtomicI64>,
+    /// Packed mutation view reads: bounded reads of the workspace record
+    /// together with at least ten more view keys.
+    view_reads: Arc<AtomicI64>,
+    /// All bounded reads, used to prove a bound immutable memo hit is local.
+    bounded_reads: Arc<AtomicI64>,
 }
 impl Default for PinMemoryBackend {
     fn default() -> Self {
@@ -42,6 +56,11 @@ impl Default for PinMemoryBackend {
             page_prefixes: Default::default(),
             page_size: Default::default(),
             page_barrier: Default::default(),
+            short_page_is_end: Default::default(),
+            timed_reads: Default::default(),
+            consistent_reads: Default::default(),
+            view_reads: Default::default(),
+            bounded_reads: Default::default(),
         }
     }
 }
@@ -156,6 +175,9 @@ impl WorkspaceKvBackend for PinMemoryBackend {
     fn supports_consistent_reads(&self) -> bool {
         true
     }
+    fn short_scan_page_is_end(&self) -> bool {
+        self.short_page_is_end.load(Ordering::SeqCst)
+    }
     async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, WorkspaceError> {
         Ok(self.rows.lock().await.get(key).cloned())
     }
@@ -163,6 +185,7 @@ impl WorkspaceKvBackend for PinMemoryBackend {
         &self,
         keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, WorkspaceError> {
+        self.consistent_reads.fetch_add(1, Ordering::SeqCst);
         let rows = self.rows.lock().await;
         Ok(keys.iter().map(|key| rows.get(key).cloned()).collect())
     }
@@ -170,6 +193,7 @@ impl WorkspaceKvBackend for PinMemoryBackend {
         &self,
         keys: &[Vec<u8>],
     ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
+        self.timed_reads.fetch_add(1, Ordering::SeqCst);
         let rows = self.rows.lock().await;
         Ok((
             keys.iter().map(|key| rows.get(key).cloned()).collect(),
@@ -181,7 +205,11 @@ impl WorkspaceKvBackend for PinMemoryBackend {
         keys: &[Vec<u8>],
         limits: KvReadLimits,
     ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
+        self.bounded_reads.fetch_add(1, Ordering::SeqCst);
         limits.validate_keys(keys)?;
+        if keys.len() >= 11 && keys[0].starts_with(b"ws/") {
+            self.view_reads.fetch_add(1, Ordering::SeqCst);
+        }
         let rows = self.rows.lock().await;
         let mut total = 0usize;
         for key in keys {

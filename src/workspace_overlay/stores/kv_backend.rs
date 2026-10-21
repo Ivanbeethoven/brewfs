@@ -354,6 +354,14 @@ pub trait WorkspaceKvBackend: Send + Sync + 'static {
     fn supports_consistent_reads(&self) -> bool {
         false
     }
+
+    /// True only when every `scan_prefix_page_with_byte_limits` page is one
+    /// atomic range read whose sole stop condition is `max_records`, so a
+    /// page shorter than that proves no further key exists in the range.
+    /// Default false: callers must continue until an empty page.
+    fn short_scan_page_is_end(&self) -> bool {
+        false
+    }
     fn name(&self) -> &'static str;
 
     /// Private native-GC adapter opt-in. A positive quota selects durable,

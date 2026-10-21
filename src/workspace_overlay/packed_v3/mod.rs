@@ -16,6 +16,7 @@ mod readonly;
 pub(crate) use readonly::{PackedLowerInodeMetadata, PackedLowerReverseNames};
 mod remote;
 mod wire;
+pub(crate) use wire::{Reader, Writer};
 pub mod wire005;
 
 pub use catalog::{

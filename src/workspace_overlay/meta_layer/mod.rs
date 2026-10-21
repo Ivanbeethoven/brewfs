@@ -48,6 +48,7 @@ mod packed_enumeration;
 pub mod packed_lower;
 mod packed_paths;
 mod packed_permissions;
+mod row_cache;
 pub use packed_lower::{
     CatalogPackedBindingAuthority, PinnedCatalogPackedBindingAuthority,
     WorkspacePackedBindingAuthority,
@@ -70,8 +71,16 @@ pub struct WorkspaceMetaLayer<W> {
     chunk_size: u64,
     open_counts: DashMap<i64, u64>,
     resolver_cache: WorkspaceResolverCache,
+    upper_rows: Option<Arc<row_cache::UpperRowCache>>,
+    /// Path/alias results; invalidated only by namespace-changing commits.
+    namespace_rows: Option<row_cache::UpperRowCache>,
+    /// When set, both caches serve rows only while the mount provably holds
+    /// its exclusive lease; once that lapses they are cleared and bypassed.
+    lease_validity: Option<Arc<super::lifecycle::LeaseValidity>>,
     locks: Mutex<WorkspaceLocks>,
     mutation_gate: Mutex<()>,
+    /// Data writes waiting for the next group commit (see `write`).
+    write_queue: std::sync::Mutex<WriteQueue>,
     metrics: Arc<WorkspaceMetrics>,
     lower: WorkspaceLower,
 }
@@ -97,6 +106,125 @@ fn validate_fixed_layer_pair(chain: &[LayerRecord]) -> Result<(), WorkspaceError
     Ok(())
 }
 
+/// Cache keys whose source rows one versioned commit writes. A cached value
+/// depends only on the rows of its own key: `Inode` on that inode's rows,
+/// `Permission` on its inode and ACL-xattr rows, `Dentry`/`Xattr` on that
+/// exact (parent|ino, name). Extent rows touch only their inode's entries.
+/// ACL rows have no per-key mapping, so they clear the whole row cache.
+pub(super) struct RowsWritten {
+    row_keys: Option<Vec<row_cache::RowKey>>,
+    /// Any dentry row or inode deletion: paths/aliases may change.
+    namespace: bool,
+    /// Set only for a create: the commit's single dentry is a Put naming an
+    /// inode this same commit introduces (allocated fresh, nlink 1/2, its
+    /// parent hint is that dentry's parent). Such an entry cannot change the
+    /// paths or aliases of any existing inode, so the namespace cache drops
+    /// only the new inode's own entries instead of everything.
+    created: Option<i64>,
+}
+
+impl RowsWritten {
+    pub(super) fn of(request: &VersionedMutation) -> Self {
+        let namespace = !request.dentries.is_empty()
+            || request
+                .inodes
+                .iter()
+                .any(|inode| inode.state == InodeState::Deleted);
+        let row_keys = request.acls.is_empty().then(|| {
+            let inodes = request
+                .inodes
+                .iter()
+                .map(|row| row.ino)
+                .chain(request.extents.iter().map(|row| row.ino))
+                .chain(request.xattrs.iter().map(|row| row.ino))
+                .collect::<BTreeSet<_>>();
+            let mut keys = Vec::with_capacity(
+                inodes.len() * 2 + request.dentries.len() + request.xattrs.len(),
+            );
+            for ino in inodes {
+                keys.push(row_cache::RowKey::Inode(ino));
+                keys.push(row_cache::RowKey::Permission(ino));
+            }
+            for row in &request.dentries {
+                keys.push(row_cache::RowKey::Dentry(row.parent_ino, row.name.clone()));
+            }
+            for row in &request.xattrs {
+                keys.push(row_cache::RowKey::Xattr(row.ino, row.name.clone()));
+            }
+            keys
+        });
+        Self {
+            row_keys,
+            namespace,
+            created: None,
+        }
+    }
+
+    /// `of(request)` for a create commit whose dentry introduces `ino`.
+    /// Falls back to the full namespace invalidation unless the request has
+    /// exactly that shape, so a misuse can only cost performance.
+    pub(super) fn of_create(request: &VersionedMutation, ino: i64) -> Self {
+        let mut written = Self::of(request);
+        let [dentry] = request.dentries.as_slice() else {
+            return written;
+        };
+        let fresh = dentry.op == crate::workspace_overlay::model::DentryOp::Put
+            && dentry.ino == Some(ino)
+            && request.inodes.iter().any(|row| {
+                row.ino == ino
+                    && row.state == InodeState::Present
+                    && row.parent_hint == Some(dentry.parent_ino)
+            })
+            && request
+                .inodes
+                .iter()
+                .all(|row| row.state != InodeState::Deleted);
+        if fresh {
+            written.created = Some(ino);
+        }
+        written
+    }
+}
+
+/// One `MetaLayer::write` waiting for a group commit.
+struct PendingWrite {
+    ino: i64,
+    chunk_id: u64,
+    slice: SliceDesc,
+    new_size: u64,
+    reply: tokio::sync::oneshot::Sender<Result<(), MetaError>>,
+}
+
+/// Concurrent data writes share one versioned commit. Exactly one leader at a
+/// time drains the queue under the mutation gate; everyone else waits for the
+/// leader's reply. A batch is one CAS on the same head version a single write
+/// uses, so conflict detection and row ordering are unchanged.
+#[derive(Default)]
+struct WriteQueue {
+    pending: Vec<PendingWrite>,
+    leader: bool,
+}
+
+/// Each member of a failed batch gets the same failure. I/O errors keep their
+/// errno (the FUSE reply); every other kind keeps its variant where it carries
+/// only plain data, else its message.
+fn duplicate_write_error(error: &MetaError) -> MetaError {
+    match error {
+        MetaError::Io(io) => match io.raw_os_error() {
+            Some(errno) => MetaError::Io(std::io::Error::from_raw_os_error(errno)),
+            None => MetaError::Io(std::io::Error::new(io.kind(), io.to_string())),
+        },
+        MetaError::NotFound(ino) => MetaError::NotFound(*ino),
+        MetaError::NotSupported(message) => MetaError::NotSupported(message.clone()),
+        MetaError::InvalidPath(message) => MetaError::InvalidPath(message.clone()),
+        MetaError::Internal(message) => MetaError::Internal(message.clone()),
+        other => MetaError::Internal(other.to_string()),
+    }
+}
+
+/// Bound on writes folded into one commit, far inside the packet limits.
+const MAX_GROUP_WRITES: usize = 64;
+
 #[derive(Default)]
 struct WorkspaceLocks {
     plocks: BTreeMap<(i64, i64), Vec<PlockRecord>>,
@@ -113,8 +241,12 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             chunk_size: DEFAULT_CHUNK_SIZE,
             open_counts: DashMap::new(),
             resolver_cache: WorkspaceResolverCache::default(),
+            upper_rows: None,
+            namespace_rows: None,
+            lease_validity: None,
             locks: Mutex::new(WorkspaceLocks::default()),
             mutation_gate: Mutex::new(()),
+            write_queue: std::sync::Mutex::new(WriteQueue::default()),
             metrics: global_workspace_metrics(),
             lower: WorkspaceLower::Native,
         }
@@ -124,6 +256,154 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         let mut layer = Self::new(store, view);
         layer.chunk_size = chunk_size;
         layer
+    }
+
+    /// Serve read-only upper-row lookups from a short-lived cache. Only valid
+    /// while this mount holds the exclusive workspace lease and is the sole
+    /// writer; every local commit invalidates it. Frozen packed base only.
+    pub fn with_upper_row_cache(mut self, ttl: std::time::Duration) -> Self {
+        if !ttl.is_zero() {
+            self.upper_rows = Some(Arc::new(row_cache::UpperRowCache::new(ttl)));
+            self.namespace_rows = Some(row_cache::UpperRowCache::new(ttl));
+        }
+        self
+    }
+
+    /// Every view change. Clears namespace results too; commits use
+    /// `invalidate_rows_written`.
+    pub(crate) fn invalidate_upper_rows(&self) {
+        if let Some(cache) = &self.upper_rows {
+            cache.invalidate_all();
+        }
+        if let Some(cache) = &self.namespace_rows {
+            cache.invalidate_all();
+        }
+    }
+
+    /// One commit: the row cache drops only the entries whose source rows
+    /// the commit writes (see `RowsWritten`), so unrelated directories,
+    /// ancestors and ACL xattrs stay cached. The namespace cache clears only
+    /// when the commit can change a path: any dentry row, or an inode
+    /// deleted. Renames, links, unlinks, creates and mkdir/rmdir all write
+    /// dentry rows.
+    pub(super) fn invalidate_rows_written(&self, written: &RowsWritten) {
+        if let Some(cache) = &self.upper_rows {
+            match &written.row_keys {
+                Some(keys) => cache.invalidate_keys(keys),
+                None => cache.invalidate_all(),
+            }
+        }
+        if written.namespace
+            && let Some(cache) = &self.namespace_rows
+        {
+            match written.created {
+                Some(ino) => cache.invalidate_keys(&[
+                    row_cache::RowKey::Paths(ino),
+                    row_cache::RowKey::Aliases(ino),
+                ]),
+                None => cache.invalidate_all(),
+            }
+        }
+    }
+
+    /// Tie the row caches to this mount's lease: they serve rows only while
+    /// `validity` proves the exclusive lease is held. With this set, the TTL
+    /// is only a memory/working-set bound, not the staleness bound.
+    pub fn with_lease_bound_row_cache(
+        mut self,
+        validity: Arc<super::lifecycle::LeaseValidity>,
+    ) -> Self {
+        self.lease_validity = Some(validity);
+        self
+    }
+
+    /// False once the lease can no longer be proven: every cached row is
+    /// dropped (and stays bypassed), so no stale upper row is served.
+    fn row_caches_authoritative(&self) -> bool {
+        let Some(validity) = &self.lease_validity else {
+            return true;
+        };
+        if validity.authoritative() {
+            return true;
+        }
+        if let Some(cache) = &self.upper_rows {
+            cache.invalidate_all();
+        }
+        if let Some(cache) = &self.namespace_rows {
+            cache.invalidate_all();
+        }
+        false
+    }
+
+    /// Frozen read fence without a round trip: while the exclusive lease is
+    /// proven held, no other writer can change upper rows and every local
+    /// commit invalidates the keys it writes (before and after), so the
+    /// cached rows of `ino` are exactly the store's rows. Returns the cached
+    /// head/base pair and those rows, or None to use the remote fence.
+    pub(super) async fn lease_proven_inode_rows(
+        &self,
+        ino: i64,
+    ) -> Result<Option<([LayerRecord; 2], Arc<Vec<InodeDelta>>)>, MetaError> {
+        if self.lease_validity.is_none() {
+            return Ok(None);
+        }
+        let Some(cache) = self.upper_row_cache() else {
+            return Ok(None);
+        };
+        let chain: [LayerRecord; 2] = match self.chain().await?.try_into() {
+            Ok(chain) => chain,
+            Err(_) => return Ok(None),
+        };
+        let rows = match cache.get(&row_cache::RowKey::Inode(ino)) {
+            Some(row_cache::RowValue::Inode(rows)) => rows,
+            _ => {
+                let ticket = cache.ticket();
+                let rows = Arc::new(
+                    self.store
+                        .get_inode_deltas(InodeQuery {
+                            layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
+                            ino,
+                        })
+                        .await
+                        .map_err(workspace_to_meta)?,
+                );
+                cache.insert(
+                    ticket,
+                    row_cache::RowKey::Inode(ino),
+                    row_cache::RowValue::Inode(rows.clone()),
+                );
+                rows
+            }
+        };
+        // Re-check after the (possibly awaited) load: the proof must still
+        // hold when the rows are used as the fence.
+        if !self.row_caches_authoritative() {
+            return Ok(None);
+        }
+        Ok(Some((chain, rows)))
+    }
+
+    /// A handle that re-checks the lease-proven local fence later (at the end
+    /// of a read request) without the meta layer.
+    pub(super) fn lease_local_fence(&self) -> Option<row_cache::LeaseLocalFence> {
+        let validity = self.lease_validity.clone()?;
+        let cache = self.upper_rows.clone()?;
+        self.packed_lower()
+            .is_some()
+            .then_some(row_cache::LeaseLocalFence { cache, validity })
+    }
+
+    fn namespace_row_cache(&self) -> Option<&row_cache::UpperRowCache> {
+        self.namespace_rows
+            .as_ref()
+            .filter(|_| self.packed_lower().is_some() && self.row_caches_authoritative())
+    }
+
+    fn upper_row_cache(&self) -> Option<&row_cache::UpperRowCache> {
+        self.upper_rows
+            .as_ref()
+            .filter(|_| self.packed_lower().is_some() && self.row_caches_authoritative())
+            .map(|cache| cache.as_ref())
     }
 
     pub fn with_read_plan_cache_max_weight(mut self, max_weight: u64) -> Self {
@@ -229,6 +509,13 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             .and_then(|lower| lower.authority.reader_session())
     }
 
+    /// Diagnostics only: render the packed lower's index cache, budget and
+    /// read-observer counters in the mount's `.stats` file.
+    pub fn install_packed_lower_stats(&self, stats: &crate::vfs::stats::FsStats) -> bool {
+        self.packed_lower()
+            .is_some_and(|lower| lower.metadata.install_stats(stats))
+    }
+
     pub(crate) fn packed_lower(&self) -> Option<&Arc<WorkspacePackedLower>> {
         match &self.lower {
             WorkspaceLower::Native => None,
@@ -259,18 +546,35 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         Ok(())
     }
 
-    async fn validate_packed_metadata(
+    async fn packed_metadata_fence(
         &self,
-        lower: &WorkspacePackedLower,
-    ) -> Result<(), MetaError> {
-        lower
-            .authority
-            .validate(&self.guard().await, &lower.binding)
-            .await
-            .map_err(workspace_to_meta)
+    ) -> Result<
+        Option<(
+            HeadGuard,
+            [LayerRecord; 2],
+            Option<super::packed_reader_lifecycle::PackedReaderRequestOwner>,
+        )>,
+        MetaError,
+    > {
+        let Some(lower) = self.packed_lower() else {
+            return Ok(None);
+        };
+        let _ = lower;
+        // Immutable lower: the cached head/base pair is the read view. No
+        // reader pin, binding authentication or remote fence per op.
+        let guard = self.guard().await;
+        let chain = self.chain().await?;
+        let layers: [LayerRecord; 2] = chain
+            .try_into()
+            .map_err(|_| workspace_to_meta(WorkspaceError::Fenced))?;
+        Ok(Some((guard, layers, None)))
     }
 
-    async fn packed_metadata_fence(
+    /// Fence for multi-step reads (directory pages, xattr lists, paths). They
+    /// hold a fresh head record and reader generation across awaits and
+    /// re-check the head/lease between steps. The immutable lower's binding
+    /// is authenticated once at attach, never per step.
+    pub(super) async fn packed_enumeration_fence(
         &self,
     ) -> Result<
         Option<(
@@ -291,29 +595,19 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         let chain = self.chain().await?;
         let layers = [
             self.store
-                .load_layer(chain[0].layer_id)
+                .load_layer(guard.expected_head_layer_id)
                 .await
                 .map_err(workspace_to_meta)?,
-            self.store
-                .load_layer(chain[1].layer_id)
-                .await
-                .map_err(workspace_to_meta)?,
+            chain[1].clone(),
         ];
-        if layers[0].layer_id != guard.expected_head_layer_id
-            || layers[1].layer_id != lower.binding.base_layer_id
-        {
+        if layers[1].layer_id != lower.binding.base_layer_id {
             return Err(workspace_to_meta(WorkspaceError::Fenced));
         }
-        lower
-            .authority
-            .validate(&guard, &lower.binding)
-            .await
-            .map_err(workspace_to_meta)?;
+        validate_fixed_layer_pair(&layers).map_err(workspace_to_meta)?;
         self.store
             .validate_read_fence(guard.clone(), layers.clone())
             .await
             .map_err(workspace_to_meta)?;
-        validate_fixed_layer_pair(&layers).map_err(workspace_to_meta)?;
         Ok(Some((guard, layers, reader_owner)))
     }
 
@@ -325,19 +619,19 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             Option<super::packed_reader_lifecycle::PackedReaderRequestOwner>,
         )>,
     ) -> Result<(), MetaError> {
-        if let Some((guard, layers, _reader_owner)) = fence {
+        if let Some((guard, layers, reader_owner)) = fence {
             let lower = self
                 .packed_lower()
                 .ok_or_else(|| workspace_to_meta(WorkspaceError::Fenced))?;
-            lower
-                .authority
-                .validate(&guard, &lower.binding)
-                .await
-                .map_err(workspace_to_meta)?;
-            self.store
-                .validate_read_fence(guard, layers)
-                .await
-                .map_err(workspace_to_meta)?;
+            let _ = lower;
+            // Single-step reads carry no owner and need no recheck.
+            // Multi-step enumeration fences re-check the head/lease.
+            if reader_owner.is_some() {
+                self.store
+                    .validate_read_fence(guard, layers)
+                    .await
+                    .map_err(workspace_to_meta)?;
+            }
         }
         Ok(())
     }
@@ -353,6 +647,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
     pub async fn replace_view_context(&self, view: ViewContext) {
         let old_workspace = self.view.read().await.workspace_id;
         self.resolver_cache.invalidate_workspace(old_workspace);
+        self.invalidate_upper_rows();
         *self.view.write().await = view;
         *self.layer_pair.write().await = None;
     }
@@ -395,14 +690,30 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         ino: i64,
     ) -> Result<Resolution<InodeDelta>, MetaError> {
         let chain = self.chain().await?;
-        let rows = self
-            .store
-            .get_inode_deltas(InodeQuery {
-                layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
-                ino,
-            })
-            .await
-            .map_err(workspace_to_meta)?;
+        let cache = self.upper_row_cache();
+        let rows = match cache.and_then(|cache| cache.get(&row_cache::RowKey::Inode(ino))) {
+            Some(row_cache::RowValue::Inode(rows)) => rows,
+            _ => {
+                let ticket = cache.map(row_cache::UpperRowCache::ticket);
+                let rows = std::sync::Arc::new(
+                    self.store
+                        .get_inode_deltas(InodeQuery {
+                            layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
+                            ino,
+                        })
+                        .await
+                        .map_err(workspace_to_meta)?,
+                );
+                if let (Some(cache), Some(ticket)) = (cache, ticket) {
+                    cache.insert(
+                        ticket,
+                        row_cache::RowKey::Inode(ino),
+                        row_cache::RowValue::Inode(rows.clone()),
+                    );
+                }
+                rows
+            }
+        };
         Ok(resolve_inode_state(&chain, &rows, ino)
             .map_err(workspace_to_meta)?
             .map(|resolved| resolved.inode))
@@ -410,12 +721,229 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
 
     async fn resolve_inode_delta(&self, ino: i64) -> Result<Option<InodeDelta>, MetaError> {
         if self.packed_lower().is_some() {
-            let snapshot = self.permission_snapshot(vec![ino], None).await?;
+            let snapshot = self.cached_permission_snapshot(ino).await?;
             return Ok(resolve_inode(&snapshot.layers, &snapshot.inodes, ino)
                 .map_err(workspace_to_meta)?
                 .map(|value| value.inode));
         }
         Ok(self.resolve_inode_delta_state(ino).await?.into_option())
+    }
+
+    fn validate_write(
+        ino: i64,
+        chunk_id: u64,
+        slice: &SliceDesc,
+        new_size: u64,
+        chunk_size: u64,
+    ) -> Result<(), MetaError> {
+        let (chunk_ino, chunk_index) = crate::vfs::extract_ino_and_chunk_index(chunk_id);
+        if chunk_ino != ino || slice.chunk_id != chunk_id || slice.length == 0 {
+            return Err(MetaError::InvalidPath(
+                "slice does not match the workspace inode/chunk".into(),
+            ));
+        }
+        let end = slice
+            .offset
+            .checked_add(slice.length)
+            .ok_or_else(|| MetaError::InvalidPath("slice range overflows".into()))?;
+        if end > chunk_size {
+            return Err(MetaError::InvalidPath(
+                "slice range exceeds workspace chunk size".into(),
+            ));
+        }
+        let slice_start = chunk_index
+            .checked_mul(chunk_size)
+            .and_then(|start| start.checked_add(slice.offset))
+            .ok_or_else(|| MetaError::InvalidPath("slice start overflows".into()))?;
+        if new_size <= slice_start {
+            return Err(MetaError::InvalidPath(format!(
+                "new size {new_size} does not cover slice start {slice_start}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Drain the write queue in batches until it is empty, then give up
+    /// leadership. Runs while the caller's own write is queued, so the
+    /// caller always ends up in one of these batches.
+    async fn lead_group_commits(&self) {
+        loop {
+            let batch = {
+                let mut queue = self.write_queue.lock().unwrap();
+                if queue.pending.is_empty() {
+                    queue.leader = false;
+                    return;
+                }
+                let take = queue.pending.len().min(MAX_GROUP_WRITES);
+                queue.pending.drain(..take).collect::<Vec<_>>()
+            };
+            let _mutation_guard = self.mutation_gate.lock().await;
+            // A member whose inode is gone or not a regular file fails alone;
+            // it must not fail unrelated writes sharing the batch.
+            let mut members = Vec::with_capacity(batch.len());
+            for member in batch {
+                match self.write_target_is_file(member.ino).await {
+                    Ok(()) => members.push(member),
+                    Err(error) => {
+                        let _ = member.reply.send(Err(error));
+                    }
+                }
+            }
+            if members.is_empty() {
+                continue;
+            }
+            let result = self.commit_write_batch(&members).await;
+            drop(_mutation_guard);
+            for member in members {
+                let _ = member.reply.send(match &result {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(duplicate_write_error(error)),
+                });
+            }
+        }
+    }
+
+    async fn write_target_is_file(&self, ino: i64) -> Result<(), MetaError> {
+        let inode = self
+            .resolve_inode_delta(ino)
+            .await?
+            .ok_or(MetaError::NotFound(ino))?;
+        if file_type_from_code(inode.kind)? != FileType::File {
+            return Err(MetaError::NotSupported(
+                "workspace data writes require a regular file".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Commit every write of `batch` in one versioned mutation: one inode row
+    /// per distinct inode (folded in arrival order) and every visible extent
+    /// in arrival order, so a later write still wins on overlap.
+    async fn commit_write_batch(&self, batch: &[PendingWrite]) -> Result<(), MetaError> {
+        for _ in 0..64 {
+            let expected_layers = self.mutation_version().await?;
+            let result = async {
+                let mut inodes: BTreeMap<i64, InodeDelta> = BTreeMap::new();
+                let mut extents = Vec::with_capacity(batch.len());
+                let now = now_ns()?;
+                for write in batch {
+                    let inode = match inodes.remove(&write.ino) {
+                        Some(inode) => inode,
+                        None => {
+                            let inode = self
+                                .resolve_inode_delta(write.ino)
+                                .await?
+                                .ok_or(MetaError::NotFound(write.ino))?;
+                            if file_type_from_code(inode.kind)? != FileType::File {
+                                return Err(MetaError::NotSupported(
+                                    "workspace data writes require a regular file".into(),
+                                ));
+                            }
+                            inode
+                        }
+                    };
+                    let mut inode = inode;
+                    let (_, chunk_index) = crate::vfs::extract_ino_and_chunk_index(write.chunk_id);
+                    let slice_start = chunk_index * self.chunk_size + write.slice.offset;
+                    // Publish only the visible prefix; see the single-write
+                    // rationale (aligned tails past EOF stay out of the graph).
+                    let visible_length = write.slice.length.min(write.new_size - slice_start);
+                    inode.size = inode.size.max(write.new_size);
+                    inode.mtime_ns = now;
+                    inode.ctime_ns = now;
+                    inode.data_version = inode.data_version.saturating_add(1);
+                    extents.push(DataExtentDelta::data(
+                        inode.layer_id,
+                        write.ino,
+                        chunk_index,
+                        write.slice.offset,
+                        visible_length,
+                        write.slice.slice_id,
+                        0,
+                        0,
+                    ));
+                    inodes.insert(write.ino, inode);
+                }
+                self.mutate_data_batch(&expected_layers, inodes.into_values().collect(), extents)
+                    .await
+            }
+            .await;
+            match result {
+                Err(MetaError::Io(ref error)) if error.raw_os_error() == Some(libc::EBUSY) => {
+                    tokio::task::yield_now().await;
+                }
+                other => return other,
+            }
+        }
+        Err(MetaError::Io(std::io::Error::from_raw_os_error(
+            libc::EBUSY,
+        )))
+    }
+
+    /// A create just committed the only dentry naming the fresh inode `ino`
+    /// (it was allocated by this create, so no other alias exists), so its
+    /// complete path set is exactly `parent`'s cached paths joined with
+    /// `name`. Seed it so the first permission walk of the new file needs no
+    /// reverse-index scan. Only when `parent`'s complete paths are cached
+    /// under the lease-bound namespace cache; otherwise nothing is seeded.
+    fn seed_created_paths(&self, parent: i64, name: &str, ino: i64) {
+        let Some(cache) = self.namespace_row_cache() else {
+            return;
+        };
+        let ticket = cache.ticket();
+        let parent_paths = if parent == self.root_ino() {
+            Arc::new(vec![b"/".to_vec()])
+        } else {
+            match cache.get(&row_cache::RowKey::Paths(parent)) {
+                Some(row_cache::RowValue::Paths(paths)) => paths,
+                _ => return,
+            }
+        };
+        if parent_paths.is_empty() {
+            return;
+        }
+        let paths = parent_paths
+            .iter()
+            .map(|path| {
+                let mut child = path.clone();
+                if child.last() != Some(&b'/') {
+                    child.push(b'/');
+                }
+                child.extend_from_slice(name.as_bytes());
+                child
+            })
+            .collect::<Vec<_>>();
+        cache.insert(
+            ticket,
+            row_cache::RowKey::Paths(ino),
+            row_cache::RowValue::Paths(Arc::new(paths)),
+        );
+    }
+
+    /// One inode's permission snapshot. While the exclusive lease is proven
+    /// held the lease-bound row cache answers it: this mount is the only
+    /// upper writer and every commit drops the `Permission` key of each inode
+    /// it writes (before and after). A mutation built on it still CASes the
+    /// head version it read, so a stale entry can only fail that CAS.
+    async fn cached_permission_snapshot(&self, ino: i64) -> Result<PermissionSnapshot, MetaError> {
+        let lease_bound = self.lease_validity.is_some() && self.row_caches_authoritative();
+        let cache = self.upper_row_cache().filter(|_| lease_bound);
+        let key = row_cache::RowKey::Permission(ino);
+        if let Some(row_cache::RowValue::Permission(snapshot)) =
+            cache.and_then(|cache| cache.get(&key))
+        {
+            return Ok((*snapshot).clone());
+        }
+        let ticket = cache.map(row_cache::UpperRowCache::ticket);
+        let snapshot = self.permission_snapshot(vec![ino], None).await?;
+        if let (Some(cache), Some(ticket)) = (cache, ticket) {
+            cache.insert(
+                ticket,
+                key,
+                row_cache::RowValue::Permission(Arc::new(snapshot.clone())),
+            );
+        }
+        Ok(snapshot)
     }
 
     async fn resolve_dentry_entry(
@@ -425,15 +953,28 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
     ) -> Result<Option<ResolvedDentry>, MetaError> {
         let fence = self.packed_metadata_fence().await?;
         let chain = self.chain().await?;
-        let rows = self
-            .store
-            .get_dentry_deltas(DentryQuery {
-                layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
-                parent_ino: parent,
-                name: Some(name.to_vec()),
-            })
-            .await
-            .map_err(workspace_to_meta)?;
+        let cache = self.upper_row_cache();
+        let key = row_cache::RowKey::Dentry(parent, name.to_vec());
+        let rows = match cache.and_then(|cache| cache.get(&key)) {
+            Some(row_cache::RowValue::Dentry(rows)) => rows,
+            _ => {
+                let ticket = cache.map(row_cache::UpperRowCache::ticket);
+                let rows = std::sync::Arc::new(
+                    self.store
+                        .get_dentry_deltas(DentryQuery {
+                            layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
+                            parent_ino: parent,
+                            name: Some(name.to_vec()),
+                        })
+                        .await
+                        .map_err(workspace_to_meta)?,
+                );
+                if let (Some(cache), Some(ticket)) = (cache, ticket) {
+                    cache.insert(ticket, key, row_cache::RowValue::Dentry(rows.clone()));
+                }
+                rows
+            }
+        };
         let result =
             match resolve_dentry_state(&chain, &rows, parent, name).map_err(workspace_to_meta)? {
                 Resolution::Present(entry) => Ok(Some(entry)),
@@ -442,9 +983,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                     let Some(lower) = self.packed_lower() else {
                         return Ok(None);
                     };
-                    self.validate_packed_metadata(lower).await?;
                     let entry = lower.metadata.lookup_with_attr_bytes(parent, name).await?;
-                    self.validate_packed_metadata(lower).await?;
                     Ok(entry.map(|(ino, attr)| ResolvedDentry {
                         layer_id: lower.binding.base_layer_id,
                         parent_ino: parent,
@@ -531,7 +1070,8 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         if actor.uid == 0 {
             return Ok(());
         }
-        let (directory, access, _, control) = self.permission_inode(expected, parent).await?;
+        let (directory, access, _, control) =
+            self.permission_inode_for_check(expected, parent).await?;
         if directory.kind != file_type_code(FileType::Dir) {
             return Err(MetaError::NotDirectory(parent));
         }
@@ -560,7 +1100,8 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                 if !visited.insert(ino) {
                     return Err(MetaError::Io(std::io::Error::from_raw_os_error(libc::EIO)));
                 }
-                let (inode, access, _, control) = self.permission_inode(expected, ino).await?;
+                let (inode, access, _, control) =
+                    self.permission_inode_for_check(expected, ino).await?;
                 if inode.kind != file_type_code(FileType::Dir) {
                     return Err(MetaError::NotDirectory(ino));
                 }
@@ -586,7 +1127,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             && actor.uid != directory.uid
             && let Some(child) = child
         {
-            let (inode, _, _, _) = self.permission_inode(expected, child).await?;
+            let (inode, _, _, _) = self.permission_inode_for_check(expected, child).await?;
             if actor.uid != inode.uid {
                 return Err(MetaError::Io(std::io::Error::from_raw_os_error(
                     libc::EPERM,
@@ -637,6 +1178,44 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             0
         };
         Ok((inode.mode >> shift) & requested == requested)
+    }
+
+    /// For a read-only permission decision inside a conditional mutation.
+    /// While the exclusive lease is proven held, the cached permission rows
+    /// of `ino` are exactly the store's (every local commit invalidates the
+    /// rows it writes), so they answer the decision without a round trip;
+    /// the mutation's own CAS still checks its layer version. Otherwise this
+    /// is `permission_inode`. Never use it for rows the commit writes back.
+    async fn permission_inode_for_check(
+        &self,
+        expected: &[LayerRecord; 2],
+        ino: i64,
+    ) -> Result<PermissionInode, MetaError> {
+        if self.lease_validity.is_some()
+            && let Some(cache) = self.upper_row_cache()
+            && let Some(row_cache::RowValue::Permission(snapshot)) =
+                cache.get(&row_cache::RowKey::Permission(ino))
+            && snapshot.layers[0].layer_id == expected[0].layer_id
+            && snapshot.layers[1].layer_id == expected[1].layer_id
+            && self.row_caches_authoritative()
+        {
+            return Self::decode_permission_inode((*snapshot).clone(), ino);
+        }
+        let ticket = self.upper_row_cache().map(row_cache::UpperRowCache::ticket);
+        let snapshot = self.permission_snapshot(vec![ino], None).await?;
+        if &snapshot.layers != expected {
+            return Err(workspace_to_meta(WorkspaceError::Busy));
+        }
+        if self.lease_validity.is_some()
+            && let (Some(cache), Some(ticket)) = (self.upper_row_cache(), ticket)
+        {
+            cache.insert(
+                ticket,
+                row_cache::RowKey::Permission(ino),
+                row_cache::RowValue::Permission(Arc::new(snapshot.clone())),
+            );
+        }
+        Self::decode_permission_inode(snapshot, ino)
     }
 
     async fn permission_inode(
@@ -743,6 +1322,44 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         self.resolver_cache
             .invalidate_inode(guard.workspace_id, inode.ino);
         Ok(inode)
+    }
+
+    async fn mutate_data_batch(
+        &self,
+        expected: &[LayerRecord; 2],
+        mut inodes: Vec<InodeDelta>,
+        mut extents: Vec<DataExtentDelta>,
+    ) -> Result<(), MetaError> {
+        let guard = self.guard().await;
+        for inode in &mut inodes {
+            inode.layer_id = guard.expected_head_layer_id;
+            inode.sequence = 0;
+        }
+        for extent in &mut extents {
+            extent.layer_id = guard.expected_head_layer_id;
+            extent.sequence = 0;
+        }
+        let private_bytes = extents
+            .iter()
+            .filter_map(|extent| {
+                matches!(extent.kind, super::model::ExtentKind::Data { .. })
+                    .then_some(extent.length)
+            })
+            .fold(0u64, u64::saturating_add);
+        let touched = inodes.iter().map(|inode| inode.ino).collect::<Vec<_>>();
+        self.commit_versioned_mutation(VersionedMutation {
+            inodes,
+            extents,
+            ..VersionedMutation::empty(guard.clone(), expected.clone(), self.chunk_size)
+        })
+        .await
+        .map_err(|error| self.mutation_error(error))?;
+        self.metrics.add_private_bytes_written(private_bytes);
+        for ino in touched {
+            self.resolver_cache
+                .invalidate_inode(guard.workspace_id, ino);
+        }
+        Ok(())
     }
 
     fn mutation_error(&self, error: WorkspaceError) -> MetaError {
@@ -1126,25 +1743,29 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                         });
                     }
                 }
-                self.commit_versioned_mutation(VersionedMutation {
-                    expected_layers: expected_layers.clone(),
-                    xattrs,
-                    acls: Vec::new(),
-                    extents: Vec::new(),
-                    chunk_size: self.chunk_size,
-                    guard,
-                    dentries: vec![DentryDelta::put(
-                        inode.layer_id,
-                        parent,
-                        name.as_bytes().to_vec(),
-                        ino,
-                        inode.kind,
-                        0,
-                    )],
-                    inodes: vec![inode.clone(), parent_inode],
-                })
+                self.commit_created_mutation(
+                    VersionedMutation {
+                        expected_layers: expected_layers.clone(),
+                        xattrs,
+                        acls: Vec::new(),
+                        extents: Vec::new(),
+                        chunk_size: self.chunk_size,
+                        guard,
+                        dentries: vec![DentryDelta::put(
+                            inode.layer_id,
+                            parent,
+                            name.as_bytes().to_vec(),
+                            ino,
+                            inode.kind,
+                            0,
+                        )],
+                        inodes: vec![inode.clone(), parent_inode],
+                    },
+                    ino,
+                )
                 .await
                 .map_err(workspace_to_meta)?;
+                self.seed_created_paths(parent, &name, ino);
                 Ok((ino, file_attr(&inode)?))
             }
             .await;
@@ -1390,6 +2011,11 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         )))
     }
 
+    fn permission_snapshot_answers_access(&self) -> bool {
+        self.packed_lower().is_some()
+            && self.posix_acl_capability() == PosixAclCapability::ReadWrite
+    }
+
     fn posix_acl_capability(&self) -> PosixAclCapability {
         if self.store.supports_versioned_permissions()
             && (self.packed_lower().is_none() || self.store.supports_packed_permissions())
@@ -1401,7 +2027,25 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
     }
 
     async fn inode_permissions(&self, ino: i64) -> Result<Option<InodePermissions>, MetaError> {
-        let snapshot = self.permission_snapshot(vec![ino], None).await?;
+        // Read-only access decision: may use the cached snapshot. Mutations
+        // take their own fresh permission snapshot and CAS on its layers.
+        let cache = self.upper_row_cache();
+        let key = row_cache::RowKey::Permission(ino);
+        let snapshot = match cache.and_then(|cache| cache.get(&key)) {
+            Some(row_cache::RowValue::Permission(snapshot)) => (*snapshot).clone(),
+            _ => {
+                let ticket = cache.map(row_cache::UpperRowCache::ticket);
+                let snapshot = self.permission_snapshot(vec![ino], None).await?;
+                if let (Some(cache), Some(ticket)) = (cache, ticket) {
+                    cache.insert(
+                        ticket,
+                        key,
+                        row_cache::RowValue::Permission(std::sync::Arc::new(snapshot.clone())),
+                    );
+                }
+                snapshot
+            }
+        };
         let Some(inode) =
             resolve_inode(&snapshot.layers, &snapshot.inodes, ino).map_err(workspace_to_meta)?
         else {
@@ -1476,7 +2120,6 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         }
         self.chain().await?;
         if let Some(lower) = self.packed_lower() {
-            self.validate_packed_metadata(lower).await?;
             let chain = self.chain().await?;
             if lower.binding.base_layer_id != chain[1].layer_id
                 || lower.metadata.root_ino() != self.root_ino()
@@ -1509,9 +2152,7 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                 let Some(lower) = self.packed_lower() else {
                     return Ok(None);
                 };
-                self.validate_packed_metadata(lower).await?;
                 let attr = lower.metadata.stat_fresh(ino).await?;
-                self.validate_packed_metadata(lower).await?;
                 Ok(attr)
             }
         };
@@ -1536,14 +2177,29 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         let _mutation_guard = self.mutation_gate.lock().await;
         let actor = crate::meta::layer::namespace_actor();
         let created = actor.is_some() && crate::meta::layer::take_created_inode_open_authority(ino);
+        // A frozen-base read-only open changes no state, so it does not pay
+        // an empty authenticated CAS; later write opens still do.
+        // The creator's own first open of an inode its create just committed
+        // (frozen mode) needs no second authenticated CAS: the create commit
+        // already authenticated binding, head, lease and writer authority at
+        // the same head version, and this mount is the only upper writer.
+        // Any later writable open still commits one.
+        let open_commits = self
+            .packed_lower()
+            .is_some_and(|_| (_write || _append) && !created);
         for _ in 0..64 {
             let prepared = async {
-                let version = if self.packed_lower().is_some() {
+                let version = if self.packed_lower().is_some() && open_commits {
                     Some(self.mutation_version().await?)
                 } else {
                     None
                 };
-                let snapshot = self.permission_snapshot(vec![ino], None).await?;
+                let snapshot = match &version {
+                    // A commit follows: it CASes this exact head version.
+                    Some(_) => self.permission_snapshot(vec![ino], None).await?,
+                    // Decision only (no commit): the lease-bound cache.
+                    None => self.cached_permission_snapshot(ino).await?,
+                };
                 Ok::<_, MetaError>((version, snapshot))
             }
             .await;
@@ -1580,7 +2236,7 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                     )));
                 }
             }
-            if self.packed_lower().is_some() {
+            if open_commits {
                 match self
                     .commit_versioned_mutation(VersionedMutation::empty(
                         self.guard().await,
@@ -1617,6 +2273,16 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         };
         if remove {
             self.open_counts.remove(&ino);
+        }
+        // Only an unlinked inode needs the orphan-removal commit. The common
+        // close of a linked file skips the mutation version entirely; the
+        // loop below re-reads the inode under a fresh version before writing.
+        let remove = remove
+            && self
+                .resolve_inode_delta(ino)
+                .await?
+                .is_some_and(|inode| inode.nlink == 0);
+        if remove {
             for attempt in 0..64 {
                 let expected_layers = self.mutation_version().await?;
                 let Some(mut inode) = self.resolve_inode_delta(ino).await? else {
@@ -2496,81 +3162,27 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         slice: SliceDesc,
         new_size: u64,
     ) -> Result<(), MetaError> {
-        let _mutation_guard = self.mutation_gate.lock().await;
-        for _ in 0..64 {
-            let expected_layers = self.mutation_version().await?;
-            let result = async {
-                let (chunk_ino, chunk_index) = crate::vfs::extract_ino_and_chunk_index(chunk_id);
-                if chunk_ino != ino || slice.chunk_id != chunk_id || slice.length == 0 {
-                    return Err(MetaError::InvalidPath(
-                        "slice does not match the workspace inode/chunk".into(),
-                    ));
-                }
-                let end = slice
-                    .offset
-                    .checked_add(slice.length)
-                    .ok_or_else(|| MetaError::InvalidPath("slice range overflows".into()))?;
-                if end > self.chunk_size {
-                    return Err(MetaError::InvalidPath(
-                        "slice range exceeds workspace chunk size".into(),
-                    ));
-                }
-                let mut inode = self
-                    .resolve_inode_delta(ino)
-                    .await?
-                    .ok_or(MetaError::NotFound(ino))?;
-                if file_type_from_code(inode.kind)? != FileType::File {
-                    return Err(MetaError::NotSupported(
-                        "workspace data writes require a regular file".into(),
-                    ));
-                }
-                let chunk_start = chunk_index
-                    .checked_mul(self.chunk_size)
-                    .ok_or_else(|| MetaError::InvalidPath("file size overflows".into()))?;
-                let slice_start = chunk_start
-                    .checked_add(slice.offset)
-                    .ok_or_else(|| MetaError::InvalidPath("slice start overflows".into()))?;
-                if new_size <= slice_start {
-                    return Err(MetaError::InvalidPath(format!(
-                        "new size {new_size} does not cover slice start {slice_start}"
-                    )));
-                }
-                // The writer may persist an aligned physical slice that extends past the
-                // logical EOF (for example a 64 KiB cached sub-block produced by a 4 KiB
-                // mmap write).  Only publish the visible prefix.  Keeping the aligned tail
-                // out of the extent graph also guarantees that a later truncate-extend
-                // observes zeroes rather than resurrecting bytes beyond the old EOF.
-                let visible_length = slice.length.min(new_size - slice_start);
-                let now = now_ns()?;
-                inode.size = inode.size.max(new_size);
-                inode.mtime_ns = now;
-                inode.ctime_ns = now;
-                inode.data_version = inode.data_version.saturating_add(1);
-                let extent = DataExtentDelta::data(
-                    inode.layer_id,
-                    ino,
-                    chunk_index,
-                    slice.offset,
-                    visible_length,
-                    slice.slice_id,
-                    0,
-                    0,
-                );
-                self.mutate_data(&expected_layers, inode, vec![extent], Vec::new())
-                    .await?;
-                Ok(())
-            }
-            .await;
-            match result {
-                Err(MetaError::Io(ref error)) if error.raw_os_error() == Some(libc::EBUSY) => {
-                    tokio::task::yield_now().await;
-                }
-                other => return other,
-            }
+        Self::validate_write(ino, chunk_id, &slice, new_size, self.chunk_size)?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let lead = {
+            let mut queue = self.write_queue.lock().unwrap();
+            queue.pending.push(PendingWrite {
+                ino,
+                chunk_id,
+                slice,
+                new_size,
+                reply: sender,
+            });
+            !std::mem::replace(&mut queue.leader, true)
+        };
+        if lead {
+            self.lead_group_commits().await;
         }
-        Err(MetaError::Io(std::io::Error::from_raw_os_error(
-            libc::EBUSY,
-        )))
+        receiver.await.unwrap_or_else(|_| {
+            Err(MetaError::Internal(
+                "workspace group commit leader was dropped".into(),
+            ))
+        })
     }
 
     async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError> {
@@ -2886,15 +3498,28 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
             return Err(MetaError::NotFound(inode));
         }
         let chain = self.chain().await?;
-        let rows = self
-            .store
-            .get_xattr_deltas(XattrQuery {
-                layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
-                ino: inode,
-                name: Some(name.to_vec()),
-            })
-            .await
-            .map_err(workspace_to_meta)?;
+        let cache = self.upper_row_cache();
+        let key = row_cache::RowKey::Xattr(inode, name.to_vec());
+        let rows = match cache.and_then(|cache| cache.get(&key)) {
+            Some(row_cache::RowValue::Xattr(rows)) => rows,
+            _ => {
+                let ticket = cache.map(row_cache::UpperRowCache::ticket);
+                let rows = std::sync::Arc::new(
+                    self.store
+                        .get_xattr_deltas(XattrQuery {
+                            layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
+                            ino: inode,
+                            name: Some(name.to_vec()),
+                        })
+                        .await
+                        .map_err(workspace_to_meta)?,
+                );
+                if let (Some(cache), Some(ticket)) = (cache, ticket) {
+                    cache.insert(ticket, key, row_cache::RowValue::Xattr(rows.clone()));
+                }
+                rows
+            }
+        };
         let result =
             match resolve_xattr_state(&chain, &rows, inode, name).map_err(workspace_to_meta)? {
                 Resolution::Present(value) => Ok(Some(value.value)),
@@ -2903,9 +3528,7 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                     let Some(lower) = self.packed_lower() else {
                         return Ok(None);
                     };
-                    self.validate_packed_metadata(lower).await?;
                     let value = lower.metadata.get_xattr_bytes(inode, name).await?;
-                    self.validate_packed_metadata(lower).await?;
                     Ok(value)
                 }
             };
@@ -3112,9 +3735,7 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                 let Some(lower) = self.packed_lower() else {
                     return Ok(None);
                 };
-                self.validate_packed_metadata(lower).await?;
                 let value = lower.metadata.get_acl(inode, acl_type, acl_id).await?;
-                self.validate_packed_metadata(lower).await?;
                 self.validate_packed_metadata_fence(fence).await?;
                 return Ok(value);
             }

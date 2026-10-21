@@ -7,9 +7,9 @@ use super::digest::CanonicalLayerDelta;
 use super::error::WorkspaceError;
 use super::ids::{JournalId, LayerId, LeaseId, SnapshotId, WorkspaceId};
 use super::model::{
-    AclDelta, BaseRevision, CommitResult, DataExtentDelta, DentryDelta, InodeDelta, InodeState,
-    LayerRecord, LayerState, SealJournal, SealPhase, SealResult, SnapshotLease, SnapshotRecord,
-    ValueOp, VolumeHeader, WorkspaceRecord, XattrDelta,
+    AclDelta, BaseRevision, DataExtentDelta, DentryDelta, InodeDelta, InodeState, LayerRecord,
+    LayerState, SealJournal, SnapshotLease, SnapshotRecord, ValueOp, VolumeHeader, WorkspaceRecord,
+    XattrDelta,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,38 +108,6 @@ pub struct CreateSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BeginSeal {
-    pub guard: HeadGuard,
-    pub journal_id: JournalId,
-    pub new_head_layer_id: LayerId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdvanceSeal {
-    pub journal_id: JournalId,
-    pub expected_phase: SealPhase,
-    pub next_phase: SealPhase,
-    pub pending_bytes: Option<u64>,
-    pub last_error: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AbortSeal {
-    pub journal_id: JournalId,
-    pub reason: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FastForwardCommit {
-    pub source_revision: BaseRevision,
-    pub source_fork_base: BaseRevision,
-    pub target_workspace_id: WorkspaceId,
-    pub target_expected_head_layer_id: LayerId,
-    pub target_expected_head_epoch: u64,
-    pub new_head_layer_id: LayerId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkDeleting {
     pub workspace_id: WorkspaceId,
     pub force_fence_lease: bool,
@@ -173,8 +141,11 @@ pub struct DeleteLayerMetadata {
     pub lease_grace_ns: u64,
 }
 
+/// Test-only: materialize an offline workspace's resolved chain as a new flat
+/// immutable lower. Production lowers come only from packed publication.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InstallCompaction {
+pub struct InstallTestBase {
     pub workspace_id: WorkspaceId,
     pub expected_head_layer_id: LayerId,
     pub expected_head_epoch: u64,
@@ -184,8 +155,9 @@ pub struct InstallCompaction {
     pub delta: CanonicalLayerDelta,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompactionResult {
+pub struct TestBaseResult {
     pub revision: BaseRevision,
     pub replacement_head_layer_id: LayerId,
     pub head_epoch: u64,
@@ -225,6 +197,10 @@ pub struct XattrQuery {
 pub struct WorkspaceNamePage<T> {
     pub rows: Vec<T>,
     pub memory_guard: crate::meta::layer::MetadataMemoryGuard,
+    /// The backend proved no row follows this page (a short page from an
+    /// atomic single-range read). False never means more rows exist; callers
+    /// then continue until an empty page.
+    pub end: bool,
 }
 
 /// Opaque, owned completeness authority for the fixed two-layer native view.
@@ -602,6 +578,48 @@ pub trait WorkspaceStore: Send + Sync {
         ))
     }
 
+    fn supports_fused_read_fence(&self) -> bool {
+        false
+    }
+
+    /// Take the head record this store last committed for `head`, if any.
+    /// A hint: a stale record only makes the next conditional mutation fail
+    /// with Busy, after which the caller re-reads the head.
+    fn take_committed_head(&self, _head: LayerId) -> Option<LayerRecord> {
+        None
+    }
+
+    /// Per-inode read fence for a frozen base: the head/lease guard is still
+    /// held, the head still sits on `base`, and this inode's upper rows are
+    /// exactly `expected`. Unrelated writes to other inodes do not fence.
+    /// Busy denotes a changed inode; Fenced denotes loss of authority.
+    async fn validate_inode_read_fence(
+        &self,
+        _guard: HeadGuard,
+        _base: LayerRecord,
+        _ino: i64,
+        _expected: Vec<InodeDelta>,
+    ) -> Result<(), WorkspaceError> {
+        Err(WorkspaceError::UnsupportedCapability(
+            "per-inode workspace read fence",
+        ))
+    }
+
+    /// One consistent read of the hot head/lease fence, the current writable
+    /// head record and one inode's rows in both layers. The returned head is
+    /// fresh (its sequence fences same-epoch writes); `base` is the caller's
+    /// cached sealed base, which is immutable for the binding.
+    async fn read_fenced_inode(
+        &self,
+        _guard: HeadGuard,
+        _base: LayerRecord,
+        _ino: i64,
+    ) -> Result<(LayerRecord, Vec<InodeDelta>), WorkspaceError> {
+        Err(WorkspaceError::UnsupportedCapability(
+            "fused workspace inode read fence",
+        ))
+    }
+
     /// Bound row decoding/allocation at the backend before returning it. A
     /// legacy get_extent_deltas followed by a length check is insufficient.
     async fn get_extent_deltas_bounded(
@@ -823,23 +841,13 @@ pub trait WorkspaceStore: Send + Sync {
         &self,
         layer_id: LayerId,
     ) -> Result<CanonicalLayerDelta, WorkspaceError>;
-    async fn begin_seal(&self, request: BeginSeal) -> Result<SealJournal, WorkspaceError>;
-    async fn advance_seal(&self, request: AdvanceSeal) -> Result<SealJournal, WorkspaceError>;
-    async fn hash_seal(&self, journal_id: JournalId) -> Result<SealJournal, WorkspaceError>;
-    async fn commit_seal(&self, journal_id: JournalId) -> Result<SealResult, WorkspaceError>;
-    async fn abort_recoverable_seal(&self, request: AbortSeal) -> Result<(), WorkspaceError>;
     async fn load_seal_journal(&self, journal_id: JournalId)
     -> Result<SealJournal, WorkspaceError>;
-    async fn list_incomplete_seal_journals(&self) -> Result<Vec<SealJournal>, WorkspaceError>;
     /// 列出指定 workspace 的所有 seal journal，包括终止状态的记录。
     async fn list_seal_journals(
         &self,
         workspace_id: WorkspaceId,
     ) -> Result<Vec<SealJournal>, WorkspaceError>;
-    async fn fast_forward_commit(
-        &self,
-        request: FastForwardCommit,
-    ) -> Result<CommitResult, WorkspaceError>;
     async fn mark_workspace_deleting(&self, request: MarkDeleting) -> Result<(), WorkspaceError>;
     async fn record_orphan_slice(&self, request: RecordOrphanSlice) -> Result<(), WorkspaceError>;
     async fn gc_snapshot(
@@ -880,8 +888,12 @@ pub trait WorkspaceStore: Send + Sync {
         now_ns: i64,
         grace_ns: u64,
     ) -> Result<(), WorkspaceError>;
-    async fn install_compaction(
+    /// Test fixture only; see `InstallTestBase`.
+    #[cfg(test)]
+    async fn install_test_base(
         &self,
-        request: InstallCompaction,
-    ) -> Result<CompactionResult, WorkspaceError>;
+        _request: InstallTestBase,
+    ) -> Result<TestBaseResult, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedCapability("test base fixture"))
+    }
 }

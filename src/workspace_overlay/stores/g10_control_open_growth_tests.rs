@@ -1,7 +1,6 @@
 // Existing-public-API candidates. No future bounded method or fake authority.
 // Memory read byte accounting is not proof of Redis/TiKV network admission.
 use super::*;
-use crate::workspace_overlay::catalog::AbortSeal;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReadObservation {
@@ -219,43 +218,6 @@ async fn g10a_kv_unrelated_public_forks_do_not_grow_target_open_transfer() {
         "unrelated public fork must not change target workspace authority");
     let after = observed_open(&peer, target.workspace_id).await;
     assert_target_open_transfer_does_not_grow(&before, &after, "forks");
-}
-
-#[tokio::test]
-async fn g10b_kv_unrelated_public_aborted_journals_do_not_grow_target_open_transfer() {
-    let (store, target, _lease, _guard) = initialized().await;
-    let child = store.create_workspace(CreateWorkspace {
-        workspace_id: WorkspaceId::from_uuid(id(20_000)),
-        head_layer_id: LayerId::from_uuid(id(20_001)),
-        base_revision: target.fork_base.clone().unwrap(), owner_id: Some("history-owner".into()),
-    }).await.unwrap();
-    let lease = store.acquire_lease(AcquireLease {
-        workspace_id: child.workspace_id, lease_id: LeaseId::from_uuid(id(20_002)),
-        holder_generation: 1, ttl_ns: 120_000_000_000,
-    }).await.unwrap();
-    let guard = HeadGuard {
-        workspace_id: child.workspace_id, expected_head_layer_id: child.head_layer_id,
-        expected_head_epoch: child.head_epoch, lease_id: lease.lease_id,
-        holder_generation: lease.holder_generation,
-    };
-    store.open_workspace_v3(target.workspace_id, "bounded-target", Duration::from_secs(3600)).await.unwrap();
-    let peer = KvWorkspaceStore::new(ObservedBackend::new((*store.backend).clone()));
-    let target_before = store.load_workspace(target.workspace_id).await.unwrap();
-    let before = observed_open(&peer, target.workspace_id).await;
-    for index in 0u128..12 {
-        let journal_id = JournalId::from_uuid(id(30_000 + index));
-        store.begin_seal(BeginSeal { guard: guard.clone(), journal_id,
-            new_head_layer_id: LayerId::from_uuid(id(40_000 + index)) }).await.unwrap();
-        store.abort_recoverable_seal(AbortSeal { journal_id, reason: "retained terminal diagnostic".into() }).await.unwrap();
-        let journal = store.load_seal_journal(journal_id).await.unwrap();
-        assert_eq!(journal.workspace_id, child.workspace_id);
-        assert_eq!(journal.phase, SealPhase::Aborted);
-    }
-    assert!(store.list_incomplete_seal_journals().await.unwrap().is_empty(),
-        "terminal unrelated history is not pending recovery");
-    assert_eq!(store.load_workspace(target.workspace_id).await.unwrap(), target_before);
-    let after = observed_open(&peer, target.workspace_id).await;
-    assert_target_open_transfer_does_not_grow(&before, &after, "terminal journals");
 }
 
 #[tokio::test]

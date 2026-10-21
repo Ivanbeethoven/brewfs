@@ -1188,6 +1188,37 @@ impl ObjectBackend for S3Backend {
         Ok(())
     }
 
+    async fn put_object_create_only_durable(&self, key: &str, data: &[u8]) -> Result<()> {
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&self.config.bucket)
+            .key(key)
+            .if_none_match("*")
+            .body(SdkBody::from(data.to_vec()).into());
+        if self.config.enable_md5 {
+            request = request.content_md5(Self::md5_base64(data));
+        }
+        let result = if self.config.disable_payload_checksum {
+            request.customize().disable_payload_signing().send().await
+        } else {
+            request.send().await
+        };
+        if let Err(error) = result {
+            // The entity namespace requires actual create-only support. In
+            // particular, never use the legacy OSS unconditional-PUT fallback.
+            if matches!(&error, SdkError::ServiceError(service)
+                if service.raw().status().as_u16() == 412)
+                && self.get_object(key).await?.as_deref() == Some(data)
+            {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        // Successful PUT durability is the configured S3 service's contract.
+        Ok(())
+    }
+
     #[tracing::instrument(level = "debug", skip(self), fields(key))]
     async fn get_object(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let resp = self
