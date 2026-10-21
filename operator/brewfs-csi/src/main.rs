@@ -64,7 +64,17 @@ impl Identity for IdentityService {
         _request: Request<proto::GetPluginCapabilitiesRequest>,
     ) -> Result<Response<proto::GetPluginCapabilitiesResponse>, Status> {
         Ok(Response::new(proto::GetPluginCapabilitiesResponse {
-            capabilities: Vec::new(),
+            // The external provisioner uses this capability response to
+            // decide whether it may call CreateVolume/DeleteVolume.  The
+            // controller service is implemented below, so advertising it is
+            // required for dynamic provisioning to proceed.
+            capabilities: vec![proto::PluginCapability {
+                r#type: Some(proto::plugin_capability::Type::Service(
+                    proto::plugin_capability::Service {
+                        r#type: proto::plugin_capability::service::Type::ControllerService as i32,
+                    },
+                )),
+            }],
         }))
     }
 
