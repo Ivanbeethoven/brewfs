@@ -5,12 +5,23 @@ set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
 SUBSTRATE_DIR="${SRC_ROOT}/substrate"
-if [ ! -d "${SUBSTRATE_DIR}/.git" ]; then
-  git clone https://github.com/agent-substrate/substrate.git "${SUBSTRATE_DIR}"
+if [ ! -f "${SUBSTRATE_DIR}/hack/install-ate-kind.sh" ]; then
+  if ! git clone --depth 1 --branch "${SUBSTRATE_VERSION}" \
+      https://github.com/agent-substrate/substrate.git "${SUBSTRATE_DIR}"; then
+    echo "==> git clone failed; downloading the ${SUBSTRATE_VERSION} tarball"
+    tmp="$(mktemp -d)"
+    fetch_github "https://github.com/agent-substrate/substrate/archive/refs/tags/${SUBSTRATE_VERSION}.tar.gz" "${tmp}/sub.tgz"
+    tar -C "${tmp}" -xzf "${tmp}/sub.tgz"
+    rm -rf "${SUBSTRATE_DIR}"
+    mv "${tmp}/substrate-${SUBSTRATE_VERSION#v}" "${SUBSTRATE_DIR}"
+    rm -rf "${tmp}"
+  fi
 fi
 cd "${SUBSTRATE_DIR}"
-git fetch --tags origin
-git checkout "${SUBSTRATE_VERSION}"
+if [ -d .git ]; then
+  git fetch --tags origin || true
+  git checkout "${SUBSTRATE_VERSION}" || true
+fi
 
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME}" \
   ./hack/create-kind-cluster.sh
