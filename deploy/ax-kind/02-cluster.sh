@@ -29,14 +29,22 @@ KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME}" \
   env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
   ./hack/create-kind-cluster.sh
 
-# Registry mirrors for the node's containerd (gcr.io/docker.io are often
-# unreachable from CN networks; DaoCloud mirrors are public).
+# Registry mirrors for the node's containerd. The mirror host names do not
+# follow a single suffix rule (registry.k8s.io -> k8s.m.daocloud.io).
+declare -A MIRRORS=(
+  [docker.io]=docker.m.daocloud.io
+  [gcr.io]=gcr.m.daocloud.io
+  [ghcr.io]=ghcr.m.daocloud.io
+  [quay.io]=quay.m.daocloud.io
+  [registry.k8s.io]=k8s.m.daocloud.io
+)
 for node in $(kind get nodes --name "${KIND_CLUSTER_NAME}"); do
-  for reg in docker.io gcr.io ghcr.io quay.io registry.k8s.io; do
+  for reg in "${!MIRRORS[@]}"; do
+    mirror="${MIRRORS[$reg]}"
     docker exec "${node}" mkdir -p "/etc/containerd/certs.d/${reg}"
     docker exec -i "${node}" tee "/etc/containerd/certs.d/${reg}/hosts.toml" >/dev/null <<EOF
 server = "https://${reg}"
-[host."https://${reg}.m.daocloud.io"]
+[host."https://${mirror}"]
   capabilities = ["pull", "resolve"]
 EOF
   done
