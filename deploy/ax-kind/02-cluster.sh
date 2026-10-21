@@ -23,7 +23,10 @@ if [ -d .git ]; then
   git checkout "${SUBSTRATE_VERSION}" || true
 fi
 
+# kind propagates the caller environment into node containers; a proxy here
+# would also be used for local registry pulls and break them.
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME}" \
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
   ./hack/create-kind-cluster.sh
 
 # Registry mirrors for the node's containerd (gcr.io/docker.io are often
