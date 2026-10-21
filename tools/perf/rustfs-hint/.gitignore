@@ -1,0 +1,8 @@
+__pycache__/
+*/runs/
+*/results/
+*.local.json
+*.local.env
+*.config
+.private-auth.json
+*.tar.gz

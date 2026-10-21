@@ -1,0 +1,82 @@
+{
+  "passed": true,
+  "scope": "Script packaging only; no new product build or performance samples",
+  "imported_sources": 70,
+  "unchanged_runner_functions": 173,
+  "python_compileall": true,
+  "offline_unittests": 5,
+  "shell_checks": [
+    {
+      "command": [
+        "bash",
+        "-n",
+        "docker/compose-xfstests/run_perf_in_container.sh"
+      ],
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "bash",
+        "-n",
+        "docker/compose-xfstests/run_redis_perf.sh"
+      ],
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "bash",
+        "-n",
+        "docker/compose-xfstests/run_juicefs_perf_in_container.sh"
+      ],
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "bash",
+        "-n",
+        "docker/compose-xfstests/run_juicefs_perf.sh"
+      ],
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "bash",
+        "docker/compose-xfstests/test_perf_report_delta.sh"
+      ],
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "bash",
+        "docker/compose-xfstests/test_juicefs_direct_matrix.sh"
+      ],
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "bash",
+        "docker/compose-xfstests/test_juicefs_perf_report.sh"
+      ],
+      "exit_code": 0
+    }
+  ],
+  "trace_checks": {
+    "traces": 18,
+    "formal_inputs_byte_identical": true,
+    "smoke_inputs_byte_identical": true
+  },
+  "reanalyzed": {
+    "runs": 36,
+    "operations": 288000,
+    "comparisons": 51,
+    "required_checks": 45,
+    "passed_required": 44,
+    "identical_json_outputs": [
+      "formal-analysis.json",
+      "formal-components.json",
+      "formal-bottlenecks.json"
+    ],
+    "full_raw_audit": true,
+    "report_generated": true
+  }
+}
