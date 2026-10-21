@@ -19,6 +19,16 @@ export LOCAL_BIN="${LOCAL_BIN:-$HOME/.local/bin}"
 export AX_IMAGE_REPO="${AX_IMAGE_REPO:-localhost:5001}"
 export TASK_RUNNER_REPO="${TASK_RUNNER_REPO:-${AX_IMAGE_REPO}/ax-task-runner}"
 
+# Optional HTTP(S) proxy for downloads and Go module fetches, e.g.
+#   AX_DEPLOY_PROXY=http://127.0.0.1:7897 ./install.sh
+export AX_DEPLOY_PROXY="${AX_DEPLOY_PROXY:-}"
+
+# Go modules: proxy.golang.org is not reachable from some networks.
+export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
+
+# Fallback mirror for the Go toolchain when go.dev is unreachable.
+export GO_DOWNLOAD_BASE="${GO_DOWNLOAD_BASE:-https://mirrors.aliyun.com/golang}"
+
 export PATH="${LOCAL_BIN}:${HOME}/.local/go/bin:${PATH}"
 export KIND_EXPERIMENTAL_PROVIDER="${KIND_EXPERIMENTAL_PROVIDER:-docker}"
 
