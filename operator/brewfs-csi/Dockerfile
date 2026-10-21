@@ -7,6 +7,9 @@ FROM ${BREWFS_IMAGE} AS brewfs
 
 FROM rust:1.90-bookworm AS builder
 WORKDIR /src
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y protobuf-compiler libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto ./proto
 COPY src ./src
