@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: brewfs-csi-node
+  namespace: brewfs-csi-system
+  labels:
+    app.kubernetes.io/name: brewfs-csi-node
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: brewfs-csi-node
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: brewfs-csi-node
+    spec:
+      serviceAccountName: brewfs-csi-node
+      priorityClassName: system-node-critical
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/csi.brewfs.io/csi.sock
+          securityContext:
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: csi-socket
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: brewfs-csi
+          image: ghcr.io/ivanbeethoven/brewfs-csi:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --socket=/csi/csi.sock
+            - --state-dir=/var/lib/brewfs-csi/mounts
+            - --node-id=$(NODE_NAME)
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+          volumeMounts:
+            - name: csi-socket
+              mountPath: /csi
+            - name: kubelet-pods
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: Bidirectional
+            - name: kubelet-ate
+              mountPath: /var/lib/ate
+              mountPropagation: Bidirectional
+            - name: brewfs-state
+              mountPath: /var/lib/brewfs-csi
+              mountPropagation: Bidirectional
+            - name: brewfs-config
+              mountPath: /etc/brewfs
+              readOnly: true
+            - name: fuse
+              mountPath: /dev/fuse
+      volumes:
+        - name: csi-socket
+          hostPath:
+            path: /var/lib/kubelet/plugins/csi.brewfs.io
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: kubelet-pods
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
+        - name: kubelet-ate
+          hostPath:
+            path: /var/lib/ate
+            type: DirectoryOrCreate
+        - name: brewfs-state
+          hostPath:
+            path: /var/lib/brewfs-csi
+            type: DirectoryOrCreate
+        - name: brewfs-config
+          secret:
+            secretName: brewfs-csi-config
+        - name: fuse
+          hostPath:
+            path: /dev/fuse
+            type: CharDevice

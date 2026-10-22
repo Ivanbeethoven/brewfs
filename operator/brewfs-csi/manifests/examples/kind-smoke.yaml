@@ -1,0 +1,43 @@
+# Apply this after manifests/ has been installed and the example StorageClass
+# has been edited for a real BrewFS workspace. It is intentionally separate
+# from the base kustomization because it creates a test PVC and Pod.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: brewfs-csi-smoke
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workspace
+  namespace: brewfs-csi-smoke
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: brewfs-workspace
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: workspace-smoke
+  namespace: brewfs-csi-smoke
+spec:
+  restartPolicy: Never
+  containers:
+    - name: test
+      image: busybox:1.36
+      command: ["sh", "-ec"]
+      args:
+        - |
+          printf 'csi-smoke:%s\n' "$HOSTNAME" > /workspace/value
+          test "$(cat /workspace/value)" = "csi-smoke:$HOSTNAME"
+          test -s /workspace/value
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+  volumes:
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: workspace
