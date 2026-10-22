@@ -268,7 +268,6 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
     }
 
     pub(super) async fn authority(&self) -> Result<TransactionAuthority> {
-        let _diagnostic = super::diagnostics::Span::start("namespace.authority");
         if self.session.namespace_id() != self.keys.namespace_id() {
             return Err(EntityError::Fenced);
         }
@@ -293,7 +292,6 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
     }
 
     pub(super) async fn lock_inode(&self, ino: i64) -> InodeGuard {
-        let _diagnostic = super::diagnostics::Span::start("data.lock_wait");
         let state = self.inode_lock(ino);
         let guard = state.mutex.clone().lock_owned().await;
         InodeGuard {
@@ -313,7 +311,6 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
     }
 
     async fn lock_all(&self, ids: &BTreeSet<i64>) -> Vec<InodeGuard> {
-        let _diagnostic = super::diagnostics::Span::start("namespace.lock_wait");
         let mut guards = Vec::with_capacity(ids.len());
         for ino in ids {
             guards.push(self.lock_inode(*ino).await);
@@ -323,11 +320,9 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
 
     async fn run(self: &Arc<Self>, request: Request, credentials: Credentials) -> Result<Reply> {
         let this = self.clone();
-        tokio::spawn(super::diagnostics::inherit(async move {
-            this.execute(request, credentials).await
-        }))
-        .await
-        .map_err(|e| EntityError::Backend(format!("owned namespace task failed: {e}")))?
+        tokio::spawn(async move { this.execute(request, credentials).await })
+            .await
+            .map_err(|e| EntityError::Backend(format!("owned namespace task failed: {e}")))?
     }
 
     pub async fn create(
@@ -729,7 +724,6 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
         Ok(())
     }
     pub(super) async fn inode(&mut self, ino: i64) -> Result<EntityInode> {
-        let _diagnostic = super::diagnostics::Span::start("namespace.resolve_inode");
         if let Some(inode) = self.inodes.get(&ino) {
             return Ok(inode.clone());
         }
@@ -752,7 +746,6 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
         Ok(inode)
     }
     async fn dentry_row(&mut self, parent: i64, name: &[u8]) -> Result<Option<(i64, EntityKind)>> {
-        let _diagnostic = super::diagnostics::Span::start("namespace.resolve_dentry");
         validate_name(name)?;
         let row = self.raw(self.ns.keys.dentry(parent, name)).await?;
         let upper: Option<EntityDentry> = row.as_deref().map(codec::decode).transpose()?;
@@ -795,7 +788,6 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
         }
     }
     async fn xattr(&mut self, ino: i64, name: &[u8]) -> Result<Option<Vec<u8>>> {
-        let _diagnostic = super::diagnostics::Span::start("namespace.resolve_xattr");
         let row = self.raw(self.ns.keys.xattr(ino, name)).await?;
         let upper: Option<EntityValue> = row.as_deref().map(codec::decode).transpose()?;
         resolver::resolve_xattr(
@@ -992,8 +984,6 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
         r: &CreateRequest,
         c: &Credentials,
     ) -> Result<CreateAllocation> {
-        let _diagnostic =
-            crate::workspace_overlay::entity::diagnostics::Span::start("namespace.prepare_create");
         if r.mode & !0o7777 != 0 {
             return Err(EntityError::Invalid("invalid create mode".into()));
         }
@@ -1082,7 +1072,6 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
         c: &Credentials,
         ids: &BTreeSet<i64>,
     ) -> Result<Reply> {
-        let _diagnostic = super::diagnostics::Span::start("namespace.prepare");
         match op {
             Request::Create(request, _) => {
                 return self.prepare_create(request, c).await.map(Reply::Create);

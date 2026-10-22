@@ -442,7 +442,6 @@ impl<B: EntityBackend> Lifecycle<B> {
     }
 
     pub async fn authority(&self, session: &WriterSession) -> Result<TransactionAuthority> {
-        let _diagnostic = super::diagnostics::Span::start("lifecycle.authority");
         if session.is_closed() {
             return Err(EntityError::Fenced);
         }

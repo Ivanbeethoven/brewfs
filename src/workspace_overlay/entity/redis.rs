@@ -1,7 +1,7 @@
 //! Redis implementation of the bounded entity substrate, independent of layers.
 
 use async_trait::async_trait;
-use redis::aio::{ConnectionLike, ConnectionManager};
+use redis::aio::ConnectionManager;
 use uuid::Uuid;
 
 use super::{
@@ -12,7 +12,6 @@ use super::{
         prepare_create, prepare_slices, validate_key, validate_keys, validate_plan, validate_scan,
     },
     codec::MAX_ROW_BYTES,
-    diagnostics::{self, Span},
     keys::EntityKeys,
 };
 
@@ -309,52 +308,6 @@ pub struct RedisEntityBackend {
     prefix: Vec<u8>,
 }
 
-// Observe actual script requests, including NOSCRIPT/load/retry, while retaining
-// the existing ConnectionManager and Script invocation behavior. Disabled mode
-// returns the connection's own future without an extra boxed async wrapper.
-struct DiagnosticConnection {
-    connection: ConnectionManager,
-    metric: &'static str,
-}
-
-impl ConnectionLike for DiagnosticConnection {
-    fn req_packed_command<'a>(
-        &'a mut self,
-        command: &'a redis::Cmd,
-    ) -> redis::RedisFuture<'a, redis::Value> {
-        if !diagnostics::enabled() {
-            return self.connection.req_packed_command(command);
-        }
-        Box::pin(async move {
-            let mut span = Span::start(self.metric);
-            span.add_round_trips(1);
-            self.connection.req_packed_command(command).await
-        })
-    }
-
-    fn req_packed_commands<'a>(
-        &'a mut self,
-        command: &'a redis::Pipeline,
-        offset: usize,
-        count: usize,
-    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
-        if !diagnostics::enabled() {
-            return self.connection.req_packed_commands(command, offset, count);
-        }
-        Box::pin(async move {
-            let mut span = Span::start(self.metric);
-            span.add_round_trips(1);
-            self.connection
-                .req_packed_commands(command, offset, count)
-                .await
-        })
-    }
-
-    fn get_db(&self) -> i64 {
-        self.connection.get_db()
-    }
-}
-
 impl RedisEntityBackend {
     pub async fn connect(url: &str, volume_id: Uuid) -> Result<Self> {
         let client = redis::Client::open(url).map_err(backend_error)?;
@@ -393,52 +346,6 @@ impl RedisEntityBackend {
         let pending = slices
             .map(|slices| prepare_slices(authority, slices))
             .transpose()?;
-        let generated_writes = prepared
-            .as_ref()
-            .map_or(0, |create| 3 + create.xattrs.len())
-            + pending
-                .as_ref()
-                .map_or(0, |pending| 1 + pending.suffixes.len());
-        let (operation, request) = if plan.writes.is_empty() && create.is_none() && slices.is_none()
-        {
-            ("redis.commit.read_only", "redis.commit.read_only.rtt")
-        } else {
-            ("redis.commit.mutation", "redis.commit.mutation.rtt")
-        };
-        let mut span = Span::start(operation);
-        span.add_rows(
-            (authority.checks.len() + plan.checks.len() + plan.writes.len() + generated_writes)
-                as u64,
-        );
-        diagnostics::record(
-            "redis.transaction.authority_rows",
-            0,
-            0,
-            authority.checks.len() as u64,
-        );
-        diagnostics::record(
-            "redis.transaction.check_rows",
-            0,
-            0,
-            plan.checks.len() as u64,
-        );
-        diagnostics::record(
-            "redis.transaction.write_rows",
-            0,
-            0,
-            (plan.writes.len() + generated_writes) as u64,
-        );
-        if create.is_some() {
-            diagnostics::record("redis.transaction.inode_allocations", 0, 0, 1);
-        }
-        if let Some(pending) = &pending {
-            diagnostics::record(
-                "redis.transaction.slice_reservations",
-                0,
-                0,
-                pending.suffixes.len() as u64,
-            );
-        }
         validate_plan(authority, plan)?;
         for check in authority.checks.iter().chain(&plan.checks) {
             self.validate_scope(&check.key)?;
@@ -524,12 +431,8 @@ impl RedisEntityBackend {
                 invocation.arg(suffix);
             }
         }
-        let mut connection = DiagnosticConnection {
-            connection: self.connection.clone(),
-            metric: request,
-        };
         invocation
-            .invoke_async(&mut connection)
+            .invoke_async(&mut self.connection.clone())
             .await
             .map_err(backend_error)
     }
@@ -551,8 +454,6 @@ fn backend_error(error: redis::RedisError) -> EntityError {
 #[async_trait]
 impl EntityBackend for RedisEntityBackend {
     async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
-        let mut span = Span::start("redis.read");
-        span.add_rows(keys.len() as u64);
         validate_keys(keys)?;
         for key in keys {
             self.validate_scope(key)?;
@@ -566,12 +467,8 @@ impl EntityBackend for RedisEntityBackend {
             .arg(MAX_KEY_BYTES)
             .arg(MAX_ROW_BYTES)
             .arg(MAX_TRANSACTION_BYTES);
-        let mut connection = DiagnosticConnection {
-            connection: self.connection.clone(),
-            metric: "redis.read.rtt",
-        };
         let (time, rows): ((i64, i64), Vec<Option<Vec<u8>>>) = invocation
-            .invoke_async(&mut connection)
+            .invoke_async(&mut self.connection.clone())
             .await
             .map_err(backend_error)?;
         if rows.len() != keys.len() || time.0 < 0 || !(0..1_000_000).contains(&time.1) {
@@ -681,7 +578,6 @@ impl EntityBackend for RedisEntityBackend {
     }
 
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut span = Span::start("redis.scan");
         validate_scan(prefix, limit)?;
         self.validate_scope(prefix)?;
         let mut pattern = Vec::with_capacity(prefix.len() + 1);
@@ -692,19 +588,14 @@ impl EntityBackend for RedisEntityBackend {
             pattern.push(*byte);
         }
         pattern.push(b'*');
-        let mut connection = DiagnosticConnection {
-            connection: self.connection.clone(),
-            metric: "redis.scan.rtt",
-        };
         let mut rows: Vec<(Vec<u8>, Vec<u8>)> = redis::Script::new(SCAN_LUA)
             .key(prefix)
             .arg(prefix)
             .arg(pattern)
             .arg(limit)
-            .invoke_async(&mut connection)
+            .invoke_async(&mut self.connection.clone())
             .await
             .map_err(backend_error)?;
-        span.add_rows(rows.len() as u64);
         rows.sort_by(|left, right| left.0.cmp(&right.0));
         Ok(rows)
     }

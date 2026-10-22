@@ -9,7 +9,6 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         &self,
         keys: Vec<Vec<u8>>,
     ) -> Result<(TransactionAuthority, Prepared<'_, B, L>)> {
-        let _diagnostic = super::super::diagnostics::Span::start("namespace.snapshot");
         if !self.session.matches_keys(&self.keys)
             || self.session.lower_binding() != self.lower.binding()
         {
