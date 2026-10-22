@@ -1,17 +1,24 @@
 //! Backend-neutral workspace control-plane facade used by the Kubernetes controllers.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context as _};
 use async_trait::async_trait;
 use brewfs::workspace_overlay::catalog::{
-    CreateSnapshot, CreateVolumeRoot, CreateWorkspace, MarkDeleting, WorkspaceStore,
+    CreateSnapshot, CreateVolumeRoot, CreateWorkspace, MarkDeleting, MaterializeNativeSnapshot,
+    WorkspaceStore,
 };
+use brewfs::workspace_overlay::digest::CanonicalLayerDelta;
 use brewfs::workspace_overlay::error::WorkspaceError;
 use brewfs::workspace_overlay::ids::{LayerId, LeaseId, SnapshotId, WorkspaceId};
 use brewfs::workspace_overlay::model::{
-    BaseRevision, LayerState, SnapshotLease, VolumeHeader, WorkspaceRecord, WorkspaceState,
+    AclDelta, BaseRevision, DataExtentDelta, DentryDelta, ExtentKind, InodeState, LayerRecord,
+    LayerState, SnapshotLease, ValueOp, VolumeHeader, WorkspaceRecord, WorkspaceState, XattrDelta,
     WORKSPACE_SCHEMA_VERSION,
+};
+use brewfs::workspace_overlay::resolver::{
+    resolve_acl, resolve_dentry, resolve_extents, resolve_inode, resolve_xattr,
 };
 use brewfs::workspace_overlay::stores::kv_store::KvWorkspaceStore;
 use uuid::Uuid;
@@ -70,6 +77,14 @@ pub struct SnapshotView {
     pub revision: BaseRevision,
 }
 
+#[derive(Clone, Debug)]
+pub struct NativeSnapshotRequest {
+    pub workspace_id: WorkspaceId,
+    pub snapshot_id: SnapshotId,
+    pub name: String,
+    pub owner_id: Option<String>,
+}
+
 #[async_trait]
 pub trait WorkspaceAdmin: Send + Sync {
     /// Transfer this administrator's owned authenticated scope into a GC owner.
@@ -90,6 +105,12 @@ pub trait WorkspaceAdmin: Send + Sync {
         _request: EnsureWorkspaceRequest,
     ) -> anyhow::Result<WorkspaceView> {
         bail!("packed-v3 carrier fork is unsupported")
+    }
+    async fn materialize_native_snapshot(
+        &self,
+        _request: NativeSnapshotRequest,
+    ) -> anyhow::Result<SnapshotView> {
+        bail!("native workspace snapshot is unsupported by this catalog")
     }
     async fn verify_clean_packed_mount(
         &self,
@@ -232,6 +253,92 @@ impl<W> WorkspaceAdmin for StoreWorkspaceAdmin<W>
 where
     W: WorkspaceStore + 'static,
 {
+    async fn materialize_native_snapshot(
+        &self,
+        request: NativeSnapshotRequest,
+    ) -> anyhow::Result<SnapshotView> {
+        if let Ok(existing) = self.store.load_snapshot(request.snapshot_id).await {
+            if existing.name.as_deref() != Some(request.name.as_str())
+                || existing.owner_id != request.owner_id
+            {
+                bail!("deterministic native snapshot ID has a different owner or name");
+            }
+            self.verify_revision(&existing.revision).await?;
+            return Ok(SnapshotView {
+                snapshot_id: existing.snapshot_id,
+                revision: existing.revision,
+            });
+        }
+
+        let view = self.inspect_workspace(request.workspace_id).await?;
+        if view.record.active_lease.is_some()
+            || view
+                .leases
+                .iter()
+                .any(|lease| matches!(lease.state, brewfs::workspace_overlay::model::LeaseState::Active | brewfs::workspace_overlay::model::LeaseState::Releasing))
+        {
+            bail!("native workspace snapshot requires a released writable lease");
+        }
+        let chain = self.store.load_layer_chain(view.record.head_layer_id).await?;
+        let [head, base] = chain.as_slice() else {
+            bail!("native workspace snapshot requires a fixed two-layer workspace");
+        };
+        let compacted_layer_id = LayerId::from_uuid(deterministic_uuid(
+            request.snapshot_id.into_uuid(),
+            "native-lower",
+        ));
+        let replacement_head_layer_id = LayerId::from_uuid(deterministic_uuid(
+            request.snapshot_id.into_uuid(),
+            "native-head",
+        ));
+
+        if let Ok(layer) = self.store.load_layer(compacted_layer_id).await {
+            if view.record.head_layer_id == replacement_head_layer_id
+                && layer.state == brewfs::workspace_overlay::model::LayerState::Sealed
+            {
+                let revision = revision_from_layer(&layer)?;
+                let snapshot = self
+                    .ensure_snapshot(EnsureSnapshotRequest {
+                        snapshot_id: request.snapshot_id,
+                        name: request.name,
+                        revision: revision.clone(),
+                        owner_id: request.owner_id,
+                    })
+                    .await?;
+                return Ok(snapshot);
+            }
+        }
+
+        let base_delta = self.store.load_layer_delta(base.layer_id).await?;
+        let head_delta = self.store.load_layer_delta(head.layer_id).await?;
+        let delta = merge_native_snapshot_delta(
+            &head,
+            &base,
+            base_delta,
+            head_delta,
+            compacted_layer_id,
+        )?;
+        let result = self
+            .store
+            .materialize_native_snapshot(MaterializeNativeSnapshot {
+                workspace_id: request.workspace_id,
+                expected_head_layer_id: view.record.head_layer_id,
+                expected_head_epoch: view.record.head_epoch,
+                expected_parent_layer_id: base.layer_id,
+                compacted_layer_id,
+                replacement_head_layer_id,
+                delta,
+            })
+            .await?;
+        self.ensure_snapshot(EnsureSnapshotRequest {
+            snapshot_id: request.snapshot_id,
+            name: request.name,
+            revision: result.revision.clone(),
+            owner_id: request.owner_id,
+        })
+        .await
+    }
+
     async fn ensure_volume(&self, identity: VolumeIdentity) -> anyhow::Result<VolumeView> {
         self.store.initialize_workspace_schema().await?;
         match self.store.load_volume_header().await? {
@@ -473,6 +580,167 @@ fn validate_operator_volume_header(
     Ok(())
 }
 
+/// Resolve the native base and writable head into one immutable layer.
+///
+/// The resolver is deliberately used here instead of picking rows by sequence
+/// globally: sequence numbers are only ordered within a layer, while the head
+/// always wins over the base.  The resulting rows are rewritten to the new
+/// layer and assigned a deterministic sequence order.  Holes are retained so
+/// a child cannot expose bytes that a parent truncated.
+fn merge_native_snapshot_delta(
+    head: &LayerRecord,
+    base: &LayerRecord,
+    base_delta: CanonicalLayerDelta,
+    head_delta: CanonicalLayerDelta,
+    output_layer: LayerId,
+) -> anyhow::Result<CanonicalLayerDelta> {
+    let chain = [head.clone(), base.clone()];
+    let mut input = CanonicalLayerDelta::default();
+    input.dentries.extend(base_delta.dentries);
+    input.dentries.extend(head_delta.dentries);
+    input.inodes.extend(base_delta.inodes);
+    input.inodes.extend(head_delta.inodes);
+    input.xattrs.extend(base_delta.xattrs);
+    input.xattrs.extend(head_delta.xattrs);
+    input.acls.extend(base_delta.acls);
+    input.acls.extend(head_delta.acls);
+    input.extents.extend(base_delta.extents);
+    input.extents.extend(head_delta.extents);
+
+    let mut output = CanonicalLayerDelta::default();
+    let dentry_keys = input
+        .dentries
+        .iter()
+        .map(|row| (row.parent_ino, row.name.clone()))
+        .collect::<BTreeSet<_>>();
+    for (parent_ino, name) in dentry_keys {
+        if let Some(entry) = resolve_dentry(&chain, &input.dentries, parent_ino, &name)? {
+            output.dentries.push(DentryDelta::put(
+                output_layer,
+                parent_ino,
+                name,
+                entry.ino,
+                entry.entry_type,
+                0,
+            ));
+        }
+    }
+
+    let inode_keys = input.inodes.iter().map(|row| row.ino).collect::<BTreeSet<_>>();
+    for ino in inode_keys {
+        if let Some(mut inode) = resolve_inode(&chain, &input.inodes, ino)?.map(|value| value.inode) {
+            inode.layer_id = output_layer;
+            inode.state = InodeState::Present;
+            inode.sequence = 0;
+            output.inodes.push(inode);
+        }
+    }
+
+    let xattr_keys = input
+        .xattrs
+        .iter()
+        .map(|row| (row.ino, row.name.clone()))
+        .collect::<BTreeSet<_>>();
+    for (ino, name) in xattr_keys {
+        if let Some(value) = resolve_xattr(&chain, &input.xattrs, ino, &name)? {
+            output.xattrs.push(XattrDelta {
+                layer_id: output_layer,
+                ino,
+                name,
+                op: ValueOp::Put,
+                value: Some(value.value),
+                sequence: 0,
+            });
+        }
+    }
+
+    let acl_keys = input
+        .acls
+        .iter()
+        .map(|row| (row.ino, row.acl_type, row.acl_id))
+        .collect::<BTreeSet<_>>();
+    for (ino, acl_type, acl_id) in acl_keys {
+        if let Some(value) = resolve_acl(&chain, &input.acls, ino, acl_type, acl_id)? {
+            output.acls.push(AclDelta {
+                layer_id: output_layer,
+                ino,
+                acl_type,
+                acl_id,
+                op: ValueOp::Put,
+                value: Some(value.value),
+                sequence: 0,
+            });
+        }
+    }
+
+    let extent_keys = input
+        .extents
+        .iter()
+        .map(|row| (row.ino, row.chunk_index))
+        .collect::<BTreeSet<_>>();
+    for (ino, chunk_index) in extent_keys {
+        let range_end = input
+            .extents
+            .iter()
+            .filter(|row| row.ino == ino && row.chunk_index == chunk_index)
+            .try_fold(0_u64, |end, row| {
+                row.logical_offset
+                    .checked_add(row.length)
+                    .map(|row_end| end.max(row_end))
+                    .ok_or_else(|| anyhow!("extent range overflows during snapshot materialization"))
+            })?;
+        for extent in resolve_extents(&chain, &input.extents, ino, chunk_index, 0..range_end)? {
+            let row = match extent.kind {
+                ExtentKind::Data {
+                    slice_id,
+                    slice_offset,
+                } => DataExtentDelta::data(
+                    output_layer,
+                    ino,
+                    chunk_index,
+                    extent.logical_offset,
+                    extent.length,
+                    slice_id,
+                    slice_offset,
+                    0,
+                ),
+                ExtentKind::Hole => DataExtentDelta::hole(
+                    output_layer,
+                    ino,
+                    chunk_index,
+                    extent.logical_offset,
+                    extent.length,
+                    0,
+                ),
+            };
+            output.extents.push(row);
+        }
+    }
+
+    let mut sequence = 1_u64;
+    for row in &mut output.dentries {
+        row.sequence = sequence;
+        sequence = sequence.checked_add(1).ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
+    }
+    for row in &mut output.inodes {
+        row.sequence = sequence;
+        sequence = sequence.checked_add(1).ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
+    }
+    for row in &mut output.xattrs {
+        row.sequence = sequence;
+        sequence = sequence.checked_add(1).ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
+    }
+    for row in &mut output.acls {
+        row.sequence = sequence;
+        sequence = sequence.checked_add(1).ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
+    }
+    for row in &mut output.extents {
+        row.sequence = sequence;
+        sequence = sequence.checked_add(1).ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
+    }
+    Ok(output)
+}
+
 fn revision_from_layer(
     layer: &brewfs::workspace_overlay::model::LayerRecord,
 ) -> anyhow::Result<BaseRevision> {
@@ -527,6 +795,61 @@ pub fn deterministic_uuid(scope: Uuid, value: &str) -> Uuid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_snapshot_merge_keeps_upper_tombstones_and_holes() {
+        let base_id = LayerId::from_uuid(Uuid::from_u128(10));
+        let head_id = LayerId::from_uuid(Uuid::from_u128(11));
+        let output_id = LayerId::from_uuid(Uuid::from_u128(12));
+        let base = LayerRecord {
+            layer_id: base_id,
+            parent_layer_id: None,
+            state: LayerState::Sealed,
+            schema_version: WORKSPACE_SCHEMA_VERSION,
+            sealed_version: Some(1),
+            delta_digest: Some([1; 32]),
+            root_hash: Some([2; 32]),
+            depth: 1,
+            owner_workspace_id: None,
+            next_sequence: 3,
+            owned_slice_count: 1,
+            owned_bytes: 4,
+            created_at_ns: 1,
+            sealed_at_ns: Some(1),
+        };
+        let head = LayerRecord {
+            layer_id: head_id,
+            parent_layer_id: Some(base_id),
+            state: LayerState::Writable,
+            schema_version: WORKSPACE_SCHEMA_VERSION,
+            sealed_version: None,
+            delta_digest: None,
+            root_hash: None,
+            depth: 2,
+            owner_workspace_id: Some(WorkspaceId::from_uuid(Uuid::from_u128(13))),
+            next_sequence: 3,
+            owned_slice_count: 0,
+            owned_bytes: 0,
+            created_at_ns: 2,
+            sealed_at_ns: None,
+        };
+        let base_delta = CanonicalLayerDelta {
+            dentries: vec![DentryDelta::put(base_id, 1, b"old".to_vec(), 2, 8, 1)],
+            extents: vec![DataExtentDelta::data(base_id, 2, 0, 0, 4, 77, 0, 1)],
+            ..CanonicalLayerDelta::default()
+        };
+        let head_delta = CanonicalLayerDelta {
+            dentries: vec![DentryDelta::whiteout(head_id, 1, b"old".to_vec(), 1)],
+            extents: vec![DataExtentDelta::hole(head_id, 2, 0, 0, 4, 1)],
+            ..CanonicalLayerDelta::default()
+        };
+        let merged = merge_native_snapshot_delta(&head, &base, base_delta, head_delta, output_id)
+            .unwrap();
+        assert!(merged.dentries.is_empty());
+        assert_eq!(merged.extents.len(), 1);
+        assert_eq!(merged.extents[0].layer_id, output_id);
+        assert!(matches!(merged.extents[0].kind, ExtentKind::Hole));
+    }
 
     #[tokio::test]
     async fn native_volume_bootstrap_preserves_header_root_and_snapshot_on_retry() {

@@ -706,6 +706,67 @@ pub struct BrewFSWorkspaceSnapshotStatus {
     pub conditions: Vec<WorkspaceCondition>,
 }
 
+#[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[kube(
+    group = "storage.brewfs.io",
+    version = "v1alpha1",
+    kind = "BrewFSWorkspaceFork",
+    plural = "brewfsworkspaceforks",
+    namespaced,
+    status = "BrewFSWorkspaceForkStatus",
+    shortname = "bfwsf"
+)]
+#[serde(rename_all = "camelCase")]
+pub struct BrewFSWorkspaceForkSpec {
+    pub cluster_ref: NamespacedNameRef,
+    pub source_workspace_ref: NamespacedNameRef,
+    /// Name of the child BrewFSWorkspace and StorageClass. Keeping this
+    /// explicit lets AX use the same identity for all three resources.
+    pub workspace_name: String,
+}
+
+impl BrewFSWorkspaceForkSpec {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.cluster_ref.name.trim().is_empty() {
+            return Err("clusterRef.name must not be empty".into());
+        }
+        if self.source_workspace_ref.name.trim().is_empty() {
+            return Err("sourceWorkspaceRef.name must not be empty".into());
+        }
+        if self.workspace_name.trim().is_empty() {
+            return Err("workspaceName must not be empty".into());
+        }
+        if self.workspace_name.len() > 63
+            || !self
+                .workspace_name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || self.workspace_name.starts_with('-')
+            || self.workspace_name.ends_with('-')
+        {
+            return Err("workspaceName must be a DNS-1123 name".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrewFSWorkspaceForkStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    pub phase: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_class_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<WorkspaceCondition>,
+}
+
 fn validate_mount_path(path: &str) -> Result<(), String> {
     if !path.starts_with('/') {
         return Err("mountPath must be absolute".into());

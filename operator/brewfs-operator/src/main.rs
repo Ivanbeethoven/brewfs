@@ -23,7 +23,9 @@ use tracing::{error, info};
 use crate::crd::{BrewFSCluster, BrewFSMount};
 use crate::reconciler::OperatorContext;
 #[cfg(feature = "workspace-operator")]
-use crate::workspace::crd::{BrewFSWorkspace, BrewFSWorkspaceMount, BrewFSWorkspaceSnapshot};
+use crate::workspace::crd::{
+    BrewFSWorkspace, BrewFSWorkspaceFork, BrewFSWorkspaceMount, BrewFSWorkspaceSnapshot,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -80,7 +82,9 @@ fn print_crd() -> anyhow::Result<()> {
             .context("serialize BrewFSWorkspaceMount CRD to YAML")?;
         let workspace_snapshot_crd = serde_yaml::to_string(&BrewFSWorkspaceSnapshot::crd())
             .context("serialize BrewFSWorkspaceSnapshot CRD to YAML")?;
-        print!("---\n{workspace_crd}---\n{workspace_mount_crd}---\n{workspace_snapshot_crd}");
+        let workspace_fork_crd = serde_yaml::to_string(&BrewFSWorkspaceFork::crd())
+            .context("serialize BrewFSWorkspaceFork CRD to YAML")?;
+        print!("---\n{workspace_crd}---\n{workspace_mount_crd}---\n{workspace_snapshot_crd}---\n{workspace_fork_crd}");
     }
     Ok(())
 }
@@ -199,7 +203,7 @@ async fn run_controller() -> anyhow::Result<()> {
         .run(
             workspace::controller::reconcile_workspace_snapshot,
             workspace::controller::error_policy_snapshot,
-            context,
+            context.clone(),
         )
         .for_each(|result| async move {
             match result {
@@ -207,6 +211,24 @@ async fn run_controller() -> anyhow::Result<()> {
                     info!(name = %object_ref.name, ?action, "reconciled BrewFSWorkspaceSnapshot");
                 }
                 Err(error) => error!(?error, "BrewFSWorkspaceSnapshot reconcile loop error"),
+            }
+        });
+
+        let workspace_fork_controller = Controller::new(
+            Api::<BrewFSWorkspaceFork>::all(client.clone()),
+            watcher::Config::default(),
+        )
+        .run(
+            workspace::controller::reconcile_workspace_fork,
+            workspace::controller::error_policy_fork,
+            context.clone(),
+        )
+        .for_each(|result| async move {
+            match result {
+                Ok((object_ref, action)) => {
+                    info!(name = %object_ref.name, ?action, "reconciled BrewFSWorkspaceFork");
+                }
+                Err(error) => error!(?error, "BrewFSWorkspaceFork reconcile loop error"),
             }
         });
 
@@ -219,7 +241,8 @@ async fn run_controller() -> anyhow::Result<()> {
                 mount_controller,
                 workspace_controller,
                 workspace_mount_controller,
-                workspace_snapshot_controller
+                workspace_snapshot_controller,
+                workspace_fork_controller
             );
         };
         tokio::pin!(controllers);

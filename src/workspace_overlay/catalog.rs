@@ -141,11 +141,14 @@ pub struct DeleteLayerMetadata {
     pub lease_grace_ns: u64,
 }
 
-/// Test-only: materialize an offline workspace's resolved chain as a new flat
-/// immutable lower. Production lowers come only from packed publication.
-#[cfg(test)]
+/// Materialize a quiesced native workspace's resolved chain as a new flat
+/// immutable lower and replace its writable head with an empty overlay.
+///
+/// The caller must hold the workspace lifecycle fence (no live writable
+/// lease), and the backend must compare the expected head/epoch in the same
+/// transaction as the rotation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InstallTestBase {
+pub struct MaterializeNativeSnapshot {
     pub workspace_id: WorkspaceId,
     pub expected_head_layer_id: LayerId,
     pub expected_head_epoch: u64,
@@ -155,13 +158,18 @@ pub struct InstallTestBase {
     pub delta: CanonicalLayerDelta,
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TestBaseResult {
+pub struct MaterializeNativeSnapshotResult {
     pub revision: BaseRevision,
     pub replacement_head_layer_id: LayerId,
     pub head_epoch: u64,
 }
+
+#[cfg(test)]
+pub type InstallTestBase = MaterializeNativeSnapshot;
+
+#[cfg(test)]
+pub type TestBaseResult = MaterializeNativeSnapshotResult;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DentryQuery {
@@ -888,12 +896,20 @@ pub trait WorkspaceStore: Send + Sync {
         now_ns: i64,
         grace_ns: u64,
     ) -> Result<(), WorkspaceError>;
-    /// Test fixture only; see `InstallTestBase`.
+    async fn materialize_native_snapshot(
+        &self,
+        _request: MaterializeNativeSnapshot,
+    ) -> Result<MaterializeNativeSnapshotResult, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedCapability(
+            "native workspace snapshot",
+        ))
+    }
+
     #[cfg(test)]
     async fn install_test_base(
         &self,
-        _request: InstallTestBase,
+        request: InstallTestBase,
     ) -> Result<TestBaseResult, WorkspaceError> {
-        Err(WorkspaceError::UnsupportedCapability("test base fixture"))
+        self.materialize_native_snapshot(request).await
     }
 }

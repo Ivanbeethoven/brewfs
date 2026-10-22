@@ -24,8 +24,9 @@ use crate::workspace_overlay::catalog::{
     RecordOrphanSlice, ReleaseLease, RenewLease, SliceReference, VersionedMutation, WorkspaceStore,
     WorkspaceStoreCapabilities, XattrMutation, XattrQuery,
 };
-#[cfg(test)]
-use crate::workspace_overlay::catalog::{InstallTestBase, TestBaseResult};
+use crate::workspace_overlay::catalog::{
+    MaterializeNativeSnapshot, MaterializeNativeSnapshotResult,
+};
 use crate::workspace_overlay::digest::{CanonicalLayerDelta, delta_digest, root_hash};
 use crate::workspace_overlay::error::WorkspaceError;
 use crate::workspace_overlay::ids::{JournalId, LayerId, LeaseId, SnapshotId, WorkspaceId};
@@ -2161,11 +2162,10 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         Ok(())
     }
 
-    #[cfg(test)]
-    async fn install_test_base(
+    async fn materialize_native_snapshot(
         &self,
-        request: InstallTestBase,
-    ) -> Result<TestBaseResult, WorkspaceError> {
+        request: MaterializeNativeSnapshot,
+    ) -> Result<MaterializeNativeSnapshotResult, WorkspaceError> {
         if request.compacted_layer_id == request.replacement_head_layer_id {
             return Err(WorkspaceError::CorruptMetadata(
                 "compacted and replacement head IDs must differ".into(),
@@ -2330,7 +2330,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         .await
         .map_err(backend)?;
         tx.commit().await.map_err(backend)?;
-        Ok(TestBaseResult {
+        Ok(MaterializeNativeSnapshotResult {
             revision: BaseRevision {
                 layer_id: request.compacted_layer_id,
                 sealed_version,

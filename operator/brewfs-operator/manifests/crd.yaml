@@ -3134,3 +3134,107 @@ spec:
     storage: true
     subresources:
       status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: brewfsworkspaceforks.storage.brewfs.io
+spec:
+  group: storage.brewfs.io
+  names:
+    categories: []
+    kind: BrewFSWorkspaceFork
+    plural: brewfsworkspaceforks
+    shortNames:
+    - bfwsf
+    singular: brewfsworkspacefork
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for BrewFSWorkspaceForkSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              clusterRef:
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              sourceWorkspaceRef:
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              workspaceName:
+                description: Name of the child BrewFSWorkspace and StorageClass. Keeping this explicit lets AX use the same identity for all three resources.
+                type: string
+            required:
+            - clusterRef
+            - sourceWorkspaceRef
+            - workspaceName
+            type: object
+          status:
+            nullable: true
+            properties:
+              conditions:
+                items:
+                  properties:
+                    lastTransitionTime:
+                      format: date-time
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              message:
+                type: string
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                type: string
+              snapshotId:
+                nullable: true
+                type: string
+              storageClassName:
+                nullable: true
+                type: string
+              workspaceId:
+                nullable: true
+                type: string
+            required:
+            - message
+            - phase
+            type: object
+        required:
+        - spec
+        title: BrewFSWorkspaceFork
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

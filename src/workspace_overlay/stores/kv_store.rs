@@ -14,8 +14,9 @@ use tokio::sync::Mutex;
 
 use super::kv_backend::{KvCheck, KvEntry, KvReadLimits, KvWrite, WorkspaceKvBackend};
 use crate::workspace_overlay::catalog::*;
-#[cfg(test)]
-use crate::workspace_overlay::catalog::{InstallTestBase, TestBaseResult};
+use crate::workspace_overlay::catalog::{
+    MaterializeNativeSnapshot, MaterializeNativeSnapshotResult,
+};
 use crate::workspace_overlay::digest::{CanonicalLayerDelta, delta_digest, root_hash};
 use crate::workspace_overlay::error::{ConflictDetail, WorkspaceError};
 use crate::workspace_overlay::ids::{JournalId, LayerId, LeaseId, SnapshotId, WorkspaceId};
@@ -4790,11 +4791,10 @@ where
         Ok(())
     }
 
-    #[cfg(test)]
-    async fn install_test_base(
+    async fn materialize_native_snapshot(
         &self,
-        request: InstallTestBase,
-    ) -> Result<TestBaseResult, WorkspaceError> {
+        request: MaterializeNativeSnapshot,
+    ) -> Result<MaterializeNativeSnapshotResult, WorkspaceError> {
         self.require_admin_access()?;
         if request.compacted_layer_id == request.replacement_head_layer_id {
             return Err(WorkspaceError::CorruptMetadata(
@@ -4955,7 +4955,7 @@ where
             }
             let committed = txn.commit().await?;
             if committed {
-                return Ok(TestBaseResult {
+                return Ok(MaterializeNativeSnapshotResult {
                     revision,
                     replacement_head_layer_id: request.replacement_head_layer_id,
                     head_epoch: epoch,
