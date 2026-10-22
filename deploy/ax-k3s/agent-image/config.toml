@@ -1,0 +1,10 @@
+model_provider = "deepseek"
+model = "deepseek-v4-flash"
+sandbox_mode = "danger-full-access"
+approval_policy = "never"
+
+[model_providers.deepseek]
+name = "deepseek"
+base_url = "https://api.deepseek.com/v1"
+env_key = "DEEPSEEK_API_KEY"
+wire_api = "responses"
