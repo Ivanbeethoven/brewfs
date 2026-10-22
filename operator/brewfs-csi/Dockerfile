@@ -15,7 +15,7 @@ COPY proto ./proto
 COPY src ./src
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates mount util-linux \
     && rm -rf /var/lib/apt/lists/*

@@ -287,7 +287,12 @@ impl MountOps for SystemMountOps {
     }
 
     fn unbind(&self, target: &Path) -> io::Result<()> {
-        run_command(Command::new("umount").arg(target))
+        run_command(Command::new("umount").arg(target))?;
+        match fs::remove_dir(target) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn unmount_brewfs(&self, target: &Path) -> io::Result<()> {
