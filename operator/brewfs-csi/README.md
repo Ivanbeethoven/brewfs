@@ -65,10 +65,13 @@ acquisition is returned as a failed stage request.
 
 Substrate v0.5.0 does not consume a PVC. Its `externalVolumeTemplate` names a
 StorageClass and asks the registered `CSIDriverConfig` to provision one volume
-per actor. The current AX API does not carry an arbitrary existing workspace
-UUID into that template. A production AX bridge therefore still needs a
-reviewed workspace-to-StorageClass broker or an API field for a pre-provisioned
-volume identity. Until that exists, use the operator's one-mount-pod path.
+per actor. The AX fork used for the integration adds
+`WorkspaceSpec.externalStorageClassName`; when it is set, AX emits that
+`externalVolumeTemplate` and leaves `durableDir` empty. The StorageClass's
+`workspace` parameter is the pre-provisioned BrewFS workspace UUID. This keeps
+workspace ownership with BrewFS while giving AX a deterministic CSI volume
+identity. The AX change is in `Ivanbeethoven/ax` branch `brewfs-workspace`,
+commit `a0a660a`.
 
 The controller endpoint in `csidriverconfig.yaml` is intentionally plaintext
 inside the cluster. Enable Substrate pod-identity TLS and configure a matching
@@ -82,7 +85,10 @@ cargo check --manifest-path operator/brewfs-csi/Cargo.toml --locked
 cargo test --manifest-path operator/brewfs-csi/Cargo.toml --locked
 ```
 
-The image build expects a BrewFS image containing `/usr/local/bin/brewfs`:
+The image build expects a BrewFS image containing `/usr/local/bin/brewfs`.
+The runtime stage uses Debian Trixie so it can run the current BrewFS images
+built with glibc 2.39; the builder installs `protobuf-compiler` before running
+the locked Rust build:
 
 ```bash
 docker build \
@@ -91,11 +97,43 @@ docker build \
   operator/brewfs-csi
 ```
 
-No FUSE mount, Kubernetes cluster, Substrate actor, or `csi-sanity` run was
-available in this change. The unit tests use a fake mount-operations boundary;
-they validate identity parsing, status mapping, idempotent reference handling,
-and stale-target protection without pretending to validate host mount
-propagation.
+## Verification matrix
+
+The following evidence was collected on the single-node k3s cluster
+`brewfs-singapore-v2` on 2026-10-22. The existing `ax-system`, `ate-system`,
+WorkerPool, and registry workloads were left running. The temporary resources
+were in `brewfs-csi-ax-test` and `ax-csi-test`.
+
+| Area | Result | Evidence |
+| --- | --- | --- |
+| Rust unit tests | **Verified** | `cargo fmt --manifest-path operator/brewfs-csi/Cargo.toml --all --check`; `cargo test --manifest-path operator/brewfs-csi/Cargo.toml --locked`: 6 tests passed. |
+| CSI image | **Verified** | Image `localhost:5001/brewfs-csi@sha256:91d446adb46e48e80b36bd8715440fc3fafb7e168d4de9a062adf2829e32ec96`, built from the committed Dockerfile with `protobuf-compiler` and pushed to the in-cluster registry. |
+| Identity and node CSI calls | **Verified** | csi-sanity v5.3.0 full run: no identity or node failures after the target-removal fix. `NodeStageVolume`, `NodePublishVolume`, `NodeUnpublishVolume`, `NodeUnstageVolume`, and idempotent stage/publish paths exercised against the live Unix socket. |
+| csi-sanity overall | **Partial** | `Ran 33 of 92 Specs`: **30 passed, 3 failed, 1 pending, 58 skipped**. The first failure was `CreateVolume ... same name and different capacity` (expected an error, got nil). The other failures were invalid-volume `DeleteVolume` and nonexistent-volume `ValidateVolumeCapabilities`. The controller is intentionally stateless and maps the configured workspace deterministically, so it does not retain capacity or a volume inventory. Snapshot, expansion, stats, and group-controller cases were skipped as unsupported. |
+| AX external-volume selection | **Verified** | AX fork `a0a660a`; `WorkspaceSpec.externalStorageClassName: brewfs-ax-workspace` produced a Substrate `externalVolumeTemplate`. The patched runner image was `localhost:5001/ax-task-runner@sha256:1b89768c157514a8e83571abeea5de71828107186a4d776aa4e050571f99ab5e`. |
+| AX task data path | **Verified** | `brewfs-csi-task-3` was resumed to `Running` with `Ready=True`, `WorkspaceReady=True`, worker `10.42.0.23`. `ax ssh ... -- sh -c 'cat /workspace/ax-proof; sha256sum /workspace/ax-proof; wc -c < /workspace/ax-proof'` returned `ax-csi-proof:workspace`, SHA-256 `4f6f4a5fcfde254f79f67bf571401928044d4f54b071f5e0a211ec210aecff38`, and `23` bytes. |
+| RustFS publication | **Verified** | `aws s3 ls s3://brewfs-data/chunks-v2/ --recursive` showed `chunks-v2/129/0` (27 bytes). Reading that object through RustFS and hashing its 23-byte payload after the four-byte slice header returned the same SHA and `ax-csi-proof:workspace`. |
+| Separate remount | **Unverified** | A prior separate remount could list the directory but returned `EIO` while reading the object. The successful AX read plus direct RustFS object check are the current data-path evidence; a clean independent remount remains to be repeated. |
+| AX `ssh` guest tunnel | **Verified for this task** | `ax ssh` returned the exact file contents and hash above. The earlier EOF issue was resolved in the tested task path; no claim is made for unrelated guest-service configurations. |
+
+The focused csi-sanity command used unique paths that did not exist before the
+run, and cleanup helpers for paths left by the test harness:
+
+```bash
+kubectl -n brewfs-csi-ax-test exec <node-pod> -c brewfs-csi -- \
+  /tmp/csi-sanity \
+  -csi.endpoint unix:///csi/csi.sock \
+  -csi.testvolumeparameters /tmp/csi-params.yaml \
+  -csi.stagingdir /tmp/csi-full-stage-20261022b \
+  -csi.mountdir /tmp/csi-full-target-20261022b \
+  -csi.removemountpathcmd /tmp/remove-csi-path.sh \
+  -csi.removestagingpathcmd /tmp/remove-csi-path.sh
+```
+
+The unit tests use a fake mount-operations boundary; they validate identity
+parsing, status mapping, idempotent reference handling, and stale-target
+protection without pretending to validate host mount propagation. The k3s
+verification above is the only cluster evidence currently recorded.
 
 For a kind smoke after installing the base resources and replacing the config
 Secret/StorageClass workspace values:
