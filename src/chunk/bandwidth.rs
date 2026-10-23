@@ -101,11 +101,19 @@ impl BandwidthLimiter {
         // governor's `until_n_ready` can only request up to burst size at once,
         // so we loop requesting in smaller batches if needed.
         let mut remaining = tokens;
+        let mut batch_limit = 32; // at most 2 MiB per wait
         while remaining > 0 {
-            let batch = remaining.min(32); // max 32 tokens per wait (2MB)
+            let batch = remaining.min(batch_limit);
             match NonZeroU32::new(batch) {
                 Some(n) => {
-                    let _ = limiter.until_n_ready(n).await;
+                    if let Err(governor::InsufficientCapacity(capacity)) =
+                        limiter.until_n_ready(n).await
+                    {
+                        // Rejected requests consume no tokens. Retry against
+                        // this bucket's actual capacity without reducing debt.
+                        batch_limit = capacity;
+                        continue;
+                    }
                     trace!(
                         "{} rate limit: acquired {} tokens ({} remaining)",
                         direction,
@@ -144,6 +152,47 @@ impl std::fmt::Debug for BandwidthLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn one_mib_download_limit_charges_full_block() {
+        let limiter = BandwidthLimiter::new(&BandwidthConfig {
+            upload_limit_mibps: None,
+            download_limit_mibps: Some(1),
+        });
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            limiter.acquire_download(4 * 1024 * 1024),
+        )
+        .await
+        .expect("a full block must eventually acquire its tokens");
+        assert!(
+            started.elapsed() >= Duration::from_millis(2900),
+            "4 MiB at 1 MiB/s with a 1 MiB initial burst bypassed throttling: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn one_mib_upload_limit_charges_framed_block() {
+        let limiter = BandwidthLimiter::new(&BandwidthConfig {
+            upload_limit_mibps: Some(1),
+            download_limit_mibps: None,
+        });
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            limiter.acquire_upload(4 * 1024 * 1024 + 4),
+        )
+        .await
+        .expect("a framed block must eventually acquire its tokens");
+        assert!(
+            started.elapsed() >= Duration::from_millis(2900),
+            "framed 4 MiB upload at 1 MiB/s bypassed throttling: {:?}",
+            started.elapsed()
+        );
+    }
 
     #[tokio::test]
     async fn test_unlimited_does_not_block() {
