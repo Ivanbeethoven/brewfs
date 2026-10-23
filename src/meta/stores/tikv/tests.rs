@@ -429,6 +429,45 @@ async fn tikv_rejects_non_empty_rmdir() {
 
 #[tokio::test]
 #[ignore = "requires a running TiKV/PD cluster; set BREWFS_TIKV_PD_ENDPOINTS"]
+async fn tikv_chunk_discovery_visits_later_keys_across_clones_and_wraps() {
+    let store = TiKvMetaStore::from_config(integration_config("chunk-discovery"))
+        .await
+        .expect("tikv store should connect");
+    store.initialize().await.unwrap();
+    // Decimal chunk suffixes sort lexically as 10, 100, 2. The first two
+    // remain unfragmented while the last needs eventual compaction discovery.
+    for (chunk_id, count) in [(10, 1), (100, 1), (2, 8)] {
+        for ordinal in 0..count {
+            store
+                .append_slice(
+                    chunk_id,
+                    SliceDesc {
+                        chunk_id,
+                        slice_id: chunk_id * 100 + ordinal,
+                        offset: 0,
+                        length: 4096,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let clone = store.clone();
+    for _ in 0..2 {
+        let mut visited = HashSet::new();
+        for iteration in 0..4 {
+            let reader = if iteration % 2 == 0 { &store } else { &clone };
+            assert!(reader.list_chunk_ids(0).await.unwrap().is_empty());
+            let page = reader.list_chunk_ids(1).await.unwrap();
+            assert!(page.len() <= 1);
+            visited.extend(page);
+        }
+        assert_eq!(visited, HashSet::from([10, 100, 2]));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a running TiKV/PD cluster; set BREWFS_TIKV_PD_ENDPOINTS"]
 async fn tikv_transactional_file_data_schema() {
     let store = TiKvMetaStore::from_config(integration_config("file-data"))
         .await

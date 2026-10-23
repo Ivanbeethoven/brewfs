@@ -73,6 +73,7 @@ pub struct TiKvMetaStore {
     client: TransactionClient,
     lock_session: Uuid,
     counter_leases: Arc<Mutex<HashMap<String, CounterLease>>>,
+    chunk_scan_cursor: Arc<Mutex<Option<Vec<u8>>>>,
     txn_gates: Arc<Vec<Mutex<()>>>,
     _config: Config,
 }
@@ -116,6 +117,7 @@ impl TiKvMetaStore {
             client,
             lock_session: Uuid::new_v4(),
             counter_leases: Arc::new(Mutex::new(HashMap::new())),
+            chunk_scan_cursor: Arc::new(Mutex::new(None)),
             txn_gates: Arc::new((0..TXN_GATE_COUNT).map(|_| Mutex::new(())).collect()),
             _config: config,
         })
@@ -512,6 +514,16 @@ impl TiKvMetaStore {
         limit: Option<usize>,
         operation: &str,
     ) -> Result<Vec<KvPair>, MetaError> {
+        Self::txn_scan_prefix_from(txn, prefix, None, limit, operation).await
+    }
+
+    async fn txn_scan_prefix_from(
+        txn: &mut Transaction,
+        prefix: Vec<u8>,
+        after: Option<Vec<u8>>,
+        limit: Option<usize>,
+        operation: &str,
+    ) -> Result<Vec<KvPair>, MetaError> {
         let mut out = Vec::new();
         let mut remaining = limit.unwrap_or(usize::MAX);
         if remaining == 0 {
@@ -522,7 +534,9 @@ impl TiKvMetaStore {
             Some(end) => Bound::Excluded(Key::from(end)),
             None => Bound::Unbounded,
         };
-        let mut lower = Bound::Included(Key::from(prefix));
+        let mut lower = after
+            .map(|key| Bound::Excluded(Key::from(key)))
+            .unwrap_or_else(|| Bound::Included(Key::from(prefix)));
 
         while remaining > 0 {
             let batch_limit = remaining.min(SCAN_BATCH_LIMIT as usize) as u32;
@@ -2589,25 +2603,54 @@ impl MetaStore for TiKvMetaStore {
         }
 
         let operation = "list_chunk_ids";
-        self.read_txn(operation, |store, txn| {
-            Box::pin(async move {
-                let prefix = store.chunk_prefix();
-                let pairs =
-                    Self::txn_scan_prefix(txn, prefix.clone(), Some(limit), operation).await?;
-                let mut out = Vec::with_capacity(pairs.len());
-                for pair in pairs {
-                    let key: Vec<u8> = pair.into_key().into();
-                    let suffix = std::str::from_utf8(&key[prefix.len()..]).map_err(|e| {
-                        MetaError::Serialization(format!("TiKV chunk key is not UTF-8: {e}"))
-                    })?;
-                    if let Ok(chunk_id) = suffix.parse::<u64>() {
-                        out.push(chunk_id);
-                    }
-                }
-                Ok(out)
-            })
-        })
-        .await
+        let mut cursor = self.chunk_scan_cursor.lock().await;
+        for _ in 0..2 {
+            let after = cursor.clone();
+            let (ids, last_key, had_rows) = self
+                .read_txn(operation, |store, txn| {
+                    let after = after.clone();
+                    Box::pin(async move {
+                        let prefix = store.chunk_prefix();
+                        let pairs = Self::txn_scan_prefix_from(
+                            txn,
+                            prefix.clone(),
+                            after,
+                            Some(limit),
+                            operation,
+                        )
+                        .await?;
+                        let had_rows = !pairs.is_empty();
+                        let last_key = pairs.last().map(|pair| {
+                            let key: Vec<u8> = pair.key().clone().into();
+                            key
+                        });
+                        let mut out = Vec::with_capacity(pairs.len());
+                        for pair in pairs {
+                            let key: Vec<u8> = pair.into_key().into();
+                            let suffix =
+                                std::str::from_utf8(&key[prefix.len()..]).map_err(|e| {
+                                    MetaError::Serialization(format!(
+                                        "TiKV chunk key is not UTF-8: {e}"
+                                    ))
+                                })?;
+                            if let Ok(chunk_id) = suffix.parse::<u64>() {
+                                out.push(chunk_id);
+                            }
+                        }
+                        Ok((out, last_key, had_rows))
+                    })
+                })
+                .await?;
+            if had_rows {
+                *cursor = last_key;
+                return Ok(ids);
+            }
+            if cursor.take().is_some() {
+                continue;
+            }
+            return Ok(Vec::new());
+        }
+        Ok(Vec::new())
     }
 
     async fn replace_slices_for_compact(
