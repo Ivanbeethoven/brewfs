@@ -48,6 +48,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     init_tracing();
 
     match Cli::parse().command {
