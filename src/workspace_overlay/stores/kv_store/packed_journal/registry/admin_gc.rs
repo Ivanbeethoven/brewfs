@@ -12,6 +12,7 @@ pub(crate) struct PackedHistoryVersionRetirementOptions {
     pub grace_ns: u64,
     pub max_native_holds: u64,
     pub max_current_bindings: u64,
+    pub max_work: u64,
     pub cancel: CancellationToken,
 }
 
@@ -120,6 +121,7 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
                 grace_ns: options.grace_ns,
                 max_native_holds: options.max_native_holds,
                 max_current_bindings: options.max_current_bindings,
+                max_work: options.max_work,
                 cancel: options.cancel,
             },
         )
@@ -131,6 +133,7 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
         journal_id: JournalId,
         client: &ObjectClient<O>,
         budget: &Arc<V3MountBudget>,
+        max_members: u64,
         cancel: CancellationToken,
     ) -> Result<u64, WorkspaceError> {
         self.configure_packed_reader_pin_budget(budget.clone())?;
@@ -152,7 +155,7 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
         let actual = actual.retain(owner)?;
         // No terminal state, source proof or completed PUT is supplied by the
         // caller. The collector consumes exact persisted journal/root checks.
-        self.collect_aborted_packed_graph(&actual, client, budget, cancel)
+        self.collect_aborted_packed_graph(&actual, client, budget, max_members, cancel)
             .await
     }
 }

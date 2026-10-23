@@ -11,6 +11,8 @@ pub struct PackedGcPolicy {
     pub lease_ttl_seconds: u64,
     pub grace_seconds: u64,
     pub max_scans: u16,
+    /// Candidate quanta per tick. A graph quantum releases one member (and
+    /// completes its DELETE); history releases one member or drains one DELETE.
     pub max_operations: u16,
     pub max_protective_rows: u64,
 }
@@ -432,6 +434,7 @@ where
                             grace_ns: policy.grace_ns(),
                             max_native_holds: policy.max_protective_rows,
                             max_current_bindings: policy.max_protective_rows,
+                            max_work: 1,
                             cancel,
                         },
                     )
@@ -454,7 +457,7 @@ where
             }
             Candidate::Journal(journal) => Ok(Collection::objects(
                 self.store
-                    .collect_aborted_packed_journal(journal, &self.client, &self.budget, cancel)
+                    .collect_aborted_packed_journal(journal, &self.client, &self.budget, 1, cancel)
                     .await?,
             )),
             Candidate::Object(reference) => {

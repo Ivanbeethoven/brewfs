@@ -26,6 +26,9 @@ impl WorkspaceKvBackend for HistoryMemoryBackend {
     fn supports_consistent_reads(&self) -> bool {
         true
     }
+    async fn authenticate_gc_admin(&self) -> Result<(), WorkspaceError> {
+        self.memory.authenticate_gc_admin().await
+    }
     async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, WorkspaceError> {
         self.unbounded_reads.fetch_add(1, Ordering::SeqCst);
         self.memory.get(key).await
@@ -230,6 +233,7 @@ fn options(incarnation: Uuid) -> PackedHistoryRetirementOptions {
         grace_ns: 100,
         max_native_holds: 32,
         max_current_bindings: 32,
+        max_work: u64::MAX,
         cancel: CancellationToken::new(),
     }
 }

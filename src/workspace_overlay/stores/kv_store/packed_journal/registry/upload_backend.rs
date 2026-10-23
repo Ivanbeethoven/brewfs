@@ -351,6 +351,9 @@ mod tests {
     }
     #[async_trait]
     impl ObjectBackend for ObservedLocalFs {
+        fn forbids_mutation_replay(&self) -> bool {
+            true
+        }
         async fn put_object(&self, _: &str, _: &[u8]) -> anyhow::Result<()> {
             anyhow::bail!("fixture requires create-only")
         }
@@ -945,6 +948,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gc_tick_yields_between_aborted_graph_members() {
+        use super::super::admin_gc::facade::{PackedGcCursor, PackedGcPolicy, PackedGcTickRequest};
+        let fixture = collector_fixture().await;
+        assert!(migrate(&fixture).await.audited_objects > 0);
+        fixture.metadata.gc_admin.store(true, Ordering::SeqCst);
+        let admin = fixture
+            .store
+            .open_packed_gc_admin(
+                fixture.client.clone(),
+                fixture.budget.clone(),
+                crate::chunk::ChunkLayout::default(),
+            )
+            .await
+            .unwrap();
+        let root_key = registry_root_key(fixture.journal.source.staging_id);
+        let mut root =
+            RootRow::decode(&fixture.metadata.get(&root_key).await.unwrap().unwrap()).unwrap();
+        assert!(root.members > 1);
+        let initial_members = root.members;
+        for _ in 0..=initial_members {
+            let members_before = root.members;
+            let deletes_before = fixture.backend.deletes.load(Ordering::SeqCst);
+            let report = admin
+                .tick(PackedGcTickRequest {
+                    policy: PackedGcPolicy {
+                        lease_ttl_seconds: 300,
+                        grace_seconds: 3600,
+                        max_scans: 1,
+                        max_operations: 1,
+                        max_protective_rows: 64,
+                    },
+                    cursor: PackedGcCursor::decode(br#"{"tier":"Journal","after":null}"#).unwrap(),
+                    cancel: CancellationToken::new(),
+                })
+                .await
+                .unwrap();
+            root =
+                RootRow::decode(&fixture.metadata.get(&root_key).await.unwrap().unwrap()).unwrap();
+            assert!(
+                members_before - root.members <= 1,
+                "one GC operation must yield after one graph member"
+            );
+            assert!(fixture.backend.deletes.load(Ordering::SeqCst) - deletes_before <= 1);
+            assert!(report.deleted_objects <= 1);
+            let cursor: serde_json::Value =
+                serde_json::from_slice(&report.next_cursor.encode().unwrap()).unwrap();
+            assert!(
+                !cursor["after"].is_null(),
+                "other candidates must get a turn"
+            );
+            if root.state == RootState::Retired {
+                assert_eq!(root.members, 0);
+                return;
+            }
+            assert_eq!(root.state, RootState::Retiring);
+        }
+        panic!("successive GC ticks did not retire the graph");
+    }
+
+    #[tokio::test]
     async fn actual_packed_gc_aborted_route_requires_registry_then_collects_and_resumes() {
         let fixture = collector_fixture().await;
         assert!(
@@ -954,6 +1017,7 @@ mod tests {
                     fixture.journal.journal_id,
                     &fixture.client,
                     &fixture.budget,
+                    MAX_OBJECTS,
                     CancellationToken::new(),
                 )
                 .await
@@ -967,6 +1031,7 @@ mod tests {
                 fixture.journal.journal_id,
                 &fixture.client,
                 &fixture.budget,
+                MAX_OBJECTS,
                 CancellationToken::new(),
             )
             .await
@@ -994,6 +1059,7 @@ mod tests {
                     fixture.journal.journal_id,
                     &fixture.client,
                     &fixture.budget,
+                    MAX_OBJECTS,
                     CancellationToken::new(),
                 )
                 .await
@@ -1053,6 +1119,7 @@ mod tests {
                         requested,
                         &fixture.client,
                         &fixture.budget,
+                        MAX_OBJECTS,
                         CancellationToken::new(),
                     )
                     .await,
@@ -1103,6 +1170,7 @@ mod tests {
                         fixture.journal.journal_id,
                         &fixture.client,
                         &budget,
+                        MAX_OBJECTS,
                         cancel,
                     )
                     .await
@@ -1124,6 +1192,7 @@ mod tests {
                     &fixture.journal,
                     &fixture.client,
                     &fixture.budget,
+                    MAX_OBJECTS,
                     CancellationToken::new()
                 )
                 .await
@@ -1140,6 +1209,7 @@ mod tests {
                 &fixture.journal,
                 &fixture.client,
                 &fixture.budget,
+                MAX_OBJECTS,
                 CancellationToken::new(),
             )
             .await
@@ -1184,6 +1254,7 @@ mod tests {
                     &fixture.journal,
                     &fixture.client,
                     &fixture.budget,
+                    MAX_OBJECTS,
                     CancellationToken::new()
                 )
                 .await
@@ -1241,6 +1312,7 @@ mod tests {
                 &fixture.journal,
                 &fixture.client,
                 &fixture.budget,
+                MAX_OBJECTS,
                 CancellationToken::new(),
             )
             .await
@@ -1341,6 +1413,7 @@ mod tests {
                     &fixture.journal,
                     &fixture.client,
                     &fixture.budget,
+                    MAX_OBJECTS,
                     CancellationToken::new()
                 )
                 .await
@@ -1399,7 +1472,7 @@ mod tests {
         let run_cancel = cancel.clone();
         let task = tokio::spawn(async move {
             store
-                .collect_aborted_packed_graph(&expected, &client, &budget, run_cancel)
+                .collect_aborted_packed_graph(&expected, &client, &budget, MAX_OBJECTS, run_cancel)
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())

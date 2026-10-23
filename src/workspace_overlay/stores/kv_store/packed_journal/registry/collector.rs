@@ -691,6 +691,7 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
         expected: &PackedJournalRecord,
         client: &ObjectClient<O>,
         budget: &Arc<V3MountBudget>,
+        max_members: u64,
         cancel: CancellationToken,
     ) -> Result<u64, WorkspaceError> {
         self.registry_budget(budget)?;
@@ -698,7 +699,7 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             .admit(&[(V3BudgetPool::Metadata, OPERATION_BYTES)])
             .map_err(journal_budget_error)?;
         live(budget, &cancel)?;
-        if expected.phase != PackedJournalPhase::Aborted {
+        if expected.phase != PackedJournalPhase::Aborted || max_members == 0 {
             return Err(WorkspaceError::Fenced);
         }
         self.begin_aborted_root_retirement(expected).await?;
@@ -709,8 +710,14 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
         .into_bytes();
         let mut after: Option<Vec<u8>> = None;
         let mut deleted = 0u64;
+        let mut released = 0u64;
         loop {
             live(budget, &cancel)?;
+            // Reverse rows are removed atomically with member release. A later
+            // tick resumes at the remaining rows while the root stays Retiring.
+            if released == max_members {
+                return Ok(deleted);
+            }
             // Every page has its own read version. Validate terminal ownership
             // on both sides; each release then consumes exact page/row checks.
             self.check_aborted_root_retirement(expected).await?;
@@ -723,12 +730,15 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                 break;
             }
             for entry in page {
+                live(budget, &cancel)?;
+                if released == max_members {
+                    return Ok(deleted);
+                }
                 if !entry.key.starts_with(&prefix)
                     || after.as_ref().is_some_and(|last| &entry.key <= last)
                 {
                     return Err(journal_error("root retirement cursor/key mismatch"));
                 }
-                live(budget, &cancel)?;
                 let reference = V3ObjectRef::decode_value(&entry.value).map_err(journal_error)?;
                 if self
                     .release_aborted_graph_member(expected, &entry, &reference)
@@ -738,6 +748,9 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                         .await?;
                     deleted = increment(deleted)?;
                 }
+                // Shared objects cost a membership release too. Yield only
+                // after any single-use DELETE has reached its durable outcome.
+                released = increment(released)?;
                 after = Some(entry.key);
             }
         }

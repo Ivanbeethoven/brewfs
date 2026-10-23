@@ -1184,6 +1184,7 @@ pub(super) async fn contract<B: WorkspaceKvBackend>(fixture: Fixture<'_, B>) {
         grace_ns: 1,
         max_native_holds: 1000,
         max_current_bindings: 1000,
+        max_work: u64::MAX,
         cancel: CancellationToken::new(),
     };
     assert!(
