@@ -114,7 +114,9 @@ impl SliceCensus {
             return Ok(None);
         }
         let end = (self.next + 128).min(self.end);
-        let row_keys = (self.next..end).map(|id| keys.slice(id)).collect::<Vec<_>>();
+        let row_keys = (self.next..end)
+            .map(|id| keys.slice(id))
+            .collect::<Vec<_>>();
         let snapshot = backend.read(&row_keys).await?;
         let mut rows = Vec::new();
         for (id, bytes) in (self.next..end).zip(snapshot.rows) {

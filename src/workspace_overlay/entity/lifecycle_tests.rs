@@ -205,7 +205,14 @@ async fn resume_and_discard_preserve_4097_slice_tombstones() {
         let row: SliceOwnership = decode(snapshot.rows[0].as_deref().unwrap()).unwrap();
         assert!(matches!(row.state, SliceState::Deleted { .. }));
     }
-    assert!(backend.read(&[keys.slice_delete_fence()]).await.unwrap().rows[0].is_none());
+    assert!(
+        backend
+            .read(&[keys.slice_delete_fence()])
+            .await
+            .unwrap()
+            .rows[0]
+            .is_none()
+    );
 
     let foreign = Lifecycle::new(
         backend.clone(),
