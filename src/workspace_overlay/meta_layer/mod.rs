@@ -1567,6 +1567,10 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                     inode.mtime_ns = timestamp_now;
                 } else if let Some(mtime) = req.mtime {
                     inode.mtime_ns = mtime;
+                } else if req.size.is_some() {
+                    // FUSE truncate/ftruncate can send only the new size.
+                    // Keep explicit timestamps authoritative for combined SETATTRs.
+                    inode.mtime_ns = timestamp_now;
                 }
                 if let Some(ctime) = req.ctime {
                     inode.ctime_ns = ctime;
