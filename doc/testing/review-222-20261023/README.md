@@ -61,12 +61,30 @@ The regression and explicit-release control above passed three times.
 Formatting and diff whitespace are checked before publication. Existing
 dependency warnings are retained in the complete logs.
 
-Additional gates are running and are **not** counted as passes: five existing
-lifecycle tests, overlay workspace check and strict all-target Clippy,
-overlay resolver integration, full default workspace libraries/binaries,
-workspace check/build, both FUSE runtime checks, strict default Clippy and
-the shell gates. Keep the PR draft until the remaining relevant checks finish.
-Full monolithic overlay/all-features and mounted backend suites have not run.
+All scheduled local gates passed:
+
+| Gate | Result |
+| --- | --- |
+| Focused lifecycle harness | 5 passed / 0 failed / 0 ignored |
+| Overlay resolver integration | 14 passed / 0 failed / 0 ignored |
+| Full default workspace libraries/binaries | 1,196 passed / 0 failed / 225 ignored |
+| Workspace check and build | both passed |
+| Overlay workspace check | passed |
+| Strict overlay and default all-target Clippy | both passed with `-D warnings` |
+| Tokio and io-uring FUSE checks | both passed |
+| Four shell syntax checks, three shell scripts, diff check | all passed |
+| `cargo fmt --all --check` | passed |
+
+The focused lifecycle run took 1.03 seconds after a 538.32 second build. The
+full workspace test run took 140.15 seconds after compilation. The 16 GiB
+cgroup reached its memory limit transiently (`max` events 632) but recorded
+zero OOM kills; this resource output is preserved in the complete logs. All
+commands used two Cargo jobs, dev/test codegen units 16, incremental/debug
+information disabled, and ran serially under the shared host lock.
+
+The full monolithic all-features overlay suite and mounted real-backend suites
+were not run. The overlay coverage above is the selected lifecycle and resolver
+coverage, not a full-overlay or mounted-backend claim.
 
 The separate lifecycle harness selects all five tests in the lifecycle module.
 Restoring only its excluded test declarations reproduces all 532 candidate
@@ -77,5 +95,7 @@ coverage is not a full-overlay suite claim.
 
 `commands.md` lists completed commands, environments and exact result counts.
 `validation.tar.gz` preserves full logs, source patches, the harness generator
-and its source-equivalence report. Later gate evidence is added in follow-up
-commits without changing the verified fix.
+and its source-equivalence report. After all commands exited, the private
+target was removed only after a `/proc` users audit; `target-cleanup.json`
+records 8,375,136,256 allocated bytes removed and disk moving from 85% to 82%.
+No gate remains pending in this local scope.
