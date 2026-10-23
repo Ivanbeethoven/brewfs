@@ -1389,6 +1389,7 @@ impl AuthenticatedV3Snapshot {
                 });
             }
         }
+        drop(directory_page);
         type ActiveFrame = Option<(
             (u32, u32),
             std::sync::Arc<super::budget::V3Owned<super::pipeline::V3SharedFrame>>,
@@ -1725,7 +1726,7 @@ impl AuthenticatedV3Snapshot {
             ])?;
             let page =
                 super::V3FrameDirectoryPage::read(client, &reference, container.digest).await?;
-            let weight = std::mem::size_of::<CachedFrameDirectory>()
+            let weight = std::mem::size_of::<super::budget::V3Owned<CachedFrameDirectory>>()
                 + reference.key.capacity()
                 + page.frames.capacity()
                     * std::mem::size_of::<crate::workspace_overlay::packed_v3::PackedFrameDescriptor>(
@@ -1741,7 +1742,12 @@ impl AuthenticatedV3Snapshot {
         let page = &cached.as_ref().expect("authenticated descriptor page").page;
         // Routing and source checks still apply to every ordinal, including
         // cache hits; sharing a reference does not authorize another container.
-        if page.container_digest != container.digest || page.container_len != container.object_len {
+        if !matches!(
+            container.kind,
+            V3ObjectKind::GroupContainer | V3ObjectKind::LargeData
+        ) || page.container_digest != container.digest
+            || page.container_len != container.object_len
+        {
             return Err(PackedWireError::Invalid(
                 "PM07 frame directory disagrees with authenticated container".into(),
             ));
@@ -3105,6 +3111,308 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_read_reuses_one_authenticated_frame_directory_page() {
+        use super::super::{
+            V3BuildPolicy, V3FramePolicy, V3IndexBuilder, V3IndexReader, V3IndexRecord,
+            V3IndexValue, V3InodeLocation, build_v3_container_with_policy,
+        };
+        use crate::cadapter::{
+            client::{ObjectBackend, ObjectByteStream},
+            localfs::LocalFsBackend,
+        };
+        use crate::workspace_overlay::packed_v3::{
+            AccessProfile, GroupMeta, PackedCodec, PackedFileInput, PackedInodeIndexEntry,
+            SizeClassTable, pack_group_files_with_policy,
+        };
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct CountingBackend {
+            inner: LocalFsBackend,
+            range_keys: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl ObjectBackend for CountingBackend {
+            async fn put_object(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+                self.inner.put_object(key, bytes).await
+            }
+            async fn put_object_create_only(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+                self.inner.put_object_create_only(key, bytes).await
+            }
+            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                self.inner.get_object(key).await
+            }
+            async fn get_object_range(
+                &self,
+                key: &str,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                self.inner.get_object_range(key, offset, buf).await
+            }
+            async fn get_object_range_stream(
+                &self,
+                key: &str,
+                offset: u64,
+                length: u64,
+            ) -> anyhow::Result<ObjectByteStream> {
+                self.range_keys.lock().unwrap().push(key.to_owned());
+                self.inner
+                    .get_object_range_stream(key, offset, length)
+                    .await
+            }
+            async fn get_etag(&self, key: &str) -> anyhow::Result<String> {
+                self.inner.get_etag(key).await
+            }
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                self.inner.delete_object(key).await
+            }
+        }
+
+        let policy = V3BuildPolicy {
+            frames: V3FramePolicy::Static256Kib,
+            inline_data: false,
+            p90: None,
+        };
+        let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let (group, frames) = pack_group_files_with_policy(
+            7,
+            [2; 32],
+            vec![PackedFileInput {
+                name: b"file".to_vec(),
+                inode: 3,
+                kind: 1,
+                mode: 0o100644,
+                uid: 1000,
+                gid: 1000,
+                rdev: 0,
+                nlink: 1,
+                atime_ns: 1,
+                mtime_ns: 2,
+                ctime_ns: 3,
+                flags: 0,
+                data: data.clone(),
+            }],
+            AccessProfile::RandomSmallFile,
+            SizeClassTable::default(),
+            policy,
+        )
+        .unwrap();
+        let built = build_v3_container_with_policy(
+            0,
+            8,
+            AccessProfile::RandomSmallFile,
+            SizeClassTable::default(),
+            PackedCodec::Raw,
+            PackedCodec::Raw,
+            std::slice::from_ref(&group),
+            &frames,
+            policy,
+        )
+        .unwrap();
+        assert_eq!(built.frame_pages.len(), 1);
+        assert_eq!(built.frame_pages[0].frames.len(), 16);
+
+        let temp = tempfile::tempdir().unwrap();
+        let range_keys = Arc::new(Mutex::new(Vec::new()));
+        let client = ObjectClient::new(CountingBackend {
+            inner: LocalFsBackend::new(temp.path()),
+            range_keys: Arc::clone(&range_keys),
+        });
+        let container = V3ObjectRef::from_bytes(
+            "container".into(),
+            V3ObjectKind::GroupContainer,
+            &built.bytes,
+        )
+        .unwrap();
+        client
+            .put_object(&container.key, &built.bytes)
+            .await
+            .unwrap();
+        let metadata = GroupMeta::decode(&group.metadata).unwrap();
+        let entry = &metadata.entries()[0];
+        let inode = V3InodeLocation {
+            hot: PackedInodeIndexEntry {
+                inode: entry.inode,
+                parent_inode: 1,
+                parent_dir_key: [2; 32],
+                group_id: built.groups[0].group_id,
+                entry_ordinal: 0,
+                name: entry.name.clone(),
+                kind: entry.kind,
+                mode: entry.mode,
+                uid: entry.uid,
+                gid: entry.gid,
+                rdev: entry.rdev,
+                nlink: entry.nlink,
+                atime_ns: entry.atime_ns,
+                mtime_ns: entry.mtime_ns,
+                ctime_ns: entry.ctime_ns,
+                size: entry.size,
+            },
+            group: built.groups[0].clone(),
+        };
+        let mut rows: Vec<Vec<V3IndexRecord>> = vec![Vec::new(); V3_ROOT_COUNT];
+        rows[V3RootKind::Inodes as usize].push(V3IndexRecord {
+            first_key: 3u64.to_be_bytes().to_vec(),
+            last_key: 3u64.to_be_bytes().to_vec(),
+            value: V3IndexValue::Leaf(inode.encode_value().unwrap()),
+        });
+        rows[V3RootKind::Containers as usize].push(V3IndexRecord {
+            first_key: vec![0; 4],
+            last_key: vec![0; 4],
+            value: V3IndexValue::Leaf(container.encode_value().unwrap()),
+        });
+        for (index, page) in built.frame_pages.iter().enumerate() {
+            let bytes = page.encode().unwrap();
+            let reference = V3ObjectRef::from_bytes(
+                format!("descriptors/{index}"),
+                V3ObjectKind::FrameDirectory,
+                &bytes,
+            )
+            .unwrap();
+            client.put_object(&reference.key, &bytes).await.unwrap();
+            let mut first = vec![0; 4];
+            first.extend_from_slice(&page.first_ordinal.to_be_bytes());
+            let mut last = vec![0; 4];
+            last.extend_from_slice(&page.frames.last().unwrap().frame_ordinal.to_be_bytes());
+            rows[V3RootKind::Frames as usize].push(V3IndexRecord {
+                first_key: first,
+                last_key: last,
+                value: V3IndexValue::Leaf(reference.encode_value().unwrap()),
+            });
+        }
+        let mut snapshot_manifest = manifest();
+        snapshot_manifest.build.policy = policy;
+        for (kind, records) in ROOT_KINDS.into_iter().zip(rows) {
+            if records.is_empty() {
+                continue;
+            }
+            let mut builder = V3IndexBuilder::new(
+                client.clone(),
+                kind.object_kind(),
+                "indexes".into(),
+                2,
+                16384,
+            )
+            .unwrap();
+            for record in records {
+                builder.push(record).await.unwrap();
+            }
+            snapshot_manifest.roots[kind as usize] = builder.finish().await.unwrap();
+        }
+        let manifest_bytes = snapshot_manifest.encode().unwrap();
+        let manifest_ref =
+            V3ObjectRef::from_bytes("manifest".into(), V3ObjectKind::Manifest, &manifest_bytes)
+                .unwrap();
+        client
+            .put_object(&manifest_ref.key, &manifest_bytes)
+            .await
+            .unwrap();
+        let snapshot = AuthenticatedV3Snapshot::open(&client, &manifest_ref)
+            .await
+            .unwrap();
+        let reader = V3IndexReader::new(client.clone(), 1 << 20);
+        // Warm the index pages, then measure preparation before payload reads.
+        snapshot
+            .prepare_inode_read(&client, &reader, 3, 0, 1, 32 << 20)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            range_keys.lock().unwrap().clear();
+            let prepared = snapshot
+                .prepare_inode_read(&client, &reader, 3, 0, data.len(), 32 << 20)
+                .await
+                .unwrap();
+            let descriptor_gets = range_keys
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|key| key.as_str() == "descriptors/0")
+                .count();
+            assert_eq!(descriptor_gets, 1);
+            assert_eq!(prepared.plan.segments.len(), 16);
+            let mut output = vec![0; data.len()];
+            crate::chunk::read_plan::execute_unified_into(
+                prepared.fetcher.as_ref(),
+                0,
+                &prepared.plan,
+                &mut output,
+            )
+            .await
+            .unwrap();
+            assert_eq!(output, data);
+        }
+
+        // Cache hits retain their memory owner and recheck the caller's
+        // container and manifest bindings without another descriptor GET.
+        range_keys.lock().unwrap().clear();
+        let budget = reader.budget().clone();
+        let before = budget.state().used;
+        let mut memo = None;
+        snapshot
+            .frame_directory(&client, &reader, 0, 0, &container, &mut memo)
+            .await
+            .unwrap();
+        assert!(
+            budget.state().used[super::super::V3BudgetPool::Metadata as usize]
+                > before[super::super::V3BudgetPool::Metadata as usize]
+        );
+        for invalid in 0..3 {
+            let mut wrong_container = container.clone();
+            match invalid {
+                0 => wrong_container.digest[0] ^= 1,
+                1 => wrong_container.object_len += 1,
+                _ => wrong_container.kind = V3ObjectKind::FrameDirectory,
+            }
+            assert!(matches!(
+                snapshot
+                    .frame_directory(&client, &reader, 0, 1, &wrong_container, &mut memo)
+                    .await,
+                Err(PackedWireError::Invalid(message))
+                    if message.contains("frame directory disagrees")
+            ));
+        }
+        for invalid in 0..3 {
+            let mut wrong_snapshot = snapshot.clone();
+            match invalid {
+                0 => wrong_snapshot.manifest.profile = AccessProfile::Mixed,
+                1 => {
+                    wrong_snapshot
+                        .manifest
+                        .size_classes
+                        .max_random_frame_raw_bytes /= 2
+                }
+                _ => wrong_snapshot.manifest.build.policy.frames = V3FramePolicy::Static1Mib,
+            }
+            assert!(matches!(
+                wrong_snapshot
+                    .frame_directory(&client, &reader, 0, 1, &container, &mut memo)
+                    .await,
+                Err(PackedWireError::Invalid(message))
+                    if message.contains("profile disagrees")
+            ));
+        }
+        assert_eq!(
+            range_keys
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|key| key.as_str() == "descriptors/0")
+                .count(),
+            1
+        );
+        drop(memo);
+        assert_eq!(
+            budget.state().used[super::super::V3BudgetPool::Metadata as usize],
+            before[super::super::V3BudgetPool::Metadata as usize]
+        );
+        reader.close().await;
+        drop(reader);
+        assert_eq!(budget.state().used, [0; 8]);
     }
 
     #[tokio::test]
