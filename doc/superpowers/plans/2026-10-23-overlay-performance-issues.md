@@ -118,8 +118,14 @@ Interrupted attempts are preserved separately; another task starting a
 concurrent build caused those cancellations, not a source failure. Vendor
 warnings remain in the complete output; the requested strict clippy commands
 both exited 0. The 225 ignored workspace tests are not counted as passes.
-Broader focused module suites and overlay acceptance are still pending.
-No throughput benchmark or overall performance acceptance is claimed yet.
+Broader focused module suites also passed: the retained entity suite passed
+86 tests with 0 failures and 30 ignored; the retained packed metadata suite
+passed 121 tests with 0 failures and 0 ignored. The isolated real-backend
+runner passed 7 packed-entity-lower tests plus 109 entity tests, with 0
+failures and 0 ignored; its cleanup proof records no containers or volumes
+left in its project. These focused suites are in addition to the 1,196-test
+workspace gate. No throughput benchmark or overall performance acceptance is
+claimed yet.
 
 ## Fix commits
 
