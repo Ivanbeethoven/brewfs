@@ -307,7 +307,10 @@ impl WorkspaceKvBackend for PinMemoryBackend {
             })
             .collect();
         drop(rows);
-        if let Some((entered, resume)) = self.page_barrier.lock().await.take() {
+        // Pause only this page; other reads must be able to take the now-empty
+        // hook while the simulated remote reply remains outstanding.
+        let barrier = self.page_barrier.lock().await.take();
+        if let Some((entered, resume)) = barrier {
             entered.notify_one();
             resume.notified().await;
         }

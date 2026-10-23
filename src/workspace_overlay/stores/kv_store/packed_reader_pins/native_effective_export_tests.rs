@@ -13,6 +13,9 @@ mod native_payload_budget_tests;
 #[path = "packed_enumeration_tests.rs"]
 mod packed_enumeration_tests;
 
+#[path = "performance_tests.rs"]
+mod performance_tests;
+
 use super::*;
 use crate::cadapter::client::ObjectClient;
 use crate::cadapter::localfs::LocalFsBackend;

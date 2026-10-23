@@ -115,12 +115,9 @@ pub(super) struct RowsWritten {
     row_keys: Option<Vec<row_cache::RowKey>>,
     /// Any dentry row or inode deletion: paths/aliases may change.
     namespace: bool,
-    /// Set only for a create: the commit's single dentry is a Put naming an
-    /// inode this same commit introduces (allocated fresh, nlink 1/2, its
-    /// parent hint is that dentry's parent). Such an entry cannot change the
-    /// paths or aliases of any existing inode, so the namespace cache drops
-    /// only the new inode's own entries instead of everything.
-    created: Option<i64>,
+    /// Complete affected set for a fresh create or file-only namespace
+    /// mutation. Directory moves can change descendant paths and use None.
+    namespace_inodes: Option<Vec<i64>>,
 }
 
 impl RowsWritten {
@@ -156,7 +153,7 @@ impl RowsWritten {
         Self {
             row_keys,
             namespace,
-            created: None,
+            namespace_inodes: None,
         }
     }
 
@@ -180,7 +177,7 @@ impl RowsWritten {
                 .iter()
                 .all(|row| row.state != InodeState::Deleted);
         if fresh {
-            written.created = Some(ino);
+            written.namespace_inodes = Some(vec![ino]);
         }
         written
     }
@@ -282,10 +279,9 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
 
     /// One commit: the row cache drops only the entries whose source rows
     /// the commit writes (see `RowsWritten`), so unrelated directories,
-    /// ancestors and ACL xattrs stay cached. The namespace cache clears only
-    /// when the commit can change a path: any dentry row, or an inode
-    /// deleted. Renames, links, unlinks, creates and mkdir/rmdir all write
-    /// dentry rows.
+    /// ancestors and ACL xattrs stay cached. Namespace changes invalidate
+    /// only a known complete set of file paths/aliases; directory changes
+    /// and unknown shapes clear the namespace cache, including descendants.
     pub(super) fn invalidate_rows_written(&self, written: &RowsWritten) {
         if let Some(cache) = &self.upper_rows {
             match &written.row_keys {
@@ -296,11 +292,18 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         if written.namespace
             && let Some(cache) = &self.namespace_rows
         {
-            match written.created {
-                Some(ino) => cache.invalidate_keys(&[
-                    row_cache::RowKey::Paths(ino),
-                    row_cache::RowKey::Aliases(ino),
-                ]),
+            match &written.namespace_inodes {
+                Some(inodes) => cache.invalidate_keys(
+                    &inodes
+                        .iter()
+                        .flat_map(|ino| {
+                            [
+                                row_cache::RowKey::Paths(*ino),
+                                row_cache::RowKey::Aliases(*ino),
+                            ]
+                        })
+                        .collect::<Vec<_>>(),
+                ),
                 None => cache.invalidate_all(),
             }
         }
@@ -1064,19 +1067,36 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         parent: i64,
         child: Option<i64>,
     ) -> Result<(), MetaError> {
+        self.check_namespace_actor_with_parent(expected, parent, child, None)
+            .await
+    }
+
+    async fn check_namespace_actor_with_parent(
+        &self,
+        expected: &[LayerRecord; 2],
+        parent: i64,
+        child: Option<i64>,
+        parent_permission: Option<&PermissionInode>,
+    ) -> Result<(), MetaError> {
         let Some(actor) = crate::meta::layer::namespace_actor() else {
             return Ok(());
         };
         if actor.uid == 0 {
             return Ok(());
         }
-        let (directory, access, _, control) =
-            self.permission_inode_for_check(expected, parent).await?;
+        let loaded;
+        let (directory, access, _, control) = match parent_permission {
+            Some(permission) => permission,
+            None => {
+                loaded = self.permission_inode_for_check(expected, parent).await?;
+                &loaded
+            }
+        };
         if directory.kind != file_type_code(FileType::Dir) {
             return Err(MetaError::NotDirectory(parent));
         }
         let allowed = Self::inode_allows_actor(
-            &directory,
+            directory,
             access.as_deref(),
             control.as_deref(),
             actor.uid,
@@ -1633,10 +1653,18 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             let expected_layers = self.mutation_version().await?;
             let result = async {
                 validate_name(&name)?;
-                self.check_namespace_actor(&expected_layers, parent, None)
-                    .await?;
-                let (mut parent_inode, _, parent_default, _) =
-                    self.permission_inode(&expected_layers, parent).await?;
+                // A writeback template must come from this exact mutation
+                // version, never the lease-cached permission decision. Reuse
+                // that fresh snapshot for authorization too.
+                let parent_permission = self.permission_inode(&expected_layers, parent).await?;
+                self.check_namespace_actor_with_parent(
+                    &expected_layers,
+                    parent,
+                    None,
+                    Some(&parent_permission),
+                )
+                .await?;
+                let (mut parent_inode, _, parent_default, _) = parent_permission;
                 let mut creation_mode = mode & 0o7777;
                 let request_actor = crate::meta::layer::namespace_actor();
                 let creation_uid = request_actor.as_ref().map_or(uid, |actor| actor.uid);
@@ -1844,21 +1872,24 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                         inode.state = InodeState::Deleted;
                     }
                 }
-                self.commit_versioned_mutation(VersionedMutation {
-                    expected_layers: expected_layers.clone(),
-                    xattrs: Vec::new(),
-                    acls: Vec::new(),
-                    extents: Vec::new(),
-                    chunk_size: self.chunk_size,
-                    guard,
-                    dentries: vec![DentryDelta::whiteout(
-                        parent_inode.layer_id,
-                        parent,
-                        name.as_bytes().to_vec(),
-                        0,
-                    )],
-                    inodes: vec![inode, parent_inode],
-                })
+                self.commit_namespace_mutation(
+                    VersionedMutation {
+                        expected_layers: expected_layers.clone(),
+                        xattrs: Vec::new(),
+                        acls: Vec::new(),
+                        extents: Vec::new(),
+                        chunk_size: self.chunk_size,
+                        guard,
+                        dentries: vec![DentryDelta::whiteout(
+                            parent_inode.layer_id,
+                            parent,
+                            name.as_bytes().to_vec(),
+                            0,
+                        )],
+                        inodes: vec![inode, parent_inode],
+                    },
+                    (!directory).then(|| vec![entry.ino]),
+                )
                 .await
                 .map_err(workspace_to_meta)?;
                 Ok(())
@@ -2514,23 +2545,26 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                 parent_inode.mtime_ns = now;
                 parent_inode.ctime_ns = now;
                 parent_inode.sequence = 0;
-                self.commit_versioned_mutation(VersionedMutation {
-                    expected_layers: expected_layers.clone(),
-                    xattrs: Vec::new(),
-                    acls: Vec::new(),
-                    extents: Vec::new(),
-                    chunk_size: self.chunk_size,
-                    guard,
-                    dentries: vec![DentryDelta::put(
-                        inode.layer_id,
-                        parent,
-                        name.as_bytes().to_vec(),
-                        ino,
-                        inode.kind,
-                        0,
-                    )],
-                    inodes: vec![inode.clone(), parent_inode],
-                })
+                self.commit_namespace_mutation(
+                    VersionedMutation {
+                        expected_layers: expected_layers.clone(),
+                        xattrs: Vec::new(),
+                        acls: Vec::new(),
+                        extents: Vec::new(),
+                        chunk_size: self.chunk_size,
+                        guard,
+                        dentries: vec![DentryDelta::put(
+                            inode.layer_id,
+                            parent,
+                            name.as_bytes().to_vec(),
+                            ino,
+                            inode.kind,
+                            0,
+                        )],
+                        inodes: vec![inode.clone(), parent_inode],
+                    },
+                    Some(vec![ino]),
+                )
                 .await
                 .map_err(workspace_to_meta)?;
                 file_attr(&inode)
@@ -2714,6 +2748,11 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                 source_inode.ctime_ns = now;
                 source_inode.sequence = 0;
 
+                let files = (source_kind != FileType::Dir).then(|| {
+                    std::iter::once(source.ino)
+                        .chain(destination.iter().map(|entry| entry.ino))
+                        .collect()
+                });
                 let mut inodes = vec![source_inode];
                 if old_parent == new_parent {
                     inodes.push(new_parent_inode);
@@ -2724,26 +2763,34 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                 if let Some(inode) = destination_inode {
                     inodes.push(inode);
                 }
-                self.commit_versioned_mutation(VersionedMutation {
-                    expected_layers: expected_layers.clone(),
-                    xattrs: Vec::new(),
-                    acls: Vec::new(),
-                    extents: Vec::new(),
-                    chunk_size: self.chunk_size,
-                    guard,
-                    dentries: vec![
-                        DentryDelta::whiteout(head, old_parent, old_name.as_bytes().to_vec(), 0),
-                        DentryDelta::put(
-                            head,
-                            new_parent,
-                            new_name.as_bytes().to_vec(),
-                            source.ino,
-                            source.entry_type,
-                            0,
-                        ),
-                    ],
-                    inodes,
-                })
+                self.commit_namespace_mutation(
+                    VersionedMutation {
+                        expected_layers: expected_layers.clone(),
+                        xattrs: Vec::new(),
+                        acls: Vec::new(),
+                        extents: Vec::new(),
+                        chunk_size: self.chunk_size,
+                        guard,
+                        dentries: vec![
+                            DentryDelta::whiteout(
+                                head,
+                                old_parent,
+                                old_name.as_bytes().to_vec(),
+                                0,
+                            ),
+                            DentryDelta::put(
+                                head,
+                                new_parent,
+                                new_name.as_bytes().to_vec(),
+                                source.ino,
+                                source.entry_type,
+                                0,
+                            ),
+                        ],
+                        inodes,
+                    },
+                    files,
+                )
                 .await
                 .map_err(workspace_to_meta)?;
                 Ok(())
@@ -2856,33 +2903,39 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                     right_inode.sequence = 0;
                     inodes.extend([left_inode, right_inode]);
                 }
-                self.commit_versioned_mutation(VersionedMutation {
-                    expected_layers: expected_layers.clone(),
-                    xattrs: Vec::new(),
-                    acls: Vec::new(),
-                    extents: Vec::new(),
-                    chunk_size: self.chunk_size,
-                    guard,
-                    dentries: vec![
-                        DentryDelta::put(
-                            head,
-                            old_parent,
-                            old_name.as_bytes().to_vec(),
-                            right.ino,
-                            right.entry_type,
-                            0,
-                        ),
-                        DentryDelta::put(
-                            head,
-                            new_parent,
-                            new_name.as_bytes().to_vec(),
-                            left.ino,
-                            left.entry_type,
-                            0,
-                        ),
-                    ],
-                    inodes,
-                })
+                let files = (left.entry_type != file_type_code(FileType::Dir)
+                    && right.entry_type != file_type_code(FileType::Dir))
+                .then(|| vec![left.ino, right.ino]);
+                self.commit_namespace_mutation(
+                    VersionedMutation {
+                        expected_layers: expected_layers.clone(),
+                        xattrs: Vec::new(),
+                        acls: Vec::new(),
+                        extents: Vec::new(),
+                        chunk_size: self.chunk_size,
+                        guard,
+                        dentries: vec![
+                            DentryDelta::put(
+                                head,
+                                old_parent,
+                                old_name.as_bytes().to_vec(),
+                                right.ino,
+                                right.entry_type,
+                                0,
+                            ),
+                            DentryDelta::put(
+                                head,
+                                new_parent,
+                                new_name.as_bytes().to_vec(),
+                                left.ino,
+                                left.entry_type,
+                                0,
+                            ),
+                        ],
+                        inodes,
+                    },
+                    files,
+                )
                 .await
                 .map_err(workspace_to_meta)?;
                 Ok(())

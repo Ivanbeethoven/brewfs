@@ -1,7 +1,8 @@
 //! Authenticated PM11 lower combined with native workspace Data/Hole coverage.
 //! Store binding publication and whole-request retries are separate contracts.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 
@@ -250,6 +251,7 @@ pub(crate) struct WorkspacePackedLower {
     pub(super) inode_cold_memo: moka::sync::Cache<i64, Option<Arc<LowerInodeCold>>>,
     /// The lower's authenticated reverse (parent, name) aliases of an inode, complete across pages, for the binding lifetime.
     pub(super) reverse_names: moka::sync::Cache<i64, LowerAliases>,
+    memo_fills: MemoFills,
     upper_identity: usize,
     upper_layout: ChunkLayout,
 }
@@ -282,13 +284,50 @@ const PERMISSION_XATTRS: [&[u8]; 3] = [
     b"system.brewfs.acl",
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MemoKind {
+    Hot,
+    Cold,
+    Reverse,
+}
+
+type MemoFills = Mutex<BTreeMap<(MemoKind, i64), Weak<tokio::sync::Mutex<()>>>>;
+
 impl WorkspacePackedLower {
+    /// Coordinate only concurrent fills. Values (including absence) remain
+    /// in the byte-bounded memos; errors and cancellation are never cached.
+    async fn lock_memo_fill(
+        &self,
+        kind: MemoKind,
+        ino: i64,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, MetaError> {
+        let lock = {
+            let mut fills = self
+                .memo_fills
+                .lock()
+                .map_err(|_| MetaError::Internal("packed memo fill registry poisoned".into()))?;
+            fills.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = fills.get(&(kind, ino)).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                fills.insert((kind, ino), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        Ok(lock.lock_owned().await)
+    }
+
     /// The lower inode's hot attributes (None: no such lower inode),
     /// memoized for the binding lifetime.
     pub(super) async fn inode_hot(
         &self,
         ino: i64,
     ) -> Result<Option<Arc<LowerInodeHot>>, MetaError> {
+        if let Some(found) = self.inode_hot_memo.get(&ino) {
+            return Ok(found);
+        }
+        let _fill = self.lock_memo_fill(MemoKind::Hot, ino).await?;
         if let Some(found) = self.inode_hot_memo.get(&ino) {
             return Ok(found);
         }
@@ -312,6 +351,10 @@ impl WorkspacePackedLower {
         &self,
         ino: i64,
     ) -> Result<Option<Arc<LowerInodeCold>>, MetaError> {
+        if let Some(found) = self.inode_cold_memo.get(&ino) {
+            return Ok(found);
+        }
+        let _fill = self.lock_memo_fill(MemoKind::Cold, ino).await?;
         if let Some(found) = self.inode_cold_memo.get(&ino) {
             return Ok(found);
         }
@@ -341,6 +384,10 @@ impl WorkspacePackedLower {
         ino: i64,
         mut page: impl FnMut() -> Result<(), MetaError>,
     ) -> Result<LowerAliases, MetaError> {
+        if let Some(found) = self.reverse_names.get(&ino) {
+            return Ok(found);
+        }
+        let _fill = self.lock_memo_fill(MemoKind::Reverse, ino).await?;
         if let Some(found) = self.reverse_names.get(&ino) {
             return Ok(found);
         }
@@ -435,6 +482,7 @@ impl WorkspacePackedLower {
                 })
                 .max_capacity(LOWER_MEMO_BYTES)
                 .build(),
+            memo_fills: MemoFills::default(),
             upper_identity: Arc::as_ptr(&upper) as *const () as usize,
             upper_layout: layout,
             upper: Arc::new(NativeUpperFetcher {
