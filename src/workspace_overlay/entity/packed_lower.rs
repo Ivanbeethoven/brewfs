@@ -271,7 +271,7 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K
             )) => return self.end_call(&admission).await,
             Err(error) => return Err(error),
         };
-        stream::iter(entries.iter().take(32))
+        stream::iter(entries.entries.iter().take(32))
             .map(|(_, entry)| async move {
                 if let EntityDentry::Present { ino, kind } = entry {
                     tokio::try_join!(self.inode_inner(*ino), self.cold_inner(*ino))?;
@@ -475,12 +475,7 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLower
                     let memo::Value::Directory(entries) = directory.as_ref() else {
                         return Err(EntityError::Corrupt("lower directory memo type".into()));
                     };
-                    return Ok(memo::Value::Dentry(
-                        entries
-                            .iter()
-                            .find(|(entry_name, _)| entry_name == name)
-                            .map(|(_, entry)| entry.clone()),
-                    ));
+                    return Ok(memo::Value::Dentry(entries.lookup(name).cloned()));
                 }
                 let entry = self
                     .snapshot
@@ -555,12 +550,12 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> ImmutableLower
         let admission = self.begin_call().await?;
         let entries = self.directory_inner(ino).await?;
         self.end_call(&admission).await?;
-        Ok(entries.as_ref().clone())
+        Ok(entries.entries.clone())
     }
 }
 
 impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K> {
-    async fn directory_inner(&self, ino: i64) -> Result<Arc<Vec<(Vec<u8>, EntityDentry)>>> {
+    async fn directory_inner(&self, ino: i64) -> Result<Arc<memo::Directory>> {
         let value = self
             .memo
             .get(memo::Key::Directory(ino), || async {
@@ -575,7 +570,7 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K
         }
     }
 
-    async fn load_directory(&self, ino: i64) -> Result<Vec<(Vec<u8>, EntityDentry)>> {
+    async fn load_directory(&self, ino: i64) -> Result<memo::Directory> {
         self.require_directory(ino).await?;
         let mut result = Vec::new();
         let mut retained_bytes = 0usize;
@@ -621,7 +616,7 @@ impl<O: ObjectBackend + Clone + 'static, K: WorkspaceKvBackend> PackedLower<O, K
                 result.push((entry.name, value));
             }
         }
-        Ok(result)
+        Ok(memo::Directory::from_entries(result))
     }
 }
 

@@ -26,7 +26,42 @@ pub(super) enum Value {
     Cold(Option<Arc<V3ColdAttributes>>),
     Dentry(Option<EntityDentry>),
     Chunk(Arc<ChunkMap>),
-    Directory(Arc<Vec<(Vec<u8>, EntityDentry)>>),
+    Directory(Arc<Directory>),
+}
+
+/// A complete immutable directory retains its published enumeration order and
+/// a separate sorted index of entry positions for name lookup.
+pub(super) struct Directory {
+    pub(super) entries: Vec<(Vec<u8>, EntityDentry)>,
+    name_index: Vec<usize>,
+    #[cfg(test)]
+    comparisons: std::sync::atomic::AtomicUsize,
+}
+
+impl Directory {
+    pub(super) fn from_entries(entries: Vec<(Vec<u8>, EntityDentry)>) -> Self {
+        let mut name_index: Vec<_> = (0..entries.len()).collect();
+        name_index.sort_unstable_by(|left, right| entries[*left].0.cmp(&entries[*right].0));
+        Self {
+            entries,
+            name_index,
+            #[cfg(test)]
+            comparisons: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(super) fn lookup(&self, name: &[u8]) -> Option<&EntityDentry> {
+        let index = self
+            .name_index
+            .binary_search_by(|index| {
+                #[cfg(test)]
+                self.comparisons
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.entries[*index].0.as_slice().cmp(name)
+            })
+            .ok()?;
+        Some(&self.entries[self.name_index[index]].1)
+    }
 }
 
 fn weight(key: &Key, value: &Arc<Value>) -> u32 {
@@ -56,8 +91,11 @@ fn weight(key: &Key, value: &Arc<Value>) -> u32 {
                     * std::mem::size_of::<crate::workspace_overlay::entity::model::ChunkSpan>()
         }
         Value::Directory(entries) => {
-            entries.capacity() * std::mem::size_of::<(Vec<u8>, EntityDentry)>()
+            std::mem::size_of::<Directory>()
+                + entries.entries.capacity() * std::mem::size_of::<(Vec<u8>, EntityDentry)>()
+                + entries.name_index.capacity() * std::mem::size_of::<usize>()
                 + entries
+                    .entries
                     .iter()
                     .map(|(name, _)| name.capacity())
                     .sum::<usize>()
@@ -144,7 +182,41 @@ impl Memo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace_overlay::entity::model::EntityKind;
+    use crate::workspace_overlay::entity::resolver::MAX_DIRECTORY_ENTRIES;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn directory_lookup_is_logarithmic_and_preserves_enumeration_order() {
+        let entries: Vec<_> = (0..MAX_DIRECTORY_ENTRIES)
+            .rev()
+            .map(|index| {
+                (
+                    format!("entry-{index:04}").into_bytes(),
+                    EntityDentry::Present {
+                        ino: index as i64 + 1,
+                        kind: EntityKind::File,
+                    },
+                )
+            })
+            .collect();
+        let directory = Directory::from_entries(entries.clone());
+        // Allow log2(n) plus two comparisons per distinct query. The previous
+        // scan needs n comparisons for each miss, regardless of memo warmth.
+        let comparison_limit = MAX_DIRECTORY_ENTRIES.ilog2() as usize + 2;
+        for index in 0..MAX_DIRECTORY_ENTRIES {
+            let missing = format!("entry-{index:04}-missing");
+            assert!(directory.lookup(missing.as_bytes()).is_none());
+            let comparisons = directory.comparisons.swap(0, Ordering::Relaxed);
+            assert!(comparisons > 0 && comparisons <= comparison_limit);
+        }
+        for (name, entry) in &entries {
+            assert_eq!(directory.lookup(name), Some(entry));
+            let comparisons = directory.comparisons.swap(0, Ordering::Relaxed);
+            assert!(comparisons > 0 && comparisons <= comparison_limit);
+        }
+        assert_eq!(directory.entries, entries);
+    }
 
     #[test]
     fn memo_future_does_not_embed_loader_state() {
