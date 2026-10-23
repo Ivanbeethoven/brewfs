@@ -70,6 +70,83 @@ async fn new_test_store_with_session(session_id: Uuid) -> DatabaseMetaStore {
 }
 
 #[tokio::test]
+async fn chunk_discovery_visits_past_unchanged_first_batch_and_wraps() {
+    let store = new_test_store().await;
+    for (chunk_id, count) in [(1, 1), (2, 1), (3, 8)] {
+        for ordinal in 0..count {
+            store
+                .append_slice(
+                    chunk_id,
+                    SliceDesc {
+                        chunk_id,
+                        slice_id: chunk_id * 100 + ordinal,
+                        offset: 0,
+                        length: 4096,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+    assert!(store.list_chunk_ids(0).await.unwrap().is_empty());
+    let mut visited = HashSet::new();
+    for _ in 0..4 {
+        let page = store.list_chunk_ids(1).await.unwrap();
+        assert!(page.len() <= 1);
+        visited.extend(page);
+    }
+    assert_eq!(visited, HashSet::from([1, 2, 3]));
+
+    // The first two chunks stay unfragmented and are never removed. Discovery
+    // must nevertheless wrap and revisit every chunk on subsequent cycles.
+    visited.clear();
+    for _ in 0..4 {
+        visited.extend(store.list_chunk_ids(1).await.unwrap());
+    }
+    assert_eq!(visited, HashSet::from([1, 2, 3]));
+}
+
+#[tokio::test]
+async fn chunk_discovery_survives_deleted_cursor_and_zero_limit() {
+    let store = new_test_store().await;
+    for chunk_id in [1, 2, u64::MAX] {
+        store
+            .append_slice(
+                chunk_id,
+                SliceDesc {
+                    chunk_id,
+                    slice_id: chunk_id,
+                    offset: 0,
+                    length: 4096,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let first = store.list_chunk_ids(1).await.unwrap();
+    assert_eq!(first.len(), 1);
+    SliceMeta::delete_many()
+        .filter(slice_meta::Column::ChunkId.eq(first[0] as i64))
+        .exec(&store.db)
+        .await
+        .unwrap();
+    let expected: HashSet<_> = [1, 2, u64::MAX]
+        .into_iter()
+        .filter(|chunk_id| *chunk_id != first[0])
+        .collect();
+    let mut visited = HashSet::new();
+    for _ in 0..4 {
+        assert!(store.list_chunk_ids(0).await.unwrap().is_empty());
+        let page = store.list_chunk_ids(1).await.unwrap();
+        assert!(page.len() <= 1);
+        visited.extend(page);
+    }
+    assert_eq!(visited, expected);
+    SliceMeta::delete_many().exec(&store.db).await.unwrap();
+    assert!(store.list_chunk_ids(1).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn dangling_dentry_fused_lookup_returns_not_found_and_fuse_enoent() {
     let store = Arc::new(new_test_store().await);
     let root = store.root_ino();

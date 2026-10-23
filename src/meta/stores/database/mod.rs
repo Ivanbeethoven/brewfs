@@ -61,6 +61,7 @@ struct PlockHashMapKey {
 pub struct DatabaseMetaStore {
     db: DatabaseConnection,
     sqlite_txn_gate: Arc<Mutex<()>>,
+    chunk_scan_cursor: Arc<Mutex<Option<i64>>>,
     sid: OnceLock<Uuid>,
     _config: Config,
 }
@@ -172,6 +173,7 @@ impl DatabaseMetaStore {
         let store = Self {
             db,
             sqlite_txn_gate: Arc::new(Mutex::new(())),
+            chunk_scan_cursor: Arc::new(Mutex::new(None)),
             sid: OnceLock::new(),
             _config: config,
         };
@@ -489,6 +491,21 @@ impl DatabaseMetaStore {
                     return Err(MetaError::Database(e));
                 }
             }
+        }
+
+        let chunk_index_stmt = Index::create()
+            .if_not_exists()
+            .name("idx_slice_meta_chunk_id")
+            .table(SliceMeta)
+            .col(slice_meta::Column::ChunkId)
+            .to_owned();
+        let chunk_index_sql = builder.build(&chunk_index_stmt);
+        match db.execute(chunk_index_sql).await {
+            Ok(_) => info!("Slice chunk index created successfully"),
+            Err(e) if e.to_string().contains("already exists") => {
+                info!("Slice chunk index already exists, skipping: {}", e);
+            }
+            Err(e) => return Err(MetaError::Database(e)),
         }
 
         info!("Database schema initialized successfully");
@@ -3188,19 +3205,36 @@ impl MetaStore for DatabaseMetaStore {
     }
 
     async fn list_chunk_ids(&self, limit: usize) -> Result<Vec<u64>, MetaError> {
-        let rows: Vec<(i64,)> = SliceMeta::find()
-            .select_only()
-            .column(slice_meta::Column::ChunkId)
-            .distinct()
-            .into_tuple()
-            .all(&self.db)
-            .await
-            .map_err(MetaError::Database)?;
-        Ok(rows
-            .into_iter()
-            .take(limit)
-            .map(|(id,)| id as u64)
-            .collect())
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut cursor = self.chunk_scan_cursor.lock().await;
+        for _ in 0..2 {
+            let mut query = SliceMeta::find()
+                .select_only()
+                .column(slice_meta::Column::ChunkId)
+                .distinct()
+                .order_by_asc(slice_meta::Column::ChunkId)
+                .limit(limit as u64);
+            if let Some(after) = *cursor {
+                query = query.filter(slice_meta::Column::ChunkId.gt(after));
+            }
+            let rows: Vec<(i64,)> = query
+                .into_tuple()
+                .all(&self.db)
+                .await
+                .map_err(MetaError::Database)?;
+            if rows.is_empty() {
+                if cursor.take().is_some() {
+                    continue;
+                }
+                return Ok(Vec::new());
+            }
+            *cursor = rows.last().map(|(id,)| *id);
+            return Ok(rows.into_iter().map(|(id,)| id as u64).collect());
+        }
+        Ok(Vec::new())
     }
 
     #[tracing::instrument(
