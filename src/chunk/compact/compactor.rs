@@ -226,15 +226,32 @@ where
         slices: &[SliceDesc],
         chunk_id: u64,
     ) -> Result<u64, CompactorError> {
-        let chunk_size = self.layout.chunk_size;
-        let mut merged_data = vec![0u8; chunk_size as usize];
+        // Preserve holes inside the occupied prefix, without manufacturing an
+        // unused zero tail. Validate every range before allocating or doing I/O.
+        let occupied_end = slices.iter().try_fold(0_u64, |prefix_end, slice| {
+            let Some(end) = slice
+                .offset
+                .checked_add(slice.length)
+                .filter(|end| *end <= self.layout.chunk_size)
+            else {
+                return Err(CompactorError::InvalidData(format!(
+                    "Slice {} exceeds chunk bounds: offset={}, length={}, chunk_size={}",
+                    slice.slice_id, slice.offset, slice.length, self.layout.chunk_size
+                )));
+            };
+            Ok(prefix_end.max(end))
+        })?;
+        let merged_len = usize::try_from(occupied_end).map_err(|_| {
+            CompactorError::InvalidData("Compacted range exceeds address space".into())
+        })?;
+        let mut merged_data = vec![0u8; merged_len];
 
         self.read_and_merge_slices(slices, &mut merged_data).await?;
 
         let new_slice_id = self.meta_store.next_id(SLICE_ID_KEY).await? as u64;
 
         self.meta_store
-            .record_uncommitted_slice(new_slice_id, chunk_id, chunk_size, "compact_heavy")
+            .record_uncommitted_slice(new_slice_id, chunk_id, occupied_end, "compact_heavy")
             .await
             .map_err(CompactorError::MetaError)?;
 
@@ -244,7 +261,7 @@ where
             slice_id: new_slice_id,
             chunk_id,
             offset: 0,
-            length: chunk_size,
+            length: occupied_end,
         };
 
         let all_ids: Vec<u64> = slices.iter().map(|s| s.slice_id).collect();
@@ -272,7 +289,7 @@ where
                     new_slice_id, "Compact heavy conflict detected, retry needed"
                 );
                 if let Err(cleanup_err) = self
-                    .cleanup_uncommitted_slice(new_slice_id, chunk_size)
+                    .cleanup_uncommitted_slice(new_slice_id, occupied_end)
                     .await
                 {
                     warn!(
