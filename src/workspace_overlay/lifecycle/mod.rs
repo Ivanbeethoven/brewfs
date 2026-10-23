@@ -277,6 +277,15 @@ fn is_fixed_layer_pair(chain: &[LayerRecord]) -> bool {
 struct LeaseHeartbeat {
     cancel: CancellationToken,
     task: JoinHandle<()>,
+    validity: Arc<LeaseValidity>,
+}
+
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        self.validity.revoke();
+        self.cancel.cancel();
+        self.task.abort();
+    }
 }
 
 impl LeaseHeartbeat {
@@ -290,6 +299,7 @@ impl LeaseHeartbeat {
     ) -> Self {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
+        let owner_validity = validity.clone();
         let task = tokio::spawn(async move {
             let ttl_ns = match duration_ns(ttl) {
                 Ok(value) => value,
@@ -319,12 +329,17 @@ impl LeaseHeartbeat {
                 }
             }
         });
-        Self { cancel, task }
+        Self {
+            cancel,
+            task,
+            validity: owner_validity,
+        }
     }
 
-    async fn stop(self) {
+    async fn stop(mut self) {
+        self.validity.revoke();
         self.cancel.cancel();
-        let _ = self.task.await;
+        let _ = (&mut self.task).await;
     }
 }
 
