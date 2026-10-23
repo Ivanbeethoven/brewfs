@@ -659,16 +659,6 @@ async fn stale_open_paths_do_not_allocate_a_handle_or_increment_open_count() {
 }
 
 #[tokio::test]
-async fn statfs_rejects_unbounded_layer_scans_until_usage_counters_exist() {
-    let meta = test_meta().await;
-    assert!(matches!(
-        meta.stat_fs().await,
-        Err(crate::meta::store::MetaError::NotSupported(message))
-            if message == "workspace statfs requires persistent usage counters"
-    ));
-}
-
-#[tokio::test]
 async fn concurrent_directory_creates_do_not_lose_parent_updates() {
     let meta = Arc::new(test_meta().await);
     let root = meta.root_ino();

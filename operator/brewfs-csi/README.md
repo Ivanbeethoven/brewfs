@@ -47,6 +47,18 @@ restarts, persisted PID/reference state lets it reuse a live mount or remove a
 stale mount before retrying lease acquisition; a failed BrewFS lease
 acquisition is returned as a failed stage request.
 
+For `workspace-v1` mounts, filesystem `statfs` reports a **synthetic** 1 PiB
+total and 1 PiB free/available (1,125,899,906,842,624 bytes each). Usage is
+unknown: the zero used-inode count and 10,485,760 free-inode budget are also
+placeholders. These values are not measured Redis/S3 capacity, quota enforcement,
+or a guarantee that writes will fit. They avoid an unbounded workspace scan and
+provide nonzero capacity to tools such as `stat -f` and `df`.
+This is the BrewFS FUSE response, not CSI capacity reporting: the adapter still
+does not advertise or implement `NodeGetVolumeStats`. The separate experimental
+entity FUSE adapter is outside this fallback.
+The [fresh-mount evidence](../../doc/superpowers/plans/2026-10-23-workspace-statfs-fallback.md)
+records the exact byte counts, data readback and absence of new statfs errors.
+
 ## Kubernetes resources
 
 `manifests/` contains:

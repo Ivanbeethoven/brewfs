@@ -23,7 +23,7 @@ use crate::meta::layer::{InodePermissions, MetaLayer, PosixAclCapability};
 use crate::meta::posix_acl::{ACCESS_XATTR, DEFAULT_XATTR, PosixAcl};
 use crate::meta::store::{
     AclRule, CreateEntryResult, DirEntry, FileAttr, FileType, MetaError, OpenFlags, SetAttrFlags,
-    SetAttrRequest, StatFsSnapshot,
+    SetAttrRequest, StatFsSnapshot, stat_fs_snapshot_from_usage,
 };
 use crate::vfs::handles::DirHandle;
 
@@ -2133,14 +2133,11 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
     }
 
     async fn stat_fs(&self) -> Result<StatFsSnapshot, MetaError> {
-        // A correct effective-view count would require enumerating both layers
-        // while blocking mutations. That O(N) scan is forbidden on the hot
-        // `statfs` path and becomes unbounded for large workspaces. Report the
-        // limitation explicitly until usage counters are persisted and updated
-        // atomically with workspace mutations.
-        Err(MetaError::NotSupported(
-            "workspace statfs requires persistent usage counters".into(),
-        ))
+        // Usage is unknown without persisted effective-view counters. Avoid an
+        // unbounded layer scan: report the synthetic 1 PiB capacity/free space
+        // and inode budget used for an unmetered filesystem. Zero usage here
+        // is a placeholder, not measured consumption or a storage guarantee.
+        Ok(stat_fs_snapshot_from_usage(0, 0))
     }
 
     async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {

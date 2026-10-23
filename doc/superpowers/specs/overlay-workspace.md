@@ -801,6 +801,13 @@ scan an entire namespace for each call or substitute fabricated zero usage.
 Until supported, retain an explicit unsupported result. Usage accounting is
 not justification for reinstating a workspace-wide CAS on every write.
 
+The older `workspace-v1` MetaLayer has a separate compatibility fallback for
+FUSE `statfs`: synthetic 1 PiB total and free/available, zero placeholder used
+inodes, and a synthetic 10,485,760 free-inode budget. This is explicitly not
+measured usage, a quota, or backend capacity. It performs no namespace scan.
+The fallback does not implement entity-format accounting or CSI
+`NodeGetVolumeStats`; the entity policy above remains unchanged.
+
 ### 15. Experiment stages and deferred migration
 
 Each stage has its own reviewable result. Stage 2 began as an isolated experiment
