@@ -878,7 +878,10 @@ async fn redis_entity_prefix_scan_does_not_traverse_unrelated_keys() {
         .arg("reset")
         .arg("on")
         .arg(format!(">{password}"))
-        .arg(format!("~{}*", String::from_utf8_lossy(keys.volume_prefix())))
+        .arg(format!(
+            "~{}*",
+            String::from_utf8_lossy(keys.volume_prefix())
+        ))
         .arg("+@all")
         .arg("-scan")
         .query_async::<()>(&mut connection)
