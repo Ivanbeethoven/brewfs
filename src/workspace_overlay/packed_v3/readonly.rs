@@ -1960,14 +1960,16 @@ impl<B: ObjectBackend + Clone + 'static> crate::chunk::read_plan::WorkspaceReadP
         let Some(entry) = self.entry(Self::inode(ino)?).await? else {
             return Err(MetaError::NotFound(ino));
         };
-        let end = offset
-            .checked_add(len)
-            .ok_or_else(|| MetaError::Internal("packed range end overflows".into()))?;
-        if !entry.inline_data.is_empty() {
-            return Ok(len > 0 && offset < entry.size);
-        }
-        Ok(entry.extents.iter().any(|extent| {
-            extent.file_offset < end && extent.file_offset + u64::from(extent.logical_len) > offset
-        }))
+        let context = &self.context;
+        let placement = context
+            .snapshot
+            .placement(&context.reader, entry.inode, entry.size)
+            .await
+            .map_err(map_error)?;
+        context
+            .snapshot
+            .placement_range_has_data(&context.reader, &entry, placement.as_ref(), offset, len)
+            .await
+            .map_err(map_error)
     }
 }

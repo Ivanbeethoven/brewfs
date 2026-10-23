@@ -458,6 +458,88 @@ impl AuthenticatedV3Snapshot {
         super::V3Placement::decode(&bytes, inode, size).map(Some)
     }
 
+    /// Probe authenticated logical coverage without preparing or fetching data.
+    /// The index scan retains at most one overlapping external extent, even for
+    /// ranges much larger than the output budget of a normal read.
+    pub(crate) async fn placement_range_has_data<B: ObjectBackend + Clone + 'static>(
+        &self,
+        reader: &super::V3IndexReader<B>,
+        entry: &crate::workspace_overlay::packed_v3::GroupMetaEntry,
+        placement: Option<&super::V3Placement>,
+        offset: u64,
+        length: u64,
+    ) -> PackedResult<bool> {
+        entry.validate_placement()?;
+        if entry.kind != 1 {
+            return Err(PackedWireError::Invalid(
+                "range probe requires regular inode".into(),
+            ));
+        }
+        if self
+            .manifest
+            .source
+            .as_ref()
+            .is_some_and(|source| source.placement_contract)
+            && placement.is_none()
+        {
+            return Err(PackedWireError::Invalid(
+                "required regular-inode selector is absent".into(),
+            ));
+        }
+        if placement.is_some_and(|value| value.inode() != entry.inode || value.size() != entry.size)
+        {
+            return Err(PackedWireError::Invalid(
+                "native/packed selector disagrees with inode".into(),
+            ));
+        }
+        if matches!(placement, Some(super::V3Placement::External { .. }))
+            && (entry.flags != 0 || !entry.inline_data.is_empty() || !entry.extents.is_empty())
+        {
+            return Err(PackedWireError::Invalid(
+                "PM09 external inode has conflicting GroupMeta payload".into(),
+            ));
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| PackedWireError::LimitExceeded("logical range end overflows".into()))?
+            .min(entry.size);
+        if offset >= end {
+            return Ok(false);
+        }
+        if let Some(super::V3Placement::External {
+            extents,
+            extent_count,
+            ..
+        }) = placement
+        {
+            let records = reader
+                .scan_overlaps_page(
+                    extents,
+                    &super::placement::extent_key(entry.inode, offset),
+                    &super::placement::extent_key(entry.inode, end),
+                    None,
+                    1,
+                )
+                .await?;
+            let Some(record) = records.first() else {
+                return Ok(false);
+            };
+            let extent = super::V3LargeExtent::decode_record(record, entry.inode, entry.size)?;
+            if *extent_count == 0 {
+                return Err(PackedWireError::Invalid(
+                    "PM09 external extent count exceeds selector".into(),
+                ));
+            }
+            return Ok(extent.file_offset < end
+                && extent.file_offset + u64::from(extent.logical_len) > offset);
+        }
+        Ok(!entry.inline_data.is_empty()
+            || entry.extents.iter().any(|extent| {
+                extent.file_offset < end
+                    && extent.file_offset + u64::from(extent.logical_len) > offset
+            }))
+    }
+
     pub async fn cold_attributes<B: ObjectBackend + Clone + 'static>(
         &self,
         client: &ObjectClient<B>,

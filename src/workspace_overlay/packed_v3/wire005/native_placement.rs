@@ -1437,32 +1437,16 @@ impl<B: ObjectBackend + Clone + 'static> WorkspaceReadPlanProvider
     }
     async fn range_has_data(&self, ino: i64, offset: u64, len: u64) -> Result<bool, MetaError> {
         let record = self.entry(ino).await?.ok_or(MetaError::NotFound(ino))?;
-        if !record.entry.inline_data.is_empty() {
-            return Ok(offset < record.entry.size && len != 0);
-        }
-        let prepared = self
-            .snapshot
-            .prepare_placement_read_observed(
-                &self.client,
+        self.snapshot
+            .placement_range_has_data(
                 &self.reader,
-                super::V3ReadRange {
-                    offset,
-                    length: usize::try_from(len)
-                        .map_err(|_| meta_error(invalid("range length")))?,
-                },
-                32 << 20,
-                None,
-                V3ReadPlacementInput {
-                    group_id: record.group_id,
-                    container_ordinal: record.container_ordinal,
-                    entry: record.entry.clone(),
-                    placement: record.placement.clone(),
-                    owner: record,
-                },
+                &record.entry,
+                record.placement.as_ref(),
+                offset,
+                len,
             )
             .await
-            .map_err(meta_error)?;
-        Ok(!prepared.plan.segments.is_empty())
+            .map_err(meta_error)
     }
 }
 
@@ -2779,6 +2763,182 @@ mod tests {
         provider.start_runtime();
         (kv, repo, provider)
     }
+
+    #[tokio::test]
+    async fn sparse_range_probes_distinguish_group_data_holes_and_empty_ranges() {
+        let (_temp, client, snapshot, _reads) = fixture().await;
+        let packed = PackedV3ReadonlyMeta::from_v3(client.clone(), snapshot.clone(), 4096, 0);
+        let (_kv, _repo, native) = imported(client, snapshot).await;
+        for provider in [&packed as &dyn WorkspaceReadPlanProvider, native.as_ref()] {
+            for (offset, length, expected) in [
+                (0, 4, true),
+                (4, 4, false),
+                (2, 8, true),
+                (11, 8, true),
+                (2, 0, false),
+                (12, 0, false),
+                (12, 8, false),
+            ] {
+                assert_eq!(
+                    provider.range_has_data(8, offset, length).await.unwrap(),
+                    expected,
+                    "range {offset}+{length}"
+                );
+            }
+            assert!(provider.range_has_data(8, u64::MAX, 1).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn sparse_range_probes_native_hole_is_absent() {
+        let (_temp, client, snapshot, _reads) = fixture().await;
+        let (_kv, _repo, native) = imported(client, snapshot).await;
+        assert!(!native.range_has_data(8, 4, 4).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sparse_range_probes_validate_inline_bounds() {
+        let (_temp, client, snapshot, _reads) = fixture_with_inline(true).await;
+        let packed = PackedV3ReadonlyMeta::from_v3(client, snapshot, 4096, 0);
+        for (offset, length, expected) in [(0, 4, true), (3, 2, true), (2, 0, false), (4, 1, false)]
+        {
+            assert_eq!(
+                packed.range_has_data(8, offset, length).await.unwrap(),
+                expected
+            );
+        }
+        assert!(packed.range_has_data(8, u64::MAX, 1).await.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sparse_range_probes_resolve_external_data_and_all_hole_files() {
+        use super::super::CapturedV3SourceLayout;
+        use std::os::unix::fs::FileExt;
+
+        for all_hole in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("external");
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_len(64 << 20).unwrap();
+            if !all_hole {
+                file.write_all_at(&[37; 4096], 0).unwrap();
+            }
+            file.sync_all().unwrap();
+            let backend = RecordingBackend {
+                local: LocalFsBackend::new(temp.path().join("objects")),
+                reads: Arc::new(Mutex::new(vec![])),
+            };
+            let reads = backend.reads.clone();
+            let client = ObjectClient::new(backend);
+            let options = V3ProducerOptions {
+                snapshot_id: [9; 32],
+                root_dir_key: [7; 32],
+                root_inode: 7,
+                profile: AccessProfile::RandomSmallFile,
+                size_classes: SizeClassTable::default(),
+                build_policy: Default::default(),
+                metadata_codec: PackedCodec::Raw,
+                data_codec: PackedCodec::Raw,
+            };
+            let mut captured = CapturedV3SourceLayout::capture_with_policy(
+                &path,
+                temp.path(),
+                8,
+                options.profile,
+                options.size_classes,
+                options.build_policy,
+            )
+            .await
+            .unwrap();
+            let mut producer = V3SnapshotProducer::new(
+                client.clone(),
+                temp.path(),
+                "sparse-probe".into(),
+                options,
+            )
+            .await
+            .unwrap();
+            producer
+                .set_root_attributes(super::super::V3RootAttributes {
+                    inode: 7,
+                    size: 0,
+                    blocks: 0,
+                    mode: 0o040755,
+                    uid: 0,
+                    gid: 0,
+                    nlink: 2,
+                    atime_ns: 0,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                })
+                .unwrap();
+            producer.add_external_source(&mut captured).await.unwrap();
+            let group = PackedGroupInput {
+                group_id: 1,
+                parent_dir_key: [7; 32],
+                metadata: GroupMeta::new(vec![captured.entry().clone()])
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+                frame_ordinals: vec![],
+                entry_count: 1,
+                file_count: 1,
+                layout_profile: AccessProfile::RandomSmallFile,
+            };
+            producer
+                .add_container(1, &[group], &[], &[7])
+                .await
+                .unwrap();
+            producer
+                .set_inode_blocks(8, captured.source_blocks())
+                .await
+                .unwrap();
+            let reference = producer.finish().await.unwrap();
+            let snapshot = AuthenticatedV3Snapshot::open(&client, &reference)
+                .await
+                .unwrap();
+            let packed = PackedV3ReadonlyMeta::from_v3(client.clone(), snapshot.clone(), 4096, 0);
+            let (_kv, _repo, native) = imported(client, snapshot).await;
+            let data_key = if all_hole {
+                None
+            } else {
+                let container = native
+                    .snapshot
+                    .container_ref(&native.reader, 0)
+                    .await
+                    .unwrap();
+                assert_eq!(container.kind, V3ObjectKind::LargeData);
+                Some(container.key.clone())
+            };
+            reads.lock().unwrap().clear();
+            for provider in [&packed as &dyn WorkspaceReadPlanProvider, native.as_ref()] {
+                for (offset, length, expected) in [
+                    (0, 4096, !all_hole),
+                    (1, 2, !all_hole),
+                    (4096, 4096, false),
+                    (0, 64 << 20, !all_hole),
+                    (0, 0, false),
+                    (64 << 20, 4096, false),
+                ] {
+                    assert_eq!(
+                        provider.range_has_data(8, offset, length).await.unwrap(),
+                        expected,
+                        "external all_hole={all_hole}, range {offset}+{length}"
+                    );
+                }
+            }
+            assert!(
+                reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(key, _, _)| Some(key) != data_key.as_ref()),
+                "range probes must not fetch external data payloads"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn native_concurrent_read_preparation_does_not_exhaust_default_workspace() {
         // A 16-worker scan keeps that many unified reads preparing at once.
