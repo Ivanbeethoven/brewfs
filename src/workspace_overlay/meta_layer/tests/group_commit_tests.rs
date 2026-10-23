@@ -121,7 +121,11 @@ async fn group_commit_prefetches_cold_inodes_with_bounded_concurrency() {
         }
         let mut inodes = Vec::new();
         for index in 0..MAX_GROUP_WRITES {
-            let ino = f.meta.create_file(1, format!("cold-{index}")).await.unwrap();
+            let ino = f
+                .meta
+                .create_file(1, format!("cold-{index}"))
+                .await
+                .unwrap();
             // Warm immutable-lower memos, then drop upper permission rows.
             f.meta.cached_permission_snapshot(ino).await.unwrap();
             inodes.push(ino);
@@ -140,7 +144,10 @@ async fn group_commit_prefetches_cold_inodes_with_bounded_concurrency() {
             assert_eq!(control.reads.load(Ordering::SeqCst), round * inodes.len());
             assert_eq!(control.commits.load(Ordering::SeqCst), round);
             let peak = control.peak.swap(0, Ordering::SeqCst);
-            assert!((2..=8).contains(&peak), "permission read concurrency: {peak}");
+            assert!(
+                (2..=8).contains(&peak),
+                "permission read concurrency: {peak}"
+            );
         }
         control.track.store(false, Ordering::SeqCst);
         for ino in inodes {
@@ -220,6 +227,9 @@ async fn group_commit_refreshes_prefetched_inodes_after_head_conflict() {
     assert!(control.commits.load(Ordering::SeqCst) >= 2);
     control.track.store(false, Ordering::SeqCst);
     let inode = f.meta.resolve_inode_delta(ino).await.unwrap().unwrap();
-    assert_eq!((inode.size, inode.mode, inode.data_version), (1024, 0o100600, 8));
+    assert_eq!(
+        (inode.size, inode.mode, inode.data_version),
+        (1024, 0o100600, 8)
+    );
     shutdown(&f).await;
 }
