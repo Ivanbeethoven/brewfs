@@ -52,16 +52,37 @@ Before exited 101; each after-run exited 0. The historical before-log filename
 `219-220-242-before.log` executes the three regressions for #219/#220 plus eight
 existing compactor tests. This change does not address #242.
 
-## Remaining validation
+## Completed validation and remaining scope
 
-`cargo fmt --all --check` and `git diff --check` passed. The regression/focused
-compactor suite above passed all three runs. Broader checks are still in
-progress: overlay workspace check and strict all-target Clippy, slice unit
-tests, full default workspace tests/check/build/Clippy, overlay resolver
-integration, FUSE feature checks, and shell gates. They are not claimed as
-passing; keep the PR draft until the remaining relevant gates are complete.
+All 22 scheduled candidate commands passed, with zero command failures:
+
+| Validation | Result |
+| --- | --- |
+| Compactor integration suite, three runs | 11 passed / 0 failed / 0 ignored each |
+| Focused slice unit suite | 19 passed / 0 failed / 0 ignored |
+| Full default workspace libraries and binaries | 1,196 passed / 0 failed / 225 ignored |
+| Overlay resolver integration suite | 14 passed / 0 failed / 0 ignored |
+| Formatting | passed |
+| Default and overlay workspace checks | both passed |
+| Default and overlay strict all-target Clippy | both passed with `-D warnings` |
+| Workspace build | passed |
+| No-default-feature Tokio and io-uring checks | both passed |
+| Four shell syntax checks and three shell test scripts | all passed |
+| Diff whitespace check | passed |
+
+Every Cargo build/test used two jobs, disabled incremental compilation and
+debug information, and ran serially in this task's own target under a 16 GiB
+memory limit. No OOM or unrelated failing command occurred. Existing vendored
+dependency warnings and the future-compatibility warning remain in the logs.
+Ignored tests did not run.
+
+The full monolithic overlay/all-features unit suite and mounted real-backend
+suites were not run on this branch. The overlay coverage above is explicitly
+the compactor and resolver integration suites, not a full-overlay claim.
+Keep the PR draft while that broader validation remains outstanding.
 
 `commands.md` records exact completed commands, environments, exit codes and
 test summaries. `validation.tar.gz` preserves complete before/after output and
-source patches, including dependency warnings. Later gate evidence will be
-added in a follow-up commit.
+source patches, including dependency warnings. This follow-up evidence commit
+does not modify the tested Rust sources. `target-cleanup.json` records the
+inactive private target cleanup; logs, patches and the source worktree remain.
