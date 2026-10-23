@@ -29,6 +29,9 @@ use crate::workspace_overlay::stores::kv_backend::{
 };
 use crate::workspace_overlay::stores::kv_store::KvWorkspaceStore;
 
+#[path = "group_commit_tests.rs"]
+mod group_commit_tests;
+
 const IDLE: u8 = 0;
 const RENEW_ONCE: u8 = 1;
 const ALWAYS_BUSY: u8 = 2;
@@ -53,6 +56,7 @@ const AUTH_BACKEND_MESSAGE: &str = "binding authentication injected backend resp
 const BACKEND_MESSAGE: &str = "record_open preparation injected backend response";
 
 struct ValidationControl {
+    group_commit: group_commit_tests::Control,
     mode: AtomicU8,
     target: AtomicUsize,
     calls: AtomicUsize,
@@ -70,6 +74,7 @@ struct ValidationControl {
 impl ValidationControl {
     fn new() -> Self {
         Self {
+            group_commit: group_commit_tests::Control::new(),
             mode: AtomicU8::new(IDLE),
             target: AtomicUsize::new(1),
             calls: AtomicUsize::new(0),
@@ -172,7 +177,10 @@ impl<B: WorkspaceKvBackend> WorkspaceKvBackend for ValidationBackend<B> {
         &self,
         keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, WorkspaceError> {
-        self.inner.get_many_consistent(keys).await
+        self.control
+            .group_commit
+            .read_snapshot(self.inner.as_ref(), keys)
+            .await
     }
     async fn get_many_consistent_with_time(
         &self,
@@ -264,6 +272,7 @@ impl<B: WorkspaceKvBackend> WorkspaceKvBackend for ValidationBackend<B> {
         writes: &[KvWrite],
         expires_at_ns: i64,
     ) -> Result<bool, WorkspaceError> {
+        self.control.group_commit.before_commit(writes).await;
         self.control.validations.fetch_add(1, Ordering::SeqCst);
         let mode = self.control.mode.load(Ordering::SeqCst);
         let renewal_tracked = mounted_renewal_mode(mode) && mounted_renewal_packet(checks, writes);
