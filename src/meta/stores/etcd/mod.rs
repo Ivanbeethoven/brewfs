@@ -3388,6 +3388,19 @@ impl MetaStore for EtcdMetaStore {
                         return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
                     }
 
+                    for slice in &new_slices {
+                        let reservation = tx
+                            .get_typed_json::<EtcdUncommittedSliceRecord>(
+                                &Self::etcd_uncommitted_pending_key(slice.slice_id),
+                            )
+                            .await?;
+                        if !reservation.is_some_and(|record| {
+                            record.status == "pending" && record.chunk_id == chunk_id
+                        }) {
+                            return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
+                        }
+                    }
+
                     if new_slices.is_empty() {
                         tx.delete(&slice_key);
                     } else {
@@ -3650,6 +3663,21 @@ impl MetaStore for EtcdMetaStore {
                     let record = record_for_tx.clone();
 
                     Box::pin(async move {
+                        // The earlier scan only nominates a candidate. Read
+                        // its reservation in the same CAS as the chunk map.
+                        let Some(current) = tx
+                            .get_typed_json::<EtcdUncommittedSliceRecord>(&pending_key)
+                            .await?
+                        else {
+                            return Ok(false);
+                        };
+                        if current.status != "pending"
+                            || current.created_at >= cutoff_time
+                            || current.chunk_id != record.chunk_id
+                            || current.size != record.size
+                        {
+                            return Ok(false);
+                        }
                         let slices: Vec<SliceDesc> =
                             tx.get_typed(&slice_key).await?.unwrap_or_default();
                         let exists = slices.iter().any(|slice| slice.slice_id == record.slice_id);
@@ -3657,7 +3685,7 @@ impl MetaStore for EtcdMetaStore {
                             tx.delete(pending_key);
                             Ok(false)
                         } else {
-                            let mut orphan = record.clone();
+                            let mut orphan = current;
                             orphan.status = "orphan".to_string();
                             tx.delete(pending_key);
                             tx.set_typed_json(orphan_key, &orphan)?;

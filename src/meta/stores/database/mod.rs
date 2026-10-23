@@ -3763,6 +3763,23 @@ impl MetaStore for DatabaseMetaStore {
                 }
             }
         }
+        // Consuming a pending reservation and publishing its mapping must be
+        // one transaction. A GC claim (or completed deletion) fences a resumed
+        // compactor even when the old chunk mappings are still unchanged.
+        for slice in new_slices {
+            let consumed = UncommittedSlice::delete_many()
+                .filter(uncommitted_slice::Column::SliceId.eq(slice.slice_id as i64))
+                .filter(uncommitted_slice::Column::ChunkId.eq(chunk_id as i64))
+                .filter(uncommitted_slice::Column::Status.eq("pending"))
+                .exec(&txn)
+                .await
+                .map_err(MetaError::Database)?;
+            if consumed.rows_affected != 1 {
+                txn.rollback().await.map_err(MetaError::Database)?;
+                return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
+            }
+        }
+
         let slice_ids_to_delete: Vec<i64> = delayed_slices
             .iter()
             .map(|(slice_id, _, _)| *slice_id as i64)
@@ -3808,14 +3825,6 @@ impl MetaStore for DatabaseMetaStore {
                     .await
                     .map_err(MetaError::Database)?;
             }
-        }
-
-        for slice in new_slices {
-            UncommittedSlice::delete_many()
-                .filter(uncommitted_slice::Column::SliceId.eq(slice.slice_id as i64))
-                .exec(&txn)
-                .await
-                .map_err(MetaError::Database)?;
         }
 
         txn.commit().await.map_err(MetaError::Database)?;
@@ -3865,28 +3874,25 @@ impl MetaStore for DatabaseMetaStore {
         batch_size: usize,
     ) -> Result<Vec<(u64, u64)>, MetaError> {
         let cutoff_time = Utc::now().timestamp() - max_age_secs;
+        let (_sqlite_txn_guard, txn) = self.begin_transaction().await?;
 
         let pending_slices: Vec<uncommitted_slice::Model> = UncommittedSlice::find()
             .filter(uncommitted_slice::Column::Status.eq("pending"))
             .filter(uncommitted_slice::Column::CreatedAt.lt(cutoff_time))
             .limit(batch_size as u64)
-            .all(&self.db)
+            .lock_exclusive()
+            .all(&txn)
             .await
             .map_err(MetaError::Database)?;
 
         let orphan_records: Vec<uncommitted_slice::Model> = UncommittedSlice::find()
             .filter(uncommitted_slice::Column::Status.eq("orphan"))
             .limit(batch_size as u64)
-            .all(&self.db)
+            .all(&txn)
             .await
             .map_err(MetaError::Database)?;
 
-        if pending_slices.is_empty() && orphan_records.is_empty() {
-            return Ok(vec![]);
-        }
-
         let mut cleaned = Vec::new();
-        let (_sqlite_txn_guard, txn) = self.begin_transaction().await?;
 
         for pending in &pending_slices {
             let exists_in_meta = SliceMeta::find()
