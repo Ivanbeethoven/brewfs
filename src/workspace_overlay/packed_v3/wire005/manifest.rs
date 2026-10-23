@@ -34,6 +34,11 @@ struct PlanPreparationOwner {
     permit: super::V3OwnedPermit,
 }
 
+struct CachedFrameDirectory {
+    reference: V3ObjectRef,
+    page: super::V3FrameDirectoryPage,
+}
+
 fn read_preparation_limit(allocation_limit: usize, budget: &super::V3MountBudget) -> usize {
     // Index requests and independently owned flight recipes use Plans while
     // this arena is live. Leave room even at the supported 2 MiB capacity.
@@ -1190,6 +1195,7 @@ impl AuthenticatedV3Snapshot {
         })?;
         let mut segments = Vec::with_capacity(segment_capacity);
         let mut decoded = HashMap::new();
+        let mut directory_page = None;
         if !entry.inline_data.is_empty() && length != 0 {
             segments.push(LogicalSegment {
                 logical_offset: offset,
@@ -1235,6 +1241,7 @@ impl AuthenticatedV3Snapshot {
                             extent.container_ordinal,
                             extent.frame_ordinal,
                             &frame_container,
+                            &mut directory_page,
                         )
                         .await?;
                     let descriptor = page
@@ -1586,21 +1593,30 @@ impl AuthenticatedV3Snapshot {
                 )
             })?;
         let container = V3ObjectRef::decode_value(&container_value)?;
+        let mut directory_page = None;
         let page = self
-            .frame_directory(client, reader, container_ordinal, frame_ordinal, &container)
+            .frame_directory(
+                client,
+                reader,
+                container_ordinal,
+                frame_ordinal,
+                &container,
+                &mut directory_page,
+            )
             .await?;
         page.read_frame(client, &container, frame_ordinal, allocation_limit)
             .await
     }
 
-    async fn frame_directory<B: ObjectBackend + Clone + 'static>(
+    async fn frame_directory<'page, B: ObjectBackend + Clone + 'static>(
         &self,
         client: &ObjectClient<B>,
         reader: &super::V3IndexReader<B>,
         container_ordinal: u32,
         frame_ordinal: u32,
         container: &V3ObjectRef,
-    ) -> PackedResult<super::budget::V3Owned<super::V3FrameDirectoryPage>> {
+        cached: &'page mut Option<super::budget::V3Owned<CachedFrameDirectory>>,
+    ) -> PackedResult<&'page super::V3FrameDirectoryPage> {
         let mut key = container_ordinal.to_be_bytes().to_vec();
         key.extend_from_slice(&frame_ordinal.to_be_bytes());
         let directory_value = self
@@ -1612,12 +1628,42 @@ impl AuthenticatedV3Snapshot {
                 )
             })?;
         let reference = V3ObjectRef::decode_value(&directory_value)?;
-        let mut permit = reader.budget().admit(&[
-            (super::V3BudgetPool::Metadata, 512 << 10),
-            (super::V3BudgetPool::Stored, reference.object_len * 2),
-            (super::V3BudgetPool::Control, 2048),
-        ])?;
-        let page = super::V3FrameDirectoryPage::read(client, &reference, container.digest).await?;
+        if cached
+            .as_ref()
+            .is_none_or(|entry| entry.reference != reference)
+        {
+            // Keep at most one authenticated page per preparation. Release its
+            // budget owner before admitting a different page, including when
+            // reads visit multiple containers or revisit an earlier page.
+            *cached = None;
+            let mut permit = reader.budget().admit(&[
+                (super::V3BudgetPool::Metadata, 512 << 10),
+                (super::V3BudgetPool::Stored, reference.object_len * 2),
+                (super::V3BudgetPool::Control, 2048),
+            ])?;
+            let page =
+                super::V3FrameDirectoryPage::read(client, &reference, container.digest).await?;
+            let weight = std::mem::size_of::<CachedFrameDirectory>()
+                + reference.key.capacity()
+                + page.frames.capacity()
+                    * std::mem::size_of::<crate::workspace_overlay::packed_v3::PackedFrameDescriptor>(
+                    );
+            permit.shrink(super::V3BudgetPool::Metadata, weight as u64)?;
+            permit.shrink(super::V3BudgetPool::Stored, 0)?;
+            permit.shrink(super::V3BudgetPool::Control, 0)?;
+            *cached = Some(super::budget::V3Owned::new(
+                CachedFrameDirectory { reference, page },
+                permit,
+            ));
+        }
+        let page = &cached.as_ref().expect("authenticated descriptor page").page;
+        // Routing and source checks still apply to every ordinal, including
+        // cache hits; sharing a reference does not authorize another container.
+        if page.container_digest != container.digest || page.container_len != container.object_len {
+            return Err(PackedWireError::Invalid(
+                "PM07 frame directory disagrees with authenticated container".into(),
+            ));
+        }
         if page.profile != self.manifest.profile
             || page.size_classes != self.manifest.size_classes
             || page.frame_policy != self.manifest.build.policy.frames
@@ -1633,11 +1679,7 @@ impl AuthenticatedV3Snapshot {
                 "PM07 frame index key disagrees with descriptor page".into(),
             ));
         }
-        permit.shrink(super::V3BudgetPool::Metadata,
-            (std::mem::size_of::<super::V3FrameDirectoryPage>() + page.frames.capacity()*std::mem::size_of::<crate::workspace_overlay::packed_v3::PackedFrameDescriptor>()) as u64)?;
-        permit.shrink(super::V3BudgetPool::Stored, 0)?;
-        permit.shrink(super::V3BudgetPool::Control, 0)?;
-        Ok(super::budget::V3Owned::new(page, permit))
+        Ok(page)
     }
 
     /// Authenticates the selected root page but does not eagerly fetch its
@@ -2189,6 +2231,58 @@ mod tests {
 
     #[tokio::test]
     async fn published_gc05_group_inode_partial_inline_and_sparse_reads() {
+        use crate::cadapter::client::ObjectByteStream;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Clone)]
+        struct CountingDescriptors {
+            inner: LocalFsBackend,
+            gets: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl ObjectBackend for CountingDescriptors {
+            async fn put_object(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+                self.inner.put_object(key, bytes).await
+            }
+            async fn put_object_create_only(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+                self.inner.put_object_create_only(key, bytes).await
+            }
+            async fn get_object(&self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                anyhow::bail!("unexpected full object GET")
+            }
+            async fn get_object_range(
+                &self,
+                key: &str,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                if key.starts_with("descriptors/") {
+                    self.gets.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.get_object_range(key, offset, buf).await
+            }
+            async fn get_object_range_stream(
+                &self,
+                key: &str,
+                offset: u64,
+                length: u64,
+            ) -> anyhow::Result<ObjectByteStream> {
+                if key.starts_with("descriptors/") {
+                    self.gets.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner
+                    .get_object_range_stream(key, offset, length)
+                    .await
+            }
+            async fn get_etag(&self, key: &str) -> anyhow::Result<String> {
+                self.inner.get_etag(key).await
+            }
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                self.inner.delete_object(key).await
+            }
+        }
         use super::super::{
             V3IndexBuilder, V3IndexReader, V3IndexRecord, V3IndexValue, V3InodeLocation,
             build_v3_container,
@@ -2203,7 +2297,11 @@ mod tests {
             (10 * 1024 * 1024, false, PackedCodec::Zstd),
         ] {
             let temp = tempfile::tempdir().unwrap();
-            let client = ObjectClient::new(LocalFsBackend::new(temp.path()));
+            let descriptor_gets = Arc::new(AtomicUsize::new(0));
+            let client = ObjectClient::new(CountingDescriptors {
+                inner: LocalFsBackend::new(temp.path()),
+                gets: descriptor_gets.clone(),
+            });
             let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
             let (mut group, frames) = pack_group_files(
                 7,
@@ -2357,6 +2455,7 @@ mod tests {
                 logical.resize(logical.len() + 4096, 0);
             }
             for (offset, length) in [
+                (0, logical.len()),
                 (0, 16),
                 (4090, 20),
                 (logical.len() - 17, 17),
@@ -2365,6 +2464,7 @@ mod tests {
                 if offset + length > logical.len() {
                     continue;
                 }
+                descriptor_gets.store(0, Ordering::SeqCst);
                 let prepared = snapshot
                     .prepare_inode_read(
                         &client,
@@ -2376,6 +2476,13 @@ mod tests {
                     )
                     .await
                     .unwrap();
+                if size == 10 * 1024 * 1024 {
+                    assert_eq!(
+                        descriptor_gets.load(Ordering::SeqCst),
+                        1,
+                        "one preparation must fetch the shared descriptor page once, regardless of frame count"
+                    );
+                }
                 let mut cursor = offset as u64;
                 for segment in &prepared.plan.segments {
                     assert_eq!(segment.logical_offset, cursor);
@@ -2413,6 +2520,28 @@ mod tests {
             );
             assert_eq!(output, vec![0xff; 16]);
             if size == 10 * 1024 * 1024 {
+                // A retained page must still authenticate each requested source.
+                let mut cached = None;
+                snapshot
+                    .frame_directory(&client, &reader, 0, 0, &container, &mut cached)
+                    .await
+                    .unwrap();
+                let loaded = descriptor_gets.load(Ordering::SeqCst);
+                let mut wrong_digest = container.clone();
+                wrong_digest.digest[0] ^= 1;
+                let mut wrong_length = container.clone();
+                wrong_length.object_len += 1;
+                for wrong in [&wrong_digest, &wrong_length] {
+                    assert!(
+                        snapshot
+                            .frame_directory(&client, &reader, 0, 1, wrong, &mut cached)
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!(descriptor_gets.load(Ordering::SeqCst), loaded);
+                }
+                drop(cached);
+
                 // Eager preparation retains both crossing frames and fails
                 // this legal request despite space for output plus one frame.
                 let mut bounded_output = vec![0; 4 << 20];
