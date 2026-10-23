@@ -198,16 +198,7 @@ async fn many_sid_catalog() -> (
     let (backend, store, target) = catalog().await;
     let mut rows = backend.inner.rows.lock().await;
     for index in 1..128u64 {
-        let extent = DataExtentDelta::data(
-            target,
-            index as i64 + 1,
-            0,
-            0,
-            1,
-            10_000 + index,
-            0,
-            1,
-        );
+        let extent = DataExtentDelta::data(target, index as i64 + 1, 0, 0, 1, 10_000 + index, 0, 1);
         rows.insert(
             crate::workspace_overlay::stores::kv_store::extent_key(&extent),
             encode(&extent).unwrap(),
@@ -294,7 +285,10 @@ async fn native_collection_eventually_removes_layer_with_many_sids_across_bounde
             break;
         }
     }
-    assert!(completed, "bounded retries must eventually finish native GC");
+    assert!(
+        completed,
+        "bounded retries must eventually finish native GC"
+    );
     assert_eq!(objects.deletes.load(Ordering::SeqCst), 256);
     let rows = backend.inner.rows.lock().await;
     assert!(!rows.contains_key(&hot_layer_key(target)));

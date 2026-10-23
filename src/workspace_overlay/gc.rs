@@ -194,11 +194,7 @@ where
                 .map_err(|error| WorkspaceError::Backend(error.to_string()))?
                 && self
                     .store
-                    .gc_slice_deletion_reservation_complete(
-                        slice_id,
-                        slice_end,
-                        &deleted_layers,
-                    )
+                    .gc_slice_deletion_reservation_complete(slice_id, slice_end, &deleted_layers)
                     .await?
             {
                 orphan_bytes = orphan_bytes.saturating_add(slice_end);
