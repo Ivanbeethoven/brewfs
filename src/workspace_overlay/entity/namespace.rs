@@ -12,7 +12,7 @@ use std::{
     },
 };
 
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use crate::meta::posix_acl::{ACCESS_XATTR, DEFAULT_XATTR, PosixAcl};
 
@@ -56,7 +56,7 @@ pub struct CreateRequest {
 
 #[derive(Debug, Default)]
 pub(super) struct InodeLock {
-    mutex: Arc<AsyncMutex<()>>,
+    lock: Arc<RwLock<()>>,
     handles: AtomicUsize,
 }
 
@@ -93,11 +93,16 @@ pub struct EntityNamespace<B, L> {
     dentry_hints: moka::sync::Cache<(i64, Vec<u8>), i64>,
 }
 
-/// Retain the registry entry as well as its mutex. Keeping only the mutex guard
+/// Retain the registry entry as well as its lock. Keeping only the lock guard
 /// would allow the weak registry to create a second lock for the same inode.
 pub(super) struct InodeGuard {
     _state: Arc<InodeLock>,
-    _guard: OwnedMutexGuard<()>,
+    _guard: OwnedRwLockWriteGuard<()>,
+}
+
+pub(super) struct InodeReadGuard {
+    _state: Arc<InodeLock>,
+    _guard: OwnedRwLockReadGuard<()>,
 }
 
 enum Target {
@@ -293,8 +298,18 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
 
     pub(super) async fn lock_inode(&self, ino: i64) -> InodeGuard {
         let state = self.inode_lock(ino);
-        let guard = state.mutex.clone().lock_owned().await;
+        let guard = state.lock.clone().write_owned().await;
         InodeGuard {
+            _state: state,
+            _guard: guard,
+        }
+    }
+
+    pub(super) async fn read_lock_inode(&self, ino: i64) -> InodeReadGuard {
+        let state = self.inode_lock(ino);
+        // Tokio's fair queue keeps new readers behind an already waiting writer.
+        let guard = state.lock.clone().read_owned().await;
+        InodeReadGuard {
             _state: state,
             _guard: guard,
         }

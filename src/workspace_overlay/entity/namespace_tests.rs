@@ -156,6 +156,45 @@ async fn inode_data_guard_retains_registry_identity_without_a_handle() {
 }
 
 #[tokio::test]
+async fn inode_read_guard_retains_identity_and_does_not_overtake_waiting_writers() {
+    let fixture = fixture(MemoryLower::empty()).await;
+    let first = fixture.ns.read_lock_inode(2).await;
+    let reopened = EntityNamespace::new(
+        fixture.backend.clone(),
+        fixture.lower.clone(),
+        fixture.keys.clone(),
+        fixture.ns.session.clone(),
+    );
+    let writer = reopened.lock_inode(2);
+    tokio::pin!(writer);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut writer)
+            .await
+            .is_err()
+    );
+    let reader = fixture.ns.read_lock_inode(2);
+    tokio::pin!(reader);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut reader)
+            .await
+            .is_err()
+    );
+    drop(first);
+    let writer = tokio::time::timeout(Duration::from_secs(1), writer)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut reader)
+            .await
+            .is_err()
+    );
+    drop(writer);
+    let _reader = tokio::time::timeout(Duration::from_secs(1), reader)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn interrupted_truncate_fences_namespace_mutations_until_cleanup_finishes() {
     use super::recovery::{Recovery, prepare_resize};
     let mut lower = MemoryLower::empty();

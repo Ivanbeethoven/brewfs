@@ -19,6 +19,7 @@ use crate::workspace_overlay::entity::backend::{
 use crate::workspace_overlay::entity::keys::EntityKeys;
 use crate::workspace_overlay::entity::lifecycle::{Lifecycle, WriterLease, WriterSession};
 use crate::workspace_overlay::entity::memory::MemoryEntityBackend;
+use crate::workspace_overlay::entity::model::{EntityDentry, LowerBinding};
 use crate::workspace_overlay::entity::namespace::{CreateRequest, Credentials};
 use crate::workspace_overlay::entity::redis::RedisEntityBackend;
 use crate::workspace_overlay::entity::resolver::ImmutableLower;
@@ -739,6 +740,125 @@ fn root() -> Credentials {
         groups: vec![0],
         umask: 0o022,
     }
+}
+
+#[tokio::test]
+async fn independent_reads_and_attr_progress_while_transport_is_paused() {
+    struct PausedLower {
+        inner: MemoryLower,
+        entered: tokio::sync::mpsc::UnboundedSender<u64>,
+        resume: [tokio::sync::Semaphore; 2],
+    }
+
+    #[async_trait]
+    impl ImmutableLower for PausedLower {
+        fn binding(&self) -> &LowerBinding {
+            self.inner.binding()
+        }
+        async fn inode(&self, ino: i64) -> Result<Option<EntityInode>> {
+            self.inner.inode(ino).await
+        }
+        async fn dentry(&self, parent: i64, name: &[u8]) -> Result<Option<EntityDentry>> {
+            self.inner.dentry(parent, name).await
+        }
+        async fn xattr(&self, ino: i64, name: &[u8]) -> Result<Option<Vec<u8>>> {
+            self.inner.xattr(ino, name).await
+        }
+        async fn chunk(&self, ino: i64, index: u64, size: u64) -> Result<Option<ChunkMap>> {
+            self.inner.chunk(ino, index, size).await
+        }
+        async fn readdir(&self, ino: i64) -> Result<Vec<(Vec<u8>, EntityDentry)>> {
+            self.inner.readdir(ino).await
+        }
+    }
+
+    #[async_trait]
+    impl ImmutableLowerData for PausedLower {
+        async fn read_range(&self, ino: i64, offset: u64, length: usize) -> Result<Vec<u8>> {
+            self.entered.send(offset).unwrap();
+            self.resume[offset as usize / 8]
+                .acquire()
+                .await
+                .unwrap()
+                .forget();
+            self.inner.read_range(ino, offset, length).await
+        }
+    }
+
+    let backend = Arc::new(MemoryEntityBackend::new(1000));
+    let keys = EntityKeys::new(Uuid::new_v4(), Uuid::new_v4());
+    let mut inner = MemoryLower::empty();
+    inner.add_file(1, b"base", 2, 24);
+    let (entered, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let lower = Arc::new(PausedLower {
+        inner,
+        entered,
+        resume: std::array::from_fn(|_| tokio::sync::Semaphore::new(0)),
+    });
+    let lifecycle = Lifecycle::new(backend.clone(), keys.clone());
+    lifecycle.provision(lower.binding()).await.unwrap();
+    let session = lifecycle.acquire(Uuid::new_v4(), 1_000_000).await.unwrap();
+    let namespace = EntityNamespace::new(backend, lower.clone(), keys, session);
+    let data = EntityData::new(namespace.clone(), Arc::new(NoObjectIo), 8)
+        .await
+        .unwrap();
+    let first = Arc::new(namespace.open(1, b"base", 6, &root()).await.unwrap());
+    let second = Arc::new(namespace.open(1, b"base", 4, &root()).await.unwrap());
+    let read_first = {
+        let data = data.clone();
+        let handle = first.clone();
+        tokio::spawn(async move { data.read(handle, 0, 8).await })
+    };
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap(),
+        Some(0)
+    );
+    let read_second = {
+        let data = data.clone();
+        tokio::spawn(async move { data.read(second, 8, 8).await })
+    };
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("a disjoint read must enter transport while the first read is paused"),
+        Some(8)
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), data.attr(first.clone()))
+            .await
+            .expect("fstat must progress while read transport is paused")
+            .unwrap()
+            .size,
+        24
+    );
+
+    lower.resume[1].add_permits(1);
+    assert_eq!(
+        read_second.await.unwrap().unwrap(),
+        test_lower_bytes(2, 8, 8)
+    );
+
+    // Only the cancelled caller's owned read now holds the inode barrier.
+    read_first.abort();
+    assert!(read_first.await.unwrap_err().is_cancelled());
+    let mut truncate = tokio::spawn(async move { data.truncate(first, 0).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut truncate)
+            .await
+            .is_err()
+    );
+    lower.resume[0].add_permits(1);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), truncate)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .size,
+        0
+    );
 }
 
 async fn attach<B: EntityBackend + 'static>(
