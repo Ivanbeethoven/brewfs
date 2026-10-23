@@ -24,6 +24,8 @@ use dashmap::{DashMap, Entry};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[cfg(feature = "native-packed-base")]
 use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -355,6 +357,8 @@ where
     recently_unlinked_cleanup_tick: AtomicU64,
     reader: Arc<DataReader<S, M>>,
     writer: Arc<DataWriter<S, M>>,
+    #[cfg(test)]
+    truncate_flush_test_hook: TruncateFlushTestHook,
     #[cfg(feature = "workspace-overlay")]
     packed_mutation_gate: Arc<PackedMutationGate>,
     append_locks: DashMap<i64, Arc<Mutex<()>>>,
@@ -376,6 +380,43 @@ struct SplitWriteBarrier {
     boundary: u64,
     until: Instant,
     notify: Arc<Notify>,
+}
+
+#[cfg(test)]
+struct TruncateFlushTestHook {
+    enabled: AtomicBool,
+    reached: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
+impl TruncateFlushTestHook {
+    fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            reached: Notify::new(),
+            release: Notify::new(),
+        }
+    }
+
+    fn arm(&self) {
+        self.enabled.store(true, Ordering::SeqCst);
+    }
+
+    async fn pause_once(&self) {
+        if self.enabled.swap(false, Ordering::SeqCst) {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+    }
+
+    async fn wait_until_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 struct FallocateStatFsCache {
@@ -720,6 +761,8 @@ where
             recently_unlinked_cleanup_tick: AtomicU64::new(0),
             reader,
             writer,
+            #[cfg(test)]
+            truncate_flush_test_hook: TruncateFlushTestHook::new(),
             #[cfg(feature = "workspace-overlay")]
             packed_mutation_gate,
             append_locks: DashMap::new(),
@@ -3964,6 +4007,8 @@ where
             elapsed_ms = start.elapsed().as_millis() as u64,
             "truncate path: flush complete"
         );
+        #[cfg(test)]
+        self.state.truncate_flush_test_hook.pause_once().await;
         Ok(())
     }
 
@@ -4022,10 +4067,9 @@ where
         // this inode to queue at the mutex, eventually stalling kernel writeback and
         // blocking userspace pwrite(2) for the entire flush duration.
         //
-        // After we take the lock we call writer.clear() to drop any newly-written
-        // dirty slices that arrived between the pre-flush and the lock acquisition.
-        // Those writes lose their data (truncate semantics: last-writer wins at the
-        // inode level), and meta_truncate removes any slices committed in that window.
+        // After we take the lock, drain again while ordinary inode writers are
+        // excluded. This orders writes admitted after the optimistic flush before
+        // the truncate instead of dropping acknowledged retained-prefix data.
         self.flush_before_truncate(ino, size, "truncate_inode")
             .await?;
 
@@ -4040,12 +4084,16 @@ where
             guards.push(handle.lock_write().await);
         }
 
+        self.flush_before_truncate(ino, size, "truncate_inode_locked")
+            .await?;
+
         self.meta_truncate(ino, size, self.core.layout.chunk_size)
             .await?;
 
         // POSIX semantic for `truncate`: `truncate` is immediately visible to old handles.
         self.state.reader.invalidate_all(ino as u64).await;
-        // Discard dirty data written between the pre-flush and the lock acquisition.
+        // Discard any residual dirty overlay after the ordered drain and metadata
+        // truncate have completed.
         self.state.writer.clear(ino as u64).await;
 
         let guard = self
@@ -4614,8 +4662,8 @@ where
         //
         // flush_required is called BEFORE acquiring mutation_lock to avoid holding
         // the lock during a potentially long upload wait (see truncate_inode for the
-        // full rationale).  writer.clear() inside the lock discards any dirty slices
-        // that arrived between the pre-flush and the lock acquisition.
+        // full rationale). A second drain below orders writes admitted in that gap
+        // before the truncate while the mutation lock excludes ordinary writers.
         let atomic_permissions = self.meta_layer().posix_acl_capability()
             == crate::meta::layer::PosixAclCapability::ReadWrite;
         let _guards = if let Some(size) = req.size {
@@ -4631,6 +4679,9 @@ where
             for handle in handles {
                 guards.push(handle.lock_write().await);
             }
+
+            self.flush_before_truncate(ino, size, "set_attr_truncate_locked")
+                .await?;
 
             if !atomic_permissions {
                 self.meta_truncate(ino, size, self.core.layout.chunk_size)

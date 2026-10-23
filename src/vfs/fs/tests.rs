@@ -3480,6 +3480,87 @@ mod truncate_flush_tests {
         .unwrap()
     }
 
+    async fn assert_truncate_preserves_write_in_flush_gap(use_set_attr: bool) {
+        let fs = Arc::new(new_vfs().await);
+        let root = fs.root_ino();
+        let ino = op_timeout("create_file", fs.create_file_at(root, "f", false))
+            .await
+            .unwrap();
+
+        let old = vec![0x11; 16 * 1024];
+        op_timeout("initial write", fs.write_ino(ino, 0, &old))
+            .await
+            .unwrap();
+        op_timeout(
+            "initial flush",
+            fs.state.writer.flush_required_for_truncate(ino as u64),
+        )
+        .await
+        .unwrap();
+
+        // Pause after truncate's optimistic flush and before it takes the
+        // mutation lock. A successful write can enter this gap and must not be
+        // discarded by the truncate's cleanup.
+        fs.state.truncate_flush_test_hook.arm();
+        let fs_t = fs.clone();
+        let truncate_task = tokio::spawn(async move {
+            if use_set_attr {
+                let req = SetAttrRequest {
+                    size: Some(8 * 1024),
+                    ..Default::default()
+                };
+                fs_t.set_attr(ino, &req, SetAttrFlags::empty())
+                    .await
+                    .map(|_| ())
+            } else {
+                fs_t.truncate_inode(ino, 8 * 1024).await
+            }
+        });
+        op_timeout(
+            "wait for truncate flush",
+            fs.state.truncate_flush_test_hook.wait_until_reached(),
+        )
+        .await;
+
+        let retained = vec![0xA5; 1024];
+        op_timeout(
+            "write during truncate flush",
+            fs.write_ino(ino, 0, &retained),
+        )
+        .await
+        .unwrap();
+        fs.state.truncate_flush_test_hook.release();
+        op_timeout("truncate", truncate_task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let attr = op_timeout("stat retained prefix", fs.stat_ino(ino))
+            .await
+            .unwrap();
+        let fh = op_timeout(
+            "open retained prefix",
+            fs.open(ino, attr, true, false, false),
+        )
+        .await
+        .unwrap();
+        let data = op_timeout("read retained prefix", fs.read(fh, 0, retained.len()))
+            .await
+            .unwrap();
+        let _ = fs.close(fh).await;
+        assert_eq!(data, retained);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_preserves_write_admitted_after_flush() {
+        assert_truncate_preserves_write_in_flush_gap(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_set_attr_truncate_preserves_write_admitted_after_flush() {
+        assert_truncate_preserves_write_in_flush_gap(true).await;
+    }
+
     /// Write data to create pending dirty slices in the writer,
     /// then immediately truncate.  This exercises the flush_required →
     /// writer.flush() → meta_truncate path that generic/014 tickles.
