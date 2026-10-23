@@ -24,6 +24,18 @@ pub struct Compactor<B, M: MetaStore + ?Sized> {
     config: CompactConfig,
 }
 
+pub(super) struct ChunkSnapshot {
+    slices: Vec<SliceDesc>,
+    total: u64,
+    fragmentation: f64,
+}
+
+impl ChunkSnapshot {
+    pub(super) fn count(&self) -> usize {
+        self.slices.len()
+    }
+}
+
 impl<B, M: ?Sized> Compactor<B, M>
 where
     M: MetaStore + Send + Sync + 'static,
@@ -68,54 +80,74 @@ where
         &self.block_store
     }
     pub async fn analyze_chunk(&self, chunk_id: u64) -> Result<(usize, u64, f64), CompactorError> {
+        let snapshot = self.snapshot(chunk_id).await?;
+        Ok((snapshot.count(), snapshot.total, snapshot.fragmentation))
+    }
+
+    pub(super) async fn snapshot(&self, chunk_id: u64) -> Result<ChunkSnapshot, CompactorError> {
         let slices = self.meta_store.get_slices(chunk_id).await?;
-        let count = slices.len();
-        if count == 0 {
-            return Ok((0, 0, 0.0));
-        }
         let total: u64 = slices.iter().map(|s| s.length).sum();
-        let frag = SliceDesc::calculate_fragmentation(&slices);
-        Ok((count, total, frag))
+        let fragmentation = SliceDesc::calculate_fragmentation(&slices);
+        Ok(ChunkSnapshot {
+            slices,
+            total,
+            fragmentation,
+        })
     }
 
     /// Check whether a chunk should be compacted and, if so, whether it
     /// should be done synchronously (blocking writes).
     pub async fn should_compact(&self, chunk_id: u64) -> Result<(bool, bool), CompactorError> {
-        let (count, _total, frag) = self.analyze_chunk(chunk_id).await?;
+        Ok(self.should_compact_snapshot(&self.snapshot(chunk_id).await?))
+    }
+
+    pub(super) fn should_compact_snapshot(&self, snapshot: &ChunkSnapshot) -> (bool, bool) {
+        let count = snapshot.count();
         let cfg = &self.config;
 
         if count < cfg.min_slice_count {
-            return Ok((false, false));
+            return (false, false);
         }
-        if frag < cfg.min_fragment_ratio {
-            return Ok((false, false));
+        if snapshot.fragmentation < cfg.min_fragment_ratio {
+            return (false, false);
         }
         let is_sync = count >= cfg.sync_threshold;
-        Ok((true, is_sync))
+        (true, is_sync)
     }
 
     /// Try to compact a chunk with sequential light-then-heavy strategy.
     pub async fn compact_sequential(&self, chunk_id: u64) -> Result<CompactResult, CompactorError> {
-        let (count, _, frag) = self.analyze_chunk(chunk_id).await?;
+        self.compact_snapshot(chunk_id, self.snapshot(chunk_id).await?)
+            .await
+    }
+
+    pub(super) async fn compact_snapshot(
+        &self,
+        chunk_id: u64,
+        mut snapshot: ChunkSnapshot,
+    ) -> Result<CompactResult, CompactorError> {
+        let count = snapshot.count();
         if count <= 1 {
             return Ok(CompactResult::Skipped);
         }
 
         // Determine if heavy compaction might be needed
         let mut needs_heavy = self.config.heavy_enabled
-            && (frag >= self.config.heavy_fragment_threshold
+            && (snapshot.fragmentation >= self.config.heavy_fragment_threshold
                 || count >= self.config.heavy_slice_threshold);
 
         let mut light_removed = 0usize;
         if self.config.light_enabled && count >= self.config.light_threshold {
-            let removed = self.compact_light(chunk_id).await?;
+            let removed = self.compact_light_inner(&snapshot.slices, chunk_id).await?;
 
             if let Some(n) = removed {
                 light_removed = n;
 
-                // Re-analyze
+                // A successful light publication changes the working set.
                 if n > 0 {
-                    let (count_after, _, frag_after) = self.analyze_chunk(chunk_id).await?;
+                    snapshot = self.snapshot(chunk_id).await?;
+                    let count_after = snapshot.count();
+                    let frag_after = snapshot.fragmentation;
                     needs_heavy = self.config.heavy_enabled
                         && (frag_after >= self.config.heavy_fragment_threshold
                             || count_after >= self.config.heavy_slice_threshold);
@@ -131,7 +163,7 @@ where
             }
         }
         if needs_heavy {
-            let new_slice_id = self.compact_heavy(chunk_id).await?;
+            let new_slice_id = self.compact_heavy_inner(&snapshot.slices, chunk_id).await?;
             return Ok(CompactResult::Heavy { new_slice_id });
         }
         if light_removed > 0 {
