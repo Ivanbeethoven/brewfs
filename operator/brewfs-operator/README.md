@@ -21,7 +21,7 @@ Native fork 需要在新 `BrewFSCluster` 上显式设置
 每个 workspace 各自持有一个写租约。CSI 驱动在独立的
 [`../brewfs-csi`](../brewfs-csi/README.md) 工程中。
 
-2026-10-23 的实际 AX ForkWorkspace API、双 agent 数据隔离证据及未完成的
+2026-10-23 的实际 AX ForkWorkspace API、双 agent 数据隔离及重新挂载后的
 SSH 验证见 [native fork demo](../../doc/superpowers/plans/2026-10-23-native-workspace-fork-demo.md)。
 
 完整生命周期、不可变 lower 保证和架构图见

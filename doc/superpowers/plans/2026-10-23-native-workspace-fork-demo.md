@@ -3,8 +3,9 @@
 The native fork data path passed on the existing k3s cluster with Redis,
 RustFS, BrewFS CSI, AX, and two concurrent gVisor actors. This is a functional
 demo using deterministic Python task commands, not an LLM or performance run.
-Packed fork remains deferred. SSH verification remains blocked as described
-below; this is not a claim that every integration check passed.
+Packed fork remains deferred. SSH readback also passed after replacing the two
+stale worker pods with user approval. Both workspaces were remounted for this
+verification; the original task-written bytes were preserved.
 
 ## Code and deployment
 
@@ -65,7 +66,8 @@ after parent reactivation leaves both the snapshot and fork Ready.
 ## Observed bytes and isolation
 
 Every content string below ends with a newline. These are observed hashes from
-the real CSI mounts, corroborated by the task logs.
+the real CSI mounts, corroborated by the task logs and subsequent `ax ssh`
+readback after unmount/remount.
 
 | Workspace/file | Contents | SHA-256 |
 | --- | --- | --- |
@@ -79,7 +81,59 @@ Assertions passed: B sees A's initial bytes; B does not see `parent-only.txt`;
 the parent sees neither `agent-b.txt` nor `fork-observed.txt`; B's overwrite
 does not change the parent's `agent-a.txt`.
 
-## Gates and remaining limitation
+## SSH verification after worker replacement
+
+The host reboot changed worker pod IPs while Substrate retained their old IP
+registrations. Router logs showed `UF,URX` against `10.42.0.88:8443` and the CLI
+returned `upstream connect error or disconnect/reset before headers`.
+Substrate's worker syncer treats IPs as immutable and only logs that drift.
+
+With explicit user approval, both demo actors were deleted and their CSI mounts
+released. Only these two worker pods were then replaced, one at a time:
+
+```bash
+kubectl -n ate-demo-sandbox delete pod sandbox-workerpool-7996f86485-v8gwp
+kubectl -n ate-demo-sandbox wait --for=condition=Ready pod/sandbox-workerpool-7996f86485-dtm59 --timeout=60s
+kubectl -n ate-demo-sandbox delete pod sandbox-workerpool-7996f86485-xd295
+kubectl -n ate-demo-sandbox wait --for=condition=Ready pods -l ate.dev/worker-pool=sandbox-workerpool --timeout=90s
+```
+
+The replacements `sandbox-workerpool-7996f86485-dtm59` (`10.42.0.132`) and
+`sandbox-workerpool-7996f86485-v8dpp` (`10.42.0.133`) became Ready/ACTIVE. The
+registered IPs were asserted equal to the actual pod IPs. No cluster rebuild,
+WorkerPool configuration change, or AX/runner code change was needed.
+
+Two verification tasks mounted the existing workspace UUIDs concurrently. Their
+commands read/assert the saved bytes and then sleep; they do not rewrite data.
+
+| Identity | Parent verification | Child verification |
+| --- | --- | --- |
+| Task name | `fork-agent-a-verify` | `fork-agent-b-verify` |
+| AX task ID | `task-fork-agent-a-verify-1792728502` | `task-fork-agent-b-verify-1792728503` |
+| Actor UID | `fb111331-f0dd-4565-be21-03776b49ff38` | `a4a66097-9bda-4c25-a298-ab7a4f484ca2` |
+| Worker IP | `10.42.0.133` | `10.42.0.132` |
+| Conditions | Ready=True, WorkspaceReady=True | Ready=True, WorkspaceReady=True |
+
+These actual commands exited zero:
+
+```bash
+ax -a fork-demo ssh fork-agent-a-verify -- sh -ec 'curl -fsS http://127.0.0.1/readyz?check=workspace; cat /workspace/agent-a.txt /workspace/parent-only.txt; sha256sum /workspace/agent-a.txt /workspace/parent-only.txt; test ! -e /workspace/agent-b.txt; test ! -e /workspace/fork-observed.txt; printf "PARENT_SSH_ISOLATION_PASS\n"'
+ax -a fork-demo ssh fork-agent-b-verify -- sh -ec 'curl -fsS http://127.0.0.1/readyz?check=workspace; cat /workspace/fork-observed.txt /workspace/agent-a.txt /workspace/agent-b.txt; sha256sum /workspace/fork-observed.txt /workspace/agent-a.txt /workspace/agent-b.txt; test ! -e /workspace/parent-only.txt; printf "CHILD_SSH_ISOLATION_PASS\n"'
+```
+
+Both readiness probes returned `ok`. Contents and all five SHA-256 values
+matched the table above. The terminal markers were `PARENT_SSH_ISOLATION_PASS`
+and `CHILD_SSH_ISOLATION_PASS`. Raw output is in `parent-ssh-proof.txt` and
+`child-ssh-proof.txt` in the artifact directory below.
+
+After capture, both verification tasks and demo-generated golden actors were
+removed. The AX task list for `fork-demo` is empty; both CSI state files are
+absent and neither workspace path is mounted (`DEMO_MOUNTS_RELEASED_PASS`).
+Parent/child workspaces, snapshot, StorageClasses and backend data are retained
+for inspection. Operator/CSI, AX, Substrate, registry and the two healthy
+replacement workers remain deployed.
+
+## Gates and remaining limitations
 
 Local operator workspace gates passed with `--features workspace-operator
 --all-targets`: build, check, test (58 passed, zero failed), and clippy. Clippy
@@ -91,20 +145,9 @@ Kubernetes server dry-run of all six generated CRDs passed. AX server and CLI
 tests passed with Go 1.27.3. Rust builds ran with one job and explicit CPU/RAM
 limits after the host reboot.
 
-`ax ssh` has **not passed**. Substrate still registers the existing worker pods
-at `10.42.0.88` / `10.42.0.89`; their actual post-reboot IPs are `10.42.0.114` /
-`10.42.0.116`. The router reports `UF,URX` connecting to the stale worker on port
-8443. The CLI reports:
-
-```text
-upstream connect error or disconnect/reset before headers. reset reason: connection termination
-```
-
-Substrate's worker syncer declares IPs immutable and logs this drift instead
-of repairing it. Repair requires fresh worker registration (normally replacing
-the affected pods). Those protected infrastructure pods were left unchanged;
-permission was requested before doing so. Readback evidence here uses actor
-logs and CSI mounts, not a successful SSH session.
+The reboot-related worker IP drift was repaired operationally for this demo;
+Substrate's handling of that drift was not changed. Recurrence would still
+require fresh worker registration.
 
 AX's upstream GCS snapshot default was also unsuitable for this local S3
 installation. AX now has `AX_SNAPSHOTS_BUCKET=s3://ate-snapshots/ax/`; no
@@ -119,4 +162,7 @@ Private manifests and raw logs are on this host at
 `isolation-csi-proof.txt`, `concurrent-tasks.txt`, `ax-fork-result.yaml`,
 `fork-agent-{a,b}-{task,actor}.yaml`, `fork-agent-{a,b}-guest.log`,
 `redis-acl-denials.txt`, `workers-actual-pods.txt`,
-`workers-stale-registration.json`, and `router-stale-ip.log`.
+`workers-stale-registration.json`, `router-stale-ip.log`,
+`workers-after-replacement.json`, `worker-pods-after-replacement.json`,
+`concurrent-verification-tasks.txt`, `parent-ssh-proof.txt`,
+`child-ssh-proof.txt`, and `ssh-cleanup-proof.txt`.
