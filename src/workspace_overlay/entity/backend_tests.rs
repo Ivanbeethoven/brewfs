@@ -322,15 +322,19 @@ async fn atomic_create_conformance<B: EntityBackend + 'static>(backend: Arc<B>, 
     while let Some(result) = tasks.join_next().await {
         let (ino, mut create) = result.unwrap();
         assert!(allocated.insert(ino));
-        let rows = backend
-            .read(&[
-                keys.inode(ino),
-                keys.dentry(create.inode.parent_hint.unwrap(), &create.name),
-                keys.xattr(ino, b"user.identity"),
-            ])
-            .await
-            .unwrap()
-            .rows;
+        let generated = [
+            keys.inode(ino),
+            keys.dentry(create.inode.parent_hint.unwrap(), &create.name),
+            keys.xattr(ino, b"user.identity"),
+        ];
+        let rows = backend.read(&generated).await.unwrap().rows;
+        for (key, value) in generated.into_iter().zip(&rows) {
+            assert_eq!(
+                backend.scan_prefix(&key, 1).await.unwrap(),
+                vec![(key, value.clone().unwrap())],
+                "allocator-generated rows must be indexed"
+            );
+        }
         create.inode.ino = ino;
         assert_eq!(
             codec::decode::<UpperInode>(rows[0].as_deref().unwrap()).unwrap(),
@@ -595,6 +599,11 @@ async fn slice_reservation_conformance<B: EntityBackend + 'static>(
             Some(codec::encode(&expected).unwrap()),
             "exact decimal identity in Pending row"
         );
+        assert_eq!(
+            backend.scan_prefix(&keys.slice(*id), 1).await.unwrap(),
+            vec![(keys.slice(*id), bytes.unwrap())],
+            "allocator-generated pending rows must be indexed"
+        );
     }
 
     let mut reservations = tokio::task::JoinSet::new();
@@ -823,6 +832,131 @@ async fn redis_entity_backend_conformance() {
 
 #[tokio::test]
 #[ignore = "requires BREWFS_TEST_REDIS_URL pointing to an isolated local Redis"]
+async fn redis_entity_prefix_scan_does_not_traverse_unrelated_keys() {
+    let url = std::env::var("BREWFS_TEST_REDIS_URL").expect("BREWFS_TEST_REDIS_URL");
+    let volume = Uuid::new_v4();
+    let keys = EntityKeys::new(volume, Uuid::new_v4());
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    // Rows predating the index must remain visible after opening the backend.
+    let legacy = keys.inode(42);
+    redis::cmd("SET")
+        .arg(&legacy)
+        .arg("legacy")
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+    let backend = RedisEntityBackend::connect(&url, volume).await.unwrap();
+    let authority = initialize(&backend, &keys).await;
+    let expected: Vec<_> = (0..10)
+        .map(|i| (keys.dentry(1, format!("entry-{i}").as_bytes()), vec![b'x']))
+        .collect();
+    assert_eq!(
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: expected
+                        .iter()
+                        .map(|(key, value)| put(key.clone(), value))
+                        .collect(),
+                },
+            )
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    let user = format!("entity-no-scan-{volume}");
+    let password = Uuid::new_v4().to_string();
+    let mut restricted_url = url::Url::parse(&url).unwrap();
+    restricted_url.set_username(&user).unwrap();
+    restricted_url.set_password(Some(&password)).unwrap();
+    redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg(&user)
+        .arg("reset")
+        .arg("on")
+        .arg(format!(">{password}"))
+        .arg(format!("~{}*", String::from_utf8_lossy(keys.volume_prefix())))
+        .arg("+@all")
+        .arg("-scan")
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+    let result = async {
+        let restricted = RedisEntityBackend::connect(restricted_url.as_str(), volume).await?;
+        assert_eq!(
+            restricted.scan_prefix(&legacy, 1).await?,
+            vec![(legacy, b"legacy".to_vec())]
+        );
+        // Reject traversal deterministically, without a wall-clock threshold.
+        // Grow the same database while leaving the ten-entry directory fixed.
+        for range in [0..1_000, 1_000..100_000] {
+            for start in range.step_by(1_000) {
+                let mut pipeline = redis::pipe();
+                for i in start..start + 1_000 {
+                    pipeline
+                        .cmd("SET")
+                        .arg(format!("unrelated-{volume}/{i}"))
+                        .arg("x")
+                        .ignore();
+                }
+                pipeline.query_async::<()>(&mut connection).await.unwrap();
+            }
+            assert_eq!(
+                restricted.scan_prefix(&keys.dentry_prefix(1), 10).await?,
+                expected
+            );
+            assert!(
+                restricted
+                    .scan_prefix(&keys.dentry_prefix(2), 10)
+                    .await?
+                    .is_empty()
+            );
+            assert!(matches!(
+                restricted.scan_prefix(&keys.dentry_prefix(1), 9).await,
+                Err(EntityError::Invalid(_))
+            ));
+        }
+        let deletion = EntityPlan {
+            checks: vec![],
+            writes: vec![RowWrite::Delete {
+                key: expected[0].0.clone(),
+            }],
+        };
+        assert_eq!(
+            restricted.commit(&authority, &deletion).await?,
+            CommitOutcome::Committed
+        );
+        assert_eq!(
+            restricted.scan_prefix(&keys.dentry_prefix(1), 10).await?,
+            expected[1..]
+        );
+        Ok::<_, EntityError>(())
+    }
+    .await;
+    redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&user)
+        .query_async::<usize>(&mut connection)
+        .await
+        .unwrap();
+    for start in (0..100_000).step_by(1_000) {
+        let noise: Vec<_> = (start..start + 1_000)
+            .map(|i| format!("unrelated-{volume}/{i}"))
+            .collect();
+        redis::cmd("DEL")
+            .arg(noise)
+            .query_async::<usize>(&mut connection)
+            .await
+            .unwrap();
+    }
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires BREWFS_TEST_REDIS_URL pointing to an isolated local Redis"]
 async fn redis_entity_rejects_wrong_type_and_oversize_before_any_write_or_decode() {
     let url = std::env::var("BREWFS_TEST_REDIS_URL").expect("BREWFS_TEST_REDIS_URL");
     let volume = Uuid::new_v4();
@@ -868,6 +1002,17 @@ async fn redis_entity_rejects_wrong_type_and_oversize_before_any_write_or_decode
     ));
 
     let oversized = keys.inode(12);
+    // Corrupt an indexed row, rather than bypassing the backend to create one.
+    backend
+        .commit(
+            &authority,
+            &EntityPlan {
+                checks: vec![],
+                writes: vec![put(oversized.clone(), b"valid")],
+            },
+        )
+        .await
+        .unwrap();
     redis::cmd("SET")
         .arg(&oversized)
         .arg(vec![b'x'; MAX_ROW_BYTES + 1])
@@ -963,4 +1108,29 @@ async fn redis_entity_rejects_wrong_type_and_oversize_before_any_write_or_decode
         );
     }
     assert_eq!(after.unwrap().rows, before);
+
+    // Lua errors do not roll back earlier writes: validate the index first.
+    redis::cmd("SET")
+        .arg(keys.key_index())
+        .arg("wrong-type")
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+    assert!(matches!(
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![put(observed[1].clone(), b"must-not-appear")],
+                },
+            )
+            .await,
+        Err(EntityError::Corrupt(_))
+    ));
+    assert_eq!(backend.read(&observed).await.unwrap().rows, before);
+    assert!(matches!(
+        backend.scan_prefix(keys.prefix(), 4096).await,
+        Err(EntityError::Corrupt(_))
+    ));
 }
