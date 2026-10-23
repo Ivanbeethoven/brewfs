@@ -417,6 +417,10 @@ async fn mount_cmd(mut args: MountConfig) -> anyhow::Result<()> {
             if args.volume_format == VolumeFormat::PackedMetadataV3 {
                 return mount_packed_v3_readonly_with_client(client, layout, &args).await;
             }
+            #[cfg(feature = "workspace-overlay")]
+            if args.volume_format == VolumeFormat::WorkspaceV1 {
+                return mount_workspace_with_client(layout, client, &args).await;
+            }
             let store = create_object_store(
                 client,
                 layout,
@@ -436,6 +440,10 @@ async fn mount_cmd(mut args: MountConfig) -> anyhow::Result<()> {
             #[cfg(feature = "workspace-overlay")]
             if args.volume_format == VolumeFormat::PackedMetadataV3 {
                 return mount_packed_v3_readonly_with_client(client, layout, &args).await;
+            }
+            #[cfg(feature = "workspace-overlay")]
+            if args.volume_format == VolumeFormat::WorkspaceV1 {
+                return mount_workspace_with_client(layout, client, &args).await;
             }
             let store = create_object_store(
                 client,
@@ -880,7 +888,9 @@ where
             mount_with_store(layout, store, meta_store, args).await
         }
         #[cfg(feature = "workspace-overlay")]
-        VolumeFormat::WorkspaceV1 => mount_workspace_with_store(layout, store, args).await,
+        VolumeFormat::WorkspaceV1 => {
+            anyhow::bail!("workspace mount must be dispatched with its object client")
+        }
         #[cfg(not(feature = "workspace-overlay"))]
         VolumeFormat::WorkspaceV1 => {
             anyhow::bail!("feature not compiled: workspace-overlay")
@@ -1183,8 +1193,6 @@ where
             crate::cadapter::read_observer::Origin::Demand,
         )
         .with_phase_control(Arc::clone(&phase));
-    let store = create_object_store(client.clone(), layout, &args.cache, true).await?;
-    let sink: Arc<dyn ObjectSink> = Arc::new(BackendObjectRepository::new(client));
     let packed_budget = workspace_overlay::packed_v3::wire005::V3MountBudget::from_env()?;
     match args.meta_backend {
         MetaBackendKind::Redis => {
@@ -1198,8 +1206,7 @@ where
             let catalog = Arc::new(
                 KvWorkspaceStore::new(backend).with_packed_reader_pin_budget(packed_budget.clone()),
             );
-            mount_native_with_catalog(layout, store, sink, args, control, catalog, observer, phase)
-                .await
+            mount_native_with_catalog(layout, client, args, control, catalog, observer, phase).await
         }
         MetaBackendKind::TiKv => {
             let control: Arc<dyn ControlStore> = Arc::new(
@@ -1219,8 +1226,7 @@ where
             );
             let result = mount_native_with_catalog(
                 layout,
-                store,
-                sink,
+                client,
                 args,
                 control,
                 catalog.clone(),
@@ -1242,10 +1248,9 @@ where
 }
 
 #[cfg(feature = "native-packed-base")]
-async fn mount_native_with_catalog<S, W>(
+async fn mount_native_with_catalog<B, W>(
     layout: ChunkLayout,
-    store: S,
-    sink: Arc<dyn ObjectSink>,
+    client: ObjectClient<B>,
     args: &MountConfig,
     control: Arc<dyn ControlStore>,
     workspace_store: Arc<W>,
@@ -1253,7 +1258,7 @@ async fn mount_native_with_catalog<S, W>(
     phase: Arc<std::sync::atomic::AtomicU8>,
 ) -> anyhow::Result<()>
 where
-    S: BlockStore + Send + Sync + 'static,
+    B: ObjectBackend + Clone + Send + Sync + 'static,
     W: WorkspaceStore + 'static,
 {
     let workspace_id = args
@@ -1297,6 +1302,9 @@ where
         );
     }
 
+    let cache = workspace_read_cache_config(args, workspace_header.volume_id, workspace_id);
+    let store = create_object_store(client.clone(), layout, &cache, true).await?;
+    let sink: Arc<dyn ObjectSink> = Arc::new(BackendObjectRepository::new(client));
     let generation = new_workspace_holder_generation();
     let session = WorkspaceMountSession::acquire(
         workspace_store.clone(),
@@ -1351,10 +1359,9 @@ where
         workspace_id,
         session.view.head_epoch,
     )?;
-    let vfs_config =
-        crate::vfs::config::VFSConfig::new_with_cache_config(layout, args.cache.clone())
-            .workspace_writeback_root(writeback_root)
-            .workspace_writer_epoch(session.view.holder_generation);
+    let vfs_config = crate::vfs::config::VFSConfig::new_with_cache_config(layout, cache)
+        .workspace_writeback_root(writeback_root)
+        .workspace_writer_epoch(session.view.holder_generation);
     phase.store(1, std::sync::atomic::Ordering::Release);
     let fs = VFS::from_workspace_components(vfs_config, block_store, meta_layer)?;
     fs.stats().set_extension(Arc::new(
@@ -1406,6 +1413,24 @@ fn native_namespace_id(namespace: &str, volume_id: &[u8; 16]) -> [u8; 16] {
     hasher.finalize()[..16]
         .try_into()
         .expect("sha256 prefix length")
+}
+
+#[cfg(feature = "workspace-overlay")]
+fn workspace_read_cache_config(
+    args: &MountConfig,
+    volume_id: uuid::Uuid,
+    workspace_id: WorkspaceId,
+) -> crate::vfs::cache::config::CacheConfig {
+    let mut cache = args.cache.clone();
+    cache.cache_root =
+        workspace_overlay::cache_scope::read_cache_root(&cache.cache_root, volume_id, workspace_id);
+    tracing::info!(
+        %volume_id,
+        %workspace_id,
+        cache_root = %cache.cache_root.display(),
+        "workspace read-cache namespace selected; legacy shared chunks are ignored"
+    );
+    cache
 }
 
 async fn create_object_store<B>(
@@ -1773,32 +1798,13 @@ async fn connect_workspace_tikv(
 }
 
 #[cfg(feature = "workspace-overlay")]
-async fn mount_workspace_with_store<S>(
+async fn mount_workspace_with_client<B>(
     layout: ChunkLayout,
-    store: S,
+    client: ObjectClient<B>,
     args: &MountConfig,
 ) -> anyhow::Result<()>
 where
-    S: BlockStore + Send + Sync + 'static,
-{
-    let store = if args.workspace_operator_managed {
-        mount_store::MountStore::Operator(crate::chunk::runtime_store::RuntimeBlockStore::new(
-            store,
-        ))
-    } else {
-        mount_store::MountStore::Standalone(store)
-    };
-    mount_workspace_with_store_dispatch(layout, store, args).await
-}
-
-#[cfg(feature = "workspace-overlay")]
-async fn mount_workspace_with_store_dispatch<S>(
-    layout: ChunkLayout,
-    store: S,
-    args: &MountConfig,
-) -> anyhow::Result<()>
-where
-    S: BlockStore + Send + Sync + 'static,
+    B: ObjectBackend + Send + Sync + 'static,
 {
     let packed_budget = workspace_overlay::packed_v3::wire005::V3MountBudget::from_env()?;
     match args.meta_backend {
@@ -1807,7 +1813,7 @@ where
                 anyhow::bail!("workspace-v1 sqlx catalog requires a SQLite URL")
             }
             let catalog = Arc::new(SqliteWorkspaceStore::connect(&args.meta_url).await?);
-            mount_workspace_with_catalog(layout, store, args, catalog, packed_budget).await
+            mount_workspace_with_catalog(layout, client, args, catalog, packed_budget).await
         }
         MetaBackendKind::Redis => {
             let backend =
@@ -1820,7 +1826,7 @@ where
             } else {
                 catalog
             });
-            mount_workspace_with_catalog(layout, store, args, catalog, packed_budget).await
+            mount_workspace_with_catalog(layout, client, args, catalog, packed_budget).await
         }
         MetaBackendKind::TiKv => {
             let backend = connect_workspace_tikv(
@@ -1839,7 +1845,7 @@ where
                 catalog
             });
             let result =
-                mount_workspace_with_catalog(layout, store, args, catalog.clone(), packed_budget)
+                mount_workspace_with_catalog(layout, client, args, catalog.clone(), packed_budget)
                     .await;
             if packed_mount_cutoff::requires_retention(&result) {
                 // An uncertain kernel cutoff or unfinished packed drain still
@@ -1858,15 +1864,15 @@ where
 }
 
 #[cfg(feature = "workspace-overlay")]
-async fn mount_workspace_with_catalog<S, W>(
+async fn mount_workspace_with_catalog<B, W>(
     layout: ChunkLayout,
-    store: S,
+    client: ObjectClient<B>,
     args: &MountConfig,
     workspace_store: Arc<W>,
     packed_budget: Arc<workspace_overlay::packed_v3::wire005::V3MountBudget>,
 ) -> anyhow::Result<()>
 where
-    S: BlockStore + Send + Sync + 'static,
+    B: ObjectBackend + Send + Sync + 'static,
     W: workspace_overlay::lifecycle::PackedMountCatalog,
 {
     let workspace_id = args.workspace.map(WorkspaceId::from_uuid).ok_or_else(|| {
@@ -1892,6 +1898,15 @@ where
         )
     }
 
+    let cache = workspace_read_cache_config(args, header.volume_id, workspace_id);
+    let store = create_object_store(client, layout, &cache, true).await?;
+    let store = if args.workspace_operator_managed {
+        mount_store::MountStore::Operator(crate::chunk::runtime_store::RuntimeBlockStore::new(
+            store,
+        ))
+    } else {
+        mount_store::MountStore::Standalone(store)
+    };
     let generation = new_workspace_holder_generation();
     let mut session = Some(
         WorkspaceMountSession::acquire_for_mount(
@@ -2027,7 +2042,7 @@ where
             mount_view.head_epoch,
         )?;
         let vfs_config =
-            crate::vfs::config::VFSConfig::new_with_cache_config(layout, args.cache.clone())
+            crate::vfs::config::VFSConfig::new_with_cache_config(layout, cache)
                 .workspace_writeback_root(writeback_root)
                 .workspace_writer_epoch(mount_view.holder_generation);
         session.as_ref().expect("mount session retained").initialize_packed_writeback_identity(&vfs_config).await?;

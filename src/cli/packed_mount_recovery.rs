@@ -135,10 +135,10 @@ where
     )?;
     // Verification of the existing directory and exact original marker is in
     // the private driver, before takeover. This command never initializes it.
-    let vfs_config =
-        crate::vfs::config::VFSConfig::new_with_cache_config(layout, config.cache.clone())
-            .workspace_writeback_root(writeback_root)
-            .workspace_writer_epoch(arguments.recovery_generation);
+    let cache = super::workspace_read_cache_config(&config, header.volume_id, arguments.workspace);
+    let vfs_config = crate::vfs::config::VFSConfig::new_with_cache_config(layout, cache.clone())
+        .workspace_writeback_root(writeback_root)
+        .workspace_writer_epoch(arguments.recovery_generation);
     let observer = budget.read_observer(client.read_observer())?;
     let client = client.with_read_observer(
         observer,
@@ -146,7 +146,7 @@ where
         crate::cadapter::read_observer::Phase::Startup,
         crate::cadapter::read_observer::Origin::Demand,
     );
-    let upper = Arc::new(create_object_store(client.clone(), layout, &config.cache, true).await?);
+    let upper = Arc::new(create_object_store(client.clone(), layout, &cache, true).await?);
     let original = PackedReleasedMountReference {
         guard: workspace_overlay::catalog::HeadGuard {
             workspace_id: arguments.workspace,

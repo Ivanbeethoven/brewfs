@@ -1,4 +1,4 @@
-//! Workspace-specific durable staging paths.
+//! Workspace-specific clean-cache and durable staging paths.
 
 use std::path::{Path, PathBuf};
 
@@ -6,6 +6,16 @@ use uuid::Uuid;
 
 use super::error::WorkspaceError;
 use super::ids::WorkspaceId;
+
+/// Clean block and promoted-slice keys contain only a slice ID and block index.
+/// They are not globally unique: never import the legacy shared `chunks` tree.
+/// Slices are immutable, so this scope survives writer/lease epoch changes.
+pub fn read_cache_root(cache_root: &Path, volume_id: Uuid, workspace_id: WorkspaceId) -> PathBuf {
+    cache_root
+        .join("workspace-read-v1")
+        .join(volume_id.to_string())
+        .join(workspace_id.to_string())
+}
 
 pub fn writeback_root(
     cache_root: &Path,
