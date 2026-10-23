@@ -174,6 +174,7 @@ where
         }
 
         let mut deleted_slices = Vec::with_capacity(orphan_slices.len());
+        let mut pending_slices = Vec::with_capacity(orphan_slices.len());
         let mut orphan_bytes = 0u64;
         for (slice_id, slice_end) in orphan_slices {
             let slice_end = self
@@ -182,12 +183,42 @@ where
                 .await
                 .map_err(|error| WorkspaceError::Backend(error.to_string()))?
                 .max(slice_end);
-            // This exact retained bound is authenticated before any DELETE.
-            // Busy/unknown outcomes preserve Deleting metadata for recovery.
-            self.store
-                .reserve_gc_slice_deletion(slice_id, slice_end, &deleted_layers)
-                .await?;
             let blocks = slice_end.div_ceil(u64::from(self.layout.block_size));
+            // A completed range is an authenticated durable progress marker.
+            // The snapshot and retained bound above are still rebuilt every
+            // tick, so a newly shared SID cannot be skipped accidentally.
+            if self
+                .blocks
+                .gc_slice_deletion_complete(slice_id, blocks)
+                .await
+                .map_err(|error| WorkspaceError::Backend(error.to_string()))?
+                && self
+                    .store
+                    .gc_slice_deletion_reservation_complete(
+                        slice_id,
+                        slice_end,
+                        &deleted_layers,
+                    )
+                    .await?
+            {
+                orphan_bytes = orphan_bytes.saturating_add(slice_end);
+                deleted_slices.push(slice_id);
+                continue;
+            }
+            pending_slices.push((slice_id, slice_end, blocks));
+        }
+        // Native KV backends amortize their extent census across this bounded
+        // batch. Other stores use the trait's single-SID compatibility path.
+        self.store
+            .reserve_gc_slice_deletions(
+                &pending_slices
+                    .iter()
+                    .map(|(slice_id, slice_end, _)| (*slice_id, *slice_end))
+                    .collect::<Vec<_>>(),
+                &deleted_layers,
+            )
+            .await?;
+        for (slice_id, slice_end, blocks) in pending_slices {
             if blocks != 0 {
                 self.blocks
                     .delete_range((slice_id, 0), blocks)
