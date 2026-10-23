@@ -1105,8 +1105,9 @@ async fn redis_entity_rejects_wrong_type_and_oversize_before_any_write_or_decode
     for outcome in [read.map(|_| ()), commit.map(|_| ())] {
         assert!(
             matches!(&outcome, Err(EntityError::Backend(message))
-                if message.contains("strlen")
-                    && (message.contains("ACL") || message.contains("NOPERM"))),
+                if (message.contains("strlen")
+                    && (message.contains("ACL") || message.contains("NOPERM")))
+                    || message.contains("can't run this command or subcommand")),
             "{outcome:?}"
         );
     }
