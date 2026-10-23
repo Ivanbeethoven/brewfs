@@ -60,6 +60,53 @@ pub(super) struct InodeLock {
     handles: AtomicUsize,
 }
 
+#[derive(Debug, Default)]
+pub(super) struct InodeLockRegistry {
+    entries: BTreeMap<i64, Weak<InodeLock>>,
+    prune_cursor: Option<i64>,
+    #[cfg(test)]
+    prune_checks: usize,
+}
+
+impl InodeLockRegistry {
+    fn get(&mut self, ino: i64) -> Arc<InodeLock> {
+        if let Some(lock) = self.entries.get(&ino).and_then(Weak::upgrade) {
+            return lock;
+        }
+        if self.entries.len() > 4096 {
+            // Bound work under the shared mutex, including when every handle
+            // is live. Advance across live entries too, so later-dead entries
+            // are eventually revisited even if the registry stops growing.
+            use std::ops::Bound::{Excluded, Unbounded};
+            let start = self.prune_cursor.map_or(Unbounded, Excluded);
+            let mut dead = [0; 16];
+            let mut dead_count = 0;
+            let mut checked = 0;
+            for (&ino, lock) in self.entries.range((start, Unbounded)).take(16) {
+                #[cfg(test)]
+                {
+                    self.prune_checks += 1;
+                }
+                checked += 1;
+                self.prune_cursor = Some(ino);
+                if lock.strong_count() == 0 {
+                    dead[dead_count] = ino;
+                    dead_count += 1;
+                }
+            }
+            if checked < 16 {
+                self.prune_cursor = None;
+            }
+            for ino in &dead[..dead_count] {
+                self.entries.remove(ino);
+            }
+        }
+        let lock = Arc::new(InodeLock::default());
+        self.entries.insert(ino, Arc::downgrade(&lock));
+        lock
+    }
+}
+
 pub struct EntityHandle {
     ino: i64,
     namespace: Vec<u8>,
@@ -86,7 +133,7 @@ pub struct EntityNamespace<B, L> {
     pub(super) keys: EntityKeys,
     pub(super) lifecycle: Lifecycle<B>,
     pub(super) session: WriterSession,
-    locks: Arc<Mutex<BTreeMap<i64, Weak<InodeLock>>>>,
+    locks: Arc<Mutex<InodeLockRegistry>>,
     // Advisory topology only. Every inode/ACL used for a decision is freshly
     // read and checked; stale hints can only cause additional reads/retries.
     directory_hints: moka::sync::Cache<i64, i64>,
@@ -278,17 +325,10 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
     }
 
     fn inode_lock(&self, ino: i64) -> Arc<InodeLock> {
-        let mut locks = self.locks.lock().expect("entity lock registry poisoned");
-        if let Some(lock) = locks.get(&ino).and_then(Weak::upgrade) {
-            return lock;
-        }
-        // Only dead registry entries are pruned; live handles retain their lock.
-        if locks.len() > 4096 {
-            locks.retain(|_, v| v.strong_count() > 0);
-        }
-        let lock = Arc::new(InodeLock::default());
-        locks.insert(ino, Arc::downgrade(&lock));
-        lock
+        self.locks
+            .lock()
+            .expect("entity lock registry poisoned")
+            .get(ino)
     }
 
     pub(super) async fn lock_inode(&self, ino: i64) -> InodeGuard {
@@ -1338,5 +1378,41 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
             }
         }
         Ok(Reply::Done)
+    }
+}
+
+#[cfg(test)]
+mod lock_registry_tests {
+    use super::*;
+
+    #[test]
+    fn pruning_work_is_bounded_with_retained_inodes() {
+        let mut registry = InodeLockRegistry::default();
+        let retained: Vec<_> = (0..8192).map(|ino| registry.get(ino)).collect();
+        assert!(
+            registry.prune_checks <= 8192 * 16,
+            "{} liveness checks for 8192 retained locks",
+            registry.prune_checks
+        );
+        for (ino, lock) in retained.iter().enumerate() {
+            assert!(Arc::ptr_eq(lock, &registry.get(ino as i64)));
+        }
+        for ino in 8192..16384 {
+            drop(registry.get(ino));
+        }
+        assert!(registry.prune_checks <= 16384 * 16);
+    }
+
+    #[test]
+    fn pruning_reclaims_dead_entries_without_splitting_live_locks() {
+        let mut registry = InodeLockRegistry::default();
+        let retained: Vec<_> = (0..8192).map(|ino| registry.get(ino)).collect();
+        let live = retained[0].clone();
+        drop(retained);
+        for ino in 8192..16384 {
+            drop(registry.get(ino));
+        }
+        assert!(registry.entries.len() <= 4097);
+        assert!(Arc::ptr_eq(&live, &registry.get(0)));
     }
 }
