@@ -16,6 +16,7 @@ use super::backend::{
 use super::codec::{decode, encode};
 use super::keys::EntityKeys;
 use super::model::{ENTITY_FORMAT, LowerBinding};
+use super::ownership::{SliceCensus, SliceState};
 use super::{EntityError, Result};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -668,17 +669,16 @@ impl<B: EntityBackend> Lifecycle<B> {
             self.keys.lower_pin(),
             self.keys.maintenance(),
             self.keys.counter("inode"),
+            self.keys.slice_delete_fence(),
         ];
         let namespace_rows = self.backend.scan_prefix(self.keys.prefix(), 4096).await?;
         if namespace_rows.iter().any(|(key, _)| !allowed.contains(key)) {
             return Err(EntityError::Busy);
         }
-        let slice_prefix = [self.keys.volume_prefix(), b"slice/"].concat();
-        for (_, value) in self.backend.scan_prefix(&slice_prefix, 4096).await? {
-            let row: super::ownership::SliceOwnership = decode(&value)?;
-            if row.namespace_id == self.keys.namespace_id() {
-                row.validate(&self.keys, row.slice_id)?;
-                if !matches!(row.state, super::ownership::SliceState::Deleted { .. }) {
+        let mut census = SliceCensus::new(self.backend.as_ref(), &self.keys).await?;
+        while let Some(rows) = census.next_page(self.backend.as_ref(), &self.keys).await? {
+            for row in rows {
+                if !matches!(row.state, SliceState::Deleted { .. }) {
                     return Err(EntityError::Busy);
                 }
             }
@@ -725,6 +725,9 @@ impl<B: EntityBackend> Lifecycle<B> {
                             },
                             RowWrite::Delete {
                                 key: self.keys.counter("inode"),
+                            },
+                            RowWrite::Delete {
+                                key: self.keys.slice_delete_fence(),
                             },
                         ],
                     },
@@ -775,7 +778,11 @@ impl<B: EntityBackend> Lifecycle<B> {
             return Err(EntityError::Invalid("invalid resumed lease request".into()));
         }
         let maintenance = self.maintenance_authority(token).await?;
-        let keys = vec![self.keys.descriptor(), self.keys.lease()];
+        let keys = vec![
+            self.keys.descriptor(),
+            self.keys.lease(),
+            self.keys.slice_delete_fence(),
+        ];
         let snapshot = self.backend.read(&keys).await?;
         let mut descriptor =
             self.decode_descriptor(snapshot.rows[0].as_deref().ok_or(EntityError::Fenced)?)?;
@@ -788,32 +795,23 @@ impl<B: EntityBackend> Lifecycle<B> {
                 return Err(EntityError::Busy);
             }
         }
-        let mut checks = checked_rows(&keys, snapshot.rows);
-        let slice_prefix = [self.keys.volume_prefix(), b"slice/"].concat();
-        for (key, bytes) in self.backend.scan_prefix(&slice_prefix, 4096).await? {
-            let row: super::ownership::SliceOwnership = decode(&bytes)?;
-            if row.namespace_id != self.keys.namespace_id() {
-                continue;
+        // Maintenance fences new uploads/publications. Abandon and completion
+        // only remove blockers; reserve_delete is the only maintenance change
+        // that adds one and atomically changes slice_delete_fence. Checking it
+        // with the exact maintenance authority keeps this final CAS bounded.
+        let checks = checked_rows(&keys, snapshot.rows);
+        let mut census = SliceCensus::new(self.backend.as_ref(), &self.keys).await?;
+        while let Some(rows) = census.next_page(self.backend.as_ref(), &self.keys).await? {
+            for row in rows {
+                if row.staging_hold
+                    || matches!(
+                        row.state,
+                        SliceState::Pending { .. } | SliceState::Deleting { .. }
+                    )
+                {
+                    return Err(EntityError::Busy);
+                }
             }
-            row.validate(&self.keys, row.slice_id)?;
-            if key != self.keys.slice(row.slice_id) {
-                return Err(EntityError::Corrupt(
-                    "mismatched slice on namespace resume".into(),
-                ));
-            }
-            if row.staging_hold
-                || matches!(
-                    row.state,
-                    super::ownership::SliceState::Pending { .. }
-                        | super::ownership::SliceState::Deleting { .. }
-                )
-            {
-                return Err(EntityError::Busy);
-            }
-            checks.push(RowCheck {
-                key,
-                expected: Some(bytes),
-            });
         }
         let identity = LeaseIdentity {
             lease_id: new_lease_id,

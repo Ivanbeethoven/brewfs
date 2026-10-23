@@ -8,7 +8,7 @@ use crate::workspace_overlay::entity::backend::{
 use crate::workspace_overlay::entity::codec::encode;
 use crate::workspace_overlay::entity::lifecycle::{LowerRegistry, WriterSession};
 use crate::workspace_overlay::entity::ownership::{
-    chunk_membership_keys, plan_chunk_membership_from_rows, plan_orphan,
+    SliceOwnership, chunk_membership_keys, plan_chunk_membership_from_rows, plan_orphan,
 };
 use crate::workspace_overlay::entity::redis::RedisEntityBackend;
 use crate::workspace_overlay::entity::resolver::{self, test_support::MemoryLower};

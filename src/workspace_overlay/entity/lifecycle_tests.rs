@@ -34,6 +34,278 @@ async fn fixture() -> (
     (backend, lifecycle, session)
 }
 
+async fn reserve_slice_history(
+    backend: &Arc<MemoryEntityBackend>,
+    lifecycle: &Lifecycle<MemoryEntityBackend>,
+    session: &WriterSession,
+) {
+    let ownership = Ownership::new(backend.clone(), lifecycle.keys().clone());
+    let authority = lifecycle.authority(session).await.unwrap();
+    for _ in 0..64 {
+        drop(
+            ownership
+                .reserve_uploads(session, &authority, &[1; 64])
+                .await
+                .unwrap(),
+        );
+    }
+    drop(
+        ownership
+            .reserve_uploads(session, &authority, &[1])
+            .await
+            .unwrap(),
+    );
+}
+
+async fn foreign_slice_history() -> (
+    Arc<MemoryEntityBackend>,
+    Arc<Lifecycle<MemoryEntityBackend>>,
+    WriterSession,
+) {
+    let (backend, lifecycle, session) = fixture().await;
+    let foreign = Lifecycle::new(
+        backend.clone(),
+        EntityKeys::new(lifecycle.keys().volume_id(), Uuid::new_v4()),
+    );
+    foreign.provision(&lower()).await.unwrap();
+    let writer = foreign.acquire(Uuid::new_v4(), 100).await.unwrap();
+    reserve_slice_history(&backend, &foreign, &writer).await;
+    // Establish the old failure without any object PUTs: the complete volume
+    // scan rejects the 4,097th row before a namespace filter can run.
+    let prefix = [lifecycle.keys().volume_prefix(), b"slice/"].concat();
+    assert!(matches!(
+        backend.scan_prefix(&prefix, 4096).await,
+        Err(EntityError::Invalid(_))
+    ));
+    (backend, lifecycle, session)
+}
+
+#[tokio::test]
+async fn discard_empty_ignores_4097_foreign_slices() {
+    let (_, lifecycle, session) = foreign_slice_history().await;
+    let maintenance = lifecycle.enter_maintenance(&session).await.unwrap();
+    lifecycle.discard_empty(&maintenance).await.unwrap();
+    assert!(lifecycle.discard_completed(&maintenance).await.unwrap());
+}
+
+#[tokio::test]
+async fn resume_ignores_4097_foreign_slices() {
+    let (_, lifecycle, session) = foreign_slice_history().await;
+    let maintenance = lifecycle.enter_maintenance(&session).await.unwrap();
+    let resumed = lifecycle
+        .resume_after_maintenance(&maintenance, Uuid::new_v4(), 100)
+        .await
+        .unwrap();
+    lifecycle.authority(&resumed).await.unwrap();
+    assert!(matches!(
+        lifecycle.maintenance_authority(&maintenance).await,
+        Err(EntityError::Fenced)
+    ));
+}
+
+#[tokio::test]
+async fn discard_step_ignores_4097_foreign_slices() {
+    use crate::workspace_overlay::entity::recovery::{DiscardProgress, Recovery};
+
+    let (backend, lifecycle, session) = foreign_slice_history().await;
+    let maintenance = lifecycle.enter_maintenance(&session).await.unwrap();
+    let recovery = Recovery::new(backend, lifecycle.keys().clone());
+    assert!(matches!(
+        recovery.discard_step(&maintenance).await.unwrap(),
+        DiscardProgress::Complete
+    ));
+}
+
+#[tokio::test]
+async fn discard_finds_own_pending_slice_after_4097_foreign_slices() {
+    use crate::workspace_overlay::entity::recovery::{DiscardProgress, Recovery};
+
+    let (backend, lifecycle, session) = foreign_slice_history().await;
+    let keys = lifecycle.keys();
+    let ownership = Ownership::new(backend.clone(), keys.clone());
+    let authority = lifecycle.authority(&session).await.unwrap();
+    drop(
+        ownership
+            .reserve_uploads(&session, &authority, &[1])
+            .await
+            .unwrap(),
+    );
+    let maintenance = lifecycle.enter_maintenance(&session).await.unwrap();
+    assert!(matches!(
+        lifecycle.discard_empty(&maintenance).await,
+        Err(EntityError::Busy)
+    ));
+    assert!(matches!(
+        lifecycle
+            .resume_after_maintenance(&maintenance, Uuid::new_v4(), 100)
+            .await,
+        Err(EntityError::Busy)
+    ));
+    let recovery = Recovery::new(backend, keys.clone());
+    assert!(matches!(
+        recovery.discard_step(&maintenance).await.unwrap(),
+        DiscardProgress::Pending
+    ));
+    let DiscardProgress::ObjectDeletion(deletion) =
+        recovery.discard_step(&maintenance).await.unwrap()
+    else {
+        panic!("own slice was skipped after foreign pages");
+    };
+    assert_eq!(deletion.slice_id(), 4098);
+    // No PUT was issued; acknowledge the idempotent deletion of an absent object.
+    ownership
+        .complete_delete(&maintenance, &deletion)
+        .await
+        .unwrap();
+    assert!(matches!(
+        recovery.discard_step(&maintenance).await.unwrap(),
+        DiscardProgress::Complete
+    ));
+}
+
+#[tokio::test]
+async fn resume_and_discard_preserve_4097_slice_tombstones() {
+    let (backend, lifecycle, session) = fixture().await;
+    reserve_slice_history(&backend, &lifecycle, &session).await;
+    let keys = lifecycle.keys();
+    let ownership = Ownership::new(backend.clone(), keys.clone());
+    let bounded = Lifecycle::new(
+        Arc::new(CensusBackend {
+            inner: backend.clone(),
+            keys: keys.clone(),
+            maintenance: Mutex::new(None),
+        }),
+        keys.clone(),
+    );
+    let maintenance = lifecycle.enter_maintenance(&session).await.unwrap();
+    for id in 1..=4097 {
+        ownership.abandon_upload(&maintenance, id).await.unwrap();
+    }
+    // All 4,097 Available rows are eligible, but cannot fit in one final CAS.
+    let resumed = bounded
+        .resume_after_maintenance(&maintenance, Uuid::new_v4(), 100)
+        .await
+        .unwrap();
+    let maintenance = lifecycle.enter_maintenance(&resumed).await.unwrap();
+    for id in 1..=4097 {
+        let deletion = ownership.reserve_delete(&maintenance, id).await.unwrap();
+        ownership
+            .complete_delete(&maintenance, &deletion)
+            .await
+            .unwrap();
+    }
+    let resumed = bounded
+        .resume_after_maintenance(&maintenance, Uuid::new_v4(), 100)
+        .await
+        .unwrap();
+    let maintenance = lifecycle.enter_maintenance(&resumed).await.unwrap();
+    lifecycle.discard_empty(&maintenance).await.unwrap();
+    for id in 1..=4097 {
+        let snapshot = backend.read(&[keys.slice(id)]).await.unwrap();
+        let row: SliceOwnership = decode(snapshot.rows[0].as_deref().unwrap()).unwrap();
+        assert!(matches!(row.state, SliceState::Deleted { .. }));
+    }
+    assert!(backend.read(&[keys.slice_delete_fence()]).await.unwrap().rows[0].is_none());
+
+    let foreign = Lifecycle::new(
+        backend.clone(),
+        EntityKeys::new(keys.volume_id(), Uuid::new_v4()),
+    );
+    foreign.provision(&lower()).await.unwrap();
+    let writer = foreign.acquire(Uuid::new_v4(), 100).await.unwrap();
+    let maintenance = foreign.enter_maintenance(&writer).await.unwrap();
+    // Historical tombstones in another namespace also permit resume.
+    let writer = foreign
+        .resume_after_maintenance(&maintenance, Uuid::new_v4(), 100)
+        .await
+        .unwrap();
+    let foreign_ownership = Ownership::new(backend, foreign.keys().clone());
+    let authority = foreign.authority(&writer).await.unwrap();
+    let uploads = foreign_ownership
+        .reserve_uploads(&writer, &authority, &[1])
+        .await
+        .unwrap();
+    assert_eq!(uploads[0].slice_id(), 4098, "SIDs must never be reused");
+}
+
+/// Check bounded reads/commits and optionally introduce Deleting after returning
+/// an Available row, modeling a concurrent worker without timing dependencies.
+struct CensusBackend {
+    inner: Arc<MemoryEntityBackend>,
+    keys: EntityKeys,
+    maintenance: Mutex<Option<MaintenanceToken>>,
+}
+
+#[async_trait::async_trait]
+impl EntityBackend for CensusBackend {
+    async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
+        assert!(keys.len() <= 128, "census reads must remain bounded");
+        let snapshot = self.inner.read(keys).await?;
+        if keys.contains(&self.keys.slice(1)) {
+            let maintenance = self.maintenance.lock().unwrap().take();
+            if let Some(maintenance) = maintenance {
+                Ownership::new(self.inner.clone(), self.keys.clone())
+                    .reserve_delete(&maintenance, 1)
+                    .await?;
+            }
+        }
+        Ok(snapshot)
+    }
+
+    async fn commit(
+        &self,
+        authority: &TransactionAuthority,
+        plan: &EntityPlan,
+    ) -> Result<CommitOutcome> {
+        assert!(authority.checks.len() + plan.checks.len() + plan.writes.len() < 32);
+        self.inner.commit(authority, plan).await
+    }
+
+    async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.scan_prefix(prefix, limit).await
+    }
+}
+
+#[tokio::test]
+async fn resume_is_fenced_by_deletion_started_during_census() {
+    let (backend, lifecycle, session) = fixture().await;
+    let keys = lifecycle.keys().clone();
+    let ownership = Ownership::new(backend.clone(), keys.clone());
+    let authority = lifecycle.authority(&session).await.unwrap();
+    drop(
+        ownership
+            .reserve_uploads(&session, &authority, &[1])
+            .await
+            .unwrap(),
+    );
+    let maintenance = lifecycle.enter_maintenance(&session).await.unwrap();
+    ownership.abandon_upload(&maintenance, 1).await.unwrap();
+    let racing = Lifecycle::new(
+        Arc::new(CensusBackend {
+            inner: backend,
+            keys: keys.clone(),
+            maintenance: Mutex::new(Some(maintenance.clone())),
+        }),
+        keys,
+    );
+    assert!(matches!(
+        racing
+            .resume_after_maintenance(&maintenance, Uuid::new_v4(), 100)
+            .await,
+        Err(EntityError::Conflict)
+    ));
+    assert_eq!(
+        lifecycle.descriptor().await.unwrap().state,
+        NamespaceState::Quiescent
+    );
+    assert!(matches!(
+        lifecycle
+            .resume_after_maintenance(&maintenance, Uuid::new_v4(), 100)
+            .await,
+        Err(EntityError::Busy)
+    ));
+}
+
 #[tokio::test]
 async fn live_or_expired_writer_cannot_be_silently_replaced() {
     let (backend, lifecycle, session) = fixture().await;
