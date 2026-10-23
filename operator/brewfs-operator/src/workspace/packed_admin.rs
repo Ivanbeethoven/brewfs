@@ -266,6 +266,11 @@ pub async fn connect_workspace_admin_for_cluster(
             let backend = metadata_credentials
                 .connect_redis(&host, port, &namespace)
                 .await?;
+            if spec.lower_format == super::super::crd::WorkspaceLowerFormat::Native {
+                return Ok(Arc::new(StoreWorkspaceAdmin::new(KvWorkspaceStore::new(
+                    backend,
+                ))));
+            }
             let publisher_store_factory: PackedStoreFactory<RedisWorkspaceBackend> =
                 Arc::new(move |budget| {
                     let credentials = metadata_credentials.clone();
@@ -294,6 +299,11 @@ pub async fn connect_workspace_admin_for_cluster(
                 .connect_tikv(spec.tikv_pd_endpoints.clone(), &namespace, budget.clone())
                 .await
                 .context("connect TiKV workspace catalog")?;
+            if spec.lower_format == super::super::crd::WorkspaceLowerFormat::Native {
+                return Ok(Arc::new(StoreWorkspaceAdmin::new(KvWorkspaceStore::new(
+                    backend,
+                ))));
+            }
             let endpoints = spec.tikv_pd_endpoints.clone();
             let publisher_store_factory: PackedStoreFactory<TiKvWorkspaceBackend> =
                 Arc::new(move |budget| {

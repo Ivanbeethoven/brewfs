@@ -16,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 use super::crd::{WorkspaceCatalogBackend, WorkspaceClusterSpec};
 
 const MAX_PEM_BYTES: usize = 64 * 1024;
-const RUNTIME_COMMANDS: &str = "+auth +ping +select +client|setinfo +acl|whoami +get +mget +set +del +exists +strlen +type +time +zadd +zrangebylex +zrem +scan +eval +evalsha +script|load";
+const RUNTIME_COMMANDS: &str = "+auth +ping +select +client|setinfo +acl|whoami +get +mget +set +del +exists +strlen +type +time +multi +exec +zadd +zrangebylex +zrem +scan +eval +evalsha +script|load";
 
 // Deliberately no Debug/Serialize: neither raw credentials nor TLS paths belong
 // in logs, status, or agent-visible objects.
@@ -328,6 +328,11 @@ mod tests {
         assert_eq!(rows[0], "user default off -@all");
         assert!(rows[1].contains(" +acl|whoami "));
         assert!(rows[1].contains(" +eval +evalsha +script|load"));
+        // Native runtime batches TIME/MGET in an atomic Redis pipeline.
+        assert!(rows[1]
+            .split_whitespace()
+            .any(|command| command == "+multi"));
+        assert!(rows[1].split_whitespace().any(|command| command == "+exec"));
         assert!(!rows[1].contains("+@all"));
         assert!(!rows[1].contains("+acl|setuser"));
         for (row, password) in [

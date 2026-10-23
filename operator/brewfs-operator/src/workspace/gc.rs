@@ -336,11 +336,10 @@ impl OwnedWork for CatalogWork {
             }
             if let Some(cluster) = queue.pending.pop_front() {
                 if cluster.metadata.deletion_timestamp.is_none()
-                    && cluster
-                        .spec
-                        .workspace
-                        .as_ref()
-                        .is_some_and(|spec| spec.enabled)
+                    && cluster.spec.workspace.as_ref().is_some_and(|spec| {
+                        spec.enabled
+                            && spec.lower_format == super::crd::WorkspaceLowerFormat::PackedV3
+                    })
                 {
                     if let Err(error) = self.tick_cluster(&cluster, &cancel).await {
                         warn!(cluster = %cluster.name_any(), %error, "packed-v3 GC catalog deferred");

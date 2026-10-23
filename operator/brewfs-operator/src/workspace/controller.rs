@@ -6,6 +6,7 @@ use brewfs::workspace_overlay::error::WorkspaceError;
 use brewfs::workspace_overlay::ids::{LayerId, LeaseId, SnapshotId, WorkspaceId};
 use brewfs::workspace_overlay::model::{LeaseState, SnapshotLease};
 use chrono::Utc;
+use k8s_openapi::api::storage::v1::StorageClass;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::runtime::controller::Action;
 use kube::{Client, Resource, ResourceExt};
@@ -14,7 +15,6 @@ use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
 use uuid::Uuid;
-use k8s_openapi::api::storage::v1::StorageClass;
 
 use crate::crd::BrewFSCluster;
 use crate::reconciler::OperatorContext;
@@ -26,9 +26,9 @@ use super::admin::{
 };
 use super::crd::{
     BrewFSWorkspace, BrewFSWorkspaceFork, BrewFSWorkspaceForkStatus, BrewFSWorkspaceMount,
-    BrewFSWorkspaceSnapshot, BrewFSWorkspaceSnapshotStatus,
-    BrewFSWorkspaceStatus, WorkspaceCapabilityStatus, WorkspaceCondition, WorkspaceDeletionPolicy,
-    WorkspaceDesiredState, WorkspaceRevision, WorkspaceSourceKind,
+    BrewFSWorkspaceSnapshot, BrewFSWorkspaceSnapshotStatus, BrewFSWorkspaceStatus,
+    WorkspaceCapabilityStatus, WorkspaceCondition, WorkspaceDeletionPolicy, WorkspaceDesiredState,
+    WorkspaceRevision, WorkspaceSourceKind,
 };
 use super::workload::{
     patch_mount_backend_status, reconcile_workspace_catalog, reconcile_workspace_mount_workload,
@@ -215,14 +215,25 @@ pub async fn reconcile_cluster_workspace(
                 manifest_digest: hex::encode(binding.binding.manifest.digest),
             },
         },
+        None if spec.lower_format == super::crd::WorkspaceLowerFormat::Native => {
+            WorkspaceCapabilityStatus::native_only()
+        }
         None => bail!("packed-v3 root carrier binding is not initialized"),
     };
     let mut conditions = vec![
         condition(
             "WorkspaceCatalogReady",
             "True",
-            "PackedCatalogReady",
-            "packed-v3 workspace catalog and carrier root snapshot are ready",
+            if capabilities.packed_v3_ready() {
+                "PackedCatalogReady"
+            } else {
+                "NativeCatalogReady"
+            },
+            if capabilities.packed_v3_ready() {
+                "packed-v3 workspace catalog and carrier root snapshot are ready"
+            } else {
+                "native workspace catalog and root snapshot are ready"
+            },
             cluster.metadata.generation,
         ),
         capabilities.packed_lower_condition(cluster.metadata.generation),
@@ -686,6 +697,10 @@ pub async fn reconcile_workspace_snapshot(
         );
     }
     if workspace.meta().deletion_timestamp.is_none()
+        && snapshot
+            .status
+            .as_ref()
+            .is_none_or(|status| status.phase != "Ready")
         && (workspace.spec.desired_state != WorkspaceDesiredState::Suspended
             || workspace.status.as_ref().is_none_or(|status| {
                 status.phase != "Suspended"
@@ -914,8 +929,32 @@ pub async fn reconcile_workspace_fork(
     if source.spec.cluster_ref.name != fork.spec.cluster_ref.name {
         return Err(anyhow!("source workspace belongs to a different BrewFSCluster").into());
     }
-    if source.spec.desired_state != WorkspaceDesiredState::Suspended
-        || source.status.as_ref().is_none_or(|status| status.phase != "Suspended")
+    let snapshot_name = format!("{}-snapshot", name);
+    let snapshot_api: Api<BrewFSWorkspaceSnapshot> =
+        Api::namespaced(ctx.client.clone(), &namespace);
+    let existing_snapshot = snapshot_api
+        .get_opt(&snapshot_name)
+        .await
+        .map_err(anyhow::Error::from)?;
+    if existing_snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot.spec.workspace_ref.name != source.name_any()
+            || snapshot.spec.cluster_ref.name != fork.spec.cluster_ref.name
+    }) {
+        return Err(anyhow!("fork snapshot already exists with a different source").into());
+    }
+    let snapshot_ready = existing_snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot
+            .status
+            .as_ref()
+            .is_some_and(|status| status.phase == "Ready")
+    });
+    // Once the immutable snapshot is published, the parent can run again.
+    if !snapshot_ready
+        && (source.spec.desired_state != WorkspaceDesiredState::Suspended
+            || source
+                .status
+                .as_ref()
+                .is_none_or(|status| status.phase != "Suspended"))
     {
         patch_fork_status(
             &api,
@@ -934,14 +973,7 @@ pub async fn reconcile_workspace_fork(
         .as_ref()
         .and_then(|status| status.workspace_id.clone())
         .ok_or_else(|| anyhow!("source workspace has no backend identity"))?;
-    let snapshot_name = format!("{}-snapshot", name);
-    let snapshot_api: Api<BrewFSWorkspaceSnapshot> =
-        Api::namespaced(ctx.client.clone(), &namespace);
-    let snapshot = match snapshot_api
-        .get_opt(&snapshot_name)
-        .await
-        .map_err(anyhow::Error::from)?
-    {
+    let snapshot = match existing_snapshot {
         Some(snapshot) => snapshot,
         None => snapshot_api
             .create(
@@ -971,7 +1003,10 @@ pub async fn reconcile_workspace_fork(
             "waiting for source snapshot",
             None,
             None,
-            snapshot.status.as_ref().and_then(|status| status.snapshot_id.clone()),
+            snapshot
+                .status
+                .as_ref()
+                .and_then(|status| status.snapshot_id.clone()),
         )
         .await?;
         return Ok(Action::requeue(Duration::from_secs(10)));
@@ -1014,7 +1049,10 @@ pub async fn reconcile_workspace_fork(
             "waiting for child workspace",
             None,
             None,
-            snapshot.status.as_ref().and_then(|status| status.snapshot_id.clone()),
+            snapshot
+                .status
+                .as_ref()
+                .and_then(|status| status.snapshot_id.clone()),
         )
         .await?;
         return Ok(Action::requeue(Duration::from_secs(10)));
@@ -1027,7 +1065,10 @@ pub async fn reconcile_workspace_fork(
             "waiting for child workspace to become Active",
             child_status.workspace_id.clone(),
             None,
-            snapshot.status.as_ref().and_then(|status| status.snapshot_id.clone()),
+            snapshot
+                .status
+                .as_ref()
+                .and_then(|status| status.snapshot_id.clone()),
         )
         .await?;
         return Ok(Action::requeue(Duration::from_secs(10)));
@@ -1066,10 +1107,18 @@ pub async fn reconcile_workspace_fork(
     {
         Some(existing) => {
             if existing.provisioner != storage_class.provisioner
-                || existing.parameters.as_ref().and_then(|params| params.get("workspace"))
-                    != storage_class.parameters.as_ref().and_then(|params| params.get("workspace"))
+                || existing
+                    .parameters
+                    .as_ref()
+                    .and_then(|params| params.get("workspace"))
+                    != storage_class
+                        .parameters
+                        .as_ref()
+                        .and_then(|params| params.get("workspace"))
             {
-                return Err(anyhow!("fork StorageClass already exists with different identity").into());
+                return Err(
+                    anyhow!("fork StorageClass already exists with different identity").into(),
+                );
             }
         }
         None => {
@@ -1086,7 +1135,10 @@ pub async fn reconcile_workspace_fork(
         "native workspace fork and CSI StorageClass are ready",
         Some(workspace_id),
         Some(storage_class_name),
-        snapshot.status.as_ref().and_then(|status| status.snapshot_id.clone()),
+        snapshot
+            .status
+            .as_ref()
+            .and_then(|status| status.snapshot_id.clone()),
     )
     .await?;
     Ok(Action::requeue(Duration::from_secs(300)))
@@ -1115,8 +1167,7 @@ async fn cleanup_workspace_fork(
         bail!("waiting for child BrewFSWorkspace deletion");
     }
     let snapshot_name = format!("{}-snapshot", fork.name_any());
-    let snapshot_api: Api<BrewFSWorkspaceSnapshot> =
-        Api::namespaced(client.clone(), namespace);
+    let snapshot_api: Api<BrewFSWorkspaceSnapshot> = Api::namespaced(client.clone(), namespace);
     if let Some(snapshot) = snapshot_api.get_opt(&snapshot_name).await? {
         if snapshot.meta().deletion_timestamp.is_none() {
             snapshot_api
@@ -1128,7 +1179,9 @@ async fn cleanup_workspace_fork(
     let storage_api: Api<StorageClass> = Api::all(client.clone());
     let storage_name = fork_storage_class_name(namespace, &fork.spec.workspace_name);
     if storage_api.get_opt(&storage_name).await?.is_some() {
-        storage_api.delete(&storage_name, &DeleteParams::default()).await?;
+        storage_api
+            .delete(&storage_name, &DeleteParams::default())
+            .await?;
         bail!("waiting for fork StorageClass deletion");
     }
     Ok(())

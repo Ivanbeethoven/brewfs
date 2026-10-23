@@ -272,14 +272,20 @@ where
 
         let view = self.inspect_workspace(request.workspace_id).await?;
         if view.record.active_lease.is_some()
-            || view
-                .leases
-                .iter()
-                .any(|lease| matches!(lease.state, brewfs::workspace_overlay::model::LeaseState::Active | brewfs::workspace_overlay::model::LeaseState::Releasing))
+            || view.leases.iter().any(|lease| {
+                matches!(
+                    lease.state,
+                    brewfs::workspace_overlay::model::LeaseState::Active
+                        | brewfs::workspace_overlay::model::LeaseState::Releasing
+                )
+            })
         {
             bail!("native workspace snapshot requires a released writable lease");
         }
-        let chain = self.store.load_layer_chain(view.record.head_layer_id).await?;
+        let chain = self
+            .store
+            .load_layer_chain(view.record.head_layer_id)
+            .await?;
         let [head, base] = chain.as_slice() else {
             bail!("native workspace snapshot requires a fixed two-layer workspace");
         };
@@ -311,13 +317,8 @@ where
 
         let base_delta = self.store.load_layer_delta(base.layer_id).await?;
         let head_delta = self.store.load_layer_delta(head.layer_id).await?;
-        let delta = merge_native_snapshot_delta(
-            &head,
-            &base,
-            base_delta,
-            head_delta,
-            compacted_layer_id,
-        )?;
+        let delta =
+            merge_native_snapshot_delta(&head, &base, base_delta, head_delta, compacted_layer_id)?;
         let result = self
             .store
             .materialize_native_snapshot(MaterializeNativeSnapshot {
@@ -626,9 +627,14 @@ fn merge_native_snapshot_delta(
         }
     }
 
-    let inode_keys = input.inodes.iter().map(|row| row.ino).collect::<BTreeSet<_>>();
+    let inode_keys = input
+        .inodes
+        .iter()
+        .map(|row| row.ino)
+        .collect::<BTreeSet<_>>();
     for ino in inode_keys {
-        if let Some(mut inode) = resolve_inode(&chain, &input.inodes, ino)?.map(|value| value.inode) {
+        if let Some(mut inode) = resolve_inode(&chain, &input.inodes, ino)?.map(|value| value.inode)
+        {
             inode.layer_id = output_layer;
             inode.state = InodeState::Present;
             inode.sequence = 0;
@@ -687,7 +693,9 @@ fn merge_native_snapshot_delta(
                 row.logical_offset
                     .checked_add(row.length)
                     .map(|row_end| end.max(row_end))
-                    .ok_or_else(|| anyhow!("extent range overflows during snapshot materialization"))
+                    .ok_or_else(|| {
+                        anyhow!("extent range overflows during snapshot materialization")
+                    })
             })?;
         for extent in resolve_extents(&chain, &input.extents, ino, chunk_index, 0..range_end)? {
             let row = match extent.kind {
@@ -720,23 +728,33 @@ fn merge_native_snapshot_delta(
     let mut sequence = 1_u64;
     for row in &mut output.dentries {
         row.sequence = sequence;
-        sequence = sequence.checked_add(1).ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
+        sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
     }
     for row in &mut output.inodes {
         row.sequence = sequence;
-        sequence = sequence.checked_add(1).ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
+        sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
     }
     for row in &mut output.xattrs {
         row.sequence = sequence;
-        sequence = sequence.checked_add(1).ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
+        sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
     }
     for row in &mut output.acls {
         row.sequence = sequence;
-        sequence = sequence.checked_add(1).ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
+        sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
     }
     for row in &mut output.extents {
         row.sequence = sequence;
-        sequence = sequence.checked_add(1).ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
+        sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("snapshot sequence overflows"))?;
     }
     Ok(output)
 }
@@ -843,8 +861,8 @@ mod tests {
             extents: vec![DataExtentDelta::hole(head_id, 2, 0, 0, 4, 1)],
             ..CanonicalLayerDelta::default()
         };
-        let merged = merge_native_snapshot_delta(&head, &base, base_delta, head_delta, output_id)
-            .unwrap();
+        let merged =
+            merge_native_snapshot_delta(&head, &base, base_delta, head_delta, output_id).unwrap();
         assert!(merged.dentries.is_empty());
         assert_eq!(merged.extents.len(), 1);
         assert_eq!(merged.extents[0].layer_id, output_id);

@@ -7,11 +7,22 @@
 - `BrewFSCluster`：管理 Redis、RustFS 和 BrewFS 配置
 - `BrewFSMount`：专门管理挂载工作负载
 
-编译时启用 `workspace-operator` 后，还提供面向 agent workspace 的三个生命周期资源：
+编译时启用 `workspace-operator` 后，还提供面向 agent workspace 的四个生命周期资源：
 
 - `BrewFSWorkspace`：从 cluster root 或不可变 snapshot 创建固定两层 workspace
 - `BrewFSWorkspaceMount`：运行单副本 FUSE sidecar 与 agent containers，并持有独占写租约
 - `BrewFSWorkspaceSnapshot`：在 workspace quiesce 后 seal 并固定精确 revision
+- `BrewFSWorkspaceFork`：从已暂停的 native workspace 创建 snapshot、独立子 workspace 和 CSI StorageClass
+
+Native fork 需要在新 `BrewFSCluster` 上显式设置
+`spec.workspace.lowerFormat: Native`。该字段创建后不可变；缺省值仍为
+`PackedV3`，本轮不实现 packed fork。创建 snapshot 前必须停止父 workspace 的
+所有挂载、释放写租约并等待 `Suspended`；snapshot 发布后父子可以同时运行，
+每个 workspace 各自持有一个写租约。CSI 驱动在独立的
+[`../brewfs-csi`](../brewfs-csi/README.md) 工程中。
+
+2026-10-23 的实际 AX ForkWorkspace API、双 agent 数据隔离证据及未完成的
+SSH 验证见 [native fork demo](../../doc/superpowers/plans/2026-10-23-native-workspace-fork-demo.md)。
 
 完整生命周期、不可变 lower 保证和架构图见
 `../../doc/superpowers/specs/overlay-workspace.md#operator-lifecycle-reference`；可运行示例见

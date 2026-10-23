@@ -12,6 +12,10 @@ use crate::crd::{ConsumerContainerSpec, ConsumerVolumeSpec};
 pub struct WorkspaceClusterSpec {
     #[serde(default)]
     pub enabled: bool,
+    /// Immutable lower representation for a newly initialized catalog.
+    #[serde(default)]
+    #[schemars(schema_with = "workspace_lower_format_schema")]
+    pub lower_format: WorkspaceLowerFormat,
     #[serde(default)]
     pub catalog_backend: WorkspaceCatalogBackend,
     #[serde(default)]
@@ -40,6 +44,7 @@ impl Default for WorkspaceClusterSpec {
     fn default() -> Self {
         Self {
             enabled: false,
+            lower_format: WorkspaceLowerFormat::default(),
             catalog_backend: WorkspaceCatalogBackend::Redis,
             namespace: None,
             tikv_pd_endpoints: Vec::new(),
@@ -53,6 +58,27 @@ impl Default for WorkspaceClusterSpec {
             catalog_storage_size: default_catalog_storage_size(),
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema)]
+pub enum WorkspaceLowerFormat {
+    Native,
+    #[default]
+    PackedV3,
+}
+
+fn workspace_lower_format_schema(
+    gen: &mut schemars::gen::SchemaGenerator,
+) -> schemars::schema::Schema {
+    let mut schema = WorkspaceLowerFormat::json_schema(gen).into_object();
+    schema.extensions.insert(
+        "x-kubernetes-validations".into(),
+        serde_json::json!([{
+            "rule": "self == oldSelf",
+            "message": "workspace.lowerFormat is immutable after creation"
+        }]),
+    );
+    schemars::schema::Schema::Object(schema)
 }
 
 impl WorkspaceClusterSpec {
@@ -141,14 +167,12 @@ impl WorkspaceClusterSpec {
 
 /// Namespace-local transport credentials; their presence alone grants no admin capability.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct WorkspaceMetadataSecretRef {
     pub name: String,
 }
 
 /// Namespace-local object credentials. Keys are accessKey and secretKey.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct WorkspaceObjectSecretRef {
     pub name: String,
 }
