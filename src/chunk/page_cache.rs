@@ -61,15 +61,62 @@ impl ReadPageCache {
         self.cache.get(key).await
     }
 
-    /// Insert a page into the cache.
+    /// Insert a page with its own allocation so eviction releases page memory.
     #[inline]
     pub async fn insert(&self, key: PageKey, data: Bytes) {
-        self.cache.insert(key, data).await;
+        self.cache.insert(key, Bytes::copy_from_slice(&data)).await;
     }
 
     /// Page size in bytes (the granularity at which data is cached).
     #[inline]
     pub fn page_size(&self) -> usize {
         self.page_size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn evicted_range_pages_release_the_response_allocation() {
+        struct Response(Arc<Vec<u8>>);
+
+        impl AsRef<[u8]> for Response {
+            fn as_ref(&self) -> &[u8] {
+                self.0.as_slice()
+            }
+        }
+
+        let cache = ReadPageCache::new(1, DEFAULT_PAGE_SIZE);
+        let allocation = Arc::new(vec![37; 16 * DEFAULT_PAGE_SIZE]);
+        let retained_response = Arc::downgrade(&allocation);
+        let response = Bytes::from_owner(Response(allocation));
+        for page in 0..16 {
+            let start = page * DEFAULT_PAGE_SIZE;
+            cache
+                .insert(
+                    (1, 0, page as u32),
+                    response.slice(start..start + DEFAULT_PAGE_SIZE),
+                )
+                .await;
+        }
+        drop(response);
+        cache.cache.run_pending_tasks().await;
+
+        assert_eq!(cache.cache.entry_count(), 1);
+        let mut surviving_pages = 0;
+        for page in 0..16 {
+            if let Some(bytes) = cache.get(&(1, 0, page)).await {
+                assert_eq!(bytes.as_ref(), vec![37; DEFAULT_PAGE_SIZE]);
+                surviving_pages += 1;
+            }
+        }
+        assert_eq!(surviving_pages, 1);
+        assert!(
+            retained_response.upgrade().is_none(),
+            "one cached page must not retain the entire 1 MiB response allocation"
+        );
     }
 }

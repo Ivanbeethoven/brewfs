@@ -1333,8 +1333,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             // When the request is page-aligned and every page is cold, the
             // backend can stream the contiguous response straight into the
             // caller's buffer. The shared Bytes result is retained for
-            // waiters and page-cache admission, so concurrent callers still
-            // issue only one object-store request.
+            // waiters; page-cache admission copies independently owned pages.
+            // Concurrent callers still issue only one object-store request.
             let direct_target_read = (offset as usize).is_multiple_of(page_size)
                 && len.is_multiple_of(page_size)
                 && pages.iter().all(Option::is_none);
@@ -1458,8 +1458,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                         range_buf.truncate(read_len);
                         let fetched = Bytes::from(range_buf);
 
-                        // Bytes::slice keeps all page-cache entries backed by
-                        // the one contiguous response allocation.
+                        // Admission copies each slice into a page allocation;
+                        // only in-flight readers share the contiguous response.
                         for page_idx in run_start..=run_end {
                             let page_start = page_idx * page_size;
                             let page_end = (page_start + page_size).min(block_size);
