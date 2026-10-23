@@ -3,8 +3,12 @@
 //! These tests focus on the core compaction logic without requiring
 //! a full filesystem setup.
 
+#[path = "common/compaction_reply.rs"]
+mod compaction_reply;
+
 mod tests {
     use brewfs::DatabaseMetaStore;
+    use brewfs::chunk::store::BlockStore;
     use brewfs::chunk::{
         ChunkLayout, CompactResult, Compactor, slice::SliceDesc, store::InMemoryBlockStore,
     };
@@ -12,6 +16,175 @@ mod tests {
     use brewfs::{Config, DatabaseConfig, DatabaseType};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn heavy_compaction_keeps_published_objects_after_a_lost_commit_reply() {
+        let (_tmp, meta, blocks) = setup_test_env().await;
+        let ino = meta
+            .create_file(meta.root_ino(), "lost-reply".into())
+            .await
+            .unwrap();
+        let chunk_id = brewfs::vfs::chunk_id_for(ino, 0).unwrap();
+        let old = SliceDesc {
+            slice_id: 700,
+            chunk_id,
+            offset: 0,
+            length: 4096,
+        };
+        blocks
+            .write_fresh_range((old.slice_id, 0), 0, &[b'x'; 4096])
+            .await
+            .unwrap();
+        meta.write(ino, chunk_id, old, 4096).await.unwrap();
+        let compactor = Compactor::with_layout(
+            Arc::new(super::compaction_reply::LostCompactionReply(meta.clone())),
+            blocks.clone(),
+            ChunkLayout {
+                chunk_size: 8192,
+                block_size: 4096,
+            },
+        );
+        let error = compactor.compact_heavy(chunk_id).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected lost compaction commit reply"),
+            "wrong injected failure: {error}"
+        );
+        let published = meta.get_slices(chunk_id).await.unwrap();
+        assert_eq!(published.len(), 1);
+        assert_ne!(
+            published[0].slice_id, old.slice_id,
+            "the underlying commit must actually have succeeded"
+        );
+        let mut actual = [0; 4096];
+        let read = blocks
+            .read_range((published[0].slice_id, 0), 0, &mut actual)
+            .await;
+        assert!(
+            read.is_ok(),
+            "lost reply cleanup deleted an already-published object: {read:?}"
+        );
+        assert_eq!(actual, [b'x'; 4096]);
+    }
+
+    #[tokio::test]
+    async fn light_compaction_preserves_publication_order_with_nonmonotonic_ids() {
+        let (_tmp, meta, blocks) = setup_test_env().await;
+        let ino = meta
+            .create_file(meta.root_ino(), "light-order".into())
+            .await
+            .unwrap();
+        let chunk_id = brewfs::vfs::chunk_id_for(ino, 0).unwrap();
+        for slice_id in [2001, 1001] {
+            let byte = if slice_id == 2001 { b'a' } else { b'b' };
+            blocks
+                .write_fresh_range((slice_id, 0), 0, &[byte; 4096])
+                .await
+                .unwrap();
+            meta.write(
+                ino,
+                chunk_id,
+                SliceDesc {
+                    slice_id,
+                    chunk_id,
+                    offset: 0,
+                    length: 4096,
+                },
+                4096,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            meta.get_slices(chunk_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|s| s.slice_id)
+                .collect::<Vec<_>>(),
+            [2001, 1001]
+        );
+        assert_eq!(
+            Compactor::new(meta.clone(), blocks.clone())
+                .compact_light(chunk_id)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        let kept = meta.get_slices(chunk_id).await.unwrap();
+        assert_eq!(kept.len(), 1);
+        let mut actual = [0; 4096];
+        blocks
+            .read_range((kept[0].slice_id, 0), 0, &mut actual)
+            .await
+            .unwrap();
+        assert!(
+            actual.iter().all(|b| *b == b'b'),
+            "light compaction resurrected the older, higher-ID data"
+        );
+        assert_eq!(
+            kept[0].slice_id, 1001,
+            "light compaction discarded the last-published data"
+        );
+    }
+
+    #[tokio::test]
+    async fn heavy_compaction_preserves_publication_order_with_nonmonotonic_ids() {
+        let (_tmp, meta, blocks) = setup_test_env().await;
+        let ino = meta
+            .create_file(meta.root_ino(), "heavy-order".into())
+            .await
+            .unwrap();
+        let chunk_id = brewfs::vfs::chunk_id_for(ino, 0).unwrap();
+        for (slice_id, offset, length, byte) in [(2001, 0, 8192, b'a'), (1001, 2048, 4096, b'b')] {
+            blocks
+                .write_fresh_range((slice_id, 0), 0, &vec![byte; length as usize])
+                .await
+                .unwrap();
+            meta.write(
+                ino,
+                chunk_id,
+                SliceDesc {
+                    slice_id,
+                    chunk_id,
+                    offset,
+                    length,
+                },
+                8192,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            meta.get_slices(chunk_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|s| s.slice_id)
+                .collect::<Vec<_>>(),
+            [2001, 1001]
+        );
+        let layout = ChunkLayout {
+            chunk_size: 16384,
+            block_size: 8192,
+        };
+        let new_id = Compactor::with_layout(meta, blocks.clone(), layout)
+            .compact_heavy(chunk_id)
+            .await
+            .unwrap();
+        let mut actual = vec![0; 8192];
+        blocks
+            .read_range((new_id, 0), 0, &mut actual)
+            .await
+            .unwrap();
+        assert!(actual[..2048].iter().all(|b| *b == b'a'));
+        assert!(actual[6144..].iter().all(|b| *b == b'a'));
+        assert!(
+            actual[2048..6144].iter().all(|b| *b == b'b'),
+            "heavy compaction resurrected the older, higher-ID data"
+        );
+    }
 
     async fn setup_test_env() -> (TempDir, Arc<DatabaseMetaStore>, Arc<InMemoryBlockStore>) {
         let tmp_dir = TempDir::new().unwrap();

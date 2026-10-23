@@ -158,20 +158,17 @@ impl SliceDesc {
     /// newer slice are removed. Partially covered slices are kept intact
     /// because their block data addressing depends on the original offset.
     ///
-    /// Ordering: slices with higher `slice_id` are considered newer.
+    /// Ordering: later metadata entries are newer, independent of slice IDs.
+    /// Survivors retain their original relative order.
     pub fn remove_fully_covered(slices: &[SliceDesc]) -> Vec<SliceDesc> {
         if slices.is_empty() {
             return vec![];
         }
 
-        // Sort by slice_id descending (newest first)
-        let mut sorted: Vec<SliceDesc> = slices.to_vec();
-        sorted.sort_by_key(|s| std::cmp::Reverse(s.slice_id));
-
         let mut covered_ranges: Vec<(u64, u64)> = Vec::new();
         let mut result: Vec<SliceDesc> = Vec::new();
 
-        for slice in sorted {
+        for slice in slices.iter().rev() {
             let start = slice.offset;
             let end = slice.offset + slice.length;
 
@@ -181,13 +178,13 @@ impl SliceDesc {
                 .any(|&(cs, ce)| start >= cs && end <= ce);
 
             if !is_fully_covered {
-                result.push(slice);
+                result.push(*slice);
             }
 
             covered_ranges.push((start, end));
         }
 
-        result.sort_by_key(|s| s.offset);
+        result.reverse();
         result
     }
 
@@ -469,15 +466,13 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_fully_covered_sorted_by_offset() {
+    fn test_remove_fully_covered_preserves_publication_order() {
         let slices = vec![
             make_slice(3, 200, 50),
             make_slice(1, 0, 50),
             make_slice(2, 100, 50),
         ];
         let result = SliceDesc::remove_fully_covered(&slices);
-        for i in 1..result.len() {
-            assert!(result[i].offset >= result[i - 1].offset, "not sorted");
-        }
+        assert_eq!(result, slices);
     }
 }
