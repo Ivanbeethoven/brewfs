@@ -18,6 +18,9 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
 pub mod proto {
     tonic::include_proto!("csi.v1");
 }
@@ -287,17 +290,39 @@ impl MountOps for SystemMountOps {
         if self.process_start_time(pid)? != Some(start_time) {
             return Ok(());
         }
-        run_command(Command::new("kill").arg("-TERM").arg(pid.to_string()))?;
-        for _ in 0..50 {
-            if self.process_start_time(pid)? != Some(start_time) {
-                return Ok(());
+
+        #[cfg(target_os = "linux")]
+        {
+            // pidfd_open binds the handle to this process instance. Re-read
+            // the marker after opening it: if the numeric PID was recycled
+            // during open, reject it before sending any signal. Once the
+            // pidfd is open, later PID reuse cannot redirect pidfd_send_signal.
+            match Self::pidfd_open(pid) {
+                Ok(pidfd) => {
+                    if self.process_start_time(pid)? != Some(start_time) {
+                        return Ok(());
+                    }
+                    Self::pidfd_send_term(&pidfd)?;
+                    return self.wait_for_exit(pid, start_time);
+                }
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EINVAL | libc::ENOSYS | libc::EPERM)
+                    ) => {}
+                Err(error) => return Err(error),
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("BrewFS PID {pid} did not exit after SIGTERM"),
-        ))
+
+        // Kernels without pidfd support retain the start-time fallback. The
+        // final read is immediately before the legacy numeric signal; this
+        // is the only unavoidable check/kill window on such kernels. Linux
+        // deployments use the pidfd path above, which has no PID-reuse window.
+        if self.process_start_time(pid)? != Some(start_time) {
+            return Ok(());
+        }
+        run_command(Command::new("kill").arg("-TERM").arg(pid.to_string()))?;
+        self.wait_for_exit(pid, start_time)
     }
 
     fn start_brewfs(&self, spec: &MountSpec, target: &Path) -> io::Result<u32> {
@@ -407,6 +432,49 @@ impl MountOps for SystemMountOps {
 
     fn unmount_brewfs(&self, target: &Path) -> io::Result<()> {
         run_command(Command::new("umount").arg(target))
+    }
+}
+
+impl SystemMountOps {
+    #[cfg(target_os = "linux")]
+    fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: pidfd_open returned a newly owned, valid file descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as std::os::fd::RawFd) })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pidfd_send_term(pidfd: &OwnedFd) -> io::Result<()> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                libc::SIGTERM,
+                std::ptr::null::<libc::siginfo_t>(),
+                0u32,
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wait_for_exit(&self, pid: u32, start_time: u64) -> io::Result<()> {
+        for _ in 0..50 {
+            if self.process_start_time(pid)? != Some(start_time) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("BrewFS PID {pid} did not exit after SIGTERM"),
+        ))
     }
 }
 
@@ -652,8 +720,10 @@ impl<O: MountOps> MountManager<O> {
             // The previous plugin process left a stale mount behind. Remove
             // only the mount owned by this volume before reacquiring the
             // workspace lease; a live PID is always reused.
-            self.ops.unmount_brewfs(&shared)?;
-            mounted = false;
+            if mounted {
+                self.ops.unmount_brewfs(&shared)?;
+                mounted = false;
+            }
             state = MountState::default();
         }
         if !mounted {
@@ -904,11 +974,19 @@ mod tests {
 
         fn unmount_brewfs(&self, target: &Path) -> io::Result<()> {
             *self.unmounts.lock().unwrap() += 1;
-            self.mounted
+            let removed = self
+                .mounted
                 .lock()
                 .unwrap()
                 .remove(&target.display().to_string());
-            Ok(())
+            if removed {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "shared mount is already absent",
+                ))
+            }
         }
     }
 
@@ -1041,6 +1119,55 @@ mod tests {
         manager.stage(&spec).await.unwrap();
         assert_eq!(manager.load_state(&spec).unwrap().pid, Some(300));
         assert!(ops.checked_pids.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stage_recovers_dead_pid_when_shared_mount_is_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let ops = Arc::new(FakeOps {
+            next_pid: StdMutex::new(600),
+            ..Default::default()
+        });
+        let manager = MountManager::new_with_root(ops.clone(), temp.path().join("state"));
+        let spec = spec(&temp);
+        manager.stage(&spec).await.unwrap();
+        let dead_pid = manager.load_state(&spec).unwrap().pid.unwrap();
+        ops.mounted
+            .lock()
+            .unwrap()
+            .remove(&spec.shared_mount().display().to_string());
+        ops.dead.lock().unwrap().insert(dead_pid);
+
+        manager.stage(&spec).await.unwrap();
+        assert_eq!(*ops.starts.lock().unwrap(), 2);
+        assert_eq!(manager.load_state(&spec).unwrap().pid, Some(dead_pid + 1));
+        assert_eq!(*ops.unmounts.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn system_stop_brewfs_does_not_signal_a_recycled_pid() {
+        let mut child = Command::new("bash")
+            .args(["-c", "exec -a brewfs sleep 30"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let ops = SystemMountOps;
+        let start_time = (0..20)
+            .find_map(|_| {
+                let marker = ops.process_start_time(pid).unwrap();
+                marker.or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    None
+                })
+            })
+            .unwrap();
+
+        // A different start marker represents the same numeric PID after
+        // recycling. Cleanup must leave that unrelated process untouched.
+        ops.stop_brewfs(pid, start_time.wrapping_add(1)).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[tokio::test]
