@@ -266,6 +266,12 @@ impl MountOps for SystemMountOps {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let _ = child.kill();
+        // Reap the child before the final mount check so it cannot finish
+        // mounting after cleanup. kill() alone neither waits nor unmounts.
+        child.wait()?;
+        if self.is_mounted(target)? {
+            self.unmount_brewfs(target)?;
+        }
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!("BrewFS mount did not become visible at {target:?}"),
@@ -322,7 +328,7 @@ struct MountState {
     mount_root: String,
     read_only: bool,
     /// PID of the lease-owning BrewFS process when started by this plugin.
-    /// `None` preserves compatibility with state written before PID tracking.
+    /// `None` permits reading legacy state, but cannot authenticate a live mount.
     #[serde(default)]
     pid: Option<u32>,
     #[serde(default)]
@@ -466,6 +472,11 @@ impl<O: MountOps> MountManager<O> {
         let shared = spec.shared_mount();
         let mut state = self.load_state(spec)?;
         let mut mounted = self.ops.is_mounted(&shared)?;
+        if mounted && state.pid.is_none() {
+            return Err(CsiError::MountCommand(format!(
+                "cannot reuse mount at {shared:?} without a recorded BrewFS PID; unmount it before retrying"
+            )));
+        }
         let stale = match state.pid {
             Some(pid) => mounted && !self.ops.process_alive(pid)?,
             None => false,
