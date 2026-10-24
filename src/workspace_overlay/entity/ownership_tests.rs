@@ -446,6 +446,16 @@ struct CountingBackend {
 
 #[async_trait::async_trait]
 impl EntityBackend for CountingBackend {
+    async fn scan_prefix_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.scan_prefix_page(prefix, after, limit).await
+    }
     async fn read(&self, keys: &[Vec<u8>]) -> Result<super::super::backend::RowSnapshot> {
         self.reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

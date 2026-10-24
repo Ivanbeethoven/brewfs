@@ -1265,6 +1265,16 @@ impl PausingBackend {
 
 #[async_trait]
 impl EntityBackend for PausingBackend {
+    async fn scan_prefix_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let rows = self.inner.scan_prefix_page(prefix, after, limit).await?;
+        self.after_read(&[prefix.to_vec()]).await;
+        Ok(rows)
+    }
     async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.read_batches.lock().unwrap().push(keys.to_vec());

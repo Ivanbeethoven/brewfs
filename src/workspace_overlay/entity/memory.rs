@@ -1,6 +1,6 @@
 //! Atomic in-memory reference backend with a controllable backend clock.
 
-use std::{collections::BTreeMap, sync::Mutex};
+use std::{collections::BTreeMap, ops::Bound, sync::Mutex};
 
 use async_trait::async_trait;
 
@@ -9,7 +9,7 @@ use super::{
     backend::{
         CommitOutcome, CreateAllocation, EntityBackend, EntityPlan, RowCheck, RowSnapshot,
         RowWrite, SliceAllocation, TransactionAuthority, add_bytes, next_counter, prepare_create,
-        prepare_slices, validate_checked_read, validate_plan, validate_scan,
+        prepare_slices, validate_checked_read, validate_plan, validate_scan, validate_scan_page,
     },
 };
 
@@ -253,16 +253,29 @@ impl EntityBackend for MemoryEntityBackend {
         prefix: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        validate_scan(prefix, limit)?;
+        self.scan_prefix_page(prefix, None, limit).await
+    }
+
+    async fn scan_prefix_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        validate_scan_page(prefix, after, limit)?;
         let state = self.state.lock().map_err(poisoned)?;
-        let entries = state
-            .rows
-            .range(prefix.to_vec()..)
-            .take_while(|(key, _)| key.starts_with(prefix))
-            .take(limit);
+        let start = after.map_or_else(
+            || Bound::Included(prefix.to_vec()),
+            |key| Bound::Excluded(key.to_vec()),
+        );
         let mut result = Vec::new();
         let mut total = 0;
-        for (key, value) in entries {
+        for (key, value) in state
+            .rows
+            .range((start, Bound::Unbounded))
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .take(limit)
+        {
             add_bytes(&mut total, key, Some(value))?;
             result.push((key.clone(), value.clone()));
         }
