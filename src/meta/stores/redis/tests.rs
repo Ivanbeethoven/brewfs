@@ -2335,6 +2335,10 @@ async fn get_slices_cache_detects_remote_compact_via_version_token() {
         length: 8192,
     };
     store
+        .record_uncommitted_slice(new_slice.slice_id, chunk_id, new_slice.length, "compact")
+        .await
+        .unwrap();
+    store
         .replace_slices_for_compact_with_version(chunk_id, &[new_slice], &[], &[old_slice])
         .await
         .unwrap();

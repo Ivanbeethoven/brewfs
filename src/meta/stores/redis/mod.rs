@@ -99,7 +99,7 @@ const CHUNK_CAS_LUA: &str = r#"
 // KEYS: chunk list, chunk version, delayed counter, delayed index,
 // uncommitted pending index, uncommitted orphan index.
 // ARGV: expected version, new version, delayed key prefix, chunk id,
-// timestamp, delayed count, uncommitted key prefix, new-slice count,
+// timestamp, delayed count, uncommitted key prefix, new-slice count, require pending,
 // delayed (sid, offset, size) triples, new slice IDs, serialized final slices.
 const CHUNK_COMPACT_LUA: &str = r#"
     local expected = tonumber(ARGV[1])
@@ -110,12 +110,13 @@ const CHUNK_COMPACT_LUA: &str = r#"
     local n = tonumber(ARGV[6])
     local uc_prefix = ARGV[7]
     local new_count = tonumber(ARGV[8])
+    local require_pending = ARGV[9] == '1'
 
     if expected == nil or new_ver == nil or n == nil or new_count == nil
         or n < 0 or n % 1 ~= 0 or new_count < 0 or new_count % 1 ~= 0 then
         return redis.error_reply('invalid compact arguments')
     end
-    if #ARGV < 8 + 3 * n + new_count then
+    if #ARGV < 9 + 3 * n + new_count then
         return redis.error_reply('missing compact arguments')
     end
 
@@ -137,6 +138,17 @@ const CHUNK_COMPACT_LUA: &str = r#"
             return reply.ok
         end
         return reply
+    end
+
+    local new_id_start = 10 + 3 * n
+    if require_pending then
+        for i = 0, new_count - 1 do
+            local uc_key = uc_prefix .. ARGV[new_id_start + i]
+            if redis.call('HGET', uc_key, 'st') ~= 'pending'
+                or redis.call('HGET', uc_key, 'cid') ~= cid then
+                return -1
+            end
+        end
     end
 
     local first_id = 0
@@ -177,7 +189,6 @@ const CHUNK_COMPACT_LUA: &str = r#"
         end
     end
 
-    local new_id_start = 9 + 3 * n
     local data_start = new_id_start + new_count
     redis.call('DEL', KEYS[1])
     for i = data_start, #ARGV do
@@ -192,7 +203,7 @@ const CHUNK_COMPACT_LUA: &str = r#"
     for i = 0, n - 1 do
         local delayed_id = first_id + i
         local ds_key = prefix .. delayed_id
-        local base = 9 + 3 * i
+        local base = 10 + 3 * i
         redis.call('HSET', ds_key,
             'sid', ARGV[base],
             'off', ARGV[base + 1],
@@ -210,6 +221,31 @@ const CHUNK_COMPACT_LUA: &str = r#"
         redis.call('ZREM', KEYS[6], slice_id)
     end
 
+    return 1
+"#;
+
+// Claim only the still-pending reservation whose chunk was just inspected.
+// Publication consumes that same reservation atomically, so at most one wins.
+const CLAIM_UNCOMMITTED_LUA: &str = r#"
+    local current = tonumber(redis.call('GET', KEYS[2]) or '0')
+    if current ~= tonumber(ARGV[1])
+        or redis.call('HGET', KEYS[1], 'st') ~= 'pending'
+        or redis.call('HGET', KEYS[1], 'cid') ~= ARGV[2]
+        or redis.call('HGET', KEYS[1], 'sz') ~= ARGV[3] then
+        return 0
+    end
+    local created = tonumber(redis.call('HGET', KEYS[1], 'ca'))
+    if not created or created > tonumber(ARGV[4]) then
+        return 0
+    end
+    if ARGV[6] == '1' then
+        redis.call('DEL', KEYS[1])
+        redis.call('ZREM', KEYS[3], ARGV[5])
+        return 0
+    end
+    redis.call('HSET', KEYS[1], 'st', 'orphan')
+    redis.call('ZREM', KEYS[3], ARGV[5])
+    redis.call('ZADD', KEYS[4], 0, ARGV[5])
     return 1
 "#;
 
@@ -4274,6 +4310,7 @@ impl MetaStore for RedisMetaStore {
                 .arg(delayed_slices.len())
                 .arg(UNCOMMITTED_KEY_PREFIX)
                 .arg(new_slice_ids.len())
+                .arg(0)
                 .arg(&delayed_args)
                 .arg(&new_slice_ids)
                 .arg(&final_data)
@@ -4427,6 +4464,7 @@ impl MetaStore for RedisMetaStore {
                 .arg(delayed_slices.len())
                 .arg(UNCOMMITTED_KEY_PREFIX)
                 .arg(new_slice_ids.len())
+                .arg(1)
                 .arg(&delayed_args)
                 .arg(&new_slice_ids)
                 .arg(&final_data)
@@ -4436,6 +4474,9 @@ impl MetaStore for RedisMetaStore {
 
             if ok == 0 {
                 continue;
+            }
+            if ok < 0 {
+                return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
             }
 
             return Ok(());
@@ -4575,7 +4616,11 @@ impl MetaStore for RedisMetaStore {
                 .unwrap_or(0);
             let chunk_key = self.chunk_key(chunk_id);
 
-            let raw: Vec<Vec<u8>> = redis::cmd("LRANGE")
+            let version_key = self.chunk_version_key(chunk_id);
+            let (version, raw): (Option<i64>, Vec<Vec<u8>>) = redis::pipe()
+                .cmd("GET")
+                .arg(&version_key)
+                .cmd("LRANGE")
                 .arg(&chunk_key)
                 .arg(0)
                 .arg(-1)
@@ -4592,36 +4637,22 @@ impl MetaStore for RedisMetaStore {
                 }
             }
 
-            if exists {
-                // Committed, clean up
-                let _: () = redis::pipe()
-                    .atomic()
-                    .cmd("DEL")
-                    .arg(&uc_key)
-                    .ignore()
-                    .cmd("ZREM")
-                    .arg(UNCOMMITTED_PENDING_INDEX_KEY)
-                    .arg(slice_id.to_string())
-                    .ignore()
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(redis_err)?;
-            } else {
-                // Orphan
+            let claimed: i32 = redis::Script::new(CLAIM_UNCOMMITTED_LUA)
+                .key(&uc_key)
+                .key(&version_key)
+                .key(UNCOMMITTED_PENDING_INDEX_KEY)
+                .key(UNCOMMITTED_ORPHAN_INDEX_KEY)
+                .arg(version.unwrap_or(0))
+                .arg(chunk_id)
+                .arg(size)
+                .arg(cutoff)
+                .arg(slice_id)
+                .arg(i32::from(exists))
+                .invoke_async(&mut conn)
+                .await
+                .map_err(redis_err)?;
+            if claimed == 1 {
                 cleaned.push((slice_id, size));
-                let mut pipe = redis::pipe();
-                pipe.atomic();
-                pipe.hset(&uc_key, "st", "orphan");
-                pipe.cmd("ZREM")
-                    .arg(UNCOMMITTED_PENDING_INDEX_KEY)
-                    .arg(slice_id.to_string())
-                    .ignore();
-                pipe.cmd("ZADD")
-                    .arg(UNCOMMITTED_ORPHAN_INDEX_KEY)
-                    .arg(0)
-                    .arg(slice_id.to_string())
-                    .ignore();
-                let _: () = pipe.query_async(&mut conn).await.map_err(redis_err)?;
             }
         }
 

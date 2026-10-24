@@ -2726,6 +2726,25 @@ impl MetaStore for TiKvMetaStore {
                     return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
                 }
 
+                for slice in &new_slices {
+                    let reservation = Self::txn_get_raw(
+                        txn,
+                        store.uncommitted_pending_key(slice.slice_id),
+                        true,
+                        operation,
+                    )
+                    .await?;
+                    let reservation = reservation
+                        .as_deref()
+                        .map(Self::decode_uncommitted_slice)
+                        .transpose()?;
+                    if !reservation.is_some_and(|record| {
+                        record.status == "pending" && record.chunk_id == chunk_id
+                    }) {
+                        return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
+                    }
+                }
+
                 store
                     .txn_put_slices_or_delete(txn, chunk_id, &new_slices, operation)
                     .await?;
