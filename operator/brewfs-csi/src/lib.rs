@@ -184,6 +184,14 @@ pub trait MountOps: Send + Sync + 'static {
     fn process_alive(&self, pid: u32) -> io::Result<bool>;
     fn start_brewfs(&self, spec: &MountSpec, target: &Path) -> io::Result<u32>;
     fn bind(&self, source: &Path, target: &Path, read_only: bool) -> io::Result<()>;
+    /// Verify an existing bind before accepting a publish retry. Implementations
+    /// that cannot inspect its identity and mode must fail closed.
+    fn bind_matches(&self, _source: &Path, _target: &Path, _read_only: bool) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot verify existing bind mount",
+        ))
+    }
     fn unbind(&self, target: &Path) -> io::Result<()>;
     fn unmount_brewfs(&self, target: &Path) -> io::Result<()>;
 }
@@ -203,6 +211,10 @@ impl<T: MountOps> MountOps for Arc<T> {
 
     fn bind(&self, source: &Path, target: &Path, read_only: bool) -> io::Result<()> {
         (**self).bind(source, target, read_only)
+    }
+
+    fn bind_matches(&self, source: &Path, target: &Path, read_only: bool) -> io::Result<bool> {
+        (**self).bind_matches(source, target, read_only)
     }
 
     fn unbind(&self, target: &Path) -> io::Result<()> {
@@ -282,15 +294,54 @@ impl MountOps for SystemMountOps {
     fn bind(&self, source: &Path, target: &Path, read_only: bool) -> io::Result<()> {
         fs::create_dir_all(target)?;
         run_command(Command::new("mount").arg("--bind").arg(source).arg(target))?;
-        if read_only {
-            run_command(
+        if read_only
+            && let Err(error) = run_command(
                 Command::new("mount")
                     .arg("-o")
                     .arg("remount,bind,ro")
                     .arg(target),
-            )?;
+            )
+        {
+            return match self.unbind(target) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(io::Error::new(
+                    error.kind(),
+                    format!("{error}; rollback of {target:?} failed: {cleanup}"),
+                )),
+            };
         }
         Ok(())
+    }
+
+    fn bind_matches(&self, source: &Path, target: &Path, read_only: bool) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+
+        let source = fs::metadata(source)?;
+        let mounted = fs::metadata(target)?;
+        if source.dev() != mounted.dev() || source.ino() != mounted.ino() {
+            return Ok(false);
+        }
+        // VFS-OPTIONS describes this bind's flags, not the shared filesystem's
+        // superblock options (which can remain writable for other targets).
+        let output = Command::new("findmnt")
+            .args(["--noheadings", "--output", "VFS-OPTIONS", "--mountpoint"])
+            .arg(target)
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "inspect bind at {target:?}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let options = String::from_utf8_lossy(&output.stdout);
+        let options = options.trim();
+        // Ambiguous/stacked mount output is not an idempotent success.
+        if options.lines().count() != 1 {
+            return Ok(false);
+        }
+        Ok(options
+            .split(',')
+            .any(|option| option == if read_only { "ro" } else { "rw" }))
     }
 
     fn unbind(&self, target: &Path) -> io::Result<()> {
@@ -372,17 +423,47 @@ impl<O: MountOps> MountManager<O> {
     ) -> Result<(), CsiError> {
         let _guard = self.lock.lock().await;
         let shared = self.stage_locked(spec)?;
+        let mut state = self.load_state(spec)?;
+        let read_only = read_only || spec.read_only;
         if self.ops.is_mounted(target)? {
-            let mut state = self.load_state(spec)?;
+            if !self.ops.bind_matches(&shared, target, read_only)? {
+                return Err(CsiError::MountCommand(format!(
+                    "existing mount at {target:?} does not match the volume and read-only mode; unpublish it before retrying"
+                )));
+            }
             state.targets.insert(target.display().to_string());
             self.store_state(spec, &state)?;
             return Ok(());
         }
-        self.ops
-            .bind(&shared, target, read_only || spec.read_only)?;
-        let mut state = self.load_state(spec)?;
+        // Record recovery information before exposing a mount. There must be
+        // no fallible state write after a successful bind, and a failed unbind
+        // must leave enough state for unpublish (including after a restart).
+        let previous = state.clone();
         state.targets.insert(target.display().to_string());
-        self.store_state(spec, &state)
+        self.store_state(spec, &state)?;
+        if let Err(error) = self.ops.bind(&shared, target, read_only) {
+            match self.ops.is_mounted(target) {
+                Ok(false) => {
+                    if let Err(cleanup) = self.store_state(spec, &previous) {
+                        return Err(CsiError::MountCommand(format!(
+                            "{error}; restore publish state: {cleanup}"
+                        )));
+                    }
+                }
+                Ok(true) => {
+                    return Err(CsiError::MountCommand(format!(
+                        "{error}; target {target:?} remains mounted and recorded for unpublish"
+                    )));
+                }
+                Err(cleanup) => {
+                    return Err(CsiError::MountCommand(format!(
+                        "{error}; inspect rollback of {target:?}: {cleanup}; target remains recorded"
+                    )));
+                }
+            }
+            return Err(CsiError::Io(error));
+        }
+        Ok(())
     }
 
     pub async fn unpublish(&self, spec: &MountSpec, target: &Path) -> Result<(), CsiError> {
@@ -580,19 +661,29 @@ pub fn lock_state_dir(path: &Path) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
 
     #[derive(Debug, Default)]
     struct FakeOps {
         mounted: StdMutex<BTreeSet<String>>,
-        binds: StdMutex<BTreeSet<String>>,
+        binds: StdMutex<BTreeMap<String, (PathBuf, bool)>>,
         starts: StdMutex<usize>,
         unmounts: StdMutex<usize>,
+        fail_state_write: StdMutex<Option<PathBuf>>,
+        fail_state_after_probe: StdMutex<Option<(PathBuf, PathBuf)>>,
+        fail_bind: StdMutex<bool>,
+        leak_failed_bind: StdMutex<bool>,
     }
 
     impl MountOps for FakeOps {
         fn is_mounted(&self, path: &Path) -> io::Result<bool> {
+            if let Some((target, state_tmp)) = self.fail_state_after_probe.lock().unwrap().as_ref()
+                && path == target
+            {
+                fs::create_dir(state_tmp)?;
+            }
             Ok(self
                 .mounted
                 .lock()
@@ -602,7 +693,7 @@ mod tests {
                     .binds
                     .lock()
                     .unwrap()
-                    .contains(&path.display().to_string()))
+                    .contains_key(&path.display().to_string()))
         }
 
         fn process_alive(&self, _pid: u32) -> io::Result<bool> {
@@ -618,11 +709,23 @@ mod tests {
             Ok(42)
         }
 
-        fn bind(&self, _source: &Path, target: &Path, _read_only: bool) -> io::Result<()> {
-            self.binds
-                .lock()
-                .unwrap()
-                .insert(target.display().to_string());
+        fn bind(&self, source: &Path, target: &Path, read_only: bool) -> io::Result<()> {
+            if *self.fail_bind.lock().unwrap() && !*self.leak_failed_bind.lock().unwrap() {
+                return Err(io::Error::other("injected bind failure"));
+            }
+            self.binds.lock().unwrap().insert(
+                target.display().to_string(),
+                (
+                    source.to_owned(),
+                    read_only && !*self.leak_failed_bind.lock().unwrap(),
+                ),
+            );
+            if let Some(path) = self.fail_state_write.lock().unwrap().as_ref() {
+                fs::create_dir(path)?;
+            }
+            if *self.fail_bind.lock().unwrap() {
+                return Err(io::Error::other("injected bind cleanup failure"));
+            }
             Ok(())
         }
 
@@ -632,6 +735,15 @@ mod tests {
                 .unwrap()
                 .remove(&target.display().to_string());
             Ok(())
+        }
+
+        fn bind_matches(&self, source: &Path, target: &Path, read_only: bool) -> io::Result<bool> {
+            Ok(self
+                .binds
+                .lock()
+                .unwrap()
+                .get(&target.display().to_string())
+                == Some(&(source.to_owned(), read_only)))
         }
 
         fn unmount_brewfs(&self, target: &Path) -> io::Result<()> {
@@ -745,6 +857,169 @@ mod tests {
             manager.unstage(&spec).await,
             Err(CsiError::Published(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn publish_never_leaves_an_untracked_bind_on_state_write_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let ops = Arc::new(FakeOps::default());
+        let manager = MountManager::new_with_root(ops.clone(), temp.path().join("state"));
+        let spec = spec(&temp);
+        let target = temp.path().join("target");
+        manager.stage(&spec).await.unwrap();
+        *ops.fail_state_write.lock().unwrap() =
+            Some(manager.state_path(&spec).with_extension("json.tmp"));
+
+        let result = manager.publish(&spec, &target, false).await;
+        let mounted = ops.is_mounted(&target).unwrap();
+        let recorded = manager
+            .load_state(&spec)
+            .unwrap()
+            .targets
+            .contains(&target.display().to_string());
+        assert!(
+            if result.is_ok() {
+                mounted && recorded
+            } else {
+                !mounted
+            },
+            "publish={result:?}, mounted={mounted}, recorded={recorded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_bind_restores_previous_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let ops = Arc::new(FakeOps::default());
+        let manager = MountManager::new_with_root(ops.clone(), temp.path().join("state"));
+        let spec = spec(&temp);
+        manager
+            .publish(&spec, &temp.path().join("existing"), false)
+            .await
+            .unwrap();
+        let previous = fs::read(manager.state_path(&spec)).unwrap();
+        *ops.fail_bind.lock().unwrap() = true;
+
+        assert!(
+            manager
+                .publish(&spec, &temp.path().join("failed"), true)
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(manager.state_path(&spec)).unwrap(), previous);
+    }
+
+    #[tokio::test]
+    async fn publish_state_failure_before_bind_preserves_existing_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let ops = Arc::new(FakeOps::default());
+        let manager = MountManager::new_with_root(ops.clone(), temp.path().join("state"));
+        let spec = spec(&temp);
+        let existing = temp.path().join("existing");
+        let target = temp.path().join("target");
+        manager.publish(&spec, &existing, false).await.unwrap();
+        let previous = fs::read(manager.state_path(&spec)).unwrap();
+        *ops.fail_state_after_probe.lock().unwrap() = Some((
+            target.clone(),
+            manager.state_path(&spec).with_extension("json.tmp"),
+        ));
+
+        assert!(manager.publish(&spec, &target, false).await.is_err());
+        *ops.fail_state_after_probe.lock().unwrap() = None;
+        assert!(!ops.is_mounted(&target).unwrap());
+        assert!(ops.is_mounted(&existing).unwrap());
+        assert_eq!(fs::read(manager.state_path(&spec)).unwrap(), previous);
+    }
+
+    #[tokio::test]
+    async fn readonly_publish_is_idempotent_after_restart() {
+        for spec_read_only in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let ops = Arc::new(FakeOps::default());
+            let state_root = temp.path().join("state");
+            let manager = MountManager::new_with_root(ops.clone(), state_root.clone());
+            let mut spec = spec(&temp);
+            spec.read_only = spec_read_only;
+            let target = temp.path().join("target");
+            manager
+                .publish(&spec, &target, !spec_read_only)
+                .await
+                .unwrap();
+            MountManager::new_with_root(ops, state_root)
+                .publish(&spec, &target, !spec_read_only)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_bind_cleanup_keeps_recovery_state_across_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let ops = Arc::new(FakeOps::default());
+        let state_root = temp.path().join("state");
+        let manager = MountManager::new_with_root(ops.clone(), state_root.clone());
+        let spec = spec(&temp);
+        let target = temp.path().join("target");
+        *ops.fail_bind.lock().unwrap() = true;
+        *ops.leak_failed_bind.lock().unwrap() = true;
+
+        assert!(manager.publish(&spec, &target, true).await.is_err());
+        assert!(
+            manager
+                .load_state(&spec)
+                .unwrap()
+                .targets
+                .contains(&target.display().to_string())
+        );
+        let restarted = MountManager::new_with_root(ops.clone(), state_root);
+        assert!(restarted.publish(&spec, &target, true).await.is_err());
+        assert!(matches!(
+            restarted.unstage(&spec).await,
+            Err(CsiError::Published(_))
+        ));
+        restarted
+            .unpublish_by_id(&spec.volume.as_string(), &target)
+            .await
+            .unwrap();
+        assert!(!ops.is_mounted(&target).unwrap());
+        restarted
+            .unstage_by_id(&spec.volume.as_string())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_an_unrelated_existing_mount() {
+        let temp = tempfile::tempdir().unwrap();
+        let ops = Arc::new(FakeOps::default());
+        let manager = MountManager::new_with_root(ops.clone(), temp.path().join("state"));
+        let spec = spec(&temp);
+        let target = temp.path().join("target");
+        ops.mounted
+            .lock()
+            .unwrap()
+            .insert(target.display().to_string());
+
+        assert!(manager.publish(&spec, &target, true).await.is_err());
+        assert!(ops.is_mounted(&target).unwrap());
+        assert!(manager.load_state(&spec).unwrap().targets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn publish_retry_checks_volume_and_readonly_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let ops = Arc::new(FakeOps::default());
+        let manager = MountManager::new_with_root(ops.clone(), temp.path().join("state"));
+        let spec = spec(&temp);
+        let target = temp.path().join("target");
+        manager.publish(&spec, &target, false).await.unwrap();
+        assert!(manager.publish(&spec, &target, true).await.is_err());
+
+        let mut other = spec.clone();
+        other.volume.workspace = Uuid::from_u128(8);
+        assert!(manager.publish(&other, &target, false).await.is_err());
+        assert!(manager.load_state(&other).unwrap().targets.is_empty());
+        assert!(ops.is_mounted(&target).unwrap());
     }
 
     #[tokio::test]
