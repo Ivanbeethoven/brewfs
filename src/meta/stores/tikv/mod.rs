@@ -3227,15 +3227,6 @@ impl MetaStore for TiKvMetaStore {
             Box::pin(async move {
                 let plocks = store.txn_get_plocks(txn, inode, false, operation).await?;
 
-                if let Some(current) = plocks
-                    .iter()
-                    .find(|plock| plock.sid == sid && plock.owner == query.owner)
-                    && let Some(info) =
-                        PlockRecord::get_plock(&current.records, &query, &sid, &current.sid)
-                {
-                    return Ok(info);
-                }
-
                 for plock in &plocks {
                     if plock.sid == sid && plock.owner == query.owner {
                         continue;

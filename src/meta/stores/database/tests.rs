@@ -1276,9 +1276,9 @@ async fn test_lock_release() {
         .await
         .unwrap();
 
-    // Verify lock exists
+    // Query as a different owner to verify the lock exists.
     let query = FileLockQuery {
-        owner,
+        owner: owner + 1,
         lock_type: FileLockType::Write,
         range: FileLockRange { start: 0, end: 100 },
     };
@@ -1354,15 +1354,15 @@ async fn test_non_overlapping_locks() {
         .await
         .unwrap();
 
-    // Verify both locks exist
+    // Query as different owners in the same sessions to verify both locks.
     let query1 = FileLockQuery {
-        owner: owner1,
+        owner: owner2,
         lock_type: FileLockType::Write,
         range: FileLockRange { start: 0, end: 100 },
     };
 
     let query2 = FileLockQuery {
-        owner: owner2,
+        owner: owner1,
         lock_type: FileLockType::Write,
         range: FileLockRange {
             start: 200,
@@ -1461,9 +1461,9 @@ async fn test_concurrent_read_write_locks() {
         }
     }
 
-    // Verify successful locks exist
+    // A different owner can observe the write lock.
     let query1 = FileLockQuery {
-        owner: owner1,
+        owner: owner3,
         lock_type: FileLockType::Write,
         range: FileLockRange { start: 0, end: 100 },
     };

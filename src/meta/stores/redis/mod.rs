@@ -5202,15 +5202,8 @@ impl MetaStore for RedisMetaStore {
                 .unwrap_or_default()
         };
 
-        // First, try to get locks from current session's field
-        if let Some(records_json) = plock_entries.get(&current_field) {
-            let records = parse_records(records_json);
-            if let Some(v) = PlockRecord::get_plock(&records, query, &sid, &sid) {
-                return Ok(v);
-            }
-        }
-
-        // Check other sessions' locks from the already-fetched HGETALL result
+        // A caller's own locks cannot prevent SETLK. Other owners in this
+        // session still conflict, so skip only the exact (session, owner).
         for (field, records_json) in &plock_entries {
             if *field == current_field {
                 continue;

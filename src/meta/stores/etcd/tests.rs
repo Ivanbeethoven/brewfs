@@ -533,7 +533,10 @@ async fn test_multiple_read_locks() {
     assert_eq!(lock_info1.lock_type, FileLockType::Read);
     assert_eq!(lock_info1.range.start, 0);
     assert_eq!(lock_info1.range.end, 100);
-    assert_eq!(lock_info1.pid, 1234);
+    assert_eq!(
+        lock_info1.pid, 0,
+        "the conflicting lock belongs to the other session"
+    );
 
     let lock_info2 = store2.get_plock(file_ino, &query2).await.unwrap();
     assert_eq!(lock_info2.lock_type, FileLockType::UnLock);
@@ -668,9 +671,9 @@ async fn test_lock_release() {
         .await
         .unwrap();
 
-    // Verify lock exists
+    // Query as a different owner to verify the lock exists.
     let query = FileLockQuery {
-        owner,
+        owner: owner + 1,
         lock_type: FileLockType::Write,
         range: FileLockRange { start: 0, end: 100 },
     };
@@ -744,15 +747,15 @@ async fn test_non_overlapping_locks() {
         .await
         .unwrap();
 
-    // Verify both locks exist
+    // Query as different owners in the same sessions to verify both locks.
     let query1 = FileLockQuery {
-        owner: owner1,
+        owner: owner2,
         lock_type: FileLockType::Write,
         range: FileLockRange { start: 0, end: 100 },
     };
 
     let query2 = FileLockQuery {
-        owner: owner2,
+        owner: owner1,
         lock_type: FileLockType::Write,
         range: FileLockRange {
             start: 200,
@@ -852,9 +855,9 @@ async fn test_concurrent_read_write_locks() {
         }
     }
 
-    // Verify successful locks exist
+    // A different owner can observe the write lock.
     let query1 = FileLockQuery {
-        owner: owner1,
+        owner: owner3,
         lock_type: FileLockType::Write,
         range: FileLockRange { start: 0, end: 100 },
     };
