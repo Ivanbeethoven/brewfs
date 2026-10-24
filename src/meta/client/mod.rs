@@ -46,6 +46,17 @@ const CONTROL_TRASH_XATTR_NAME: &str = "system.brewfs.trash";
 struct ControlTrashMetadata {
     original_path: String,
     deleted_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared: Option<PreparedTrashStamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PreparedTrashStamp {
+    operation_id: Uuid,
+    source_inode: i64,
+    displaced_inode: i64,
+    destination_parent: i64,
+    destination_name: String,
 }
 use path_trie::PathTrie;
 use session::{SessionInfo, SessionManager};
@@ -674,14 +685,8 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
                 Ok(None) => continue,
                 Err(err) => return control_meta_error(err),
             };
-            let metadata = match self.store.get_xattr(ino, CONTROL_TRASH_XATTR_NAME).await {
-                Ok(Some(raw)) => match serde_json::from_slice::<ControlTrashMetadata>(&raw) {
-                    Ok(metadata) => Some(metadata),
-                    Err(err) => {
-                        warn!(inode = ino, error = %err, "invalid trash metadata");
-                        None
-                    }
-                },
+            let metadata = match self.load_trash_metadata(ino).await {
+                Ok(Some(metadata)) => Some(metadata),
                 Ok(None) | Err(MetaError::NotImplemented) => None,
                 Err(err) => return control_meta_error(err),
             };
@@ -793,9 +798,21 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         let Some(raw) = self.store.get_xattr(ino, CONTROL_TRASH_XATTR_NAME).await? else {
             return Ok(None);
         };
-        serde_json::from_slice::<ControlTrashMetadata>(&raw)
-            .map(Some)
-            .map_err(|err| MetaError::Internal(format!("invalid trash metadata: {err}")))
+        let metadata: ControlTrashMetadata = serde_json::from_slice(&raw)
+            .map_err(|err| MetaError::Internal(format!("invalid trash metadata: {err}")))?;
+        // Recovery has no matching operation token. Never infer a commit from
+        // an inode being deleted: an unrelated unlink could have deleted it.
+        if metadata.prepared.is_some() {
+            self.discard_prepared_trash(ino).await;
+            return Ok(None);
+        }
+        Ok(Some(metadata))
+    }
+
+    async fn discard_prepared_trash(&self, ino: i64) {
+        if let Err(err) = self.store.remove_xattr(ino, CONTROL_TRASH_XATTR_NAME).await {
+            warn!(inode = ino, error = ?err, "failed to remove non-authoritative prepared trash metadata");
+        }
     }
 
     fn parse_trash_entry_id(entry_id: &str) -> Result<i64, MetaError> {
@@ -835,24 +852,29 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         ino: i64,
         original_path: String,
     ) -> Result<bool, MetaError> {
+        self.write_trash_entry(ino, original_path, None).await
+    }
+
+    async fn write_trash_entry(
+        &self,
+        ino: i64,
+        original_path: String,
+        prepared: Option<PreparedTrashStamp>,
+    ) -> Result<bool, MetaError> {
         if !self.store.capabilities().xattr {
             return Ok(false);
         }
 
         // Do not replace an existing record: retries after a crash must be
         // idempotent and preserve the original restore path.
-        if self
-            .store
-            .get_xattr(ino, CONTROL_TRASH_XATTR_NAME)
-            .await?
-            .is_some()
-        {
+        if self.load_trash_metadata(ino).await?.is_some() {
             return Ok(false);
         }
 
         let metadata = ControlTrashMetadata {
             original_path,
             deleted_at: Utc::now().to_rfc3339(),
+            prepared,
         };
         let raw = match serde_json::to_vec(&metadata) {
             Ok(raw) => raw,
@@ -1784,20 +1806,27 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         };
 
         // Prepare the displaced inode's restore record before the namespace
-        // mutation.  This closes the crash window where rename could commit
-        // and a subsequent xattr write could be lost.  The write is
-        // idempotent, and is removed again if the backend rejects the rename.
+        // mutation. Only this operation's token and confirmed backend result
+        // can promote the prepared record to authoritative metadata.
         let mut prepared_trash = None;
         if let Some(original_path) = destination_path.as_ref() {
             if let Some(dest) = self.store.lookup(new_parent, &new_name).await? {
                 if dest != src_hint {
                     if let Ok(Some(attr)) = self.store.stat(dest).await {
                         if attr.nlink == 1 {
-                            prepared_trash = Some((
-                                dest,
-                                self.remember_trash_entry(dest, original_path.clone())
-                                    .await?,
-                            ));
+                            let stamp = PreparedTrashStamp {
+                                operation_id: Uuid::new_v4(),
+                                source_inode: src_hint,
+                                displaced_inode: dest,
+                                destination_parent: new_parent,
+                                destination_name: new_name.clone(),
+                            };
+                            if self
+                                .write_trash_entry(dest, original_path.clone(), Some(stamp.clone()))
+                                .await?
+                            {
+                                prepared_trash = Some(stamp);
+                            }
                         }
                     }
                 }
@@ -1819,13 +1848,36 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(err) => {
-                if let Some((ino, true)) = prepared_trash {
-                    let _ = self.store.remove_xattr(ino, CONTROL_TRASH_XATTR_NAME).await;
+                if let Some(stamp) = prepared_trash {
+                    self.discard_prepared_trash(stamp.displaced_inode).await;
                 }
                 return Err(err);
             }
         };
         let src_ino = outcome.ino;
+        if let Some(stamp) = prepared_trash {
+            let ino = stamp.displaced_inode;
+            if let Some(raw) = self.store.get_xattr(ino, CONTROL_TRASH_XATTR_NAME).await? {
+                let mut metadata: ControlTrashMetadata = serde_json::from_slice(&raw)
+                    .map_err(|err| MetaError::Internal(format!("invalid trash metadata: {err}")))?;
+                if metadata.prepared.as_ref() == Some(&stamp)
+                    && outcome.renamed
+                    && outcome.ino == stamp.source_inode
+                    && outcome.replaced_ino == Some(ino)
+                    && new_parent == stamp.destination_parent
+                    && new_name == stamp.destination_name
+                {
+                    metadata.prepared = None;
+                    let raw = serde_json::to_vec(&metadata)
+                        .map_err(|err| MetaError::Internal(err.to_string()))?;
+                    self.store
+                        .set_xattr(ino, CONTROL_TRASH_XATTR_NAME, &raw, 0)
+                        .await?;
+                } else if metadata.prepared.is_some() {
+                    self.discard_prepared_trash(ino).await;
+                }
+            }
+        }
         if !outcome.renamed {
             self.invalidate_open_file_cache_inode(src_ino).await;
             self.inode_cache.invalidate_inode(src_ino).await;
@@ -1850,16 +1902,6 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         }
 
         let dest_ino = outcome.replaced_ino;
-        // The trash record was prepared before rename.  Keep an existing
-        // record untouched so retries after a crash cannot duplicate it.
-        if let Some((prepared_ino, true)) = prepared_trash {
-            if dest_ino != Some(prepared_ino) {
-                let _ = self
-                    .store
-                    .remove_xattr(prepared_ino, CONTROL_TRASH_XATTR_NAME)
-                    .await;
-            }
-        }
         self.invalidate_open_file_cache_inode(src_ino).await;
         if let Some(dest_ino) = outcome.replaced_ino {
             self.invalidate_open_file_cache_inode(dest_ino).await;
@@ -4696,6 +4738,7 @@ mod tests {
         let forged_metadata = ControlTrashMetadata {
             original_path: "/docs/report.txt".to_string(),
             deleted_at: Utc::now().to_rfc3339(),
+            prepared: None,
         };
         let raw = serde_json::to_vec(&forged_metadata).unwrap();
         client
@@ -4853,6 +4896,54 @@ mod tests {
             );
             assert!(client.store.get_deleted_files().await.unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn test_control_plane_rename_trash_abandoned_prepare_not_reused_by_unlink() {
+        let client = create_test_client().await;
+        let source = client.create_file(1, "source".to_string()).await.unwrap();
+        let displaced = client
+            .create_file(1, "destination".to_string())
+            .await
+            .unwrap();
+        let stamp = PreparedTrashStamp {
+            operation_id: Uuid::new_v4(),
+            source_inode: source,
+            displaced_inode: displaced,
+            destination_parent: 1,
+            destination_name: "destination".to_string(),
+        };
+        client
+            .write_trash_entry(displaced, "/abandoned".to_string(), Some(stamp.clone()))
+            .await
+            .unwrap();
+        let raw = client
+            .store
+            .get_xattr(displaced, CONTROL_TRASH_XATTR_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        let prepared: ControlTrashMetadata = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(prepared.prepared, Some(stamp));
+
+        // Simulate a crash after preparation: do not commit or abort the rename.
+        client.unlink(1, "destination").await.unwrap();
+        let metadata = client
+            .load_trash_metadata(displaced)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.original_path, "/destination");
+        assert!(metadata.prepared.is_none());
+        assert_eq!(client.lookup(1, "source").await.unwrap(), Some(source));
+        assert!(
+            client
+                .store
+                .get_deleted_files()
+                .await
+                .unwrap()
+                .contains(&displaced)
+        );
     }
 
     #[tokio::test]
