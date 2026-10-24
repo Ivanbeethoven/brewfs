@@ -4277,6 +4277,202 @@ async fn release_lock(
         .await
 }
 
+async fn assert_lock_inode_tracked(store: &RedisMetaStore, inode: i64, expected: bool) {
+    let tracked: bool = store
+        .conn
+        .clone()
+        .sismember(RedisMetaStore::locked_key(store.get_sid().unwrap()), inode)
+        .await
+        .unwrap();
+    assert_eq!(
+        tracked, expected,
+        "session cleanup inventory for inode {inode}"
+    );
+}
+
+async fn check_lock_inventory_session_cleanup(expire: bool) {
+    let store = new_test_store_with_epoch().await;
+    let live = RedisMetaStore::from_config(test_config()).await.unwrap();
+    live.set_sid(Uuid::now_v7());
+    live.set_epoch(store.get_epoch().unwrap() + 1);
+    let observer = RedisMetaStore::from_config(test_config()).await.unwrap();
+    observer.set_sid(Uuid::now_v7());
+    observer.set_epoch(store.get_epoch().unwrap() + 2);
+    let inode = 99999;
+
+    // Two owners on one mount, plus a disjoint lock from another live mount.
+    for (holder, owner, start) in [(&store, 1, 0), (&store, 2, 200), (&live, 2, 400)] {
+        holder
+            .set_plock(
+                inode,
+                owner,
+                false,
+                FileLockType::Write,
+                FileLockRange {
+                    start,
+                    end: start + 100,
+                },
+                1234,
+            )
+            .await
+            .unwrap();
+    }
+
+    store
+        .set_plock(
+            inode,
+            1,
+            false,
+            FileLockType::UnLock,
+            FileLockRange { start: 20, end: 80 },
+            1234,
+        )
+        .await
+        .unwrap();
+    assert_lock_inode_tracked(&store, inode, true).await;
+
+    store
+        .set_plock(
+            inode,
+            1,
+            false,
+            FileLockType::UnLock,
+            FileLockRange { start: 0, end: 100 },
+            1234,
+        )
+        .await
+        .unwrap();
+
+    if expire {
+        let _: () = store
+            .conn
+            .clone()
+            .zadd(
+                super::ALL_SESSIONS_KEY,
+                store.get_sid().unwrap().to_string(),
+                0,
+            )
+            .await
+            .unwrap();
+        observer.cleanup_sessions().await.unwrap();
+    } else {
+        store.shutdown_session().await.unwrap();
+    }
+
+    let remaining_range = FileLockRange {
+        start: 200,
+        end: 300,
+    };
+    observer
+        .set_plock(inode, 2, false, FileLockType::Write, remaining_range, 5678)
+        .await
+        .expect("cleanup must release the other owner's remaining lock");
+    let live_conflict = observer
+        .set_plock(
+            inode,
+            2,
+            false,
+            FileLockType::Write,
+            FileLockRange {
+                start: 400,
+                end: 500,
+            },
+            5678,
+        )
+        .await;
+    assert!(matches!(live_conflict, Err(MetaError::LockConflict { .. })));
+    assert_lock_inode_tracked(&store, inode, false).await;
+    assert_lock_inode_tracked(&live, inode, true).await;
+
+    // The last owner must untrack its session even if another session remains.
+    observer
+        .set_plock(inode, 2, false, FileLockType::UnLock, remaining_range, 5678)
+        .await
+        .unwrap();
+    assert_lock_inode_tracked(&observer, inode, false).await;
+}
+
+#[serial]
+#[tokio::test]
+#[ignore = "requires Redis server"]
+async fn test_lock_inventory_shutdown_after_owner_unlock() {
+    check_lock_inventory_session_cleanup(false).await;
+}
+
+#[serial]
+#[tokio::test]
+#[ignore = "requires Redis server"]
+async fn test_lock_inventory_expiry_after_owner_unlock() {
+    check_lock_inventory_session_cleanup(true).await;
+}
+
+async fn check_lock_inventory_mixed_unlock(unlock_posix_first: bool) {
+    let store = new_test_store_with_epoch().await;
+    let live = RedisMetaStore::from_config(test_config()).await.unwrap();
+    live.set_sid(Uuid::now_v7());
+    live.set_epoch(store.get_epoch().unwrap() + 1);
+    let inode = 99999;
+    acquire_write_lock(&store, inode, 1, false, 1234)
+        .await
+        .unwrap();
+    store
+        .set_flock(inode, 2, false, FileLockType::Read)
+        .await
+        .unwrap();
+    // A second BSD owner must also retain the session's inventory entry.
+    store
+        .set_flock(inode, 3, false, FileLockType::Read)
+        .await
+        .unwrap();
+    if unlock_posix_first {
+        release_lock(&store, inode, 1, 1234).await.unwrap();
+    } else {
+        store
+            .set_flock(inode, 2, false, FileLockType::UnLock)
+            .await
+            .unwrap();
+        store
+            .set_flock(inode, 3, false, FileLockType::UnLock)
+            .await
+            .unwrap();
+    }
+    assert_lock_inode_tracked(&store, inode, true).await;
+    live.set_flock(inode, 3, false, FileLockType::Read)
+        .await
+        .unwrap();
+
+    if unlock_posix_first {
+        store
+            .set_flock(inode, 2, false, FileLockType::UnLock)
+            .await
+            .unwrap();
+        assert_lock_inode_tracked(&store, inode, true).await;
+        store
+            .set_flock(inode, 3, false, FileLockType::UnLock)
+            .await
+            .unwrap();
+    } else {
+        release_lock(&store, inode, 1, 1234).await.unwrap();
+    }
+    assert_lock_inode_tracked(&store, inode, false).await;
+    assert_eq!(live.get_flock(inode, 3).await.unwrap(), FileLockType::Read);
+    assert_lock_inode_tracked(&live, inode, true).await;
+}
+
+#[serial]
+#[tokio::test]
+#[ignore = "requires Redis server"]
+async fn test_lock_inventory_posix_unlock_preserves_flock_tracking() {
+    check_lock_inventory_mixed_unlock(true).await;
+}
+
+#[serial]
+#[tokio::test]
+#[ignore = "requires Redis server"]
+async fn test_lock_inventory_flock_unlock_preserves_posix_tracking() {
+    check_lock_inventory_mixed_unlock(false).await;
+}
+
 /// Simulate the t_mtab lock pattern: N concurrent tasks each doing
 /// `iterations` lock-acquire-release cycles on the same file.
 async fn run_concurrent_lock_tasks(
