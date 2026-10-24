@@ -309,20 +309,22 @@ impl MountOps for SystemMountOps {
                     if matches!(
                         error.raw_os_error(),
                         Some(libc::EINVAL | libc::ENOSYS | libc::EPERM)
-                    ) => {}
+                    ) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            format!("pidfd signaling is unavailable for BrewFS PID {pid}: {error}"),
+                        ));
+                    }
                 Err(error) => return Err(error),
             }
         }
 
-        // Kernels without pidfd support retain the start-time fallback. The
-        // final read is immediately before the legacy numeric signal; this
-        // is the only unavoidable check/kill window on such kernels. Linux
-        // deployments use the pidfd path above, which has no PID-reuse window.
-        if self.process_start_time(pid)? != Some(start_time) {
-            return Ok(());
-        }
-        run_command(Command::new("kill").arg("-TERM").arg(pid.to_string()))?;
-        self.wait_for_exit(pid, start_time)
+        // There is no safe numeric-PID fallback on platforms without pidfd;
+        // preserve the state and let a later retry handle cleanup.
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("pidfd signaling is unavailable for BrewFS PID {pid}"),
+        ))
     }
 
     fn start_brewfs(&self, spec: &MountSpec, target: &Path) -> io::Result<u32> {
