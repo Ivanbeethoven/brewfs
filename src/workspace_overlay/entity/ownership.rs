@@ -480,6 +480,24 @@ pub fn plan_chunk_memberships_from_rows(
         chunk_membership_keys(keys, ino, *index, old, new)?;
         let old_slices = old.upper_slices()?;
         let new_slices = new.upper_slices()?;
+        // Include removed spans so replacement cannot hide an invalid range.
+        // Summarize once, rather than rescanning both maps for every slice.
+        let mut referenced_ends = BTreeMap::<u64, u64>::new();
+        for span in old.spans.iter().chain(&new.spans) {
+            #[cfg(test)]
+            tests::RANGE_VALIDATION_SPAN_VISITS.with(|visits| visits.set(visits.get() + 1));
+            if let super::model::ChunkSource::Data {
+                slice_id,
+                slice_offset,
+            } = span.source
+            {
+                let end = slice_offset
+                    .checked_add(span.length)
+                    .ok_or(EntityError::Overflow)?;
+                let max_end = referenced_ends.entry(slice_id).or_default();
+                *max_end = (*max_end).max(end);
+            }
+        }
         for id in old_slices.union(&new_slices).copied() {
             let slice_key = keys.slice(id);
             if let std::collections::btree_map::Entry::Vacant(entry) = slices.entry(id) {
@@ -550,22 +568,10 @@ pub fn plan_chunk_memberships_from_rows(
                 None => {}
             }
             checks.insert(owner_key.clone(), owner);
-            // Validate removed spans too: replacing corrupt bytes cannot hide an
-            // invalid object range from recovery or normal publication.
-            for span in old.spans.iter().chain(&new.spans) {
-                if let super::model::ChunkSource::Data {
-                    slice_id,
-                    slice_offset,
-                } = span.source
-                    && slice_id == id
-                    && slice_offset
-                        .checked_add(span.length)
-                        .is_none_or(|end| end > delta.row.size)
-                {
-                    return Err(EntityError::Corrupt(
-                        "chunk extends beyond immutable slice".into(),
-                    ));
-                }
+            if referenced_ends[&id] > delta.row.size {
+                return Err(EntityError::Corrupt(
+                    "chunk extends beyond immutable slice".into(),
+                ));
             }
             delta.old_memberships += u64::from(was_present);
             if was_present == is_present {

@@ -2,9 +2,15 @@ use super::*;
 use crate::workspace_overlay::entity::{
     backend::{CommitOutcome, MemoryEntityBackend},
     codec::encode,
-    model::{ChunkSource, EntityInode, EntityKind, LowerBinding, UpperInode},
+    model::{ChunkSource, ChunkSpan, EntityInode, EntityKind, LowerBinding, UpperInode},
     recovery::Recovery,
 };
+
+thread_local! {
+    pub(super) static RANGE_VALIDATION_SPAN_VISITS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
 
 struct Fixture {
     volume_id: Uuid,
@@ -138,6 +144,128 @@ fn map(id: u64) -> ChunkMap {
             },
         )
         .unwrap()
+}
+
+#[test]
+fn fragmented_membership_range_validation_visits_each_span_once() {
+    let keys = EntityKeys::new(Uuid::new_v4(), Uuid::new_v4());
+    let data = ChunkMap::new(
+        1024 * 4096,
+        (0..1024)
+            .map(|index| ChunkSpan {
+                offset: index * 4096,
+                length: 4096,
+                source: ChunkSource::Data {
+                    slice_id: index + 1,
+                    slice_offset: 0,
+                },
+            })
+            .collect(),
+    )
+    .unwrap();
+    assert_eq!(data.spans.len(), 1024);
+    let mut rows = BTreeMap::new();
+    for id in 1..=1024 {
+        let row = SliceOwnership {
+            namespace_id: keys.namespace_id(),
+            slice_id: id,
+            size: 4096,
+            state: SliceState::Available,
+            current_refs: 1,
+            staging_hold: false,
+            retirement_hold: false,
+            publication_refs: 0,
+        };
+        let membership = SliceMembership {
+            namespace_id: keys.namespace_id(),
+            slice_id: id,
+            ino: 3,
+            chunk_index: 0,
+        };
+        rows.insert(keys.slice(id), Some(encode(&row).unwrap()));
+        rows.insert(keys.owner(id, 3, 0), Some(encode(&membership).unwrap()));
+    }
+    let expected_checks: Vec<_> = rows
+        .iter()
+        .map(|(key, expected)| RowCheck {
+            key: key.clone(),
+            expected: expected.clone(),
+        })
+        .collect();
+    let removed = data.replace(0, 4096, ChunkSource::Hole).unwrap();
+    // Reads validate an unchanged full map; writes validate a replacement.
+    for new in [&data, &removed] {
+        RANGE_VALIDATION_SPAN_VISITS.with(|visits| visits.set(0));
+        let plan = plan_chunk_membership_from_rows(&keys, 3, 0, &data, new, &rows, None).unwrap();
+        assert_eq!(
+            RANGE_VALIDATION_SPAN_VISITS.with(|visits| visits.get()),
+            data.spans.len() + new.spans.len(),
+            "range validation must not rescan both maps for every slice"
+        );
+        assert_eq!(plan.checks, expected_checks);
+        if new == &data {
+            assert!(plan.writes.is_empty());
+        } else {
+            let mut retired: SliceOwnership =
+                decode(rows[&keys.slice(1)].as_deref().unwrap()).unwrap();
+            retired.current_refs = 0;
+            retired.retirement_hold = true;
+            assert_eq!(
+                plan.writes,
+                vec![
+                    RowWrite::Delete {
+                        key: keys.owner(1, 3, 0),
+                    },
+                    put(keys.slice(1), &retired).unwrap(),
+                ]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn membership_ranges_validate_removed_unchanged_and_new_fragments() {
+    let fixture = Fixture::new().await;
+    let id = fixture.seed_available_slice().await;
+    let holes = ChunkMap::holes(16).unwrap();
+    // The first fragment has the largest source end, exactly at the size bound.
+    let data = map(id)
+        .replace(
+            0,
+            2,
+            ChunkSource::Data {
+                slice_id: id,
+                slice_offset: 14,
+            },
+        )
+        .unwrap();
+    fixture.publish(3, 0, &holes, &data).await;
+    fixture.replacement(3, 0, &data, &data).await;
+    for (slice_offset, expected) in [
+        (
+            15,
+            EntityError::Corrupt("chunk extends beyond immutable slice".into()),
+        ),
+        (u64::MAX, EntityError::Overflow),
+    ] {
+        let mut invalid = data.clone();
+        invalid.spans[0].source = ChunkSource::Data {
+            slice_id: id,
+            slice_offset,
+        };
+        for (old, new) in [
+            (&invalid, &invalid),
+            (&invalid, &holes),
+            (&invalid, &data),
+            (&data, &invalid),
+        ] {
+            assert_eq!(
+                plan_chunk_membership(fixture.backend.as_ref(), &fixture.keys, 3, 0, old, new)
+                    .await,
+                Err(expected.clone())
+            );
+        }
+    }
 }
 
 #[tokio::test]
