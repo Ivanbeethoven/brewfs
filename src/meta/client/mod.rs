@@ -830,9 +830,24 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         }
     }
 
-    async fn remember_trash_entry(&self, ino: i64, original_path: String) {
+    async fn remember_trash_entry(
+        &self,
+        ino: i64,
+        original_path: String,
+    ) -> Result<bool, MetaError> {
         if !self.store.capabilities().xattr {
-            return;
+            return Ok(false);
+        }
+
+        // Do not replace an existing record: retries after a crash must be
+        // idempotent and preserve the original restore path.
+        if self
+            .store
+            .get_xattr(ino, CONTROL_TRASH_XATTR_NAME)
+            .await?
+            .is_some()
+        {
+            return Ok(false);
         }
 
         let metadata = ControlTrashMetadata {
@@ -843,16 +858,15 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
             Ok(raw) => raw,
             Err(err) => {
                 warn!(inode = ino, error = %err, "failed to encode trash metadata");
-                return;
+                return Err(MetaError::Internal(format!(
+                    "failed to encode trash metadata: {err}"
+                )));
             }
         };
-        if let Err(err) = self
-            .store
+        self.store
             .set_xattr(ino, CONTROL_TRASH_XATTR_NAME, &raw, 0)
-            .await
-        {
-            warn!(inode = ino, error = ?err, "failed to persist trash metadata");
-        }
+            .await?;
+        Ok(true)
     }
 
     fn normalize_control_path(path: &str) -> Result<String, MetaError> {
@@ -1741,7 +1755,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
 
         Self::validate_entry_name(&new_name)?;
 
-        let (_src_ino, _src_attr) = match known_src {
+        let (src_hint, _src_attr) = match known_src {
             Some((ino, attr)) => (self.check_root(ino), Some(attr)),
             None => {
                 let src_ino = self.cached_lookup_required(old_parent, old_name).await?;
@@ -1769,17 +1783,47 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
             None
         };
 
+        // Prepare the displaced inode's restore record before the namespace
+        // mutation.  This closes the crash window where rename could commit
+        // and a subsequent xattr write could be lost.  The write is
+        // idempotent, and is removed again if the backend rejects the rename.
+        let mut prepared_trash = None;
+        if let Some(original_path) = destination_path.as_ref() {
+            if let Some(dest) = self.store.lookup(new_parent, &new_name).await? {
+                if dest != src_hint {
+                    if let Ok(Some(attr)) = self.store.stat(dest).await {
+                        if attr.nlink == 1 {
+                            prepared_trash = Some((
+                                dest,
+                                self.remember_trash_entry(dest, original_path.clone())
+                                    .await?,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // Only the backend transaction/script can decide whether the current
         // destination is the source inode or a different inode. Destination
         // hints may be stale across clients and must never control the rename.
         let outcome = if noreplace {
             self.store
                 .rename_with_mode(old_parent, old_name, new_parent, new_name.clone(), true)
-                .await?
+                .await
         } else {
             self.store
                 .rename_with_outcome(old_parent, old_name, new_parent, new_name.clone())
-                .await?
+                .await
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                if let Some((ino, true)) = prepared_trash {
+                    let _ = self.store.remove_xattr(ino, CONTROL_TRASH_XATTR_NAME).await;
+                }
+                return Err(err);
+            }
         };
         let src_ino = outcome.ino;
         if !outcome.renamed {
@@ -1806,18 +1850,14 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         }
 
         let dest_ino = outcome.replaced_ino;
-        if let (Some(dest), Some(original_path)) = (dest_ino, destination_path) {
-            // Use the authoritative replacement inode and fresh link count:
-            // destination hints and cached attributes can belong to another
-            // namespace state. Remaining hard links must keep their metadata.
-            match self.store.stat(dest).await {
-                Ok(Some(attr)) if attr.nlink == 0 => {
-                    self.remember_trash_entry(dest, original_path).await;
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!(inode = dest, error = ?err, "failed to inspect replaced inode for trash");
-                }
+        // The trash record was prepared before rename.  Keep an existing
+        // record untouched so retries after a crash cannot duplicate it.
+        if let Some((prepared_ino, true)) = prepared_trash {
+            if dest_ino != Some(prepared_ino) {
+                let _ = self
+                    .store
+                    .remove_xattr(prepared_ino, CONTROL_TRASH_XATTR_NAME)
+                    .await;
             }
         }
         self.invalidate_open_file_cache_inode(src_ino).await;
@@ -2620,7 +2660,9 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         let original_path = self.child_original_path_for_trash(parent, name).await;
         self.store.unlink(parent, name).await?;
         if let Some(ino) = target_ino {
-            self.remember_trash_entry(ino, original_path).await;
+            if let Err(err) = self.remember_trash_entry(ino, original_path).await {
+                warn!(inode = ino, error = ?err, "failed to persist trash metadata");
+            }
         }
 
         debug!("MetaClient: unlink completed, updating cache");
@@ -4788,7 +4830,7 @@ mod tests {
             let dst = client.create_file(1, "dst".to_string()).await.unwrap();
             client.link(dst, 1, "remaining").await.unwrap();
             if existing_metadata {
-                client
+                let _ = client
                     .remember_trash_entry(dst, "/previous".to_string())
                     .await;
             }
@@ -4811,6 +4853,42 @@ mod tests {
             );
             assert!(client.store.get_deleted_files().await.unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn test_control_plane_rename_trash_metadata_is_recoverable_after_commit() {
+        let client = create_test_client().await;
+        let source = client.create_file(1, "source".to_string()).await.unwrap();
+        let displaced = client
+            .create_file(1, "destination".to_string())
+            .await
+            .unwrap();
+
+        client
+            .rename(1, "source", 1, "destination".to_string())
+            .await
+            .unwrap();
+
+        // The record must already exist on the displaced inode when the
+        // namespace commit returns, so a crash immediately afterwards still
+        // leaves a restorable trash entry.
+        let metadata = client
+            .load_trash_metadata(displaced)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.original_path, "/destination");
+        assert_eq!(client.lookup(1, "destination").await.unwrap(), Some(source));
+
+        client
+            .store
+            .restore_deleted_file(displaced, 1, "destination-restored".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            client.lookup(1, "destination-restored").await.unwrap(),
+            Some(displaced)
+        );
     }
 
     #[tokio::test]
