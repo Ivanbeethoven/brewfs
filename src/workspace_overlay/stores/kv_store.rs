@@ -4557,6 +4557,29 @@ where
             .await
     }
 
+    async fn reserve_gc_slice_deletions(
+        &self,
+        slices: &[(u64, u64)],
+        deleted_layers: &[LayerId],
+    ) -> Result<(), WorkspaceError> {
+        self.reserve_native_slice_deletions(slices, deleted_layers)
+            .await
+    }
+
+    async fn gc_slice_deletion_reservation_complete(
+        &self,
+        slice_id: u64,
+        retained_slice_end: u64,
+        deleted_layers: &[LayerId],
+    ) -> Result<bool, WorkspaceError> {
+        self.native_slice_deletion_reservation_complete(
+            slice_id,
+            retained_slice_end,
+            deleted_layers,
+        )
+        .await
+    }
+
     async fn finalize_layer_metadata_deletion(
         &self,
         layer_ids: Vec<LayerId>,

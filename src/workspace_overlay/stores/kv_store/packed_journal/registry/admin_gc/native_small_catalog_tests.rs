@@ -3,6 +3,7 @@
 use super::super::tests::Objects;
 use super::*;
 use crate::workspace_overlay::catalog::{CreateVolumeRoot, RecordOrphanSlice, WorkspaceStore};
+use crate::workspace_overlay::model::DataExtentDelta;
 use crate::workspace_overlay::stores::kv_store::packed_journal::tests::JournalMemoryBackend;
 use tokio::sync::Mutex;
 
@@ -10,6 +11,7 @@ struct CappedCatalog {
     inner: Arc<JournalMemoryBackend>,
     reads: Mutex<Vec<(Vec<Vec<u8>>, KvReadLimits)>>,
     writes: AtomicUsize,
+    read_rows: AtomicUsize,
 }
 
 fn decoder_bytes(limits: KvReadLimits) -> Result<usize, WorkspaceError> {
@@ -54,9 +56,12 @@ impl WorkspaceKvBackend for CappedCatalog {
     ) -> Result<(Vec<Option<Vec<u8>>>, i64), WorkspaceError> {
         decoder_bytes(limits)?;
         self.reads.lock().await.push((keys.to_vec(), limits));
-        self.inner
+        let result = self
+            .inner
             .get_many_consistent_with_time_bounded(keys, limits)
-            .await
+            .await?;
+        self.read_rows.fetch_add(keys.len(), Ordering::SeqCst);
+        Ok(result)
     }
     async fn scan_prefix_with_byte_limits(
         &self,
@@ -64,9 +69,12 @@ impl WorkspaceKvBackend for CappedCatalog {
         mut limits: KvReadLimits,
     ) -> Result<Vec<KvEntry>, WorkspaceError> {
         limits.max_response_bytes = decoder_bytes(limits)?;
-        self.inner
+        let rows = self
+            .inner
             .scan_prefix_with_byte_limits(prefix, limits)
-            .await
+            .await?;
+        self.read_rows.fetch_add(rows.len(), Ordering::SeqCst);
+        Ok(rows)
     }
     async fn scan_prefix_page_with_byte_limits(
         &self,
@@ -75,9 +83,12 @@ impl WorkspaceKvBackend for CappedCatalog {
         mut limits: KvReadLimits,
     ) -> Result<Vec<KvEntry>, WorkspaceError> {
         limits.max_response_bytes = decoder_bytes(limits)?;
-        self.inner
+        let rows = self
+            .inner
             .scan_prefix_page_with_byte_limits(prefix, after, limits)
-            .await
+            .await?;
+        self.read_rows.fetch_add(rows.len(), Ordering::SeqCst);
+        Ok(rows)
     }
     async fn compare_and_swap(
         &self,
@@ -170,11 +181,30 @@ async fn catalog() -> (
         inner,
         reads: Mutex::new(Vec::new()),
         writes: AtomicUsize::new(0),
+        read_rows: AtomicUsize::new(0),
     });
     let store = Arc::new(
         KvWorkspaceStore::from_arc(backend.clone())
             .with_packed_reader_pin_budget(V3MountBudget::defaults()),
     );
+    (backend, store, target)
+}
+
+async fn many_sid_catalog() -> (
+    Arc<CappedCatalog>,
+    Arc<KvWorkspaceStore<CappedCatalog>>,
+    LayerId,
+) {
+    let (backend, store, target) = catalog().await;
+    let mut rows = backend.inner.rows.lock().await;
+    for index in 1..128u64 {
+        let extent = DataExtentDelta::data(target, index as i64 + 1, 0, 0, 1, 10_000 + index, 0, 1);
+        rows.insert(
+            crate::workspace_overlay::stores::kv_store::extent_key(&extent),
+            encode(&extent).unwrap(),
+        );
+    }
+    drop(rows);
     (backend, store, target)
 }
 
@@ -224,6 +254,44 @@ async fn small_catalog_native_collection_uses_supported_decoders_and_removes_onl
             .all(|(_, limits)| limits.max_value_bytes <= 96 << 10
                 && limits.max_response_bytes <= 128 << 10)
     );
+}
+
+#[tokio::test]
+async fn native_collection_eventually_removes_layer_with_many_sids_across_bounded_ticks() {
+    let (backend, store, target) = many_sid_catalog().await;
+    let objects = Objects::default();
+    let mut completed = false;
+    for _ in 0..16 {
+        backend.read_rows.store(0, Ordering::SeqCst);
+        let result = collect_one(
+            store.clone(),
+            ObjectClient::new(objects.clone()),
+            V3MountBudget::defaults(),
+            ChunkLayout {
+                chunk_size: 4 << 20,
+                block_size: 1 << 20,
+            },
+            policy(),
+            CancellationToken::new(),
+            target,
+        )
+        .await;
+        assert!(
+            backend.read_rows.load(Ordering::SeqCst) <= MAX_ROWS + 64,
+            "one collector tick exceeded its bounded metadata-row budget"
+        );
+        if result.is_ok() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(
+        completed,
+        "bounded retries must eventually finish native GC"
+    );
+    assert_eq!(objects.deletes.load(Ordering::SeqCst), 256);
+    let rows = backend.inner.rows.lock().await;
+    assert!(!rows.contains_key(&hot_layer_key(target)));
 }
 
 #[tokio::test]

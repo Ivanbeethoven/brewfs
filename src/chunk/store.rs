@@ -106,6 +106,17 @@ pub trait BlockStore {
         anyhow::bail!("block store has no durable targeted-GC range ledger")
     }
 
+    /// Return whether a previously dispatched targeted-GC range is completely
+    /// durable. Implementations use this as a progress hint only after the
+    /// caller has rebuilt the current orphan set and retained range bound.
+    async fn gc_slice_deletion_complete(
+        &self,
+        _slice_id: u64,
+        _block_count: u64,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Proactively insert a block into the read cache after upload.
     /// Default is a no-op; ObjectBlockStore overrides to populate ChunksCache.
     #[allow(dead_code)]

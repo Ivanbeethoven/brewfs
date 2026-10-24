@@ -576,6 +576,28 @@ impl<B: WorkspaceKvBackend, O: ObjectBackend + Clone + 'static> BlockStore for G
         }
         Ok(end)
     }
+    async fn gc_slice_deletion_complete(
+        &self,
+        slice: u64,
+        block_count: u64,
+    ) -> anyhow::Result<bool> {
+        if slice == 0 || block_count == 0 || self.cancel.is_cancelled() {
+            return Ok(block_count == 0);
+        }
+        let progress_key = range_progress_key((slice, 0), block_count);
+        let raw = self.store.backend.get(&progress_key).await?;
+        let Some(raw) = raw else {
+            return Ok(false);
+        };
+        let progress: RangeProgress = decode_open_value(&raw, 512)?;
+        if progress.slice != slice || progress.first != 0 || progress.count != block_count {
+            anyhow::bail!("native GC range progress identity mismatch");
+        }
+        if progress.next > block_count {
+            anyhow::bail!("native GC range progress exceeds range");
+        }
+        Ok(progress.next == block_count)
+    }
     async fn delete_range(&self, key: BlockKey, count: u64) -> anyhow::Result<()> {
         if count == 0 {
             return Ok(());

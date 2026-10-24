@@ -35,6 +35,7 @@ fn extent_layer_of_key(key: &[u8]) -> Result<LayerId, WorkspaceError> {
 const EXTENT_PREFIX: &[u8] = b"delta/extent/";
 const DELETE_PREFIX: &str = "packed/v3/native-slice-delete/";
 const MAX_TARGETS: usize = 120;
+const MAX_BATCH_SLICES: usize = 16;
 const MAX_SCAN_ROWS: usize = 4096;
 const MAX_SCAN_BYTES: usize = 32 << 20;
 const MAX_RESERVATION_BYTES: usize = 48 << 10;
@@ -308,25 +309,53 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
         end: u64,
         deleted_layers: &[LayerId],
     ) -> Result<(), WorkspaceError> {
+        self.reserve_native_slice_deletions(&[(slice, end)], deleted_layers)
+            .await
+    }
+
+    /// Reserve a bounded SID batch with one complete extent census. Each
+    /// reservation retains the same root, inventory, and per-layer generation
+    /// checks in the final CAS; batching only avoids repeating those reads.
+    pub(super) async fn reserve_native_slice_deletions(
+        &self,
+        slices: &[(u64, u64)],
+        deleted_layers: &[LayerId],
+    ) -> Result<(), WorkspaceError> {
+        if slices.is_empty() {
+            return Ok(());
+        }
+        let mut seen = BTreeSet::new();
+        if slices.iter().any(|(slice, _)| !seen.insert(*slice)) {
+            return Err(WorkspaceError::Busy);
+        }
+        for batch in slices.chunks(MAX_BATCH_SLICES) {
+            self.reserve_native_slice_deletions_batch(batch, deleted_layers)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn native_slice_deletion_reservation_complete(
+        &self,
+        slice: u64,
+        end: u64,
+        deleted_layers: &[LayerId],
+    ) -> Result<bool, WorkspaceError> {
         self.require_admin_access()?;
         if slice == 0 || end == 0 || deleted_layers.is_empty() || deleted_layers.len() > MAX_TARGETS
         {
-            return Err(WorkspaceError::Busy);
+            return Ok(false);
         }
-        let _owner = self
-            .native_auxiliary_budget()
-            .admit(&[(V3BudgetPool::Metadata, 32 << 20)])
-            .map_err(|error| WorkspaceError::InvalidReadPlan(error.to_string()))?;
-        let targets = deleted_layers.iter().copied().collect::<BTreeSet<_>>();
-        if targets.len() != deleted_layers.len() {
-            return Err(WorkspaceError::Busy);
+        let mut targets = BTreeSet::new();
+        for &layer in deleted_layers {
+            if !targets.insert(layer) {
+                return Ok(false);
+            }
         }
-        let sid_key = slice_deletion_key(slice);
         let keys = vec![
             VOLUME_HEADER_KEY.to_vec(),
             LAYER_INVENTORY_GENERATION_KEY.to_vec(),
-            EXTENT_GENERATION_KEY.to_vec(),
-            sid_key.clone(),
+            slice_deletion_key(slice),
         ];
         let values = self.slice_fence_points(&keys).await?;
         let header_raw = values[0].as_ref().ok_or(WorkspaceError::Fenced)?;
@@ -338,16 +367,118 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
             return Err(WorkspaceError::Fenced);
         }
         layer_inventory_generation(&values[1])?;
-        extent_generation(&values[2])?;
-        let old = values[3]
-            .as_deref()
-            .map(|raw| decode_open_value::<SliceDeletionReservation>(raw, MAX_RESERVATION_BYTES))
-            .transpose()?;
-        if let Some(old) = &old {
-            if encode(old)?.as_slice() != values[3].as_deref().unwrap() {
-                return Err(error("noncanonical native slice deletion reservation"));
+        let Some(raw) = values[2].as_deref() else {
+            return Ok(false);
+        };
+        let old: SliceDeletionReservation = decode_open_value(raw, MAX_RESERVATION_BYTES)?;
+        if encode(&old)?.as_slice() != raw {
+            return Err(error("noncanonical native slice deletion reservation"));
+        }
+        if old.slice != slice
+            || old.end < end
+            || old.end == 0
+            || old.run.is_nil()
+            || old.volume != header.volume_id
+            || old.header != *header_raw
+            || old.inventory.as_ref() != values[1].as_ref()
+            || old.targets.len() != targets.len()
+        {
+            return Ok(false);
+        }
+        let target_ids = targets.iter().copied().collect::<Vec<_>>();
+        let mut target_rows = Vec::with_capacity(target_ids.len());
+        for ids in target_ids.chunks(16) {
+            let keys = ids
+                .iter()
+                .copied()
+                .flat_map(|id| [hot_layer_key(id), native_reverse::state_key(id)])
+                .collect::<Vec<_>>();
+            let rows = self.slice_fence_points(&keys).await?;
+            for (index, id) in ids.iter().enumerate() {
+                let Some(raw) = rows[index * 2].as_ref() else {
+                    return Ok(false);
+                };
+                let Some(reverse) = rows[index * 2 + 1].as_ref() else {
+                    return Ok(false);
+                };
+                let layer: LayerRecord = decode_open_value(raw, OPEN_RECORD_MAX_BYTES)?;
+                if layer.layer_id != *id
+                    || layer.state != LayerState::Deleting
+                    || layer.schema_version != WORKSPACE_SCHEMA_VERSION
+                    || layer.next_sequence == 0
+                    || encode(&layer)? != *raw
+                {
+                    return Ok(false);
+                }
+                native_reverse::gc_incarnation(reverse, *id)?;
+                target_rows.push((*id, raw.clone(), reverse.clone()));
             }
-            layer_inventory_generation(&old.inventory)?;
+        }
+        Ok(old.targets == target_rows)
+    }
+
+    async fn reserve_native_slice_deletions_batch(
+        &self,
+        slices: &[(u64, u64)],
+        deleted_layers: &[LayerId],
+    ) -> Result<(), WorkspaceError> {
+        self.require_admin_access()?;
+        if slices.is_empty()
+            || slices.len() > MAX_BATCH_SLICES
+            || slices.iter().any(|(slice, end)| *slice == 0 || *end == 0)
+            || deleted_layers.is_empty()
+            || deleted_layers.len() > MAX_TARGETS
+        {
+            return Err(WorkspaceError::Busy);
+        }
+        let mut requested = BTreeMap::new();
+        for &(slice, end) in slices {
+            if requested.insert(slice, end).is_some() {
+                return Err(WorkspaceError::Busy);
+            }
+        }
+        let _owner = self
+            .native_auxiliary_budget()
+            .admit(&[(V3BudgetPool::Metadata, 32 << 20)])
+            .map_err(|error| WorkspaceError::InvalidReadPlan(error.to_string()))?;
+        let targets = deleted_layers.iter().copied().collect::<BTreeSet<_>>();
+        if targets.len() != deleted_layers.len() {
+            return Err(WorkspaceError::Busy);
+        }
+        let mut keys = vec![
+            VOLUME_HEADER_KEY.to_vec(),
+            LAYER_INVENTORY_GENERATION_KEY.to_vec(),
+            EXTENT_GENERATION_KEY.to_vec(),
+        ];
+        keys.extend(requested.keys().copied().map(slice_deletion_key));
+        let values = self.slice_fence_points(&keys).await?;
+        let header_raw = values[0].as_ref().ok_or(WorkspaceError::Fenced)?;
+        let header: VolumeHeader = decode_open_value(header_raw, OPEN_RECORD_MAX_BYTES)?;
+        if header.volume_id.is_nil()
+            || header.volume_format != VOLUME_FORMAT
+            || header.schema_version != WORKSPACE_SCHEMA_VERSION
+        {
+            return Err(WorkspaceError::Fenced);
+        }
+        layer_inventory_generation(&values[1])?;
+        extent_generation(&values[2])?;
+        let old = values[3..]
+            .iter()
+            .map(|raw| {
+                raw.as_deref()
+                    .map(|raw| {
+                        decode_open_value::<SliceDeletionReservation>(raw, MAX_RESERVATION_BYTES)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (raw, old) in values[3..].iter().zip(&old) {
+            if let Some(old) = old {
+                if encode(old)?.as_slice() != raw.as_deref().unwrap() {
+                    return Err(error("noncanonical native slice deletion reservation"));
+                }
+                layer_inventory_generation(&old.inventory)?;
+            }
         }
         let mut target_rows = Vec::with_capacity(targets.len());
         let mut checks = keys
@@ -391,15 +522,17 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                 }
             }
         }
-        if let Some(old) = &old
-            && (old.slice != slice
-                || old.end == 0
-                || old.run.is_nil()
-                || old.volume != header.volume_id
-                || old.header != *header_raw
-                || old.targets != target_rows)
-        {
-            return Err(WorkspaceError::Busy);
+        for ((slice, _), old) in requested.iter().zip(&old) {
+            if let Some(old) = old
+                && (old.slice != *slice
+                    || old.end == 0
+                    || old.run.is_nil()
+                    || old.volume != header.volume_id
+                    || old.header != *header_raw
+                    || old.targets != target_rows)
+            {
+                return Err(WorkspaceError::Busy);
+            }
         }
         // Retain the current root/topology authority in this exact reservation
         // CAS. Companion anti-birth checks forbid roots reconnecting Deleting
@@ -447,9 +580,10 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
         for (key, expected) in hot {
             merge(&mut checks, KvCheck { key, expected })?;
         }
-        // Scan the complete extent family. Never ignore an unselected layer,
-        // even if it currently appears unreachable. The durable epoch closes
-        // phantom insertion, overwrites and deletes between any pages and CAS.
+        // Scan the complete extent family once for the whole bounded batch.
+        // Never ignore an unselected layer, even if it currently appears
+        // unreachable. The durable epoch closes phantom insertion, overwrites
+        // and deletes between any pages and CAS.
         let mut after = None;
         let mut rows = 0usize;
         let mut bytes = 0usize;
@@ -503,15 +637,19 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                     slice_id,
                     slice_offset,
                 } = row.kind
-                    && slice_id == slice
+                    && let Some(end) = requested.get(&slice_id)
                 {
                     if !targets.contains(&row.layer_id) {
                         return Err(WorkspaceError::Busy);
                     }
+                    let index = requested
+                        .keys()
+                        .position(|candidate| *candidate == slice_id)
+                        .ok_or(WorkspaceError::Busy)?;
                     if slice_offset
                         .checked_add(row.length)
                         .ok_or(WorkspaceError::Busy)?
-                        > end.max(old.as_ref().map_or(0, |row| row.end))
+                        > (*end).max(old[index].as_ref().map_or(0, |row| row.end))
                     {
                         return Err(WorkspaceError::Busy);
                     }
@@ -519,29 +657,30 @@ impl<B: WorkspaceKvBackend> KvWorkspaceStore<B> {
                 after = Some(entry.key.clone());
             }
         }
-        let reservation = SliceDeletionReservation {
-            slice,
-            end: end.max(old.as_ref().map_or(0, |row| row.end)),
-            run: old.as_ref().map_or_else(Uuid::new_v4, |row| row.run),
-            volume: header.volume_id,
-            header: header_raw.clone(),
-            inventory: old
-                .as_ref()
-                .map_or_else(|| values[1].clone(), |row| row.inventory.clone()),
-            targets: target_rows,
-        };
-        let value = encode(&reservation)?;
-        if value.len() > MAX_RESERVATION_BYTES {
-            return Err(WorkspaceError::Busy);
+        let mut writes = Vec::new();
+        for ((&slice, &end), old) in requested.iter().zip(&old) {
+            let reservation = SliceDeletionReservation {
+                slice,
+                end: end.max(old.as_ref().map_or(0, |row| row.end)),
+                run: old.as_ref().map_or_else(Uuid::new_v4, |row| row.run),
+                volume: header.volume_id,
+                header: header_raw.clone(),
+                inventory: old
+                    .as_ref()
+                    .map_or_else(|| values[1].clone(), |row| row.inventory.clone()),
+                targets: target_rows.clone(),
+            };
+            let value = encode(&reservation)?;
+            if value.len() > MAX_RESERVATION_BYTES {
+                return Err(WorkspaceError::Busy);
+            }
+            if old.as_ref() != Some(&reservation) {
+                writes.push(KvWrite::Put {
+                    key: slice_deletion_key(slice),
+                    value,
+                });
+            }
         }
-        let writes = if old.as_ref() == Some(&reservation) {
-            Vec::new()
-        } else {
-            vec![KvWrite::Put {
-                key: sid_key,
-                value,
-            }]
-        };
         if checks
             .len()
             .checked_add(writes.len())

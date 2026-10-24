@@ -872,6 +872,30 @@ pub trait WorkspaceStore: Send + Sync {
             "durable GC slice deletion reservation",
         ))
     }
+    /// Reserve a bounded batch of SIDs using one catalog proof where the
+    /// backend supports it. The default preserves compatibility for stores
+    /// that only provide the single-SID operation.
+    async fn reserve_gc_slice_deletions(
+        &self,
+        slices: &[(u64, u64)],
+        deleted_layers: &[LayerId],
+    ) -> Result<(), WorkspaceError> {
+        for &(slice_id, retained_slice_end) in slices {
+            self.reserve_gc_slice_deletion(slice_id, retained_slice_end, deleted_layers)
+                .await?;
+        }
+        Ok(())
+    }
+    /// Authenticate a persisted reservation before a block store uses its
+    /// durable completion marker to skip another extent census.
+    async fn gc_slice_deletion_reservation_complete(
+        &self,
+        _slice_id: u64,
+        _retained_slice_end: u64,
+        _deleted_layers: &[LayerId],
+    ) -> Result<bool, WorkspaceError> {
+        Ok(false)
+    }
     /// Limit one collector tick when metadata finalization uses a bounded
     /// target proof. The remaining candidates stay protected until a later
     /// tick; this keeps a slice reservation's target identities complete.
