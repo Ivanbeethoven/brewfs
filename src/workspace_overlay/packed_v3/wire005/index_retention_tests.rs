@@ -185,6 +185,53 @@ async fn existing_reader_cache_owner_sum_stays_bounded_before_maintenance() {
 }
 
 #[tokio::test]
+async fn capacity_pressure_preserves_hot_pages() {
+    let backend = CountingBackend::default();
+    backend.open();
+    let mut references = Vec::new();
+    let mut charge = 0;
+    for value in 1..=3 {
+        let (reference, bytes) = object(&backend, &format!("hot-retention-{value}"), value).await;
+        assert!(charge == 0 || charge == bytes);
+        charge = bytes;
+        references.push(reference);
+    }
+    let cap = charge * 2;
+    let reader = V3IndexReader::new(ObjectClient::new(backend.clone()), cap);
+    for reference in &references[..2] {
+        reader.lookup(reference, &[1]).await.unwrap();
+    }
+    reader.pages.run_pending_tasks().await;
+    assert_eq!(visible_page_owner_charge(&reader, &references).await, cap);
+    for _ in 0..8 {
+        reader.lookup(&references[0], &[1]).await.unwrap();
+    }
+    reader.pages.run_pending_tasks().await;
+    assert_eq!(backend.range_calls.load(Ordering::SeqCst), 2);
+
+    let cold = reader.lookup(&references[2], &[1]).await.unwrap().unwrap();
+    assert_eq!(cold.as_ref(), &[3; 8192]);
+    reader.pages.run_pending_tasks().await;
+    assert!(reader.cache_ownership.owned.load(Ordering::Acquire) <= cap);
+    assert_eq!(backend.range_calls.load(Ordering::SeqCst), 3);
+
+    let hot = reader.lookup(&references[0], &[1]).await.unwrap().unwrap();
+    assert_eq!(hot.as_ref(), &[1; 8192]);
+    assert_eq!(
+        backend.range_calls.load(Ordering::SeqCst),
+        3,
+        "a fitting cold page flushed an unrelated hot page"
+    );
+    // With no retention space, C is returned to its caller but not cached.
+    reader.lookup(&references[2], &[1]).await.unwrap();
+    assert_eq!(backend.range_calls.load(Ordering::SeqCst), 4);
+    reader.lookup(&references[1], &[1]).await.unwrap();
+    assert_eq!(backend.range_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(visible_page_owner_charge(&reader, &references).await, cap);
+    assert_eq!(reader.cache_ownership.peak.load(Ordering::Acquire), cap);
+}
+
+#[tokio::test]
 async fn existing_reader_oversized_fetch_still_shares_inflight_result() {
     let backend = CountingBackend::default();
     let (reference, charge) = object(&backend, "oversized-shared", 11).await;
