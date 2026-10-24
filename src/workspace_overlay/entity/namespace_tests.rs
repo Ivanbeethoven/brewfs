@@ -1170,6 +1170,7 @@ struct PausingBackend {
     lose_reply: AtomicBool,
     mutation_commits: AtomicUsize,
     reads: AtomicUsize,
+    read_batches: Mutex<Vec<Vec<Vec<u8>>>>,
     commits: AtomicUsize,
     create_commits: AtomicUsize,
 }
@@ -1185,6 +1186,7 @@ impl PausingBackend {
             lose_reply: AtomicBool::new(false),
             mutation_commits: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
+            read_batches: Mutex::new(Vec::new()),
             commits: AtomicUsize::new(0),
             create_commits: AtomicUsize::new(0),
         }
@@ -1219,6 +1221,7 @@ impl PausingBackend {
         self.resume.notify_one();
     }
     fn reset_counts(&self) {
+        self.read_batches.lock().unwrap().clear();
         self.reads.store(0, Ordering::SeqCst);
         self.commits.store(0, Ordering::SeqCst);
         self.create_commits.store(0, Ordering::SeqCst);
@@ -1264,9 +1267,23 @@ impl PausingBackend {
 impl EntityBackend for PausingBackend {
     async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        self.read_batches.lock().unwrap().push(keys.to_vec());
         let snapshot = self.inner.read(keys).await?;
         self.after_read(keys).await;
         Ok(snapshot)
+    }
+    async fn read_checked(
+        &self,
+        keys: &[Vec<u8>],
+        checks: &[RowCheck],
+    ) -> Result<(RowSnapshot, bool)> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.read_batches.lock().unwrap().push(keys.to_vec());
+        let result = self.inner.read_checked(keys, checks).await?;
+        let mut observed = keys.to_vec();
+        observed.extend(checks.iter().map(|check| check.key.clone()));
+        self.after_read(&observed).await;
+        Ok(result)
     }
     async fn commit(
         &self,
@@ -1306,6 +1323,46 @@ impl EntityBackend for PausingBackend {
         self.after_read(&[prefix.to_vec()]).await;
         Ok(rows)
     }
+}
+
+#[tokio::test]
+async fn cold_named_open_does_not_refetch_initial_metadata_rows() {
+    let mut lower = MemoryLower::empty();
+    lower.add_file(1, b"file", 2, 10);
+    let backend = Arc::new(PausingBackend::new());
+    let fixture = attach(
+        backend.clone(),
+        Arc::new(lower),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+
+    backend.reset_counts();
+    let handle = fixture.ns.open(1, b"file", 4, &root()).await.unwrap();
+    assert_eq!(handle.ino(), 2);
+    fixture.ns.close(handle).unwrap();
+
+    let batches = backend.read_batches.lock().unwrap();
+    for (index, batch) in batches.iter().enumerate() {
+        eprintln!(
+            "read {}: {:?}",
+            index + 1,
+            batch
+                .iter()
+                .map(|key| {
+                    String::from_utf8_lossy(key.strip_prefix(fixture.keys.prefix()).unwrap_or(key))
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    let parent_reads = batches
+        .iter()
+        .filter(|batch| batch.contains(&fixture.keys.inode(1)))
+        .count();
+    assert_eq!(
+        parent_reads, 1,
+        "cold open must retain its initial parent row"
+    );
 }
 
 #[tokio::test]

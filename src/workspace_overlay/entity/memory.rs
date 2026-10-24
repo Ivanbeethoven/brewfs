@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use super::{
     EntityError, Result,
     backend::{
-        CommitOutcome, CreateAllocation, EntityBackend, EntityPlan, RowSnapshot, RowWrite,
-        SliceAllocation, TransactionAuthority, add_bytes, next_counter, prepare_create,
-        prepare_slices, validate_keys, validate_plan, validate_scan,
+        CommitOutcome, CreateAllocation, EntityBackend, EntityPlan, RowCheck, RowSnapshot,
+        RowWrite, SliceAllocation, TransactionAuthority, add_bytes, next_counter, prepare_create,
+        prepare_slices, validate_checked_read, validate_plan, validate_scan,
     },
 };
 
@@ -97,22 +97,38 @@ impl State {
 #[async_trait]
 impl EntityBackend for MemoryEntityBackend {
     async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
-        validate_keys(keys)?;
+        self.read_checked(keys, &[])
+            .await
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    async fn read_checked(
+        &self,
+        keys: &[Vec<u8>],
+        checks: &[RowCheck],
+    ) -> Result<(RowSnapshot, bool)> {
+        validate_checked_read(keys, checks)?;
         let state = self.state.lock().map_err(poisoned)?;
         if state.now_ns < 0 {
             return Err(EntityError::Corrupt("negative backend time".into()));
         }
         let mut total = 0;
-        for key in keys {
+        for key in keys.iter().chain(checks.iter().map(|check| &check.key)) {
             add_bytes(&mut total, key, state.rows.get(key).map(Vec::as_slice))?;
         }
-        Ok(RowSnapshot {
-            now_ns: state.now_ns,
-            rows: keys
-                .iter()
-                .map(|key| state.rows.get(key).cloned())
-                .collect(),
-        })
+        let matched = checks
+            .iter()
+            .all(|check| state.rows.get(&check.key) == check.expected.as_ref());
+        Ok((
+            RowSnapshot {
+                now_ns: state.now_ns,
+                rows: keys
+                    .iter()
+                    .map(|key| state.rows.get(key).cloned())
+                    .collect(),
+            },
+            matched,
+        ))
     }
 
     async fn commit(

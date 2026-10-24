@@ -9,6 +9,15 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         &self,
         keys: Vec<Vec<u8>>,
     ) -> Result<(TransactionAuthority, Prepared<'_, B, L>)> {
+        let (authority, prepared, _) = self.snapshot_checked(keys, &[]).await?;
+        Ok((authority, prepared))
+    }
+
+    async fn snapshot_checked(
+        &self,
+        keys: Vec<Vec<u8>>,
+        checks: &[RowCheck],
+    ) -> Result<(TransactionAuthority, Prepared<'_, B, L>, bool)> {
         if !self.session.matches_keys(&self.keys)
             || self.session.lower_binding() != self.lower.binding()
         {
@@ -21,7 +30,11 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
                 .filter(|key| !authority_keys.contains(key))
                 .collect::<BTreeSet<_>>(),
         );
-        let mut snapshot = self.backend.read(&read_keys).await?;
+        let (mut snapshot, matched) = if checks.is_empty() {
+            (self.backend.read(&read_keys).await?, true)
+        } else {
+            self.backend.read_checked(&read_keys, checks).await?
+        };
         if snapshot.rows.len() != read_keys.len() {
             return Err(EntityError::Corrupt("short operation snapshot".into()));
         }
@@ -40,7 +53,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
             prepared.add(RowCheck { key, expected })?;
         }
         prepared.read_covered = true;
-        Ok((authority, prepared))
+        Ok((authority, prepared, matched))
     }
 
     /// Hints only nominate rows to fetch. The actual parent walk resolves the
@@ -199,20 +212,10 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'_, B, L>
                 "operation read set exceeds row bound".into(),
             ));
         }
-        let (_, mut snapshot) = self
-            .ns
-            .snapshot(
-                self.rows
-                    .keys()
-                    .cloned()
-                    .chain(keys.iter().cloned())
-                    .collect(),
-            )
-            .await?;
-        let covered = self
-            .rows
-            .iter()
-            .all(|(key, expected)| snapshot.rows.get(key) == Some(expected));
+        // Compare the retained observations atomically with the newly discovered
+        // rows, without asking the backend to return the earlier payload again.
+        let checks = self.read_plan().checks;
+        let (_, mut snapshot, covered) = self.ns.snapshot_checked(keys.clone(), &checks).await?;
         self.now = snapshot.now;
         // Keep old observations even when the fresh batch disagrees. The
         // unchanged mutation commit or final read validation must reject that
