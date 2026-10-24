@@ -4,7 +4,7 @@
 //! stopped. There is deliberately no timeout-only takeover or reclamation API.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
@@ -94,7 +94,7 @@ pub struct WriterSession {
     lower: LowerBinding,
     admission: Arc<Admission>,
     /// All wrappers for this writer share affected-inode coordination.
-    pub(super) inode_locks: Arc<Mutex<BTreeMap<i64, Weak<super::namespace::InodeLock>>>>,
+    pub(super) inode_locks: Arc<Mutex<super::namespace::InodeLockRegistry>>,
     io_failures: Arc<Mutex<BTreeMap<i64, String>>>,
 }
 
