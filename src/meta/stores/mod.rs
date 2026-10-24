@@ -15,6 +15,9 @@ pub mod tikv;
 #[cfg(test)]
 mod readdir_tests;
 
+#[cfg(test)]
+mod truncate_tests;
+
 // Re-export main types for convenience
 pub use database::DatabaseMetaStore;
 pub use etcd::EtcdMetaStore;

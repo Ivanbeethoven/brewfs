@@ -57,50 +57,16 @@ const LOCKED_KEY: &str = "locked";
 const LINK_PARENT_KEY_PREFIX: &str = "lp:";
 const TRUNCATE_REWRITE_MAX_RETRIES: usize = 64;
 
-// Lua script for atomically replacing a chunk's slice list when the version
-// matches the caller's expectation.  Returns 1 on success, 0 on version mismatch.
-// KEYS[1] = chunk list key
-// KEYS[2] = chunk version key
-// ARGV[1] = expected version
-// ARGV[2] = new version
-// ARGV[3..N] = serialized slice data (may be empty to delete the chunk)
-const CHUNK_CAS_LUA: &str = r#"
-    local expected = tonumber(ARGV[1])
-    local new_ver  = tonumber(ARGV[2])
-
-    local current = redis.call('GET', KEYS[2])
-    local current_ver = 0
-    if current then
-        current_ver = tonumber(current)
-    end
-
-    if current_ver ~= expected then
-        return 0
-    end
-
-    redis.call('DEL', KEYS[1])
-    for i = 3, #ARGV do
-        redis.call('RPUSH', KEYS[1], ARGV[i])
-    end
-
-    if new_ver > 0 then
-        redis.call('SET', KEYS[2], new_ver)
-    else
-        redis.call('DEL', KEYS[2])
-    end
-
-    return 1
-"#;
-
 // Atomically replace a compacted chunk and create the delayed-GC ledger for
 // every removed slice. Redis does not roll back earlier writes when a Lua
 // script hits a runtime error, so all fallible type checks and delayed-ID
 // allocation happen before the chunk list is changed.
 // KEYS: chunk list, chunk version, delayed counter, delayed index,
-// uncommitted pending index, uncommitted orphan index.
+// uncommitted pending index, uncommitted orphan index, retained physical sizes.
 // ARGV: expected version, new version, delayed key prefix, chunk id,
 // timestamp, delayed count, uncommitted key prefix, new-slice count, require pending,
-// delayed (sid, offset, size) triples, new slice IDs, serialized final slices.
+// retained count, delayed (sid, offset, size) triples, new slice IDs,
+// retained (sid, size) pairs, serialized final slices.
 const CHUNK_COMPACT_LUA: &str = r#"
     local expected = tonumber(ARGV[1])
     local new_ver = tonumber(ARGV[2])
@@ -111,12 +77,14 @@ const CHUNK_COMPACT_LUA: &str = r#"
     local uc_prefix = ARGV[7]
     local new_count = tonumber(ARGV[8])
     local require_pending = ARGV[9] == '1'
+    local retained_count = tonumber(ARGV[10])
 
     if expected == nil or new_ver == nil or n == nil or new_count == nil
+        or retained_count == nil or retained_count < 0 or retained_count % 1 ~= 0
         or n < 0 or n % 1 ~= 0 or new_count < 0 or new_count % 1 ~= 0 then
         return redis.error_reply('invalid compact arguments')
     end
-    if #ARGV < 9 + 3 * n + new_count then
+    if #ARGV < 10 + 3 * n + new_count + 2 * retained_count then
         return redis.error_reply('missing compact arguments')
     end
 
@@ -140,7 +108,7 @@ const CHUNK_COMPACT_LUA: &str = r#"
         return reply
     end
 
-    local new_id_start = 10 + 3 * n
+    local new_id_start = 11 + 3 * n
     if require_pending then
         for i = 0, new_count - 1 do
             local uc_key = uc_prefix .. ARGV[new_id_start + i]
@@ -149,6 +117,24 @@ const CHUNK_COMPACT_LUA: &str = r#"
                 return -1
             end
         end
+    end
+    local sizes_type = key_type(KEYS[7])
+    if sizes_type ~= 'none' and sizes_type ~= 'hash' then
+        return redis.error_reply('invalid retained physical sizes type')
+    end
+    local retained_start = new_id_start + new_count
+    local data_start = retained_start + 2 * retained_count
+    local sizes = {}
+    -- Validate and resolve ownership bounds before any mapping is changed.
+    for i = 0, n + retained_count - 1 do
+        local base = i < n and (11 + 3 * i) or (retained_start + 2 * (i - n))
+        local sid = ARGV[base]
+        local size = tonumber(ARGV[base + (i < n and 2 or 1)])
+        local previous = redis.call('HGET', KEYS[7], sid)
+        if size == nil or (previous and tonumber(previous) == nil) then
+            return redis.error_reply('invalid retained physical size')
+        end
+        sizes[sid] = math.max(size, tonumber(previous) or 0, sizes[sid] or 0)
     end
 
     local first_id = 0
@@ -189,7 +175,6 @@ const CHUNK_COMPACT_LUA: &str = r#"
         end
     end
 
-    local data_start = new_id_start + new_count
     redis.call('DEL', KEYS[1])
     for i = data_start, #ARGV do
         redis.call('RPUSH', KEYS[1], ARGV[i])
@@ -200,18 +185,24 @@ const CHUNK_COMPACT_LUA: &str = r#"
         redis.call('DEL', KEYS[2])
     end
 
+    for i = 0, retained_count - 1 do
+        local sid = ARGV[retained_start + 2 * i]
+        redis.call('HSET', KEYS[7], sid, sizes[sid])
+    end
+
     for i = 0, n - 1 do
         local delayed_id = first_id + i
         local ds_key = prefix .. delayed_id
-        local base = 10 + 3 * i
+        local base = 11 + 3 * i
         redis.call('HSET', ds_key,
             'sid', ARGV[base],
             'off', ARGV[base + 1],
-            'sz', ARGV[base + 2],
+            'sz', sizes[ARGV[base]],
             'st', 'pending',
             'ca', now,
             'cid', cid)
         redis.call('ZADD', KEYS[4], now, delayed_id)
+        redis.call('HDEL', KEYS[7], ARGV[base])
     end
 
     for i = 0, new_count - 1 do
@@ -2494,7 +2485,8 @@ impl RedisMetaStore {
     ) -> Result<(), MetaError> {
         let chunk_key = self.chunk_key(chunk_id);
         let version_key = self.chunk_version_key(chunk_id);
-        let script = redis::Script::new(CHUNK_CAS_LUA);
+        let script = redis::Script::new(CHUNK_COMPACT_LUA);
+        let _txn_guard = Self::local_lock_for_key(&chunk_key).lock().await;
 
         for _ in 0..TRUNCATE_REWRITE_MAX_RETRIES {
             let mut conn = self.conn.clone();
@@ -2518,16 +2510,54 @@ impl RedisMetaStore {
                 let desc: SliceDesc = crate::meta::serialization::deserialize_meta(entry)?;
                 slices.push(desc);
             }
+            let removed: Vec<_> = slices
+                .iter()
+                .filter(|s| s.offset >= cutoff_offset)
+                .collect();
+            let delayed_args: Vec<String> = removed
+                .iter()
+                .flat_map(|s| {
+                    [
+                        s.slice_id.to_string(),
+                        s.offset.to_string(),
+                        s.length.to_string(),
+                    ]
+                })
+                .collect();
+            let retained_args: Vec<String> = slices
+                .iter()
+                .filter(|s| {
+                    s.offset < cutoff_offset && s.offset.saturating_add(s.length) > cutoff_offset
+                })
+                .flat_map(|s| [s.slice_id.to_string(), s.length.to_string()])
+                .collect();
             trim_slices_in_place(&mut slices, cutoff_offset);
 
-            let new_version = current_version + 1;
+            // Sparse tail chunks have no mapping to invalidate. Do not create
+            // a version key for every hole visited by a large truncate.
+            let new_version = current_version + i64::from(!raw.is_empty());
 
             // Atomic CAS via Lua: replace list iff version still matches.
             let ok: i32 = script
                 .key(&chunk_key)
                 .key(&version_key)
+                .key(DELAYED_COUNTER_KEY)
+                .key(DELAYED_INDEX_KEY)
+                .key(UNCOMMITTED_PENDING_INDEX_KEY)
+                .key(UNCOMMITTED_ORPHAN_INDEX_KEY)
+                .key(format!("{chunk_key}:physical_sizes"))
                 .arg(current_version)
                 .arg(new_version)
+                .arg(DELAYED_KEY_PREFIX)
+                .arg(chunk_id)
+                .arg(Utc::now().timestamp())
+                .arg(delayed_args.len() / 3)
+                .arg(UNCOMMITTED_KEY_PREFIX)
+                .arg(0)
+                .arg(0) // Truncation does not publish new slices.
+                .arg(retained_args.len() / 2)
+                .arg(&delayed_args)
+                .arg(&retained_args)
                 .arg(
                     slices
                         .iter()
@@ -2595,20 +2625,7 @@ impl RedisMetaStore {
             |start, end| async move {
                 for idx in start..end {
                     let chunk_id = self.chunk_id(ino, idx);
-                    let key = self.chunk_key(chunk_id);
-                    let version_key = self.chunk_version_key(chunk_id);
-                    let mut conn = self.conn.clone();
-                    redis::pipe()
-                        .atomic()
-                        .cmd("DEL")
-                        .arg(&key)
-                        .ignore()
-                        .cmd("DEL")
-                        .arg(&version_key)
-                        .ignore()
-                        .query_async::<()>(&mut conn)
-                        .await
-                        .map_err(redis_err)?;
+                    self.rewrite_trimmed_slices(chunk_id, 0).await?;
                 }
                 Ok(())
             },
@@ -4411,6 +4428,7 @@ impl MetaStore for RedisMetaStore {
                 .key(DELAYED_INDEX_KEY)
                 .key(UNCOMMITTED_PENDING_INDEX_KEY)
                 .key(UNCOMMITTED_ORPHAN_INDEX_KEY)
+                .key(format!("{chunk_key}:physical_sizes"))
                 .arg(current_version)
                 .arg(new_version)
                 .arg(DELAYED_KEY_PREFIX)
@@ -4420,6 +4438,7 @@ impl MetaStore for RedisMetaStore {
                 .arg(UNCOMMITTED_KEY_PREFIX)
                 .arg(new_slice_ids.len())
                 .arg(0)
+                .arg(0) // No newly retained extents during compaction.
                 .arg(&delayed_args)
                 .arg(&new_slice_ids)
                 .arg(&final_data)
@@ -4565,6 +4584,7 @@ impl MetaStore for RedisMetaStore {
                 .key(DELAYED_INDEX_KEY)
                 .key(UNCOMMITTED_PENDING_INDEX_KEY)
                 .key(UNCOMMITTED_ORPHAN_INDEX_KEY)
+                .key(format!("{chunk_key}:physical_sizes"))
                 .arg(current_version)
                 .arg(new_version)
                 .arg(DELAYED_KEY_PREFIX)
@@ -4574,6 +4594,7 @@ impl MetaStore for RedisMetaStore {
                 .arg(UNCOMMITTED_KEY_PREFIX)
                 .arg(new_slice_ids.len())
                 .arg(1)
+                .arg(0) // No newly retained extents during compaction.
                 .arg(&delayed_args)
                 .arg(&new_slice_ids)
                 .arg(&final_data)

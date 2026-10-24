@@ -2165,6 +2165,43 @@ async fn test_truncate_rewrite_is_atomic_for_partial_chunk() {
 
 #[serial]
 #[tokio::test]
+#[ignore = "requires isolated Redis via BREWFS_REDIS_TEST_URL"]
+async fn truncate_gc_ledger_failure_preserves_mapping_and_size() {
+    let store = new_test_store().await;
+    let ino = store
+        .create_file(store.root_ino(), "truncate-ledger-failure".into())
+        .await
+        .unwrap();
+    let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+    let slice = crate::chunk::SliceDesc {
+        slice_id: store.next_id(crate::meta::SLICE_ID_KEY).await.unwrap() as u64,
+        chunk_id,
+        offset: 0,
+        length: 8192,
+    };
+    store.append_slice(chunk_id, slice).await.unwrap();
+    store.extend_file_size(ino, slice.length).await.unwrap();
+    let sizes_key = format!("{}:physical_sizes", store.chunk_key(chunk_id));
+    let mut conn = store.conn.clone();
+    let _: () = conn.set(&sizes_key, "wrong-type").await.unwrap();
+    for size in [1, 0] {
+        assert!(store.truncate(ino, size, 65536).await.is_err());
+        assert_eq!(store.get_slices(chunk_id).await.unwrap(), vec![slice]);
+        assert_eq!(store.stat(ino).await.unwrap().unwrap().size, slice.length);
+    }
+    let _: () = conn.del(&sizes_key).await.unwrap();
+    let _: () = conn
+        .set(super::DELAYED_INDEX_KEY, "wrong-type")
+        .await
+        .unwrap();
+    assert!(store.truncate(ino, 0, 65536).await.is_err());
+    assert_eq!(store.get_slices(chunk_id).await.unwrap(), vec![slice]);
+    assert_eq!(store.stat(ino).await.unwrap().unwrap().size, slice.length);
+    let _: () = conn.del(super::DELAYED_INDEX_KEY).await.unwrap();
+}
+
+#[serial]
+#[tokio::test]
 #[ignore]
 async fn test_truncate_rewrite_never_exposes_empty_chunk_list() {
     use tokio::task::yield_now;
