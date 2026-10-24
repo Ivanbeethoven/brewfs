@@ -43,6 +43,7 @@ struct Observation {
     incarnation: Uuid,
     binding_digest: [u8; 32],
     root_revision: u64,
+    // Generation after the observation CAS, which does not advance it.
     successor_generation: u64,
     layer_generation: u64,
     registry_gate_digest: [u8; 32],
@@ -705,7 +706,7 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
                     incarnation: read.root.incarnation,
                     binding_digest: Sha256::digest(read.binding.encode()?).into(),
                     root_revision: read.root.revision,
-                    successor_generation: generation,
+                    successor_generation: decode_required(&read.generation)?,
                     layer_generation: read.layer_generation,
                     registry_gate_digest,
                     native_gate_digest,
@@ -713,13 +714,13 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
                     grace_ns: options.grace_ns,
                     phase: ObservationPhase::Observing,
                 };
-                let writes = vec![
-                    KvWrite::Put {
-                        key: observation_key(read.root.incarnation),
-                        value: observation.encode()?,
-                    },
-                    put(PACKED_ROOT_GENERATION_KEY.to_vec(), &generation)?,
-                ];
+                // Recording grace does not change roots. Keep the generation
+                // in the exact CAS checks without invalidating other histories'
+                // observations; actual retirement still advances it below.
+                let writes = [KvWrite::Put {
+                    key: observation_key(read.root.incarnation),
+                    value: observation.encode()?,
+                }];
                 self.history_clock_cas(&checks, &writes, Some(read.now))
                     .await?;
                 return Ok(PackedHistoryRetirementReport {
