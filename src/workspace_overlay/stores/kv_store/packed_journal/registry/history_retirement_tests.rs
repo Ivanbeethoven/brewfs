@@ -405,6 +405,170 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn packed_history_retirement_two_idle_histories_eventually_retire() {
+    let fixture = Fixture::new().await;
+    let mut second = fixture.root.clone();
+    second.incarnation = Uuid::new_v4();
+    second.journal_id = JournalId::new();
+    let binding = second.binding.as_mut().unwrap();
+    binding.workspace_id = WorkspaceId::new();
+    binding.head_layer_id = LayerId::new();
+    binding.base_revision.layer_id = LayerId::new();
+    binding.binding.base_layer_id = binding.base_revision.layer_id;
+    let member = MemberRow {
+        reference: fixture.reference.clone(),
+        journal_id: second.journal_id,
+        incarnation: second.incarnation,
+        ordinal: 0,
+        put_id: Uuid::nil(),
+        adopted: true,
+        pending_put: false,
+        dispatched: false,
+        retained: true,
+    };
+    {
+        let mut rows = fixture.backend.memory.rows.lock().await;
+        let key = registry_object_key(&fixture.reference);
+        let mut object = ObjectRow::decode(&rows[&key]).unwrap();
+        object.memberships = 2;
+        rows.extend([
+            (key, object.encode().unwrap()),
+            (
+                registry_root_key(second.incarnation),
+                second.encode().unwrap(),
+            ),
+            (
+                registry_history_root_key(second.binding.as_ref().unwrap()),
+                second.encode().unwrap(),
+            ),
+            (
+                packed_history_key(second.binding.as_ref().unwrap().workspace_id, 2),
+                second.binding.as_ref().unwrap().encode().unwrap(),
+            ),
+            (
+                registry_member_key(&fixture.reference, second.incarnation),
+                member.encode().unwrap(),
+            ),
+            (
+                registry_reverse_key(second.incarnation, 0),
+                fixture.reference.encode_value().unwrap(),
+            ),
+        ]);
+    }
+    // Independent histories in one volume share the same generation and clock.
+    // Actual retirement may restart the other grace once; observing must not
+    // keep both histories alive indefinitely under the same ordered GC cursor.
+    let incarnations = [fixture.root.incarnation, second.incarnation];
+    let mut released = 0;
+    let mut deleted = 0;
+    for cycle in 0..=4 {
+        fixture
+            .backend
+            .now
+            .store(1000 + cycle * 100, Ordering::SeqCst);
+        for (index, incarnation) in incarnations.iter().enumerate() {
+            let report = fixture
+                .store
+                .retire_packed_binding_history(
+                    fixture.client.clone(),
+                    fixture.budget.clone(),
+                    options(*incarnation),
+                )
+                .await
+                .unwrap();
+            eprintln!("cycle={cycle} history={index} report={report:?}");
+            if cycle == 0 {
+                assert!(report.observing && !report.retired);
+                assert_eq!(report.not_before_ns, 1100);
+            }
+            released += report.released_members;
+            deleted += report.deleted_objects;
+        }
+    }
+    for incarnation in incarnations {
+        let root = RootRow::decode(
+            &fixture
+                .backend
+                .get(&registry_root_key(incarnation))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            (root.state, root.members),
+            (RootState::Retired, 0),
+            "idle histories must finish grace despite each other's observations"
+        );
+    }
+    assert_eq!((released, deleted), (2, 1));
+    assert!(!fixture.objects.path().join(&fixture.reference.key).exists());
+}
+
+#[tokio::test]
+async fn packed_history_retirement_generation_change_restarts_grace() {
+    for key in [PACKED_ROOT_GENERATION_KEY, LAYER_INVENTORY_GENERATION_KEY] {
+        let fixture = Fixture::new().await;
+        assert_eq!(fixture.run().await.unwrap().not_before_ns, 1100);
+        fixture.backend.now.store(1100, Ordering::SeqCst);
+        {
+            let mut rows = fixture.backend.memory.rows.lock().await;
+            let generation: u64 = decode(&rows[key]).unwrap();
+            rows.insert(key.to_vec(), encode(&(generation + 1)).unwrap());
+        }
+        let restarted = fixture.run().await.unwrap();
+        assert!(restarted.observing && !restarted.retired);
+        assert_eq!(restarted.not_before_ns, 1200);
+        assert_eq!(fixture.root().await.members, 1);
+        fixture.backend.now.store(1199, Ordering::SeqCst);
+        assert!(fixture.run().await.unwrap().observing);
+        assert!(fixture.objects.path().join(&fixture.reference.key).exists());
+        fixture.backend.now.store(1200, Ordering::SeqCst);
+        assert!(fixture.run().await.unwrap().retired);
+    }
+}
+
+#[tokio::test]
+async fn packed_history_retirement_generation_race_rejects_observation_and_retirement() {
+    for already_observed in [false, true] {
+        let fixture = Fixture::new().await;
+        if already_observed {
+            fixture.run().await.unwrap();
+            fixture.backend.now.store(1100, Ordering::SeqCst);
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *fixture.backend.pause_next_write.lock().await = Some((entered.clone(), gate.clone()));
+        let store = fixture.store.clone();
+        let budget = fixture.budget.clone();
+        let client = fixture.client.clone();
+        let incarnation = fixture.root.incarnation;
+        let waiter = tokio::spawn(async move {
+            store
+                .retire_packed_binding_history(client, budget, options(incarnation))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let before = {
+            let mut rows = fixture.backend.memory.rows.lock().await;
+            let generation: u64 = decode(&rows[PACKED_ROOT_GENERATION_KEY]).unwrap();
+            rows.insert(
+                PACKED_ROOT_GENERATION_KEY.to_vec(),
+                encode(&(generation + 1)).unwrap(),
+            );
+            rows.clone()
+        };
+        gate.add_permits(1);
+        assert!(matches!(waiter.await.unwrap(), Err(WorkspaceError::Busy)));
+        assert_eq!(*fixture.backend.memory.rows.lock().await, before);
+        assert_eq!(fixture.root().await.state, RootState::BindingHistory);
+        assert!(fixture.objects.path().join(&fixture.reference.key).exists());
+    }
+}
+
+#[tokio::test]
 async fn packed_history_retirement_grace_then_release_delete_and_tombstone() {
     let fixture = Fixture::new().await;
     let observing = fixture.run().await.unwrap();
