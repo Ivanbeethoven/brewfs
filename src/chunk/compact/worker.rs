@@ -296,16 +296,14 @@ where
     };
 
     for chunk_id in chunk_ids {
-        match compactor.should_compact(chunk_id).await {
-            Ok((true, is_sync)) => {
-                // Get slice count for dynamic TTL calculation
-                let slice_count = match compactor.analyze_chunk(chunk_id).await {
-                    Ok((count, _, _)) => count,
-                    Err(e) => {
-                        warn!(chunk_id, error = %e, "Failed to analyze chunk for lock TTL");
-                        continue;
-                    }
-                };
+        match compactor.snapshot(chunk_id).await {
+            Ok(before) => {
+                let (needed, is_sync) = compactor.should_compact_snapshot(&before);
+                if !needed {
+                    continue;
+                }
+                let slice_count = before.count();
+                drop(before);
 
                 // Both sync and async compaction require the distributed lock
                 // to prevent multiple nodes from compacting the same chunk.
@@ -319,10 +317,11 @@ where
                     continue;
                 }
 
-                // Re-read slice count after acquiring lock to reduce TOCTOU window.
-                // Another node may have already compacted this chunk.
-                let slice_count = match compactor.analyze_chunk(chunk_id).await {
-                    Ok((count, _, _)) => count,
+                // Re-read once after locking: another node may have compacted
+                // the chunk. Reuse this snapshot through light/heavy planning;
+                // versioned publication still rejects concurrent writes.
+                let snapshot = match compactor.snapshot(chunk_id).await {
+                    Ok(snapshot) => snapshot,
                     Err(e) => {
                         warn!(chunk_id, error = %e, "Failed to re-analyze chunk after lock");
                         if let Some(ref mut guard) = lock_guard {
@@ -332,18 +331,15 @@ where
                     }
                 };
 
-                // Re-check if compaction is still needed after lock
-                match compactor.should_compact(chunk_id).await {
-                    Ok((true, _)) => {}
-                    _ => {
-                        debug!(chunk_id, "Compaction no longer needed after re-check");
-                        if let Some(ref mut guard) = lock_guard {
-                            guard.unlock().await;
-                        }
-                        continue;
+                if !compactor.should_compact_snapshot(&snapshot).0 {
+                    debug!(chunk_id, "Compaction no longer needed after re-check");
+                    if let Some(ref mut guard) = lock_guard {
+                        guard.unlock().await;
                     }
+                    continue;
                 }
 
+                let slice_count = snapshot.count();
                 if is_sync {
                     info!(
                         chunk_id,
@@ -353,7 +349,7 @@ where
                     debug!(chunk_id, slice_count, "Acquired async compact lock");
                 }
 
-                let result = compactor.compact_sequential(chunk_id).await;
+                let result = compactor.compact_snapshot(chunk_id, snapshot).await;
                 if let Some(ref mut guard) = lock_guard {
                     guard.unlock().await;
                 }
@@ -379,7 +375,6 @@ where
                     }
                 }
             }
-            Ok((false, _)) => {}
             Err(e) => {
                 warn!(chunk_id, error = %e, "Error checking compaction status");
             }
@@ -387,4 +382,199 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::chunk::{
+        SliceDesc,
+        store::{BlockKey, InMemoryBlockStore},
+    };
+    use crate::meta::SLICE_ID_KEY;
+    use crate::{Config, DatabaseConfig, DatabaseType, RedisMetaStore};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct WriterDuringUpload {
+        blocks: InMemoryBlockStore,
+        meta: Arc<RedisMetaStore>,
+        inject: AtomicBool,
+        chunk: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl BlockStore for WriterDuringUpload {
+        async fn write_fresh_range(
+            &self,
+            key: BlockKey,
+            offset: u64,
+            data: &[u8],
+        ) -> anyhow::Result<u64> {
+            if self.inject.swap(false, Ordering::SeqCst) {
+                self.blocks
+                    .write_fresh_range((999999, 0), 0, b"writer")
+                    .await?;
+                self.meta
+                    .append_slice(
+                        self.chunk,
+                        SliceDesc {
+                            slice_id: 999999,
+                            chunk_id: self.chunk,
+                            offset: 0,
+                            length: 6,
+                        },
+                    )
+                    .await?;
+            }
+            self.blocks.write_fresh_range(key, offset, data).await
+        }
+        async fn read_range(
+            &self,
+            key: BlockKey,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> anyhow::Result<()> {
+            self.blocks.read_range(key, offset, buf).await
+        }
+        async fn delete_range(&self, key: BlockKey, count: u64) -> anyhow::Result<()> {
+            self.blocks.delete_range(key, count).await
+        }
+    }
+
+    async fn lrange_calls(conn: &mut redis::aio::MultiplexedConnection) -> u64 {
+        let info: String = redis::cmd("INFO")
+            .arg("commandstats")
+            .query_async(conn)
+            .await
+            .unwrap();
+        info.lines()
+            .find_map(|line| line.strip_prefix("cmdstat_lrange:calls="))
+            .map(|stats| stats.split(',').next().unwrap().parse().unwrap())
+            .unwrap_or(0)
+    }
+
+    async fn exercise_cycle(light_removes: bool, concurrent_write: bool, sync: bool) {
+        let url = std::env::var("BREWFS_REDIS_TEST_URL").expect("isolated Redis test URL required");
+        let client = redis::Client::open(url.clone()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        redis::cmd("FLUSHDB")
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+        let meta = Arc::new(
+            RedisMetaStore::from_config(Config {
+                database: DatabaseConfig {
+                    db_config: DatabaseType::Redis { url },
+                },
+                cache: Default::default(),
+                client: Default::default(),
+                compact: Default::default(),
+            })
+            .await
+            .unwrap(),
+        );
+        let chunk = crate::vfs::chunk_id_for(42, 0).unwrap();
+        let blocks = Arc::new(WriterDuringUpload {
+            blocks: InMemoryBlockStore::new(),
+            meta: meta.clone(),
+            inject: AtomicBool::new(false),
+            chunk,
+        });
+        let offsets: &[u64] = if light_removes {
+            &[0, 0, 2048, 4096]
+        } else {
+            &[0, 2048, 4096]
+        };
+        for &offset in offsets {
+            let slice_id = meta.next_id(SLICE_ID_KEY).await.unwrap() as u64;
+            blocks
+                .blocks
+                .write_fresh_range((slice_id, 0), 0, &[7; 4096])
+                .await
+                .unwrap();
+            meta.append_slice(
+                chunk,
+                SliceDesc {
+                    slice_id,
+                    chunk_id: chunk,
+                    offset,
+                    length: 4096,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let compact_config = CompactConfig {
+            sync_threshold: if sync { 3 } else { 200 },
+            ..Default::default()
+        };
+        let compactor = Arc::new(Compactor::with_config(
+            meta.clone(),
+            blocks.clone(),
+            ChunkLayout {
+                chunk_size: 8192,
+                block_size: 4096,
+            },
+            compact_config,
+        ));
+        let locks = Arc::new(CompactLockManager::new(meta.clone()));
+        blocks.inject.store(concurrent_write, Ordering::SeqCst);
+        let before = lrange_calls(&mut conn).await;
+        run_compaction_cycle(
+            &meta,
+            &compactor,
+            &locks,
+            &CompactionWorkerConfig::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let reads = lrange_calls(&mut conn).await - before;
+        // Include the publication CAS read(s), which must remain in place.
+        let expected = if light_removes { 5 } else { 3 };
+        assert_eq!(
+            reads, expected,
+            "one pre-lock and one post-lock snapshot, plus reload after light publication"
+        );
+        assert!(!locks.is_locally_locked(chunk).await);
+        let slices = meta.get_slices(chunk).await.unwrap();
+        if concurrent_write {
+            assert_eq!(slices.len(), 4);
+            assert!(slices.iter().any(|slice| slice.slice_id == 999999));
+        } else {
+            assert_eq!(slices.len(), 1);
+            let mut data = vec![0; 8192];
+            blocks
+                .read_range((slices[0].slice_id, 0), 0, &mut data[..4096])
+                .await
+                .unwrap();
+            blocks
+                .read_range((slices[0].slice_id, 1), 0, &mut data[4096..])
+                .await
+                .unwrap();
+            assert_eq!(data, vec![7; 8192]);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[ignore = "requires isolated Redis via BREWFS_REDIS_TEST_URL"]
+    async fn no_op_light_uses_two_snapshots() {
+        exercise_cycle(false, false, false).await;
+        exercise_cycle(false, false, true).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[ignore = "requires isolated Redis via BREWFS_REDIS_TEST_URL"]
+    async fn successful_light_reloads_once_before_heavy() {
+        exercise_cycle(true, false, false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[ignore = "requires isolated Redis via BREWFS_REDIS_TEST_URL"]
+    async fn concurrent_mutation_still_rejects_stale_snapshot() {
+        exercise_cycle(false, true, false).await;
+    }
 }
