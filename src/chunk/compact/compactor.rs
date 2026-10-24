@@ -253,32 +253,27 @@ where
                 Err(CompactorError::MetaError(MetaError::ContinueRetry(reason)))
             }
             Err(e) => {
-                if let Err(cleanup_err) = self
-                    .cleanup_uncommitted_slice(new_slice_id, chunk_size)
-                    .await
-                {
-                    warn!(
-                        chunk_id,
-                        new_slice_id,
-                        error = %cleanup_err,
-                        "Failed to cleanup uncommitted slice after error"
-                    );
-                }
+                // A transport error can lose the reply after publication.
+                // Preserve the objects and pending record: orphan recovery
+                // checks live metadata before deciding whether to delete them.
+                warn!(
+                    chunk_id,
+                    new_slice_id,
+                    error = %e,
+                    "Compaction publication outcome is uncertain; preserving uploaded objects"
+                );
                 Err(CompactorError::MetaError(e))
             }
         }
     }
 
-    /// Read all slices and merge; newer slices (higher slice_id) overwrite older ones.
+    /// Merge in metadata publication order, matching the reader's last-entry wins rule.
     async fn read_and_merge_slices(
         &self,
         slices: &[SliceDesc],
         merged_data: &mut [u8],
     ) -> Result<(), CompactorError> {
-        let mut sorted: Vec<_> = slices.to_vec();
-        sorted.sort_by_key(|s| s.slice_id);
-
-        for slice in sorted {
+        for slice in slices {
             let start = slice.offset as usize;
             let end = start + slice.length as usize;
 
@@ -292,7 +287,7 @@ where
                 )));
             }
 
-            self.read_slice_data_into(&slice, &mut merged_data[start..end])
+            self.read_slice_data_into(slice, &mut merged_data[start..end])
                 .await?;
         }
 
