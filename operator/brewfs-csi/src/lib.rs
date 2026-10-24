@@ -655,6 +655,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage_refuses_untracked_mount() {
+        // Cover both a timeout with no state and legacy state without a PID.
+        for legacy_state in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let ops = Arc::new(FakeOps::default());
+            let manager = MountManager::new_with_root(ops.clone(), temp.path().join("state"));
+            let spec = spec(&temp);
+            let shared = spec.shared_mount();
+            ops.mounted
+                .lock()
+                .unwrap()
+                .insert(shared.display().to_string());
+            if legacy_state {
+                manager.store_state(&spec, &MountState::default()).unwrap();
+            }
+            let previous_state = fs::read(manager.state_path(&spec)).ok();
+
+            assert!(matches!(
+                manager.stage(&spec).await,
+                Err(CsiError::MountCommand(_))
+            ));
+            assert_eq!(*ops.starts.lock().unwrap(), 0);
+            assert_eq!(*ops.unmounts.lock().unwrap(), 0);
+            assert!(ops.is_mounted(&shared).unwrap());
+            assert_eq!(fs::read(manager.state_path(&spec)).ok(), previous_state);
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_reuses_tracked_mount_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let ops = Arc::new(FakeOps::default());
+        let state_root = temp.path().join("state");
+        let spec = spec(&temp);
+        MountManager::new_with_root(ops.clone(), state_root.clone())
+            .stage(&spec)
+            .await
+            .unwrap();
+        MountManager::new_with_root(ops.clone(), state_root)
+            .stage(&spec)
+            .await
+            .unwrap();
+        assert_eq!(*ops.starts.lock().unwrap(), 1);
+        assert_eq!(*ops.unmounts.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn stage_publish_and_unpublish_are_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let ops = Arc::new(FakeOps::default());
