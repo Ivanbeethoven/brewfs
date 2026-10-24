@@ -369,8 +369,7 @@ where
             {
                 Ok(entries) => snapshot.entries = entries,
                 Err(error)
-                    if error == Errno::from(libc::EACCES)
-                        || error == Errno::from(libc::EPERM) => {}
+                    if error == Errno::from(libc::EACCES) || error == Errno::from(libc::EPERM) => {}
                 Err(error) => return Err(error),
             }
         }
