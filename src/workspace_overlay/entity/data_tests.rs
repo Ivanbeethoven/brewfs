@@ -31,6 +31,8 @@ struct Objects {
     puts: AtomicUsize,
     fail_put: AtomicUsize,
     pause_put: AtomicUsize,
+    heads: AtomicUsize,
+    pause_head: AtomicUsize,
     deletes: AtomicUsize,
     fail_delete: AtomicBool,
     entered: Notify,
@@ -44,6 +46,8 @@ impl Objects {
             puts: AtomicUsize::new(0),
             fail_put: AtomicUsize::new(0),
             pause_put: AtomicUsize::new(0),
+            heads: AtomicUsize::new(0),
+            pause_head: AtomicUsize::new(0),
             deletes: AtomicUsize::new(0),
             fail_delete: AtomicBool::new(false),
             entered: Notify::new(),
@@ -105,7 +109,16 @@ impl ObjectBackend for Objects {
             .await
     }
     async fn get_object_size_bounded(&self, key: &str) -> anyhow::Result<Option<u64>> {
-        self.inner.get_object_size_bounded(key).await
+        let number = self.heads.fetch_add(1, Ordering::SeqCst) + 1;
+        let result = self.inner.get_object_size_bounded(key).await;
+        if self.pause_head.load(Ordering::SeqCst) == number {
+            let resumed = self.resume.notified();
+            tokio::pin!(resumed);
+            resumed.as_mut().enable();
+            self.entered.notify_one();
+            resumed.await;
+        }
+        result
     }
     async fn get_etag(&self, key: &str) -> anyhow::Result<String> {
         self.inner.get_etag(key).await
@@ -974,6 +987,121 @@ async fn fixture() -> Fixture<MemoryEntityBackend> {
         1_000_000,
     )
     .await
+}
+
+async fn fragmented_small_write_fixture(
+    chunk_size: u64,
+) -> (Fixture<MemoryEntityBackend>, Arc<EntityHandle>, Vec<u8>) {
+    let fixture = attach_objects(
+        Arc::new(MemoryEntityBackend::new(1000)),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+        1_000_000,
+        Arc::new(Objects::new(test_objects::backend().await)),
+        chunk_size,
+    )
+    .await;
+    let handle = new_file(&fixture, b"many-small-writes").await;
+    let expected: Vec<u8> = (0..1500).map(|i| (i % 251) as u8).collect();
+    for (offset, byte) in expected.iter().enumerate() {
+        assert_eq!(
+            fixture
+                .data
+                .write(
+                    handle.clone(),
+                    offset as u64,
+                    Bytes::copy_from_slice(&[*byte]),
+                    false
+                )
+                .await
+                .unwrap()
+                .written,
+            1
+        );
+    }
+    (fixture, handle, expected)
+}
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS via the entity data test harness"]
+async fn fragmented_small_writes_remain_readable_in_large_requests() {
+    for chunk_size in [4 * 1024 * 1024, 1024] {
+        let (fixture, handle, expected) = fragmented_small_write_fixture(chunk_size).await;
+        // The same successfully published file supports both small reads and
+        // an ordinary request spanning every independently owned object.
+        for offset in [0, 749, 1499] {
+            assert_eq!(
+                fixture.data.read(handle.clone(), offset, 1).await.unwrap(),
+                vec![expected[offset as usize]]
+            );
+        }
+        assert_eq!(
+            fixture
+                .data
+                .read(handle.clone(), 0, expected.len())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            fixture.data.read(handle, 500, 4096).await.unwrap(),
+            expected[500..]
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS via the entity data test harness"]
+async fn fragmented_small_write_read_is_fenced_between_bounded_groups() {
+    let (fixture, handle, expected) = fragmented_small_write_fixture(4 * 1024 * 1024).await;
+    // The first half fits the metadata bound; stop the first object fetch in
+    // the next group, after the first group's bytes have already been read.
+    fixture.objects.pause_head.store(751, Ordering::SeqCst);
+    let data = fixture.data.clone();
+    let mut reading = tokio::spawn(async move { data.read(handle, 0, expected.len()).await });
+    tokio::select! {
+        result = &mut reading => panic!("fragmented read failed before reaching its second group: {result:?}"),
+        entered = tokio::time::timeout(Duration::from_secs(60), fixture.objects.entered.notified()) => {
+            entered.expect("fragmented read did not reach its second group");
+        }
+    }
+    fixture.backend.set_time(2_000_000).unwrap();
+    fixture.objects.resume.notify_one();
+    assert_eq!(reading.await.unwrap(), Err(EntityError::Fenced));
+}
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS via the entity data test harness"]
+async fn fragmented_small_write_read_retries_changed_version_between_groups() {
+    let (fixture, handle, expected) = fragmented_small_write_fixture(4 * 1024 * 1024).await;
+    let inode = fixture.data.attr(handle.clone()).await.unwrap();
+    let cut = prepare_resize(
+        &fixture.keys,
+        inode.ino,
+        Some(codec::encode(&UpperInode::Present(inode.clone())).unwrap()),
+        &inode,
+        750,
+        fixture.data.chunk_size,
+        1000,
+    )
+    .unwrap();
+    fixture.objects.pause_head.store(751, Ordering::SeqCst);
+    let data = fixture.data.clone();
+    let mut reading = tokio::spawn(async move { data.read(handle, 0, 1500).await });
+    tokio::select! {
+        result = &mut reading => panic!("fragmented read failed before reaching its second group: {result:?}"),
+        entered = tokio::time::timeout(Duration::from_secs(60), fixture.objects.entered.notified()) => {
+            entered.expect("fragmented read did not reach its second group");
+        }
+    }
+    // Inject a committed remote cut after one group's bytes were collected.
+    // The reader must discard that view and retry against the new file size.
+    let authority = fixture.namespace.authority().await.unwrap();
+    assert_eq!(
+        fixture.backend.commit(&authority, &cut).await.unwrap(),
+        CommitOutcome::Committed
+    );
+    fixture.objects.resume.notify_one();
+    assert_eq!(reading.await.unwrap().unwrap(), expected[..750]);
 }
 
 async fn new_file<B: EntityBackend + 'static, O: ObjectBackend + 'static>(

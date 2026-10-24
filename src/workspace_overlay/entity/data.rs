@@ -661,12 +661,53 @@ where
 
     async fn read_locked(&self, ino: i64, offset: u64, length: usize) -> Result<Vec<u8>> {
         for _ in 0..MAX_RETRIES {
-            match self.read_attempt(ino, offset, length).await {
+            let result = match self.read_attempt(ino, offset, length).await {
+                Err(error) if Self::aggregate_metadata_bound(&error) => {
+                    self.read_grouped(ino, offset, length).await
+                }
+                result => result,
+            };
+            match result {
                 Err(EntityError::Conflict) => continue,
                 result => return result,
             }
         }
         Err(EntityError::Busy)
+    }
+
+    async fn read_grouped(&self, ino: i64, offset: u64, length: usize) -> Result<Vec<u8>> {
+        // The caller retains the handle, session admission and inode lock for
+        // the whole request. Keep a small common view across bounded groups:
+        // every data/map mutation advances the inode's monotonic data_version,
+        // and truncate/config changes must also invalidate the assembled read.
+        let (_, mut anchor) = self.snapshot(ino, Vec::new()).await?;
+        let inode = self.inode(ino, &mut anchor).await?;
+        let length = inode.size.saturating_sub(offset).min(length as u64) as usize;
+        let mut output = Vec::with_capacity(length);
+        let mut group_length = length.div_ceil(2).max(1);
+        while output.len() < length {
+            let count = group_length.min(length - output.len());
+            match self
+                .read_attempt(ino, offset + output.len() as u64, count)
+                .await
+            {
+                Err(error) if count > 1 && Self::aggregate_metadata_bound(&error) => {
+                    group_length = count / 2;
+                }
+                result => {
+                    let bytes = result?;
+                    anchor.validate_read(true).await?;
+                    if bytes.len() != count {
+                        return Err(EntityError::Conflict);
+                    }
+                    output.extend_from_slice(&bytes);
+                }
+            }
+        }
+        // No partial prefix escapes on conflict or fencing, including expiry
+        // after the last group. The outer retry starts with a new common view.
+        anchor.validate_read(true).await?;
+        Ok(output)
     }
 
     async fn read_attempt(&self, ino: i64, offset: u64, length: usize) -> Result<Vec<u8>> {
