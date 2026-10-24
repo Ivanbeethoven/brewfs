@@ -231,4 +231,25 @@ impl EntityBackend for MemoryEntityBackend {
         }
         Ok(result)
     }
+
+    async fn scan_prefix_batch(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        validate_scan(prefix, limit)?;
+        let state = self.state.lock().map_err(poisoned)?;
+        let entries = state
+            .rows
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .take(limit);
+        let mut result = Vec::new();
+        let mut total = 0;
+        for (key, value) in entries {
+            add_bytes(&mut total, key, Some(value))?;
+            result.push((key.clone(), value.clone()));
+        }
+        Ok(result)
+    }
 }

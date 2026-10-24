@@ -1306,6 +1306,15 @@ impl EntityBackend for PausingBackend {
         self.after_read(&[prefix.to_vec()]).await;
         Ok(rows)
     }
+    async fn scan_prefix_batch(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let rows = self.inner.scan_prefix_batch(prefix, limit).await?;
+        self.after_read(&[prefix.to_vec()]).await;
+        Ok(rows)
+    }
 }
 
 #[tokio::test]

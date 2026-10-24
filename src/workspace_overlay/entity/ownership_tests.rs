@@ -474,6 +474,15 @@ impl EntityBackend for CountingBackend {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.scan_prefix(prefix, limit).await
     }
+    async fn scan_prefix_batch(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.scan_prefix_batch(prefix, limit).await
+    }
 }
 
 #[tokio::test]
