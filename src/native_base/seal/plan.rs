@@ -522,7 +522,7 @@ impl SealReader<'_> {
             match &block.placement {
                 BlockPlacement::Loose { object_ordinal, .. } => {
                     let encoded = &loose_objects[object_ordinal];
-                    let decoded = decompress_framed(encoded)
+                    let decoded = decompress_framed(encoded, block_size as usize)
                         .map_err(|e| SealError::Native(format!("loose object: {e}")))?;
                     if decoded.len() as u64 != block.binding.decoded_len as u64 {
                         return Err(SealError::integrity(format!(
@@ -547,7 +547,7 @@ impl SealReader<'_> {
                             // The whole frame is the encoded inner block; the
                             // span's length lives in the decoded domain and
                             // must not be compared with frame.raw_len.
-                            let decoded = decompress_framed(raw)
+                            let decoded = decompress_framed(raw, block_size as usize)
                                 .map_err(|e| SealError::Native(format!("inner block: {e}")))?;
                             if decoded.len() as u64 != block.binding.decoded_len as u64 {
                                 return Err(SealError::integrity(format!(

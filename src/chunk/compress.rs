@@ -153,7 +153,9 @@ pub fn encode_persisted_block(data: &[u8], compression: Compression) -> Bytes {
 ///
 /// Callers must only use this for objects whose namespace declares the framed
 /// layout. Raw and incomplete bytes are rejected instead of being guessed.
-pub fn decompress_framed(data: &[u8]) -> anyhow::Result<Cow<'_, [u8]>> {
+/// `max_decoded_len` is the caller's block-size/output budget, checked before
+/// allocating a decompression buffer.
+pub fn decompress_framed(data: &[u8], max_decoded_len: usize) -> anyhow::Result<Cow<'_, [u8]>> {
     let algo = match parse_persisted_header(data) {
         PersistedHeader::Framed(algo) => algo,
         PersistedHeader::Incomplete => anyhow::bail!("truncated persisted block header"),
@@ -164,11 +166,25 @@ pub fn decompress_framed(data: &[u8]) -> anyhow::Result<Cow<'_, [u8]>> {
     let body = &data[PERSISTED_HEADER_LEN..];
 
     match algo {
-        Compression::None => Ok(Cow::Borrowed(body)),
-        Compression::Lz4 => lz4_flex::decompress_size_prepended(body)
-            .map(Cow::Owned)
-            .map_err(|e| anyhow::anyhow!("LZ4 decompression failed: {}", e)),
-        Compression::Zstd(_) => zstd::bulk::decompress(body, 64 * 1024 * 1024)
+        Compression::None => {
+            anyhow::ensure!(
+                body.len() <= max_decoded_len,
+                "raw block exceeds decoded size limit"
+            );
+            Ok(Cow::Borrowed(body))
+        }
+        Compression::Lz4 => {
+            let (decoded_len, compressed) = lz4_flex::block::uncompressed_size(body)
+                .map_err(|e| anyhow::anyhow!("LZ4 decompression failed: {}", e))?;
+            anyhow::ensure!(
+                decoded_len <= max_decoded_len,
+                "LZ4 block exceeds decoded size limit"
+            );
+            lz4_flex::block::decompress(compressed, decoded_len)
+                .map(Cow::Owned)
+                .map_err(|e| anyhow::anyhow!("LZ4 decompression failed: {}", e))
+        }
+        Compression::Zstd(_) => zstd::bulk::decompress(body, max_decoded_len)
             .map(Cow::Owned)
             .map_err(|e| anyhow::anyhow!("Zstd decompression failed: {}", e)),
     }
@@ -177,17 +193,21 @@ pub fn decompress_framed(data: &[u8]) -> anyhow::Result<Cow<'_, [u8]>> {
 /// Decompress a legacy payload using its historical, magic-based convention.
 /// If there is no magic prefix, returns the original bytes. Invalid magic
 /// prefixes fail rather than silently exposing encoded bytes as file data.
-pub fn decompress(data: &[u8]) -> anyhow::Result<Cow<'_, [u8]>> {
+pub fn decompress(data: &[u8], max_decoded_len: usize) -> anyhow::Result<Cow<'_, [u8]>> {
     if data.len() < 4 || data[0] != MAGIC[0] || data[1] != MAGIC[1] {
         // No compression header — return raw data
+        anyhow::ensure!(
+            data.len() <= max_decoded_len,
+            "raw block exceeds decoded size limit"
+        );
         return Ok(Cow::Borrowed(data));
     }
-    decompress_framed(data)
+    decompress_framed(data, max_decoded_len)
 }
 
 /// Decompress an owned Bytes buffer while preserving zero-copy raw fallback.
-pub fn decompress_bytes(data: Bytes) -> anyhow::Result<Bytes> {
-    match decompress(data.as_ref())? {
+pub fn decompress_bytes(data: Bytes, max_decoded_len: usize) -> anyhow::Result<Bytes> {
+    match decompress(data.as_ref(), max_decoded_len)? {
         Cow::Borrowed(borrowed) => {
             let base = data.as_ptr() as usize;
             let start = (borrowed.as_ptr() as usize)
@@ -204,8 +224,8 @@ pub fn decompress_bytes(data: Bytes) -> anyhow::Result<Bytes> {
 }
 
 /// Decompress an owned framed block while preserving zero-copy raw frames.
-pub fn decompress_framed_bytes(data: Bytes) -> anyhow::Result<Bytes> {
-    match decompress_framed(data.as_ref())? {
+pub fn decompress_framed_bytes(data: Bytes, max_decoded_len: usize) -> anyhow::Result<Bytes> {
+    match decompress_framed(data.as_ref(), max_decoded_len)? {
         Cow::Borrowed(borrowed) => {
             let base = data.as_ptr() as usize;
             let start = (borrowed.as_ptr() as usize)
@@ -230,7 +250,7 @@ mod tests {
         let data = b"hello world";
         let compressed = compress(data, Compression::None);
         assert_eq!(&*compressed, &data[..]);
-        let decompressed = decompress(&compressed).unwrap();
+        let decompressed = decompress(&compressed, data.len()).unwrap();
         assert_eq!(decompressed.as_ref(), data);
     }
 
@@ -242,7 +262,7 @@ mod tests {
         assert!(compressed.len() < data.len());
         assert_eq!(&compressed[..2], &MAGIC);
         assert_eq!(compressed[2], 1); // LZ4
-        let decompressed = decompress(&compressed).unwrap();
+        let decompressed = decompress(&compressed, data.len()).unwrap();
         assert_eq!(decompressed.as_ref(), data);
     }
 
@@ -253,7 +273,7 @@ mod tests {
         assert!(compressed.len() < data.len());
         assert_eq!(&compressed[..2], &MAGIC);
         assert_eq!(compressed[2], 2); // Zstd
-        let decompressed = decompress(&compressed).unwrap();
+        let decompressed = decompress(&compressed, data.len()).unwrap();
         assert_eq!(decompressed.as_ref(), data);
     }
 
@@ -264,7 +284,7 @@ mod tests {
         let compressed = compress(&data, Compression::Lz4);
         // Should be stored raw (no header) since compression isn't beneficial
         // Or it might still be smaller — just verify roundtrip
-        let decompressed = decompress(&compressed).unwrap();
+        let decompressed = decompress(&compressed, data.len()).unwrap();
         assert_eq!(decompressed.as_ref(), data);
     }
 
@@ -272,7 +292,7 @@ mod tests {
     fn test_empty_data() {
         let compressed = compress(&[], Compression::Lz4);
         assert!(compressed.is_empty());
-        let decompressed = decompress(&compressed).unwrap();
+        let decompressed = decompress(&compressed, 0).unwrap();
         assert!(decompressed.is_empty());
     }
 
@@ -280,14 +300,14 @@ mod tests {
     fn test_raw_data_without_header() {
         // Data that doesn't start with magic bytes should pass through
         let data = b"raw data without compression";
-        let decompressed = decompress(data).unwrap();
+        let decompressed = decompress(data, data.len()).unwrap();
         assert_eq!(decompressed.as_ref(), data);
     }
 
     #[test]
     fn test_raw_data_without_header_is_borrowed() {
         let data = b"incompressible raw block payload";
-        let decompressed = decompress(data).unwrap();
+        let decompressed = decompress(data, data.len()).unwrap();
         assert!(
             matches!(decompressed, Cow::Borrowed(_)),
             "raw fallback should avoid copying the object buffer"
@@ -298,7 +318,7 @@ mod tests {
     fn test_decompress_bytes_reuses_raw_buffer() {
         let data = Bytes::from_static(b"raw object payload");
         let raw_ptr = data.as_ptr();
-        let decompressed = decompress_bytes(data).unwrap();
+        let decompressed = decompress_bytes(data, b"raw object payload".len()).unwrap();
         assert_eq!(decompressed.as_ref(), b"raw object payload");
         assert_eq!(decompressed.as_ptr(), raw_ptr);
     }
@@ -312,7 +332,7 @@ mod tests {
 
         let data = Bytes::from(encoded);
         let expected_ptr = data.as_ptr().wrapping_add(4);
-        let decompressed = decompress_bytes(data).unwrap();
+        let decompressed = decompress_bytes(data, b"raw body".len()).unwrap();
 
         assert_eq!(decompressed.as_ref(), b"raw body");
         assert_eq!(decompressed.as_ptr(), expected_ptr);
@@ -326,7 +346,12 @@ mod tests {
             parse_persisted_header(&encoded),
             PersistedHeader::Framed(Compression::None)
         );
-        assert_eq!(decompress_framed_bytes(encoded).unwrap().as_ref(), raw);
+        assert_eq!(
+            decompress_framed_bytes(encoded, raw.len())
+                .unwrap()
+                .as_ref(),
+            raw
+        );
     }
 
     #[test]
@@ -343,7 +368,44 @@ mod tests {
             parse_persisted_header(b"SF\x7f\x00"),
             PersistedHeader::Invalid
         );
-        assert!(decompress_framed(b"SF\x01\x01payload").is_err());
-        assert!(decompress_framed(b"SF\x7f\x00payload").is_err());
+        assert!(decompress_framed(b"SF\x01\x01payload", 4096).is_err());
+        assert!(decompress_framed(b"SF\x7f\x00payload", 4096).is_err());
+    }
+
+    #[test]
+    fn framed_decoding_enforces_the_output_budget_for_every_encoding() {
+        let raw = vec![42; 4096];
+        for compression in [Compression::None, Compression::Lz4, Compression::Zstd(3)] {
+            let encoded = encode_persisted_block(&raw, compression);
+            assert_eq!(
+                parse_persisted_header(&encoded),
+                PersistedHeader::Framed(match compression {
+                    Compression::Zstd(_) => Compression::Zstd(0),
+                    other => other,
+                })
+            );
+            assert_eq!(
+                decompress_framed(&encoded, raw.len()).unwrap().as_ref(),
+                raw
+            );
+            assert!(decompress_framed(&encoded, raw.len() - 1).is_err());
+            assert!(decompress_framed_bytes(encoded.clone(), raw.len() - 1).is_err());
+            assert!(decompress_bytes(encoded, raw.len() - 1).is_err());
+        }
+    }
+
+    #[test]
+    fn lz4_rejects_an_oversized_length_prefix_before_decoding() {
+        let mut encoded = vec![MAGIC[0], MAGIC[1], Compression::Lz4.algo_byte(), 0];
+        encoded.extend_from_slice(&u32::MAX.to_le_bytes());
+        let error = decompress_framed(&encoded, 4096).unwrap_err();
+        assert_eq!(error.to_string(), "LZ4 block exceeds decoded size limit");
+    }
+
+    #[test]
+    fn legacy_raw_decoding_enforces_the_output_budget() {
+        let raw = Bytes::from_static(b"raw block");
+        assert!(decompress_bytes(raw.clone(), raw.len() - 1).is_err());
+        assert_eq!(decompress_bytes(raw.clone(), raw.len()).unwrap(), raw);
     }
 }

@@ -2057,7 +2057,7 @@ mod tests {
                     "{compression:?}, {logical_len}, {create_only_writes}"
                 );
                 assert_eq!(
-                    decompress_framed_bytes(request.body.clone())
+                    decompress_framed_bytes(request.body.clone(), logical_len)
                         .unwrap()
                         .as_ref(),
                     data.as_ref()

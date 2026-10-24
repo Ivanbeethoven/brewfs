@@ -713,7 +713,7 @@ impl NativeDataRuntime {
             .get(&registration.object_ref)
             .await
             .map_err(|error| NativeIoError::MissingObject(error.to_string()))?;
-        let decoded = decompress_framed(&encoded)
+        let decoded = decompress_framed(&encoded, binding.decoded_len as usize)
             .map_err(|error| NativeIoError::Integrity(error.to_string()))?
             .into_owned();
         if decoded.len() != binding.decoded_len as usize
