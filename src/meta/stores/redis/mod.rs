@@ -240,10 +240,21 @@ const CLAIM_UNCOMMITTED_LUA: &str = r#"
     return 1
 "#;
 
+// Renew only a session that has not been removed by cleanup or shutdown.
+// Checking and updating together prevents a late heartbeat from resurrecting it.
+const REFRESH_SESSION_LUA: &str = r#"
+    if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+        return 0
+    end
+    redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+    return 1
+"#;
+
 // Lua script for atomically releasing all locks held by a dead session.
 // Constructs plock keys dynamically from the locked set so the entire
 // cleanup is atomic — no TOCTOU window between reading locked_files and
 // deleting the lock fields.
+// ARGV[3] is the expiry scan cutoff, or an empty string for explicit shutdown.
 const CLEANUP_SESSION_LUA: &str = r#"
     local cjson = cjson
 
@@ -252,6 +263,15 @@ const CLEANUP_SESSION_LUA: &str = r#"
     local infos_key   = KEYS[3]
     local sid_str     = ARGV[1]
     local plock_prefix = ARGV[2]
+
+    -- A heartbeat may have renewed this session after the expiry scan.
+    -- Recheck before touching either its locks or its bookkeeping.
+    if ARGV[3] ~= '' then
+        local expiry = redis.call('ZSCORE', sessions_key, sid_str)
+        if not expiry or tonumber(expiry) > tonumber(ARGV[3]) then
+            return cjson.encode({ok=true})
+        end
+    end
 
     -- Collect every inode this session holds locks on
     local locked_files = redis.call('SMEMBERS', locked_key)
@@ -294,6 +314,11 @@ macro_rules! flock_lua {
     local lock_type = tonumber(ARGV[2])  -- 0=Read, 1=Write, 2=UnLock
     local inode_str = ARGV[3]
     local epoch = tonumber(ARGV[4])
+
+    -- Serialize acquisition with session removal; cached IDs alone cannot fence it.
+    if lock_type ~= 2 and not redis.call('ZSCORE', KEYS[4], ARGV[5]) then
+        return cjson.encode({ok=false, error="session_not_found"})
+    end
 
     -- helpers: extract {epoch, value} from stored raw
     local function parse_val(raw)
@@ -374,6 +399,11 @@ const SET_PLOCK_LUA: &str = r#"
     local range_end   = tonumber(ARGV[5])
     local inode_str   = ARGV[6]
     local epoch       = tonumber(ARGV[7])
+
+    -- Serialize acquisition with session removal; cached IDs alone cannot fence it.
+    if lock_type ~= 2 and not redis.call('ZSCORE', KEYS[4], ARGV[8]) then
+        return cjson.encode({ok=false, error="session_not_found"})
+    end
 
     -- ------------------------------------------------------------------
     -- helpers
@@ -2452,6 +2482,7 @@ impl RedisMetaStore {
             .key(&plock_key)
             .key(&locked_key)
             .key(format!("flock:{inode}"))
+            .key(ALL_SESSIONS_KEY)
             .arg(&field)
             .arg(lock_type_num)
             .arg(new_lock.pid)
@@ -2459,6 +2490,7 @@ impl RedisMetaStore {
             .arg(new_lock.lock_range.end)
             .arg(inode)
             .arg(epoch)
+            .arg(sid.to_string())
             .invoke_async(&mut self.conn.clone())
             .await
             .map_err(redis_err)?;
@@ -2467,6 +2499,7 @@ impl RedisMetaStore {
             .map_err(|e| MetaError::Internal(format!("plock Lua response parse error: {e}")))?;
 
         match response.error.as_deref() {
+            Some("session_not_found") => Err(MetaError::SessionNotFound(sid)),
             Some("lock_conflict") => Err(MetaError::LockConflict {
                 inode,
                 owner,
@@ -2578,7 +2611,11 @@ impl RedisMetaStore {
         )))
     }
 
-    async fn shutdown_session_by_id(&self, session_id: Uuid) -> Result<(), MetaError> {
+    async fn cleanup_session_by_id(
+        &self,
+        session_id: Uuid,
+        expired_before: Option<i64>,
+    ) -> Result<(), MetaError> {
         let locked_key = Self::locked_key(session_id);
         let sid_str = session_id.to_string();
         let plock_prefix = format!("{PLOCK_PREFIX}:");
@@ -2590,6 +2627,11 @@ impl RedisMetaStore {
             .key(SESSION_INFOS_KEY)
             .arg(&sid_str)
             .arg(&plock_prefix)
+            .arg(
+                expired_before
+                    .map(|cutoff| cutoff.to_string())
+                    .unwrap_or_default(),
+            )
             .invoke_async(&mut self.conn.clone())
             .await
             .map_err(redis_err)?;
@@ -2659,10 +2701,16 @@ impl RedisMetaStore {
     ) -> Result<(), MetaError> {
         let session_id_string = session_id.to_string();
         let expire = (Utc::now() + chrono::Duration::minutes(5)).timestamp_millis();
-        redis::Cmd::zadd(ALL_SESSIONS_KEY, session_id_string, expire)
-            .exec_async(&mut conn)
+        let renewed: bool = redis::Script::new(REFRESH_SESSION_LUA)
+            .key(ALL_SESSIONS_KEY)
+            .arg(session_id_string)
+            .arg(expire)
+            .invoke_async(&mut conn)
             .await
             .map_err(|err| MetaError::Internal(err.to_string()))?;
+        if !renewed {
+            return Err(MetaError::SessionNotFound(session_id));
+        }
         Ok(())
     }
 
@@ -2677,6 +2725,9 @@ impl RedisMetaStore {
                         Ok(_) => {}
                         Err(err) => {
                             error!("Failed to refresh session: {}", err);
+                            if matches!(err, MetaError::SessionNotFound(_)) {
+                                break;
+                            }
                         }
                     }
 
@@ -4927,7 +4978,7 @@ impl MetaStore for RedisMetaStore {
     #[tracing::instrument(level = "trace", skip(self))]
     async fn shutdown_session(&self) -> Result<(), MetaError> {
         let session_id = self.get_sid()?;
-        self.shutdown_session_by_id(session_id).await?;
+        self.cleanup_session_by_id(session_id, None).await?;
         Ok(())
     }
 
@@ -4942,7 +4993,7 @@ impl MetaStore for RedisMetaStore {
         for session in sessions {
             let session_id =
                 Uuid::from_str(&session).map_err(|err| MetaError::Internal(err.to_string()))?;
-            self.shutdown_session_by_id(session_id).await?;
+            self.cleanup_session_by_id(session_id, Some(now)).await?;
         }
         Ok(())
     }
@@ -5269,10 +5320,12 @@ impl MetaStore for RedisMetaStore {
                 .key(&flock_key)
                 .key(&locked_key)
                 .key(self.plock_key(inode))
+                .key(ALL_SESSIONS_KEY)
                 .arg(&field)
                 .arg(lock_type.as_u32())
                 .arg(inode)
                 .arg(epoch)
+                .arg(sid.to_string())
                 .invoke_async(&mut self.conn.clone())
                 .await
                 .map_err(redis_err)?;
@@ -5281,6 +5334,7 @@ impl MetaStore for RedisMetaStore {
                 .map_err(|e| MetaError::Internal(format!("flock Lua response parse error: {e}")))?;
 
             let result = match response.error.as_deref() {
+                Some("session_not_found") => Err(MetaError::SessionNotFound(sid)),
                 Some("lock_conflict") => Err(MetaError::LockConflict {
                     inode,
                     owner,

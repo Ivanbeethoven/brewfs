@@ -251,7 +251,191 @@ async fn new_test_store_with_epoch() -> RedisMetaStore {
     store.set_epoch(epoch);
     let session_id = Uuid::now_v7();
     store.set_sid(session_id);
+    redis::pipe()
+        .zadd(
+            super::ALL_SESSIONS_KEY,
+            session_id.to_string(),
+            (chrono::Utc::now() + chrono::Duration::minutes(5)).timestamp_millis(),
+        )
+        .hset(super::SESSION_INFOS_KEY, session_id.to_string(), "{}")
+        .exec_async(&mut conn)
+        .await
+        .unwrap();
     store
+}
+
+#[serial]
+#[tokio::test]
+#[ignore = "requires Redis; set BREWFS_REDIS_TEST_URL"]
+async fn test_session_cleanup_preserves_renewed_session_and_fresh_lock() {
+    let store = new_test_store_with_epoch().await;
+    let sid = store.get_sid().unwrap();
+    let expired_sid = Uuid::now_v7();
+    let inode = 254;
+    let cutoff = chrono::Utc::now().timestamp_millis();
+    let mut conn = store.conn.clone();
+
+    // Both sessions are selected by the reaper. Only one will be renewed.
+    redis::pipe()
+        .zadd(super::ALL_SESSIONS_KEY, sid.to_string(), cutoff)
+        .zadd(super::ALL_SESSIONS_KEY, expired_sid.to_string(), cutoff)
+        .hset(super::SESSION_INFOS_KEY, expired_sid.to_string(), "{}")
+        .exec_async(&mut conn)
+        .await
+        .unwrap();
+    store.set_sid(expired_sid);
+    acquire_write_lock(&store, inode + 1, 1, false, 1234)
+        .await
+        .unwrap();
+    store.set_sid(sid);
+    let selected: Vec<String> = conn
+        .zrangebyscore(super::ALL_SESSIONS_KEY, "-inf", cutoff)
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 2);
+
+    // Deterministically pause between selection and per-session cleanup.
+    // Renew through the heartbeat path, then acquire a newly acknowledged lock.
+    RedisMetaStore::refresh_session(sid, conn.clone())
+        .await
+        .unwrap();
+    acquire_write_lock(&store, inode, 1, false, 1234)
+        .await
+        .unwrap();
+    for selected_sid in selected {
+        store
+            .cleanup_session_by_id(Uuid::parse_str(&selected_sid).unwrap(), Some(cutoff))
+            .await
+            .unwrap();
+    }
+
+    let locks: usize = conn.hlen(store.plock_key(inode)).await.unwrap();
+    assert_eq!(locks, 1, "stale cleanup removed a fresh acknowledged lock");
+    let expiry: Option<i64> = conn
+        .zscore(super::ALL_SESSIONS_KEY, sid.to_string())
+        .await
+        .unwrap();
+    assert!(
+        expiry.is_some_and(|expiry| expiry > cutoff),
+        "stale cleanup removed a renewed session"
+    );
+    let info: bool = conn
+        .hexists(super::SESSION_INFOS_KEY, sid.to_string())
+        .await
+        .unwrap();
+    assert!(info, "renewed session info must survive");
+    assert!(
+        matches!(
+            acquire_write_lock(&store, inode, 2, false, 5678).await,
+            Err(MetaError::LockConflict { .. })
+        ),
+        "a fresh acknowledged lock must still exclude another owner"
+    );
+
+    let expired: Option<i64> = conn
+        .zscore(super::ALL_SESSIONS_KEY, expired_sid.to_string())
+        .await
+        .unwrap();
+    assert_eq!(expired, None);
+    let expired_info: bool = conn
+        .hexists(super::SESSION_INFOS_KEY, expired_sid.to_string())
+        .await
+        .unwrap();
+    assert!(!expired_info);
+    let locked: bool = conn
+        .exists(RedisMetaStore::locked_key(expired_sid))
+        .await
+        .unwrap();
+    assert!(!locked);
+    acquire_write_lock(&store, inode + 1, 2, false, 5678)
+        .await
+        .expect("genuinely expired session's lock must be removed");
+
+    // Explicit shutdown must release even a renewed session's locks.
+    store.shutdown_session().await.unwrap();
+    let remaining: usize = conn.hlen(store.plock_key(inode)).await.unwrap();
+    assert_eq!(remaining, 0);
+    let expiry: Option<i64> = conn
+        .zscore(super::ALL_SESSIONS_KEY, sid.to_string())
+        .await
+        .unwrap();
+    assert_eq!(expiry, None);
+}
+
+#[serial]
+#[tokio::test]
+#[ignore = "requires Redis; set BREWFS_REDIS_TEST_URL"]
+async fn test_session_cleanup_heartbeat_cannot_resurrect_reaped_session() {
+    let store = new_test_store_with_epoch().await;
+    let sid = store.get_sid().unwrap();
+    // Repeated heartbeats on an existing session must succeed, even in the same millisecond.
+    RedisMetaStore::refresh_session(sid, store.conn.clone())
+        .await
+        .unwrap();
+    RedisMetaStore::refresh_session(sid, store.conn.clone())
+        .await
+        .unwrap();
+    let _: () = store
+        .conn
+        .clone()
+        .zadd(super::ALL_SESSIONS_KEY, sid.to_string(), 0)
+        .await
+        .unwrap();
+    store.cleanup_sessions().await.unwrap();
+    let result = RedisMetaStore::refresh_session(sid, store.conn.clone()).await;
+    assert!(
+        matches!(result, Err(MetaError::SessionNotFound(id)) if id == sid),
+        "heartbeat must report a reaped session, got {result:?}"
+    );
+    let expiry: Option<i64> = store
+        .conn
+        .clone()
+        .zscore(super::ALL_SESSIONS_KEY, sid.to_string())
+        .await
+        .unwrap();
+    assert_eq!(expiry, None);
+}
+
+#[serial]
+#[tokio::test]
+#[ignore = "requires Redis; set BREWFS_REDIS_TEST_URL"]
+async fn test_session_cleanup_fences_reaped_plock_acquisition() {
+    let store = new_test_store_with_epoch().await;
+    let sid = store.get_sid().unwrap();
+    let _: () = store
+        .conn
+        .clone()
+        .zadd(super::ALL_SESSIONS_KEY, sid.to_string(), 0)
+        .await
+        .unwrap();
+    store.cleanup_sessions().await.unwrap();
+    let result = acquire_write_lock(&store, 254, 1, false, 1234).await;
+    assert!(
+        matches!(result, Err(MetaError::SessionNotFound(id)) if id == sid),
+        "a reaped session must not acquire locks, got {result:?}"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore = "requires Redis; set BREWFS_REDIS_TEST_URL"]
+async fn test_session_cleanup_fences_reaped_flock_acquisition() {
+    let store = new_test_store_with_epoch().await;
+    let sid = store.get_sid().unwrap();
+    store
+        .set_flock(254, 1, false, FileLockType::Write)
+        .await
+        .unwrap();
+    store
+        .set_flock(254, 1, false, FileLockType::UnLock)
+        .await
+        .unwrap();
+    store.shutdown_session().await.unwrap();
+    let result = store.set_flock(254, 1, false, FileLockType::Write).await;
+    assert!(
+        matches!(result, Err(MetaError::SessionNotFound(id)) if id == sid),
+        "a removed session must not acquire flocks, got {result:?}"
+    );
 }
 
 /// Helper struct to manage multiple test sessions
