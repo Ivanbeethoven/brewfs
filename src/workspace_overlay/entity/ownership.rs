@@ -79,6 +79,60 @@ impl SliceOwnership {
     }
 }
 
+/// Bounded census over the existing volume allocator domain, including old
+/// tombstones. Capture the high watermark only after maintenance admission:
+/// this namespace cannot allocate again under the same exact authority, and
+/// foreign allocations must not extend the census indefinitely. No new index
+/// or migration of existing reservations is needed.
+pub(super) struct SliceCensus {
+    next: u64,
+    end: u64,
+}
+
+impl SliceCensus {
+    pub async fn new<B: EntityBackend>(backend: &B, keys: &EntityKeys) -> Result<Self> {
+        let snapshot = backend.read(&[keys.counter("slice")]).await?;
+        let counter = snapshot.rows[0]
+            .as_deref()
+            .ok_or_else(|| EntityError::Corrupt("missing slice counter".into()))?;
+        let end = match super::backend::next_counter(counter) {
+            Ok(next) => next,
+            Err(EntityError::Exhausted) => i64::MAX as u64 + 1,
+            Err(error) => return Err(error),
+        };
+        Ok(Self { next: 1, end })
+    }
+
+    /// Some(empty) is a foreign-only page, not the end of the census. Retain
+    /// only this namespace's evidence and validate its exact allocated SID.
+    pub async fn next_page<B: EntityBackend>(
+        &mut self,
+        backend: &B,
+        keys: &EntityKeys,
+    ) -> Result<Option<Vec<SliceOwnership>>> {
+        if self.next == self.end {
+            return Ok(None);
+        }
+        let end = (self.next + 128).min(self.end);
+        let row_keys = (self.next..end)
+            .map(|id| keys.slice(id))
+            .collect::<Vec<_>>();
+        let snapshot = backend.read(&row_keys).await?;
+        let mut rows = Vec::new();
+        for (id, bytes) in (self.next..end).zip(snapshot.rows) {
+            if let Some(bytes) = bytes {
+                let row: SliceOwnership = decode(&bytes)?;
+                if row.namespace_id == keys.namespace_id() {
+                    row.validate(keys, id)?;
+                    rows.push(row);
+                }
+            }
+        }
+        self.next = end;
+        Ok(Some(rows))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SliceMembership {
     pub namespace_id: Uuid,
@@ -286,7 +340,13 @@ impl<B: EntityBackend> Ownership<B> {
                     &authority,
                     &EntityPlan {
                         checks: checked_rows(&keys, snapshot.rows),
-                        writes: vec![put(keys[0].clone(), &row)?],
+                        // Resume checks this namespace-wide fence instead of
+                        // accumulating a predicate for every historical slice.
+                        // The fresh reservation prevents ABA across deletions.
+                        writes: vec![
+                            put(keys[0].clone(), &row)?,
+                            put(self.keys.slice_delete_fence(), &reservation)?,
+                        ],
                     },
                 )
                 .await?,

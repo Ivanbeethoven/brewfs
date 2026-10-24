@@ -59,6 +59,10 @@ impl EntityKeys {
     pub fn maintenance(&self) -> Vec<u8> {
         self.key("maintenance")
     }
+    /// Changed atomically whenever maintenance introduces a Deleting slice.
+    pub fn slice_delete_fence(&self) -> Vec<u8> {
+        self.key("slice-delete-fence")
+    }
     pub fn inode(&self, ino: i64) -> Vec<u8> {
         self.key(&format!("inode/{ino}"))
     }

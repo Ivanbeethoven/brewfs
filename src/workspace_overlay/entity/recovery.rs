@@ -15,7 +15,7 @@ use super::keys::EntityKeys;
 use super::lifecycle::{Lifecycle, MaintenanceToken, checked_rows, committed, put};
 use super::model::{ChunkMap, ChunkSource, EntityDentry, EntityInode, EntityKind, UpperInode};
 use super::ownership::{
-    DeletionToken, OrphanRecord, Ownership, SliceOwnership, SliceState, plan_chunk_membership,
+    DeletionToken, OrphanRecord, Ownership, SliceCensus, SliceState, plan_chunk_membership,
 };
 use super::{EntityError, Result};
 
@@ -441,6 +441,7 @@ impl<B: EntityBackend> Recovery<B> {
             self.keys.lower_pin(),
             self.keys.maintenance(),
             self.keys.counter("inode"),
+            self.keys.slice_delete_fence(),
         ];
         let batch = rows
             .into_iter()
@@ -464,40 +465,32 @@ impl<B: EntityBackend> Recovery<B> {
             committed(self.backend.commit(&authority, &plan).await?)?;
             return Ok(DiscardProgress::Pending);
         }
-        let slice_prefix = [self.keys.volume_prefix(), b"slice/"].concat();
-        for (key, value) in self.backend.scan_prefix(&slice_prefix, 4096).await? {
-            let row: SliceOwnership = decode(&value)?;
-            if row.namespace_id != self.keys.namespace_id() {
-                continue;
-            }
-            row.validate(&self.keys, row.slice_id)?;
-            if key != self.keys.slice(row.slice_id) {
-                return Err(EntityError::Corrupt(
-                    "discard found mismatched slice identity".into(),
-                ));
-            }
-            if matches!(row.state, SliceState::Deleted { .. }) {
-                continue;
-            }
-            if row.current_refs != 0 {
-                return Err(EntityError::Corrupt(
-                    "discard found references without memberships".into(),
-                ));
-            }
-            if row.publication_refs != 0 {
-                return Err(EntityError::Busy);
-            }
-            if row.staging_hold {
-                self.ownership
-                    .abandon_upload(maintenance, row.slice_id)
+        let mut census = SliceCensus::new(self.backend.as_ref(), &self.keys).await?;
+        while let Some(rows) = census.next_page(self.backend.as_ref(), &self.keys).await? {
+            for row in rows {
+                if matches!(row.state, SliceState::Deleted { .. }) {
+                    continue;
+                }
+                if row.current_refs != 0 {
+                    return Err(EntityError::Corrupt(
+                        "discard found references without memberships".into(),
+                    ));
+                }
+                if row.publication_refs != 0 {
+                    return Err(EntityError::Busy);
+                }
+                if row.staging_hold {
+                    self.ownership
+                        .abandon_upload(maintenance, row.slice_id)
+                        .await?;
+                    return Ok(DiscardProgress::Pending);
+                }
+                let deletion = self
+                    .ownership
+                    .reserve_delete(maintenance, row.slice_id)
                     .await?;
-                return Ok(DiscardProgress::Pending);
+                return Ok(DiscardProgress::ObjectDeletion(deletion));
             }
-            let deletion = self
-                .ownership
-                .reserve_delete(maintenance, row.slice_id)
-                .await?;
-            return Ok(DiscardProgress::ObjectDeletion(deletion));
         }
         self.lifecycle.discard_empty(maintenance).await?;
         Ok(DiscardProgress::Complete)
