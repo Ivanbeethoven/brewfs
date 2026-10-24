@@ -1709,6 +1709,139 @@ async fn test_rename_lua_overwrite_cleans_reverse_links() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_rename_lua_overwrite_rejects_stale_reverse_index() {
+    async fn snapshot(store: &RedisMetaStore) -> Vec<(String, Vec<u8>)> {
+        let mut conn = store.conn.clone();
+        let mut keys: Vec<String> = conn.keys("*").await.unwrap();
+        keys.sort();
+        let mut rows = Vec::new();
+        for key in keys {
+            let value = redis::cmd("DUMP")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            rows.push((key, value));
+        }
+        rows
+    }
+
+    for (remaining_links, corruption) in [
+        (1, "extra"),
+        (2, "extra"),
+        (1, "missing_destination"),
+        (2, "missing_destination"),
+        (1, "missing_survivor"),
+        (1, "malformed_survivor"),
+        (1, "foreign_survivor"),
+        (1, "wrong_type"),
+    ] {
+        let store = new_test_store().await;
+        let root = store.root_ino();
+        let parent = store.mkdir(root, "destination".to_string()).await.unwrap();
+        let replaced = store.create_file(parent, "old".to_string()).await.unwrap();
+        let source = store.create_file(root, "source".to_string()).await.unwrap();
+        let survivors = (0..remaining_links)
+            .map(|index| format!("survivor::{index}:"))
+            .collect::<Vec<_>>();
+        for name in &survivors {
+            store.link(replaced, root, name).await.unwrap();
+        }
+
+        let key = RedisMetaStore::link_parent_key(replaced);
+        let mut conn = store.conn.clone();
+        match corruption {
+            "extra" => {
+                // Model a legacy overwrite leaving a reverse entry whose
+                // directory entry now belongs to a different inode.
+                let _: usize = conn.sadd(&key, format!("{root}:source")).await.unwrap();
+            }
+            "missing_destination" => {
+                let _: usize = conn.srem(&key, format!("{parent}:old")).await.unwrap();
+                // A matching cardinality must not hide the absent binding.
+                let _: usize = conn.sadd(&key, format!("{root}:source")).await.unwrap();
+            }
+            "missing_survivor" | "malformed_survivor" | "foreign_survivor" => {
+                let _: usize = conn
+                    .srem(&key, format!("{root}:{}", survivors[0]))
+                    .await
+                    .unwrap();
+                if corruption != "missing_survivor" {
+                    let member = if corruption == "malformed_survivor" {
+                        "not-a-parent:survivor".to_string()
+                    } else {
+                        format!("{root}:source")
+                    };
+                    let _: usize = conn.sadd(&key, member).await.unwrap();
+                }
+            }
+            "wrong_type" => {
+                let _: () = conn.set(&key, "not-a-set").await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = snapshot(&store).await;
+        let result = store
+            .rename(root, "source", parent, "old".to_string())
+            .await;
+
+        if corruption == "extra" {
+            let paths = store.get_paths(replaced).await.unwrap();
+            for name in &survivors {
+                assert!(
+                    paths.contains(&format!("/{name}")),
+                    "rename lost surviving reverse path /{name}: result={result:?}, paths={paths:?}"
+                );
+            }
+        }
+        assert!(
+            matches!(result, Err(MetaError::Internal(_))),
+            "inconsistent reverse index must reject rename: {corruption}: {result:?}"
+        );
+        assert_eq!(
+            snapshot(&store).await,
+            before,
+            "partial rename: {corruption}"
+        );
+        assert_eq!(store.lookup(root, "source").await.unwrap(), Some(source));
+        assert_eq!(store.lookup(parent, "old").await.unwrap(), Some(replaced));
+        for name in &survivors {
+            assert_eq!(store.lookup(root, name).await.unwrap(), Some(replaced));
+        }
+        if corruption == "extra" {
+            // Once the stale fixture entry is repaired, retrying the same
+            // rename must preserve every surviving path, including colons.
+            let _: usize = conn.srem(&key, format!("{root}:source")).await.unwrap();
+            store
+                .rename(root, "source", parent, "old".to_string())
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get_paths(replaced).await.unwrap(),
+                survivors
+                    .iter()
+                    .map(|name| format!("/{name}"))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                store.get_names(replaced).await.unwrap(),
+                survivors
+                    .iter()
+                    .map(|name| (Some(root), name.clone()))
+                    .collect::<Vec<_>>()
+            );
+            for name in &survivors {
+                assert_eq!(store.lookup(root, name).await.unwrap(), Some(replaced));
+            }
+            assert_eq!(store.lookup(parent, "old").await.unwrap(), Some(source));
+            assert_eq!(store.lookup(root, "source").await.unwrap(), None);
+        }
+    }
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_rename_lua_directory_replaces_empty_directory() {
     let store = new_test_store().await;
     let root = store.root_ino();

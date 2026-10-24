@@ -1284,6 +1284,29 @@ const RENAME_LUA: &str = r#"
             -- Non-directory cannot replace a directory
             return cjson.encode({ok=false, error="target_is_directory", ino=tonumber(dest_ino_str)})
         else
+            local dest_lp_key = link_parent_prefix .. dest_ino_str
+            local dest_member = ARGV[4] .. ":" .. new_name
+            local remaining_parent, remaining_name
+            -- Validate before mutation: Redis does not roll back failed scripts.
+            -- A stale index must not silently lose the last surviving path.
+            if dest_node.attr.nlink > 1 then
+                if redis.call('SCARD', dest_lp_key) ~= dest_node.attr.nlink
+                    or redis.call('SISMEMBER', dest_lp_key, dest_member) ~= 1 then
+                    return cjson.encode({ok=false, error="corrupt_link_parents", ino=replaced_ino})
+                end
+                if dest_node.attr.nlink == 2 then
+                    -- Cardinality is exactly two; never read an unbounded set.
+                    local members = redis.call('SRANDMEMBER', dest_lp_key, 2)
+                    local member = members[1] == dest_member and members[2] or members[1]
+                    local parent_str, name = string.match(member, "^(%d+):(.+)$")
+                    remaining_parent = tonumber(parent_str)
+                    remaining_name = name
+                    if not remaining_parent or remaining_parent <= 0
+                        or redis.call('HGET', 'd' .. parent_str, remaining_name) ~= dest_ino_str then
+                        return cjson.encode({ok=false, error="corrupt_link_parents", ino=replaced_ino})
+                    end
+                end
+            end
             -- file/symlink replacing file/symlink: decrement nlink, delete node if no links remain
             dest_node.attr.nlink = dest_node.attr.nlink - 1
             redis.call('HDEL', new_parent_dir_key, new_name)
@@ -1295,20 +1318,12 @@ const RENAME_LUA: &str = r#"
                 redis.call('HSET', deleted_set_key, dest_ino_str, 1)
                 redis.call('DEL', link_parent_prefix .. dest_ino_str)
             else
-                local dest_lp_key = link_parent_prefix .. dest_ino_str
-                redis.call('SREM', dest_lp_key, ARGV[4] .. ":" .. new_name)
-                -- Restore the inline path when only one hard link remains.
+                redis.call('SREM', dest_lp_key, dest_member)
+                -- Restore the verified inline path when only one link remains.
                 if dest_node.attr.nlink == 1 then
-                    local remaining_members = redis.call('SMEMBERS', dest_lp_key)
-                    if #remaining_members == 1 then
-                        local member = remaining_members[1]
-                        local sep_pos = string.find(member, ":", 1, true)
-                        if sep_pos and sep_pos > 1 and sep_pos < #member then
-                            dest_node.parent = tonumber(string.sub(member, 1, sep_pos - 1))
-                            dest_node.name = string.sub(member, sep_pos + 1)
-                            redis.call('DEL', dest_lp_key)
-                        end
-                    end
+                    dest_node.parent = remaining_parent
+                    dest_node.name = remaining_name
+                    redis.call('DEL', dest_lp_key)
                 end
                 dest_node.attr.ctime = timestamp
                 redis.call('SET', dest_node_key, cjson.encode(dest_node))
