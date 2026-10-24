@@ -708,7 +708,6 @@ impl<B: ObjectBackend + Clone + 'static> V3IndexReader<B> {
             let reference = reference.clone();
             let budget = self.budget.clone();
             let fetch_expected = expected.clone();
-            let pages = self.pages.clone();
             let cache_ownership = self.cache_ownership.clone();
             let elected = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let factory_elected = Arc::clone(&elected);
@@ -724,15 +723,10 @@ impl<B: ObjectBackend + Clone + 'static> V3IndexReader<B> {
                     if bytes > cache_ownership.capacity {
                         return Err(V3IndexFetchError::Unretained(page));
                     }
-                    let mut lease = cache_ownership.try_admit(bytes);
-                    if lease.is_none() {
-                        // Drop only cache references. Any cursor still owns
-                        // the page's original mount Metadata permit.
-                        pages.invalidate_all();
-                        pages.run_pending_tasks().await;
-                        lease = cache_ownership.try_admit(bytes);
-                    }
-                    match lease {
+                    // Ordinary retention pressure must not flush hot pages.
+                    // Share the new page without caching it when the exact
+                    // owner budget has no room; its mount permit stays alive.
+                    match cache_ownership.try_admit(bytes) {
                         Some(lease) => Ok(Arc::new(V3RetainedIndexPage {
                             page,
                             _cache_lease: lease,
