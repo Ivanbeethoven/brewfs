@@ -161,6 +161,24 @@ async fn conformance<B: EntityBackend + 'static>(backend: Arc<B>, keys: EntityKe
         rows.iter()
             .all(|(key, value)| key.starts_with(&prefix) && value.len() == 1)
     );
+    assert_eq!(
+        backend.scan_prefix_batch(&prefix, 2).await.unwrap(),
+        rows[..2]
+    );
+    assert_eq!(backend.scan_prefix_batch(&prefix, 4).await.unwrap(), rows);
+    assert!(
+        backend
+            .scan_prefix_batch(&keys.dentry_prefix(3), 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    for limit in [0, MAX_TRANSACTION_ROWS + 1] {
+        assert!(matches!(
+            backend.scan_prefix_batch(&prefix, limit).await,
+            Err(EntityError::Invalid(_))
+        ));
+    }
 
     let snapshot = backend.read(&[]).await.unwrap();
     let expired =
