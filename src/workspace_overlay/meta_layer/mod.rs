@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use futures::StreamExt;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::chunk::SliceDesc;
@@ -221,6 +222,9 @@ fn duplicate_write_error(error: &MetaError) -> MetaError {
 
 /// Bound on writes folded into one commit, far inside the packet limits.
 const MAX_GROUP_WRITES: usize = 64;
+
+/// Bound simultaneous cold snapshots (each packed snapshot admits 2 MiB).
+const MAX_GROUP_INODE_READS: usize = 8;
 
 #[derive(Default)]
 struct WorkspaceLocks {
@@ -771,7 +775,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
     /// caller always ends up in one of these batches.
     async fn lead_group_commits(&self) {
         loop {
-            let batch = {
+            let mut batch = {
                 let mut queue = self.write_queue.lock().unwrap();
                 if queue.pending.is_empty() {
                     queue.leader = false;
@@ -781,23 +785,9 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                 queue.pending.drain(..take).collect::<Vec<_>>()
             };
             let _mutation_guard = self.mutation_gate.lock().await;
-            // A member whose inode is gone or not a regular file fails alone;
-            // it must not fail unrelated writes sharing the batch.
-            let mut members = Vec::with_capacity(batch.len());
-            for member in batch {
-                match self.write_target_is_file(member.ino).await {
-                    Ok(()) => members.push(member),
-                    Err(error) => {
-                        let _ = member.reply.send(Err(error));
-                    }
-                }
-            }
-            if members.is_empty() {
-                continue;
-            }
-            let result = self.commit_write_batch(&members).await;
+            let result = self.commit_write_batch(&mut batch).await;
             drop(_mutation_guard);
-            for member in members {
+            for member in batch {
                 let _ = member.reply.send(match &result {
                     Ok(()) => Ok(()),
                     Err(error) => Err(duplicate_write_error(error)),
@@ -806,7 +796,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         }
     }
 
-    async fn write_target_is_file(&self, ino: i64) -> Result<(), MetaError> {
+    async fn write_target_inode(&self, ino: i64) -> Result<InodeDelta, MetaError> {
         let inode = self
             .resolve_inode_delta(ino)
             .await?
@@ -816,36 +806,55 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                 "workspace data writes require a regular file".into(),
             ));
         }
-        Ok(())
+        Ok(inode)
+    }
+
+    /// Resolve each distinct inode once per attempt, with bounded backend
+    /// concurrency. Keep the results locally: cache eviction/expiry must not
+    /// turn mutation construction into another round of serial snapshots.
+    async fn prefetch_write_inodes(
+        &self,
+        batch: &[PendingWrite],
+    ) -> BTreeMap<i64, Result<InodeDelta, MetaError>> {
+        let inodes = batch.iter().map(|write| write.ino).collect::<BTreeSet<_>>();
+        futures::stream::iter(inodes)
+            .map(|ino| async move { (ino, self.write_target_inode(ino).await) })
+            .buffer_unordered(MAX_GROUP_INODE_READS)
+            .collect()
+            .await
     }
 
     /// Commit every write of `batch` in one versioned mutation: one inode row
     /// per distinct inode (folded in arrival order) and every visible extent
     /// in arrival order, so a later write still wins on overlap.
-    async fn commit_write_batch(&self, batch: &[PendingWrite]) -> Result<(), MetaError> {
+    async fn commit_write_batch(&self, batch: &mut Vec<PendingWrite>) -> Result<(), MetaError> {
         for _ in 0..64 {
+            // Capture the CAS version before fetching rows, and discard all
+            // prefetched values on conflict before reading the next version.
             let expected_layers = self.mutation_version().await?;
+            let prefetched = self.prefetch_write_inodes(batch).await;
+            let mut inodes = BTreeMap::new();
+            // A missing/non-file inode fails only its own members, including
+            // on retry. Keep the remaining writes in their arrival order.
+            for member in std::mem::take(batch) {
+                match &prefetched[&member.ino] {
+                    Ok(inode) => {
+                        inodes.entry(member.ino).or_insert_with(|| inode.clone());
+                        batch.push(member);
+                    }
+                    Err(error) => {
+                        let _ = member.reply.send(Err(duplicate_write_error(error)));
+                    }
+                }
+            }
+            if batch.is_empty() {
+                return Ok(());
+            }
             let result = async {
-                let mut inodes: BTreeMap<i64, InodeDelta> = BTreeMap::new();
                 let mut extents = Vec::with_capacity(batch.len());
                 let now = now_ns()?;
-                for write in batch {
-                    let inode = match inodes.remove(&write.ino) {
-                        Some(inode) => inode,
-                        None => {
-                            let inode = self
-                                .resolve_inode_delta(write.ino)
-                                .await?
-                                .ok_or(MetaError::NotFound(write.ino))?;
-                            if file_type_from_code(inode.kind)? != FileType::File {
-                                return Err(MetaError::NotSupported(
-                                    "workspace data writes require a regular file".into(),
-                                ));
-                            }
-                            inode
-                        }
-                    };
-                    let mut inode = inode;
+                for write in batch.iter() {
+                    let inode = inodes.get_mut(&write.ino).expect("validated write inode");
                     let (_, chunk_index) = crate::vfs::extract_ino_and_chunk_index(write.chunk_id);
                     let slice_start = chunk_index * self.chunk_size + write.slice.offset;
                     // Publish only the visible prefix; see the single-write
@@ -865,7 +874,6 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                         0,
                         0,
                     ));
-                    inodes.insert(write.ino, inode);
                 }
                 self.mutate_data_batch(&expected_layers, inodes.into_values().collect(), extents)
                     .await
