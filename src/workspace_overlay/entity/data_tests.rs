@@ -306,6 +306,14 @@ impl<B: EntityBackend> EntityBackend for MeteredBackend<B> {
         self.scans.fetch_add(1, Ordering::SeqCst);
         self.inner.scan_prefix(prefix, limit).await
     }
+    async fn scan_prefix_batch(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scans.fetch_add(1, Ordering::SeqCst);
+        self.inner.scan_prefix_batch(prefix, limit).await
+    }
 }
 
 async fn exercise_batched_file_io<B: EntityBackend + 'static>(
@@ -2152,6 +2160,13 @@ impl EntityBackend for RenewDuringAllocationBackend {
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.inner.scan_prefix(prefix, limit).await
     }
+    async fn scan_prefix_batch(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.scan_prefix_batch(prefix, limit).await
+    }
 
     async fn commit(
         &self,
@@ -2245,6 +2260,13 @@ impl EntityBackend for LostReplyBackend {
     }
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.inner.scan_prefix(prefix, limit).await
+    }
+    async fn scan_prefix_batch(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.scan_prefix_batch(prefix, limit).await
     }
     async fn commit(
         &self,

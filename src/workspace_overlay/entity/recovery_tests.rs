@@ -49,6 +49,13 @@ impl<B: EntityBackend> EntityBackend for FaultBackend<B> {
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.inner.scan_prefix(prefix, limit).await
     }
+    async fn scan_prefix_batch(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.scan_prefix_batch(prefix, limit).await
+    }
 }
 
 struct Fixture<B> {
@@ -631,6 +638,265 @@ async fn orphan_contract<B: EntityBackend>(backend: Arc<B>, keys: EntityKeys) {
             .rows[0],
         Some(encode(&UpperInode::Deleted).unwrap())
     );
+}
+
+#[tokio::test]
+async fn discard_progresses_above_4096_namespace_rows() {
+    large_discard_contract(
+        Arc::new(MemoryEntityBackend::new(10)),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires BREWFS_TEST_REDIS_URL pointing to an isolated local Redis"]
+async fn discard_progresses_above_4096_namespace_rows_redis() {
+    let url = std::env::var("BREWFS_TEST_REDIS_URL").expect("BREWFS_TEST_REDIS_URL");
+    let volume = Uuid::new_v4();
+    let backend = Arc::new(RedisEntityBackend::connect(&url, volume).await.unwrap());
+    let keys = EntityKeys::new(volume, Uuid::new_v4());
+    large_discard_contract(backend.clone(), keys.clone()).await;
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let mut remaining: Vec<_> = backend
+        .scan_prefix(keys.volume_prefix(), 4096)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    remaining.push(keys.key_index());
+    redis::cmd("DEL")
+        .arg(remaining)
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+}
+
+async fn large_discard_contract<B: EntityBackend + 'static>(backend: Arc<B>, keys: EntityKeys) {
+    use crate::workspace_overlay::entity::namespace::{
+        CreateRequest, Credentials, EntityNamespace,
+    };
+
+    let lower = Arc::new(MemoryLower::empty());
+    let lifecycle = Lifecycle::new(backend.clone(), keys.clone());
+    lifecycle.provision(&lower.binding).await.unwrap();
+    let session = lifecycle
+        .acquire(Uuid::new_v4(), 60_000_000_000)
+        .await
+        .unwrap();
+    let namespace = EntityNamespace::new(
+        backend.clone(),
+        lower.clone(),
+        keys.clone(),
+        session.clone(),
+    );
+    for index in 0..2049 {
+        namespace
+            .create(
+                CreateRequest {
+                    parent: 1,
+                    name: format!("file-{index}").into_bytes(),
+                    kind: EntityKind::File,
+                    mode: 0o644,
+                    rdev: 0,
+                    symlink_target: None,
+                },
+                Credentials {
+                    uid: 0,
+                    gid: 0,
+                    groups: vec![0],
+                    umask: 0,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let mut metadata_keys = Vec::new();
+    for suffix in [b"dentry/".as_slice(), b"inode/"] {
+        let prefix = [keys.prefix(), suffix].concat();
+        metadata_keys.extend(
+            backend
+                .scan_prefix(&prefix, 4096)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(key, _)| key),
+        );
+    }
+    assert!(metadata_keys.len() > 4096);
+    // Complete observations must still reject overflow for other callers.
+    assert!(matches!(
+        backend.scan_prefix(keys.prefix(), 4096).await,
+        Err(EntityError::Invalid(_))
+    ));
+    eprintln!(
+        "created 2049 empty files: {} inode/dentry rows",
+        metadata_keys.len()
+    );
+    let maintenance = lifecycle.enter_maintenance(&session).await.unwrap();
+    let mut remaining = metadata_keys.len();
+    let mut completed = false;
+    for step in 0..64 {
+        // Reconstruct recovery each time: progress must survive a caller restart.
+        let result = Recovery::new(backend.clone(), keys.clone())
+            .discard_step(&maintenance)
+            .await;
+        if let Err(error) = &result {
+            for retry in 1..=2 {
+                eprintln!(
+                    "retry {retry}: {:?}",
+                    Recovery::new(backend.clone(), keys.clone())
+                        .discard_step(&maintenance)
+                        .await
+                        .err()
+                );
+            }
+            eprintln!(
+                "step {step}: {error:?}; lower-owner proof: {:?}",
+                lifecycle.deleted_lower_owner_proof(&maintenance).await
+            );
+        }
+        match result.unwrap() {
+            DiscardProgress::Pending => {
+                let mut next = 0;
+                for batch in metadata_keys.chunks(128) {
+                    next += backend
+                        .read(batch)
+                        .await
+                        .unwrap()
+                        .rows
+                        .iter()
+                        .filter(|row| row.is_some())
+                        .count();
+                }
+                assert!(next < remaining, "discard did not remove metadata");
+                assert!(remaining - next <= 128, "discard exceeded its batch bound");
+                remaining = next;
+                assert!(matches!(
+                    lifecycle.deleted_lower_owner_proof(&maintenance).await,
+                    Err(EntityError::Busy)
+                ));
+            }
+            DiscardProgress::Complete => {
+                assert_eq!(remaining, 0);
+                eprintln!("discard complete after {} steps", step + 1);
+                completed = true;
+                break;
+            }
+            DiscardProgress::ObjectDeletion(_) => panic!("empty files have no upper objects"),
+        }
+    }
+    assert!(
+        completed,
+        "discard failed to complete within bounded batches"
+    );
+    lifecycle
+        .deleted_lower_owner_proof(&maintenance)
+        .await
+        .unwrap();
+    assert!(
+        backend
+            .read(&[
+                keys.lower_pin(),
+                keys.lower_owner(&lower.binding.manifest_digest, keys.namespace_id()),
+            ])
+            .await
+            .unwrap()
+            .rows
+            .iter()
+            .all(Option::is_none)
+    );
+    let registry: LowerRegistry = decode(
+        backend
+            .read(&[keys.lower_registry(&lower.binding.manifest_digest)])
+            .await
+            .unwrap()
+            .rows[0]
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(registry.owners, 0);
+}
+
+#[tokio::test]
+async fn discard_checks_chunks_and_owners_before_sweeping_metadata() {
+    let mut fixture = Fixture::new(
+        Arc::new(MemoryEntityBackend::new(10)),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
+    let first = fixture.upper(1, 0, b"data").await;
+    let second = fixture.upper(2, 0, b"more").await;
+    let dentry_keys: Vec<_> = (0..129)
+        .map(|i| fixture.keys.dentry(1, format!("whiteout-{i}").as_bytes()))
+        .collect();
+    fixture
+        .commit(&EntityPlan {
+            checks: vec![],
+            writes: dentry_keys
+                .iter()
+                .map(|key| put(key.clone(), &EntityDentry::Whiteout).unwrap())
+                .collect(),
+        })
+        .await;
+    let mut metadata_keys = dentry_keys;
+    metadata_keys.push(fixture.keys.inode(2));
+    let before = fixture.backend.read(&metadata_keys).await.unwrap().rows;
+    let maintenance = fixture
+        .lifecycle
+        .enter_maintenance(&fixture.session)
+        .await
+        .unwrap();
+    for id in [first, second] {
+        assert!(matches!(
+            fixture.recovery().discard_step(&maintenance).await.unwrap(),
+            DiscardProgress::Pending
+        ));
+        assert_eq!(fixture.slice(id).await.current_refs, 0);
+        assert_eq!(
+            fixture.backend.read(&metadata_keys).await.unwrap().rows,
+            before
+        );
+    }
+    // This owner sorts beyond the first metadata batch. Even there it must
+    // block the sweep rather than being deleted as ordinary metadata.
+    let authority = fixture
+        .lifecycle
+        .maintenance_authority(&maintenance)
+        .await
+        .unwrap();
+    committed(
+        fixture
+            .backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![put(fixture.keys.owner(first, 2, 99), &true).unwrap()],
+                },
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        fixture.recovery().discard_step(&maintenance).await,
+        Err(EntityError::Corrupt(message)) if message == "discard found membership without chunk"
+    ));
+    assert_eq!(
+        fixture.backend.read(&metadata_keys).await.unwrap().rows,
+        before
+    );
+    assert!(matches!(
+        fixture
+            .lifecycle
+            .deleted_lower_owner_proof(&maintenance)
+            .await,
+        Err(EntityError::Busy)
+    ));
 }
 
 #[tokio::test]

@@ -397,9 +397,12 @@ impl<B: EntityBackend> Recovery<B> {
         }
         self.lifecycle.begin_discard(maintenance).await?;
         let authority = self.lifecycle.maintenance_authority(maintenance).await?;
-        let rows = self.backend.scan_prefix(self.keys.prefix(), 4096).await?;
+        // Each committed deletion advances the next scan from the beginning.
+        // Separate prefix probes preserve the cleanup ordering even when a
+        // chunk or membership would fall outside the first metadata batch.
         let chunk_prefix = [self.keys.prefix(), b"chunk/"].concat();
-        if let Some((key, bytes)) = rows.iter().find(|(key, _)| key.starts_with(&chunk_prefix)) {
+        let chunks = self.backend.scan_prefix_batch(&chunk_prefix, 1).await?;
+        if let Some((key, bytes)) = chunks.first() {
             let suffix = std::str::from_utf8(&key[chunk_prefix.len()..])
                 .map_err(|_| EntityError::Corrupt("invalid discarded chunk key".into()))?;
             let (ino, index) = suffix
@@ -430,7 +433,12 @@ impl<B: EntityBackend> Recovery<B> {
             return Ok(DiscardProgress::Pending);
         }
         let owner_prefix = [self.keys.prefix(), b"owner/"].concat();
-        if rows.iter().any(|(key, _)| key.starts_with(&owner_prefix)) {
+        if !self
+            .backend
+            .scan_prefix_batch(&owner_prefix, 1)
+            .await?
+            .is_empty()
+        {
             return Err(EntityError::Corrupt(
                 "discard found membership without chunk".into(),
             ));
@@ -443,6 +451,14 @@ impl<B: EntityBackend> Recovery<B> {
             self.keys.counter("inode"),
             self.keys.slice_delete_fence(),
         ];
+        // Allow room for every retained lifecycle row, so they cannot hide a
+        // sweepable row or turn a partial scan into a false emptiness proof.
+        // Deleting at most 128 observed rows makes progress restart-safe
+        // without a separately persisted cursor.
+        let rows = self
+            .backend
+            .scan_prefix_batch(self.keys.prefix(), 128 + lifecycle_keys.len())
+            .await?;
         let batch = rows
             .into_iter()
             .filter(|(key, _)| !lifecycle_keys.contains(key))

@@ -185,6 +185,15 @@ pub trait EntityBackend: Send + Sync {
     /// Bounded prefix observation. A caller using this to decide a mutation must
     /// check its parent row, read before the scan, in the resulting transaction.
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// First at most `limit` matching rows in key order. More matching rows are
+    /// allowed; only an empty batch proves prefix absence. A quiescent sweeper
+    /// can resume from the beginning after deleting each batch, retaining exact
+    /// authority and row predicates for every mutation.
+    async fn scan_prefix_batch(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 }
 
 pub(super) fn validate_key(key: &[u8]) -> Result<()> {
