@@ -128,12 +128,11 @@ impl V3GroupRef {
         Ok(reference)
     }
 
-    pub async fn read_metadata<B: ObjectBackend + Clone>(
+    fn validate_metadata_read(
         &self,
-        client: &ObjectClient<B>,
         container: &V3ObjectRef,
         allocation_limit: usize,
-    ) -> PackedResult<Arc<GroupMeta>> {
+    ) -> PackedResult<()> {
         self.validate()?;
         super::validate_key(&container.key)?;
         if container.kind != V3ObjectKind::GroupContainer
@@ -152,6 +151,16 @@ impl V3GroupRef {
                 "wire 005 group metadata allocation exceeds budget".into(),
             ));
         }
+        Ok(())
+    }
+
+    pub async fn read_metadata<B: ObjectBackend + Clone>(
+        &self,
+        client: &ObjectClient<B>,
+        container: &V3ObjectRef,
+        allocation_limit: usize,
+    ) -> PackedResult<Arc<GroupMeta>> {
+        self.validate_metadata_read(container, allocation_limit)?;
         client
             .typed_exact(
                 crate::cadapter::read_observer::ReadClass::GroupMetadata,
@@ -246,6 +255,82 @@ impl V3GroupRef {
         permit.shrink(V3BudgetPool::Raw, 0)?;
         permit.shrink(V3BudgetPool::Workspace, 0)?;
         Ok(Arc::new(super::budget::V3Owned::new(metadata, permit)))
+    }
+}
+
+type OwnedGroupMetadata = Arc<super::budget::V3Owned<Arc<GroupMeta>>>;
+
+struct DirectoryGroup {
+    group: V3GroupRef,
+    container: V3ObjectRef,
+    metadata: tokio::sync::OnceCell<OwnedGroupMetadata>,
+}
+
+/// One authenticated group per open directory. Switching groups retires the
+/// previous slot; concurrent consumers keep their own charged owners alive.
+pub(crate) struct V3DirectoryMetadata {
+    current: std::sync::Mutex<Option<Arc<super::budget::V3Owned<DirectoryGroup>>>>,
+    budget: Arc<super::V3MountBudget>,
+    _permit: super::V3OwnedPermit,
+}
+
+impl V3DirectoryMetadata {
+    pub(crate) fn new(budget: Arc<super::V3MountBudget>) -> PackedResult<Self> {
+        let permit = budget.admit(&[(super::V3BudgetPool::Roots, 256)])?;
+        Ok(Self {
+            current: std::sync::Mutex::new(None),
+            budget,
+            _permit: permit,
+        })
+    }
+
+    pub(super) async fn read<B: ObjectBackend + Clone>(
+        &self,
+        group: &V3GroupRef,
+        client: &ObjectClient<B>,
+        container: &V3ObjectRef,
+        allocation_limit: usize,
+    ) -> PackedResult<OwnedGroupMetadata> {
+        // Hits and followers still obey admission and the caller's allocation
+        // limit. Match the complete references so count/name/frame claims can
+        // never borrow validation from a different occurrence of the bytes.
+        let _request = self.budget.admit(&[(super::V3BudgetPool::Control, 512)])?;
+        group.validate_metadata_read(container, allocation_limit)?;
+        let slot = {
+            let mut current = self.current.lock().unwrap();
+            if let Some(slot) = current
+                .as_ref()
+                .filter(|slot| slot.group == *group && slot.container == *container)
+            {
+                slot.clone()
+            } else {
+                // Release the old retained group before admitting its successor.
+                *current = None;
+                let bytes =
+                    512 + group.first_name.len() + group.last_name.len() + container.key.len();
+                let permit = self
+                    .budget
+                    .admit(&[(super::V3BudgetPool::Metadata, bytes as u64)])?;
+                let slot = Arc::new(super::budget::V3Owned::new(
+                    DirectoryGroup {
+                        group: group.clone(),
+                        container: container.clone(),
+                        metadata: tokio::sync::OnceCell::new(),
+                    },
+                    permit,
+                ));
+                *current = Some(slot.clone());
+                slot
+            }
+        };
+        // No directory-state lock spans I/O. OnceCell shares successful fills
+        // and lets a later caller retry after failure or cancellation.
+        slot.metadata
+            .get_or_try_init(|| {
+                group.read_metadata_owned(client, container, allocation_limit, &self.budget)
+            })
+            .await
+            .cloned()
     }
 }
 
@@ -666,6 +751,119 @@ mod tests {
         );
         drop(consumer);
         assert_eq!(budget.state().used, [0; 8]);
+    }
+
+    #[tokio::test]
+    async fn directory_metadata_checks_context_retries_failures_and_preserves_owners() {
+        let (group, frames) = inputs();
+        for codec in [PackedCodec::Raw, PackedCodec::Zstd] {
+            let built = build_v3_container(
+                0,
+                1,
+                AccessProfile::RandomSmallFile,
+                SizeClassTable::default(),
+                (codec, codec),
+                std::slice::from_ref(&group),
+                &frames,
+            )
+            .unwrap();
+            let container = V3ObjectRef::from_bytes(
+                "directory".into(),
+                V3ObjectKind::GroupContainer,
+                &built.bytes,
+            )
+            .unwrap();
+            let group = &built.groups[0];
+            let temp = tempfile::tempdir().unwrap();
+            let client = ObjectClient::new(LocalFsBackend::new(temp.path()));
+            client
+                .put_object(&container.key, &built.bytes)
+                .await
+                .unwrap();
+            let budget = super::super::V3MountBudget::defaults();
+            let cache = V3DirectoryMetadata::new(budget.clone()).unwrap();
+            let held = cache
+                .read(group, &client, &container, 512 << 10)
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(
+                &held,
+                &cache
+                    .read(group, &client, &container, 512 << 10)
+                    .await
+                    .unwrap()
+            ));
+            assert!(cache.read(group, &client, &container, 1).await.is_err());
+            for field in 0..3 {
+                let mut wrong = group.clone();
+                match field {
+                    0 => wrong.entry_count += 1,
+                    1 => wrong.first_name = b"fild".to_vec(),
+                    _ => wrong.first_frame += 1,
+                }
+                // These references still point to the same authenticated bytes.
+                assert!(
+                    cache
+                        .read(&wrong, &client, &container, 512 << 10)
+                        .await
+                        .is_err()
+                );
+                cache
+                    .read(group, &client, &container, 512 << 10)
+                    .await
+                    .unwrap();
+            }
+            let mut outside = container.clone();
+            outside.object_len = (V3_HEADER_LEN + V3_FOOTER_LEN) as u64;
+            assert!(
+                cache
+                    .read(group, &client, &outside, 512 << 10)
+                    .await
+                    .is_err()
+            );
+            let mut missing = container.clone();
+            missing.key = "missing".into();
+            assert!(
+                cache
+                    .read(group, &client, &missing, 512 << 10)
+                    .await
+                    .is_err()
+            );
+            // A failed authentication must leave the cell retryable.
+            let mut corrupt = built.bytes.clone();
+            corrupt[group.meta_offset as usize] ^= 1;
+            client.put_object(&container.key, &corrupt).await.unwrap();
+            assert!(
+                cache
+                    .read(group, &client, &container, 512 << 10)
+                    .await
+                    .is_err()
+            );
+            client
+                .put_object(&container.key, &built.bytes)
+                .await
+                .unwrap();
+            let retried = cache
+                .read(group, &client, &container, 512 << 10)
+                .await
+                .unwrap();
+            assert_eq!(retried.entries(), held.entries());
+            drop(retried);
+            budget.close();
+            assert!(
+                cache
+                    .read(group, &client, &container, 512 << 10)
+                    .await
+                    .is_err()
+            );
+            drop(cache);
+            assert_eq!(
+                budget.state().used[super::super::V3BudgetPool::Metadata as usize],
+                held.owned_memory_bytes() as u64
+            );
+            drop(held);
+            assert_eq!(budget.state().used, [0; 8]);
+        }
     }
 
     #[tokio::test]

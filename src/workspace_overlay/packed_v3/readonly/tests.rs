@@ -301,6 +301,13 @@ async fn current_readonly_fixture(
 async fn current_readonly_directory_fixture(
     entries: Vec<GroupMetaEntry>,
 ) -> (tempfile::TempDir, PackedV3ReadonlyMeta<LocalFsBackend>) {
+    readonly_directory_fixture_with_group_size(entries, 512).await
+}
+
+async fn readonly_directory_fixture_with_group_size(
+    entries: Vec<GroupMetaEntry>,
+    group_size: usize,
+) -> (tempfile::TempDir, PackedV3ReadonlyMeta<LocalFsBackend>) {
     use super::super::wire005::{
         AuthenticatedV3Snapshot, V3_HEADER_LEN, V3ProducerOptions, V3SnapshotProducer,
     };
@@ -309,7 +316,7 @@ async fn current_readonly_directory_fixture(
     // Keep every authenticated GroupMeta page below its 256 KiB wire bound
     // while preserving one parent directory across all groups.
     let mut groups = Vec::new();
-    for (group_id, chunk) in entries.chunks(512).enumerate() {
+    for (group_id, chunk) in entries.chunks(group_size).enumerate() {
         let chunk = chunk.to_vec();
         let metadata = GroupMeta::new(chunk.clone()).unwrap();
         groups.push(PackedGroupInput {
@@ -354,6 +361,125 @@ async fn current_readonly_directory_fixture(
         temp,
         PackedV3ReadonlyMeta::from_v3(client, snapshot, 4096, 0),
     )
+}
+
+#[tokio::test]
+async fn paged_directory_reuses_authenticated_group_metadata() {
+    use super::super::wire005::V3BudgetPool;
+    use crate::cadapter::read_observer::{Ledger, ReadClass, ReadWork};
+
+    let entries: Vec<_> = (0..1056)
+        .map(|index| GroupMetaEntry {
+            name: format!("f{index:04}").into_bytes(),
+            inode: index as u64 + 2,
+            kind: 1,
+            mode: 0o100644,
+            uid: 1,
+            gid: 2,
+            rdev: 0,
+            nlink: 1,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            size: 0,
+            flags: 0,
+            inline_data: Arc::from([]),
+            extents: Vec::new(),
+        })
+        .collect();
+    let (_temp, meta) = readonly_directory_fixture_with_group_size(entries.clone(), 1024).await;
+    let observer = meta.context.client.read_observer().unwrap();
+    let group_fetches = || {
+        observer
+            .snapshot()
+            .rows
+            .iter()
+            .filter(|((ledger, context), _)| {
+                *ledger == Ledger::BackendBody && context.class == ReadClass::GroupMetadata
+            })
+            .map(|(_, counters)| counters.started)
+            .sum::<u64>()
+    };
+    let budget = &meta.context.budget;
+    let baseline = budget.state().used;
+    let directory = meta.opendir(1).await.unwrap();
+    // This is the lower-page shape used by the head/base/lower merge.
+    for offset in (0..1024).step_by(32) {
+        let page = directory
+            .get_entries_page_raw_owned(offset as u64, 32)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 32);
+        for (actual, expected) in page.entries.iter().zip(&entries[offset..offset + 32]) {
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.ino, expected.inode as i64);
+        }
+    }
+    assert_eq!(
+        group_fetches(),
+        1,
+        "sequential pages refetched the same group"
+    );
+    let retained = budget.state().used[V3BudgetPool::Metadata as usize];
+    assert!(retained > baseline[V3BudgetPool::Metadata as usize]);
+    for work in [ReadWork::Authentication, ReadWork::Decode] {
+        assert_eq!(
+            observer
+                .snapshot()
+                .work
+                .iter()
+                .filter(
+                    |((context, actual), _)| context.class == ReadClass::GroupMetadata
+                        && *actual == work
+                )
+                .map(|(_, latency)| latency.count)
+                .sum::<u64>(),
+            1
+        );
+    }
+    let page = directory.get_entries_page_raw(1024, 32).await.unwrap();
+    assert_eq!(page[0].name, entries[1024].name);
+    assert_eq!(page.len(), 32);
+    assert_eq!(group_fetches(), 2);
+    assert!(
+        budget.state().used[V3BudgetPool::Metadata as usize] < retained,
+        "advancing groups retained the previous large group"
+    );
+    assert!(
+        directory
+            .get_entries_page_raw(1056, 32)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // A rewind refetches the evicted group, then reuses it within that group.
+    directory.get_entries_page_raw(0, 32).await.unwrap();
+    directory.get_entries_page_raw(32, 32).await.unwrap();
+    assert_eq!(group_fetches(), 3);
+    drop(directory);
+    assert_eq!(
+        budget.state().used,
+        baseline,
+        "closing the directory leaked its owners"
+    );
+
+    let directory = meta.opendir(1).await.unwrap();
+    let pages = futures::future::join_all(
+        (0..32).map(|page| directory.get_entries_page_raw(page * 32, 32)),
+    )
+    .await;
+    for (page, result) in pages.into_iter().enumerate() {
+        let result = result.unwrap();
+        assert_eq!(result.len(), 32);
+        assert_eq!(result[0].name, entries[page * 32].name);
+    }
+    assert_eq!(
+        group_fetches(),
+        4,
+        "concurrent pages did not share the group fill"
+    );
+    drop(directory);
+    assert_eq!(budget.state().used, baseline);
 }
 
 #[tokio::test]

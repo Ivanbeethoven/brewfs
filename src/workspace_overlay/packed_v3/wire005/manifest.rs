@@ -776,9 +776,32 @@ impl AuthenticatedV3Snapshot {
         client: &ObjectClient<B>,
         reader: &super::V3IndexReader<B>,
         parent: [u8; 32],
+        offset: u64,
+        limit: usize,
+        allocation_limit: usize,
+    ) -> PackedResult<Vec<crate::workspace_overlay::packed_v3::GroupMetaEntry>> {
+        self.readdir_page_with_metadata(
+            client,
+            reader,
+            parent,
+            offset,
+            limit,
+            allocation_limit,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn readdir_page_with_metadata<B: ObjectBackend + Clone + 'static>(
+        &self,
+        client: &ObjectClient<B>,
+        reader: &super::V3IndexReader<B>,
+        parent: [u8; 32],
         mut offset: u64,
         limit: usize,
         allocation_limit: usize,
+        metadata: Option<&super::V3DirectoryMetadata>,
     ) -> PackedResult<Vec<crate::workspace_overlay::packed_v3::GroupMetaEntry>> {
         if offset > V3_MAX_DIRECTORY_ORDINAL {
             return Err(PackedWireError::LimitExceeded(
@@ -826,9 +849,18 @@ impl AuthenticatedV3Snapshot {
                 ));
             }
             let container = self.container_ref(reader, group.container_ordinal).await?;
-            let meta = group
-                .read_metadata_owned(client, &container, allocation_limit, reader.budget())
-                .await?;
+            let meta = match metadata {
+                Some(metadata) => {
+                    metadata
+                        .read(&group, client, &container, allocation_limit)
+                        .await?
+                }
+                None => {
+                    group
+                        .read_metadata_owned(client, &container, allocation_limit, reader.budget())
+                        .await?
+                }
+            };
             for entry in meta.entries().iter().skip(entry_offset) {
                 let weight =
                     std::mem::size_of::<crate::workspace_overlay::packed_v3::GroupMetaEntry>()
