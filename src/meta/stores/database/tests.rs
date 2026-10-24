@@ -62,6 +62,25 @@ async fn new_test_store() -> DatabaseMetaStore {
         .expect("Failed to create test database store")
 }
 
+#[tokio::test]
+async fn directory_pages_follow_namespace_mutations() {
+    super::super::readdir_tests::directory_pages_follow_namespace_mutations(
+        &new_test_store().await,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires a dedicated PostgreSQL database via BREWFS_POSTGRES_TEST_URL"]
+async fn postgres_directory_pages_follow_namespace_mutations() {
+    let mut config = test_config();
+    config.database.db_config = DatabaseType::Postgres {
+        url: std::env::var("BREWFS_POSTGRES_TEST_URL").expect("dedicated PostgreSQL test URL"),
+    };
+    let store = DatabaseMetaStore::from_config(config).await.unwrap();
+    super::super::readdir_tests::directory_pages_follow_namespace_mutations(&store).await;
+}
+
 /// Create a new test store with pre-configured session ID
 async fn new_test_store_with_session(session_id: Uuid) -> DatabaseMetaStore {
     let store = new_test_store().await;

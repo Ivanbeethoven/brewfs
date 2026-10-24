@@ -643,6 +643,20 @@ pub trait MetaStore: Send + Sync {
 
     async fn readdir(&self, ino: i64) -> Result<Vec<DirEntry>, MetaError>;
 
+    /// Return at most `limit` children in UTF-8 byte order, with names >= `start`.
+    /// Continue with the last name followed by U+0001, the smallest valid
+    /// filename byte (NUL is forbidden, including in PostgreSQL text).
+    /// This is a live namespace cursor, not a snapshot across calls.
+    async fn readdir_page(
+        &self,
+        ino: i64,
+        start: &str,
+        limit: usize,
+    ) -> Result<Vec<DirEntry>, MetaError> {
+        let _ = (ino, start, limit);
+        Err(MetaError::NotImplemented)
+    }
+
     /// Batch query attributes for multiple inodes (for optimization)
     /// Returns attributes in the same order as input inodes
     /// Returns None for inodes that don't exist

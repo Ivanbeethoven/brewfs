@@ -1827,6 +1827,48 @@ impl MetaStore for EtcdMetaStore {
         Ok(entries)
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
+    async fn readdir_page(
+        &self,
+        ino: i64,
+        start: &str,
+        limit: usize,
+    ) -> Result<Vec<DirEntry>, MetaError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let entry = self
+            .etcd_get_json::<EtcdEntryInfo>(&Self::etcd_reverse_key(ino))
+            .await?
+            .ok_or(MetaError::NotFound(ino))?;
+        if entry.to_file_attr(ino).kind != FileType::Dir {
+            return Err(MetaError::NotDirectory(ino));
+        }
+        let prefix = Self::etcd_forward_key(ino, "");
+        let options = GetOptions::new()
+            .with_range(Self::prefix_range_end(&prefix))
+            .with_limit(i64::try_from(limit).unwrap_or(i64::MAX));
+        let response = get_with_retry(&self.client, &format!("{prefix}{start}"), || {
+            Some(options.clone())
+        })
+        .await
+        .map_err(|e| MetaError::Internal(format!("Etcd directory page failed: {e}")))?;
+        response
+            .kvs()
+            .iter()
+            .map(|kv| {
+                let entry: EtcdForwardEntry = serde_json::from_slice(kv.value())
+                    .map_err(|e| MetaError::Serialization(e.to_string()))?;
+                let kind = entry.resolved_entry_type().into();
+                Ok(DirEntry {
+                    name: entry.name,
+                    ino: entry.inode,
+                    kind,
+                })
+            })
+            .collect()
+    }
+
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn mkdir(&self, parent: i64, name: String) -> Result<i64, MetaError> {
         self.create_directory(parent, name).await

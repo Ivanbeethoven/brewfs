@@ -34,7 +34,7 @@ use sea_orm::{
     DatabaseConnection, DatabaseTransaction, EntityTrait, IntoActiveModel, PaginatorTrait,
     QueryFilter, QueryOrder, QuerySelect, Schema, TransactionTrait, sea_query,
 };
-use sea_query::Index;
+use sea_query::{ExprTrait, Index};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::path::Path;
@@ -506,6 +506,16 @@ impl DatabaseMetaStore {
                 info!("Slice chunk index already exists, skipping: {}", e);
             }
             Err(e) => return Err(MetaError::Database(e)),
+        }
+
+        // S3 cursors require byte ordering regardless of the database locale.
+        if builder == sea_orm::DbBackend::Postgres {
+            db.execute(sea_orm::Statement::from_string(
+                builder,
+                "CREATE INDEX IF NOT EXISTS idx_content_meta_name_bytes ON content_meta (parent_inode, entry_name COLLATE \"C\")",
+            ))
+            .await
+            .map_err(MetaError::Database)?;
         }
 
         info!("Database schema initialized successfully");
@@ -1535,6 +1545,48 @@ impl MetaStore for DatabaseMetaStore {
         }
 
         Ok(entries)
+    }
+
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
+    async fn readdir_page(
+        &self,
+        ino: i64,
+        start: &str,
+        limit: usize,
+    ) -> Result<Vec<DirEntry>, MetaError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(access) = self.get_access_meta(ino).await? else {
+            return Err(if self.get_file_meta(ino).await?.is_some() {
+                MetaError::NotDirectory(ino)
+            } else {
+                MetaError::NotFound(ino)
+            });
+        };
+        if !access.permission().is_directory() {
+            return Err(MetaError::NotDirectory(ino));
+        }
+        let name = if self.db.get_database_backend() == sea_orm::DbBackend::Postgres {
+            "entry_name COLLATE \"C\""
+        } else {
+            "entry_name COLLATE BINARY"
+        };
+        let contents = ContentMeta::find()
+            .filter(content_meta::Column::ParentInode.eq(ino))
+            .filter(sea_query::Expr::cust(name).gte(start))
+            .order_by(sea_query::Expr::cust(name), sea_orm::Order::Asc)
+            .limit(limit as u64)
+            .all(&self.db)
+            .await?;
+        Ok(contents
+            .into_iter()
+            .map(|entry| DirEntry {
+                name: entry.entry_name,
+                ino: entry.inode,
+                kind: entry.entry_type.into(),
+            })
+            .collect())
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]

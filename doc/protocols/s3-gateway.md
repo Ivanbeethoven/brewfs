@@ -102,6 +102,16 @@ aws cli / mc / SDK
 | Lifecycle / Notification / Replication / Inventory | 远期 | 依赖持久任务、事件日志、幂等重试与运维控制面 |
 | SelectObjectContent | 远期评估 | 仅在有明确需求和可维护的执行引擎后立项 |
 
+ListObjects 使用按 UTF-8 字节排序的目录游标，从 prefix/marker 定位，收集
+`max-keys + 1` 个可见对象或公共前缀后停止；仅为实际返回的对象读取属性和 ETag。
+目录批次最多 64 项，目录对象、隐式目录和隐藏目录的判定仍可能需要额外遍历；
+连续大量空目录不保证与返回对象数相同的工作量。游标反映实时命名空间，不提供跨页快照。
+
+Redis 在目录 hash 旁维护 `d<ino>:names` 有序集合，所有 namespace Lua 脚本原子维护名称。
+已有目录首次分页时会在 Redis 内一次性构建索引（与该目录大小成正比），之后使用范围查询；
+空成员标记完整索引。启用此版本前应升级该卷的所有写入进程，旧版本不会维护这个索引。
+PostgreSQL 使用 `C` collation 的目录名称索引，避免数据库 locale 改变 S3 排序。
+
 ### 条件请求
 
 M1 仅承诺已验证的基础读写与 Range 语义，不承诺完整条件头行为。所有未实现的条件头必须明确拒绝，不能静默表现为已满足；完整 precondition 语义列入 M3。
