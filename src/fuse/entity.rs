@@ -355,12 +355,24 @@ where
     ) -> FuseResult<Vec<(DirectoryEntry, EntityInode)>> {
         // Serialize a rewind with reads of this handle, without holding the
         // global handle bookkeeping lock across metadata I/O. A failed refresh
-        // leaves the previous snapshot intact so the caller can retry.
+        // leaves the previous snapshot intact.
         let mut snapshot = directory.snapshot.lock().await;
         if offset == 0 && snapshot.started {
-            snapshot.entries = self
+            // Opening the handle granted enumeration for its lifetime, so a
+            // permission change after opendir must not revoke it: keep serving
+            // the last good snapshot when the refresh is refused. Structural
+            // failures (the directory is gone, or the authority is fenced) still
+            // surface to the caller.
+            match self
                 .directory_snapshot(directory.ino, &directory.credentials)
-                .await?;
+                .await
+            {
+                Ok(entries) => snapshot.entries = entries,
+                Err(error)
+                    if error == Errno::from(libc::EACCES)
+                        || error == Errno::from(libc::EPERM) => {}
+                Err(error) => return Err(error),
+            }
         }
         snapshot.started = true;
         Ok(snapshot.entries.iter().skip(offset).cloned().collect())
