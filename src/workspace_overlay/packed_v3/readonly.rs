@@ -532,6 +532,7 @@ where
 
 struct PackedDirectoryPageSource<B: ObjectBackend + Clone + 'static> {
     context: Arc<V3ReadonlyContext<B>>,
+    metadata: super::wire005::V3DirectoryMetadata,
 }
 
 #[async_trait]
@@ -575,13 +576,14 @@ where
         };
         let entries = context
             .snapshot
-            .readdir_page(
+            .readdir_page_with_metadata(
                 &context.client,
                 &context.reader,
                 key,
                 child_offset,
                 max_entries,
                 512 * 1024,
+                Some(&self.metadata),
             )
             .await
             .map_err(map_error)?;
@@ -1320,6 +1322,8 @@ where
             ino,
             Arc::new(PackedDirectoryPageSource {
                 context: Arc::clone(&self.context),
+                metadata: super::wire005::V3DirectoryMetadata::new(self.context.budget.clone())
+                    .map_err(map_error)?,
             }),
         ))
     }
