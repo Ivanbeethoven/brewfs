@@ -13,6 +13,7 @@ pub(super) type PendingExtentWrite = (i64, Vec<KvWrite>);
 
 #[derive(Clone)]
 pub(super) struct JournalMemoryBackend {
+    pub(super) gc_admin: Arc<AtomicBool>,
     pub(super) rows: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     now: Arc<AtomicI64>,
     pub(super) lose_reply: Arc<AtomicBool>,
@@ -28,6 +29,7 @@ pub(super) struct JournalMemoryBackend {
 impl Default for JournalMemoryBackend {
     fn default() -> Self {
         Self {
+            gc_admin: Default::default(),
             rows: Default::default(),
             now: Arc::new(AtomicI64::new(1)),
             lose_reply: Default::default(),
@@ -146,6 +148,15 @@ impl WorkspaceKvBackend for JournalMemoryBackend {
     }
     fn supports_consistent_reads(&self) -> bool {
         true
+    }
+    async fn authenticate_gc_admin(&self) -> Result<(), WorkspaceError> {
+        if self.gc_admin.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(WorkspaceError::UnsupportedCapability(
+                "test GC identity denied",
+            ))
+        }
     }
     async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, WorkspaceError> {
         Ok(self.rows.lock().await.get(key).cloned())

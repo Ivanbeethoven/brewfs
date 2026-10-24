@@ -15,6 +15,8 @@ pub(crate) struct PackedHistoryRetirementOptions {
     pub grace_ns: u64,
     pub max_native_holds: u64,
     pub max_current_bindings: u64,
+    /// Combined member-release and queued-DELETE work for this invocation.
+    pub max_work: u64,
     pub cancel: CancellationToken,
 }
 
@@ -595,6 +597,7 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
             || options.grace_ns > MAX_HISTORY_GRACE_NS
             || options.max_native_holds == 0
             || options.max_current_bindings == 0
+            || options.max_work == 0
         {
             return Err(WorkspaceError::Fenced);
         }
@@ -789,37 +792,39 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
             .as_ref()
             .ok_or(WorkspaceError::Fenced)?
             .not_before_ns()?;
-        let (mut deleted_objects, mut quarantined_objects, initial_queue_checks) = self
-            .consume_history_delete_queue(
-                options.incarnation,
-                &client,
-                budget,
-                &options.cancel,
-                lower,
-            )
+        let mut remaining = options.max_work;
+        let (deleted_objects, quarantined_objects, initial_queue_checks) = self
+            .consume_history_delete_queue(&options, &client, budget, lower, &mut remaining)
             .await?;
+        let mut report = PackedHistoryRetirementReport {
+            observing: false,
+            retired: false,
+            not_before_ns: lower,
+            released_members: 0,
+            deleted_objects,
+            quarantined_objects,
+        };
+        let Some(initial_queue_checks) = initial_queue_checks else {
+            return Ok(report);
+        };
         if read.root.state == RootState::Retired {
             let mut read = self.history_retirement_read(options.incarnation).await?;
             history_require_committed(&read, lower)?;
             history_merge(&mut read.checks, &initial_queue_checks)?;
             self.history_clock_cas(&read.checks, &[], Some(lower))
                 .await?;
-            return Ok(PackedHistoryRetirementReport {
-                observing: false,
-                retired: true,
-                not_before_ns: lower,
-                released_members: 0,
-                deleted_objects,
-                quarantined_objects,
-            });
+            report.retired = true;
+            return Ok(report);
         }
         let prefix =
             format!("{REGISTRY_REVERSE_PREFIX}{}/", options.incarnation.simple()).into_bytes();
         let mut after = None;
-        let mut released_members = 0;
         let mut visited = 0;
         loop {
             history_live(budget, &options.cancel)?;
+            if remaining == 0 {
+                return Ok(report);
+            }
             let before = self.history_retirement_read(options.incarnation).await?;
             history_require_committed(&before, lower)?;
             self.history_clock_cas(&before.checks, &[], Some(lower))
@@ -835,6 +840,9 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
             }
             for entry in page {
                 history_live(budget, &options.cancel)?;
+                if remaining == 0 {
+                    return Ok(report);
+                }
                 visited = increment(visited)?;
                 if visited > MAX_OBJECTS {
                     return Err(WorkspaceError::Busy);
@@ -847,25 +855,25 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
                 let reference = V3ObjectRef::decode_value(&entry.value).map_err(journal_error)?;
                 self.release_history_member(options.incarnation, &entry, &reference, lower)
                     .await?;
-                released_members = increment(released_members)?;
+                remaining -= 1;
+                report.released_members = increment(report.released_members)?;
                 after = Some(entry.key);
             }
         }
         let (completed, quarantined, queue_checks) = self
-            .consume_history_delete_queue(
-                options.incarnation,
-                &client,
-                budget,
-                &options.cancel,
-                lower,
-            )
+            .consume_history_delete_queue(&options, &client, budget, lower, &mut remaining)
             .await?;
-        deleted_objects = deleted_objects
+        report.deleted_objects = report
+            .deleted_objects
             .checked_add(completed)
             .ok_or(WorkspaceError::Fenced)?;
-        quarantined_objects = quarantined_objects
+        report.quarantined_objects = report
+            .quarantined_objects
             .checked_add(quarantined)
             .ok_or(WorkspaceError::Fenced)?;
+        let Some(queue_checks) = queue_checks else {
+            return Ok(report);
+        };
         history_live(budget, &options.cancel)?;
         let mut read = self.history_retirement_read(options.incarnation).await?;
         history_require_committed(&read, lower)?;
@@ -902,14 +910,8 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
         ];
         self.history_clock_cas(&read.checks, &writes, Some(lower))
             .await?;
-        Ok(PackedHistoryRetirementReport {
-            observing: false,
-            retired: true,
-            not_before_ns: lower,
-            released_members,
-            deleted_objects,
-            quarantined_objects,
-        })
+        report.retired = true;
+        Ok(report)
     }
 
     async fn release_history_member(
@@ -1028,12 +1030,14 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
 
     async fn consume_history_delete_queue<O: ObjectBackend + Clone>(
         &self,
-        incarnation: Uuid,
+        options: &PackedHistoryRetirementOptions,
         client: &ObjectClient<O>,
         budget: &Arc<V3MountBudget>,
-        cancel: &CancellationToken,
         lower: i64,
-    ) -> Result<(u64, u64, Vec<KvCheck>), WorkspaceError> {
+        remaining: &mut u64,
+    ) -> Result<(u64, u64, Option<Vec<KvCheck>>), WorkspaceError> {
+        let incarnation = options.incarnation;
+        let cancel = &options.cancel;
         let prefix = format!(
             "packed/v3/registry/history-delete-queue/{}/",
             incarnation.simple()
@@ -1045,6 +1049,10 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
         let mut visited = 0;
         loop {
             history_live(budget, cancel)?;
+            if *remaining == 0 {
+                // Only a validated empty page can authorize final retirement.
+                return Ok((deleted, quarantined, None));
+            }
             let before = self.history_retirement_read(incarnation).await?;
             history_require_committed(&before, lower)?;
             if !matches!(before.root.state, RootState::Retiring | RootState::Retired) {
@@ -1060,10 +1068,13 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
                 .await?;
             if page.is_empty() {
                 history_live(budget, cancel)?;
-                return Ok((deleted, quarantined, before.checks));
+                return Ok((deleted, quarantined, Some(before.checks)));
             }
             for entry in page {
                 history_live(budget, cancel)?;
+                if *remaining == 0 {
+                    return Ok((deleted, quarantined, None));
+                }
                 visited = increment(visited)?;
                 if visited > MAX_OBJECTS
                     || !entry.key.starts_with(&prefix)
@@ -1187,6 +1198,7 @@ impl<B: WorkspaceKvBackend + 'static> KvWorkspaceStore<B> {
                 ];
                 self.history_clock_cas(&read.checks, &writes, Some(lower))
                     .await?;
+                *remaining -= 1;
                 after = Some(entry.key);
             }
         }

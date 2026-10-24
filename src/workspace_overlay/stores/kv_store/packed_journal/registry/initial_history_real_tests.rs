@@ -22,6 +22,7 @@ fn retirement_options(incarnation: Uuid) -> PackedHistoryRetirementOptions {
         grace_ns: INITIAL_GRACE_NS,
         max_native_holds: 1000,
         max_current_bindings: 1000,
+        max_work: u64::MAX,
         cancel: CancellationToken::new(),
     }
 }

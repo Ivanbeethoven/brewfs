@@ -22,8 +22,159 @@ fn routed_options(binding: &PackedLowerBindingRecord) -> PackedHistoryVersionRet
         grace_ns: 100,
         max_native_holds: 32,
         max_current_bindings: 32,
+        max_work: u64::MAX,
         cancel: CancellationToken::new(),
     }
+}
+
+async fn bounded_history_ticks(start_with_delete_queue: bool) {
+    use super::super::super::admin_gc::facade::{
+        PackedGcCursor, PackedGcPolicy, PackedGcTickRequest,
+    };
+    let fixture = Fixture::new().await;
+    let mut root = fixture.root.clone();
+    root.members = 4;
+    let mut references = vec![fixture.reference.clone()];
+    {
+        let mut rows = fixture.backend.memory.rows.lock().await;
+        let original_object =
+            ObjectRow::decode(&rows[&registry_object_key(&fixture.reference)]).unwrap();
+        let original_member =
+            MemberRow::decode(&rows[&registry_member_key(&fixture.reference, root.incarnation)])
+                .unwrap();
+        for ordinal in 1..4 {
+            let mut reference = fixture.reference.clone();
+            reference.key = format!("packed-v3/history-tests/member-{ordinal}");
+            std::fs::copy(
+                fixture.objects.path().join(&fixture.reference.key),
+                fixture.objects.path().join(&reference.key),
+            )
+            .unwrap();
+            let mut object = original_object.clone();
+            object.reference = reference.clone();
+            // A shared member still consumes work even though no DELETE follows.
+            if !start_with_delete_queue && ordinal == 1 {
+                object.memberships = 2;
+            }
+            let mut member = original_member.clone();
+            member.reference = reference.clone();
+            member.ordinal = ordinal;
+            rows.extend([
+                (registry_object_key(&reference), object.encode().unwrap()),
+                (
+                    registry_member_key(&reference, root.incarnation),
+                    member.encode().unwrap(),
+                ),
+                (
+                    registry_reverse_key(root.incarnation, ordinal),
+                    reference.encode_value().unwrap(),
+                ),
+            ]);
+            references.push(reference);
+        }
+        rows.insert(registry_root_key(root.incarnation), root.encode().unwrap());
+        rows.insert(
+            registry_history_root_key(root.binding.as_ref().unwrap()),
+            root.encode().unwrap(),
+        );
+        rows.insert(
+            VOLUME_HEADER_KEY.to_vec(),
+            encode(&VolumeHeader {
+                volume_format: "workspace-v1".into(),
+                schema_version: WORKSPACE_SCHEMA_VERSION,
+                volume_id: Uuid::new_v4(),
+                created_at_ns: 100,
+            })
+            .unwrap(),
+        );
+    }
+    fixture.make_committed_fixture().await;
+    let lower = 1000 + 3600 * 1_000_000_000;
+    {
+        let mut rows = fixture.backend.memory.rows.lock().await;
+        let key = observation_key(root.incarnation);
+        let mut observation = Observation::decode(&rows[&key]).unwrap();
+        observation.grace_ns = 3600 * 1_000_000_000;
+        rows.insert(key, observation.encode().unwrap());
+    }
+    fixture.backend.now.store(lower, Ordering::SeqCst);
+    if start_with_delete_queue {
+        for (ordinal, reference) in references.iter().enumerate() {
+            fixture
+                .store
+                .release_history_member(
+                    root.incarnation,
+                    &KvEntry {
+                        key: registry_reverse_key(root.incarnation, ordinal as u64),
+                        value: reference.encode_value().unwrap(),
+                    },
+                    reference,
+                    lower,
+                )
+                .await
+                .unwrap();
+        }
+    }
+    fixture
+        .backend
+        .memory
+        .gc_admin
+        .store(true, Ordering::SeqCst);
+    let admin = fixture
+        .store
+        .open_packed_gc_admin(
+            fixture.client.clone(),
+            fixture.budget.clone(),
+            crate::chunk::ChunkLayout::default(),
+        )
+        .await
+        .unwrap();
+    let mut previous = fixture.root().await;
+    for _ in 0..12 {
+        let report = admin
+            .tick(PackedGcTickRequest {
+                policy: PackedGcPolicy {
+                    lease_ttl_seconds: 300,
+                    grace_seconds: 3600,
+                    max_scans: 1,
+                    max_operations: 1,
+                    max_protective_rows: 64,
+                },
+                cursor: PackedGcCursor::default(),
+                cancel: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        let current = fixture.root().await;
+        assert!(
+            previous.members - current.members + report.deleted_objects <= 1,
+            "one history GC operation must bound member releases and queued DELETEs"
+        );
+        assert_eq!(report.deferred, 0);
+        if current.state == RootState::Retired {
+            assert_eq!(current.members, 0);
+            for (ordinal, reference) in references.iter().enumerate() {
+                assert_eq!(
+                    fixture.objects.path().join(&reference.key).exists(),
+                    !start_with_delete_queue && ordinal == 1,
+                );
+            }
+            return;
+        }
+        assert_eq!(current.state, RootState::Retiring);
+        previous = current;
+    }
+    panic!("bounded history ticks did not finish retirement");
+}
+
+#[tokio::test]
+async fn gc_tick_yields_between_history_members_including_shared_objects() {
+    bounded_history_ticks(false).await;
+}
+
+#[tokio::test]
+async fn gc_tick_yields_between_history_queued_deletes() {
+    bounded_history_ticks(true).await;
 }
 
 #[tokio::test]
