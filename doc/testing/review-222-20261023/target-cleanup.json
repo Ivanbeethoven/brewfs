@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-10-23T17:13:11.049410+00:00",
+  "removed": "/mnt/brewfs-data/src/brewfs-fix-lease-drop-review/target",
+  "issue": "222",
+  "pr": "280",
+  "reason": "Published issue: private target only; proc command/environment/maps/fd audit found no users. Source, logs, patches and STATUS retained.",
+  "df_before": "Filesystem      Size  Used Avail Use% Mounted on\n/dev/vdb        251G  202G   37G  85% /mnt/brewfs-data\n",
+  "target_allocated_bytes": 8375136256,
+  "free_bytes_change": 8375123968,
+  "df_after": "Filesystem      Size  Used Avail Use% Mounted on\n/dev/vdb        251G  194G   45G  82% /mnt/brewfs-data\n"
+}
