@@ -81,6 +81,30 @@ async fn postgres_directory_pages_follow_namespace_mutations() {
     super::super::readdir_tests::directory_pages_follow_namespace_mutations(&store).await;
 }
 
+#[tokio::test]
+async fn truncate_gc_ledger_failure_rolls_back_mapping_and_size() {
+    let store = new_test_store().await;
+    let ino = store
+        .create_file(store.root_ino(), "truncate-ledger-failure".into())
+        .await
+        .unwrap();
+    let chunk_id = chunk_id_for(ino, 0).unwrap();
+    let slice = SliceDesc {
+        slice_id: 1,
+        chunk_id,
+        offset: 0,
+        length: 8192,
+    };
+    store.append_slice(chunk_id, slice).await.unwrap();
+    store.extend_file_size(ino, slice.length).await.unwrap();
+    store.db.execute_unprepared("CREATE TRIGGER reject_gc BEFORE INSERT ON delayed_slice BEGIN SELECT RAISE(ABORT, 'injected GC ledger failure'); END").await.unwrap();
+    for size in [1, 0] {
+        assert!(store.truncate(ino, size, 65536).await.is_err());
+        assert_eq!(store.get_slices(chunk_id).await.unwrap(), vec![slice]);
+        assert_eq!(store.stat(ino).await.unwrap().unwrap().size, slice.length);
+    }
+}
+
 /// Create a new test store with pre-configured session ID
 async fn new_test_store_with_session(session_id: Uuid) -> DatabaseMetaStore {
     let store = new_test_store().await;

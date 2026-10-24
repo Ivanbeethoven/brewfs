@@ -810,6 +810,37 @@ impl DatabaseMetaStore {
         }
     }
 
+    // Retained records own the physical extent of a shortened live slice. GC
+    // ignores them until removal promotes the record to pending in the same
+    // transaction that removes the mapping. No slice wire/schema change is needed.
+    async fn stage_slice_reclamation<C: ConnectionTrait>(
+        conn: &C,
+        slice: SliceDesc,
+        retained: bool,
+    ) -> Result<(), MetaError> {
+        let previous = DelayedSlice::find()
+            .filter(delayed_slice::Column::ChunkId.eq(slice.chunk_id as i64))
+            .filter(delayed_slice::Column::SliceId.eq(slice.slice_id as i64))
+            .filter(delayed_slice::Column::Status.eq("retained"))
+            .lock_exclusive()
+            .one(conn)
+            .await
+            .map_err(MetaError::Database)?;
+        let size = previous
+            .as_ref()
+            .map_or(slice.length, |row| slice.length.max(row.size as u64));
+        let mut record: delayed_slice::ActiveModel = previous.map(Into::into).unwrap_or_default();
+        record.slice_id = Set(slice.slice_id as i64);
+        record.chunk_id = Set(slice.chunk_id as i64);
+        record.offset = Set(slice.offset as i64);
+        record.size = Set(size as i64);
+        record.created_at = Set(Utc::now().timestamp());
+        record.reason = Set("reclaim".to_string());
+        record.status = Set(if retained { "retained" } else { "pending" }.to_string());
+        record.save(conn).await.map_err(MetaError::Database)?;
+        Ok(())
+    }
+
     async fn prune_slices_for_truncate<C>(
         &self,
         conn: &C,
@@ -831,6 +862,7 @@ impl DatabaseMetaStore {
                 let rows = SliceMeta::find()
                     .filter(slice_meta::Column::ChunkId.eq(chunk_id))
                     .order_by_asc(slice_meta::Column::Id)
+                    .lock_exclusive()
                     .all(conn)
                     .await
                     .map_err(MetaError::Database)?;
@@ -844,10 +876,12 @@ impl DatabaseMetaStore {
                     match trim_action(offset, length, cutoff_offset) {
                         TrimAction::Keep => {}
                         TrimAction::Drop => {
+                            Self::stage_slice_reclamation(conn, row.clone().into(), false).await?;
                             let active: slice_meta::ActiveModel = row.into();
                             active.delete(conn).await.map_err(MetaError::Database)?;
                         }
                         TrimAction::Truncate(new_len) => {
+                            Self::stage_slice_reclamation(conn, row.clone().into(), true).await?;
                             let mut active: slice_meta::ActiveModel = row.into();
                             active.length = Set(new_len as i64);
                             active.update(conn).await.map_err(MetaError::Database)?;
@@ -861,12 +895,20 @@ impl DatabaseMetaStore {
                     .map_err(|_| MetaError::Internal("chunk_id overflow".to_string()))?;
                 let end_chunk_id = i64::try_from(chunk_id_for(ino, end)?)
                     .map_err(|_| MetaError::Internal("chunk_id overflow".to_string()))?;
-                SliceMeta::delete_many()
+                let rows = SliceMeta::find()
                     .filter(slice_meta::Column::ChunkId.gte(start_chunk_id))
                     .filter(slice_meta::Column::ChunkId.lt(end_chunk_id))
-                    .exec(conn)
+                    .lock_exclusive()
+                    .all(conn)
                     .await
                     .map_err(MetaError::Database)?;
+                for row in rows {
+                    Self::stage_slice_reclamation(conn, row.clone().into(), false).await?;
+                    // Delete only rows whose ownership was recorded above;
+                    // a range delete could also catch a concurrently appended row.
+                    let active: slice_meta::ActiveModel = row.into();
+                    active.delete(conn).await.map_err(MetaError::Database)?;
+                }
                 Ok(())
             },
         )
@@ -3748,24 +3790,18 @@ impl MetaStore for DatabaseMetaStore {
         }
 
         if !delayed_slices.is_empty() {
-            let now = Utc::now().timestamp();
-
             for (slice_id, offset, size) in &delayed_slices {
-                let delayed_model = delayed_slice::ActiveModel {
-                    slice_id: Set(*slice_id as i64),
-                    chunk_id: Set(chunk_id as i64),
-                    offset: Set(*offset as i64),
-                    size: Set(*size as i64),
-                    created_at: Set(now),
-                    reason: Set("compact".to_string()),
-                    status: Set("pending".to_string()),
-                    ..Default::default()
-                };
-
-                delayed_model
-                    .insert(&txn)
-                    .await
-                    .map_err(MetaError::Database)?;
+                Self::stage_slice_reclamation(
+                    &txn,
+                    SliceDesc {
+                        slice_id: *slice_id,
+                        chunk_id,
+                        offset: *offset,
+                        length: u64::from(*size),
+                    },
+                    false,
+                )
+                .await?;
             }
         }
 
@@ -3892,24 +3928,18 @@ impl MetaStore for DatabaseMetaStore {
         }
 
         if !delayed_slices.is_empty() {
-            let now = Utc::now().timestamp();
-
             for (slice_id, offset, size) in &delayed_slices {
-                let delayed_model = delayed_slice::ActiveModel {
-                    slice_id: Set(*slice_id as i64),
-                    chunk_id: Set(chunk_id as i64),
-                    offset: Set(*offset as i64),
-                    size: Set(*size as i64),
-                    created_at: Set(now),
-                    reason: Set("compact".to_string()),
-                    status: Set("pending".to_string()),
-                    ..Default::default()
-                };
-
-                delayed_model
-                    .insert(&txn)
-                    .await
-                    .map_err(MetaError::Database)?;
+                Self::stage_slice_reclamation(
+                    &txn,
+                    SliceDesc {
+                        slice_id: *slice_id,
+                        chunk_id,
+                        offset: *offset,
+                        length: u64::from(*size),
+                    },
+                    false,
+                )
+                .await?;
             }
         }
 

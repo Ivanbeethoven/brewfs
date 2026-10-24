@@ -55,6 +55,7 @@ const UNCOMMITTED_ORPHAN_PREFIX: &str = "gc/uncommitted/orphan/";
 const DELAYED_ID_KEY: &str = "gc/delayed/id";
 const UNCOMMITTED_ID_KEY: &str = "gc/uncommitted/id";
 const ETCD_TXN_BATCH_WRITE_LIMIT: usize = 48;
+const TRUNCATED_SLICES_PREFIX: &str = "gc/truncated/";
 
 /// Etcd-based metadata store
 pub struct EtcdMetaStore {
@@ -78,6 +79,15 @@ struct EtcdDelayedSliceRecord {
     created_at: i64,
     reason: String,
     status: String,
+}
+
+/// Detached mappings remain durable until they are promoted to ordinary
+/// delayed records in bounded transactions. A chunk can contain more slices
+/// than etcd permits writes in a single transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TruncatedSlices {
+    slices: Vec<SliceDesc>,
+    created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -490,13 +500,66 @@ impl EtcdMetaStore {
         Some((cutoff_chunk, cutoff_offset, drop_start, old_chunk_count))
     }
 
+    fn physical_sizes_key(chunk_id: u64) -> String {
+        format!("gc/physical_sizes/{chunk_id}")
+    }
+
+    async fn trim_chunk_for_truncate(
+        tx: &mut EtcdTxnCtx<'_>,
+        chunk_id: u64,
+        cutoff_offset: u64,
+    ) -> Result<(), MetaError> {
+        let key = key_for_slice(chunk_id);
+        let mut slices: Vec<SliceDesc> = tx.get_typed(&key).await?.unwrap_or_default();
+        if slices.is_empty() {
+            return Ok(());
+        }
+        let sizes_key = Self::physical_sizes_key(chunk_id);
+        let mut sizes: HashMap<u64, u64> = tx.get_typed_json(&sizes_key).await?.unwrap_or_default();
+        let mut removed = Vec::new();
+        for slice in &slices {
+            if slice.offset >= cutoff_offset {
+                let mut physical = *slice;
+                physical.length = sizes
+                    .remove(&slice.slice_id)
+                    .unwrap_or(slice.length)
+                    .max(slice.length);
+                removed.push(physical);
+            } else if slice.offset.saturating_add(slice.length) > cutoff_offset {
+                let size = sizes.entry(slice.slice_id).or_insert(slice.length);
+                *size = (*size).max(slice.length);
+            }
+        }
+        trim_slices_in_place(&mut slices, cutoff_offset);
+        if slices.is_empty() {
+            tx.delete(key);
+        } else {
+            tx.set_typed(key, &slices)?;
+        }
+        if sizes.is_empty() {
+            tx.delete(sizes_key);
+        } else {
+            tx.set_typed_json(sizes_key, &sizes)?;
+        }
+        if !removed.is_empty() {
+            tx.set_typed_json(
+                format!("{TRUNCATED_SLICES_PREFIX}{}", Uuid::new_v4()),
+                &TruncatedSlices {
+                    slices: removed,
+                    created_at: Utc::now().timestamp(),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     async fn prune_slices_for_truncate(
         tx: &mut EtcdTxnCtx<'_>,
         ino: i64,
         new_size: u64,
         old_size: u64,
         chunk_size: u64,
-    ) -> Result<Vec<String>, MetaError> {
+    ) -> Result<Vec<u64>, MetaError> {
         let Some((cutoff_chunk, cutoff_offset, drop_start, old_chunk_count)) =
             Self::truncate_drop_range(new_size, old_size, chunk_size)
         else {
@@ -505,42 +568,34 @@ impl EtcdMetaStore {
 
         if cutoff_offset > 0 {
             let chunk_id = chunk_id_for(ino, cutoff_chunk)?;
-            let key = key_for_slice(chunk_id);
-            let mut slices: Vec<SliceDesc> = tx.get_typed(&key).await?.unwrap_or_default();
-            trim_slices_in_place(&mut slices, cutoff_offset);
-            if slices.is_empty() {
-                tx.delete(key);
-            } else {
-                tx.set_typed(key, &slices)?;
-            }
+            Self::trim_chunk_for_truncate(tx, chunk_id, cutoff_offset).await?;
         }
 
         let mut staged_deletes = 0;
         let mut deferred_delete_keys = Vec::new();
         for idx in drop_start..old_chunk_count {
             let chunk_id = chunk_id_for(ino, idx)?;
-            let key = key_for_slice(chunk_id);
-            if staged_deletes < ETCD_TXN_BATCH_WRITE_LIMIT {
-                tx.delete(key);
+            if staged_deletes < (ETCD_TXN_BATCH_WRITE_LIMIT - 4) / 3 {
+                Self::trim_chunk_for_truncate(tx, chunk_id, 0).await?;
                 staged_deletes += 1;
             } else {
-                deferred_delete_keys.push(key);
+                deferred_delete_keys.push(chunk_id);
             }
         }
 
         Ok(deferred_delete_keys)
     }
 
-    async fn delete_keys_batched(&self, keys: Vec<String>) -> Result<(), MetaError> {
-        for batch in keys.chunks(ETCD_TXN_BATCH_WRITE_LIMIT) {
+    async fn reclaim_truncated_chunks(&self, chunks: Vec<u64>) -> Result<(), MetaError> {
+        for batch in chunks.chunks(ETCD_TXN_BATCH_WRITE_LIMIT / 3) {
             let batch = batch.to_vec();
             EtcdTxn::new(&self.client)
                 .max_retries(10)
                 .run(|tx| {
                     let batch = batch.clone();
                     Box::pin(async move {
-                        for key in batch {
-                            tx.delete(key);
+                        for chunk_id in batch {
+                            Self::trim_chunk_for_truncate(tx, chunk_id, 0).await?;
                         }
                         Ok(())
                     })
@@ -551,10 +606,10 @@ impl EtcdMetaStore {
         Ok(())
     }
 
-    async fn stage_delayed_slice_records(
+    async fn stage_delayed_slice_records<S: Copy + Into<u64> + Send + Sync>(
         tx: &mut EtcdTxnCtx<'_>,
         chunk_id: u64,
-        delayed_slices: &[(u64, u64, u32)],
+        delayed_slices: &[(u64, u64, S)],
         now: i64,
     ) -> Result<(), MetaError> {
         if delayed_slices.is_empty() {
@@ -562,6 +617,9 @@ impl EtcdMetaStore {
         }
 
         let delayed_id_key = DELAYED_ID_KEY.to_string();
+        let sizes_key = Self::physical_sizes_key(chunk_id);
+        let mut sizes: HashMap<u64, u64> = tx.get_typed_json(&sizes_key).await?.unwrap_or_default();
+        let had_sizes = !sizes.is_empty();
         let mut next_id = tx
             .get_typed_json::<i64>(&delayed_id_key)
             .await?
@@ -569,12 +627,13 @@ impl EtcdMetaStore {
 
         for (slice_id, offset, size) in delayed_slices {
             next_id += 1;
+            let size = (*size).into();
             let record = EtcdDelayedSliceRecord {
                 id: next_id,
                 slice_id: *slice_id,
                 chunk_id,
                 offset: *offset,
-                size: *size as u64,
+                size: sizes.remove(slice_id).unwrap_or(size).max(size),
                 created_at: now,
                 reason: "compact".to_string(),
                 status: "pending".to_string(),
@@ -583,6 +642,64 @@ impl EtcdMetaStore {
         }
 
         tx.set_typed_json(delayed_id_key, &next_id)?;
+        if had_sizes {
+            if sizes.is_empty() {
+                tx.delete(sizes_key);
+            } else {
+                tx.set_typed_json(sizes_key, &sizes)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn promote_truncated_slices(&self, batch_size: usize) -> Result<(), MetaError> {
+        let mut remaining = batch_size;
+        while remaining > 0 {
+            let Some((key, _)) = self
+                .scan_json_page::<TruncatedSlices>(TRUNCATED_SLICES_PREFIX, None, 1)
+                .await?
+                .pop()
+            else {
+                break;
+            };
+            // Honor the GC batch size while keeping each metadata transaction
+            // within etcd's write budget (records, counter, extent map, queue).
+            let limit = remaining.min(ETCD_TXN_BATCH_WRITE_LIMIT - 3);
+            let promoted = EtcdTxn::new(&self.client)
+                .max_retries(10)
+                .run(|tx| {
+                    let key = key.clone();
+                    Box::pin(async move {
+                        let Some(mut record) = tx.get_typed_json::<TruncatedSlices>(&key).await?
+                        else {
+                            return Ok(0);
+                        };
+                        let count = limit.min(record.slices.len());
+                        let removed: Vec<_> = record.slices.drain(..count).collect();
+                        if let Some(first) = removed.first() {
+                            let delayed: Vec<_> = removed
+                                .iter()
+                                .map(|slice| (slice.slice_id, slice.offset, slice.length))
+                                .collect();
+                            Self::stage_delayed_slice_records(
+                                tx,
+                                first.chunk_id,
+                                &delayed,
+                                record.created_at,
+                            )
+                            .await?;
+                        }
+                        if record.slices.is_empty() {
+                            tx.delete(key);
+                        } else {
+                            tx.set_typed_json(key, &record)?;
+                        }
+                        Ok(count)
+                    })
+                })
+                .await?;
+            remaining -= promoted;
+        }
         Ok(())
     }
 
@@ -2817,7 +2934,7 @@ impl MetaStore for EtcdMetaStore {
             })
             .await?;
 
-        self.delete_keys_batched(deferred_delete_keys).await?;
+        self.reclaim_truncated_chunks(deferred_delete_keys).await?;
         Ok(())
     }
 
@@ -3356,7 +3473,7 @@ impl MetaStore for EtcdMetaStore {
             .ok_or_else(|| MetaError::Internal("Invalid delayed data length".to_string()))?;
         let now = Utc::now().timestamp();
 
-        Self::ensure_atomic_compaction_write_budget(2, delayed_slices.len())?;
+        Self::ensure_atomic_compaction_write_budget(3, delayed_slices.len())?;
 
         EtcdTxn::new(&self.client)
             .max_retries(10)
@@ -3410,7 +3527,7 @@ impl MetaStore for EtcdMetaStore {
         let now = Utc::now().timestamp();
 
         Self::ensure_atomic_compaction_write_budget(
-            2 + new_slices.len() * 2,
+            3 + new_slices.len() * 2,
             delayed_slices.len(),
         )?;
 
@@ -3549,6 +3666,7 @@ impl MetaStore for EtcdMetaStore {
         batch_size: usize,
         max_age_secs: i64,
     ) -> Result<Vec<(u64, u64, u64, i64)>, MetaError> {
+        self.promote_truncated_slices(batch_size).await?;
         if batch_size == 0 {
             return Ok(vec![]);
         }
