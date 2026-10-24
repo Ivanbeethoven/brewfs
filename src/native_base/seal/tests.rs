@@ -1029,10 +1029,12 @@ fn sf_framed_native_block_roundtrips_through_the_native_path() {
     // Sanity in the codec direction: a genuine native frame decodes and
     // yields the original block (the loose path shares this framing).
     let fx = mixed_fixture();
-    let decoded: Vec<u8> =
-        decompress_framed(&encode_persisted_block(&fx.blocks[3], Compression::Zstd(3)))
-            .unwrap()
-            .to_vec();
+    let decoded: Vec<u8> = decompress_framed(
+        &encode_persisted_block(&fx.blocks[3], Compression::Zstd(3)),
+        BLOCK_SIZE as usize,
+    )
+    .unwrap()
+    .to_vec();
     assert_eq!(decoded, fx.blocks[3]);
 }
 

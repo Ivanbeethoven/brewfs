@@ -726,8 +726,9 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                         origin,
                         ReadWork::Decode,
                     );
-                    let decoded = Self::decode_object(layout, compression, Bytes::from(bytes))
-                        .map_err(|error| (FailureClass::Decode, error))?;
+                    let decoded =
+                        Self::decode_object(layout, compression, Bytes::from(bytes), block_size)
+                            .map_err(|error| (FailureClass::Decode, error))?;
                     if decoded.len() > block_size {
                         return Err((
                             FailureClass::Schema,
@@ -864,9 +865,10 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         layout: ObjectLayout,
         current_compression: Compression,
         bytes: Bytes,
+        block_size: usize,
     ) -> anyhow::Result<Bytes> {
         match layout {
-            ObjectLayout::Versioned(_) => decompress_framed_bytes(bytes),
+            ObjectLayout::Versioned(_) => decompress_framed_bytes(bytes, block_size),
             // Legacy `None` objects were written as arbitrary raw bytes. Do
             // not inspect a magic-like prefix, since that would corrupt valid
             // user data such as `SF\0\0payload`.
@@ -874,7 +876,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             // Legacy compressed mounts retain the historical compatibility
             // convention: valid legacy frames are decoded and non-frame bytes
             // remain raw.
-            ObjectLayout::Legacy => decompress_bytes(bytes),
+            ObjectLayout::Legacy => decompress_bytes(bytes, block_size),
         }
     }
 
@@ -1923,6 +1925,43 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn zstd_blocks_above_64_mib_roundtrip_from_object_backend() -> anyhow::Result<()> {
+        for block_size in [64 * 1024 * 1024 + 1, 128 * 1024 * 1024] {
+            let object_dir = tempfile::tempdir()?;
+            let writer_cache = tempfile::tempdir()?;
+            let config = BlockStoreConfig {
+                block_size,
+                compression: Compression::Zstd(3),
+                page_cache_capacity: 0,
+                populate_write_cache_after_upload: false,
+                range_background_prefetch: false,
+                ..Default::default()
+            };
+            let writer = ObjectBlockStore::new_with_configs_async(
+                ObjectClient::new(LocalFsBackend::new(object_dir.path())),
+                ChunksCacheConfig::with_budgets(0, 0, writer_cache.path().to_path_buf()),
+                config,
+            )
+            .await?;
+            let raw = vec![42; block_size];
+            writer.write_fresh_range((229, 0), 0, &raw).await?;
+            drop(writer);
+
+            // A fresh reader must decode the persisted frame, even for a small
+            // read and when the mount's current compression setting is None.
+            let reader_cache = tempfile::tempdir()?;
+            let reader =
+                local_object_store(object_dir.path(), reader_cache.path(), block_size).await;
+            let mut output = vec![0; 4096];
+            reader
+                .read_range((229, 0), (block_size - output.len()) as u64, &mut output)
+                .await?;
+            assert_eq!(output, raw[block_size - output.len()..]);
+        }
+        Ok(())
     }
 
     #[tokio::test]

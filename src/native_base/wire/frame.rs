@@ -440,7 +440,7 @@ mod tests {
         let frame = PackFrame::native_block_v1(&encoded).unwrap();
         assert_eq!(frame.raw_len as usize, encoded.len());
         assert_eq!(
-            crate::chunk::compress::decompress_framed(&frame.stored)
+            crate::chunk::compress::decompress_framed(&frame.stored, MAX_PLAIN_PAYLOAD as usize)
                 .unwrap()
                 .len(),
             MAX_PLAIN_PAYLOAD as usize

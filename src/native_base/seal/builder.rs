@@ -137,7 +137,7 @@ impl SealBuilder {
                 "object ref length disagrees with the encoded object bytes",
             ));
         }
-        let decoded = decompress_framed(encoded_object)
+        let decoded = decompress_framed(encoded_object, self.block_size as usize)
             .map_err(|e| SealError::Native(format!("loose object: {e}")))?;
         if decoded.is_empty() || decoded.len() as u64 > self.block_size as u64 {
             return Err(SealError::placement(format!(
