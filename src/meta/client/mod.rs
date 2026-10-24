@@ -1760,6 +1760,15 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
             }
         }
 
+        let destination_path = if !noreplace && self.store.capabilities().xattr {
+            Some(
+                self.child_original_path_for_trash(new_parent, &new_name)
+                    .await,
+            )
+        } else {
+            None
+        };
+
         // Only the backend transaction/script can decide whether the current
         // destination is the source inode or a different inode. Destination
         // hints may be stale across clients and must never control the rename.
@@ -1797,6 +1806,20 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         }
 
         let dest_ino = outcome.replaced_ino;
+        if let (Some(dest), Some(original_path)) = (dest_ino, destination_path) {
+            // Use the authoritative replacement inode and fresh link count:
+            // destination hints and cached attributes can belong to another
+            // namespace state. Remaining hard links must keep their metadata.
+            match self.store.stat(dest).await {
+                Ok(Some(attr)) if attr.nlink == 0 => {
+                    self.remember_trash_entry(dest, original_path).await;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(inode = dest, error = ?err, "failed to inspect replaced inode for trash");
+                }
+            }
+        }
         self.invalidate_open_file_cache_inode(src_ino).await;
         if let Some(dest_ino) = outcome.replaced_ino {
             self.invalidate_open_file_cache_inode(dest_ino).await;
@@ -4670,6 +4693,158 @@ mod tests {
         assert!(client.store.stat(report_ino).await.unwrap().is_some());
 
         client.shutdown_runtime().await;
+    }
+
+    #[tokio::test]
+    async fn test_control_plane_trash_metadata_survives_rename_overwrite() {
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let options = MetaClientOptions {
+            mount_point: Some("/mnt/trash-rename".to_string()),
+            control_runtime_dir: Some(runtime_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let client = create_test_client_with_options(options).await;
+        let docs_ino = client.mkdir(1, "docs".to_string()).await.unwrap();
+        let displaced_ino = client
+            .create_file(docs_ino, "destination".to_string())
+            .await
+            .unwrap();
+
+        let source_ino = client
+            .create_file(docs_ino, "source".to_string())
+            .await
+            .unwrap();
+        client
+            .rename(docs_ino, "source", docs_ino, "destination".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            client.lookup(docs_ino, "destination").await.unwrap(),
+            Some(source_ino)
+        );
+
+        client.start_control_plane().await.unwrap();
+        let registry =
+            crate::control::runtime::RuntimeRegistry::new(runtime_dir.path().to_path_buf());
+        let record = registry
+            .select_instance(Some("/mnt/trash-rename"))
+            .await
+            .unwrap();
+
+        let trash = crate::control::client::send_request(
+            &record.socket_path,
+            &crate::control::protocol::ControlRequest::ListTrash,
+        )
+        .await
+        .unwrap();
+        match trash {
+            crate::control::protocol::ControlResponse::Trash { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].id, displaced_ino.to_string());
+                assert_eq!(entries[0].original_path, "/docs/destination");
+                assert_eq!(entries[0].size, Some(0));
+                assert!(entries[0].deleted_at.is_some());
+            }
+            other => panic!("unexpected trash response: {other:?}"),
+        }
+
+        client
+            .rename(
+                docs_ino,
+                "destination",
+                docs_ino,
+                "moved-source".to_string(),
+            )
+            .await
+            .unwrap();
+        let restore = crate::control::client::send_request(
+            &record.socket_path,
+            &crate::control::protocol::ControlRequest::RestoreTrashEntry {
+                entry_id: displaced_ino.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        match restore {
+            crate::control::protocol::ControlResponse::TrashRestored { entry_id } => {
+                assert_eq!(entry_id, displaced_ino.to_string());
+            }
+            other => panic!("unexpected restore response: {other:?}"),
+        }
+        assert_eq!(
+            client.resolve_path("/docs/destination").await.unwrap(),
+            displaced_ino
+        );
+
+        client.shutdown_runtime().await;
+    }
+
+    #[tokio::test]
+    async fn test_control_plane_rename_trash_keeps_live_hardlink_metadata() {
+        for existing_metadata in [false, true] {
+            let client = create_test_client().await;
+            let src = client.create_file(1, "src".to_string()).await.unwrap();
+            let dst = client.create_file(1, "dst".to_string()).await.unwrap();
+            client.link(dst, 1, "remaining").await.unwrap();
+            if existing_metadata {
+                client
+                    .remember_trash_entry(dst, "/previous".to_string())
+                    .await;
+            }
+            let before = client
+                .store
+                .get_xattr(dst, CONTROL_TRASH_XATTR_NAME)
+                .await
+                .unwrap();
+            client.rename(1, "src", 1, "dst".to_string()).await.unwrap();
+            assert_eq!(client.lookup(1, "dst").await.unwrap(), Some(src));
+            assert_eq!(client.lookup(1, "remaining").await.unwrap(), Some(dst));
+            assert_eq!(client.store.stat(dst).await.unwrap().unwrap().nlink, 1);
+            assert_eq!(
+                client
+                    .store
+                    .get_xattr(dst, CONTROL_TRASH_XATTR_NAME)
+                    .await
+                    .unwrap(),
+                before
+            );
+            assert!(client.store.get_deleted_files().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_control_plane_rename_trash_requires_successful_replacement() {
+        let client = create_test_client().await;
+        let src = client.create_file(1, "src".to_string()).await.unwrap();
+        let dst = client.create_file(1, "dst".to_string()).await.unwrap();
+        assert!(
+            client
+                .rename_noreplace(1, "src", 1, "dst".to_string())
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .rename(1, "missing", 1, "dst".to_string())
+                .await
+                .is_err()
+        );
+        let dir = client.mkdir(1, "dir".to_string()).await.unwrap();
+        assert!(client.rename(1, "dir", 1, "dst".to_string()).await.is_err());
+        client
+            .rename(1, "src", dir, "new".to_string())
+            .await
+            .unwrap();
+        client.link(src, dir, "alias").await.unwrap();
+        client
+            .rename(dir, "new", dir, "alias".to_string())
+            .await
+            .unwrap();
+        for ino in [src, dst, dir] {
+            assert!(client.load_trash_metadata(ino).await.unwrap().is_none());
+        }
+        assert!(client.store.get_deleted_files().await.unwrap().is_empty());
     }
 
     #[tokio::test]
