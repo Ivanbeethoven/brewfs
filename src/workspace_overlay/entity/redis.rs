@@ -41,6 +41,10 @@ return {redis.call('TIME'), rows}
 // All key types, predicates, operations, counters and bounds are validated
 // before the first mutating command: Lua errors cannot roll back a prior SET.
 const TRANSACTION_LUA: &str = r#"
+local index = table.remove(KEYS, 1)
+if redis.call('TYPE', index).ok ~= 'zset' or not redis.call('ZSCORE', index, '') then
+    return redis.error_reply('ENTITY_CORRUPT missing entity key index')
+end
 local authorities, checks, writes = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
 local mode = ARGV[7]
 local extra_keys = mode == 'create' and 2 or (mode == 'reserve' and 1 or 0)
@@ -85,7 +89,7 @@ if mode ~= 'commit' and mode ~= 'create' and mode ~= 'reserve' then
 end
 local total, total_stored = 0, 0
 for _, key in ipairs(KEYS) do
-    if #key == 0 or #key > 1024 or string.sub(key, 1, #prefix) ~= prefix then
+    if key == index or #key == 0 or #key > 1024 or string.sub(key, 1, #prefix) ~= prefix then
         return redis.error_reply('ENTITY_INVALID invalid entity key')
     end
     local size = redis.pcall('STRLEN', key)
@@ -194,7 +198,11 @@ if mode == 'reserve' then
     end
     -- Validate the entire batch before consuming even its first identity.
     redis.call('INCRBY', counter_key, reservation_count)
-    for _, row in ipairs(generated) do redis.call('SET', row[1], row[2]) end
+    redis.call('ZADD', index, 0, counter_key)
+    for _, row in ipairs(generated) do
+        redis.call('SET', row[1], row[2])
+        redis.call('ZADD', index, 0, row[1])
+    end
     return {5, table.concat(ids, ',')}
 end
 if mode == 'create' then
@@ -257,48 +265,82 @@ if mode == 'create' then
     -- No data-dependent validation remains after this point. INCR's rounded
     -- Lua reply is ignored; the exact decimal preview is the published identity.
     redis.call('INCR', counter_key)
+    redis.call('ZADD', index, 0, counter_key)
 end
 for i = 1, writes do
     local key, operation, value = KEYS[authorities + checks + i], ARGV[cursor], ARGV[cursor + 1]
-    if operation == 'put' then redis.call('SET', key, value) else redis.call('DEL', key) end
+    if operation == 'put' then
+        redis.call('SET', key, value)
+        redis.call('ZADD', index, 0, key)
+    else
+        redis.call('DEL', key)
+        redis.call('ZREM', index, key)
+    end
     cursor = cursor + 2
 end
-for _, row in ipairs(generated) do redis.call('SET', row[1], row[2]) end
+for _, row in ipairs(generated) do
+    redis.call('SET', row[1], row[2])
+    redis.call('ZADD', index, 0, row[1])
+end
 if allocated then return {4, allocated} end
 return {1, ''}
 "#;
 
-// No maintained global key index. SCAN runs inside one bounded script so the
-// response is complete or fails closed. Parent-row validation is still needed
-// before committing a decision made from this observation. A large unrelated
-// database may exceed this prototype's scan-work bound and is unsupported.
-const SCAN_LUA: &str = r#"
-local prefix, pattern, limit = ARGV[1], ARGV[2], tonumber(ARGV[3])
-local cursor, calls, total, seen, rows = '0', 0, 0, {}, {}
-repeat
-    calls = calls + 1
-    if calls > 2048 then return redis.error_reply('ENTITY_INVALID scan exceeds work bound') end
-    local page = redis.call('SCAN', cursor, 'MATCH', pattern, 'COUNT', 128)
-    cursor = page[1]
-    for _, key in ipairs(page[2]) do
-        if string.sub(key, 1, #prefix) ~= prefix or #key > 1024 then
-            return redis.error_reply('ENTITY_INVALID invalid scanned key')
-        end
-        if not seen[key] then
-            if #rows >= limit then return redis.error_reply('ENTITY_INVALID scan exceeds row bound') end
-            seen[key] = true
-            if redis.call('TYPE', key).ok ~= 'string' then
-                return redis.error_reply('ENTITY_CORRUPT invalid scanned row type')
-            end
-            local size = redis.call('STRLEN', key)
-            total = total + #key + size
-            if size > 4194304 or total > 16777216 then
-                return redis.error_reply('ENTITY_INVALID scan exceeds byte bound')
-            end
-            rows[#rows + 1] = {key, redis.call('GET', key)}
-        end
+// Backfill only at first open, with SCAN turns outside Lua. Checking existence
+// and adding each member atomically prevents a concurrent delete from leaving
+// a stale index entry. The empty member marks completion and keeps an empty
+// volume's index alive. Old writers must be stopped before upgrading.
+const INDEX_LUA: &str = r#"
+local index = KEYS[1]
+local kind = redis.call('TYPE', index).ok
+if kind ~= 'none' and kind ~= 'zset' then
+    return redis.error_reply('ENTITY_CORRUPT invalid entity key index type')
+end
+if redis.call('ZSCORE', index, '') then return 1 end
+for i = 2, #KEYS do
+    if KEYS[i] ~= index and redis.call('EXISTS', KEYS[i]) == 1 then
+        redis.call('ZADD', index, 0, KEYS[i])
     end
-until cursor == '0'
+end
+if ARGV[1] == '1' then redis.call('ZADD', index, 0, '') end
+return 0
+"#;
+
+// One lexicographic range, bounded by matching rows rather than database size.
+// Read limit + 1 keys to detect overflow; never return an incomplete observation
+// to directory emptiness/rename or recovery callers. Parent predicates remain
+// necessary when committing a decision made from this observation.
+const SCAN_LUA: &str = r#"
+local index, prefix, limit = KEYS[1], ARGV[1], tonumber(ARGV[2])
+if redis.call('TYPE', index).ok ~= 'zset' or not redis.call('ZSCORE', index, '') then
+    return redis.error_reply('ENTITY_CORRUPT missing entity key index')
+end
+-- Find the exact exclusive prefix successor, including binary suffixes.
+local upper = '+'
+for i = #prefix, 1, -1 do
+    local byte = string.byte(prefix, i)
+    if byte < 255 then
+        upper = '(' .. string.sub(prefix, 1, i - 1) .. string.char(byte + 1)
+        break
+    end
+end
+local keys = redis.call('ZRANGEBYLEX', index, '[' .. prefix, upper, 'LIMIT', 0, limit + 1)
+if #keys > limit then return redis.error_reply('ENTITY_INVALID scan exceeds row bound') end
+local total, rows = 0, {}
+for _, key in ipairs(keys) do
+    if string.sub(key, 1, #prefix) ~= prefix or #key > 1024 then
+        return redis.error_reply('ENTITY_INVALID invalid scanned key')
+    end
+    if redis.call('TYPE', key).ok ~= 'string' then
+        return redis.error_reply('ENTITY_CORRUPT invalid scanned row type')
+    end
+    local size = redis.call('STRLEN', key)
+    total = total + #key + size
+    if size > 4194304 or total > 16777216 then
+        return redis.error_reply('ENTITY_INVALID scan exceeds byte bound')
+    end
+    rows[#rows + 1] = {key, redis.call('GET', key)}
+end
 return rows
 "#;
 
@@ -306,6 +348,7 @@ return rows
 pub struct RedisEntityBackend {
     connection: ConnectionManager,
     prefix: Vec<u8>,
+    index: Vec<u8>,
 }
 
 impl RedisEntityBackend {
@@ -314,10 +357,63 @@ impl RedisEntityBackend {
         let connection = ConnectionManager::new(client)
             .await
             .map_err(backend_error)?;
-        let prefix = EntityKeys::new(volume_id, Uuid::nil())
-            .volume_prefix()
-            .to_vec();
-        Ok(Self { connection, prefix })
+        let keys = EntityKeys::new(volume_id, Uuid::nil());
+        let backend = Self {
+            connection,
+            prefix: keys.volume_prefix().to_vec(),
+            index: keys.key_index(),
+        };
+        backend.initialize_index().await?;
+        Ok(backend)
+    }
+
+    async fn initialize_index(&self) -> Result<()> {
+        let script = redis::Script::new(INDEX_LUA);
+        let mut connection = self.connection.clone();
+        let ready: bool = script
+            .key(&self.index)
+            .arg(0)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(backend_error)?;
+        if ready {
+            return Ok(());
+        }
+        // This volume prefix contains only a fixed tag and UUID, no glob bytes.
+        let pattern = [self.prefix.as_slice(), b"*"].concat();
+        let mut cursor = 0_u64;
+        loop {
+            let (next, keys): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(128)
+                .query_async(&mut connection)
+                .await
+                .map_err(backend_error)?;
+            // COUNT is a hint: explicitly bound each atomic backfill batch.
+            for batch in keys.chunks(128) {
+                script
+                    .key(&self.index)
+                    .key(batch)
+                    .arg(0)
+                    .invoke_async::<bool>(&mut connection)
+                    .await
+                    .map_err(backend_error)?;
+            }
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+        script
+            .key(&self.index)
+            .arg(1)
+            .invoke_async::<bool>(&mut connection)
+            .await
+            .map_err(backend_error)?;
+        Ok(())
     }
 
     fn validate_scope(&self, key: &[u8]) -> Result<()> {
@@ -326,6 +422,9 @@ impl RedisEntityBackend {
             return Err(EntityError::Invalid(
                 "entity key belongs to another volume".into(),
             ));
+        }
+        if key == self.index {
+            return Err(EntityError::Invalid("reserved entity key index".into()));
         }
         Ok(())
     }
@@ -362,6 +461,7 @@ impl RedisEntityBackend {
         }
         let script = redis::Script::new(TRANSACTION_LUA);
         let mut invocation = script.prepare_invoke();
+        invocation.key(&self.index);
         for check in authority.checks.iter().chain(&plan.checks) {
             invocation.key(&check.key);
         }
@@ -580,23 +680,12 @@ impl EntityBackend for RedisEntityBackend {
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         validate_scan(prefix, limit)?;
         self.validate_scope(prefix)?;
-        let mut pattern = Vec::with_capacity(prefix.len() + 1);
-        for byte in prefix {
-            if matches!(byte, b'*' | b'?' | b'[' | b']' | b'\\') {
-                pattern.push(b'\\');
-            }
-            pattern.push(*byte);
-        }
-        pattern.push(b'*');
-        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = redis::Script::new(SCAN_LUA)
-            .key(prefix)
+        redis::Script::new(SCAN_LUA)
+            .key(&self.index)
             .arg(prefix)
-            .arg(pattern)
             .arg(limit)
             .invoke_async(&mut self.connection.clone())
             .await
-            .map_err(backend_error)?;
-        rows.sort_by(|left, right| left.0.cmp(&right.0));
-        Ok(rows)
+            .map_err(backend_error)
     }
 }

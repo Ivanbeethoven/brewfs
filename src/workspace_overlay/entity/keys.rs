@@ -44,6 +44,9 @@ impl EntityKeys {
     fn volume_key(&self, suffix: &str) -> Vec<u8> {
         [self.volume_prefix(), suffix.as_bytes()].concat()
     }
+    pub(super) fn key_index(&self) -> Vec<u8> {
+        self.volume_key("key-index")
+    }
     pub fn descriptor(&self) -> Vec<u8> {
         self.key("descriptor")
     }
