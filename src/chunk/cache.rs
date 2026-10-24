@@ -2518,6 +2518,32 @@ impl ChunksCache {
         self.persist_opportunistic(key, data, generation).await;
     }
 
+    async fn cold_marker_has_file(
+        disk_storage: &DiskStorage,
+        cold_cache: &moka::future::Cache<String, ()>,
+        key: &str,
+    ) -> bool {
+        if cold_cache.get(key).await.is_none() {
+            return false;
+        }
+
+        // Eviction can leave a residency hint behind. Recheck the file under
+        // the publication gate so clearing that hint cannot race a replacement.
+        let shard = &disk_storage.key_shards[DiskStorage::key_shard_index(key)];
+        let _gate = shard.gate.lock().await;
+        let path = disk_storage
+            .base_dir
+            .join(DiskStorage::key_to_filename(key));
+        match tokio::fs::metadata(path).await {
+            Ok(metadata) => metadata.is_file(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                cold_cache.invalidate(key).await;
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
     async fn persist_opportunistic(&self, key: String, data: bytes::Bytes, generation: u64) {
         if self.config.max_disk_bytes == 0 {
             return;
@@ -2527,7 +2553,7 @@ impl ChunksCache {
         // S3, but keep this genuinely opportunistic. If local cache I/O is
         // saturated, skip the disk write instead of queuing more background
         // work that can compete with foreground reads and writes.
-        if self.cold_cache.get(&key).await.is_some() {
+        if Self::cold_marker_has_file(&self.disk_storage, &self.cold_cache, &key).await {
             return;
         }
 
@@ -2566,7 +2592,7 @@ impl ChunksCache {
                 key: cached_key.clone(),
             };
 
-            if cold_cache.get(&cached_key).await.is_some() {
+            if Self::cold_marker_has_file(&disk_storage, &cold_cache, &cached_key).await {
                 return;
             }
 
@@ -3561,6 +3587,47 @@ mod tests {
             .await
         );
         assert!(!cache.is_disk_cached(&key).await);
+    }
+
+    #[tokio::test]
+    async fn cold_marker_recheck_preserves_concurrent_replacement() {
+        let temp_dir = tempdir().unwrap();
+        let cache = ChunksCache::new_with_config(ChunksCacheConfig::with_budgets(
+            0,
+            4096,
+            temp_dir.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+        let key = "marker-replacement".to_string();
+        cache
+            .store_to_disk(&key, bytes::Bytes::from_static(b"old"))
+            .await
+            .unwrap();
+        let path = temp_dir.path().join(DiskStorage::key_to_filename(&key));
+        tokio::fs::remove_file(&path).await.unwrap();
+
+        let shard = &cache.disk_storage.key_shards[DiskStorage::key_shard_index(&key)];
+        let gate = shard.gate.lock().await;
+        let mut recheck = Box::pin(ChunksCache::cold_marker_has_file(
+            &cache.disk_storage,
+            &cache.cold_cache,
+            &key,
+        ));
+        assert!(futures::poll!(&mut recheck).is_pending());
+
+        // Model a replacement published while the marker recheck waits for
+        // the shard gate. The earlier absence must not invalidate its marker.
+        tokio::fs::write(&path, b"replacement").await.unwrap();
+        cache.cold_cache.insert(key.clone(), ()).await;
+        drop(gate);
+
+        assert!(recheck.await);
+        assert!(cache.is_disk_cached(&key).await);
+        assert_eq!(
+            cache.get(&key).await,
+            Some(bytes::Bytes::from_static(b"replacement"))
+        );
     }
 
     #[tokio::test]
