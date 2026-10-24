@@ -777,10 +777,10 @@ where
         {
             return Ok(output);
         }
+        let mut object_pieces = BTreeMap::<_, Vec<_>>::new();
         for (destination, span) in pieces {
             let destination = usize::try_from(destination).map_err(|_| EntityError::Overflow)?;
             let count = usize::try_from(span.length).map_err(|_| EntityError::Overflow)?;
-            let target = &mut output[destination..destination + count];
             match span.source {
                 ChunkSource::Hole => {}
                 ChunkSource::LowerRange {
@@ -801,24 +801,37 @@ where
                             "short authenticated lower read".into(),
                         ));
                     }
-                    target.copy_from_slice(&bytes);
+                    output[destination..destination + count].copy_from_slice(&bytes);
                 }
                 ChunkSource::Data {
                     slice_id,
                     slice_offset,
                 } => {
-                    let descriptor = descriptors
-                        .get(&slice_id)
-                        .expect("validated object descriptor");
-                    let bytes = self.read_object(descriptor).await?;
-                    let start = usize::try_from(slice_offset).map_err(|_| EntityError::Overflow)?;
-                    let source = bytes
-                        .get(start..start.checked_add(count).ok_or(EntityError::Overflow)?)
-                        .ok_or_else(|| {
-                            EntityError::Corrupt("slice read exceeds authenticated object".into())
-                        })?;
-                    target.copy_from_slice(source);
+                    object_pieces.entry(slice_id).or_default().push((
+                        destination,
+                        count,
+                        slice_offset,
+                    ));
                 }
+            }
+        }
+        // An overwrite can leave several visible fragments of one immutable
+        // object. Authenticate it once and scatter its fragments, retaining
+        // only one full object buffer at a time. The piece bound above also
+        // bounds these request-local recipes.
+        for (slice_id, pieces) in object_pieces {
+            let descriptor = descriptors
+                .get(&slice_id)
+                .expect("validated object descriptor");
+            let bytes = self.read_object(descriptor).await?;
+            for (destination, count, slice_offset) in pieces {
+                let start = usize::try_from(slice_offset).map_err(|_| EntityError::Overflow)?;
+                let source = bytes
+                    .get(start..start.checked_add(count).ok_or(EntityError::Overflow)?)
+                    .ok_or_else(|| {
+                        EntityError::Corrupt("slice read exceeds authenticated object".into())
+                    })?;
+                output[destination..destination + count].copy_from_slice(source);
             }
         }
         // Revalidate after transport too. Old objects remain protected by
