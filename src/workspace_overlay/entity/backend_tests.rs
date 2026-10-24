@@ -216,6 +216,51 @@ async fn conformance<B: EntityBackend + 'static>(backend: Arc<B>, keys: EntityKe
         ));
     }
 
+    assert_eq!(
+        backend.scan_prefix_page(&prefix, None, 2).await.unwrap(),
+        rows[..2]
+    );
+    let cursor = &rows[1].0;
+    assert_eq!(
+        backend
+            .commit(
+                &authority,
+                &EntityPlan {
+                    checks: vec![],
+                    writes: vec![RowWrite::Delete {
+                        key: cursor.clone()
+                    }],
+                }
+            )
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    assert_eq!(
+        backend
+            .scan_prefix_page(&prefix, Some(cursor), 2)
+            .await
+            .unwrap(),
+        rows[2..]
+    );
+    assert!(
+        backend
+            .scan_prefix_page(&prefix, Some(&rows[2].0), 2)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        backend.scan_prefix_page(&prefix, None, 0).await,
+        Err(EntityError::Invalid(_))
+    ));
+    assert!(matches!(
+        backend
+            .scan_prefix_page(&prefix, Some(&keys.inode(2)), 2)
+            .await,
+        Err(EntityError::Invalid(_))
+    ));
+
     let snapshot = backend.read(&[]).await.unwrap();
     let expired =
         TransactionAuthority::from_validated(authority.checks.clone(), Some(snapshot.now_ns))
@@ -965,6 +1010,21 @@ async fn redis_entity_prefix_scan_does_not_traverse_unrelated_keys() {
                 restricted.scan_prefix(&keys.dentry_prefix(1), 10).await?,
                 expected
             );
+            let mut paged = Vec::new();
+            loop {
+                let after = paged
+                    .last()
+                    .map(|(key, _): &(Vec<u8>, Vec<u8>)| key.as_slice());
+                let page = restricted
+                    .scan_prefix_page(&keys.dentry_prefix(1), after, 3)
+                    .await?;
+                if page.is_empty() {
+                    break;
+                }
+                assert!(page.len() <= 3);
+                paged.extend(page);
+            }
+            assert_eq!(paged, expected);
             assert!(
                 restricted
                     .scan_prefix(&keys.dentry_prefix(2), 10)
@@ -1082,6 +1142,10 @@ async fn redis_entity_rejects_wrong_type_and_oversize_before_any_write_or_decode
     ));
     assert!(matches!(
         backend.scan_prefix(&oversized, 1).await,
+        Err(EntityError::Invalid(_))
+    ));
+    assert!(matches!(
+        backend.scan_prefix_page(&oversized, None, 1).await,
         Err(EntityError::Invalid(_))
     ));
     assert!(matches!(

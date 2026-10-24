@@ -10,7 +10,7 @@ use super::{
         CommitOutcome, CreateAllocation, EntityBackend, EntityPlan, MAX_KEY_BYTES,
         MAX_TRANSACTION_BYTES, RowCheck, RowSnapshot, RowWrite, SliceAllocation,
         TransactionAuthority, prepare_create, prepare_slices, validate_checked_read, validate_key,
-        validate_plan, validate_scan,
+        validate_plan, validate_scan, validate_scan_page,
     },
     codec::MAX_ROW_BYTES,
     keys::EntityKeys,
@@ -323,6 +323,7 @@ return 0
 // Complete scans read limit + 1 keys to detect overflow. Batch scans explicitly
 // allow a partial prefix for quiescent sweeps. Parent/authority predicates remain
 // necessary when committing a decision made from either observation.
+// An optional fourth argument supplies an exclusive cursor for batch scans.
 const SCAN_LUA: &str = r#"
 local index, prefix, limit = KEYS[1], ARGV[1], tonumber(ARGV[2])
 local batch = ARGV[3] == 'batch'
@@ -338,7 +339,9 @@ for i = #prefix, 1, -1 do
         break
     end
 end
-local keys = redis.call('ZRANGEBYLEX', index, '[' .. prefix, upper, 'LIMIT', 0, batch and limit or limit + 1)
+local lower = '[' .. prefix
+if batch and ARGV[4] and ARGV[4] ~= '' then lower = '(' .. ARGV[4] end
+local keys = redis.call('ZRANGEBYLEX', index, lower, upper, 'LIMIT', 0, batch and limit or limit + 1)
 if not batch and #keys > limit then return redis.error_reply('ENTITY_INVALID scan exceeds row bound') end
 local total, rows = 0, {}
 for _, key in ipairs(keys) do
@@ -725,13 +728,23 @@ impl EntityBackend for RedisEntityBackend {
         prefix: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        validate_scan(prefix, limit)?;
+        self.scan_prefix_page(prefix, None, limit).await
+    }
+
+    async fn scan_prefix_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        validate_scan_page(prefix, after, limit)?;
         self.validate_scope(prefix)?;
         redis::Script::new(SCAN_LUA)
             .key(&self.index)
             .arg(prefix)
             .arg(limit)
             .arg("batch")
+            .arg(after.unwrap_or_default())
             .invoke_async(&mut self.connection.clone())
             .await
             .map_err(backend_error)

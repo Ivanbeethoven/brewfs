@@ -194,6 +194,16 @@ pub trait EntityBackend: Send + Sync {
         prefix: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// At most `limit` rows in bytewise key order, strictly after `after` when
+    /// supplied. The cursor need not still exist. Unlike scan_prefix, a page is
+    /// not a complete prefix observation; mutations must check their parent row
+    /// read before the scan, and completion requires an empty subsequent page.
+    async fn scan_prefix_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 }
 
 pub(super) fn validate_key(key: &[u8]) -> Result<()> {
@@ -574,6 +584,19 @@ pub(super) fn validate_scan(prefix: &[u8], limit: usize) -> Result<()> {
     validate_key(prefix)?;
     if limit == 0 || limit > MAX_TRANSACTION_ROWS {
         return Err(EntityError::Invalid("invalid entity scan row bound".into()));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_scan_page(prefix: &[u8], after: Option<&[u8]>, limit: usize) -> Result<()> {
+    validate_scan(prefix, limit)?;
+    if let Some(after) = after {
+        validate_key(after)?;
+        if !after.starts_with(prefix) {
+            return Err(EntityError::Invalid(
+                "entity scan cursor outside prefix".into(),
+            ));
+        }
     }
     Ok(())
 }

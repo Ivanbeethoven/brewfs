@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use super::*;
 use crate::workspace_overlay::entity::backend::{
@@ -17,6 +17,8 @@ struct FaultBackend<B> {
     inner: Arc<B>,
     /// 1: fail before mutation, 2: lose a successful committed reply.
     fault: AtomicU8,
+    scanned_rows: AtomicUsize,
+    scans: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -47,7 +49,21 @@ impl<B: EntityBackend> EntityBackend for FaultBackend<B> {
         self.inner.reserve_slices(authority, allocation).await
     }
     async fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.inner.scan_prefix(prefix, limit).await
+        let rows = self.inner.scan_prefix(prefix, limit).await?;
+        self.scanned_rows.fetch_add(rows.len(), Ordering::SeqCst);
+        self.scans.fetch_add(1, Ordering::SeqCst);
+        Ok(rows)
+    }
+    async fn scan_prefix_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let rows = self.inner.scan_prefix_page(prefix, after, limit).await?;
+        self.scanned_rows.fetch_add(rows.len(), Ordering::SeqCst);
+        self.scans.fetch_add(1, Ordering::SeqCst);
+        Ok(rows)
     }
     async fn scan_prefix_batch(
         &self,
@@ -74,6 +90,8 @@ impl<B: EntityBackend> Fixture<B> {
         let backend = Arc::new(FaultBackend {
             inner: backend,
             fault: AtomicU8::new(0),
+            scanned_rows: AtomicUsize::new(0),
+            scans: AtomicUsize::new(0),
         });
         let mut lower = MemoryLower::empty();
         lower.add_file(1, b"file", 2, 48);
@@ -248,6 +266,216 @@ impl<B: EntityBackend> Fixture<B> {
         )
         .unwrap()
     }
+}
+
+async fn cleanup_scan_work<B: EntityBackend>(
+    backend: Arc<B>,
+    keys: EntityKeys,
+    orphan: bool,
+    chunks: u64,
+    cut: u64,
+) {
+    let fixture = Fixture::new(backend, keys).await;
+    fixture.resize(chunks * 16).await;
+    fixture
+        .commit(&EntityPlan {
+            checks: Vec::new(),
+            writes: (0..chunks)
+                .map(|index| {
+                    put(fixture.keys.chunk(2, index), &ChunkMap::holes(16).unwrap()).unwrap()
+                })
+                .collect(),
+        })
+        .await;
+    if orphan {
+        let (raw, mut inode) = fixture.inode().await;
+        inode.nlink = 0;
+        let mut plan = plan_orphan(&fixture.keys, &fixture.session, 2, None).unwrap();
+        plan.checks.push(RowCheck {
+            key: fixture.keys.inode(2),
+            expected: raw,
+        });
+        plan.writes
+            .push(put(fixture.keys.inode(2), &UpperInode::Present(inode)).unwrap());
+        plan.writes
+            .push(put(fixture.keys.dentry(1, b"file"), &EntityDentry::Whiteout).unwrap());
+        fixture.commit(&plan).await;
+    } else {
+        fixture.resize(cut).await;
+    }
+    let maintenance = fixture
+        .lifecycle
+        .enter_maintenance(&fixture.session)
+        .await
+        .unwrap();
+    let authority = fixture
+        .lifecycle
+        .maintenance_authority(&maintenance)
+        .await
+        .unwrap();
+    fixture.backend.scanned_rows.store(0, Ordering::SeqCst);
+    fixture.backend.scans.store(0, Ordering::SeqCst);
+    let mut complete = false;
+    for _ in 0..=chunks {
+        // Every step reconstructs recovery, exercising only durable progress.
+        let recovery = fixture.recovery();
+        complete = if orphan {
+            recovery.recover_orphan_step(&maintenance, 2).await
+        } else {
+            recovery.truncate_step(&authority, 2).await
+        }
+        .unwrap();
+        if complete {
+            break;
+        }
+    }
+    assert!(complete, "cleanup did not finish");
+    let scanned = fixture.backend.scanned_rows.load(Ordering::SeqCst);
+    let scans = fixture.backend.scans.load(Ordering::SeqCst);
+    eprintln!(
+        "orphan={orphan}, chunk_rows={chunks}, cut={cut}, scanned_rows={scanned}, scans={scans}"
+    );
+    // A retained prefix may require one bounded page of lookahead, but whole
+    // file cleanup must fetch each chunk value only once, even after restart.
+    let lookahead = if cut == 0 { 0 } else { 64 };
+    assert!(
+        scanned <= chunks as usize + lookahead,
+        "cleanup repeatedly fetched chunk values: {scanned} rows for {chunks} chunks"
+    );
+    if cut > 0 {
+        assert!(
+            scans < chunks as usize / 8,
+            "retained rows need bounded pages, not one request per row"
+        );
+    }
+    let remaining = fixture
+        .backend
+        .inner
+        .scan_prefix(&fixture.keys.chunk_prefix(2), 4096)
+        .await
+        .unwrap();
+    assert_eq!(remaining.len() as u64, cut.div_ceil(16));
+    for (key, _) in remaining {
+        let index: u64 = std::str::from_utf8(&key[fixture.keys.chunk_prefix(2).len()..])
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(index < cut.div_ceil(16));
+    }
+}
+
+#[tokio::test]
+async fn truncate_cleanup_scans_each_chunk_once() {
+    cleanup_scan_work(
+        Arc::new(MemoryEntityBackend::new(10)),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+        false,
+        128,
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn orphan_cleanup_scans_each_chunk_once() {
+    cleanup_scan_work(
+        Arc::new(MemoryEntityBackend::new(10)),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+        true,
+        128,
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn truncate_cleanup_pages_over_retained_prefix() {
+    cleanup_scan_work(
+        Arc::new(MemoryEntityBackend::new(10)),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+        false,
+        1024,
+        1023 * 16,
+    )
+    .await;
+}
+
+async fn sparse_legacy_truncate_contract<B: EntityBackend>(backend: Arc<B>, keys: EntityKeys) {
+    let mut fixture = Fixture::new(backend, keys).await;
+    let boundary = fixture.upper(0, 0, b"BOUNDARY").await;
+    fixture.resize(((1_u64 << 53) + 1) * 16).await;
+    let mut tails = Vec::new();
+    for index in [2, 9, 10, 11, 99, 100, 1_u64 << 53] {
+        tails.push(fixture.upper(index, 0, b"TAIL").await);
+    }
+    fixture.resize(5).await;
+    let authority = fixture.authority().await;
+    assert!(
+        !fixture
+            .recovery()
+            .truncate_step(&authority, 2)
+            .await
+            .unwrap()
+    );
+
+    // A pre-pagination writer would have persisted next_chunk=1 after masking
+    // the boundary, without a key-order cursor. Resume those exact bytes.
+    let key = fixture.keys.truncate(2);
+    let raw = fixture
+        .backend
+        .read(std::slice::from_ref(&key))
+        .await
+        .unwrap()
+        .rows[0]
+        .clone();
+    let mut legacy: serde_json::Value = serde_json::from_slice(raw.as_deref().unwrap()).unwrap();
+    assert_eq!(legacy["next_chunk"], 1);
+    legacy.as_object_mut().unwrap().remove("scan_after");
+    fixture
+        .commit(&EntityPlan {
+            checks: vec![RowCheck {
+                key: key.clone(),
+                expected: raw,
+            }],
+            writes: vec![put(key.clone(), &legacy).unwrap()],
+        })
+        .await;
+    // Lose each committed response and reconstruct the service. No chunk may
+    // be skipped or have its ownership released twice when key order crosses
+    // decimal widths or IDs above the exact integer range of a Lua number.
+    for _ in 0..=tails.len() {
+        fixture.backend.fault.store(2, Ordering::SeqCst);
+        assert!(matches!(
+            fixture.recovery().truncate_step(&authority, 2).await,
+            Err(EntityError::Backend(_))
+        ));
+    }
+    assert!(
+        fixture
+            .recovery()
+            .truncate_step(&authority, 2)
+            .await
+            .unwrap()
+    );
+    assert!(fixture.backend.read(&[key]).await.unwrap().rows[0].is_none());
+    assert_eq!(fixture.slice(boundary).await.current_refs, 1);
+    for id in tails {
+        assert_eq!(fixture.slice(id).await.current_refs, 0);
+    }
+    assert_eq!(fixture.bytes().await, b"BOUND");
+    fixture.resize(48).await;
+    let mut expected = b"BOUND".to_vec();
+    expected.resize(48, 0);
+    assert_eq!(fixture.bytes().await, expected);
+}
+
+#[tokio::test]
+async fn truncate_resumes_legacy_cursor_across_sparse_decimal_keys_and_lost_replies() {
+    sparse_legacy_truncate_contract(
+        Arc::new(MemoryEntityBackend::new(10)),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+    )
+    .await;
 }
 
 async fn truncate_contract<B: EntityBackend>(backend: Arc<B>, keys: EntityKeys) {
@@ -471,7 +699,7 @@ async fn redis_truncate_orphan_underflow_and_discard_crash_contracts() {
     let url = std::env::var("BREWFS_TEST_REDIS_URL").expect("BREWFS_TEST_REDIS_URL");
     let client = redis::Client::open(url.as_str()).unwrap();
     let mut connection = client.get_multiplexed_async_connection().await.unwrap();
-    for case in 0..4 {
+    for case in 0..8 {
         let volume = Uuid::new_v4();
         let keys = EntityKeys::new(volume, Uuid::new_v4());
         let backend = Arc::new(RedisEntityBackend::connect(&url, volume).await.unwrap());
@@ -479,7 +707,11 @@ async fn redis_truncate_orphan_underflow_and_discard_crash_contracts() {
             0 => truncate_contract(backend.clone(), keys.clone()).await,
             1 => underflow_contract(backend.clone(), keys.clone()).await,
             2 => orphan_contract(backend.clone(), keys.clone()).await,
-            _ => discard_contract(backend.clone(), keys.clone()).await,
+            3 => discard_contract(backend.clone(), keys.clone()).await,
+            4 => cleanup_scan_work(backend.clone(), keys.clone(), false, 128, 0).await,
+            5 => cleanup_scan_work(backend.clone(), keys.clone(), true, 128, 0).await,
+            6 => cleanup_scan_work(backend.clone(), keys.clone(), false, 1024, 1023 * 16).await,
+            _ => sparse_legacy_truncate_contract(backend.clone(), keys.clone()).await,
         }
         for (key, _) in backend
             .scan_prefix(keys.volume_prefix(), 4096)

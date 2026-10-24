@@ -29,8 +29,12 @@ pub struct TruncateIntent {
     pub chunk_size: u64,
     /// Inode-local fence against an upload prepared before the cut.
     pub data_version: u64,
-    /// Next chunk that has not yet had its stale mapping removed or masked.
+    /// Numeric lower bound on chunks that may still contain stale mappings.
     pub next_chunk: u64,
+    /// Last visited chunk in bytewise key order, committed with its cleanup.
+    /// Older intents have only the numeric lower bound and start at the prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_after: Option<u64>,
 }
 
 impl TruncateIntent {
@@ -44,6 +48,9 @@ impl TruncateIntent {
             || self.cut_size >= self.previous_size
             || self.previous_size > i64::MAX as u64
             || self.next_chunk < self.cut_size / self.chunk_size
+            || self
+                .scan_after
+                .is_some_and(|index| index < self.cut_size / self.chunk_size)
         {
             return Err(EntityError::Corrupt("invalid truncate intent".into()));
         }
@@ -127,6 +134,7 @@ pub fn prepare_resize(
             chunk_size,
             data_version: inode.data_version,
             next_chunk: new_size / chunk_size,
+            scan_after: None,
         };
         intent.validate(keys, ino)?;
         plan.writes.push(put(keys.truncate(ino), &intent)?);
@@ -188,38 +196,50 @@ impl<B: EntityBackend> Recovery<B> {
                 "truncate cut or generation changed during cleanup".into(),
             ));
         }
-        let chunks = self.chunks(ino).await?;
         let first = intent.cut_size / intent.chunk_size;
         let suffix = intent.cut_size % intent.chunk_size;
         let mut candidate = None;
-        for (index, key, bytes) in chunks {
-            if index < first {
-                continue;
+        let mut after = intent.scan_after;
+        let mut limit = 1;
+        'scan: loop {
+            let chunks = self.chunks(ino, after, limit).await?;
+            if chunks.is_empty() {
+                break;
             }
-            let map: ChunkMap = decode(&bytes)?;
-            map.validate()?;
-            if map.chunk_size != intent.chunk_size || index.checked_mul(intent.chunk_size).is_none()
-            {
-                return Err(EntityError::Corrupt(
-                    "truncate chunk geometry mismatch".into(),
-                ));
-            }
-            if index < intent.next_chunk {
-                if index != first
-                    || suffix == 0
-                    || map
-                        .clip(suffix, intent.chunk_size - suffix)?
-                        .iter()
-                        .any(|span| span.source != ChunkSource::Hole)
+            for (index, key, bytes) in chunks {
+                after = Some(index);
+                if index < first {
+                    continue;
+                }
+                let map: ChunkMap = decode(&bytes)?;
+                map.validate()?;
+                if map.chunk_size != intent.chunk_size
+                    || index.checked_mul(intent.chunk_size).is_none()
                 {
                     return Err(EntityError::Corrupt(
-                        "truncate cursor skipped stale bytes".into(),
+                        "truncate chunk geometry mismatch".into(),
                     ));
                 }
-                continue;
+                if index < intent.next_chunk {
+                    if index != first
+                        || suffix == 0
+                        || map
+                            .clip(suffix, intent.chunk_size - suffix)?
+                            .iter()
+                            .any(|span| span.source != ChunkSource::Hole)
+                    {
+                        return Err(EntityError::Corrupt(
+                            "truncate cursor skipped stale bytes".into(),
+                        ));
+                    }
+                    continue;
+                }
+                candidate = Some((index, key, bytes, map));
+                break 'scan;
             }
-            candidate = Some((index, key, bytes, map));
-            break;
+            // Skip retained rows in bounded pages, rather than issuing one
+            // metadata request per retained chunk on a small shrink.
+            limit = 64;
         }
         let mut plan = EntityPlan {
             checks: checked_rows(&keys, snapshot.rows),
@@ -246,7 +266,13 @@ impl<B: EntityBackend> Recovery<B> {
             } else {
                 RowWrite::Delete { key }
             });
-            intent.next_chunk = index.checked_add(1).ok_or(EntityError::Overflow)?;
+            let next_index = index.checked_add(1).ok_or(EntityError::Overflow)?;
+            // Decimal key order can visit 10 before 2. Keep the numeric floor
+            // conservative so records remain resumable by older writers.
+            if index == intent.next_chunk {
+                intent.next_chunk = next_index;
+            }
+            intent.scan_after = Some(index);
             plan.writes.push(put(self.keys.truncate(ino), &intent)?);
             committed(self.backend.commit(authority, &plan).await?)?;
             return Ok(false);
@@ -275,8 +301,9 @@ impl<B: EntityBackend> Recovery<B> {
 
     /// One atomic orphan cleanup step after truncate recovery and quiescence.
     /// Chunk deletion, membership changes and the durable cursor share a commit;
-    /// repeated recovery cannot release an owner twice. Prefix scans are bounded
-    /// to 4096 rows, as for truncate cleanup. Lower data is never upper-owned.
+    /// repeated recovery cannot release an owner twice. Fetch only the first
+    /// remaining chunk; deletion itself provides durable scan progress. Lower
+    /// data is never upper-owned.
     async fn orphan_step(&self, authority: &TransactionAuthority, ino: i64) -> Result<bool> {
         let keys = vec![
             self.keys.orphan(ino),
@@ -308,7 +335,7 @@ impl<B: EntityBackend> Recovery<B> {
         if inode.ino != ino || inode.nlink != 0 {
             return Err(EntityError::Corrupt("orphan still linked".into()));
         }
-        let chunks = self.chunks(ino).await?;
+        let chunks = self.chunks(ino, None, 1).await?;
         if chunks
             .iter()
             .any(|(index, _, _)| *index < orphan.cleanup_chunk)
@@ -334,7 +361,12 @@ impl<B: EntityBackend> Recovery<B> {
                 expected: Some(bytes),
             });
             plan.writes.push(RowWrite::Delete { key });
-            orphan.cleanup_chunk = index.checked_add(1).ok_or(EntityError::Overflow)?;
+            let next_index = index.checked_add(1).ok_or(EntityError::Overflow)?;
+            // Deletion advances the key scan; this numeric floor must not skip
+            // smaller indices that sort after the deleted key.
+            if index == orphan.cleanup_chunk {
+                orphan.cleanup_chunk = next_index;
+            }
             plan.writes.push(put(self.keys.orphan(ino), &orphan)?);
             committed(self.backend.commit(authority, &plan).await?)?;
             return Ok(false);
@@ -370,10 +402,20 @@ impl<B: EntityBackend> Recovery<B> {
         Ok(true)
     }
 
-    async fn chunks(&self, ino: i64) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>> {
+    async fn chunks(
+        &self,
+        ino: i64,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>> {
         let prefix = self.keys.chunk_prefix(ino);
+        let after = after.map(|index| self.keys.chunk(ino, index));
         let mut chunks = Vec::new();
-        for (key, value) in self.backend.scan_prefix(&prefix, 4096).await? {
+        for (key, value) in self
+            .backend
+            .scan_prefix_page(&prefix, after.as_deref(), limit)
+            .await?
+        {
             let index = std::str::from_utf8(&key[prefix.len()..])
                 .ok()
                 .and_then(|text| text.parse::<u64>().ok())
@@ -383,7 +425,6 @@ impl<B: EntityBackend> Recovery<B> {
             }
             chunks.push((index, key, value));
         }
-        chunks.sort_by_key(|(index, _, _)| *index);
         Ok(chunks)
     }
 

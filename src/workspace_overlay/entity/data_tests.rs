@@ -314,6 +314,16 @@ impl<B: EntityBackend> EntityBackend for MeteredBackend<B> {
         self.scans.fetch_add(1, Ordering::SeqCst);
         self.inner.scan_prefix_batch(prefix, limit).await
     }
+
+    async fn scan_prefix_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scans.fetch_add(1, Ordering::SeqCst);
+        self.inner.scan_prefix_page(prefix, after, limit).await
+    }
 }
 
 async fn exercise_batched_file_io<B: EntityBackend + 'static>(
@@ -2100,6 +2110,14 @@ impl RenewDuringAllocationBackend {
 
 #[async_trait]
 impl EntityBackend for RenewDuringAllocationBackend {
+    async fn scan_prefix_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.scan_prefix_page(prefix, after, limit).await
+    }
     async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
         self.inner.read(keys).await
     }
@@ -2236,6 +2254,14 @@ struct LostReplyBackend {
 
 #[async_trait]
 impl EntityBackend for LostReplyBackend {
+    async fn scan_prefix_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.scan_prefix_page(prefix, after, limit).await
+    }
     async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
         self.inner.read(keys).await
     }

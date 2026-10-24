@@ -245,6 +245,14 @@ struct CensusBackend {
 
 #[async_trait::async_trait]
 impl EntityBackend for CensusBackend {
+    async fn scan_prefix_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.scan_prefix_page(prefix, after, limit).await
+    }
     async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
         assert!(keys.len() <= 128, "census reads must remain bounded");
         let snapshot = self.inner.read(keys).await?;
@@ -684,6 +692,14 @@ struct LostReplyBackend {
 
 #[async_trait::async_trait]
 impl EntityBackend for LostReplyBackend {
+    async fn scan_prefix_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.scan_prefix_page(prefix, after, limit).await
+    }
     async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
         self.inner.read(keys).await
     }
