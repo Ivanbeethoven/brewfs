@@ -354,6 +354,15 @@ async fn tikv_factory_initializes_root() {
 
 #[tokio::test]
 #[ignore = "requires a running TiKV/PD cluster; set BREWFS_TIKV_PD_ENDPOINTS"]
+async fn directory_pages_follow_namespace_mutations() {
+    let store = TiKvMetaStore::from_config(integration_config("directory-pages"))
+        .await
+        .unwrap();
+    super::super::readdir_tests::directory_pages_follow_namespace_mutations(&store).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running TiKV/PD cluster; set BREWFS_TIKV_PD_ENDPOINTS"]
 async fn tikv_transactional_namespace_schema() {
     let store = TiKvMetaStore::from_config(integration_config("namespace"))
         .await

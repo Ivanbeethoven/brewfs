@@ -754,6 +754,12 @@ const LINK_LUA: &str = r#"
 
     -- Add to directory
     redis.call('HSET', dir_key, name, node.ino)
+    if redis.call('ZSCORE', dir_key .. ':names', '') then
+        redis.call('ZADD', dir_key .. ':names', 0, name)
+    elseif redis.call('HLEN', dir_key) == 1 then
+        redis.call('DEL', dir_key .. ':names')
+        redis.call('ZADD', dir_key .. ':names', 0, '', 0, name)
+    end
 
     -- Save node
     redis.call('SET', node_key, cjson.encode(node))
@@ -795,6 +801,7 @@ const UNLINK_LUA: &str = r#"
 
     -- Remove from directory
     redis.call('HDEL', dir_key, name)
+    redis.call('ZREM', dir_key .. ':names', name)
 
     -- Remove from link_parents (idempotent)
     local member = parent_ino .. ":" .. name
@@ -956,8 +963,10 @@ const RMDIR_LUA: &str = r#"
 
     -- Atomic delete
     redis.call('HDEL', parent_dir_key, name)
+    redis.call('ZREM', parent_dir_key .. ':names', name)
     redis.call('DEL', child_node_key)
     redis.call('DEL', child_dir_key)
+    redis.call('DEL', child_dir_key .. ':names')
     redis.call('DEL', child_xattr_key)
 
     return cjson.encode({ok=true})
@@ -1042,6 +1051,12 @@ const CREATE_ENTRY_LUA: &str = r#"
 
     -- Add directory entry
     redis.call('HSET', parent_dir_key, name, new_ino)
+    if redis.call('ZSCORE', parent_dir_key .. ':names', '') then
+        redis.call('ZADD', parent_dir_key .. ':names', 0, name)
+    elseif redis.call('HLEN', parent_dir_key) == 1 then
+        redis.call('DEL', parent_dir_key .. ':names')
+        redis.call('ZADD', parent_dir_key .. ':names', 0, '', 0, name)
+    end
 
     -- Update parent if creating directory (nlink++)
     if kind == "Dir" then
@@ -1184,6 +1199,7 @@ const RENAME_LUA: &str = r#"
             redis.call('HDEL', new_parent_dir_key, new_name)
             redis.call('DEL', dest_node_key)
             redis.call('DEL', dest_dir_key)
+            redis.call('DEL', dest_dir_key .. ':names')
             redis.call('DEL', xattr_prefix .. dest_ino_str)
             -- Destination dir had a ".." entry pointing to new_parent; account for its removal
             new_parent_nlink_adj = new_parent_nlink_adj - 1
@@ -1263,6 +1279,13 @@ const RENAME_LUA: &str = r#"
     -- Remove old dentry and add new dentry
     redis.call('HDEL', old_parent_dir_key, old_name)
     redis.call('HSET', new_parent_dir_key, new_name, dentry_ino)
+    redis.call('ZREM', old_parent_dir_key .. ':names', old_name)
+    if redis.call('ZSCORE', new_parent_dir_key .. ':names', '') then
+        redis.call('ZADD', new_parent_dir_key .. ':names', 0, new_name)
+    elseif redis.call('HLEN', new_parent_dir_key) == 1 then
+        redis.call('DEL', new_parent_dir_key .. ':names')
+        redis.call('ZADD', new_parent_dir_key .. ':names', 0, '', 0, new_name)
+    end
 
     -- Save updated child node
     redis.call('SET', child_node_key, cjson.encode(child_node))
@@ -2850,6 +2873,74 @@ impl MetaStore for RedisMetaStore {
             }
         }
         Ok(result)
+    }
+
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
+    async fn readdir_page(
+        &self,
+        ino: i64,
+        start: &str,
+        limit: usize,
+    ) -> Result<Vec<DirEntry>, MetaError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // The empty member marks a complete index, including empty directories.
+        // Older volumes build it once. All namespace scripts maintain it in the
+        // same atomic operation as the directory hash; exchange keeps names.
+        let script = redis::Script::new(
+            r#"
+            local parent = redis.call('GET', KEYS[2])
+            if not parent then return {'not_found', {}} end
+            if cjson.decode(parent).kind ~= 'Dir' then return {'not_directory', {}} end
+            local index = KEYS[1] .. ':names'
+            if not redis.call('ZSCORE', index, '') then
+                redis.call('DEL', index)
+                local names = redis.call('HKEYS', KEYS[1])
+                for _, name in ipairs(names) do
+                    redis.call('ZADD', index, 0, name)
+                end
+                redis.call('ZADD', index, 0, '')
+            end
+            local lower = '[' .. ARGV[1]
+            if ARGV[1] == '' then lower = '(' end
+            local names = redis.call('ZRANGEBYLEX', index, lower, '+', 'LIMIT', 0, ARGV[2])
+            local result = {}
+            for _, name in ipairs(names) do
+                local ino = redis.call('HGET', KEYS[1], name)
+                local node = ino and redis.call('GET', ARGV[3] .. ino)
+                if not node then return redis.error_reply('missing indexed directory inode') end
+                table.insert(result, {name, node})
+            end
+            return {'ok', result}
+        "#,
+        );
+        let (status, entries): (String, Vec<(String, String)>) = script
+            .key(self.dir_key(ino))
+            .key(self.node_key(ino))
+            .arg(start)
+            .arg(limit)
+            .arg(NODE_KEY_PREFIX)
+            .invoke_async(&mut self.conn.clone())
+            .await
+            .map_err(redis_err)?;
+        match status.as_str() {
+            "not_found" => return Err(MetaError::NotFound(ino)),
+            "not_directory" => return Err(MetaError::NotDirectory(ino)),
+            _ => {}
+        }
+        entries
+            .into_iter()
+            .map(|(name, value)| {
+                let node: StoredNode = serde_json::from_str(&value)
+                    .map_err(|e| MetaError::Serialization(e.to_string()))?;
+                Ok(DirEntry {
+                    name,
+                    ino: node.ino,
+                    kind: node.kind.into(),
+                })
+            })
+            .collect()
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]

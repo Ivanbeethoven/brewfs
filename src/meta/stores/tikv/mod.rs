@@ -1519,6 +1519,58 @@ impl MetaStore for TiKvMetaStore {
         .await
     }
 
+    async fn readdir_page(
+        &self,
+        ino: i64,
+        start: &str,
+        limit: usize,
+    ) -> Result<Vec<DirEntry>, MetaError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let operation = "readdir_page";
+        let start = start.to_string();
+        self.read_txn(operation, |store, txn| {
+            let start = start.clone();
+            Box::pin(async move {
+                let node = store
+                    .txn_get_node(txn, ino, false, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(ino))?;
+                if node.kind != StoredNodeKind::Dir {
+                    return Err(MetaError::NotDirectory(ino));
+                }
+                let prefix = store.dentry_prefix(ino);
+                let mut lower = prefix.clone();
+                lower.extend_from_slice(start.as_bytes());
+                let upper = prefix_range_end(&prefix)
+                    .map(Key::from)
+                    .map(Bound::Excluded)
+                    .unwrap_or(Bound::Unbounded);
+                let range = BoundRange::new(Bound::Included(Key::from(lower)), upper);
+                let pairs = txn
+                    .scan(range, limit.min(u32::MAX as usize) as u32)
+                    .await
+                    .map_err(|e| Self::tikv_err(operation, e))?;
+                pairs
+                    .map(|pair| {
+                        let (key, value): (Key, Vec<u8>) = pair.into();
+                        let key: Vec<u8> = key.into();
+                        let name = String::from_utf8(key[prefix.len()..].to_vec())
+                            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+                        let dentry = Self::decode_dentry(&value)?;
+                        Ok(DirEntry {
+                            name,
+                            ino: dentry.ino,
+                            kind: dentry.kind.into(),
+                        })
+                    })
+                    .collect()
+            })
+        })
+        .await
+    }
+
     async fn mkdir(&self, parent: i64, name: String) -> Result<i64, MetaError> {
         let operation = "mkdir";
         self.write_txn_serialized(operation, parent as u64, |store, txn| {

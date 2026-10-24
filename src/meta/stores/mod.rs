@@ -12,6 +12,9 @@ pub(crate) mod pool;
 pub mod redis;
 pub mod tikv;
 
+#[cfg(test)]
+mod readdir_tests;
+
 // Re-export main types for convenience
 pub use database::DatabaseMetaStore;
 pub use etcd::EtcdMetaStore;

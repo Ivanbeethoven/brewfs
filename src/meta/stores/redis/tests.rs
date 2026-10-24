@@ -149,6 +149,60 @@ async fn new_test_store() -> RedisMetaStore {
         .expect("Failed to create test database store")
 }
 
+#[tokio::test]
+#[serial]
+#[ignore = "requires a dedicated Redis test database"]
+async fn directory_pages_follow_namespace_mutations() {
+    super::super::readdir_tests::directory_pages_follow_namespace_mutations(
+        &new_test_store().await,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+#[ignore = "requires a dedicated Redis test database"]
+async fn directory_pages_bound_backend_work_and_upgrade_legacy_hashes() {
+    let store = new_test_store().await;
+    let dir = store.mkdir(1, "large".to_string()).await.unwrap();
+    for index in 0..1024 {
+        store
+            .create_file(dir, format!("key{index:04}"))
+            .await
+            .unwrap();
+    }
+    reset_redis_commandstats(&store).await;
+    for (start, expected) in [("", "key0000"), ("key0513", "key0513")] {
+        let page = store.readdir_page(dir, start, 2).await.unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].name, expected);
+    }
+    assert_eq!(redis_command_calls(&store, "hgetall").await, 0);
+    assert_eq!(redis_command_calls(&store, "hkeys").await, 0);
+    assert_eq!(redis_command_calls(&store, "zrangebylex").await, 2);
+    assert_eq!(redis_command_calls(&store, "get").await, 6);
+
+    // Simulate an existing directory written before the ordered index existed.
+    let _: () = store
+        .conn
+        .clone()
+        .del(format!("{}:names", store.dir_key(dir)))
+        .await
+        .unwrap();
+    reset_redis_commandstats(&store).await;
+    assert_eq!(
+        store.readdir_page(dir, "key0513", 2).await.unwrap()[0].name,
+        "key0513"
+    );
+    assert_eq!(redis_command_calls(&store, "hkeys").await, 1);
+    reset_redis_commandstats(&store).await;
+    assert_eq!(
+        store.readdir_page(dir, "key0515", 2).await.unwrap()[0].name,
+        "key0515"
+    );
+    assert_eq!(redis_command_calls(&store, "hkeys").await, 0);
+}
+
 async fn reset_redis_commandstats(store: &RedisMetaStore) {
     let _: () = redis::cmd("CONFIG")
         .arg("RESETSTAT")

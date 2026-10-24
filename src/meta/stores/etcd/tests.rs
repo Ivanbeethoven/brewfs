@@ -144,6 +144,18 @@ async fn new_test_store() -> EtcdMetaStore {
         .expect("Failed to create test etcd store")
 }
 
+#[tokio::test]
+#[serial]
+#[ignore = "requires a dedicated etcd test server via BREWFS_ETCD_TEST_URL"]
+async fn directory_pages_follow_namespace_mutations() {
+    let mut config = test_config();
+    config.database.db_config = DatabaseType::Etcd {
+        urls: vec![std::env::var("BREWFS_ETCD_TEST_URL").expect("dedicated etcd test URL")],
+    };
+    let store = EtcdMetaStore::from_config(config).await.unwrap();
+    super::super::readdir_tests::directory_pages_follow_namespace_mutations(&store).await;
+}
+
 /// Create a new test store with pre-configured session ID
 async fn new_test_store_with_session(session_id: Uuid) -> EtcdMetaStore {
     let store = new_test_store().await;

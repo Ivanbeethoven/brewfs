@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::chunk::store::BlockStore;
-use crate::gateway::s3::list::{ListCollector, ListQuery};
+use crate::gateway::s3::list::{ListQuery, ListedObject, ListingSource, collect_page};
 use crate::gateway::s3::multipart::{
     self, UploadMeta, multipart_etag, new_upload_id, parse_part_name,
 };
@@ -570,42 +570,6 @@ where
 
     // ---- listing ------------------------------------------------------------
 
-    async fn walk_dir(
-        &self,
-        root_path: &str,
-        root_key: &str,
-        collector: &mut ListCollector,
-    ) -> S3Result<()> {
-        let mut pending = vec![(root_path.to_string(), root_key.to_string())];
-        while let Some((dir_path, parent_key)) = pending.pop() {
-            let entries = self.read_dir_entries(&dir_path).await?;
-            for entry in entries {
-                if dir_path == "/" && entry.name == SYS_DIR_NAME {
-                    continue;
-                }
-                let child_path = format!("{dir_path}/{}", entry.name);
-                let is_dir = entry.kind == FileType::Dir;
-                let mut dirobj = false;
-                let mut etag = None;
-                let (size, mtime) = match self.vfs.stat_ino(entry.ino).await {
-                    Some(a) => (a.size, a.mtime),
-                    None => (0, 0),
-                };
-                if is_dir {
-                    dirobj = self.is_dir_object(entry.ino).await;
-                } else {
-                    etag = self.read_etag(entry.ino).await;
-                }
-                collector.push_entry(&parent_key, &entry.name, is_dir, size, mtime, dirobj, etag);
-                if is_dir && collector.should_descend(&parent_key, &entry.name, dirobj) {
-                    let child_key = format!("{parent_key}{}/", entry.name);
-                    pending.push((child_path, child_key));
-                }
-            }
-        }
-        Ok(())
-    }
-
     async fn list_keys(
         &self,
         bucket: &str,
@@ -614,10 +578,8 @@ where
         let mode = &self.opts.bucket_mode;
         let root = path::bucket_root(mode, bucket).map_err(Self::path_err)?;
         path::validate_key_namespace(mode, &query.prefix).map_err(Self::path_err)?;
-        self.stat_bucket_root(bucket).await?;
-        let mut collector = ListCollector::new(query);
-        self.walk_dir(&root, "", &mut collector).await?;
-        Ok(collector.finish())
+        let attr = self.stat_bucket_root(bucket).await?;
+        collect_page(self, attr.ino, root == "/", query).await
     }
 
     // ---- multipart ------------------------------------------------------------
@@ -674,6 +636,54 @@ where
             }
         }
         Ok(false)
+    }
+}
+
+#[async_trait]
+impl<S: BlockStore + Send + Sync + 'static> ListingSource for BrewFsS3<S> {
+    async fn read_page(&self, ino: i64, start: &str, limit: usize) -> S3Result<Vec<DirEntry>> {
+        match self
+            .vfs
+            .meta_layer()
+            .store()
+            .readdir_page(ino, start, limit)
+            .await
+        {
+            Ok(entries) => Ok(entries),
+            Err(crate::meta::store::MetaError::NotFound(_)) => Ok(Vec::new()),
+            Err(error) => Err(s3_error!(InternalError, "directory page: {error}")),
+        }
+    }
+
+    async fn directory_object(&self, ino: i64) -> bool {
+        self.is_dir_object(ino).await
+    }
+
+    async fn lookup_directory(&self, ino: i64, name: &str) -> S3Result<Option<DirEntry>> {
+        let entry = self
+            .vfs
+            .meta_layer()
+            .store()
+            .lookup_with_attr(ino, name)
+            .await
+            .map_err(|error| s3_error!(InternalError, "directory lookup: {error}"))?;
+        Ok(entry
+            .filter(|(_, attr)| attr.kind == FileType::Dir)
+            .map(|(ino, attr)| DirEntry {
+                ino,
+                name: name.to_string(),
+                kind: attr.kind,
+            }))
+    }
+
+    async fn load_object(&self, ino: i64, object: &mut ListedObject) {
+        if let Some(attr) = self.vfs.stat_ino(ino).await {
+            object.size = attr.size;
+            object.mtime = attr.mtime;
+        }
+        if !object.is_dir_object {
+            object.etag = self.read_etag(ino).await;
+        }
     }
 }
 
