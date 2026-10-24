@@ -29,19 +29,44 @@ filesystem binary or its on-disk formats.
   bidirectional propagation for the host paths it serves.
 * State is an atomically replaced JSON file under `--state-dir`. It records the
   mount context, published targets, and the PID of a mount process started by
-  this plugin. Repeated stage/publish and unpublish/unstage calls are safe.
+  this plugin, plus the shared mount's kernel filesystem identity and each
+  target's read-only mode. Publish and unpublish inspect `/proc/self/mountinfo`
+  and compare the device, filesystem root, type, source, and mode before
+  accepting an existing target or unmounting it. Foreign mounts and mode
+  mismatches return CSI `FailedPrecondition` and are left mounted. The same
+  checks apply after a plugin restart; a target path in state alone is not
+  proof of ownership.
+  Publish checks an existing target before starting or persisting a shared
+  mount, so rejecting a foreign target leaves prior state unchanged.
+  Unpublish retains an `O_PATH` reference to prevent mount-ID reuse, pins the
+  parent directory, and revalidates the exact mount ID and identity immediately
+  before `umount2(..., UMOUNT_NOFOLLOW)`. This avoids resolving the caller's
+  ancestor pathname again and rejects a final-component symlink swap. Linux
+  does not provide an atomic unmount-by-handle operation here: a privileged
+  overmount or rename can still race the final check and syscall. Host mount
+  changes must be serialized with CSI operations to eliminate that remaining
+  window. Passing a target fd through `/proc/self/fd` alone is insufficient;
+  Linux can follow an overmount even through that path. Lazy detach is not used.
   Unstage refuses to remove a shared mount while a target is still published.
   If a recorded mount process is gone but its mountpoint remains, the stale
-  mount is removed before a new process is started. An existing mount without
-  a recorded PID (including state from an older adapter) is rejected; unmount
-  it before retrying stage. A mount visibility timeout kills and reaps the
-  child, then removes any mount that appeared during the final poll.
-* Publish records its target before binding, so state persistence failures
-  cannot leave an untracked bind. A failed read-only remount rolls back the
-  bind; if cleanup also fails, the error reports both failures and the target
-  remains recorded for `NodeUnpublishVolume`. A publish retry verifies the
-  source inode and the target's read-only mount option before accepting an
-  existing mount. A mismatched mount must be unpublished before retrying.
+  mount is removed only if its identity still matches, before a new process
+  is started. Mounted targets with missing state or legacy state lacking
+  identity/mode information are rejected. Drain and unmount these volumes
+  before upgrading, then stage and publish them with the new adapter. A
+  missing or replaced shared mount also prevents target ownership validation;
+  investigate the host mounts before retrying cleanup. A mount visibility
+  timeout kills and reaps the child, then removes any mount that appeared
+  during the final poll.
+* Publish records a pending recovery intent before binding and commits the
+  publish only after ownership and mode verification. Rejected verification
+  rolls back the owned bind, any shared mount/process started by this attempt,
+  and the intent, restoring prior state. If cleanup itself fails, CSI returns
+  `Aborted` and keeps recovery state for `NodeUnpublishVolume`; pending binds
+  still require source verification but may have a failed read-only remount.
+  A changed mount identity at the final unmount re-check also returns `Aborted`.
+  This re-check uses `statx(STATX_MNT_ID)` and `/proc/self/mountinfo` and shrinks
+  the TOCTOU window to the syscall boundary; it does **not** eliminate it.
+  See [the rejected fd/quarantine designs](tests/issue180/README.md).
 
 The BrewFS process remains the lease authority. CSI reference tracking only
 controls when the node plugin may unbind and unstage; it cannot grant a second
@@ -156,6 +181,15 @@ The unit tests use a fake mount-operations boundary; they validate identity
 parsing, status mapping, idempotent reference handling, and stale-target
 protection without pretending to validate host mount propagation. The k3s
 verification above is the only cluster evidence currently recorded.
+
+The focused `ownership_kernel_replacements_are_not_unmounted` test also uses
+real tmpfs bind mounts in a private Linux mount namespace. It checks overmounts,
+symlink swaps, replacement by another bind of the same filesystem, busy mounts,
+and successful cleanup. Build the CSI library test binary, then run that test
+with `sudo unshare --mount --fork --propagation private env
+CSI_PRIVATE_MOUNT_TEST=1 <test-binary> --exact
+tests::ownership_kernel_replacements_are_not_unmounted --ignored --nocapture`.
+The test refuses to run in the host mount namespace or with shared propagation.
 
 For a kind smoke after replacing the config Secret values and the static PV's
 `volumeHandle` with an existing operator-provisioned workspace:
