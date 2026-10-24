@@ -3514,6 +3514,9 @@ impl MetaStore for DatabaseMetaStore {
             .map_err(MetaError::Database)?;
 
         for row in rows {
+            if row.sid == *sid && row.owner == query.owner {
+                continue;
+            }
             let locks: Vec<PlockRecord> = serde_json::from_slice(&row.records).unwrap_or_default();
 
             if let Some(v) = PlockRecord::get_plock(&locks, query, sid, &row.sid) {

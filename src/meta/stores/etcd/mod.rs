@@ -3814,6 +3814,9 @@ impl MetaStore for EtcdMetaStore {
             .unwrap_or_default();
 
         for plock in plocks {
+            if plock.sid == *sid && plock.owner == query.owner {
+                continue;
+            }
             let locks = &plock.records;
             if let Some(v) = PlockRecord::get_plock(locks, query, sid, &plock.sid) {
                 return Ok(v);
