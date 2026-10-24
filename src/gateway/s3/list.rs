@@ -41,8 +41,8 @@ impl ListQuery {
 pub(crate) trait ListingSource: Sync {
     async fn read_page(&self, ino: i64, start: &str, limit: usize) -> S3Result<Vec<DirEntry>>;
     async fn lookup_directory(&self, ino: i64, name: &str) -> S3Result<Option<DirEntry>>;
-    async fn directory_object(&self, ino: i64) -> bool;
-    async fn load_object(&self, ino: i64, object: &mut ListedObject);
+    async fn directory_object(&self, ino: i64) -> S3Result<bool>;
+    async fn load_object(&self, ino: i64, object: &mut ListedObject) -> S3Result<()>;
 }
 
 enum WalkItem {
@@ -208,7 +208,7 @@ pub(crate) async fn collect_page(
                     }
                     continue;
                 }
-                let dirobj = is_dir && source.directory_object(entry.ino).await;
+                let dirobj = is_dir && source.directory_object(entry.ino).await?;
                 let previous_prefixes = collector.common_prefixes.len();
                 collector.push_entry(&parent, &entry.name, is_dir, 0, 0, dirobj, None);
                 if (!is_dir || (dirobj && !query.hide_dir_objects))
@@ -246,7 +246,7 @@ pub(crate) async fn collect_page(
     }
     let mut result = collector.finish();
     for object in &mut result.objects {
-        source.load_object(inodes[&object.key], object).await;
+        source.load_object(inodes[&object.key], object).await?;
     }
     Ok(result)
 }
@@ -558,16 +558,17 @@ mod tests {
                 }))
         }
 
-        async fn directory_object(&self, ino: i64) -> bool {
+        async fn directory_object(&self, ino: i64) -> S3Result<bool> {
             self.markers.fetch_add(1, Ordering::Relaxed);
-            self.store
+            Ok(self
+                .store
                 .get_xattr(ino, "brewfs.s3.dirobj")
                 .await
                 .unwrap()
-                .is_some()
+                .is_some())
         }
 
-        async fn load_object(&self, ino: i64, object: &mut ListedObject) {
+        async fn load_object(&self, ino: i64, object: &mut ListedObject) -> S3Result<()> {
             self.attributes.fetch_add(1, Ordering::Relaxed);
             let attr = self.store.stat(ino).await.unwrap().unwrap();
             object.size = attr.size;
@@ -581,6 +582,7 @@ mod tests {
                     .unwrap()
                     .map(|value| String::from_utf8(value).unwrap());
             }
+            Ok(())
         }
     }
 

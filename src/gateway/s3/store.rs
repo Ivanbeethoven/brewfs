@@ -250,11 +250,14 @@ where
         Ok(entries)
     }
 
-    async fn get_xattr(&self, ino: i64, name: &str) -> Option<String> {
-        match self.vfs.get_xattr_ino(ino, name).await {
-            Ok(Some(bytes)) => String::from_utf8(bytes).ok(),
-            _ => None,
-        }
+    async fn get_xattr(&self, ino: i64, name: &str) -> S3Result<Option<String>> {
+        self.vfs
+            .get_xattr_ino(ino, name)
+            .await
+            .map_err(Self::err)?
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(|e| s3_error!(InternalError, "invalid UTF-8 in {name}: {e}"))
     }
 
     async fn set_xattr(&self, ino: i64, name: &str, value: &str) -> S3Result<()> {
@@ -264,19 +267,20 @@ where
             .map_err(Self::err)
     }
 
-    async fn read_etag(&self, ino: i64) -> Option<String> {
+    async fn read_etag(&self, ino: i64) -> S3Result<Option<String>> {
         self.get_xattr(ino, XATTR_ETAG).await
     }
 
-    async fn read_object_meta(&self, ino: i64) -> ObjectMeta {
-        self.get_xattr(ino, XATTR_META)
-            .await
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+    async fn read_object_meta(&self, ino: i64) -> S3Result<ObjectMeta> {
+        match self.get_xattr(ino, XATTR_META).await? {
+            Some(raw) => serde_json::from_str(&raw)
+                .map_err(|e| s3_error!(InternalError, "invalid object metadata: {e}")),
+            None => Ok(ObjectMeta::default()),
+        }
     }
 
-    async fn is_dir_object(&self, ino: i64) -> bool {
-        self.get_xattr(ino, XATTR_DIROBJ).await.is_some()
+    async fn is_dir_object(&self, ino: i64) -> S3Result<bool> {
+        Ok(self.get_xattr(ino, XATTR_DIROBJ).await?.is_some())
     }
 
     /// ETag reported for objects written outside the gateway (no stored etag).
@@ -485,7 +489,8 @@ where
             if attr.kind != FileType::Dir {
                 return;
             }
-            if self.is_dir_object(attr.ino).await {
+            // Pruning is best effort: only remove a confirmed implicit directory.
+            if !matches!(self.is_dir_object(attr.ino).await, Ok(false)) {
                 return;
             }
             let Ok(entries) = self.read_dir_entries(&parent).await else {
@@ -519,7 +524,7 @@ where
         };
 
         if attr.kind == FileType::Dir {
-            if !key.ends_with('/') || !self.is_dir_object(attr.ino).await {
+            if !key.ends_with('/') || !self.is_dir_object(attr.ino).await? {
                 return Ok(());
             }
             let _ = self.vfs.remove_xattr_ino(attr.ino, XATTR_DIROBJ).await;
@@ -556,7 +561,7 @@ where
             Err(e) => return Err(Self::err(e)),
         };
         if attr.kind == FileType::Dir {
-            let dirobj = key.ends_with('/') && self.is_dir_object(attr.ino).await;
+            let dirobj = key.ends_with('/') && self.is_dir_object(attr.ino).await?;
             if !dirobj {
                 return Err(s3_error!(NoSuchKey, "no such object"));
             }
@@ -655,7 +660,7 @@ impl<S: BlockStore + Send + Sync + 'static> ListingSource for BrewFsS3<S> {
         }
     }
 
-    async fn directory_object(&self, ino: i64) -> bool {
+    async fn directory_object(&self, ino: i64) -> S3Result<bool> {
         self.is_dir_object(ino).await
     }
 
@@ -676,14 +681,15 @@ impl<S: BlockStore + Send + Sync + 'static> ListingSource for BrewFsS3<S> {
             }))
     }
 
-    async fn load_object(&self, ino: i64, object: &mut ListedObject) {
+    async fn load_object(&self, ino: i64, object: &mut ListedObject) -> S3Result<()> {
         if let Some(attr) = self.vfs.stat_ino(ino).await {
             object.size = attr.size;
             object.mtime = attr.mtime;
         }
         if !object.is_dir_object {
-            object.etag = self.read_etag(ino).await;
+            object.etag = self.read_etag(ino).await?;
         }
+        Ok(())
     }
 }
 
@@ -963,7 +969,7 @@ where
         let mode = &self.opts.bucket_mode;
         let (_target, attr, is_dir_obj) = self.resolve_object(mode, &bucket, &key).await?;
 
-        let meta = self.read_object_meta(attr.ino).await;
+        let meta = self.read_object_meta(attr.ino).await?;
         let metadata = meta.metadata.clone().map(|m| {
             m.into_iter()
                 .map(|(k, v)| (k, MetadataValue::from(v)))
@@ -971,7 +977,7 @@ where
         });
         let etag = self
             .read_etag(attr.ino)
-            .await
+            .await?
             .unwrap_or_else(|| Self::fallback_etag(&attr));
 
         // Directory objects are always empty.
@@ -1058,10 +1064,10 @@ where
         let mode = &self.opts.bucket_mode;
         let (_target, attr, is_dir_obj) = self.resolve_object(mode, &bucket, &key).await?;
 
-        let meta = self.read_object_meta(attr.ino).await;
+        let meta = self.read_object_meta(attr.ino).await?;
         let etag = self
             .read_etag(attr.ino)
-            .await
+            .await?
             .unwrap_or_else(|| Self::fallback_etag(&attr));
         let metadata = meta.metadata.map(|m| {
             m.into_iter()
@@ -1219,11 +1225,11 @@ where
                 }),
             }
         } else {
-            self.read_object_meta(src_attr.ino).await
+            self.read_object_meta(src_attr.ino).await?
         };
         let etag = self
             .read_etag(src_attr.ino)
-            .await
+            .await?
             .unwrap_or_else(|| Self::fallback_etag(&src_attr));
         let bucket_lock = self.bucket_lock_for(&dst_bucket);
         let _bucket_guard = bucket_lock.lock().await;
@@ -1563,7 +1569,7 @@ where
                 && valid_part_number(n)
                 && let Some(attr) = self.vfs.stat_ino(entry.ino).await
             {
-                let etag = self.read_etag(entry.ino).await;
+                let etag = self.read_etag(entry.ino).await?;
                 parts.push((n, attr.size, attr.mtime, etag));
             }
         }
@@ -1665,7 +1671,7 @@ where
             }
             let stored = self
                 .read_etag(attr.ino)
-                .await
+                .await?
                 .ok_or_else(|| s3_error!(InvalidPart, "part {n} has no etag"))?;
             let requested = part
                 .e_tag
@@ -1934,6 +1940,10 @@ fn prefixes_to_dto(prefixes: &std::collections::BTreeSet<String>) -> Option<Vec<
 #[cfg(test)]
 #[path = "tests/conditions.rs"]
 mod conditions_tests;
+
+#[cfg(test)]
+#[path = "store_xattr_tests.rs"]
+mod xattr_tests;
 
 #[cfg(test)]
 mod tests {
