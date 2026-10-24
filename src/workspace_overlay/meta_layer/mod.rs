@@ -2868,7 +2868,7 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                     .await?;
                 self.check_namespace_actor(&expected_layers, new_parent, Some(right.ino))
                     .await?;
-                if old_parent == new_parent && old_name == new_name {
+                if left.ino == right.ino {
                     return Ok(());
                 }
                 if file_type_from_code(left.entry_type)? == FileType::Dir
@@ -2891,29 +2891,66 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                         right.ino
                     )));
                 }
-                let guard = self.guard().await;
-                let head = guard.expected_head_layer_id;
-                let mut inodes = Vec::new();
+                let mut left_inode = self
+                    .resolve_inode_delta(left.ino)
+                    .await?
+                    .ok_or(MetaError::NotFound(left.ino))?;
+                let mut right_inode = self
+                    .resolve_inode_delta(right.ino)
+                    .await?
+                    .ok_or(MetaError::NotFound(right.ino))?;
+                let mut old_parent_inode = self
+                    .resolve_inode_delta(old_parent)
+                    .await?
+                    .ok_or(MetaError::ParentNotFound(old_parent))?;
+                let mut new_parent_inode = if old_parent == new_parent {
+                    old_parent_inode.clone()
+                } else {
+                    self.resolve_inode_delta(new_parent)
+                        .await?
+                        .ok_or(MetaError::ParentNotFound(new_parent))?
+                };
+                for parent in [&old_parent_inode, &new_parent_inode] {
+                    if file_type_from_code(parent.kind)? != FileType::Dir {
+                        return Err(MetaError::NotDirectory(parent.ino));
+                    }
+                }
+                let left_is_dir = file_type_from_code(left_inode.kind)? == FileType::Dir;
+                let right_is_dir = file_type_from_code(right_inode.kind)? == FileType::Dir;
                 if old_parent != new_parent {
-                    let mut left_inode = self
-                        .resolve_inode_delta(left.ino)
-                        .await?
-                        .ok_or(MetaError::NotFound(left.ino))?;
-                    let mut right_inode = self
-                        .resolve_inode_delta(right.ino)
-                        .await?
-                        .ok_or(MetaError::NotFound(right.ino))?;
-                    if file_type_from_code(left_inode.kind)? == FileType::Dir {
+                    if left_is_dir != right_is_dir {
+                        let (losing, gaining) = if left_is_dir {
+                            (&mut old_parent_inode, &mut new_parent_inode)
+                        } else {
+                            (&mut new_parent_inode, &mut old_parent_inode)
+                        };
+                        losing.nlink = losing.nlink.checked_sub(1).ok_or_else(|| {
+                            MetaError::Internal("directory nlink underflow".into())
+                        })?;
+                        gaining.nlink = gaining.nlink.checked_add(1).ok_or_else(|| {
+                            MetaError::Internal("directory nlink overflow".into())
+                        })?;
+                    }
+                    if left_is_dir {
                         left_inode.parent_hint = Some(new_parent);
                     }
-                    if file_type_from_code(right_inode.kind)? == FileType::Dir {
+                    if right_is_dir {
                         right_inode.parent_hint = Some(old_parent);
                     }
-                    left_inode.layer_id = head;
-                    right_inode.layer_id = head;
-                    left_inode.sequence = 0;
-                    right_inode.sequence = 0;
-                    inodes.extend([left_inode, right_inode]);
+                }
+                let guard = self.guard().await;
+                let head = guard.expected_head_layer_id;
+                let now = now_ns()?;
+                old_parent_inode.mtime_ns = now;
+                new_parent_inode.mtime_ns = now;
+                let mut inodes = vec![left_inode, right_inode, old_parent_inode];
+                if old_parent != new_parent {
+                    inodes.push(new_parent_inode);
+                }
+                for inode in &mut inodes {
+                    inode.layer_id = head;
+                    inode.ctime_ns = now;
+                    inode.sequence = 0;
                 }
                 let files = (left.entry_type != file_type_code(FileType::Dir)
                     && right.entry_type != file_type_code(FileType::Dir))
