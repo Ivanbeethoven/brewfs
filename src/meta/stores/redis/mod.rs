@@ -1295,6 +1295,21 @@ const RENAME_LUA: &str = r#"
                 redis.call('HSET', deleted_set_key, dest_ino_str, 1)
                 redis.call('DEL', link_parent_prefix .. dest_ino_str)
             else
+                local dest_lp_key = link_parent_prefix .. dest_ino_str
+                redis.call('SREM', dest_lp_key, ARGV[4] .. ":" .. new_name)
+                -- Restore the inline path when only one hard link remains.
+                if dest_node.attr.nlink == 1 then
+                    local remaining_members = redis.call('SMEMBERS', dest_lp_key)
+                    if #remaining_members == 1 then
+                        local member = remaining_members[1]
+                        local sep_pos = string.find(member, ":", 1, true)
+                        if sep_pos and sep_pos > 1 and sep_pos < #member then
+                            dest_node.parent = tonumber(string.sub(member, 1, sep_pos - 1))
+                            dest_node.name = string.sub(member, sep_pos + 1)
+                            redis.call('DEL', dest_lp_key)
+                        end
+                    end
+                end
                 dest_node.attr.ctime = timestamp
                 redis.call('SET', dest_node_key, cjson.encode(dest_node))
             end

@@ -1619,6 +1619,96 @@ async fn test_rename_lua_overwrite_file() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_rename_lua_overwrite_cleans_reverse_links() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    for remaining_links in [1, 2, 0] {
+        let dir_name = format!("destination-{remaining_links}");
+        let parent = store.mkdir(root, dir_name.clone()).await.unwrap();
+        let destination = "overwritten:entry";
+        let replaced = store
+            .create_file(parent, destination.to_string())
+            .await
+            .unwrap();
+        let source_name = format!("source-{remaining_links}");
+        let source = store.create_file(root, source_name.clone()).await.unwrap();
+        let survivors = (0..remaining_links)
+            .map(|index| format!("survivor-{remaining_links}:{index}"))
+            .collect::<Vec<_>>();
+        for name in &survivors {
+            store.link(replaced, root, name).await.unwrap();
+        }
+        assert_eq!(
+            store.stat(replaced).await.unwrap().unwrap().nlink,
+            remaining_links + 1
+        );
+
+        store
+            .rename(root, &source_name, parent, destination.to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(store.lookup(root, &source_name).await.unwrap(), None);
+        assert_eq!(
+            store.lookup(parent, destination).await.unwrap(),
+            Some(source)
+        );
+        for name in &survivors {
+            assert_eq!(store.lookup(root, name).await.unwrap(), Some(replaced));
+        }
+        let reverse = store.load_link_parents(replaced).await.unwrap();
+        assert!(
+            !reverse.contains(&(parent, destination.to_string())),
+            "overwrite left a stale reverse entry for inode {replaced}: {reverse:?}"
+        );
+        if remaining_links > 1 {
+            assert_eq!(
+                reverse,
+                survivors
+                    .iter()
+                    .map(|name| (root, name.clone()))
+                    .collect::<Vec<_>>()
+            );
+        } else {
+            assert!(reverse.is_empty());
+        }
+        assert_eq!(
+            store.get_paths(replaced).await.unwrap(),
+            survivors
+                .iter()
+                .map(|name| format!("/{name}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store.get_paths(source).await.unwrap(),
+            vec![format!("/{dir_name}/{destination}")]
+        );
+        assert_eq!(
+            store.stat(replaced).await.unwrap().unwrap().nlink,
+            remaining_links
+        );
+
+        for name in &survivors {
+            store.unlink(root, name).await.unwrap();
+            assert_eq!(store.lookup(root, name).await.unwrap(), None);
+        }
+        assert!(store.get_paths(replaced).await.unwrap().is_empty());
+        assert!(store.load_link_parents(replaced).await.unwrap().is_empty());
+        let node = store.get_node(replaced).await.unwrap().unwrap();
+        assert!(node.deleted);
+        assert_eq!(node.attr.nlink, 0);
+        assert!(store.get_deleted_files().await.unwrap().contains(&replaced));
+        assert_eq!(
+            store.lookup(parent, destination).await.unwrap(),
+            Some(source)
+        );
+    }
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_rename_lua_directory_replaces_empty_directory() {
     let store = new_test_store().await;
     let root = store.root_ino();
