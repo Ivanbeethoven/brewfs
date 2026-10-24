@@ -124,6 +124,36 @@ async fn rename_exchange_and_hardlink_update_dentries_and_nlink_atomically() {
 }
 
 #[tokio::test]
+async fn rename_exchange_cross_parent_directory_file_updates_nlink() {
+    let meta = test_meta().await;
+    let root = meta.root_ino();
+    let a = meta.mkdir(root, "A".into()).await.unwrap();
+    let b = meta.mkdir(root, "B".into()).await.unwrap();
+    let d = meta.mkdir(a, "d".into()).await.unwrap();
+    let f = meta.create_file(b, "f".into()).await.unwrap();
+    let before_a = meta.stat(a).await.unwrap().unwrap();
+    let before_b = meta.stat(b).await.unwrap().unwrap();
+    assert_eq!((before_a.nlink, before_b.nlink), (3, 2));
+
+    meta.rename_exchange(a, "d", b, "f").await.unwrap();
+
+    assert_eq!(meta.lookup(a, "d").await.unwrap(), Some(f));
+    assert_eq!(meta.lookup(b, "f").await.unwrap(), Some(d));
+    let after_a = meta.stat(a).await.unwrap().unwrap();
+    let after_b = meta.stat(b).await.unwrap().unwrap();
+    eprintln!(
+        "parent nlink before: ({}, {}), after: ({}, {})",
+        before_a.nlink, before_b.nlink, after_a.nlink, after_b.nlink
+    );
+    eprintln!(
+        "parent mtime/ctime unchanged: A={}, B={}",
+        (before_a.mtime, before_a.ctime) == (after_a.mtime, after_a.ctime),
+        (before_b.mtime, before_b.ctime) == (after_b.mtime, after_b.ctime)
+    );
+    assert_eq!((after_a.nlink, after_b.nlink), (2, 3));
+}
+
+#[tokio::test]
 async fn rename_onto_same_inode_keeps_both_hard_links() {
     let meta = test_meta().await;
     let root = meta.root_ino();
