@@ -182,7 +182,12 @@ impl From<VolumeIdError> for CsiError {
 pub trait MountOps: Send + Sync + 'static {
     fn is_mounted(&self, path: &Path) -> io::Result<bool>;
     fn process_alive(&self, pid: u32) -> io::Result<bool>;
+    /// Return the Linux process start-time marker for a BrewFS process.
+    /// `None` means the PID is absent or is not a BrewFS process.
+    fn process_start_time(&self, pid: u32) -> io::Result<Option<u64>>;
     fn start_brewfs(&self, spec: &MountSpec, target: &Path) -> io::Result<u32>;
+    /// Stop only after the caller has authenticated this exact PID instance.
+    fn stop_brewfs(&self, pid: u32, start_time: u64) -> io::Result<()>;
     fn bind(&self, source: &Path, target: &Path, read_only: bool) -> io::Result<()>;
     /// Verify an existing bind before accepting a publish retry. Implementations
     /// that cannot inspect its identity and mode must fail closed.
@@ -205,8 +210,16 @@ impl<T: MountOps> MountOps for Arc<T> {
         (**self).process_alive(pid)
     }
 
+    fn process_start_time(&self, pid: u32) -> io::Result<Option<u64>> {
+        (**self).process_start_time(pid)
+    }
+
     fn start_brewfs(&self, spec: &MountSpec, target: &Path) -> io::Result<u32> {
         (**self).start_brewfs(spec, target)
+    }
+
+    fn stop_brewfs(&self, pid: u32, start_time: u64) -> io::Result<()> {
+        (**self).stop_brewfs(pid, start_time)
     }
 
     fn bind(&self, source: &Path, target: &Path, read_only: bool) -> io::Result<()> {
@@ -236,16 +249,55 @@ impl MountOps for SystemMountOps {
     }
 
     fn process_alive(&self, pid: u32) -> io::Result<bool> {
+        Ok(self.process_start_time(pid)?.is_some())
+    }
+
+    fn process_start_time(&self, pid: u32) -> io::Result<Option<u64>> {
         let command_line = match fs::read(Path::new("/proc").join(pid.to_string()).join("cmdline"))
         {
             Ok(command_line) => command_line,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        Ok(command_line
+        if !command_line
             .split(|byte| *byte == 0)
             .next()
-            .is_some_and(|command| command.ends_with(b"/brewfs") || command == b"brewfs"))
+            .is_some_and(|command| command.ends_with(b"/brewfs") || command == b"brewfs")
+        {
+            return Ok(None);
+        }
+        let stat = match fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat"))
+        {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let fields = stat
+            .rsplit_once(')')
+            .map(|(_, fields)| fields.split_whitespace().skip(19).next())
+            .flatten()
+            .ok_or_else(|| io::Error::other(format!("invalid /proc/{pid}/stat")))?;
+        fields
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|error| io::Error::other(format!("invalid /proc/{pid}/stat start time: {error}")))
+    }
+
+    fn stop_brewfs(&self, pid: u32, start_time: u64) -> io::Result<()> {
+        if self.process_start_time(pid)? != Some(start_time) {
+            return Ok(());
+        }
+        run_command(Command::new("kill").arg("-TERM").arg(pid.to_string()))?;
+        for _ in 0..50 {
+            if self.process_start_time(pid)? != Some(start_time) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("BrewFS PID {pid} did not exit after SIGTERM"),
+        ))
     }
 
     fn start_brewfs(&self, spec: &MountSpec, target: &Path) -> io::Result<u32> {
@@ -383,6 +435,11 @@ struct MountState {
     /// `None` permits reading legacy state, but cannot authenticate a live mount.
     #[serde(default)]
     pid: Option<u32>,
+    /// Linux `/proc/<pid>/stat` start time captured with `pid`. This prevents
+    /// cleanup from signaling a reused PID. Legacy state has no marker and is
+    /// never signaled until a new authenticated state is written.
+    #[serde(default)]
+    pid_start_time: Option<u64>,
     #[serde(default)]
     targets: BTreeSet<String>,
 }
@@ -508,8 +565,10 @@ impl<O: MountOps> MountManager<O> {
         }
         let shared = spec.shared_mount();
         if self.ops.is_mounted(&shared)? {
+            self.verify_pid_for_cleanup(&state)?;
             self.ops.unmount_brewfs(&shared)?;
         }
+        self.stop_pid_for_cleanup(&state)?;
         let path = self.state_path(spec);
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -540,8 +599,10 @@ impl<O: MountOps> MountManager<O> {
         }
         let shared = spec.shared_mount();
         if self.ops.is_mounted(&shared)? {
+            self.verify_pid_for_cleanup(&state)?;
             self.ops.unmount_brewfs(&shared)?;
         }
+        self.stop_pid_for_cleanup(&state)?;
         match fs::remove_file(self.state_path(&spec)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -559,10 +620,34 @@ impl<O: MountOps> MountManager<O> {
                 "cannot reuse mount at {shared:?} without a recorded BrewFS PID; unmount it before retrying"
             )));
         }
-        let stale = match state.pid {
-            Some(pid) => mounted && !self.ops.process_alive(pid)?,
-            None => false,
-        };
+        let mut stale = false;
+        if let Some(pid) = state.pid {
+            let alive = self.ops.process_alive(pid)?;
+            let current_start_time = self.ops.process_start_time(pid)?;
+            let verified = state
+                .pid_start_time
+                .zip(current_start_time)
+                .is_some_and(|(expected, actual)| expected == actual);
+            if mounted {
+                if state.pid_start_time.is_some() && alive && !verified {
+                    return Err(CsiError::Busy(format!(
+                        "shared mount {shared:?} is not owned by recorded BrewFS PID {pid}"
+                    )));
+                }
+                stale = !alive;
+            } else if alive {
+                if state.pid_start_time.is_some() && !verified {
+                    return Err(CsiError::Busy(format!(
+                        "recorded BrewFS PID {pid} was reused while shared mount {shared:?} is absent"
+                    )));
+                }
+                return Err(CsiError::Busy(format!(
+                    "recorded BrewFS PID {pid} is still alive while shared mount {shared:?} is absent"
+                )));
+            } else {
+                stale = true;
+            }
+        }
         if stale {
             // The previous plugin process left a stale mount behind. Remove
             // only the mount owned by this volume before reacquiring the
@@ -576,8 +661,14 @@ impl<O: MountOps> MountManager<O> {
             // Replacing it is safe: the new BrewFS process must reacquire the
             // same workspace lease before serving any request.
             let pid = self.ops.start_brewfs(spec, &shared)?;
+            let start_time = self.ops.process_start_time(pid)?.ok_or_else(|| {
+                CsiError::MountCommand(format!(
+                    "started BrewFS PID {pid} but could not record its process identity"
+                ))
+            })?;
             state = MountState::default();
             state.pid = Some(pid);
+            state.pid_start_time = Some(start_time);
         }
         state.volume_id = spec.volume.as_string();
         state.shared_mount = shared.display().to_string();
@@ -587,6 +678,49 @@ impl<O: MountOps> MountManager<O> {
         state.read_only = spec.read_only;
         self.store_state(spec, &state)?;
         Ok(shared)
+    }
+
+    fn verify_pid_for_cleanup(&self, state: &MountState) -> Result<(), CsiError> {
+        let Some(pid) = state.pid else {
+            return Err(CsiError::MountCommand(
+                "cannot clean up a shared mount without a recorded BrewFS PID".to_owned(),
+            ));
+        };
+        if !self.ops.process_alive(pid)? {
+            return Ok(());
+        }
+        let Some(expected) = state.pid_start_time else {
+            return Err(CsiError::Busy(format!(
+                "cannot authenticate live legacy BrewFS PID {pid} for cleanup"
+            )));
+        };
+        if self.ops.process_start_time(pid)? != Some(expected) {
+            return Err(CsiError::Busy(format!(
+                "recorded BrewFS PID {pid} was reused; refusing cleanup"
+            )));
+        }
+        Ok(())
+    }
+
+    fn stop_pid_for_cleanup(&self, state: &MountState) -> Result<(), CsiError> {
+        let Some(pid) = state.pid else {
+            return Ok(());
+        };
+        if !self.ops.process_alive(pid)? {
+            return Ok(());
+        }
+        let Some(start_time) = state.pid_start_time else {
+            return Err(CsiError::Busy(format!(
+                "cannot stop live legacy BrewFS PID {pid} without an identity marker"
+            )));
+        };
+        if self.ops.process_start_time(pid)? != Some(start_time) {
+            return Err(CsiError::Busy(format!(
+                "recorded BrewFS PID {pid} was reused; refusing to stop it"
+            )));
+        }
+        self.ops.stop_brewfs(pid, start_time)?;
+        Ok(())
     }
 
     fn spec_from_state(&self, volume_id: &str) -> Result<MountSpec, CsiError> {
@@ -675,6 +809,11 @@ mod tests {
         fail_state_after_probe: StdMutex<Option<(PathBuf, PathBuf)>>,
         fail_bind: StdMutex<bool>,
         leak_failed_bind: StdMutex<bool>,
+        alive: StdMutex<BTreeSet<u32>>,
+        dead: StdMutex<BTreeSet<u32>>,
+        checked_pids: StdMutex<Vec<u32>>,
+        next_pid: StdMutex<u32>,
+        stopped_pids: StdMutex<Vec<u32>>,
     }
 
     impl MountOps for FakeOps {
@@ -697,16 +836,33 @@ mod tests {
         }
 
         fn process_alive(&self, _pid: u32) -> io::Result<bool> {
-            Ok(true)
+            let pid = _pid;
+            self.checked_pids.lock().unwrap().push(pid);
+            Ok(!self.dead.lock().unwrap().contains(&pid))
+        }
+
+        fn process_start_time(&self, pid: u32) -> io::Result<Option<u64>> {
+            Ok((!self.dead.lock().unwrap().contains(&pid)).then_some(pid as u64))
         }
 
         fn start_brewfs(&self, _spec: &MountSpec, target: &Path) -> io::Result<u32> {
             *self.starts.lock().unwrap() += 1;
+            let mut next_pid = self.next_pid.lock().unwrap();
+            let pid = *next_pid;
+            *next_pid += 1;
+            self.alive.lock().unwrap().insert(pid);
             self.mounted
                 .lock()
                 .unwrap()
                 .insert(target.display().to_string());
-            Ok(42)
+            Ok(pid)
+        }
+
+        fn stop_brewfs(&self, pid: u32, start_time: u64) -> io::Result<()> {
+            assert_eq!(start_time, pid as u64);
+            self.stopped_pids.lock().unwrap().push(pid);
+            self.dead.lock().unwrap().insert(pid);
+            Ok(())
         }
 
         fn bind(&self, source: &Path, target: &Path, read_only: bool) -> io::Result<()> {
@@ -823,6 +979,115 @@ mod tests {
             .unwrap();
         assert_eq!(*ops.starts.lock().unwrap(), 1);
         assert_eq!(*ops.unmounts.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn stage_preserves_live_pid_when_shared_mount_disappears() {
+        let temp = tempfile::tempdir().unwrap();
+        let ops = Arc::new(FakeOps {
+            next_pid: StdMutex::new(100),
+            ..Default::default()
+        });
+        let state_root = temp.path().join("state");
+        let spec = spec(&temp);
+        let manager = MountManager::new_with_root(ops.clone(), state_root);
+
+        manager.stage(&spec).await.unwrap();
+        let shared = spec.shared_mount();
+        let state_before: MountState = manager.load_state(&spec).unwrap();
+        let live_pid = state_before.pid.expect("initial stage records a PID");
+        ops.mounted
+            .lock()
+            .unwrap()
+            .remove(&shared.display().to_string());
+
+        let result = manager.stage(&spec).await;
+        assert!(matches!(result, Err(CsiError::Busy(_))));
+        let state_after: MountState = manager.load_state(&spec).unwrap();
+        assert_eq!(state_after.pid, Some(live_pid));
+        assert_eq!(*ops.starts.lock().unwrap(), 1);
+        assert_eq!(*ops.checked_pids.lock().unwrap(), vec![live_pid]);
+    }
+
+    #[tokio::test]
+    async fn stage_replaces_stale_or_absent_pid_only_when_safe() {
+        let temp = tempfile::tempdir().unwrap();
+        let ops = Arc::new(FakeOps {
+            next_pid: StdMutex::new(200),
+            ..Default::default()
+        });
+        let spec = spec(&temp);
+        let manager = MountManager::new_with_root(ops.clone(), temp.path().join("state"));
+
+        manager.stage(&spec).await.unwrap();
+        let shared = spec.shared_mount();
+        let stale_pid = manager.load_state(&spec).unwrap().pid.unwrap();
+        ops.mounted
+            .lock()
+            .unwrap()
+            .remove(&shared.display().to_string());
+        ops.dead.lock().unwrap().insert(stale_pid);
+        manager.stage(&spec).await.unwrap();
+        assert_eq!(*ops.starts.lock().unwrap(), 2);
+        assert_eq!(manager.load_state(&spec).unwrap().pid, Some(stale_pid + 1));
+
+        let temp = tempfile::tempdir().unwrap();
+        let ops = Arc::new(FakeOps {
+            next_pid: StdMutex::new(300),
+            ..Default::default()
+        });
+        let spec = self::spec(&temp);
+        let manager = MountManager::new_with_root(ops.clone(), temp.path().join("state"));
+        manager.stage(&spec).await.unwrap();
+        assert_eq!(manager.load_state(&spec).unwrap().pid, Some(300));
+        assert!(ops.checked_pids.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unstage_stops_the_recorded_pid_after_shared_mount_disappears() {
+        let temp = tempfile::tempdir().unwrap();
+        let ops = Arc::new(FakeOps {
+            next_pid: StdMutex::new(400),
+            ..Default::default()
+        });
+        let manager = MountManager::new_with_root(ops.clone(), temp.path().join("state"));
+        let spec = spec(&temp);
+        manager.stage(&spec).await.unwrap();
+        let pid = manager.load_state(&spec).unwrap().pid.unwrap();
+        ops.mounted
+            .lock()
+            .unwrap()
+            .remove(&spec.shared_mount().display().to_string());
+
+        manager.unstage(&spec).await.unwrap();
+        assert_eq!(*ops.stopped_pids.lock().unwrap(), vec![pid]);
+        assert!(!manager.state_path(&spec).exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_refuses_a_reused_pid_without_signaling_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let ops = Arc::new(FakeOps {
+            next_pid: StdMutex::new(500),
+            ..Default::default()
+        });
+        let manager = MountManager::new_with_root(ops.clone(), temp.path().join("state"));
+        let spec = spec(&temp);
+        manager.stage(&spec).await.unwrap();
+        let mut state = manager.load_state(&spec).unwrap();
+        state.pid_start_time = Some(501);
+        manager.store_state(&spec, &state).unwrap();
+        ops.mounted
+            .lock()
+            .unwrap()
+            .remove(&spec.shared_mount().display().to_string());
+
+        assert!(matches!(
+            manager.unstage(&spec).await,
+            Err(CsiError::Busy(_))
+        ));
+        assert!(manager.state_path(&spec).exists());
+        assert!(ops.stopped_pids.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
