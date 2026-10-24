@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "truncate_gc_tests.rs"]
+mod truncate_gc;
 use crate::chunk::{layout::ChunkLayout, store::InMemoryBlockStore};
 use crate::meta::MetaLayer;
 use crate::meta::client::MetaClient;

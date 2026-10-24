@@ -508,6 +508,17 @@ impl DatabaseMetaStore {
             Err(e) => return Err(MetaError::Database(e)),
         }
 
+        let retained_index = Index::create()
+            .if_not_exists()
+            .name("idx_delayed_slice_retained")
+            .table(DelayedSlice)
+            .col(delayed_slice::Column::SliceId)
+            .col(delayed_slice::Column::Status)
+            .to_owned();
+        db.execute(builder.build(&retained_index))
+            .await
+            .map_err(MetaError::Database)?;
+
         info!("Database schema initialized successfully");
         Ok(())
     }
@@ -800,6 +811,68 @@ impl DatabaseMetaStore {
         }
     }
 
+    // A shortened mapping still owns the entire immutable slice. Keep that
+    // physical size outside the pending GC queue until the mapping is removed.
+    async fn record_truncated_slice<C: ConnectionTrait>(
+        conn: &C,
+        row: &slice_meta::Model,
+        retained: bool,
+    ) -> Result<(), MetaError> {
+        if retained {
+            if let Some(previous) = DelayedSlice::find()
+                .filter(delayed_slice::Column::SliceId.eq(row.slice_id))
+                .filter(delayed_slice::Column::Status.eq("retained"))
+                .one(conn)
+                .await
+                .map_err(MetaError::Database)?
+            {
+                let size = previous.size.max(row.length);
+                let mut active: delayed_slice::ActiveModel = previous.into();
+                active.size = Set(size);
+                active.update(conn).await.map_err(MetaError::Database)?;
+                return Ok(());
+            }
+        } else {
+            Self::release_retained_slices(conn, &[row.slice_id]).await?;
+        }
+        delayed_slice::ActiveModel {
+            slice_id: Set(row.slice_id),
+            chunk_id: Set(row.chunk_id),
+            offset: Set(row.offset),
+            size: Set(row.length),
+            created_at: Set(Utc::now().timestamp()),
+            reason: Set("truncate".to_string()),
+            status: Set(if retained { "retained" } else { "pending" }.to_string()),
+            ..Default::default()
+        }
+        .insert(conn)
+        .await
+        .map_err(MetaError::Database)?;
+        Ok(())
+    }
+
+    async fn release_retained_slices<C: ConnectionTrait>(
+        conn: &C,
+        slice_ids: &[i64],
+    ) -> Result<(), MetaError> {
+        // Start reader grace at unmapping, not at the earlier partial truncate.
+        DelayedSlice::update_many()
+            .col_expr(
+                delayed_slice::Column::Status,
+                sea_query::Expr::value("pending"),
+            )
+            .col_expr(
+                delayed_slice::Column::CreatedAt,
+                sea_query::Expr::value(Utc::now().timestamp()),
+            )
+            .filter(delayed_slice::Column::SliceId.is_in(slice_ids.iter().copied()))
+            .filter(delayed_slice::Column::Status.eq("retained"))
+            .exec(conn)
+            .await
+            .map_err(MetaError::Database)?;
+        Ok(())
+    }
+
     async fn prune_slices_for_truncate<C>(
         &self,
         conn: &C,
@@ -834,10 +907,12 @@ impl DatabaseMetaStore {
                     match trim_action(offset, length, cutoff_offset) {
                         TrimAction::Keep => {}
                         TrimAction::Drop => {
+                            Self::record_truncated_slice(conn, &row, false).await?;
                             let active: slice_meta::ActiveModel = row.into();
                             active.delete(conn).await.map_err(MetaError::Database)?;
                         }
                         TrimAction::Truncate(new_len) => {
+                            Self::record_truncated_slice(conn, &row, true).await?;
                             let mut active: slice_meta::ActiveModel = row.into();
                             active.length = Set(new_len as i64);
                             active.update(conn).await.map_err(MetaError::Database)?;
@@ -851,6 +926,15 @@ impl DatabaseMetaStore {
                     .map_err(|_| MetaError::Internal("chunk_id overflow".to_string()))?;
                 let end_chunk_id = i64::try_from(chunk_id_for(ino, end)?)
                     .map_err(|_| MetaError::Internal("chunk_id overflow".to_string()))?;
+                let rows = SliceMeta::find()
+                    .filter(slice_meta::Column::ChunkId.gte(start_chunk_id))
+                    .filter(slice_meta::Column::ChunkId.lt(end_chunk_id))
+                    .all(conn)
+                    .await
+                    .map_err(MetaError::Database)?;
+                for row in rows {
+                    Self::record_truncated_slice(conn, &row, false).await?;
+                }
                 SliceMeta::delete_many()
                     .filter(slice_meta::Column::ChunkId.gte(start_chunk_id))
                     .filter(slice_meta::Column::ChunkId.lt(end_chunk_id))
@@ -3676,6 +3760,7 @@ impl MetaStore for DatabaseMetaStore {
             .collect();
 
         if !slice_ids_to_delete.is_empty() {
+            Self::release_retained_slices(&txn, &slice_ids_to_delete).await?;
             SliceMeta::delete_many()
                 .filter(slice_meta::Column::ChunkId.eq(chunk_id as i64))
                 .filter(slice_meta::Column::SliceId.is_in(slice_ids_to_delete))
@@ -3803,6 +3888,7 @@ impl MetaStore for DatabaseMetaStore {
             .collect();
 
         if !slice_ids_to_delete.is_empty() {
+            Self::release_retained_slices(&txn, &slice_ids_to_delete).await?;
             SliceMeta::delete_many()
                 .filter(slice_meta::Column::ChunkId.eq(chunk_id as i64))
                 .filter(slice_meta::Column::SliceId.is_in(slice_ids_to_delete))

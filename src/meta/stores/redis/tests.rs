@@ -82,6 +82,108 @@ fn redis_test_url() -> String {
         .unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string())
 }
 
+#[serial]
+#[tokio::test]
+#[ignore = "requires an isolated Redis test database"]
+async fn truncate_gc_preserves_physical_size_and_does_not_block_pending_work() {
+    cleanup_test_data().await.unwrap();
+    let store = new_test_store().await;
+    let ino = store
+        .create_file(store.root_ino(), "truncate-gc".into())
+        .await
+        .unwrap();
+    let slice = crate::chunk::SliceDesc {
+        slice_id: 17,
+        chunk_id: store.chunk_id(ino, 0),
+        offset: 0,
+        length: 8192,
+    };
+    store.truncate(ino, slice.length, 64 << 20).await.unwrap();
+    store.append_slice(slice.chunk_id, slice).await.unwrap();
+    store.truncate(ino, 4096, 64 << 20).await.unwrap();
+    store.truncate(ino, 1, 64 << 20).await.unwrap();
+    assert!(store.process_delayed_slices(1, 0).await.unwrap().is_empty());
+    assert_eq!(store.get_slices(slice.chunk_id).await.unwrap()[0].length, 1);
+    let other = crate::chunk::SliceDesc {
+        slice_id: 18,
+        ..slice
+    };
+    store.append_slice(other.chunk_id, other).await.unwrap();
+    store
+        .replace_slices_for_compact(
+            other.chunk_id,
+            &[],
+            &crate::chunk::SliceDesc::encode_delayed_data(&[other], &[other.slice_id]),
+        )
+        .await
+        .unwrap();
+    let ready = store.process_delayed_slices(1, 0).await.unwrap();
+    assert_eq!(
+        ready.len(),
+        1,
+        "retained prefixes must not block another GC record"
+    );
+    assert_eq!(ready[0].0, other.slice_id);
+    store.confirm_delayed_deleted(&[ready[0].3]).await.unwrap();
+    let visible = store.get_slices(slice.chunk_id).await.unwrap();
+    store
+        .replace_slices_for_compact_with_version(
+            slice.chunk_id,
+            &[],
+            &crate::chunk::SliceDesc::encode_delayed_data(&visible, &[slice.slice_id]),
+            &visible,
+        )
+        .await
+        .unwrap();
+    let ready = store.process_delayed_slices(10, 0).await.unwrap();
+    assert!(
+        ready
+            .iter()
+            .any(|row| row.0 == slice.slice_id && row.2 == 8192)
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore = "requires an isolated Redis test database"]
+async fn truncate_gc_enqueues_complete_chunks_and_restarts_reader_grace() {
+    cleanup_test_data().await.unwrap();
+    let store = new_test_store().await;
+    let ino = store
+        .create_file(store.root_ino(), "truncate-gc".into())
+        .await
+        .unwrap();
+    let slice = crate::chunk::SliceDesc {
+        slice_id: 17,
+        chunk_id: store.chunk_id(ino, 0),
+        offset: 0,
+        length: 8192,
+    };
+    store.truncate(ino, slice.length, 64 << 20).await.unwrap();
+    store.append_slice(slice.chunk_id, slice).await.unwrap();
+    store.truncate(ino, 1, 64 << 20).await.unwrap();
+    let mut conn = store.conn.clone();
+    let ids: Vec<i64> = conn.zrange(super::DELAYED_INDEX_KEY, 0, -1).await.unwrap();
+    for id in ids {
+        let _: () = conn.zadd(super::DELAYED_INDEX_KEY, id, 0).await.unwrap();
+    }
+    store.truncate(ino, 0, 64 << 20).await.unwrap();
+    assert!(
+        store
+            .process_delayed_slices(10, 60)
+            .await
+            .unwrap()
+            .is_empty(),
+        "old retained ownership must not bypass reader grace"
+    );
+    let ready = store.process_delayed_slices(10, 0).await.unwrap();
+    assert!(
+        ready
+            .iter()
+            .any(|row| row.0 == slice.slice_id && row.2 == 8192)
+    );
+}
+
 async fn cleanup_test_data() -> Result<(), MetaError> {
     let url = redis_test_url();
     let client = redis::Client::open(url)

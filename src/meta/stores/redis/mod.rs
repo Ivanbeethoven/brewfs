@@ -57,41 +57,6 @@ const LOCKED_KEY: &str = "locked";
 const LINK_PARENT_KEY_PREFIX: &str = "lp:";
 const TRUNCATE_REWRITE_MAX_RETRIES: usize = 64;
 
-// Lua script for atomically replacing a chunk's slice list when the version
-// matches the caller's expectation.  Returns 1 on success, 0 on version mismatch.
-// KEYS[1] = chunk list key
-// KEYS[2] = chunk version key
-// ARGV[1] = expected version
-// ARGV[2] = new version
-// ARGV[3..N] = serialized slice data (may be empty to delete the chunk)
-const CHUNK_CAS_LUA: &str = r#"
-    local expected = tonumber(ARGV[1])
-    local new_ver  = tonumber(ARGV[2])
-
-    local current = redis.call('GET', KEYS[2])
-    local current_ver = 0
-    if current then
-        current_ver = tonumber(current)
-    end
-
-    if current_ver ~= expected then
-        return 0
-    end
-
-    redis.call('DEL', KEYS[1])
-    for i = 3, #ARGV do
-        redis.call('RPUSH', KEYS[1], ARGV[i])
-    end
-
-    if new_ver > 0 then
-        redis.call('SET', KEYS[2], new_ver)
-    else
-        redis.call('DEL', KEYS[2])
-    end
-
-    return 1
-"#;
-
 // Atomically replace a compacted chunk and create the delayed-GC ledger for
 // every removed slice. Redis does not roll back earlier writes when a Lua
 // script hits a runtime error, so all fallible type checks and delayed-ID
@@ -99,8 +64,10 @@ const CHUNK_CAS_LUA: &str = r#"
 // KEYS: chunk list, chunk version, delayed counter, delayed index,
 // uncommitted pending index, uncommitted orphan index.
 // ARGV: expected version, new version, delayed key prefix, chunk id,
-// timestamp, delayed count, uncommitted key prefix, new-slice count,
-// delayed (sid, offset, size) triples, new slice IDs, serialized final slices.
+// timestamp, delayed count, uncommitted key prefix, new-slice count, reason,
+// retained-size key prefix, (sid, offset, size, retained) tuples,
+// new slice IDs, serialized final slices. Retained sizes stay outside the GC
+// index until a later truncate/compaction unmaps the prefix.
 const CHUNK_COMPACT_LUA: &str = r#"
     local expected = tonumber(ARGV[1])
     local new_ver = tonumber(ARGV[2])
@@ -110,12 +77,14 @@ const CHUNK_COMPACT_LUA: &str = r#"
     local n = tonumber(ARGV[6])
     local uc_prefix = ARGV[7]
     local new_count = tonumber(ARGV[8])
+    local reason = ARGV[9]
+    local retained_prefix = ARGV[10]
 
-    if expected == nil or new_ver == nil or n == nil or new_count == nil
+    if expected == nil or new_ver == nil or n == nil or new_count == nil or reason == nil
         or n < 0 or n % 1 ~= 0 or new_count < 0 or new_count % 1 ~= 0 then
         return redis.error_reply('invalid compact arguments')
     end
-    if #ARGV < 8 + 3 * n + new_count then
+    if #ARGV < 10 + 4 * n + new_count then
         return redis.error_reply('missing compact arguments')
     end
 
@@ -137,6 +106,26 @@ const CHUNK_COMPACT_LUA: &str = r#"
             return reply.ok
         end
         return reply
+    end
+
+    local physical_sizes = {}
+    for i = 0, n - 1 do
+        local base = 11 + 4 * i
+        local retained_key = retained_prefix .. ARGV[base]
+        local retained_type = key_type(retained_key)
+        if retained_type ~= 'none' and retained_type ~= 'string' then
+            return redis.error_reply('invalid retained slice size type')
+        end
+        local stored = redis.call('GET', retained_key)
+        local size = tonumber(ARGV[base + 2])
+        local retained_size = 0
+        if stored then
+            retained_size = tonumber(stored)
+        end
+        if size == nil or retained_size == nil or size < 0 or retained_size < 0 then
+            return redis.error_reply('invalid retained slice size')
+        end
+        physical_sizes[i + 1] = math.max(size, retained_size)
     end
 
     local first_id = 0
@@ -177,7 +166,7 @@ const CHUNK_COMPACT_LUA: &str = r#"
         end
     end
 
-    local new_id_start = 9 + 3 * n
+    local new_id_start = 11 + 4 * n
     local data_start = new_id_start + new_count
     redis.call('DEL', KEYS[1])
     for i = data_start, #ARGV do
@@ -192,15 +181,22 @@ const CHUNK_COMPACT_LUA: &str = r#"
     for i = 0, n - 1 do
         local delayed_id = first_id + i
         local ds_key = prefix .. delayed_id
-        local base = 9 + 3 * i
-        redis.call('HSET', ds_key,
-            'sid', ARGV[base],
-            'off', ARGV[base + 1],
-            'sz', ARGV[base + 2],
-            'st', 'pending',
-            'ca', now,
-            'cid', cid)
-        redis.call('ZADD', KEYS[4], now, delayed_id)
+        local base = 11 + 4 * i
+        local retained_key = retained_prefix .. ARGV[base]
+        if ARGV[base + 3] == '1' then
+            redis.call('SET', retained_key, physical_sizes[i + 1])
+        else
+            redis.call('HSET', ds_key,
+                'sid', ARGV[base],
+                'off', ARGV[base + 1],
+                'sz', physical_sizes[i + 1],
+                'st', 'pending',
+                'rs', reason,
+                'ca', now,
+                'cid', cid)
+            redis.call('ZADD', KEYS[4], now, delayed_id)
+            redis.call('DEL', retained_key)
+        end
     end
 
     for i = 0, new_count - 1 do
@@ -529,6 +525,7 @@ static REDIS_TXN_LOCKS: OnceLock<Vec<tokio::sync::Mutex<()>>> = OnceLock::new();
 const DELAYED_COUNTER_KEY: &str = "ds_counter";
 const DELAYED_KEY_PREFIX: &str = "ds";
 const DELAYED_INDEX_KEY: &str = "ds_idx";
+const TRUNCATE_RETAINED_SIZE_PREFIX: &str = "truncate_size:";
 const UNCOMMITTED_KEY_PREFIX: &str = "uc";
 const UNCOMMITTED_PENDING_INDEX_KEY: &str = "uc_pending_idx";
 const UNCOMMITTED_ORPHAN_INDEX_KEY: &str = "uc_orphan_idx";
@@ -2417,7 +2414,7 @@ impl RedisMetaStore {
     ) -> Result<(), MetaError> {
         let chunk_key = self.chunk_key(chunk_id);
         let version_key = self.chunk_version_key(chunk_id);
-        let script = redis::Script::new(CHUNK_CAS_LUA);
+        let script = redis::Script::new(CHUNK_COMPACT_LUA);
 
         for _ in 0..TRUNCATE_REWRITE_MAX_RETRIES {
             let mut conn = self.conn.clone();
@@ -2441,7 +2438,36 @@ impl RedisMetaStore {
                 let desc: SliceDesc = crate::meta::serialization::deserialize_meta(entry)?;
                 slices.push(desc);
             }
+            let original = slices.clone();
             trim_slices_in_place(&mut slices, cutoff_offset);
+
+            let kept_ids: std::collections::HashSet<u64> =
+                slices.iter().map(|slice| slice.slice_id).collect();
+            let delayed_slices: Vec<SliceDesc> = original
+                .iter()
+                .filter(|slice| {
+                    !kept_ids.contains(&slice.slice_id)
+                        || slices.iter().any(|kept| {
+                            kept.slice_id == slice.slice_id && kept.length != slice.length
+                        })
+                })
+                .copied()
+                .collect();
+            let delayed_args: Vec<String> = delayed_slices
+                .iter()
+                .flat_map(|slice| {
+                    [
+                        slice.slice_id.to_string(),
+                        slice.offset.to_string(),
+                        slice.length.to_string(),
+                        u8::from(kept_ids.contains(&slice.slice_id)).to_string(),
+                    ]
+                })
+                .collect();
+            let final_data: Vec<Vec<u8>> = slices
+                .iter()
+                .map(crate::meta::serialization::serialize_meta)
+                .collect::<Result<_, _>>()?;
 
             let new_version = current_version + 1;
 
@@ -2449,14 +2475,22 @@ impl RedisMetaStore {
             let ok: i32 = script
                 .key(&chunk_key)
                 .key(&version_key)
+                .key(DELAYED_COUNTER_KEY)
+                .key(DELAYED_INDEX_KEY)
+                .key(UNCOMMITTED_PENDING_INDEX_KEY)
+                .key(UNCOMMITTED_ORPHAN_INDEX_KEY)
                 .arg(current_version)
                 .arg(new_version)
-                .arg(
-                    slices
-                        .iter()
-                        .map(crate::meta::serialization::serialize_meta)
-                        .collect::<Result<Vec<_>, _>>()?,
-                )
+                .arg(DELAYED_KEY_PREFIX)
+                .arg(chunk_id)
+                .arg(Utc::now().timestamp())
+                .arg(delayed_slices.len())
+                .arg(UNCOMMITTED_KEY_PREFIX)
+                .arg(0)
+                .arg("truncate")
+                .arg(TRUNCATE_RETAINED_SIZE_PREFIX)
+                .arg(&delayed_args)
+                .arg(&final_data)
                 .invoke_async(&mut conn)
                 .await
                 .map_err(redis_err)?;
@@ -2469,6 +2503,71 @@ impl RedisMetaStore {
         Err(MetaError::Internal(format!(
             "truncate rewrite retried too many times for chunk {chunk_id}"
         )))
+    }
+
+    async fn delete_chunk_for_truncate(&self, chunk_id: u64) -> Result<(), MetaError> {
+        let chunk_key = self.chunk_key(chunk_id);
+        let version_key = self.chunk_version_key(chunk_id);
+        let script = redis::Script::new(CHUNK_COMPACT_LUA);
+
+        for _ in 0..TRUNCATE_REWRITE_MAX_RETRIES {
+            let mut conn = self.conn.clone();
+            let (version, raw): (Option<i64>, Vec<Vec<u8>>) = redis::pipe()
+                .cmd("GET")
+                .arg(&version_key)
+                .cmd("LRANGE")
+                .arg(&chunk_key)
+                .arg(0)
+                .arg(-1)
+                .query_async(&mut conn)
+                .await
+                .map_err(redis_err)?;
+            if raw.is_empty() {
+                return Ok(());
+            }
+            let delayed_slices: Vec<SliceDesc> = raw
+                .iter()
+                .map(|entry| crate::meta::serialization::deserialize_meta(entry))
+                .collect::<Result<_, _>>()?;
+            let delayed_args: Vec<String> = delayed_slices
+                .iter()
+                .flat_map(|slice| {
+                    [
+                        slice.slice_id.to_string(),
+                        slice.offset.to_string(),
+                        slice.length.to_string(),
+                        "0".to_string(),
+                    ]
+                })
+                .collect();
+            let current_version = version.unwrap_or(0);
+            let ok: i32 = script
+                .key(&chunk_key)
+                .key(&version_key)
+                .key(DELAYED_COUNTER_KEY)
+                .key(DELAYED_INDEX_KEY)
+                .key(UNCOMMITTED_PENDING_INDEX_KEY)
+                .key(UNCOMMITTED_ORPHAN_INDEX_KEY)
+                .arg(current_version)
+                .arg(current_version + 1)
+                .arg(DELAYED_KEY_PREFIX)
+                .arg(chunk_id)
+                .arg(Utc::now().timestamp())
+                .arg(delayed_slices.len())
+                .arg(UNCOMMITTED_KEY_PREFIX)
+                .arg(0)
+                .arg("truncate")
+                .arg(TRUNCATE_RETAINED_SIZE_PREFIX)
+                .arg(&delayed_args)
+                .arg(&[] as &[Vec<u8>])
+                .invoke_async(&mut conn)
+                .await
+                .map_err(redis_err)?;
+            if ok == 1 {
+                return Ok(());
+            }
+        }
+        Err(MetaError::ContinueRetry(RetryReason::CompactConflict))
     }
 
     async fn shutdown_session_by_id(&self, session_id: Uuid) -> Result<(), MetaError> {
@@ -2518,20 +2617,7 @@ impl RedisMetaStore {
             |start, end| async move {
                 for idx in start..end {
                     let chunk_id = self.chunk_id(ino, idx);
-                    let key = self.chunk_key(chunk_id);
-                    let version_key = self.chunk_version_key(chunk_id);
-                    let mut conn = self.conn.clone();
-                    redis::pipe()
-                        .atomic()
-                        .cmd("DEL")
-                        .arg(&key)
-                        .ignore()
-                        .cmd("DEL")
-                        .arg(&version_key)
-                        .ignore()
-                        .query_async::<()>(&mut conn)
-                        .await
-                        .map_err(redis_err)?;
+                    self.delete_chunk_for_truncate(chunk_id).await?;
                 }
                 Ok(())
             },
@@ -4216,6 +4302,7 @@ impl MetaStore for RedisMetaStore {
                     slice_id.to_string(),
                     offset.to_string(),
                     u64::from(*size).to_string(),
+                    "0".to_string(),
                 ]
             })
             .collect();
@@ -4274,6 +4361,8 @@ impl MetaStore for RedisMetaStore {
                 .arg(delayed_slices.len())
                 .arg(UNCOMMITTED_KEY_PREFIX)
                 .arg(new_slice_ids.len())
+                .arg("compact")
+                .arg(TRUNCATE_RETAINED_SIZE_PREFIX)
                 .arg(&delayed_args)
                 .arg(&new_slice_ids)
                 .arg(&final_data)
@@ -4329,6 +4418,7 @@ impl MetaStore for RedisMetaStore {
                     slice_id.to_string(),
                     offset.to_string(),
                     u64::from(*size).to_string(),
+                    "0".to_string(),
                 ]
             })
             .collect();
@@ -4427,6 +4517,8 @@ impl MetaStore for RedisMetaStore {
                 .arg(delayed_slices.len())
                 .arg(UNCOMMITTED_KEY_PREFIX)
                 .arg(new_slice_ids.len())
+                .arg("compact")
+                .arg(TRUNCATE_RETAINED_SIZE_PREFIX)
                 .arg(&delayed_args)
                 .arg(&new_slice_ids)
                 .arg(&final_data)

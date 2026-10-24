@@ -27,7 +27,8 @@ pub struct Model {
     pub created_at: i64,
     /// Deletion reason (e.g., "compact", "gc", "manual")
     pub reason: String,
-    /// Deletion status: "pending", "meta_deleted", "confirmed"
+    /// Deletion status: "retained", "pending", "meta_deleted", "confirmed"
+    /// - retained: physical size of a shortened, still-readable slice; not GC work
     /// - pending: initial state, slice_meta still exists
     /// - meta_deleted: slice_meta deleted, waiting for block deletion
     /// - confirmed: block deleted, can be removed
