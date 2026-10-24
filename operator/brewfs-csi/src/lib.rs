@@ -266,6 +266,12 @@ impl MountOps for SystemMountOps {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let _ = child.kill();
+        // Reap the child before the final mount check so it cannot finish
+        // mounting after cleanup. kill() alone neither waits nor unmounts.
+        child.wait()?;
+        if self.is_mounted(target)? {
+            self.unmount_brewfs(target)?;
+        }
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!("BrewFS mount did not become visible at {target:?}"),
@@ -322,7 +328,7 @@ struct MountState {
     mount_root: String,
     read_only: bool,
     /// PID of the lease-owning BrewFS process when started by this plugin.
-    /// `None` preserves compatibility with state written before PID tracking.
+    /// `None` permits reading legacy state, but cannot authenticate a live mount.
     #[serde(default)]
     pid: Option<u32>,
     #[serde(default)]
@@ -466,6 +472,11 @@ impl<O: MountOps> MountManager<O> {
         let shared = spec.shared_mount();
         let mut state = self.load_state(spec)?;
         let mut mounted = self.ops.is_mounted(&shared)?;
+        if mounted && state.pid.is_none() {
+            return Err(CsiError::MountCommand(format!(
+                "cannot reuse mount at {shared:?} without a recorded BrewFS PID; unmount it before retrying"
+            )));
+        }
         let stale = match state.pid {
             Some(pid) => mounted && !self.ops.process_alive(pid)?,
             None => false,
@@ -652,6 +663,53 @@ mod tests {
         ));
         assert!(VolumeId::parse("brewfs://cluster/not-a-uuid").is_err());
         assert!(VolumeId::parse("brewfs://cluster/a/b").is_err());
+    }
+
+    #[tokio::test]
+    async fn stage_refuses_untracked_mount() {
+        // Cover both a timeout with no state and legacy state without a PID.
+        for legacy_state in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let ops = Arc::new(FakeOps::default());
+            let manager = MountManager::new_with_root(ops.clone(), temp.path().join("state"));
+            let spec = spec(&temp);
+            let shared = spec.shared_mount();
+            ops.mounted
+                .lock()
+                .unwrap()
+                .insert(shared.display().to_string());
+            if legacy_state {
+                manager.store_state(&spec, &MountState::default()).unwrap();
+            }
+            let previous_state = fs::read(manager.state_path(&spec)).ok();
+
+            assert!(matches!(
+                manager.stage(&spec).await,
+                Err(CsiError::MountCommand(_))
+            ));
+            assert_eq!(*ops.starts.lock().unwrap(), 0);
+            assert_eq!(*ops.unmounts.lock().unwrap(), 0);
+            assert!(ops.is_mounted(&shared).unwrap());
+            assert_eq!(fs::read(manager.state_path(&spec)).ok(), previous_state);
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_reuses_tracked_mount_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let ops = Arc::new(FakeOps::default());
+        let state_root = temp.path().join("state");
+        let spec = spec(&temp);
+        MountManager::new_with_root(ops.clone(), state_root.clone())
+            .stage(&spec)
+            .await
+            .unwrap();
+        MountManager::new_with_root(ops.clone(), state_root)
+            .stage(&spec)
+            .await
+            .unwrap();
+        assert_eq!(*ops.starts.lock().unwrap(), 1);
+        assert_eq!(*ops.unmounts.lock().unwrap(), 0);
     }
 
     #[tokio::test]

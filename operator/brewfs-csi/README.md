@@ -26,9 +26,10 @@ filesystem binary or its on-disk formats.
   this plugin. Repeated stage/publish and unpublish/unstage calls are safe.
   Unstage refuses to remove a shared mount while a target is still published.
   If a recorded mount process is gone but its mountpoint remains, the stale
-  mount is removed before a new process is started. A state file without a PID
-  (from an older adapter) is reused conservatively and should be retired before
-  production use.
+  mount is removed before a new process is started. An existing mount without
+  a recorded PID (including state from an older adapter) is rejected; unmount
+  it before retrying stage. A mount visibility timeout kills and reaps the
+  child, then removes any mount that appeared during the final poll.
 
 The BrewFS process remains the lease authority. CSI reference tracking only
 controls when the node plugin may unbind and unstage; it cannot grant a second
