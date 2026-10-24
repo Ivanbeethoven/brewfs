@@ -28,6 +28,9 @@ SSH 验证见 [native fork demo](../../doc/superpowers/plans/2026-10-23-native-w
 `../../doc/superpowers/specs/overlay-workspace.md#operator-lifecycle-reference`；可运行示例见
 `manifests/example-workspace.yaml`。
 
+Fork 身份不可变约束、StorageClass 所有权检查及旧 fork 的升级限制见
+[`docs/fork-safety.md`](docs/fork-safety.md)。
+
 详细文档入口：
 
 - `docs/README.md`

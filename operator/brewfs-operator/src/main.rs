@@ -1,5 +1,40 @@
 mod crd;
 mod reconciler;
+#[cfg(test)]
+mod manifest_tests {
+    use serde::Deserialize;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn fork_regression_210_storage_class_rbac_is_minimal() {
+        let mut verbs = BTreeSet::new();
+        for document in serde_yaml::Deserializer::from_str(include_str!("../manifests/rbac.yaml")) {
+            let value = serde_yaml::Value::deserialize(document).unwrap();
+            if let Some(rules) = value["rules"].as_sequence() {
+                for rule in rules {
+                    let contains = |field: &str, needle: &str| {
+                        rule[field].as_sequence().is_some_and(|values| {
+                            values
+                                .iter()
+                                .any(|v| v.as_str() == Some(needle) || v.as_str() == Some("*"))
+                        })
+                    };
+                    if contains("apiGroups", "storage.k8s.io")
+                        && contains("resources", "storageclasses")
+                    {
+                        for verb in rule["verbs"].as_sequence().unwrap() {
+                            verbs.insert(verb.as_str().unwrap().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            verbs,
+            BTreeSet::from(["get".into(), "create".into(), "delete".into()])
+        );
+    }
+}
 #[cfg(feature = "workspace-operator")]
 mod workspace;
 
