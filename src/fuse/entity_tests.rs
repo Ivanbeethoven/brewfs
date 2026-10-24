@@ -204,3 +204,132 @@ async fn opening_directory_still_requires_ancestor_search_permission() {
         Some(libc::EACCES.into())
     );
 }
+
+async fn directory_entries(
+    fuse: &EntityFuse<MemoryEntityBackend, MemoryLower, LocalFsBackend>,
+    node: u64,
+    fh: u64,
+    offset: u64,
+    plus: bool,
+) -> Vec<(OsString, i64)> {
+    if plus {
+        fuse.readdirplus(request(), node, fh, offset, 0)
+            .await
+            .unwrap()
+            .entries
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| {
+                assert_eq!(entry.attr.ino, entry.inode);
+                assert_eq!(entry.attr.kind, entry.kind);
+                (entry.name, entry.offset)
+            })
+            .collect()
+    } else {
+        fuse.readdir(request(), node, fh, offset as i64)
+            .await
+            .unwrap()
+            .entries
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.name, entry.offset))
+            .collect()
+    }
+}
+
+async fn assert_rewind_refreshes(plus: bool) {
+    let (_temp, fuse, node, _backend) = fixture().await;
+    let fh = fuse.opendir(request(), node, 0).await.unwrap().fh;
+    let original = directory_entries(&fuse, node, fh, 0, plus).await;
+    assert_eq!(
+        original,
+        vec![(".".into(), 1), ("..".into(), 2), ("child".into(), 3)]
+    );
+    assert!(directory_entries(&fuse, node, fh, 3, plus).await.is_empty());
+
+    let created = fuse
+        .create(request(), node, OsStr::new("before"), 0o644, 0)
+        .await
+        .unwrap();
+    fuse.release(request(), created.attr.ino, created.fh, 0, 0, false)
+        .await
+        .unwrap();
+    // A new name sorts before child, but continuation cookies must still refer
+    // to the original snapshot, including when switching enumeration modes.
+    assert_eq!(
+        directory_entries(&fuse, node, fh, 2, plus).await,
+        original[2..]
+    );
+    assert_eq!(
+        directory_entries(&fuse, node, fh, 2, !plus).await,
+        original[2..]
+    );
+    fuse.unlink(request(), node, OsStr::new("child"))
+        .await
+        .unwrap();
+    assert_eq!(
+        directory_entries(&fuse, node, fh, 2, !plus).await,
+        original[2..]
+    );
+
+    let refreshed = directory_entries(&fuse, node, fh, 0, plus).await;
+    assert_eq!(
+        refreshed,
+        vec![(".".into(), 1), ("..".into(), 2), ("before".into(), 3)],
+        "rewinding the same directory handle must refresh created and removed names"
+    );
+    assert_eq!(
+        directory_entries(&fuse, node, fh, 2, !plus).await,
+        refreshed[2..]
+    );
+    assert!(directory_entries(&fuse, node, fh, 3, plus).await.is_empty());
+    fuse.releasedir(request(), node, fh, 0).await.unwrap();
+}
+
+#[tokio::test]
+async fn readdir_rewind_refreshes_created_and_removed_names() {
+    assert_rewind_refreshes(false).await;
+}
+
+#[tokio::test]
+async fn readdirplus_rewind_refreshes_created_and_removed_names() {
+    assert_rewind_refreshes(true).await;
+}
+
+#[tokio::test]
+async fn rewind_refresh_failure_keeps_snapshot() {
+    for plus in [false, true] {
+        let (_temp, fuse, node, _backend) = fixture().await;
+        let fh = fuse.opendir(request(), node, 0).await.unwrap().fh;
+        let original = directory_entries(&fuse, node, fh, 0, plus).await;
+        fuse.unlink(request(), node, OsStr::new("child"))
+            .await
+            .unwrap();
+        fuse.rmdir(request(), 1, OsStr::new("directory"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fuse.readdir(request(), node, fh, 0).await.err(),
+            Some(libc::ENOENT.into())
+        );
+        assert_eq!(
+            fuse.readdirplus(request(), node, fh, 0, 0).await.err(),
+            Some(libc::ENOENT.into())
+        );
+        // Failed refreshes preserve both the old cookies and inode attributes.
+        assert_eq!(
+            directory_entries(&fuse, node, fh, 2, plus).await,
+            original[2..]
+        );
+        assert_eq!(
+            directory_entries(&fuse, node, fh, 2, !plus).await,
+            original[2..]
+        );
+        fuse.releasedir(request(), node, fh, 0).await.unwrap();
+    }
+}
