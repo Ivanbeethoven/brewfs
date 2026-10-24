@@ -638,12 +638,14 @@ where
             let from = to_vfs_path(from)?;
             let to = to_vfs_path(to)?;
             ensure_mutable(&to)?;
+            let destination = self.resolve_parent(&to).await?;
+            let _guards = self.lock_paths(&from, &to).await;
+            // Resolve under the locks so a concurrent MOVE cannot leave COPY
+            // using the inode and attributes of a previous source binding.
             let source = self.resolve_existing(&from).await?;
             if source.1.kind != FileType::File {
                 return Err(FsError::Forbidden);
             }
-            let destination = self.resolve_parent(&to).await?;
-            let _guards = self.lock_paths(&from, &to).await;
             self.recheck_parent(&to, destination.parent_ino).await?;
             let staging = self.reserve_staging();
             let staging_parent = match self.resolve_parent(&staging).await {
@@ -1287,6 +1289,114 @@ mod tests {
             )
             .expect("create VFS");
             BrewFsDavFs::new(vfs, false, false)
+        }
+
+        async fn copy_with_changed_source(replacement: Option<FileType>) {
+            let mut dav = test_dav_fs().await;
+            dav.props_supported = true;
+            dav.initialize().await.unwrap();
+
+            // COPY must acquire the destination shard first. Holding the source
+            // shard then lets us observe that COPY has reached lock_paths.
+            assert_ne!(lock_shard("/a"), lock_shard("/b"));
+            let (source_dir, destination_dir) = if lock_shard("/a") > lock_shard("/b") {
+                ("a", "b")
+            } else {
+                ("b", "a")
+            };
+            let root = dav.vfs.root_ino();
+            let source_parent = dav.vfs.mkdir_at_new(root, source_dir).await.unwrap();
+            dav.vfs.mkdir_at_new(root, destination_dir).await.unwrap();
+            let from_path = format!("/{source_dir}/file");
+            let to_path = format!("/{destination_dir}/copy");
+            let from = DavPath::new(&from_path).unwrap();
+            let to = DavPath::new(&to_path).unwrap();
+            let old_ino = dav.vfs.create_file(&from_path).await.unwrap();
+            dav.vfs.write_ino(old_ino, 0, b"old").await.unwrap();
+            let old_props = br#"[{"name":"old","namespace":"urn:test","xml":[111]}]"#;
+            let new_props = br#"[{"name":"new","namespace":"urn:test","xml":[110]}]"#;
+            dav.vfs
+                .set_xattr_ino(old_ino, XATTR_DEAD_PROPS, old_props, 0)
+                .await
+                .unwrap();
+
+            let source_guard = dav.lock_for(&from_path).lock_owned().await;
+            let destination_lock = dav.lock_for(&to_path);
+            let change_source = async {
+                while destination_lock.try_lock().is_ok() {
+                    tokio::task::yield_now().await;
+                }
+                // Perform MOVE's VFS mutation while holding its path lock.
+                // The old inode stays alive under another name, so stale COPY
+                // can still succeed and expose its bytes and dead properties.
+                dav.vfs
+                    .rename_at_noreplace(source_parent, "file", source_parent, "moved")
+                    .await
+                    .unwrap();
+                match replacement {
+                    Some(FileType::File) => {
+                        let ino = dav.vfs.create_file(&from_path).await.unwrap();
+                        dav.vfs
+                            .write_ino(ino, 0, b"replacement contents")
+                            .await
+                            .unwrap();
+                        dav.vfs
+                            .set_xattr_ino(ino, XATTR_DEAD_PROPS, new_props, 0)
+                            .await
+                            .unwrap();
+                    }
+                    Some(FileType::Dir) => {
+                        dav.vfs.mkdir_at_new(source_parent, "file").await.unwrap();
+                    }
+                    None => {}
+                    _ => unreachable!(),
+                }
+                drop(source_guard);
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(dav.copy(&from, &to), change_source)
+            })
+            .await
+            .expect("COPY and source mutation should finish without deadlock");
+
+            match replacement {
+                Some(FileType::File) => {
+                    result.unwrap();
+                    let (ino, attr) = dav.resolve_existing(&to_path).await.unwrap();
+                    let file = dav.vfs.open_guard(ino, attr, true, false).await.unwrap();
+                    assert_eq!(file.read(0, 64).await.unwrap(), b"replacement contents");
+                    file.close().await.unwrap();
+                    assert_eq!(dav.read_dead_props(ino).await.unwrap().unwrap(), new_props);
+                }
+                _ => {
+                    let expected = if replacement.is_none() {
+                        FsError::NotFound
+                    } else {
+                        FsError::Forbidden
+                    };
+                    assert_eq!(result, Err(expected));
+                    assert!(matches!(
+                        dav.resolve_existing(&to_path).await,
+                        Err(FsError::NotFound)
+                    ));
+                }
+            }
+            assert!(dav.active_staging.is_empty());
+        }
+
+        #[tokio::test]
+        async fn copy_revalidates_replaced_source_after_locking() {
+            copy_with_changed_source(Some(FileType::File)).await;
+        }
+
+        #[tokio::test]
+        async fn copy_revalidates_missing_source_after_locking() {
+            copy_with_changed_source(None).await;
+        }
+
+        #[tokio::test]
+        async fn copy_revalidates_source_type_after_locking() {
+            copy_with_changed_source(Some(FileType::Dir)).await;
         }
 
         #[tokio::test]
