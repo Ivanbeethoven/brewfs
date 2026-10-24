@@ -696,6 +696,27 @@ impl DiskStorage {
         &self,
         key: &str,
         data: bytes::Bytes,
+        permit: OwnedSemaphorePermit,
+        generation: u64,
+    ) -> anyhow::Result<bool> {
+        // Once admitted, a store owns its permit and reservation through
+        // publication or rollback. Cancelling an upload caller must not detach
+        // its blocking write from the cleanup/accounting that follows it.
+        // Acquiring the permit before spawning also bounds these owned tasks.
+        let storage = self.clone();
+        let key = key.to_owned();
+        tokio::spawn(async move {
+            storage
+                .finish_store_with_permit_at_generation(&key, data, permit, generation)
+                .await
+        })
+        .await?
+    }
+
+    async fn finish_store_with_permit_at_generation(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
         _permit: OwnedSemaphorePermit,
         generation: u64,
     ) -> anyhow::Result<bool> {

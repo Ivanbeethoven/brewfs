@@ -3005,6 +3005,157 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn sibling_upload_failure_does_not_orphan_pending_disk_publication() {
+        fn cache_files(dir: &Path) -> Vec<std::fs::DirEntry> {
+            let mut files = Vec::new();
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    files.extend(cache_files(&entry.path()));
+                } else {
+                    files.push(entry);
+                }
+            }
+            files
+        }
+
+        struct FailSecondUpload;
+        #[async_trait]
+        impl ObjectBackend for FailSecondUpload {
+            async fn put_object(&self, key: &str, _: &[u8]) -> anyhow::Result<()> {
+                anyhow::ensure!(!key.ends_with("/1"), "injected sibling upload failure");
+                Ok(())
+            }
+            async fn get_object(&self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                unreachable!()
+            }
+            async fn get_object_range(
+                &self,
+                _: &str,
+                _: u64,
+                _: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                unreachable!()
+            }
+            async fn get_etag(&self, _: &str) -> anyhow::Result<String> {
+                unreachable!()
+            }
+            async fn delete_object(&self, _: &str) -> anyhow::Result<()> {
+                unreachable!()
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                ObjectBlockStore::new_with_configs_async(
+                    ObjectClient::new(FailSecondUpload),
+                    ChunksCacheConfig::with_budgets(0, 16 * 1024 * 1024, dir.path().to_path_buf()),
+                    BlockStoreConfig {
+                        block_size: 4096,
+                        compression: Compression::None,
+                        persist_write_cache_after_upload: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+            ready_rx.await.unwrap();
+
+            let mut uploads = tokio::task::JoinSet::new();
+            let successful = store.clone();
+            uploads.spawn(async move {
+                successful
+                    .write_fresh_range((700, 0), 0, &vec![42; 4096])
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while store.block_cache.stats().disk_bytes == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("successful upload must reach disk-cache persistence");
+
+            // The hot-cache insertion has finished and the disk writer is
+            // blocked. Hold publication, then allow its temporary file to finish.
+            let key = ObjectBlockStore::<FailSecondUpload>::key_for((700, 0));
+            let gate = store.block_cache.hold_publication(&key).await;
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if cache_files(dir.path()).into_iter().any(|entry| {
+                        entry.file_name().to_string_lossy().ends_with(".tmp")
+                            && entry.metadata().unwrap().len()
+                                == store.block_cache.stats().disk_bytes
+                    }) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("temporary file must finish before cancelling publication");
+
+            let failing = store.clone();
+            uploads
+                .spawn(async move { failing.write_fresh_range((700, 1), 0, &vec![7; 4096]).await });
+            let failure = uploads.join_next().await.unwrap().unwrap().unwrap_err();
+            assert!(
+                failure
+                    .to_string()
+                    .contains("injected sibling upload failure")
+            );
+            uploads.abort_all();
+            assert!(
+                uploads
+                    .join_next()
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+            drop(gate);
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let entries = cache_files(dir.path());
+                    if entries.len() == 1
+                        && !entries[0].file_name().to_string_lossy().ends_with(".tmp")
+                    {
+                        assert_eq!(
+                            store.block_cache.stats().disk_bytes,
+                            entries[0].metadata().unwrap().len()
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("cancelled upload must finish cache publication without leaking its temp file");
+            assert_eq!(
+                store.block_cache.get(&key).await,
+                Some(Bytes::from(vec![42; 4096]))
+            );
+        });
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_write_fresh_range_write_cache_population_is_configurable()
     -> Result<(), Box<dyn std::error::Error>> {
