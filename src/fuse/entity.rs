@@ -50,7 +50,13 @@ struct OpenFile {
 struct OpenDirectory {
     ino: i64,
     // Creating this handle grants enumeration for its lifetime.
+    credentials: Credentials,
+    snapshot: tokio::sync::Mutex<DirectorySnapshot>,
+}
+
+struct DirectorySnapshot {
     entries: Vec<(DirectoryEntry, EntityInode)>,
+    started: bool,
 }
 
 struct Handles {
@@ -296,6 +302,79 @@ where
             .filter(|directory| directory.ino == ino)
             .cloned()
             .ok_or(Errno::from(libc::EBADF))
+    }
+
+    async fn directory_snapshot(
+        &self,
+        ino: i64,
+        credentials: &Credentials,
+    ) -> FuseResult<Vec<(DirectoryEntry, EntityInode)>> {
+        let listed = self
+            .state
+            .namespace
+            .readdir_snapshot(ino, credentials)
+            .await
+            .map_err(errno)?;
+        let mut entries = Vec::with_capacity(listed.entries.len() + 2);
+        entries.push((
+            DirectoryEntry {
+                inode: self.node(ino),
+                kind: FileType::Directory,
+                name: OsString::from("."),
+                offset: 1,
+            },
+            listed.directory,
+        ));
+        entries.push((
+            DirectoryEntry {
+                inode: self.node(listed.parent.ino),
+                kind: FileType::Directory,
+                name: OsString::from(".."),
+                offset: 2,
+            },
+            listed.parent,
+        ));
+        for (name, child) in listed.entries {
+            entries.push((
+                DirectoryEntry {
+                    inode: self.node(child.ino),
+                    kind: kind(child.kind),
+                    name: OsString::from_vec(name),
+                    offset: entries.len() as i64 + 1,
+                },
+                child,
+            ));
+        }
+        Ok(entries)
+    }
+
+    async fn read_directory(
+        &self,
+        directory: &OpenDirectory,
+        offset: usize,
+    ) -> FuseResult<Vec<(DirectoryEntry, EntityInode)>> {
+        // Serialize a rewind with reads of this handle, without holding the
+        // global handle bookkeeping lock across metadata I/O. A failed refresh
+        // leaves the previous snapshot intact.
+        let mut snapshot = directory.snapshot.lock().await;
+        if offset == 0 && snapshot.started {
+            // Opening the handle granted enumeration for its lifetime, so a
+            // permission change after opendir must not revoke it: keep serving
+            // the last good snapshot when the refresh is refused. Structural
+            // failures (the directory is gone, or the authority is fenced) still
+            // surface to the caller.
+            match self
+                .directory_snapshot(directory.ino, &directory.credentials)
+                .await
+            {
+                Ok(entries) => snapshot.entries = entries,
+                Err(error)
+                    if error == Errno::from(libc::EACCES) || error == Errno::from(libc::EPERM) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        snapshot.started = true;
+        Ok(snapshot.entries.iter().skip(offset).cloned().collect())
     }
 
     fn store_file(&self, fh: u64, file: OpenFile) -> FuseResult<()> {
@@ -758,51 +837,24 @@ where
         let ino = self.ino(inode)?;
         let fh = self.reserve_handle()?;
         let credentials = credentials(request, 0)?;
-        let listed = self
-            .state
-            .namespace
-            .readdir_snapshot(ino, &credentials)
-            .await
-            .map_err(errno)?;
-        let mut entries = Vec::with_capacity(listed.entries.len() + 2);
-        entries.push((
-            DirectoryEntry {
-                inode,
-                kind: FileType::Directory,
-                name: OsString::from("."),
-                offset: 1,
-            },
-            listed.directory,
-        ));
-        entries.push((
-            DirectoryEntry {
-                inode: self.node(listed.parent.ino),
-                kind: FileType::Directory,
-                name: OsString::from(".."),
-                offset: 2,
-            },
-            listed.parent,
-        ));
-        for (name, child) in listed.entries {
-            entries.push((
-                DirectoryEntry {
-                    inode: self.node(child.ino),
-                    kind: kind(child.kind),
-                    name: OsString::from_vec(name),
-                    offset: entries.len() as i64 + 1,
-                },
-                child,
-            ));
-        }
+        let entries = self.directory_snapshot(ino, &credentials).await?;
         let mut handles = self
             .state
             .handles
             .lock()
             .map_err(|_| Errno::from(libc::EIO))?;
         handles.live()?;
-        handles
-            .directories
-            .insert(fh, Arc::new(OpenDirectory { ino, entries }));
+        handles.directories.insert(
+            fh,
+            Arc::new(OpenDirectory {
+                ino,
+                credentials,
+                snapshot: tokio::sync::Mutex::new(DirectorySnapshot {
+                    entries,
+                    started: false,
+                }),
+            }),
+        );
         Ok(ReplyOpen { fh, flags: 0 })
     }
 
@@ -821,11 +873,11 @@ where
             .admit_directory_read()
             .await
             .map_err(errno)?;
-        let entries = directory
-            .entries
-            .iter()
-            .skip(offset)
-            .map(|(entry, _)| Ok(entry.clone()))
+        let entries = self
+            .read_directory(&directory, offset)
+            .await?
+            .into_iter()
+            .map(|(entry, _)| Ok(entry))
             .collect::<Vec<_>>();
         Ok(ReplyDirectory {
             entries: Box::pin(stream::iter(entries)),
@@ -866,14 +918,14 @@ where
             .await
             .map_err(errno)?;
         let mut entries = Vec::new();
-        for (entry, attr) in directory.entries.iter().skip(offset) {
+        for (entry, attr) in self.read_directory(&directory, offset).await? {
             entries.push(Ok(DirectoryEntryPlus {
                 inode: entry.inode,
                 generation: 0,
                 kind: entry.kind,
-                name: entry.name.clone(),
+                name: entry.name,
                 offset: entry.offset,
-                attr: self.attr(attr),
+                attr: self.attr(&attr),
                 entry_ttl: Duration::ZERO,
                 attr_ttl: Duration::ZERO,
             }));
