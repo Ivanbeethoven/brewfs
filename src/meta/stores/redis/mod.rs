@@ -298,6 +298,7 @@ macro_rules! flock_lua {
 
     local flock_key = KEYS[1]
     local locked_key = KEYS[2]
+    local plock_key = KEYS[3]
     local field = ARGV[1]
     local lock_type = tonumber(ARGV[2])  -- 0=Read, 1=Write, 2=UnLock
     local inode_str = ARGV[3]
@@ -321,10 +322,16 @@ macro_rules! flock_lua {
             return cjson.encode({ok=true})  -- stale unlock, ignore
         end
         redis.call('HDEL', flock_key, field)
-        -- Remove from locked set if field was the last one
-        if redis.call('HLEN', flock_key) == 0 then
-            redis.call('SREM', locked_key, inode_str)
+        -- Both lock namespaces share this session's inode inventory.
+        local sid_prefix = string.match(field, "^[^:]+:")
+        for _, key in ipairs({flock_key, plock_key}) do
+            for _, other_field in ipairs(redis.call('HKEYS', key)) do
+                if string.sub(other_field, 1, #sid_prefix) == sid_prefix then
+                    return cjson.encode({ok=true})
+                end
+            end
         end
+        redis.call('SREM', locked_key, inode_str)
         return cjson.encode({ok=true})
     end
 
@@ -368,6 +375,7 @@ const SET_PLOCK_LUA: &str = r#"
 
     local plock_key = KEYS[1]
     local locked_key = KEYS[2]
+    local flock_key = KEYS[3]
     local field = ARGV[1]
     local lock_type = tonumber(ARGV[2])  -- 0=Read, 1=Write, 2=UnLock
     local pid = tonumber(ARGV[3])
@@ -522,6 +530,15 @@ const SET_PLOCK_LUA: &str = r#"
 
         if #new_records == 0 then
             redis.call('HDEL', plock_key, field)
+            -- Keep tracking until this session has no POSIX or BSD owners.
+            local sid_prefix = string.match(field, "^[^:]+:")
+            for _, key in ipairs({plock_key, flock_key}) do
+                for _, other_field in ipairs(redis.call('HKEYS', key)) do
+                    if string.sub(other_field, 1, #sid_prefix) == sid_prefix then
+                        return cjson.encode({ok=true})
+                    end
+                end
+            end
             redis.call('SREM', locked_key, inode_str)
         else
             redis.call('HSET', plock_key, field,
@@ -2443,6 +2460,7 @@ impl RedisMetaStore {
         let result: String = script
             .key(&plock_key)
             .key(&locked_key)
+            .key(format!("flock:{inode}"))
             .arg(&field)
             .arg(lock_type_num)
             .arg(new_lock.pid)
@@ -5229,6 +5247,7 @@ impl MetaStore for RedisMetaStore {
             let result: String = script
                 .key(&flock_key)
                 .key(&locked_key)
+                .key(self.plock_key(inode))
                 .arg(&field)
                 .arg(lock_type.as_u32())
                 .arg(inode)
