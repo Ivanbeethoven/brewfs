@@ -32,6 +32,10 @@ use crate::workspace_overlay::entity::namespace::{
 use crate::workspace_overlay::entity::resolver::ImmutableLowerData;
 use crate::workspace_overlay::entity::{EntityError, Result};
 
+#[cfg(test)]
+#[path = "entity_tests.rs"]
+mod tests;
+
 /// The experimental bootstrap uses 4 MiB chunks. A 1 MiB request stays
 /// within EntityData's bounded I/O geometry even when it straddles a chunk.
 pub const MAX_WRITE: u32 = 1024 * 1024;
@@ -45,6 +49,7 @@ struct OpenFile {
 
 struct OpenDirectory {
     ino: i64,
+    // Creating this handle grants enumeration for its lifetime.
     entries: Vec<(DirectoryEntry, EntityInode)>,
 }
 
@@ -803,16 +808,17 @@ where
 
     async fn readdir<'a>(
         &'a self,
-        request: Request,
+        _request: Request,
         inode: u64,
         fh: u64,
         offset: i64,
     ) -> FuseResult<ReplyDirectory<BoxStream<'a, FuseResult<DirectoryEntry>>>> {
         let directory = self.directory(inode, fh)?;
         let offset = usize::try_from(offset).map_err(|_| Errno::from(libc::EINVAL))?;
-        self.state
+        let _admission = self
+            .state
             .namespace
-            .access(directory.ino, 5, &credentials(request, 0)?)
+            .admit_directory_read()
             .await
             .map_err(errno)?;
         let entries = directory
@@ -845,7 +851,7 @@ where
 
     async fn readdirplus<'a>(
         &'a self,
-        request: Request,
+        _request: Request,
         inode: u64,
         fh: u64,
         offset: u64,
@@ -853,10 +859,10 @@ where
     ) -> FuseResult<ReplyDirectoryPlus<BoxStream<'a, FuseResult<DirectoryEntryPlus>>>> {
         let directory = self.directory(inode, fh)?;
         let offset = usize::try_from(offset).map_err(|_| Errno::from(libc::EINVAL))?;
-        let credentials = credentials(request, 0)?;
-        self.state
+        let _admission = self
+            .state
             .namespace
-            .access(directory.ino, 5, &credentials)
+            .admit_directory_read()
             .await
             .map_err(errno)?;
         let mut entries = Vec::new();

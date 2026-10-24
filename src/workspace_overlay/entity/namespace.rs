@@ -590,6 +590,14 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
             .map(Reply::directory)
     }
 
+    /// Admit a read on an already-authorized directory handle. The adapter
+    /// validates the handle's inode; chmod does not revoke its open read grant.
+    pub(crate) async fn admit_directory_read(&self) -> Result<OperationGuard> {
+        let admission = self.session.admit()?;
+        self.authority().await?;
+        Ok(admission)
+    }
+
     /// Linked close is local. Unlinked data remains a durable recovery obligation.
     pub fn close(&self, handle: EntityHandle) -> Result<()> {
         if handle.namespace != self.keys.prefix() {
@@ -1179,7 +1187,7 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
                 return Ok(Reply::Inode(inode));
             }
             Request::Readdir { ino } => {
-                let directory = self.parent(*ino, c, 5).await?;
+                let directory = self.parent(*ino, c, 4).await?;
                 let parent = self
                     .inode(
                         directory
