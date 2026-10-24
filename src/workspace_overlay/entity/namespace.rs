@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -111,6 +111,7 @@ pub struct EntityHandle {
     ino: i64,
     namespace: Vec<u8>,
     access: u32,
+    mutated: AtomicBool,
     state: Arc<InodeLock>,
     _admission: OperationGuard,
 }
@@ -119,6 +120,21 @@ impl EntityHandle {
     pub fn ino(&self) -> i64 {
         self.ino
     }
+
+    pub(super) fn mark_mutated(&self) {
+        self.mutated.store(true, Ordering::Release);
+    }
+
+    pub(super) fn needs_release_barrier(&self) -> bool {
+        self.mutated.load(Ordering::Acquire)
+    }
+}
+
+/// Attributes captured and validated together with a directory's entries.
+pub struct DirectorySnapshot {
+    pub directory: EntityInode,
+    pub parent: EntityInode,
+    pub entries: Vec<(Vec<u8>, EntityInode)>,
 }
 
 impl Drop for EntityHandle {
@@ -195,7 +211,7 @@ enum Reply {
     Done,
     Inode(EntityInode),
     Open(EntityInode, EntityHandle),
-    Directory(Vec<(Vec<u8>, EntityInode)>),
+    Directory(Box<DirectorySnapshot>),
     Create(CreateAllocation),
 }
 
@@ -212,11 +228,11 @@ impl Reply {
         };
         (inode, handle)
     }
-    fn directory(self) -> Vec<(Vec<u8>, EntityInode)> {
-        let Self::Directory(entries) = self else {
+    fn directory(self) -> DirectorySnapshot {
+        let Self::Directory(snapshot) = self else {
             unreachable!("directory request reply")
         };
-        entries
+        *snapshot
     }
 }
 
@@ -546,6 +562,14 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
         ino: i64,
         credentials: &Credentials,
     ) -> Result<Vec<(Vec<u8>, EntityInode)>> {
+        Ok(self.readdir_snapshot(ino, credentials).await?.entries)
+    }
+
+    pub async fn readdir_snapshot(
+        &self,
+        ino: i64,
+        credentials: &Credentials,
+    ) -> Result<DirectorySnapshot> {
         self.execute(Request::Readdir { ino }, credentials.clone())
             .await
             .map(Reply::directory)
@@ -680,6 +704,7 @@ impl<B: EntityBackend + 'static, L: ImmutableLower + 'static> EntityNamespace<B,
                         ino: inode.ino,
                         namespace: self.keys.prefix().to_vec(),
                         access,
+                        mutated: AtomicBool::new(false),
                         state,
                         _admission: admission,
                     };
@@ -1139,7 +1164,14 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
                 return Ok(Reply::Inode(inode));
             }
             Request::Readdir { ino } => {
-                self.parent(*ino, c, 5).await?;
+                let directory = self.parent(*ino, c, 5).await?;
+                let parent = self
+                    .inode(
+                        directory
+                            .parent_hint
+                            .unwrap_or(self.ns.lower.binding().root_ino),
+                    )
+                    .await?;
                 let entries = self.directory_entries(*ino).await?;
                 self.prefetch(
                     entries
@@ -1164,7 +1196,11 @@ impl<'a, B: EntityBackend + 'static, L: ImmutableLower + 'static> Prepared<'a, B
                     }
                     output.push((name, inode));
                 }
-                return Ok(Reply::Directory(output));
+                return Ok(Reply::Directory(Box::new(DirectorySnapshot {
+                    directory,
+                    parent,
+                    entries: output,
+                })));
             }
             Request::Link { ino, parent, name } => {
                 self.parent(*parent, c, 3).await?;

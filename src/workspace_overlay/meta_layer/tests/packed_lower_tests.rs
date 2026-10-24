@@ -34,6 +34,9 @@ use crate::workspace_overlay::stores::database::SqliteWorkspaceStore;
 #[path = "packed_lower_tests/default_reader_attach_contracts.rs"]
 mod default_reader_attach_contracts;
 
+#[path = "packed_lower_tests/performance_tests.rs"]
+mod performance_tests;
+
 #[derive(Clone)]
 struct CountedBackend {
     inner: LocalFsBackend,

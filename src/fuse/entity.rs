@@ -45,7 +45,7 @@ struct OpenFile {
 
 struct OpenDirectory {
     ino: i64,
-    entries: Vec<DirectoryEntry>,
+    entries: Vec<(DirectoryEntry, EntityInode)>,
 }
 
 struct Handles {
@@ -670,7 +670,7 @@ where
         let result = if flush {
             self.state
                 .data
-                .fsync(file.handle.clone())
+                .flush_release(file.handle.clone())
                 .await
                 .map_err(errno)
         } else {
@@ -756,35 +756,38 @@ where
         let listed = self
             .state
             .namespace
-            .readdir(ino, &credentials)
+            .readdir_snapshot(ino, &credentials)
             .await
             .map_err(errno)?;
-        let attr = self
-            .state
-            .namespace
-            .getattr(ino, &credentials)
-            .await
-            .map_err(errno)?;
-        let mut entries = Vec::with_capacity(listed.len() + 2);
-        entries.push(DirectoryEntry {
-            inode,
-            kind: FileType::Directory,
-            name: OsString::from("."),
-            offset: 1,
-        });
-        entries.push(DirectoryEntry {
-            inode: self.node(attr.parent_hint.unwrap_or(self.state.root)),
-            kind: FileType::Directory,
-            name: OsString::from(".."),
-            offset: 2,
-        });
-        for (name, child) in listed {
-            entries.push(DirectoryEntry {
-                inode: self.node(child.ino),
-                kind: kind(child.kind),
-                name: OsString::from_vec(name),
-                offset: entries.len() as i64 + 1,
-            });
+        let mut entries = Vec::with_capacity(listed.entries.len() + 2);
+        entries.push((
+            DirectoryEntry {
+                inode,
+                kind: FileType::Directory,
+                name: OsString::from("."),
+                offset: 1,
+            },
+            listed.directory,
+        ));
+        entries.push((
+            DirectoryEntry {
+                inode: self.node(listed.parent.ino),
+                kind: FileType::Directory,
+                name: OsString::from(".."),
+                offset: 2,
+            },
+            listed.parent,
+        ));
+        for (name, child) in listed.entries {
+            entries.push((
+                DirectoryEntry {
+                    inode: self.node(child.ino),
+                    kind: kind(child.kind),
+                    name: OsString::from_vec(name),
+                    offset: entries.len() as i64 + 1,
+                },
+                child,
+            ));
         }
         let mut handles = self
             .state
@@ -816,8 +819,7 @@ where
             .entries
             .iter()
             .skip(offset)
-            .cloned()
-            .map(Ok)
+            .map(|(entry, _)| Ok(entry.clone()))
             .collect::<Vec<_>>();
         Ok(ReplyDirectory {
             entries: Box::pin(stream::iter(entries)),
@@ -858,25 +860,14 @@ where
             .await
             .map_err(errno)?;
         let mut entries = Vec::new();
-        for entry in directory.entries.iter().skip(offset) {
-            let attr = match self
-                .state
-                .namespace
-                .getattr(self.ino(entry.inode)?, &credentials)
-                .await
-            {
-                Ok(attr) => attr,
-                // A stable directory stream can outlive an unlinked name.
-                Err(EntityError::NotFound) => continue,
-                Err(error) => return Err(errno(error)),
-            };
+        for (entry, attr) in directory.entries.iter().skip(offset) {
             entries.push(Ok(DirectoryEntryPlus {
                 inode: entry.inode,
                 generation: 0,
                 kind: entry.kind,
                 name: entry.name.clone(),
                 offset: entry.offset,
-                attr: self.attr(&attr),
+                attr: self.attr(attr),
                 entry_ttl: Duration::ZERO,
                 attr_ttl: Duration::ZERO,
             }));

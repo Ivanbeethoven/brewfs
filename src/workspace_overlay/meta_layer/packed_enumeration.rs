@@ -267,8 +267,10 @@ impl<W: WorkspaceStore + 'static> DirectoryPageSource for WorkspaceDirectory<W> 
         }
         // A bounded checkpoint cache is an accelerator, never cookie identity.
         // Cancellation commits no checkpoint and drops all transient pages.
-        let mut checkpoints = self.checkpoints.lock().await;
-        let cursor = checkpoints
+        let cursor = self
+            .checkpoints
+            .lock()
+            .await
             .iter()
             .filter(|cursor| cursor.visible <= offset)
             .max_by_key(|cursor| cursor.visible)
@@ -299,6 +301,7 @@ impl<W: WorkspaceStore + 'static> DirectoryPageSource for WorkspaceDirectory<W> 
             }
         }
         self.view.validate().await?;
+        let mut checkpoints = self.checkpoints.lock().await;
         if checkpoints.len() == CHECKPOINTS {
             checkpoints.pop_front();
         }

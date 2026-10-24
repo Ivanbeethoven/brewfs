@@ -232,6 +232,19 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         self.commit_with_written(request, written).await
     }
 
+    /// The caller supplies every file whose aliases change, including an
+    /// overwritten destination. Whiteouts alone cannot identify that set.
+    /// Directory operations and unknown shapes retain global invalidation.
+    pub(super) async fn commit_namespace_mutation(
+        &self,
+        request: VersionedMutation,
+        files: Option<Vec<i64>>,
+    ) -> Result<super::super::catalog::MutationResult, WorkspaceError> {
+        let mut written = super::RowsWritten::of(&request);
+        written.namespace_inodes = files;
+        self.commit_with_written(request, written).await
+    }
+
     async fn commit_with_written(
         &self,
         request: VersionedMutation,

@@ -146,6 +146,70 @@ impl ObjectBackend for NoObjectIo {
     }
 }
 
+struct CountingRangeObjects {
+    bytes: Option<Vec<u8>>,
+    heads: AtomicUsize,
+    gets: AtomicUsize,
+}
+
+#[async_trait]
+impl ObjectBackend for CountingRangeObjects {
+    async fn put_object(&self, _: &str, _: &[u8]) -> anyhow::Result<()> {
+        anyhow::bail!("test object backend is read-only")
+    }
+
+    async fn get_object(&self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        panic!("entity reads must use bounded streaming GET")
+    }
+
+    async fn get_object_range(
+        &self,
+        _: &str,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> anyhow::Result<usize> {
+        let start = usize::try_from(offset)?;
+        let Some(source) = self.bytes.as_deref().and_then(|bytes| bytes.get(start..)) else {
+            return Ok(0);
+        };
+        let source = &source[..source.len().min(buf.len())];
+        buf[..source.len()].copy_from_slice(source);
+        Ok(source.len())
+    }
+
+    async fn get_object_range_stream(
+        &self,
+        _: &str,
+        offset: u64,
+        length: u64,
+    ) -> anyhow::Result<ObjectByteStream> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        let start = usize::try_from(offset)?;
+        let bytes = self
+            .bytes
+            .as_deref()
+            .and_then(|bytes| bytes.get(start..))
+            .unwrap_or_default();
+        let bytes = bytes[..bytes.len().min(usize::try_from(length)?)].to_vec();
+        Ok(Box::pin(futures_util::stream::once(async move {
+            Ok(Bytes::from(bytes))
+        })))
+    }
+
+    async fn get_object_size_bounded(&self, _: &str) -> anyhow::Result<Option<u64>> {
+        self.heads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.bytes.as_ref().map(|bytes| bytes.len() as u64))
+    }
+
+    async fn get_etag(&self, _: &str) -> anyhow::Result<String> {
+        Ok("test-etag".into())
+    }
+
+    async fn delete_object(&self, _: &str) -> anyhow::Result<()> {
+        anyhow::bail!("test object backend is read-only")
+    }
+}
+
 struct Fixture<B, O = Objects> {
     backend: Arc<B>,
     keys: EntityKeys,
@@ -814,6 +878,175 @@ async fn new_file<B: EntityBackend + 'static, O: ObjectBackend + 'static>(
     Arc::new(fixture.namespace.open(1, name, 6, &root()).await.unwrap())
 }
 
+#[tokio::test]
+async fn readdirplus_reuses_attributes_captured_by_opendir() {
+    use asyncfuse::raw::{Filesystem, Request};
+    let fixture = attach_objects(
+        Arc::new(MeteredBackend::new(MemoryEntityBackend::new(1000))),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+        1_000_000,
+        Arc::new(NoObjectIo),
+        8,
+    )
+    .await;
+    for n in 0..8 {
+        new_file(&fixture, format!("child-{n}").as_bytes()).await;
+    }
+    let fuse =
+        crate::fuse::entity::EntityFuse::new(fixture.namespace.clone(), fixture.data.clone(), 1)
+            .unwrap();
+    let opened = fuse.opendir(Request::default(), 1, 0).await.unwrap();
+    fixture.backend.take_counts();
+    let entries: Vec<_> = fuse
+        .readdirplus(Request::default(), 1, opened.fh, 0, 0)
+        .await
+        .unwrap()
+        .entries
+        .collect()
+        .await;
+    assert_eq!(entries.len(), 11); // dot, dot-dot, lower file, eight upper files
+    for entry in entries {
+        let entry = entry.unwrap();
+        assert_eq!(entry.attr.ino, entry.inode);
+        assert_eq!(entry.attr.kind, entry.kind);
+        if entry.name == "base" {
+            assert_eq!(entry.attr.size, 24);
+        }
+    }
+    // One fresh directory access check; attributes were already batched at open.
+    assert_eq!(fixture.backend.take_counts(), (1, 0, 0, 0));
+}
+
+#[tokio::test]
+async fn readdirplus_captures_actual_parent_attributes() {
+    use asyncfuse::raw::{Filesystem, Request};
+    let fixture = attach_objects(
+        Arc::new(MeteredBackend::new(MemoryEntityBackend::new(1000))),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+        1_000_000,
+        Arc::new(NoObjectIo),
+        8,
+    )
+    .await;
+    let fuse =
+        crate::fuse::entity::EntityFuse::new(fixture.namespace.clone(), fixture.data.clone(), 1)
+            .unwrap();
+    let parent = fuse
+        .mkdir(
+            Request::default(),
+            1,
+            std::ffi::OsStr::new("parent"),
+            0o750,
+            0,
+        )
+        .await
+        .unwrap()
+        .attr;
+    let child = fuse
+        .mkdir(
+            Request::default(),
+            parent.ino,
+            std::ffi::OsStr::new("child"),
+            0o711,
+            0,
+        )
+        .await
+        .unwrap()
+        .attr;
+    let opened = fuse
+        .opendir(Request::default(), child.ino, 0)
+        .await
+        .unwrap();
+    fixture.backend.take_counts();
+    let entries: Vec<_> = fuse
+        .readdirplus(Request::default(), child.ino, opened.fh, 0, 0)
+        .await
+        .unwrap()
+        .entries
+        .collect()
+        .await;
+    assert_eq!(entries.len(), 2);
+    let dot = entries[0].as_ref().unwrap();
+    let parent_entry = entries[1].as_ref().unwrap();
+    assert_eq!(dot.attr.ino, child.ino);
+    assert_eq!(dot.attr.perm, child.perm);
+    assert_eq!(parent_entry.attr.ino, parent.ino);
+    assert_eq!(parent_entry.attr.perm, parent.perm);
+    assert_eq!(parent_entry.attr.nlink, 3);
+    assert_eq!(fixture.backend.take_counts(), (1, 0, 0, 0));
+}
+
+#[tokio::test]
+async fn clean_fuse_release_avoids_metadata_barrier_but_explicit_fsync_keeps_it() {
+    use asyncfuse::raw::{Filesystem, Request};
+    let fixture = attach_objects(
+        Arc::new(MeteredBackend::new(MemoryEntityBackend::new(1000))),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+        1_000_000,
+        Arc::new(NoObjectIo),
+        8,
+    )
+    .await;
+    let fuse =
+        crate::fuse::entity::EntityFuse::new(fixture.namespace.clone(), fixture.data.clone(), 1)
+            .unwrap();
+    for flags in [libc::O_RDONLY as u32, libc::O_RDWR as u32] {
+        let opened = fuse.open(Request::default(), 3, flags).await.unwrap();
+        fixture.backend.take_counts();
+        fuse.fsync(Request::default(), 3, opened.fh, false)
+            .await
+            .unwrap();
+        assert_eq!(fixture.backend.take_counts(), (1, 1, 0, 0));
+        fuse.release(Request::default(), 3, opened.fh, flags, 0, true)
+            .await
+            .unwrap();
+        assert_eq!(fixture.backend.take_counts(), (0, 0, 0, 0));
+    }
+    let opened = fuse
+        .open(Request::default(), 3, libc::O_RDWR as u32)
+        .await
+        .unwrap();
+    fuse.setattr(
+        Request::default(),
+        3,
+        Some(opened.fh),
+        asyncfuse::SetAttr {
+            size: Some(40),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    fixture.backend.take_counts();
+    fuse.release(
+        Request::default(),
+        3,
+        opened.fh,
+        libc::O_RDWR as u32,
+        0,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fixture.backend.take_counts(),
+        (1, 1, 0, 0),
+        "truncate keeps the release barrier"
+    );
+
+    let opened = fuse.open(Request::default(), 3, 0).await.unwrap();
+    fixture
+        .session
+        .remember_io_failure(2, "injected earlier uncertain write".into());
+    assert_eq!(
+        fuse.release(Request::default(), 3, opened.fh, 0, 0, true)
+            .await
+            .unwrap_err(),
+        asyncfuse::Errno::from(libc::EIO),
+        "even a clean handle must report the inode's sticky error"
+    );
+}
+
 async fn exercise_copy_up<B: EntityBackend + 'static>(fixture: &Fixture<B>) {
     let handle = Arc::new(
         fixture
@@ -1099,6 +1332,70 @@ async fn upper_reads_reject_missing_corrupted_and_oversized_objects() {
         fixture.data.read(handle, 0, 7).await,
         Err(EntityError::Corrupt(_))
     ));
+}
+
+#[tokio::test]
+async fn upper_object_read_uses_bounded_get_without_metadata_head() {
+    let bytes = b"authenticated payload".to_vec();
+    let objects = Arc::new(CountingRangeObjects {
+        bytes: Some(bytes.clone()),
+        heads: AtomicUsize::new(0),
+        gets: AtomicUsize::new(0),
+    });
+    let fixture = attach_objects(
+        Arc::new(MemoryEntityBackend::new(1000)),
+        EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+        1_000_000,
+        objects.clone(),
+        8,
+    )
+    .await;
+    let descriptor = ObjectDescriptor {
+        namespace_id: fixture.keys.namespace_id(),
+        slice_id: 1,
+        size: bytes.len() as u64,
+        sha256: Sha256::digest(&bytes).into(),
+    };
+
+    assert_eq!(fixture.data.read_object(&descriptor).await.unwrap(), bytes);
+    assert_eq!(objects.heads.load(Ordering::SeqCst), 0);
+    assert_eq!(objects.gets.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn upper_object_read_rejects_missing_short_corrupt_and_extended_payloads() {
+    let expected = b"authenticated payload";
+    for bytes in [
+        None,
+        Some(Vec::new()),
+        Some(expected[..expected.len() - 1].to_vec()),
+        Some(vec![b'x'; expected.len()]),
+        Some([expected.as_slice(), b"extra"].concat()),
+    ] {
+        let objects = Arc::new(CountingRangeObjects {
+            bytes,
+            heads: AtomicUsize::new(0),
+            gets: AtomicUsize::new(0),
+        });
+        let fixture = attach_objects(
+            Arc::new(MemoryEntityBackend::new(1000)),
+            EntityKeys::new(Uuid::new_v4(), Uuid::new_v4()),
+            1_000_000,
+            objects,
+            8,
+        )
+        .await;
+        let descriptor = ObjectDescriptor {
+            namespace_id: fixture.keys.namespace_id(),
+            slice_id: 1,
+            size: expected.len() as u64,
+            sha256: Sha256::digest(expected).into(),
+        };
+        assert!(matches!(
+            fixture.data.read_object(&descriptor).await,
+            Err(EntityError::Corrupt(_))
+        ));
+    }
 }
 
 #[tokio::test]

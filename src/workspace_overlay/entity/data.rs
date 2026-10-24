@@ -313,6 +313,7 @@ where
         // Enqueue on the shared FIFO lock before spawning; a following fsync
         // cannot overtake an already admitted write waiting on this inode.
         let guard = self.namespace.lock_inode(ino).await;
+        handle.mark_mutated();
         let this = self.clone();
         tokio::spawn(async move {
             let (_handle, _admission, _guard) = (handle, admission, guard);
@@ -828,19 +829,15 @@ where
 
     async fn read_object(&self, descriptor: &ObjectDescriptor) -> Result<Vec<u8>> {
         let key = self.namespace.keys.object(descriptor.slice_id);
-        let size = self
-            .objects
-            .get_object_size_bounded(&key)
-            .await
-            .map_err(|e| EntityError::Backend(format!("entity object HEAD failed: {e}")))?;
-        if size != Some(descriptor.size) {
-            return Err(EntityError::Corrupt(
-                "entity object size or presence mismatch".into(),
-            ));
-        }
+        // Probe one byte past the authenticated length: an exact-size range
+        // would hide an appended suffix. Short EOF is checked below as well.
+        let probe_size = descriptor
+            .size
+            .checked_add(1)
+            .ok_or(EntityError::Overflow)?;
         let mut stream = self
             .objects
-            .get_object_range_stream(&key, 0, descriptor.size)
+            .get_object_range_stream(&key, 0, probe_size)
             .await
             .map_err(|e| EntityError::Backend(format!("entity object GET failed: {e}")))?;
         let mut bytes = Vec::with_capacity(descriptor.size as usize);
@@ -880,6 +877,7 @@ where
         }
         let admission = self.namespace.session.admit()?;
         let guard = self.namespace.lock_inode(ino).await;
+        handle.mark_mutated();
         let this = self.clone();
         tokio::spawn(async move {
             let (_handle, _admission, _guard) = (handle, admission, guard);
@@ -951,11 +949,26 @@ where
     /// shrink, reports retained failures, and validates the configured metadata
     /// durability boundary. Redis persistence policy remains deployment policy.
     pub async fn fsync(self: &Arc<Self>, handle: Arc<EntityHandle>) -> Result<()> {
+        self.sync_handle(handle, false).await
+    }
+
+    /// A clean close still waits for preceding inode operations and reports
+    /// retained I/O failures. Only explicit fsync or a mutated handle needs
+    /// the metadata durability barrier. The mutation flag is never cleared.
+    pub async fn flush_release(self: &Arc<Self>, handle: Arc<EntityHandle>) -> Result<()> {
+        self.sync_handle(handle, true).await
+    }
+
+    async fn sync_handle(self: &Arc<Self>, handle: Arc<EntityHandle>, release: bool) -> Result<()> {
         let ino = self.namespace.validate_handle(&handle, 0)?;
         let admission = self.namespace.session.admit()?;
         let guard = self.namespace.lock_inode(ino).await;
         let this = self.clone();
         tokio::spawn(async move {
+            if release && !handle.needs_release_barrier() {
+                let (_handle, _admission, _guard) = (handle, admission, guard);
+                return this.check_failure(ino);
+            }
             let (_handle, _admission, _guard) = (handle, admission, guard);
             for _ in 0..MAX_RETRIES {
                 let (authority, mut rows) = this.settled_snapshot(ino, Vec::new()).await?;
