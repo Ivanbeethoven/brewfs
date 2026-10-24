@@ -193,14 +193,13 @@ struct PendingWrite {
     reply: tokio::sync::oneshot::Sender<Result<(), MetaError>>,
 }
 
-/// Concurrent data writes share one versioned commit. Exactly one leader at a
-/// time drains the queue under the mutation gate; everyone else waits for the
-/// leader's reply. A batch is one CAS on the same head version a single write
-/// uses, so conflict detection and row ordering are unchanged.
+/// Concurrent data writes share one versioned commit. The mutation gate holder
+/// commits one batch, then hands leadership to another waiting writer. A batch
+/// is one CAS on the same head version a single write uses, so conflict detection
+/// and row ordering are unchanged.
 #[derive(Default)]
 struct WriteQueue {
     pending: Vec<PendingWrite>,
-    leader: bool,
 }
 
 /// Each member of a failed batch gets the same failure. I/O errors keep their
@@ -770,29 +769,24 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         Ok(())
     }
 
-    /// Drain the write queue in batches until it is empty, then give up
-    /// leadership. Runs while the caller's own write is queued, so the
-    /// caller always ends up in one of these batches.
-    async fn lead_group_commits(&self) {
-        loop {
-            let mut batch = {
-                let mut queue = self.write_queue.lock().unwrap();
-                if queue.pending.is_empty() {
-                    queue.leader = false;
-                    return;
-                }
-                let take = queue.pending.len().min(MAX_GROUP_WRITES);
-                queue.pending.drain(..take).collect::<Vec<_>>()
-            };
-            let _mutation_guard = self.mutation_gate.lock().await;
-            let result = self.commit_write_batch(&mut batch).await;
-            drop(_mutation_guard);
-            for member in batch {
-                let _ = member.reply.send(match &result {
-                    Ok(()) => Ok(()),
-                    Err(error) => Err(duplicate_write_error(error)),
-                });
+    /// Commit one batch while owning the mutation gate. Send every reply before
+    /// releasing the gate so completed writers observe their receipts before
+    /// taking leadership again. The next gate waiter owns the next batch.
+    async fn commit_next_write_batch(&self, _mutation_guard: tokio::sync::MutexGuard<'_, ()>) {
+        let mut batch = {
+            let mut queue = self.write_queue.lock().unwrap();
+            if queue.pending.is_empty() {
+                return;
             }
+            let take = queue.pending.len().min(MAX_GROUP_WRITES);
+            queue.pending.drain(..take).collect::<Vec<_>>()
+        };
+        let result = self.commit_write_batch(&mut batch).await;
+        for member in batch {
+            let _ = member.reply.send(match &result {
+                Ok(()) => Ok(()),
+                Err(error) => Err(duplicate_write_error(error)),
+            });
         }
     }
 
@@ -3228,8 +3222,8 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
         new_size: u64,
     ) -> Result<(), MetaError> {
         Self::validate_write(ino, chunk_id, &slice, new_size, self.chunk_size)?;
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        let lead = {
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        {
             let mut queue = self.write_queue.lock().unwrap();
             queue.pending.push(PendingWrite {
                 ino,
@@ -3238,16 +3232,19 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                 new_size,
                 reply: sender,
             });
-            !std::mem::replace(&mut queue.leader, true)
-        };
-        if lead {
-            self.lead_group_commits().await;
         }
-        receiver.await.unwrap_or_else(|_| {
-            Err(MetaError::Internal(
-                "workspace group commit leader was dropped".into(),
-            ))
-        })
+        loop {
+            let guard = tokio::select! {
+                biased;
+                result = &mut receiver => return result.unwrap_or_else(|_| {
+                    Err(MetaError::Internal("workspace group commit was dropped".into()))
+                }),
+                guard = self.mutation_gate.lock() => guard,
+            };
+            // Only gate acquisition races the receipt: once a batch is taken,
+            // finish it before checking our result and handing off leadership.
+            self.commit_next_write_batch(guard).await;
+        }
     }
 
     async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError> {

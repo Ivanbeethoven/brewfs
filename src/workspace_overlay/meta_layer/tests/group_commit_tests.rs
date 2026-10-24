@@ -81,8 +81,7 @@ fn enqueue<B: WorkspaceKvBackend>(
     inodes: &[i64],
 ) -> Vec<tokio::sync::oneshot::Receiver<Result<(), MetaError>>> {
     let mut queue = f.meta.write_queue.lock().unwrap();
-    assert!(queue.pending.is_empty() && !queue.leader);
-    queue.leader = true;
+    assert!(queue.pending.is_empty());
     inodes
         .iter()
         .enumerate()
@@ -104,6 +103,151 @@ fn enqueue<B: WorkspaceKvBackend>(
             receiver
         })
         .collect()
+}
+
+#[tokio::test]
+async fn group_commit_leader_returns_before_later_commit_finishes() {
+    let f = fixture_with_cache(64 << 20).await;
+    let first_ino = f.meta.create_file(1, "first".into()).await.unwrap();
+    let second_ino = f.meta.create_file(1, "second".into()).await.unwrap();
+    let write = |ino, slice_id| {
+        let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+        f.meta.write(
+            ino,
+            chunk_id,
+            SliceDesc {
+                slice_id,
+                chunk_id,
+                offset: 0,
+                length: 64,
+            },
+            64,
+        )
+    };
+    let control = &f.control.group_commit;
+    control.track.store(true, Ordering::SeqCst);
+    control.pause_commit.store(true, Ordering::SeqCst);
+    let mut first = write(first_ino, 50_000);
+    let mut second = write(second_ino, 50_001);
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            result = &mut first => panic!("first commit must pause: {result:?}"),
+            permit = control.reached.acquire() => permit.unwrap().forget(),
+        }
+        // Enqueue B while A owns the first backend commit.
+        assert!(futures::poll!(&mut second).is_pending());
+        assert_eq!(f.meta.write_queue.lock().unwrap().pending.len(), 1);
+        control.pause_commit.store(true, Ordering::SeqCst);
+        control.resume.add_permits(1);
+
+        // B's backend commit stays blocked. A must return independently of
+        // it; the timeout bounds failure, while barriers enforce the schedule.
+        let (first_result, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(2), &mut first),
+            async {
+                tokio::select! {
+                    result = &mut second => panic!("second commit must pause: {result:?}"),
+                    permit = control.reached.acquire() => permit.unwrap().forget(),
+                }
+            }
+        );
+        let returned_before_second = first_result.is_ok();
+        control.resume.add_permits(1);
+        match first_result {
+            Ok(result) => result.unwrap(),
+            Err(_) => first.await.unwrap(),
+        }
+        second.await.unwrap();
+        assert!(
+            returned_before_second,
+            "committed leader must return while the later backend commit is blocked"
+        );
+    })
+    .await
+    .expect("group commit handoff must finish");
+
+    assert_eq!(control.commits.load(Ordering::SeqCst), 2);
+    for ino in [first_ino, second_ino] {
+        assert_eq!(f.meta.stat(ino).await.unwrap().unwrap().size, 64);
+    }
+    shutdown(&f).await;
+}
+
+#[tokio::test]
+async fn group_commit_handoff_preserves_batch_limit_and_order_with_cancelled_waiters() {
+    use crate::workspace_overlay::catalog::ExtentQuery;
+    use crate::workspace_overlay::model::ExtentKind;
+    use crate::workspace_overlay::resolver::{ResolvedExtent, resolve_extents};
+
+    let f = fixture_with_cache(64 << 20).await;
+    let ino = f.meta.create_file(1, "overlapping".into()).await.unwrap();
+    let chunk_id = crate::vfs::chunk_id_for(ino, 0).unwrap();
+    let control = &f.control.group_commit;
+    control.track.store(true, Ordering::SeqCst);
+    let guard = f.meta.mutation_gate.lock().await;
+    let count = 2 * MAX_GROUP_WRITES + 1;
+    let mut writes = (0..count)
+        .map(|index| {
+            f.meta.write(
+                ino,
+                chunk_id,
+                SliceDesc {
+                    slice_id: 50_000 + index as u64,
+                    chunk_id,
+                    offset: 0,
+                    length: 64,
+                },
+                64,
+            )
+        })
+        .collect::<Vec<_>>();
+    for write in &mut writes {
+        assert!(futures::poll!(write).is_pending());
+    }
+    // Cancel the first waiter for each of the first two batches. Their queued
+    // writes still commit, and live waiters must inherit the mutation gate.
+    drop(writes.remove(MAX_GROUP_WRITES));
+    drop(writes.remove(0));
+    drop(guard);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        futures::future::try_join_all(writes),
+    )
+    .await
+    .expect("cancelled gate waiters must not strand later writes")
+    .unwrap();
+
+    assert_eq!(control.commits.load(Ordering::SeqCst), 3);
+    assert!(f.meta.write_queue.lock().unwrap().pending.is_empty());
+    let inode = f.meta.resolve_inode_delta(ino).await.unwrap().unwrap();
+    assert_eq!((inode.size, inode.data_version), (64, count as u64 + 1));
+    let chain = f.meta.chain().await.unwrap();
+    let extents = f
+        .meta
+        .store
+        .get_extent_deltas(ExtentQuery {
+            layer_ids: chain.iter().map(|layer| layer.layer_id).collect(),
+            ino,
+            chunk_index: 0,
+            range_start: 0,
+            range_end: 64,
+        })
+        .await
+        .unwrap();
+    assert_eq!(extents.len(), count);
+    assert_eq!(
+        resolve_extents(&chain, &extents, ino, 0, 0..64).unwrap(),
+        vec![ResolvedExtent {
+            logical_offset: 0,
+            length: 64,
+            kind: ExtentKind::Data {
+                slice_id: 50_000 + count as u64 - 1,
+                slice_offset: 0,
+            },
+        }]
+    );
+    shutdown(&f).await;
 }
 
 #[tokio::test]
@@ -137,7 +281,9 @@ async fn group_commit_prefetches_cold_inodes_with_bounded_concurrency() {
         // batch must be just as concurrent as the initially cold batch.
         for round in 1..=2 {
             let replies = enqueue(&f, &inodes);
-            f.meta.lead_group_commits().await;
+            f.meta
+                .commit_next_write_batch(f.meta.mutation_gate.lock().await)
+                .await;
             for reply in replies {
                 reply.await.unwrap().unwrap();
             }
@@ -167,7 +313,9 @@ async fn group_commit_deduplicates_inodes_and_preserves_member_errors() {
     let control = &f.control.group_commit;
     control.track.store(true, Ordering::SeqCst);
     let replies = enqueue(&f, &[ino, missing, 1, ino, missing]);
-    f.meta.lead_group_commits().await;
+    f.meta
+        .commit_next_write_batch(f.meta.mutation_gate.lock().await)
+        .await;
     for (index, reply) in replies.into_iter().enumerate() {
         let result = reply.await.unwrap();
         match index {
@@ -217,7 +365,14 @@ async fn group_commit_refreshes_prefetched_inodes_after_head_conflict() {
         control.resume.add_permits(1);
     };
     tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::join!(f.meta.lead_group_commits(), conflict);
+        tokio::join!(
+            async {
+                f.meta
+                    .commit_next_write_batch(f.meta.mutation_gate.lock().await)
+                    .await;
+            },
+            conflict
+        );
     })
     .await
     .expect("conflicting group commit must finish");
