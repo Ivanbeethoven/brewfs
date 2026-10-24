@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "workspace-overlay")]
 #[path = "tests/close_failure.rs"]
 mod close_failure;
+#[cfg(feature = "native-packed-base")]
+mod native_setattr_tests;
 
 #[derive(Clone)]
 struct StressRng(u64);

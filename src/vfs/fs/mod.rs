@@ -4103,36 +4103,20 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn packed_owned_truncate_inode(&self, ino: i64, size: u64) -> Result<(), VfsError> {
         #[cfg(feature = "native-packed-base")]
-        if let Some(runtime) = self.native_runtime() {
-            let attr = self.meta_stat_required(ino, PathHint::none()).await?;
-            if attr.kind != FileType::File {
-                return Err(if attr.kind == FileType::Dir {
-                    VfsError::IsADirectory {
-                        path: PathHint::none(),
-                    }
-                } else {
-                    VfsError::InvalidInput
-                });
-            }
-            runtime
-                .truncate(ino as u64, size)
+        if self.native_runtime().is_some() {
+            return self
+                .packed_owned_set_attr_inner(
+                    ino,
+                    &SetAttrRequest {
+                        size: Some(size),
+                        ..Default::default()
+                    },
+                    SetAttrFlags::empty(),
+                    true,
+                    None,
+                )
                 .await
-                .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?;
-            self.meta_truncate(ino, size, self.core.layout.chunk_size)
-                .await?;
-            self.state.reader.invalidate_all(ino as u64).await;
-            let inode = self
-                .lock_inode(ino)
-                .or_insert_with(|| Inode::new(ino, size));
-            inode.set_size(size);
-            inode.invalidate_allocated_blocks();
-            inode.bump_data_epoch();
-            if let Some(mut attr) = self.state.handles.attr_for_inode(ino) {
-                attr.size = size;
-                self.state.handles.update_attr_for_inode(ino, &attr);
-            }
-            self.notify_kernel_invalidate_inode_all(ino);
-            return Ok(());
+                .map(|_| ());
         }
 
         // Flush dirty data BEFORE acquiring mutation_lock so that we do not hold the
@@ -4757,6 +4741,26 @@ where
             self.flush_before_truncate(ino, size, "set_attr_truncate_locked")
                 .await?;
 
+            #[cfg(feature = "native-packed-base")]
+            if let Some(runtime) = self.native_runtime() {
+                let attr = self.meta_stat_required(ino, PathHint::none()).await?;
+                if attr.kind != FileType::File {
+                    return Err(if attr.kind == FileType::Dir {
+                        VfsError::IsADirectory {
+                            path: PathHint::none(),
+                        }
+                    } else {
+                        VfsError::InvalidInput
+                    });
+                }
+                // Capture the baseline before changing namespace size. Defer
+                // the data mutation until metadata has authorized the request.
+                runtime
+                    .size(ino as u64)
+                    .await
+                    .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?;
+            }
+
             if !atomic_permissions {
                 self.meta_truncate(ino, size, self.core.layout.chunk_size)
                     .await?;
@@ -4794,6 +4798,25 @@ where
         } else {
             self.meta_set_attr(ino, &filtered, flags).await?
         };
+
+        #[cfg(feature = "native-packed-base")]
+        if let Some(size) = req.size
+            && let Some(runtime) = self.native_runtime()
+        {
+            // Keep the same inode mutation lock through namespace permission
+            // checks and native admission so writes cannot split the truncate.
+            runtime
+                .truncate(ino as u64, size)
+                .await
+                .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?;
+            // The runtime commits pending control mutations as a final size.
+            // Drain this truncate before a later extension can coalesce away
+            // the shrink and leave the old extents visible after fsync.
+            runtime
+                .fsync(ino as u64)
+                .await
+                .map_err(|error| VfsError::Anyhow(anyhow::anyhow!(error.to_string())))?;
+        }
 
         // Ensure the returned attr carries exactly the requested truncation size.
         // The kernel trusts this value for truncate_pagecache decisions; a stale
@@ -5385,6 +5408,7 @@ where
 
         #[cfg(feature = "native-packed-base")]
         if let Some(runtime) = self.native_runtime() {
+            let _mutation_guard = self.state.append_lock(handle.ino).lock_owned().await;
             self.ensure_inode_registered(handle.ino).await?;
             let write_offset = if handle.flags.append {
                 runtime
@@ -5645,6 +5669,7 @@ where
 
         #[cfg(feature = "native-packed-base")]
         if let Some(runtime) = self.native_runtime() {
+            let _mutation_guard = self.state.append_lock(ino).lock_owned().await;
             let attr = self.meta_stat_required(ino, PathHint::none()).await?;
             if attr.kind == FileType::Dir {
                 return Err(VfsError::IsADirectory {
@@ -5777,6 +5802,7 @@ where
 
         #[cfg(feature = "native-packed-base")]
         if let Some(runtime) = self.native_runtime() {
+            let _mutation_guard = self.state.append_lock(ino).lock_owned().await;
             let receipt = runtime
                 .write(ino as u64, offset, data)
                 .await
