@@ -736,17 +736,87 @@ pub struct BrewFSWorkspaceSnapshotStatus {
     version = "v1alpha1",
     kind = "BrewFSWorkspaceFork",
     plural = "brewfsworkspaceforks",
+    schema = "manual",
     namespaced,
     status = "BrewFSWorkspaceForkStatus",
     shortname = "bfwsf"
 )]
 #[serde(rename_all = "camelCase")]
 pub struct BrewFSWorkspaceForkSpec {
+    #[schemars(schema_with = "fork_name_ref_schema")]
     pub cluster_ref: NamespacedNameRef,
+    #[schemars(schema_with = "fork_name_ref_schema")]
     pub source_workspace_ref: NamespacedNameRef,
-    /// Name of the child BrewFSWorkspace and StorageClass. Keeping this
-    /// explicit lets AX use the same identity for all three resources.
+    /// Name of the child BrewFSWorkspace; also used in the StorageClass prefix.
+    #[schemars(length(min = 1, max = 63))]
     pub workspace_name: String,
+}
+
+fn fork_name_ref_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+    serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "required": ["name"],
+        "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 253 } }
+    }))
+    .expect("static fork reference schema")
+}
+
+impl JsonSchema for BrewFSWorkspaceFork {
+    fn schema_name() -> String {
+        "BrewFSWorkspaceFork".into()
+    }
+
+    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        // Root transition rules also cover removal of the entire status object.
+        // A field-local oldSelf rule alone can be bypassed by removing an optional field.
+        let mut rules = vec![serde_json::json!({
+            "rule": "self.spec == oldSelf.spec",
+            "message": "fork clusterRef, sourceWorkspaceRef and workspaceName are immutable"
+        })];
+        for field in ["identity", "workspaceId", "snapshotId", "storageClassName"] {
+            rules.push(serde_json::json!({
+                "rule": format!("!has(oldSelf.status) || !has(oldSelf.status.{field}) || (has(self.status) && has(self.status.{field}) && self.status.{field} == oldSelf.status.{field})"),
+                "message": format!("fork status.{field} cannot be changed or removed once recorded")
+            }));
+        }
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "required": ["spec"],
+            "properties": {
+                "spec": gen.subschema_for::<BrewFSWorkspaceForkSpec>(),
+                "status": gen.subschema_for::<BrewFSWorkspaceForkStatus>()
+            },
+            "x-kubernetes-validations": rules
+        }))
+        .expect("fork structural schema")
+    }
+}
+
+/// Written before adding the finalizer or creating any dependent resource.
+/// Cleanup uses this record even if an older API server admitted a spec edit.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrewFSWorkspaceForkIdentity {
+    #[schemars(length(min = 1, max = 253))]
+    pub namespace: String,
+    #[schemars(length(min = 1, max = 253))]
+    pub fork_name: String,
+    #[schemars(length(min = 1, max = 253))]
+    pub fork_uid: String,
+    #[schemars(length(min = 1, max = 253))]
+    pub cluster_name: String,
+    #[schemars(length(min = 1, max = 253))]
+    pub source_workspace_name: String,
+    #[schemars(length(min = 1, max = 253))]
+    pub source_workspace_uid: String,
+    #[schemars(length(min = 1, max = 253))]
+    pub source_workspace_id: String,
+    #[schemars(length(min = 1, max = 63))]
+    pub workspace_name: String,
+    #[schemars(length(min = 1, max = 253))]
+    pub snapshot_name: String,
+    #[schemars(length(min = 1, max = 63))]
+    pub storage_class_name: String,
 }
 
 impl BrewFSWorkspaceForkSpec {
@@ -782,10 +852,15 @@ pub struct BrewFSWorkspaceForkStatus {
     pub phase: String,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<BrewFSWorkspaceForkIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 253))]
     pub workspace_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 63))]
     pub storage_class_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 253))]
     pub snapshot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<WorkspaceCondition>,

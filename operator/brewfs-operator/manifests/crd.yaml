@@ -3160,13 +3160,14 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Auto-generated derived type for BrewFSWorkspaceForkSpec via `CustomResource`
         properties:
           spec:
             properties:
               clusterRef:
                 properties:
                   name:
+                    maxLength: 253
+                    minLength: 1
                     type: string
                 required:
                 - name
@@ -3174,12 +3175,16 @@ spec:
               sourceWorkspaceRef:
                 properties:
                   name:
+                    maxLength: 253
+                    minLength: 1
                     type: string
                 required:
                 - name
                 type: object
               workspaceName:
-                description: Name of the child BrewFSWorkspace and StorageClass. Keeping this explicit lets AX use the same identity for all three resources.
+                description: Name of the child BrewFSWorkspace; also used in the StorageClass prefix.
+                maxLength: 63
+                minLength: 1
                 type: string
             required:
             - clusterRef
@@ -3187,7 +3192,6 @@ spec:
             - workspaceName
             type: object
           status:
-            nullable: true
             properties:
               conditions:
                 items:
@@ -3215,6 +3219,62 @@ spec:
                   - type
                   type: object
                 type: array
+              identity:
+                description: Written before adding the finalizer or creating any dependent resource. Cleanup uses this record even if an older API server admitted a spec edit.
+                nullable: true
+                properties:
+                  clusterName:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  forkName:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  forkUid:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  namespace:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  snapshotName:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  sourceWorkspaceId:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  sourceWorkspaceName:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  sourceWorkspaceUid:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  storageClassName:
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  workspaceName:
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                required:
+                - clusterName
+                - forkName
+                - forkUid
+                - namespace
+                - snapshotName
+                - sourceWorkspaceId
+                - sourceWorkspaceName
+                - sourceWorkspaceUid
+                - storageClassName
+                - workspaceName
+                type: object
               message:
                 type: string
               observedGeneration:
@@ -3224,12 +3284,18 @@ spec:
               phase:
                 type: string
               snapshotId:
+                maxLength: 253
+                minLength: 1
                 nullable: true
                 type: string
               storageClassName:
+                maxLength: 63
+                minLength: 1
                 nullable: true
                 type: string
               workspaceId:
+                maxLength: 253
+                minLength: 1
                 nullable: true
                 type: string
             required:
@@ -3240,6 +3306,17 @@ spec:
         - spec
         title: BrewFSWorkspaceFork
         type: object
+        x-kubernetes-validations:
+        - message: fork clusterRef, sourceWorkspaceRef and workspaceName are immutable
+          rule: self.spec == oldSelf.spec
+        - message: fork status.identity cannot be changed or removed once recorded
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.identity) || (has(self.status) && has(self.status.identity) && self.status.identity == oldSelf.status.identity)'
+        - message: fork status.workspaceId cannot be changed or removed once recorded
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.workspaceId) || (has(self.status) && has(self.status.workspaceId) && self.status.workspaceId == oldSelf.status.workspaceId)'
+        - message: fork status.snapshotId cannot be changed or removed once recorded
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.snapshotId) || (has(self.status) && has(self.status.snapshotId) && self.status.snapshotId == oldSelf.status.snapshotId)'
+        - message: fork status.storageClassName cannot be changed or removed once recorded
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.storageClassName) || (has(self.status) && has(self.status.storageClassName) && self.status.storageClassName == oldSelf.status.storageClassName)'
     served: true
     storage: true
     subresources:
