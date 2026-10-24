@@ -281,7 +281,7 @@ where
     pub async fn attr(self: &Arc<Self>, handle: Arc<EntityHandle>) -> Result<EntityInode> {
         let ino = self.namespace.validate_handle(&handle, 0)?;
         let _admission = self.namespace.session.admit()?;
-        let _guard = self.namespace.lock_inode(ino).await;
+        let _guard = self.namespace.read_lock_inode(ino).await;
         for _ in 0..MAX_RETRIES {
             let result = async {
                 let (_, mut rows) = self.snapshot(ino, Vec::new()).await?;
@@ -649,7 +649,7 @@ where
         let ino = self.namespace.validate_handle(&handle, 4)?;
         self.check_range(offset, length)?;
         let admission = self.namespace.session.admit()?;
-        let guard = self.namespace.lock_inode(ino).await;
+        let guard = self.namespace.read_lock_inode(ino).await;
         let this = self.clone();
         tokio::spawn(async move {
             let (_handle, _admission, _guard) = (handle, admission, guard);
