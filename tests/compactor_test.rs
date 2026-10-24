@@ -8,13 +8,13 @@ mod compaction_reply;
 
 mod tests {
     use brewfs::DatabaseMetaStore;
-    use brewfs::chunk::store::BlockStore;
+    use brewfs::chunk::store::{BlockKey, BlockStore};
     use brewfs::chunk::{
         ChunkLayout, CompactResult, Compactor, slice::SliceDesc, store::InMemoryBlockStore,
     };
     use brewfs::meta::store::MetaStore;
     use brewfs::{Config, DatabaseConfig, DatabaseType};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -207,6 +207,166 @@ mod tests {
         meta_store.initialize().await.unwrap();
 
         (tmp_dir, meta_store, block_store)
+    }
+
+    struct RecordingBlocks {
+        inner: Arc<InMemoryBlockStore>,
+        writes: Mutex<Vec<(BlockKey, usize)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlockStore for RecordingBlocks {
+        async fn write_fresh_range(
+            &self,
+            key: BlockKey,
+            offset: u64,
+            data: &[u8],
+        ) -> anyhow::Result<u64> {
+            self.writes.lock().unwrap().push((key, data.len()));
+            self.inner.write_fresh_range(key, offset, data).await
+        }
+
+        async fn read_range(
+            &self,
+            key: BlockKey,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> anyhow::Result<()> {
+            self.inner.read_range(key, offset, buf).await
+        }
+
+        async fn delete_range(&self, key: BlockKey, count: u64) -> anyhow::Result<()> {
+            self.inner.delete_range(key, count).await
+        }
+    }
+
+    #[tokio::test]
+    async fn heavy_compaction_uploads_only_the_occupied_prefix() {
+        let (_tmp, meta, blocks) = setup_test_env().await;
+        let file = meta
+            .create_file(meta.root_ino(), "short-fragmented".into())
+            .await
+            .unwrap();
+        let chunk = brewfs::vfs::chunk_id_for(file, 0).unwrap();
+        let mut expected = vec![0; 8192];
+        for (i, offset) in [0, 2048, 4096].into_iter().enumerate() {
+            let slice_id = meta.next_id(brewfs::meta::SLICE_ID_KEY).await.unwrap() as u64;
+            let data = vec![b'a' + i as u8; 4096];
+            blocks
+                .write_fresh_range((slice_id, 0), 0, &data)
+                .await
+                .unwrap();
+            meta.write(
+                file,
+                chunk,
+                SliceDesc {
+                    slice_id,
+                    chunk_id: chunk,
+                    offset,
+                    length: 4096,
+                },
+                offset + 4096,
+            )
+            .await
+            .unwrap();
+            expected[offset as usize..offset as usize + 4096].copy_from_slice(&data);
+        }
+        let recording = Arc::new(RecordingBlocks {
+            inner: blocks.clone(),
+            writes: Mutex::default(),
+        });
+        let compactor = Compactor::new(meta.clone(), recording.clone());
+        assert_eq!(
+            compactor.should_compact(chunk).await.unwrap(),
+            (true, false)
+        );
+        let CompactResult::Heavy { new_slice_id } =
+            compactor.compact_sequential(chunk).await.unwrap()
+        else {
+            panic!("three partially overlapping slices must trigger heavy compaction");
+        };
+        let writes = recording.writes.lock().unwrap().clone();
+        assert_eq!(
+            writes,
+            vec![((new_slice_id, 0), 8192)],
+            "unused chunk tail must not be uploaded"
+        );
+        assert_eq!(
+            meta.get_slices(chunk).await.unwrap(),
+            vec![SliceDesc {
+                slice_id: new_slice_id,
+                chunk_id: chunk,
+                offset: 0,
+                length: 8192,
+            }]
+        );
+        let mut actual = vec![0; expected.len()];
+        blocks
+            .read_range((new_slice_id, 0), 0, &mut actual)
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert!(
+            blocks
+                .read_range((new_slice_id, 0), 8192, &mut [0])
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn heavy_compaction_preserves_holes_and_rejects_invalid_bounds() {
+        let (_tmp, meta, blocks) = setup_test_env().await;
+        let file = meta
+            .create_file(meta.root_ino(), "sparse-fragmented".into())
+            .await
+            .unwrap();
+        let chunk = brewfs::vfs::chunk_id_for(file, 0).unwrap();
+        let slice_id = meta.next_id(brewfs::meta::SLICE_ID_KEY).await.unwrap() as u64;
+        blocks
+            .write_fresh_range((slice_id, 0), 0, b"end")
+            .await
+            .unwrap();
+        meta.write(
+            file,
+            chunk,
+            SliceDesc {
+                slice_id,
+                chunk_id: chunk,
+                offset: 4096,
+                length: 3,
+            },
+            4099,
+        )
+        .await
+        .unwrap();
+        let compactor = Compactor::new(meta.clone(), blocks.clone());
+        let new_id = compactor.compact_heavy(chunk).await.unwrap();
+        let mut actual = vec![0; 4099];
+        blocks
+            .read_range((new_id, 0), 0, &mut actual)
+            .await
+            .unwrap();
+        assert!(actual[..4096].iter().all(|byte| *byte == 0));
+        assert_eq!(&actual[4096..], b"end");
+        assert_eq!(meta.get_slices(chunk).await.unwrap()[0].length, 4099);
+
+        let invalid_chunk = chunk + 1;
+        meta.append_slice(
+            invalid_chunk,
+            SliceDesc {
+                slice_id: 9999,
+                chunk_id: invalid_chunk,
+                offset: ChunkLayout::default().chunk_size,
+                length: 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            compactor.compact_heavy(invalid_chunk).await,
+            Err(brewfs::chunk::CompactorError::InvalidData(_))
+        ));
     }
 
     #[tokio::test]
