@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,7 +18,7 @@ use parking_lot::Mutex as ParkingMutex;
 use sea_orm::sea_query::WindowSelectType;
 use sha2::{Digest, Sha256, digest::KeyInit};
 use tokio::fs;
-use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, trace, warn};
 
 static DISK_CACHE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1718,15 +1718,16 @@ impl SystemMetrics {
 ///
 /// # Thread Safety
 ///
-/// This struct uses `Arc<RwLock<>>` for access stats and `Arc<>` for system metrics,
-/// allowing safe concurrent access from multiple threads while maintaining consistency.
+/// The bounded cache shares atomic access counters and system metrics safely
+/// across threads without a global statistics-map lock.
 #[derive(Debug, Clone)]
 struct Policy {
     /// Per-key access statistics with dual time window analysis
     ///
     /// Stores `AccessStats` for each cache key, tracking both short-term burst
-    /// patterns and medium-term trends. Protected by RwLock for safe concurrent access.
-    access_stats: Arc<RwLock<HashMap<String, AccessStats>>>,
+    /// patterns and medium-term trends. Capacity follows the cold marker budget;
+    /// idle histories expire after the longest observation window.
+    access_stats: moka::sync::Cache<String, Arc<AccessStats>>,
 
     /// Global system performance metrics
     ///
@@ -1763,11 +1764,18 @@ struct Policy {
 }
 
 impl Policy {
+    #[cfg(test)]
+    async fn tracked_key_count(&self) -> u64 {
+        self.access_stats.run_pending_tasks();
+        self.access_stats.entry_count()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         short_window_size: Duration,
         medium_window_size: Duration,
         max_entries: usize,
+        max_tracked_keys: usize,
         base_promotion_threshold: f64,
         short_window_weight: f64,
         medium_window_weight: f64,
@@ -1784,7 +1792,10 @@ impl Policy {
         );
 
         Policy {
-            access_stats: Arc::new(RwLock::new(HashMap::new())),
+            access_stats: moka::sync::Cache::builder()
+                .max_capacity(max_tracked_keys as u64)
+                .time_to_idle(short_window_size.max(medium_window_size))
+                .build(),
             system_metrics: Arc::new(SystemMetrics::new()),
             short_window_size,
             medium_window_size,
@@ -1859,35 +1870,14 @@ impl Policy {
 
     async fn record_access(&self, key: String) {
         trace!("Recording access for key: {}", key);
-
-        // Use read lock to get or create AccessStats
-        {
-            let stats = self.access_stats.read().await;
-            if let Some(entry) = stats.get(&key) {
-                // If exists, directly record access (no need for write lock)
-                trace!("Found existing access stats for key: {}", key);
-                entry.record_access();
-                return;
-            }
-        }
-
-        // If not exists, get write lock to create
-        trace!("Creating new access stats for key: {}", key);
-        let mut stats = self.access_stats.write().await;
-        // Double check, prevent other threads from creating in the meantime
-        if let Some(entry) = stats.get(&key) {
-            trace!("Access stats created by another thread for key: {}", key);
-            entry.record_access();
-        } else {
-            debug!("Creating new AccessStats entry for key: {}", key);
-            let entry = AccessStats::new(
+        let entry = self.access_stats.get_with(key, || {
+            Arc::new(AccessStats::new(
                 self.short_window_size,
                 self.medium_window_size,
                 self.max_entries,
-            );
-            entry.record_access();
-            stats.insert(key, entry);
-        }
+            ))
+        });
+        entry.record_access();
     }
 
     async fn should_promote(&self, key: String) -> bool {
@@ -1898,9 +1888,7 @@ impl Policy {
             key, threshold
         );
 
-        // Use read lock to check promotion conditions, reduce lock contention
-        let stats = self.access_stats.read().await;
-        if let Some(entry) = stats.get(&key) {
+        if let Some(entry) = self.access_stats.get(&key) {
             // Use weighted frequency from both time windows
             let weighted_frequency = entry
                 .get_weighted_access_frequency(self.short_window_weight, self.medium_window_weight);
@@ -1939,21 +1927,6 @@ impl Policy {
         );
         self.system_metrics
             .update_cache_utilization(current_size, max_size);
-    }
-
-    /// Clean up old entries
-    async fn cleanup_old_entries(&self, max_idle_duration: Duration) {
-        let mut stats = self.access_stats.write().await;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        stats.retain(|_, entry| {
-            let last_update = entry.last_update.load(Ordering::Relaxed);
-            let idle_duration = now.saturating_sub(last_update);
-            idle_duration < max_idle_duration.as_secs()
-        });
     }
 }
 
@@ -2171,6 +2144,7 @@ impl ChunksCache {
             config.short_window_size,
             config.medium_window_size,
             config.max_access_entries,
+            config.cold_cache_size,
             config.base_promotion_threshold,
             config.short_window_weight,
             config.medium_window_weight,
@@ -2678,6 +2652,7 @@ impl ChunksCache {
         self.hot_cache.invalidate(key).await;
         trace!("Invalidating from cold cache: {}", key);
         self.cold_cache.invalidate(key).await;
+        self.policy.access_stats.invalidate(key);
         self.disk_storage.remove_file_locked(key, true).await?;
 
         debug!("Successfully removed key: {}", key);
@@ -4132,6 +4107,7 @@ mod tests {
             short_window_size,
             medium_window_size,
             max_entries,
+            128, // max_tracked_keys
             base_promotion_threshold,
             0.7,  // short_window_weight
             0.3,  // medium_window_weight
@@ -4169,6 +4145,69 @@ mod tests {
         } else {
             println!("Key not promoted - this is normal for low frequency access");
         }
+    }
+
+    #[tokio::test]
+    async fn policy_statistics_are_bounded_under_disk_cache_churn() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ChunksCache::new_with_config(ChunksCacheConfig {
+            max_hot_bytes: 0,
+            max_disk_bytes: 4096,
+            cold_cache_size: 16,
+            disk_storage_dir: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        for i in 0..256 {
+            let key = format!("churn-{i}");
+            cache.insert(&key, &vec![7; 32]).await.unwrap();
+            assert_eq!(cache.get(&key).await.unwrap().as_ref(), &[7; 32]);
+        }
+        assert!(
+            cache.policy.tracked_key_count().await <= 16,
+            "promotion history must be bounded even when disk eviction removes old payloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_cache_remove_reclaims_promotion_statistics() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ChunksCache::new_with_config(ChunksCacheConfig {
+            max_hot_bytes: 0,
+            max_disk_bytes: 4096,
+            disk_storage_dir: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        for i in 0..128 {
+            let key = format!("removed-{i}");
+            cache.insert(&key, &vec![7; 32]).await.unwrap();
+            assert!(cache.get(&key).await.is_some());
+            cache.remove(&key).await.unwrap();
+        }
+        assert_eq!(cache.policy.tracked_key_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn idle_promotion_statistics_expire_without_payload_activity() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ChunksCache::new_with_config(ChunksCacheConfig {
+            max_hot_bytes: 0,
+            max_disk_bytes: 4096,
+            cold_cache_size: 16,
+            short_window_size: Duration::from_secs(1),
+            medium_window_size: Duration::from_secs(1),
+            disk_storage_dir: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        cache.policy.record_access("idle".into()).await;
+        assert_eq!(cache.policy.tracked_key_count().await, 1);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(cache.policy.tracked_key_count().await, 0);
     }
 
     #[test]
@@ -4214,6 +4253,7 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(60),
             100,
+            128,
             5.0,
             0.75,
             0.25,
