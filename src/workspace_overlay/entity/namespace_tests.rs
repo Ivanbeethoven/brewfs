@@ -1272,6 +1272,19 @@ impl EntityBackend for PausingBackend {
         self.after_read(keys).await;
         Ok(snapshot)
     }
+    async fn read_checked(
+        &self,
+        keys: &[Vec<u8>],
+        checks: &[RowCheck],
+    ) -> Result<(RowSnapshot, bool)> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.read_batches.lock().unwrap().push(keys.to_vec());
+        let result = self.inner.read_checked(keys, checks).await?;
+        let mut observed = keys.to_vec();
+        observed.extend(checks.iter().map(|check| check.key.clone()));
+        self.after_read(&observed).await;
+        Ok(result)
+    }
     async fn commit(
         &self,
         authority: &TransactionAuthority,

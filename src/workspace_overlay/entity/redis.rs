@@ -8,8 +8,9 @@ use super::{
     EntityError, Result,
     backend::{
         CommitOutcome, CreateAllocation, EntityBackend, EntityPlan, MAX_KEY_BYTES,
-        MAX_TRANSACTION_BYTES, RowSnapshot, RowWrite, SliceAllocation, TransactionAuthority,
-        prepare_create, prepare_slices, validate_key, validate_keys, validate_plan, validate_scan,
+        MAX_TRANSACTION_BYTES, RowCheck, RowSnapshot, RowWrite, SliceAllocation,
+        TransactionAuthority, prepare_create, prepare_slices, validate_checked_read, validate_key,
+        validate_plan, validate_scan,
     },
     codec::MAX_ROW_BYTES,
     keys::EntityKeys,
@@ -32,8 +33,20 @@ for _, key in ipairs(KEYS) do
     end
 end
 local rows = {}
-for i, key in ipairs(KEYS) do rows[i] = redis.call('GET', key) end
-return {redis.call('TIME'), rows}
+local read_count, matched = #KEYS - tonumber(ARGV[4]), 1
+for i, key in ipairs(KEYS) do
+    local current = redis.call('GET', key)
+    if i <= read_count then
+        rows[i] = current
+    else
+        local cursor = 5 + 2 * (i - read_count - 1)
+        local present, expected = ARGV[cursor], ARGV[cursor + 1]
+        if (present == '0' and current) or (present == '1' and current ~= expected) then
+            matched = 0
+        end
+    end
+end
+return {redis.call('TIME'), rows, matched}
 "#;
 
 // The first five args carry small counts and a split lease deadline. Full IDs
@@ -554,20 +567,36 @@ fn backend_error(error: redis::RedisError) -> EntityError {
 #[async_trait]
 impl EntityBackend for RedisEntityBackend {
     async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot> {
-        validate_keys(keys)?;
-        for key in keys {
+        self.read_checked(keys, &[])
+            .await
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    async fn read_checked(
+        &self,
+        keys: &[Vec<u8>],
+        checks: &[RowCheck],
+    ) -> Result<(RowSnapshot, bool)> {
+        validate_checked_read(keys, checks)?;
+        for key in keys.iter().chain(checks.iter().map(|check| &check.key)) {
             self.validate_scope(key)?;
         }
         let script = redis::Script::new(READ_LUA);
         let mut invocation = script.prepare_invoke();
-        for key in keys {
+        for key in keys.iter().chain(checks.iter().map(|check| &check.key)) {
             invocation.key(key);
         }
         invocation
             .arg(MAX_KEY_BYTES)
             .arg(MAX_ROW_BYTES)
-            .arg(MAX_TRANSACTION_BYTES);
-        let (time, rows): ((i64, i64), Vec<Option<Vec<u8>>>) = invocation
+            .arg(MAX_TRANSACTION_BYTES)
+            .arg(checks.len());
+        for check in checks {
+            invocation
+                .arg(u8::from(check.expected.is_some()))
+                .arg(check.expected.as_deref().unwrap_or_default());
+        }
+        let (time, rows, matched): ((i64, i64), Vec<Option<Vec<u8>>>, bool) = invocation
             .invoke_async(&mut self.connection.clone())
             .await
             .map_err(backend_error)?;
@@ -581,7 +610,7 @@ impl EntityBackend for RedisEntityBackend {
             .checked_mul(1_000_000_000)
             .and_then(|value| value.checked_add(time.1 * 1000))
             .ok_or(EntityError::Overflow)?;
-        Ok(RowSnapshot { now_ns, rows })
+        Ok((RowSnapshot { now_ns, rows }, matched))
     }
 
     async fn commit(

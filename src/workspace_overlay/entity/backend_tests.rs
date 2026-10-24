@@ -112,6 +112,42 @@ async fn conformance<B: EntityBackend + 'static>(backend: Arc<B>, keys: EntityKe
             .rows,
         vec![Some(vec![]), None]
     );
+    // Checked rows are exact predicates, including empty values and absence.
+    // They are not returned as part of the extension, even on a mismatch.
+    for (expected_empty, expected_absent, matched) in [
+        (Some(b"".as_slice()), None, true),
+        (None, None, false),
+        (Some(b"".as_slice()), Some(b"".as_slice()), false),
+        (Some(b"changed".as_slice()), None, false),
+    ] {
+        let checks = [
+            check(empty_key.clone(), expected_empty),
+            check(other_key.clone(), expected_absent),
+        ];
+        let (snapshot, actual) = backend
+            .read_checked(&[keys.descriptor()], &checks)
+            .await
+            .unwrap();
+        assert_eq!(actual, matched);
+        assert_eq!(snapshot.rows, vec![Some(b"active".to_vec())]);
+        assert!(snapshot.now_ns >= 0);
+        let (snapshot, actual) = backend.read_checked(&[], &checks).await.unwrap();
+        assert_eq!(actual, matched);
+        assert!(snapshot.rows.is_empty());
+    }
+    for checks in [
+        vec![check(foreign, None)],
+        vec![check(empty_key.clone(), None); MAX_TRANSACTION_ROWS],
+        vec![RowCheck {
+            key: empty_key.clone(),
+            expected: Some(vec![0; MAX_ROW_BYTES + 1]),
+        }],
+    ] {
+        assert!(matches!(
+            backend.read_checked(&[keys.descriptor()], &checks).await,
+            Err(EntityError::Invalid(_))
+        ));
+    }
     assert_eq!(
         backend
             .commit(

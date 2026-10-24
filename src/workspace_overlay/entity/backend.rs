@@ -131,6 +131,29 @@ impl TransactionAuthority {
 #[async_trait]
 pub trait EntityBackend: Send + Sync {
     async fn read(&self, keys: &[Vec<u8>]) -> Result<RowSnapshot>;
+    /// Read new rows and compare earlier observations in the same atomic view.
+    /// Only `keys` are returned; the boolean reports whether every check matched,
+    /// including absence. A mismatch must not replace the caller's observations.
+    /// Backends may override this fallback to avoid returning checked rows.
+    async fn read_checked(
+        &self,
+        keys: &[Vec<u8>],
+        checks: &[RowCheck],
+    ) -> Result<(RowSnapshot, bool)> {
+        validate_checked_read(keys, checks)?;
+        let mut combined = keys.to_vec();
+        combined.extend(checks.iter().map(|check| check.key.clone()));
+        let mut snapshot = self.read(&combined).await?;
+        if snapshot.rows.len() != combined.len() {
+            return Err(EntityError::Corrupt("short checked read".into()));
+        }
+        let observed = snapshot.rows.split_off(keys.len());
+        let matched = checks
+            .iter()
+            .zip(observed)
+            .all(|(check, value)| check.expected == value);
+        Ok((snapshot, matched))
+    }
     /// Exact authority-row changes (including heartbeat renewal) are conflicts.
     /// The caller must obtain fresh lifecycle authority before retrying. Backend
     /// time at or past the deadline is fenced, never silently extended.
@@ -217,16 +240,23 @@ pub(super) fn add_bytes(total: &mut usize, key: &[u8], value: Option<&[u8]>) -> 
     Ok(())
 }
 
-pub(super) fn validate_keys(keys: &[Vec<u8>]) -> Result<()> {
-    if keys.len() > MAX_TRANSACTION_ROWS {
+pub(super) fn validate_checked_read(keys: &[Vec<u8>], checks: &[RowCheck]) -> Result<()> {
+    if keys.len().saturating_add(checks.len()) > MAX_TRANSACTION_ROWS {
         return Err(EntityError::Invalid(
             "entity transaction exceeds row bound".into(),
         ));
     }
-    validate_same_volume(keys.iter().map(Vec::as_slice))?;
+    validate_same_volume(
+        keys.iter()
+            .map(Vec::as_slice)
+            .chain(checks.iter().map(|check| check.key.as_slice())),
+    )?;
     let mut total = 0;
     for key in keys {
         add_bytes(&mut total, key, None)?;
+    }
+    for check in checks {
+        add_bytes(&mut total, &check.key, check.expected.as_deref())?;
     }
     Ok(())
 }
