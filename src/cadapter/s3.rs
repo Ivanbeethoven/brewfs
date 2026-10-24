@@ -823,6 +823,7 @@ impl S3Backend {
             bucket: self.config.bucket.clone(),
             key: key.to_string(),
             upload_id: upload_id.clone(),
+            armed: true,
         };
 
         let data_arc = Arc::new(data.to_vec());
@@ -926,7 +927,7 @@ impl S3Backend {
             .await?;
 
         // Disarm cleanup guard since upload succeeded
-        std::mem::forget(cleanup_on_drop);
+        cleanup_on_drop.disarm();
 
         Ok(())
     }
@@ -955,6 +956,7 @@ impl S3Backend {
             bucket: self.config.bucket.clone(),
             key: key.to_string(),
             upload_id: upload_id.clone(),
+            armed: true,
         };
 
         let mut parts: Vec<Vec<Bytes>> = Vec::new();
@@ -1073,7 +1075,7 @@ impl S3Backend {
             .send()
             .await?;
 
-        std::mem::forget(cleanup_on_drop);
+        cleanup_on_drop.disarm();
         Ok(())
     }
 }
@@ -1084,10 +1086,21 @@ struct MultipartCleanupGuard {
     bucket: String,
     key: String,
     upload_id: String,
+    armed: bool,
+}
+
+impl MultipartCleanupGuard {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for MultipartCleanupGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key = self.key.clone();
@@ -1403,7 +1416,8 @@ mod tests {
     use crate::cadapter::client::ObjectClient;
     use crate::cadapter::read_observer::{Engine, Ledger, Origin, Phase, ReadClass, ReadObserver};
     use aws_smithy_runtime_api::client::http::{
-        HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector,
+        HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpClient,
+        SharedHttpConnector,
     };
     use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
     use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
@@ -1715,6 +1729,10 @@ mod tests {
     struct CaptureState {
         requests: Arc<tokio::sync::Mutex<Vec<CapturedRequest>>>,
         fail_next_put: Arc<AtomicBool>,
+        fail_next_complete: Arc<AtomicBool>,
+        pause_next_put: Arc<AtomicBool>,
+        put_paused: Arc<tokio::sync::Notify>,
+        resume_put: Arc<tokio::sync::Notify>,
     }
 
     struct MockS3 {
@@ -1751,7 +1769,16 @@ mod tests {
             body,
         });
 
-        if method == Method::PUT && state.fail_next_put.swap(false, Ordering::SeqCst) {
+        if method == Method::PUT && state.pause_next_put.swap(false, Ordering::SeqCst) {
+            state.put_paused.notify_one();
+            state.resume_put.notified().await;
+        }
+
+        if (method == Method::PUT && state.fail_next_put.swap(false, Ordering::SeqCst))
+            || (method == Method::POST
+                && query.contains("uploadId=")
+                && state.fail_next_complete.swap(false, Ordering::SeqCst))
+        {
             return (
                 AxumStatusCode::INTERNAL_SERVER_ERROR,
                 "<Error><Code>InternalError</Code></Error>",
@@ -1819,6 +1846,161 @@ mod tests {
                 },
                 mutation_replay_forbidden: false,
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct TrackedHttpClient {
+        delegate: SharedHttpClient,
+        _lifetime: Arc<()>,
+    }
+
+    impl HttpClient for TrackedHttpClient {
+        fn http_connector(
+            &self,
+            settings: &HttpConnectorSettings,
+            components: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            self.delegate.http_connector(settings, components)
+        }
+    }
+
+    fn tracked_multipart_backend(mock: &MockS3) -> (S3Backend, std::sync::Weak<()>) {
+        let mut backend = mock.backend(None);
+        // The mock accepts small parts so these tests need only a few bytes.
+        backend.config.part_size = 4;
+        let lifetime = Arc::new(());
+        let weak = Arc::downgrade(&lifetime);
+        let config = backend
+            .client
+            .config()
+            .to_builder()
+            .http_client(TrackedHttpClient {
+                delegate: aws_smithy_http_client::Builder::new().build_http(),
+                _lifetime: lifetime,
+            })
+            .build();
+        backend.client = Client::from_conf(config);
+        (backend, weak)
+    }
+
+    async fn upload_multipart_for_cleanup_test(backend: &S3Backend, vectored: bool) -> Result<()> {
+        if vectored {
+            backend
+                .put_object_vectored(
+                    "test",
+                    vec![Bytes::from_static(b"abc"), Bytes::from_static(b"def")],
+                )
+                .await
+        } else {
+            backend.put_object("test", b"abcdef").await
+        }
+    }
+
+    async fn assert_multipart_cleanup(
+        mock: &MockS3,
+        backend: S3Backend,
+        lifetime: std::sync::Weak<()>,
+        expected_aborts: usize,
+    ) {
+        assert!(lifetime.upgrade().is_some());
+        drop(backend);
+        // Error/cancellation cleanup runs in a spawned task; allow it to finish
+        // before checking both ownership release and the captured abort request.
+        timeout(Duration::from_secs(5), async {
+            while lifetime.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("multipart cleanup must release the client transport after backend drop");
+        let requests = mock.state.requests.lock().await;
+        let aborts: Vec<_> = requests
+            .iter()
+            .filter(|request| request.method == Method::DELETE)
+            .collect();
+        assert_eq!(aborts.len(), expected_aborts);
+        for abort in aborts {
+            assert_eq!(abort.path, "/test-bucket/test");
+            assert!(
+                abort
+                    .query
+                    .split('&')
+                    .any(|parameter| parameter == "uploadId=test-upload")
+            );
+        }
+    }
+
+    async fn check_multipart_success_releases_transport(vectored: bool) {
+        let mock = MockS3::new().await;
+        let (backend, lifetime) = tracked_multipart_backend(&mock);
+        for _ in 0..3 {
+            upload_multipart_for_cleanup_test(&backend, vectored)
+                .await
+                .unwrap();
+        }
+        assert_multipart_cleanup(&mock, backend, lifetime, 0).await;
+        let requests = mock.state.requests.lock().await;
+        assert_eq!(
+            requests
+                .iter()
+                .filter(
+                    |request| request.method == Method::POST && request.query.contains("uploadId=")
+                )
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_cleanup_scalar_success_releases_transport() {
+        check_multipart_success_releases_transport(false).await;
+    }
+
+    #[tokio::test]
+    async fn multipart_cleanup_vectored_success_releases_transport() {
+        check_multipart_success_releases_transport(true).await;
+    }
+
+    #[tokio::test]
+    async fn multipart_cleanup_aborts_failed_uploads() {
+        for vectored in [false, true] {
+            for fail_completion in [false, true] {
+                let mock = MockS3::new().await;
+                let (backend, lifetime) = tracked_multipart_backend(&mock);
+                if fail_completion {
+                    mock.state.fail_next_complete.store(true, Ordering::SeqCst);
+                } else {
+                    mock.state.fail_next_put.store(true, Ordering::SeqCst);
+                }
+                assert!(
+                    upload_multipart_for_cleanup_test(&backend, vectored)
+                        .await
+                        .is_err()
+                );
+                assert_multipart_cleanup(&mock, backend, lifetime, 1).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_cleanup_aborts_cancelled_uploads() {
+        for vectored in [false, true] {
+            let mock = MockS3::new().await;
+            let (backend, lifetime) = tracked_multipart_backend(&mock);
+            mock.state.pause_next_put.store(true, Ordering::SeqCst);
+            let mut upload = Box::pin(upload_multipart_for_cleanup_test(&backend, vectored));
+            timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    result = &mut upload => panic!("upload should be paused: {result:?}"),
+                    _ = mock.state.put_paused.notified() => {}
+                }
+            })
+            .await
+            .expect("upload must reach a part request before cancellation");
+            drop(upload);
+            mock.state.resume_put.notify_one();
+            assert_multipart_cleanup(&mock, backend, lifetime, 1).await;
         }
     }
 
