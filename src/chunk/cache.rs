@@ -634,7 +634,7 @@ impl DiskStorage {
         data: impl AsRef<[u8]>,
         generation: u64,
     ) -> anyhow::Result<Option<u64>> {
-        if self.health.is_bypassed() {
+        if !self.health.can_attempt() {
             return Ok(None);
         }
 
@@ -658,9 +658,9 @@ impl DiskStorage {
         data: bytes::Bytes,
         token: DiskStorePermit,
     ) -> anyhow::Result<Option<u64>> {
-        if self.health.is_bypassed() {
+        let Some(_operation) = self.health.try_operation() else {
             return Ok(None);
-        }
+        };
         let DiskStorePermit {
             permit,
             generation,
@@ -906,13 +906,16 @@ impl DiskStorage {
         offset: u64,
         buf: &mut [u8],
     ) -> anyhow::Result<Option<usize>> {
-        if self.health.is_bypassed() {
+        let Some(_operation) = self.health.try_operation() else {
             return Ok(None);
-        }
+        };
 
         let filename = Self::key_to_filename(key);
         let filepath = self.base_dir.join(filename);
-        if tokio::fs::metadata(&filepath).await.is_err() {
+        if let Err(err) = tokio::fs::metadata(&filepath).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                self.health.record_error();
+            }
             return Ok(None);
         }
 
@@ -1047,13 +1050,16 @@ impl DiskStorage {
     }
 
     pub async fn load_with_health(&self, key: &str) -> anyhow::Result<Option<bytes::Bytes>> {
-        if self.health.is_bypassed() {
+        let Some(_operation) = self.health.try_operation() else {
             return Ok(None);
-        }
+        };
 
         let filename = Self::key_to_filename(key);
         let filepath = self.base_dir.join(filename);
-        if tokio::fs::metadata(&filepath).await.is_err() {
+        if let Err(err) = tokio::fs::metadata(&filepath).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                self.health.record_error();
+            }
             return Ok(None);
         }
 
@@ -3884,6 +3890,129 @@ mod tests {
             .store_with_health("skipped-after-bypass", b"data")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_disk_health_recovers_through_health_wrappers() {
+        for operation in ["store", "permit", "load", "range"] {
+            let temp_dir = tempdir().unwrap();
+            let base = temp_dir.path().join("cache");
+            fs::write(&base, b"not a directory").await.unwrap();
+            let storage = DiskStorage::new(&base, 0).await.unwrap();
+            for i in 0..3 {
+                assert!(
+                    storage
+                        .store_with_health(&format!("failed-{i}"), b"data")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert!(storage.health.is_bypassed());
+
+            fs::remove_file(&base).await.unwrap();
+            fs::create_dir(&base).await.unwrap();
+            storage.store("readable", b"data").await.unwrap();
+            assert!(
+                storage
+                    .store_with_health("cooldown", b"data")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            storage.health.elapse_cooldown_for_test();
+
+            for i in 0..10 {
+                match operation {
+                    "permit" => {
+                        let key = format!("recovered-{i}");
+                        let permit = storage.acquire_store_permit(&key).await.unwrap();
+                        assert!(
+                            storage
+                                .store_with_permit_health(
+                                    &key,
+                                    bytes::Bytes::from_static(b"data"),
+                                    permit,
+                                )
+                                .await
+                                .unwrap()
+                                .is_some()
+                        );
+                    }
+                    "store" => assert!(
+                        storage
+                            .store_with_health(&format!("recovered-{i}"), b"data")
+                            .await
+                            .unwrap()
+                            .is_some(),
+                        "a repaired disk must admit a recovery store after cooldown"
+                    ),
+                    "load" => assert_eq!(
+                        storage
+                            .load_with_health("readable")
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some(b"data".as_slice())
+                    ),
+                    "range" => {
+                        let mut buf = [0; 2];
+                        assert_eq!(
+                            storage
+                                .load_range_with_health("readable", 1, &mut buf)
+                                .await
+                                .unwrap(),
+                            Some(2)
+                        );
+                        assert_eq!(&buf, b"at");
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                !storage.health.is_bypassed(),
+                "{operation} must recover the disk tier"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disk_health_failed_probe_restarts_cooldown() {
+        let temp_dir = tempdir().unwrap();
+        let base = temp_dir.path().join("cache");
+        fs::write(&base, b"not a directory").await.unwrap();
+        let storage = DiskStorage::new(&base, 0).await.unwrap();
+        for i in 0..3 {
+            storage
+                .store_with_health(&format!("failed-{i}"), b"data")
+                .await
+                .unwrap();
+        }
+        storage.health.elapse_cooldown_for_test();
+        assert!(
+            storage
+                .store_with_health("failed-probe", b"data")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_file(&base).await.unwrap();
+        fs::create_dir(&base).await.unwrap();
+        assert!(
+            storage
+                .store_with_health("still-cooling", b"data")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        storage.health.elapse_cooldown_for_test();
+        assert!(
+            storage
+                .store_with_health("repaired", b"data")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
