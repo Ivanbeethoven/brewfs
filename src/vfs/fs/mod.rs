@@ -368,6 +368,7 @@ where
     fuse_write_order: Arc<FuseWriteOrder>,
     fuse_read_cancel: crate::vfs::fuse_read_cancel::ReadRegistry,
     fuse_notify: StdMutex<Option<FuseNotify>>,
+    fuse_cache_ttl: std::sync::OnceLock<Duration>,
     #[cfg(target_os = "linux")]
     fuse_mount_device: StdMutex<Option<(u32, u32)>>,
     statfs_cache: StdMutex<Option<StatFsCache>>,
@@ -774,6 +775,7 @@ where
             fuse_write_order: Arc::new(FuseWriteOrder::default()),
             fuse_read_cancel,
             fuse_notify: StdMutex::new(None),
+            fuse_cache_ttl: std::sync::OnceLock::new(),
             #[cfg(target_os = "linux")]
             fuse_mount_device: StdMutex::new(None),
             statfs_cache: StdMutex::new(None),
@@ -1310,6 +1312,19 @@ where
     ) -> Result<Self, VfsError> {
         let backend = Arc::new(Backend::new(store.clone(), meta_layer.clone()));
         Self::from_components_with_backend(config, store, meta_layer, background_tasks, backend)
+    }
+
+    /// Create a workspace VFS with the default cache configuration.
+    #[cfg(feature = "workspace-overlay")]
+    pub fn new_workspace(
+        layout: ChunkLayout,
+        store: S,
+        meta_layer: Arc<M>,
+    ) -> Result<Self, VfsError>
+    where
+        M: crate::chunk::read_plan::WorkspaceReadPlanProvider,
+    {
+        Self::from_workspace_components(VFSConfig::new(layout), Arc::new(store), meta_layer)
     }
 
     #[cfg(feature = "workspace-overlay")]
@@ -1957,6 +1972,22 @@ where
             .fuse_notify
             .lock()
             .expect("fuse notify lock poisoned") = Some(notify);
+    }
+
+    /// Set once before mounting; all VFS clones share the same explicit policy.
+    /// This overrides the zero permission TTL only on writable POSIX ACL mounts.
+    ///
+    /// # Panics
+    /// Panics if the TTL has already been configured on this VFS or a clone.
+    pub fn set_fuse_cache_ttl(&self, ttl: Duration) {
+        self.state
+            .fuse_cache_ttl
+            .set(ttl)
+            .expect("FUSE cache TTL already configured");
+    }
+
+    pub(crate) fn configured_fuse_cache_ttl(&self) -> Duration {
+        self.state.fuse_cache_ttl.get().copied().unwrap_or_default()
     }
 
     fn fuse_notify(&self) -> Option<FuseNotify> {
