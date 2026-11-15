@@ -1,8 +1,14 @@
-/// Use Tokio's CPU-based worker selection and its environment override.
+/// Select up to eight CPU workers and preserve Tokio's environment override.
 pub(crate) fn build() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+        let workers = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .min(8);
+        builder.worker_threads(workers);
+    }
+    builder.enable_all().build()
 }
 
 #[cfg(test)]
@@ -24,7 +30,7 @@ mod tests {
     #[test]
     fn default_and_environment_override() {
         // Isolate environment changes from concurrently running Rust tests.
-        for (setting, expected) in [(None, std::thread::available_parallelism().unwrap().get()), (Some("2"), 2)] {
+        for (setting, expected) in [(None, std::thread::available_parallelism().unwrap().get().min(8)), (Some("2"), 2)] {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child
                 .arg("worker_count_child")
