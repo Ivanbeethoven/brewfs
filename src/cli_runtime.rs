@@ -1,11 +1,8 @@
-/// One worker reduces executor handoffs for the FUSE metadata path. Keep the
-/// multithread runtime and Tokio's existing explicit environment override.
+/// Use Tokio's CPU-based worker selection and its environment override.
 pub(crate) fn build() -> std::io::Result<tokio::runtime::Runtime> {
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
-        builder.worker_threads(1);
-    }
-    builder.enable_all().build()
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
 }
 
 #[cfg(test)]
@@ -27,7 +24,7 @@ mod tests {
     #[test]
     fn default_and_environment_override() {
         // Isolate environment changes from concurrently running Rust tests.
-        for (setting, expected) in [(None, 1), (Some("2"), 2)] {
+        for (setting, expected) in [(None, std::thread::available_parallelism().unwrap().get()), (Some("2"), 2)] {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child
                 .arg("worker_count_child")
