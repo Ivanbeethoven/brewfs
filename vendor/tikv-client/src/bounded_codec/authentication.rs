@@ -4,7 +4,7 @@
 use super::{limit, malformed, take, varint, Schema};
 use tonic::Status;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Shape {
     Lock,
     Prewrite,
@@ -58,10 +58,12 @@ fn inspect_shape(
                 return Err(malformed());
             }
             let length = usize::try_from(varint(&mut bytes)?).map_err(|_| malformed())?;
-            take(&mut bytes, length)?;
-            return Err(Status::failed_precondition(
-                "bounded authentication returned a key or region error",
-            ));
+            let body = take(&mut bytes, length)?;
+            let fields = error_field_mask(body)?;
+            let source = if field == 1 { "region" } else { "key" };
+            return Err(Status::failed_precondition(format!(
+                "bounded authentication returned a key or region error: stage={shape:?} source={source} fields={fields:#x}"
+            )));
         }
         let nested = match (shape, field) {
             (Shape::Lock, 7) | (Shape::Prewrite, 5) | (Shape::Commit, 4) | (Shape::Rollback, 3) => {
@@ -113,9 +115,71 @@ fn inspect_shape(
     Ok(())
 }
 
+/// Inspect only field tags; nested error values are neither decoded nor logged.
+fn error_field_mask(mut bytes: &[u8]) -> Result<u64, Status> {
+    let mut mask = 0u64;
+    for _ in 0..32 {
+        if bytes.is_empty() {
+            return Ok(mask);
+        }
+        let tag = varint(&mut bytes)?;
+        let field = tag >> 3;
+        if field == 0 || field >= 64 {
+            return Err(limit());
+        }
+        mask |= 1u64 << field;
+        match tag & 7 {
+            0 => {
+                varint(&mut bytes)?;
+            }
+            1 => {
+                take(&mut bytes, 8)?;
+            }
+            2 => {
+                let length = usize::try_from(varint(&mut bytes)?).map_err(|_| malformed())?;
+                take(&mut bytes, length)?;
+            }
+            5 => {
+                take(&mut bytes, 4)?;
+            }
+            _ => return Err(malformed()),
+        }
+    }
+    if bytes.is_empty() {
+        Ok(mask)
+    } else {
+        Err(limit())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_reports_stage_and_tags_without_values() {
+        let error = inspect(&[0x12, 5, 0x1a, 3, b'a', b'b', b'c'], Schema::Prewrite).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error
+            .message()
+            .contains("stage=Prewrite source=key fields=0x8"));
+        assert!(!error.message().contains("abc"));
+        let error = inspect(&[0x0a, 2, 0x2a, 0], Schema::Commit).unwrap_err();
+        assert!(error
+            .message()
+            .contains("stage=Commit source=region fields=0x20"));
+    }
+
+    #[test]
+    fn diagnostic_limits_malformed_and_repeated_fields() {
+        assert_eq!(error_field_mask(&[0x0a, 0, 0x20, 1]).unwrap(), 0x12);
+        assert!(error_field_mask(&[0x0a, 3, 1]).is_err());
+        assert!(error_field_mask(&[0]).is_err());
+        assert!(error_field_mask(&[0x0b]).is_err());
+        assert!(error_field_mask(&[0x80, 4, 0]).is_err());
+        assert!(error_field_mask(&[0x08, 1].repeat(32)).is_ok());
+        assert!(error_field_mask(&[0x08, 1].repeat(33)).is_err());
+    }
 
     #[test]
     fn exact_presence_empty_value_and_absence_are_distinct() {

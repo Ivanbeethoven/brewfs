@@ -4244,7 +4244,7 @@ fn posix_acl_errno(error: MetaError) -> Errno {
 
 impl From<MetaError> for Errno {
     fn from(val: MetaError) -> Self {
-        let code = match val {
+        let code = match &val {
             MetaError::NotFound(_) | MetaError::EntryNotFound { .. } => libc::ENOENT,
             MetaError::ParentNotFound(_) => libc::ENOENT,
             MetaError::NotDirectory(_) => libc::ENOTDIR,
@@ -4258,13 +4258,16 @@ impl From<MetaError> for Errno {
             MetaError::FilenameTooLong => libc::ENAMETOOLONG,
             _ => libc::EIO,
         };
+        if code == libc::EIO {
+            tracing::warn!(error = ?val, "filesystem metadata request failed");
+        }
         Errno::from(code)
     }
 }
 
 impl From<VfsError> for Errno {
     fn from(val: VfsError) -> Self {
-        let code = match val {
+        let code = match &val {
             VfsError::NotFound { .. } => libc::ENOENT,
             VfsError::AlreadyExists { .. } => libc::EEXIST,
             VfsError::NotADirectory { .. } => libc::ENOTDIR,
@@ -4306,6 +4309,9 @@ impl From<VfsError> for Errno {
             VfsError::StaleNetworkFileHandle => libc::ESTALE,
             _ => libc::EIO,
         };
+        if code == libc::EIO {
+            tracing::warn!(error = ?val, "filesystem data request failed");
+        }
         code.into()
     }
 }
