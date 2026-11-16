@@ -24,6 +24,9 @@ mod packed_lower_tests;
 #[path = "tests/kernel_cache_tests.rs"]
 mod kernel_cache_tests;
 
+#[path = "tests/packed_read_retry_tests.rs"]
+mod packed_read_retry_tests;
+
 #[path = "tests/packed_open_preparation_tests.rs"]
 mod packed_open_preparation_tests;
 

@@ -56,9 +56,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         let Some(deadline) = started.checked_add(ttl) else {
             return Ok(None);
         };
-        for _ in 0..8 {
-            // layer_pair deliberately retains a mount-lifetime head sequence.
-            // Fetch the actual generation, including same-epoch upper writes.
+        let layers = retry_busy_metadata_read(|| async {
             let chain = self
                 .store
                 .load_layer_chain(guard.expected_head_layer_id)
@@ -78,28 +76,41 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                     .await
                     .map_err(workspace_to_meta)?;
             }
-            match self
-                .store
+            self.store
                 .validate_read_fence(guard.clone(), layers.clone())
                 .await
-            {
-                Err(WorkspaceError::Busy) => {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                Err(error) => return Err(workspace_to_meta(error)),
-                Ok(()) => {}
-            }
-            if cache.layers.as_ref() != Some(&layers) {
-                self.invalidate_upper_rows();
-                cache.layers = Some(layers);
-            }
-            cache.deadline = Some(deadline);
-            cache.guard = Some(guard);
-            cache.ttl = ttl;
-            return Ok(Some(deadline));
+                .map_err(workspace_to_meta)?;
+            Ok(layers)
+        })
+        .await?;
+        if cache.layers.as_ref() != Some(&layers) {
+            self.invalidate_upper_rows();
+            cache.layers = Some(layers);
         }
-        // Contention cannot grant an unchecked cache lifetime.
-        Err(workspace_to_meta(WorkspaceError::Busy))
+        cache.deadline = Some(deadline);
+        cache.guard = Some(guard);
+        cache.ttl = ttl;
+        Ok(Some(deadline))
     }
+}
+
+/// Rebuild a read-only metadata snapshot after a transient routing conflict.
+/// Every attempt performs all authority checks; successful cache lifetimes
+/// retain the caller's original deadline.
+pub(super) async fn retry_busy_metadata_read<T, F, Fut>(mut read: F) -> Result<T, MetaError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, MetaError>>,
+{
+    for attempt in 0..8 {
+        match read().await {
+            Err(MetaError::Io(ref error))
+                if error.raw_os_error() == Some(libc::EBUSY) && attempt < 7 =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final metadata read attempt always returns")
 }

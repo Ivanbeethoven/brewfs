@@ -4251,6 +4251,7 @@ impl From<MetaError> for Errno {
             MetaError::DirectoryNotEmpty(_) => libc::ENOTEMPTY,
             MetaError::AlreadyExists { .. } => libc::EEXIST,
             MetaError::LockConflict { .. } => libc::EAGAIN,
+            MetaError::Io(error) => error.raw_os_error().unwrap_or(libc::EIO),
             MetaError::NotSupported(_) | MetaError::NotImplemented => libc::ENOSYS,
             MetaError::InvalidPath(_) => libc::EINVAL,
             MetaError::InvalidFilename => libc::EINVAL,
@@ -7912,3 +7913,6 @@ mod fuse_init_tests {
         }
     }
 }
+#[cfg(test)]
+#[path = "packed_read_retry_tests.rs"]
+mod packed_read_retry_tests;

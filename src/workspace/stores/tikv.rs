@@ -1546,6 +1546,7 @@ fn is_definite_precommit_write_conflict(error: &tikv_client::Error) -> bool {
 }
 
 fn backend(error: impl std::fmt::Display) -> WorkspaceError {
+    log::warn!("TiKV workspace request failed: {error}");
     WorkspaceError::Backend(format!("TiKV workspace catalog: {error}"))
 }
 

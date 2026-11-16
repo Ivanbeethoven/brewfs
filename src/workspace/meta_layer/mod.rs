@@ -1224,20 +1224,23 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         inodes: Vec<i64>,
         dentry: Option<(i64, Vec<u8>)>,
     ) -> Result<PermissionSnapshot, MetaError> {
-        let snapshot = if let Some(lower) = self.packed_lower() {
-            self.merged_packed_permission_snapshot(lower, inodes.clone(), dentry)
-                .await?
-        } else {
-            let chain = self.chain().await?;
-            self.store
-                .read_permission_snapshot(PermissionSnapshotQuery {
-                    layer_ids: [chain[0].layer_id, chain[1].layer_id],
-                    inodes: inodes.clone(),
-                    dentry,
-                })
-                .await
-                .map_err(workspace_to_meta)?
-        };
+        let snapshot = kernel_cache::retry_busy_metadata_read(|| async {
+            if let Some(lower) = self.packed_lower() {
+                self.merged_packed_permission_snapshot(lower, inodes.clone(), dentry.clone())
+                    .await
+            } else {
+                let chain = self.chain().await?;
+                self.store
+                    .read_permission_snapshot(PermissionSnapshotQuery {
+                        layer_ids: [chain[0].layer_id, chain[1].layer_id],
+                        inodes: inodes.clone(),
+                        dentry: dentry.clone(),
+                    })
+                    .await
+                    .map_err(workspace_to_meta)
+            }
+        })
+        .await?;
         // Retain only bounded topology hints across permission-cache eviction.
         // A stale hint may fetch an unnecessary row but cannot authorize a walk.
         for ino in inodes {
