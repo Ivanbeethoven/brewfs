@@ -3,11 +3,20 @@ use crate::workspace::catalog::*;
 use crate::workspace::digest::CanonicalLayerDelta;
 use crate::workspace::ids::*;
 use crate::workspace::model::*;
+use std::sync::atomic::AtomicUsize;
+
+#[path = "packed_read_retry_tests.rs"]
+mod packed_read_retry_tests;
 
 struct BindingWithoutPins<W> {
     inner: Arc<W>,
     binding: Option<PackedLowerBinding>,
     probes: AtomicU64,
+    metadata_reads_enabled: bool,
+    busy_layer_chain_reads: AtomicUsize,
+    layer_chain_reads: AtomicUsize,
+    busy_permission_snapshot_reads: AtomicUsize,
+    permission_snapshot_reads: AtomicUsize,
 }
 
 #[tokio::test]
@@ -17,6 +26,11 @@ async fn packed_default_reader_missing_binding_fences_before_unsupported_lifecyc
         inner: f.meta.store().clone(),
         binding: None,
         probes: AtomicU64::new(0),
+        metadata_reads_enabled: false,
+        busy_layer_chain_reads: AtomicUsize::new(0),
+        layer_chain_reads: AtomicUsize::new(0),
+        busy_permission_snapshot_reads: AtomicUsize::new(0),
+        permission_snapshot_reads: AtomicUsize::new(0),
     });
     let error = store
         .clone()
@@ -39,6 +53,11 @@ async fn packed_default_reader_present_binding_still_cannot_attach_without_pins(
         inner: f.meta.store().clone(),
         binding: Some(f.authority.binding.clone()),
         probes: AtomicU64::new(0),
+        metadata_reads_enabled: false,
+        busy_layer_chain_reads: AtomicUsize::new(0),
+        layer_chain_reads: AtomicUsize::new(0),
+        busy_permission_snapshot_reads: AtomicUsize::new(0),
+        permission_snapshot_reads: AtomicUsize::new(0),
     });
     let before = f.gets.load(Ordering::SeqCst);
     let candidate =
@@ -89,6 +108,16 @@ impl<W: WorkspaceStore + 'static> WorkspaceStore for BindingWithoutPins<W> {
         self.inner.load_layer(id).await
     }
     async fn load_layer_chain(&self, head: LayerId) -> Result<Vec<LayerRecord>, WorkspaceError> {
+        self.layer_chain_reads.fetch_add(1, Ordering::SeqCst);
+        if self
+            .busy_layer_chain_reads
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(WorkspaceError::Busy);
+        }
         self.inner.load_layer_chain(head).await
     }
     async fn allocate_id(&self, name: &str) -> Result<i64, WorkspaceError> {
@@ -168,6 +197,44 @@ impl<W: WorkspaceStore + 'static> WorkspaceStore for BindingWithoutPins<W> {
     }
     async fn get_acl_deltas(&self, request: AclQuery) -> Result<Vec<AclDelta>, WorkspaceError> {
         self.inner.get_acl_deltas(request).await
+    }
+    async fn read_permission_snapshot(
+        &self,
+        request: PermissionSnapshotQuery,
+    ) -> Result<PermissionSnapshot, WorkspaceError> {
+        if !self.metadata_reads_enabled {
+            return Err(WorkspaceError::UnsupportedCapability(
+                "atomic permission snapshot",
+            ));
+        }
+        self.permission_snapshot_reads
+            .fetch_add(1, Ordering::SeqCst);
+        if self
+            .busy_permission_snapshot_reads
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(WorkspaceError::Busy);
+        }
+        self.inner.read_permission_snapshot(request).await
+    }
+    async fn validate_read_fence(
+        &self,
+        guard: HeadGuard,
+        expected_layers: [LayerRecord; 2],
+    ) -> Result<(), WorkspaceError> {
+        if self.metadata_reads_enabled {
+            self.inner.validate_read_fence(guard, expected_layers).await
+        } else {
+            Err(WorkspaceError::UnsupportedCapability(
+                "workspace read fence",
+            ))
+        }
+    }
+    fn supports_versioned_permissions(&self) -> bool {
+        self.metadata_reads_enabled && self.inner.supports_versioned_permissions()
     }
     async fn apply_namespace_mutation(
         &self,
