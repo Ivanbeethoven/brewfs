@@ -4084,6 +4084,9 @@ where
                 // this batch drains we re-check write_gen and repeat until no
                 // new writes arrived during the wait.
                 let batch_result: anyhow::Result<()> = loop {
+                    // Capture broadcasts that occur between checking the slice
+                    // states and polling the waiter.
+                    let changed = self.shared.flush_notify.notified();
                     if let Some(err) = self.shared.writeback_error() {
                         break Err(anyhow::anyhow!("writeback failed: {err}"));
                     }
@@ -4096,36 +4099,39 @@ where
                         break Ok(());
                     }
 
-                    if timeout(FLUSH_WAIT, self.shared.flush_notify.notified())
-                        .await
-                        .is_err()
-                    {
-                        if start.elapsed() > deadline {
-                            let pending: Vec<_> = slices
-                                .iter()
-                                .filter(|s| !matches!(s.lock().state, SliceStatus::Committed))
-                                .map(|s| {
-                                    let g = s.lock();
-                                    format!("{:?}@{}", g.state, g.offset)
-                                })
-                                .collect();
-                            let ino = self.shared.inode.ino();
-                            tracing::error!(
-                                ino,
-                                elapsed_ms = start.elapsed().as_millis() as u64,
-                                pending_slices = pending.len(),
-                                pending_states = ?pending,
-                                "flush timeout"
-                            );
-                            break Err(anyhow::anyhow!(
-                                "flush timeout after {:?} for ino {ino}, {}/{} slices still pending: {:?}",
-                                deadline,
-                                ino,
-                                pending.len(),
-                                pending
-                            ));
+                    let remaining = deadline.saturating_sub(start.elapsed());
+                    if remaining.is_zero() {
+                        let pending: Vec<_> = slices
+                            .iter()
+                            .filter_map(|s| {
+                                let g = s.lock();
+                                (!matches!(g.state, SliceStatus::Committed))
+                                    .then(|| format!("{:?}@{}", g.state, g.offset))
+                            })
+                            .collect();
+                        if pending.is_empty() {
+                            break Ok(());
                         }
+                        let ino = self.shared.inode.ino();
+                        tracing::error!(
+                            ino,
+                            elapsed_ms = start.elapsed().as_millis() as u64,
+                            pending_slices = pending.len(),
+                            pending_states = ?pending,
+                            "flush timeout"
+                        );
+                        break Err(anyhow::anyhow!(
+                            "flush timeout after {:?} for ino {ino}, {}/{} slices still pending: {:?}",
+                            deadline,
+                            pending.len(),
+                            slices.len(),
+                            pending
+                        ));
+                    }
 
+                    if timeout(remaining.min(FLUSH_WAIT), changed).await.is_err()
+                        && remaining > FLUSH_WAIT
+                    {
                         // Safety net: FLUSH_WAIT elapsed without progress.  If
                         // any slice is Uploaded but commit_chunk is not running,
                         // re-spawn commit_chunk so flush does not wait forever.
@@ -6824,6 +6830,8 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::time::{sleep, timeout};
+
+    mod flush_deadline_tests;
 
     fn test_config_with_writeback_and_auto_flush(
         layout: ChunkLayout,
