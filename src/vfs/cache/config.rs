@@ -77,6 +77,8 @@ pub struct CacheConfig {
 
     // Upload parameters
     pub upload_concurrency: usize,
+    /// Time to collect 4 KiB native writes into one object; zero disables grouping.
+    pub native_write_coalesce_window_ms: u64,
 
     // Prefetch parameters
     pub prefetch_enabled: bool,
@@ -133,6 +135,7 @@ impl Default for CacheConfig {
             dirty_slice_target_size: 32 * 1024 * 1024,
             dirty_slice_max_age_ms: 2000,
             upload_concurrency: 10,
+            native_write_coalesce_window_ms: 0,
             prefetch_enabled: true,
             prefetch_initial_bytes: 4 * 1024 * 1024,
             prefetch_max_bytes: 128 * 1024 * 1024,

@@ -93,6 +93,7 @@ pub struct WriteConfig {
     pub auto_flush_max_age: Duration,
     /// Maximum in-flight block uploads per writer.
     pub upload_concurrency: usize,
+    pub native_write_coalesce_window: Duration,
     /// Controls ordering of upload vs metadata commit.
     pub writeback_mode: crate::vfs::cache::config::WriteBackMode,
     /// Experimental page-to-block assembler for cached writeback writes.
@@ -153,6 +154,7 @@ impl Default for WriteConfig {
             // many concurrent foreground PUTs. Eight permits preserves
             // sequential throughput and lowers random-write tail latency.
             upload_concurrency: 10,
+            native_write_coalesce_window: Duration::ZERO,
             writeback_mode,
             cached_block_assembler: env_flag_enabled("BREWFS_CACHED_BLOCK_ASSEMBLER"),
             writeback_recent_pending_soft_limit,
@@ -213,6 +215,13 @@ impl WriteConfig {
     pub fn upload_concurrency(self, upload_concurrency: usize) -> Self {
         Self {
             upload_concurrency: upload_concurrency.max(1),
+            ..self
+        }
+    }
+
+    pub fn native_write_coalesce_window(self, window: Duration) -> Self {
+        Self {
+            native_write_coalesce_window: window,
             ..self
         }
     }
@@ -311,6 +320,9 @@ impl VFSConfig {
                 .freeze_min_bytes(cache.dirty_slice_target_size)
                 .auto_flush_max_age(Duration::from_millis(cache.dirty_slice_max_age_ms))
                 .upload_concurrency(cache.upload_concurrency)
+                .native_write_coalesce_window(Duration::from_millis(
+                    cache.native_write_coalesce_window_ms,
+                ))
                 .writeback_mode(cache.writeback_mode)
                 .writeback_recent_pending_soft_limit(cache.writeback_recent_pending_soft_bytes)
                 .writeback_recent_pending_hard_limit(cache.writeback_recent_pending_hard_bytes)

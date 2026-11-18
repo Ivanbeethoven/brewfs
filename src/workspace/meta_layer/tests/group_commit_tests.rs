@@ -114,6 +114,7 @@ fn enqueue<B: WorkspaceKvBackend>(
                     offset: 0,
                     length: 64,
                 },
+                object_offset: 0,
                 new_size: 64,
                 reply,
             });

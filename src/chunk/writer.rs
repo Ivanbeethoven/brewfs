@@ -3,6 +3,7 @@
 use super::layout::ChunkLayout;
 use super::slice::{SliceOffset, block_span_iter_slice};
 use super::store::BlockStore;
+use super::upload_diagnostic::{BlockDiagnostic, PermitWait};
 use crate::meta::MetaLayer;
 use crate::utils::NumCastExt;
 use crate::vfs::backend::Backend;
@@ -200,7 +201,7 @@ where
                 span.offset,
                 block_chunks,
             );
-            futures.push(future);
+            futures.push((block_index, span.offset, span.len, future));
         }
 
         // Bound total concurrent block uploads. Upload-before-commit flushes use
@@ -208,9 +209,11 @@ where
         // foreground reads keep capacity. Compaction uses upload_permit() directly.
         let futures: Vec<_> = futures
             .into_iter()
-            .map(|f| {
+            .map(|(block_index, block_offset, block_length, f)| {
                 let local_upload_limit = local_upload_limit.clone();
                 let observation = observation.clone();
+                let diagnostic =
+                    BlockDiagnostic::for_key(slice_id, block_index, block_offset, block_length);
                 async move {
                     if request_unique != 0
                         && let Some(observer) = &observation
@@ -234,15 +237,29 @@ where
                         }
                     });
                     let _local_permit = match local_upload_limit {
-                        Some(limit) => Some(
-                            limit
+                        Some(limit) => {
+                            let wait =
+                                PermitWait::begin(0, Arc::as_ptr(&limit) as usize, diagnostic);
+                            let permit = limit
                                 .acquire_owned()
                                 .await
-                                .expect("local upload semaphore closed"),
-                        ),
+                                .expect("local upload semaphore closed");
+                            if let Some(wait) = wait {
+                                wait.acquired();
+                            }
+                            Some(permit)
+                        }
                         None => None,
                     };
+                    let kind = match priority {
+                        UploadPriority::Foreground => 1,
+                        UploadPriority::Writeback => 2,
+                    };
+                    let wait = PermitWait::begin(kind, 0, diagnostic);
                     let _p = upload_permit_for(priority).await;
+                    if let Some(wait) = wait {
+                        wait.acquired();
+                    }
                     drop(queue_wait);
                     let object_put = observation.as_ref().and_then(|observer| {
                         if request_unique == 0 {
@@ -252,7 +269,11 @@ where
                                 .background_segment_timer(request_unique, RequestSegment::ObjectPut)
                         }
                     });
+                    let backend_call = diagnostic.map(|context| context.stage("backend_call"));
                     let result = f.await;
+                    if let Some(backend_call) = backend_call {
+                        backend_call.finish(result.is_ok());
+                    }
                     drop(object_put);
                     result
                 }

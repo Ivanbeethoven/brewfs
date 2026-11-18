@@ -12,11 +12,16 @@
 mod cached_write_watermarks;
 #[cfg(all(test, target_os = "linux"))]
 mod cached_write_watermarks_bench;
+mod native_groups;
+#[cfg(all(test, feature = "workspace"))]
+mod native_integration_tests;
+mod native_upload;
 mod packed_publication_drain;
 use cached_write_watermarks::CachedWriteWatermarks;
 use packed_publication_drain::{PackedWriterTasks, spawn_writer_owned};
 
 use super::reader::DataReader;
+use crate::chunk::upload_diagnostic::SliceDiagnostic;
 use crate::chunk::writer::{DataUploader, UploadPriority};
 use crate::chunk::{BlockStore, SliceDesc};
 use crate::meta::backoff::backoff;
@@ -416,6 +421,7 @@ pub(crate) struct SliceState {
     /// Set to `true` when a pipeline upload task has been spawned for this
     /// slice to prevent duplicate top-level upload tasks.
     upload_task_active: bool,
+    native_group: Option<native_upload::Stage>,
     /// Publication must consume the shared-object member reservation.
     coalesced_object: bool,
     bypass_write_coalesce: bool,
@@ -480,6 +486,9 @@ impl SliceState {
         creation_unique: u64,
     ) -> Self {
         let now = Instant::now();
+        if let Some(diagnostic) = SliceDiagnostic::new(chunk_id, offset, creation_unique, now) {
+            diagnostic.record("slice_created", 0);
+        }
         Self {
             state: SliceStatus::Writable,
             slice_id: None,
@@ -490,6 +499,7 @@ impl SliceState {
             block_done: 0,
             in_flight: 0,
             upload_task_active: false,
+            native_group: None,
             coalesced_object: false,
             bypass_write_coalesce: false,
             recent_pending_accounted: false,
@@ -515,6 +525,31 @@ impl SliceState {
             write_order: creation_unique,
             max_write_unique: creation_unique,
             write_origin_mask: 0,
+        }
+    }
+
+    fn diagnostic_state(&self, stage: &str) {
+        let diagnostic = if stage == "slice_failed" {
+            SliceDiagnostic::for_failure(
+                self.chunk_id,
+                self.offset,
+                self.creation_unique,
+                self.started,
+            )
+        } else {
+            SliceDiagnostic::new(
+                self.chunk_id,
+                self.offset,
+                self.creation_unique,
+                self.started,
+            )
+        };
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.state(stage, self.slice_id.unwrap_or(0), &format!(
+                ",\"status\":\"{:?}\",\"uploaded\":{},\"dispatched_end\":{},\"in_flight\":{},\"upload_task_active\":{},\"data_length\":{}",
+                self.state, self.uploaded, self.dispatched_end, self.in_flight,
+                self.upload_task_active, self.data.len(),
+            ));
         }
     }
 
@@ -875,6 +910,7 @@ where
                 None
             };
             s.data.freeze();
+            s.diagnostic_state("slice_frozen");
 
             if s.in_flight == 0 && !s.has_idle_block() {
                 s.state = SliceStatus::Uploaded;
@@ -934,6 +970,7 @@ where
                 s.err = None;
             }
             self.clear_recent_pending_if_complete(s);
+            s.diagnostic_state("upload_range_completed");
             s.notify.notify_waiters();
             s.uploaded != previous_uploaded || s.state != previous_state
         });
@@ -1037,6 +1074,7 @@ where
     fn mark_failed(&self, err: anyhow::Error) {
         let message = err.to_string();
         self.with_mut(|s| {
+            s.diagnostic_state("slice_failed");
             s.state = SliceStatus::Failed;
             s.in_flight = 0;
             s.upload_task_active = false;
@@ -1151,6 +1189,11 @@ where
         self.with_mut(|s| {
             if s.slice_id.is_none() {
                 s.slice_id = Some(id);
+                if let Some(diagnostic) =
+                    SliceDiagnostic::new(s.chunk_id, s.offset, s.creation_unique, s.started)
+                {
+                    diagnostic.register(id);
+                }
             }
         })
     }
@@ -1177,6 +1220,7 @@ where
     fn mark_committed(&self) {
         self.with_mut(|s| {
             s.state = SliceStatus::Committed;
+            s.diagnostic_state("slice_committed");
             s.notify.notify_waiters();
         });
         self.shared.flush_notify.notify_waiters();
@@ -1675,6 +1719,38 @@ where
                 allow_gap_from,
                 request_ids.observation_unique,
             )? {
+                if let Some(groups) = self.inner.native_groups.as_mut()
+                    && matches!(origin, WriteOrigin::Normal)
+                    && buf.len() == 4096
+                    && offset.is_multiple_of(4096)
+                    && handle.with_mut(|s| {
+                        if s.state != SliceStatus::Writable
+                            || s.upload_task_active
+                            || s.write_order != write_order
+                            || s.offset != offset
+                            || s.data.len() != 4096
+                            || s.slice_id.is_some()
+                            || s.dispatched_end != 0
+                        {
+                            return false;
+                        }
+                        s.upload_task_active = true;
+                        s.native_group = Some(native_upload::Stage::Open);
+                        true
+                    })
+                {
+                    handle.freeze_with_reason(SliceFreezeReason::SizeOrChunkEnd);
+                    let (first_write, epoch) = handle.with_ref(|s| (s.started, s.frozen_epoch));
+                    native_upload::seal(groups.push(
+                        (self.chunk_id, epoch),
+                        first_write,
+                        slice.clone(),
+                    ));
+                    return Ok(WriteAction {
+                        start_commit,
+                        flush,
+                    });
+                }
                 let should_flush = if matches!(
                     self.shared.config.writeback_mode,
                     WriteBackMode::CommitBeforeUpload
@@ -2318,11 +2394,22 @@ where
         recent_pending_upload: Arc<RecentPendingUploadState>,
     ) -> Self {
         let upload_concurrency = config.upload_concurrency.max(1);
+        let native_groups = (!config.native_write_coalesce_window.is_zero()
+            && matches!(config.writeback_mode, WriteBackMode::UploadBeforeCommit)
+            && config.layout.block_size >= 4096
+            && backend.meta().supports_native_write_groups())
+        .then(|| {
+            native_groups::Groups::with_capacity(
+                config.native_write_coalesce_window,
+                (config.layout.block_size as usize / 4096).min(native_groups::MAX_MEMBERS),
+            )
+        });
         Self {
             inode,
             config,
             buffer_usage,
             inner: Mutex::new(Inner {
+                native_groups,
                 flush_waiting: 0,
                 write_waiting: 0,
                 chunks: BTreeMap::default(),
@@ -2394,7 +2481,10 @@ where
     }
 }
 
+type NativeWriteGroups = native_groups::Groups<(u64, u64), Arc<ParkingMutex<SliceState>>>;
+
 struct Inner {
+    native_groups: Option<NativeWriteGroups>,
     flush_waiting: u16,
     write_waiting: u16,
     chunks: BTreeMap<u64, ChunkState>,
@@ -3135,7 +3225,6 @@ where
         });
         let mut guard = self.shared.inner.lock().await;
         drop(chunk_lock_wait);
-        let write_order = self.shared.next_write_order();
 
         if !bypass_flush_gate {
             // Wait for any ongoing flush to finish. This serializes ordinary
@@ -3159,6 +3248,9 @@ where
             guard.write_waiting -= 1;
         }
 
+        // Assign the order when the write can register all of its spans.
+        // A later write must not publish before an earlier span enters its queue.
+        let write_order = self.shared.next_write_order();
         let layout = self.shared.config.layout;
         let chunk_index = layout.chunk_index_of(offset);
         let within_offset = layout.within_chunk_offset(offset);
@@ -3247,7 +3339,6 @@ where
                     None,
                 )?;
                 drop(dirty_merge);
-                drop(guard);
 
                 for slice in action.flush {
                     Self::spawn_flush_slice(self.shared.clone(), slice);
@@ -3258,19 +3349,8 @@ where
                 }
 
                 position += span_len;
-                if position >= buf.len() {
-                    break;
-                }
-                let chunk_lock_wait = observation.as_ref().and_then(|observer| {
-                    if request_unique == 0 {
-                        observer.unscoped_segment_timer(RequestSegment::ChunkLockWait)
-                    } else {
-                        observer.segment_timer(request_unique, RequestSegment::ChunkLockWait)
-                    }
-                });
-                guard = self.shared.inner.lock().await;
-                drop(chunk_lock_wait);
             }
+            drop(guard);
         }
 
         if matches!(origin, WriteOrigin::Normal) {
@@ -4009,6 +4089,9 @@ where
             }
 
             guard.flush_waiting += 1;
+            if let Some(groups) = &mut guard.native_groups {
+                native_upload::seal(groups.seal_all());
+            }
         }
         let mut flush_gate = FlushGateGuard::new(self.shared.clone());
 
@@ -4022,7 +4105,10 @@ where
 
                 // Snapshot every slice that exists right now.
                 let slices: Vec<Arc<ParkingMutex<SliceState>>> = {
-                    let guard = self.shared.inner.lock().await;
+                    let mut guard = self.shared.inner.lock().await;
+                    if let Some(groups) = &mut guard.native_groups {
+                        native_upload::seal(groups.seal_all());
+                    }
                     guard
                         .chunks
                         .values()
@@ -4268,6 +4354,7 @@ where
                 return;
             }
             s.upload_task_active = true;
+            s.diagnostic_state("upload_task_spawned");
         }
         Self::spawn_upload_task(shared, slice);
     }
@@ -4306,83 +4393,100 @@ where
     fn spawn_upload_task(shared: Arc<Shared<B, M>>, slice: Arc<ParkingMutex<SliceState>>) {
         let tasks = shared.recent_pending_upload.packed_tasks.clone();
         spawn_writer_owned(&tasks, async move {
+            slice.lock().diagnostic_state("upload_task_started");
             // Allocate slice_id once, up front, before dispatching any blocks.
-            let slice_id = {
-                let handle = SliceHandle {
-                    slice: &slice,
-                    shared: &shared,
-                };
-                let existing = handle.with_ref(|s| s.slice_id);
-                match existing {
-                    Some(id) => id,
-                    None => match shared.backend.meta().next_id(SLICE_ID_KEY).await {
-                        Ok(id) => {
-                            let id = id as u64;
-                            let limit = shared.backend.store().write_coalesce_limit();
-                            let eligible = limit > 0
-                                && shared.backend.meta().supports_write_coalescing()
-                                && matches!(
-                                    shared.config.writeback_mode,
-                                    WriteBackMode::UploadBeforeCommit
-                                )
-                                && crate::chunk::store::coalesce::encode_id(id, 0).is_ok()
-                                && handle.with_ref(|s| {
-                                    s.state == SliceStatus::Readonly
-                                        && s.dispatched_end == 0
-                                        && s.data.len() > 0
-                                        && s.data.len() <= limit as u64
-                                        && s.data.len() <= s.data.block_size() as u64
-                                        && !s.bypass_write_coalesce
+            let slice_id =
+                {
+                    let handle = SliceHandle {
+                        slice: &slice,
+                        shared: &shared,
+                    };
+                    let existing = handle.with_ref(|s| s.slice_id);
+                    if existing.is_none() {
+                        handle.with_ref(|s| s.diagnostic_state("slice_id_wait"));
+                    }
+                    match existing {
+                        Some(id) => id,
+                        None => match shared.backend.meta().next_id(SLICE_ID_KEY).await {
+                            Ok(id) => {
+                                let id = id as u64;
+                                let limit = shared.backend.store().write_coalesce_limit();
+                                let eligible = limit > 0
+                                    && shared.backend.meta().supports_write_coalescing()
+                                    && matches!(
+                                        shared.config.writeback_mode,
+                                        WriteBackMode::UploadBeforeCommit
+                                    )
+                                    && crate::chunk::store::coalesce::encode_id(id, 0).is_ok()
+                                    && handle.with_ref(|s| {
+                                        s.state == SliceStatus::Readonly
+                                            && s.dispatched_end == 0
+                                            && s.data.len() > 0
+                                            && s.data.len() <= limit as u64
+                                            && s.data.len() <= s.data.block_size() as u64
+                                            && !s.bypass_write_coalesce
+                                    });
+                                handle.with_ref(|s| {
+                                    if let Some(diagnostic) = SliceDiagnostic::new(
+                                        s.chunk_id,
+                                        s.offset,
+                                        s.creation_unique,
+                                        s.started,
+                                    ) {
+                                        diagnostic.state("upload_path", id, &format!(
+                                        ",\"coalesced\":{eligible},\"coalesce_limit\":{limit}",
+                                    ));
+                                    }
                                 });
-                            if eligible {
-                                let result = async {
-                                    let plan = handle
-                                        .prepare_upload()?
-                                        .context("coalesced upload has no data")?;
-                                    let parts: Vec<_> = plan
-                                        .data
-                                        .into_iter()
-                                        .flat_map(|(_, pages)| pages)
-                                        .collect();
-                                    let len = parts.iter().map(|part| part.len() as u64).sum();
-                                    let _remote_upload = shared
-                                        .recent_pending_upload
-                                        .track_remote_upload_inflight(len);
-                                    let stored_id = shared
-                                        .backend
-                                        .store_arc()
-                                        .write_coalesced(
-                                            id,
-                                            plan.chunk_id,
-                                            parts,
-                                            shared.backend.meta_arc(),
-                                            shared.upload_limit.clone(),
-                                        )
-                                        .await?;
-                                    handle.set_slice_id(stored_id);
-                                    handle.with_mut(|s| s.coalesced_object = true);
-                                    handle.advance_upload_range(0, 1, len);
-                                    handle.try_commit().await;
-                                    Ok::<(), anyhow::Error>(())
+                                if eligible {
+                                    let result = async {
+                                        let plan = handle
+                                            .prepare_upload()?
+                                            .context("coalesced upload has no data")?;
+                                        let parts: Vec<_> = plan
+                                            .data
+                                            .into_iter()
+                                            .flat_map(|(_, pages)| pages)
+                                            .collect();
+                                        let len = parts.iter().map(|part| part.len() as u64).sum();
+                                        let _remote_upload = shared
+                                            .recent_pending_upload
+                                            .track_remote_upload_inflight(len);
+                                        let stored_id = shared
+                                            .backend
+                                            .store_arc()
+                                            .write_coalesced(
+                                                id,
+                                                plan.chunk_id,
+                                                parts,
+                                                shared.backend.meta_arc(),
+                                                shared.upload_limit.clone(),
+                                            )
+                                            .await?;
+                                        handle.set_slice_id(stored_id);
+                                        handle.with_mut(|s| s.coalesced_object = true);
+                                        handle.advance_upload_range(0, 1, len);
+                                        handle.try_commit().await;
+                                        Ok::<(), anyhow::Error>(())
+                                    }
+                                    .await;
+                                    if let Err(error) = result {
+                                        handle.mark_failed(error);
+                                    }
+                                    slice.lock().upload_task_active = false;
+                                    shared.flush_notify.notify_waiters();
+                                    return;
                                 }
-                                .await;
-                                if let Err(error) = result {
-                                    handle.mark_failed(error);
-                                }
-                                slice.lock().upload_task_active = false;
-                                shared.flush_notify.notify_waiters();
+                                handle.set_slice_id(id);
+                                id
+                            }
+                            Err(e) => {
+                                handle.mark_failed(anyhow::anyhow!("Failed to get slice id: {e}"));
                                 return;
                             }
-                            handle.set_slice_id(id);
-                            id
-                        }
-                        Err(e) => {
-                            handle.mark_failed(anyhow::anyhow!("Failed to get slice id: {e}"));
-                            return;
-                        }
-                    },
-                }
-            };
+                        },
+                    }
+                };
 
             // Result type for each upload sub-task: (start_idx, end_idx, bytes_len)
             type UploadResult = Result<(usize, usize, u64), anyhow::Error>;
@@ -4450,6 +4554,7 @@ where
                     let request_unique = request_observation
                         .as_ref()
                         .map_or(0, |_| slice.lock().observation_unique);
+                    slice.lock().diagnostic_state("upload_batch_dispatched");
                     let upload_priority = if matches!(
                         shared.config.writeback_mode,
                         WriteBackMode::CommitBeforeUpload
@@ -5202,6 +5307,12 @@ where
             };
 
             Self::split_uploaded_prefix_tail(&shared, chunk_id, &slice).await;
+
+            let group = slice.lock().native_group;
+            if group.is_some() {
+                Self::commit_native_front(&shared, chunk_id, &slice).await;
+                continue;
+            }
 
             // Get a snapshot of the current slice to check its status.
             // The `notification` in `Notify` is not queued (but the waiters are), this may result in a lost wake-up.

@@ -1124,6 +1124,7 @@ pub struct CacheFileConfig {
     pub dirty_slice_target_size: Option<u64>,
     pub dirty_slice_max_age_ms: Option<u64>,
     pub upload_concurrency: Option<usize>,
+    pub native_write_coalesce_window_ms: Option<u64>,
     pub prefetch_enabled: Option<bool>,
     pub prefetch_max_bytes: Option<u64>,
     pub prefetch_concurrency: Option<usize>,
@@ -1792,6 +1793,9 @@ impl CacheFileConfig {
         }
         if let Some(upload_concurrency) = self.upload_concurrency {
             cache.upload_concurrency = upload_concurrency.max(1);
+        }
+        if let Some(window) = self.native_write_coalesce_window_ms {
+            cache.native_write_coalesce_window_ms = window;
         }
         if let Some(prefetch_enabled) = self.prefetch_enabled {
             cache.prefetch_enabled = prefetch_enabled;

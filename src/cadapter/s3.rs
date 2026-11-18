@@ -797,11 +797,19 @@ impl S3Backend {
                 request = request.content_md5(sum.clone());
             }
 
+            let send = crate::chunk::upload_diagnostic::BlockDiagnostic::for_object_key(
+                key,
+                total_size as u64,
+            )
+            .map(|context| context.with_attempt(attempt).stage("s3_send"));
             let result = if self.config.disable_payload_checksum {
                 request.customize().disable_payload_signing().send().await
             } else {
                 request.send().await
             };
+            if let Some(send) = send {
+                send.finish(result.is_ok());
+            }
 
             match result {
                 Ok(_) => return Ok(()),

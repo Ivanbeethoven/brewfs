@@ -138,6 +138,13 @@ pub struct WorkspaceMetaLayer<W> {
     >,
     /// Data writes waiting for the next group commit (see `write`).
     write_queue: std::sync::Mutex<WriteQueue>,
+    #[cfg(test)]
+    flush_receipt: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     metrics: Arc<WorkspaceMetrics>,
     row_cache_counters: Arc<RowCacheCounters>,
     empty_query_cache_enabled: bool,
@@ -252,6 +259,7 @@ struct PendingWrite {
     ino: i64,
     chunk_id: u64,
     slice: SliceDesc,
+    object_offset: u64,
     new_size: u64,
     reply: tokio::sync::oneshot::Sender<Result<(), MetaError>>,
 }
@@ -317,6 +325,8 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
             #[cfg(test)]
             native_retry_events: std::sync::Mutex::new(None),
             write_queue: std::sync::Mutex::new(WriteQueue::default()),
+            #[cfg(test)]
+            flush_receipt: std::sync::Mutex::new(None),
             metrics: global_workspace_metrics(),
             row_cache_counters: Arc::new(RowCacheCounters::default()),
             empty_query_cache_enabled: true,
@@ -975,6 +985,30 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn hold_mutations(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.mutation_gate.lock().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_flush_receipt(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (notify, reached) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        assert!(
+            self.flush_receipt
+                .lock()
+                .unwrap()
+                .replace((notify, wait))
+                .is_none()
+        );
+        (reached, release)
+    }
+
     async fn write_target_inode(&self, ino: i64) -> Result<InodeDelta, MetaError> {
         let inode = self
             .resolve_inode_delta(ino)
@@ -1050,7 +1084,7 @@ impl<W: WorkspaceStore + 'static> WorkspaceMetaLayer<W> {
                         write.slice.offset,
                         visible_length,
                         write.slice.slice_id,
-                        0,
+                        write.object_offset,
                         0,
                     ));
                 }
@@ -3581,6 +3615,7 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
                 ino,
                 chunk_id,
                 slice,
+                object_offset: 0,
                 new_size,
                 reply: sender,
             });
@@ -3597,6 +3632,66 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
             // finish it before checking our result and handing off leadership.
             self.commit_next_write_batch(guard).await;
         }
+    }
+
+    fn supports_native_write_groups(&self) -> bool {
+        self.packed_lower().is_none()
+    }
+
+    async fn write_native_group(
+        &self,
+        ino: i64,
+        chunk_id: u64,
+        slice_id: u64,
+        offsets: &[u64],
+    ) -> Result<(), MetaError> {
+        if !self.supports_native_write_groups() || !(1..=32).contains(&offsets.len()) {
+            return Err(MetaError::InvalidPath("invalid native write group".into()));
+        }
+        let (_, index) = crate::vfs::extract_ino_and_chunk_index(chunk_id);
+        let base = index
+            .checked_mul(self.chunk_size)
+            .ok_or_else(|| MetaError::InvalidPath("chunk start overflows".into()))?;
+        let mut batch = Vec::with_capacity(offsets.len());
+        let mut receivers = Vec::with_capacity(offsets.len());
+        for (position, &offset) in offsets.iter().enumerate() {
+            if !offset.is_multiple_of(4096) || offsets[..position].contains(&offset) {
+                return Err(MetaError::InvalidPath(
+                    "duplicate or unaligned native page".into(),
+                ));
+            }
+            let new_size = base
+                .checked_add(offset)
+                .and_then(|n| n.checked_add(4096))
+                .ok_or_else(|| MetaError::InvalidPath("native page end overflows".into()))?;
+            let slice = SliceDesc {
+                chunk_id,
+                slice_id,
+                offset,
+                length: 4096,
+            };
+            Self::validate_write(ino, chunk_id, &slice, new_size, self.chunk_size)?;
+            let (reply, receiver) = tokio::sync::oneshot::channel();
+            batch.push(PendingWrite {
+                ino,
+                chunk_id,
+                slice,
+                object_offset: position as u64 * 4096,
+                new_size,
+                reply,
+            });
+            receivers.push(receiver);
+        }
+        let _guard = self.mutation_gate.lock().await;
+        self.commit_write_batch(&mut batch).await?;
+        // Every member targets the same inode. A lookup failure is returned
+        // to each waiting writer by commit_write_batch before any mutation.
+        if batch.is_empty() {
+            return receivers.remove(0).await.map_err(|_| {
+                MetaError::Internal("native group lost its metadata result".into())
+            })?;
+        }
+        Ok(())
     }
 
     async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError> {
@@ -3658,7 +3753,20 @@ impl<W: WorkspaceStore + 'static> MetaLayer for WorkspaceMetaLayer<W> {
     }
 
     async fn flush_metadata(&self) -> Result<(), MetaError> {
-        self.store.flush_metadata().await.map_err(workspace_to_meta)
+        self.store
+            .flush_metadata()
+            .await
+            .map_err(workspace_to_meta)?;
+        #[cfg(test)]
+        {
+            let receipt = self.flush_receipt.lock().unwrap().take();
+            if let Some((notify, wait)) = receipt {
+                let _ = notify.send(());
+                wait.await
+                    .map_err(|_| MetaError::Internal("metadata receipt was dropped".into()))?;
+            }
+        }
+        Ok(())
     }
 
     async fn get_plock(

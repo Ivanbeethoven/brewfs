@@ -30,6 +30,7 @@ pub mod singleflight;
 pub mod slice;
 pub mod span;
 pub mod store;
+pub(crate) mod upload_diagnostic;
 pub mod util;
 pub mod writer;
 

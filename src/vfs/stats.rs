@@ -50,6 +50,8 @@ pub enum RequestSegment {
     Handler = 10,
     /// Wall time inside Future::poll, not a claim of on-CPU time.
     HandlerPoll = 11,
+    NativeUploadPermitWait = 12,
+    NativeMetadataPublish = 13,
 }
 
 /// Small fixed set of operation classes for the request-level latency
@@ -99,7 +101,7 @@ impl RequestOperation {
 }
 
 impl RequestSegment {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::FuseQueueWait,
         Self::FileLockWait,
         Self::ChunkLockWait,
@@ -112,6 +114,8 @@ impl RequestSegment {
         Self::Reply,
         Self::Handler,
         Self::HandlerPoll,
+        Self::NativeUploadPermitWait,
+        Self::NativeMetadataPublish,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -128,6 +132,8 @@ impl RequestSegment {
             Self::Reply => "reply",
             Self::Handler => "handler",
             Self::HandlerPoll => "handler_poll",
+            Self::NativeUploadPermitWait => "native_upload_permit_wait",
+            Self::NativeMetadataPublish => "native_metadata_publish",
         }
     }
 }

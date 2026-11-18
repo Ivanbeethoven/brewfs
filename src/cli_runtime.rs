@@ -30,7 +30,13 @@ mod tests {
     #[test]
     fn default_and_environment_override() {
         // Isolate environment changes from concurrently running Rust tests.
-        for (setting, expected) in [(None, std::thread::available_parallelism().unwrap().get().min(8)), (Some("2"), 2)] {
+        for (setting, expected) in [
+            (
+                None,
+                std::thread::available_parallelism().unwrap().get().min(8),
+            ),
+            (Some("2"), 2),
+        ] {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child
                 .arg("worker_count_child")

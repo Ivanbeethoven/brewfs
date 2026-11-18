@@ -1359,6 +1359,13 @@ impl<B: ObjectBackend + Send + Sync + 'static> ObjectBlockStore<B> {
         let cache_key = Self::key_for(key);
         let object_key = Self::versioned_key_for(key);
         let total_len = chunks.iter().map(|c| c.len()).sum::<usize>();
+        let diagnostic = super::upload_diagnostic::BlockDiagnostic::for_key(
+            key.0,
+            key.1,
+            offset,
+            total_len as u64,
+        );
+        let prepare = diagnostic.map(|context| context.stage("backend_prepare"));
         if total_len == 0 {
             return Ok(0);
         }
@@ -1377,23 +1384,29 @@ impl<B: ObjectBackend + Send + Sync + 'static> ObjectBlockStore<B> {
         );
         let upload_len = prepared.chunks.iter().map(Bytes::len).sum::<usize>();
         self.bandwidth.acquire_upload(upload_len).await;
+        if let Some(prepare) = prepare {
+            prepare.finish(true);
+        }
         self.object_metrics
             .record_put_prepare(prepare_started.elapsed());
 
         let started = Instant::now();
-        if self.config.create_only_writes {
+        let put = diagnostic.map(|context| context.stage("object_put"));
+        let result = if self.config.create_only_writes {
             self.client
                 .put_object_create_only(&object_key, &prepared.chunks[0])
                 .await
-                .map_err(|e| {
-                    anyhow::anyhow!("create-only object put failed: {object_key}, {e:?}")
-                })?;
+                .map_err(|e| anyhow::anyhow!("create-only object put failed: {object_key}, {e:?}"))
         } else {
             self.client
                 .put_object_vectored(&object_key, prepared.chunks)
                 .await
-                .map_err(|e| anyhow::anyhow!("object store put failed: {object_key}, {e:?}"))?;
+                .map_err(|e| anyhow::anyhow!("object store put failed: {object_key}, {e:?}"))
+        };
+        if let Some(put) = put {
+            put.finish(result.is_ok());
         }
+        result?;
         self.object_metrics
             .record_put(upload_len as u64, started.elapsed());
         self.format_cache

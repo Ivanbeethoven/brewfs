@@ -583,6 +583,22 @@ pub trait MetaLayer: Send + Sync {
         new_size: u64,
     ) -> Result<(), MetaError>;
 
+    fn supports_native_write_groups(&self) -> bool {
+        false
+    }
+
+    /// Publish every disjoint page of a single native object in one mutation.
+    /// Entries give chunk-local byte offsets in physical page order.
+    async fn write_native_group(
+        &self,
+        _ino: i64,
+        _chunk_id: u64,
+        _slice_id: u64,
+        _offsets: &[u64],
+    ) -> Result<(), MetaError> {
+        Err(MetaError::NotImplemented)
+    }
+
     // ---------- Metadata + ID utilities ----------
     async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError>;
 
